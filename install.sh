@@ -63,7 +63,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   echo ""
 
   echo "[1/2] 스킬 심링크 제거"
-  for link in "$HOME/.claude/commands/jhw" "$HOME/.gemini/commands/jhw"; do
+  for link in "$HOME/.claude/commands/jhw" "$HOME/.gemini/commands/jhw" "$HOME/.config/opencode/skills/jhw"; do
     if [ -L "$link" ]; then
       rm "$link"
       ok "$(dirname "$link") 심링크 제거"
@@ -73,6 +73,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   echo "[2/2] MCP 서버 등록 해제"
   unregister_mcp "$HOME/.claude/settings.json" "Claude"
   unregister_mcp "$HOME/.gemini/settings.json" "Gemini"
+  unregister_mcp "$HOME/.config/opencode/opencode.json" "OpenCode"
 
   echo ""
   echo "제거 완료!"
@@ -98,9 +99,11 @@ echo ""
 echo "[2/4] TUI 감지"
 CLAUDE_DIR="$HOME/.claude"
 GEMINI_DIR="$HOME/.gemini"
+OPENCODE_DIR="$HOME/.config/opencode"
 
 [ -d "$CLAUDE_DIR" ] && ok "Claude Code ($CLAUDE_DIR)" || skip "Claude Code (미설치)"
 [ -d "$GEMINI_DIR" ] && ok "Gemini CLI ($GEMINI_DIR)" || skip "Gemini CLI (미설치)"
+[ -d "$OPENCODE_DIR" ] && ok "OpenCode ($OPENCODE_DIR)" || skip "OpenCode (미설치)"
 
 # [3/4] 스킬 심링크
 echo ""
@@ -127,6 +130,17 @@ if [ -d "$GEMINI_DIR" ]; then
   ln -sfn "$SCRIPT_DIR/skills/claude" "$TARGET"
   ok "Gemini: $TARGET → $SCRIPT_DIR/skills/claude"
 fi
+if [ -d "$OPENCODE_DIR" ]; then
+  mkdir -p "$OPENCODE_DIR/skills"
+  TARGET="$OPENCODE_DIR/skills/jhw"
+  if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then
+    mv "$TARGET" "$TARGET.bak.$(date +%Y%m%d%H%M%S)"
+    ok "OpenCode: 기존 jhw 디렉토리 백업"
+  fi
+  [ -L "$TARGET" ] && rm "$TARGET"
+  ln -sfn "$SCRIPT_DIR/skills/claude" "$TARGET"
+  ok "OpenCode: $TARGET → $SCRIPT_DIR/skills/claude"
+fi
 
 # [4/4] MCP 서버 등록
 echo ""
@@ -136,6 +150,23 @@ if [ -d "$CLAUDE_DIR" ]; then
 fi
 if [ -d "$GEMINI_DIR" ]; then
   register_mcp "$GEMINI_DIR/settings.json" "Gemini"
+fi
+if [ -d "$OPENCODE_DIR" ]; then
+  # OpenCode uses opencode.json with type field
+  node -e "
+    const fs = require('fs');
+    const p = '$OPENCODE_DIR/opencode.json';
+    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
+    s.mcpServers = s.mcpServers || {};
+    s.mcpServers['jhw-notion'] = {
+      type: 'stdio',
+      command: 'node',
+      args: ['$MCP_ENTRY'],
+      env: []
+    };
+    fs.writeFileSync(p, JSON.stringify(s, null, 2));
+  "
+  ok "OpenCode: opencode.json에 jhw-notion 서버 추가"
 fi
 
 # .env 확인
