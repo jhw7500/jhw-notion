@@ -39,3 +39,4 @@ description: Notion AI Workspace에 확정된 정보를 즉시 저장
 - 중간 결과나 미확정 정보는 저장하지 않는다.
 - 저장 전 반드시 사용자 승인을 받는다.
 - 상태 필드는 기본값 "확정"으로 설정한다.
+- `jhw_record` MCP 도구가 불가능하여 `notion-create-pages`를 직접 호출할 때, date 프로퍼티는 반드시 expanded 키를 사용한다: `"date:date:start":"YYYY-MM-DD"` (단순 `"date"` 키는 에러 발생).
