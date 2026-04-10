@@ -39,6 +39,34 @@ register_mcp() {
   ok "$tui_name: settings.json에 jhw-notion 서버 추가"
 }
 
+register_opencode_mcp() {
+  local settings_file="$1"
+
+  node -e "
+    const fs = require('fs');
+    const p = '$settings_file';
+    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
+
+    s['$schema'] = s['$schema'] || 'https://opencode.ai/config.json';
+    s.mcp = s.mcp || {};
+    s.mcp['jhw-notion'] = {
+      type: 'local',
+      command: ['node', '$MCP_ENTRY'],
+      enabled: true
+    };
+
+    if (s.mcpServers && s.mcpServers['jhw-notion']) {
+      delete s.mcpServers['jhw-notion'];
+      if (Object.keys(s.mcpServers).length === 0) {
+        delete s.mcpServers;
+      }
+    }
+
+    fs.writeFileSync(p, JSON.stringify(s, null, 2));
+  "
+  ok "OpenCode: opencode.json에 jhw-notion 서버 추가"
+}
+
 unregister_mcp() {
   local settings_file="$1"
   local tui_name="$2"
@@ -57,6 +85,40 @@ unregister_mcp() {
   ok "$tui_name: jhw-notion 서버 제거"
 }
 
+unregister_opencode_mcp() {
+  local settings_file="$1"
+
+  if [ ! -f "$settings_file" ]; then return; fi
+
+  node -e "
+    const fs = require('fs');
+    const p = '$settings_file';
+    const s = JSON.parse(fs.readFileSync(p, 'utf8'));
+    let changed = false;
+
+    if (s.mcp && s.mcp['jhw-notion']) {
+      delete s.mcp['jhw-notion'];
+      if (Object.keys(s.mcp).length === 0) {
+        delete s.mcp;
+      }
+      changed = true;
+    }
+
+    if (s.mcpServers && s.mcpServers['jhw-notion']) {
+      delete s.mcpServers['jhw-notion'];
+      if (Object.keys(s.mcpServers).length === 0) {
+        delete s.mcpServers;
+      }
+      changed = true;
+    }
+
+    if (changed) {
+      fs.writeFileSync(p, JSON.stringify(s, null, 2));
+    }
+  "
+  ok "OpenCode: jhw-notion 서버 제거"
+}
+
 # --- Uninstall ---
 if [ "${1:-}" = "--uninstall" ]; then
   echo "jhw-notion 제거를 시작합니다..."
@@ -73,7 +135,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   echo "[2/2] MCP 서버 등록 해제"
   unregister_mcp "$HOME/.claude/settings.json" "Claude"
   unregister_mcp "$HOME/.gemini/settings.json" "Gemini"
-  unregister_mcp "$HOME/.config/opencode/opencode.json" "OpenCode"
+  unregister_opencode_mcp "$HOME/.config/opencode/opencode.json"
 
   echo ""
   echo "제거 완료!"
@@ -152,21 +214,7 @@ if [ -d "$GEMINI_DIR" ]; then
   register_mcp "$GEMINI_DIR/settings.json" "Gemini"
 fi
 if [ -d "$OPENCODE_DIR" ]; then
-  # OpenCode uses opencode.json with type field
-  node -e "
-    const fs = require('fs');
-    const p = '$OPENCODE_DIR/opencode.json';
-    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
-    s.mcpServers = s.mcpServers || {};
-    s.mcpServers['jhw-notion'] = {
-      type: 'stdio',
-      command: 'node',
-      args: ['$MCP_ENTRY'],
-      env: []
-    };
-    fs.writeFileSync(p, JSON.stringify(s, null, 2));
-  "
-  ok "OpenCode: opencode.json에 jhw-notion 서버 추가"
+  register_opencode_mcp "$OPENCODE_DIR/opencode.json"
 fi
 
 # .env 확인

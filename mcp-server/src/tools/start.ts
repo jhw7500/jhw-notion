@@ -21,13 +21,13 @@ export function registerStart(server: McpServer) {
 
       // 1. Projects DB에 레코드 생성
       const projectProps: Record<string, any> = {
-        "프로젝트명": { title: [{ text: { content: name } }] },
-        "상태": { select: { name: "진행중" } },
-        "설명": { rich_text: [{ text: { content: description } }] },
-        "시작일": { date: { start: today } },
+        "title": { title: [{ text: { content: name } }] },
+        "status": { select: { name: "진행중" } },
+        "description": { rich_text: [{ text: { content: description } }] },
+        "start_date": { date: { start: today } },
       };
-      if (repo) projectProps["레포 경로"] = { rich_text: [{ text: { content: repo } }] };
-      if (stack) projectProps["기술 스택"] = { rich_text: [{ text: { content: stack } }] };
+      if (repo) projectProps["repo"] = { rich_text: [{ text: { content: repo } }] };
+      if (stack) projectProps["tech_stack"] = { multi_select: stack.split(",").map((s: string) => ({ name: s.trim() })) };
 
       const projectPage = await notion.pages.create({
         parent: { database_id: NOTION_CONFIG.databases.projects },
@@ -48,12 +48,12 @@ export function registerStart(server: McpServer) {
       const decisionPage = await notion.pages.create({
         parent: { database_id: NOTION_CONFIG.databases.decisionLog },
         properties: {
-          "결정": { title: [{ text: { content: `${name} 프로젝트 시작` } }] },
-          "상태": { select: { name: "확정" } },
-          "영역": { select: { name: "기타" } },
-          "날짜": { date: { start: today } },
-          "근거": { rich_text: [{ text: { content: description } }] },
-          "관련 프로젝트": { rich_text: [{ text: { content: name } }] },
+          "title": { title: [{ text: { content: `${name} 프로젝트 시작` } }] },
+          "status": { select: { name: "확정" } },
+          "area": { select: { name: "기타" } },
+          "date": { date: { start: today } },
+          "rationale": { rich_text: [{ text: { content: description } }] },
+          "project": { rich_text: [{ text: { content: name } }] },
         },
       });
 

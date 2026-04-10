@@ -8,6 +8,8 @@
 
 **Tech Stack:** TypeScript, @modelcontextprotocol/sdk, @notionhq/client, Node.js
 
+> **Status note (2026-04-09):** 이 문서는 초기 구현 계획 스냅샷이다. 현재 live 기준 문서는 `README.md`, `DESIGN.md`, 그리고 `mcp-server/src/*` 실제 코드다. Notion DB 프로퍼티 key는 과거 한글 스키마가 아니라 영문 스키마(`title`, `status`, `rationale`, `project`, `date`, `repo`, `tech_stack`, `start_date` 등)를 사용한다.
+
 ---
 
 ## File Structure
@@ -120,9 +122,9 @@ NOTION_API_KEY=ntn_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```typescript
 export const NOTION_CONFIG = {
   databases: {
-    projects: "d45ed33c-26ee-45be-ad9c-513db7c422e0",
-    preferences: "634f7b00-b7a2-447b-9514-a109b57557a8",
-    decisionLog: "c1d8d3c3-538e-40a9-a306-2b694a4d8ff9",
+    projects: "4430fcd4-bfba-4a46-9a1b-4520db86e883",
+    preferences: "4e5ba7f0-b9cc-4171-84a7-f4e430abaf57",
+    decisionLog: "6c9fbc24-c5fb-4ca9-aa61-781cacc7ecfd",
   },
   pages: {
     references: "3398a230-a04e-81cc-b3a3-d408355fee9f",

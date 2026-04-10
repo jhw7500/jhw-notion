@@ -87,9 +87,9 @@ jhw-notion/
 ```typescript
 export const NOTION_CONFIG = {
   databases: {
-    projects: "d45ed33c-26ee-45be-ad9c-513db7c422e0",
-    preferences: "634f7b00-b7a2-447b-9514-a109b57557a8",
-    decisionLog: "c1d8d3c3-538e-40a9-a306-2b694a4d8ff9",
+    projects: "4430fcd4-bfba-4a46-9a1b-4520db86e883",
+    preferences: "4e5ba7f0-b9cc-4171-84a7-f4e430abaf57",
+    decisionLog: "6c9fbc24-c5fb-4ca9-aa61-781cacc7ecfd",
   },
   pages: {
     references: "3398a230-a04e-81cc-b3a3-d408355fee9f",
@@ -206,38 +206,45 @@ export const NOTION_CONFIG = {
 
 ### 4.5 Notion 프로퍼티 매핑
 
-프로퍼티명은 **한글**이다 (영문 사용 시 실패).
+현재 live Notion DB의 프로퍼티 key는 **영문**이다. 과거 한글 스키마 문서는 stale이며, 실제 기준은 `mcp-server/src/config.ts`와 각 tool 구현이다.
 
 #### Decision Log DB
 
 | 프로퍼티 | 타입 | 비고 |
 |---------|------|------|
-| 결정 | title | 제목 |
-| 상태 | select | 확정, 검토중, 폐기 |
-| 근거 | rich_text | |
-| 대안 | rich_text | |
-| 영역 | select | |
-| 관련 프로젝트 | rich_text | |
-| 날짜 | date | |
+| title | title | 제목 |
+| status | select | 확정, 검토중, 폐기 |
+| rationale | rich_text | |
+| alternatives | rich_text | |
+| area | select | |
+| project | rich_text | |
+| date | date | |
+| result | rich_text | 선택 사항 |
 
 #### Projects DB
 
 | 프로퍼티 | 타입 | 비고 |
 |---------|------|------|
-| 프로젝트명 | title | 제목 |
-| 상태 | select | 계획중, 진행중, 완료 |
-| 레포 경로 | rich_text | |
-| 기술 스택 | rich_text | |
-| 설명 | rich_text | |
-| 시작일 | date | |
-| 완료일 | date | |
+| title | title | 제목 |
+| status | select | 계획중, 진행중, 완료 |
+| repo | rich_text | |
+| tech_stack | multi_select | 기술 스택 배열 |
+| description | rich_text | |
+| start_date | date | |
+| end_date | date | |
+| created_at | created_time | Notion 자동 생성 |
 
 #### Preferences DB
 
 | 프로퍼티 | 타입 | 비고 |
 |---------|------|------|
-| 규칙 | title | 제목 |
-| 범주 | select | |
+| title | title | 제목 |
+| category | select | |
+| content | rich_text | 본문 |
+| tools | multi_select | 선호 도구 |
+| priority | select | 우선순위 |
+| created_at | created_time | Notion 자동 생성 |
+| updated_at | last_edited_time | Notion 자동 갱신 |
 
 ## 5. TUI 스킬 설계
 
@@ -319,7 +326,7 @@ npm install && npm run build
 echo "[2/4] TUI 감지"
 CLAUDE_DIR="$HOME/.claude"
 GEMINI_DIR="$HOME/.gemini"
-CODEX_TOML="$HOME/.codex/config.toml"
+OPENCODE_DIR="$HOME/.config/opencode"
 
 # [3/4] 스킬 심링크
 echo "[3/4] 스킬 심링크"
@@ -330,6 +337,11 @@ fi
 if [ -d "$GEMINI_DIR" ]; then
   ln -sfn "$SCRIPT_DIR/skills/gemini" "$GEMINI_DIR/commands/jhw"
   echo "  Gemini: $GEMINI_DIR/commands/jhw → $SCRIPT_DIR/skills/gemini ✅"
+fi
+if [ -d "$OPENCODE_DIR" ]; then
+  mkdir -p "$OPENCODE_DIR/skills"
+  ln -sfn "$SCRIPT_DIR/skills/claude" "$OPENCODE_DIR/skills/jhw"
+  echo "  OpenCode: $OPENCODE_DIR/skills/jhw → $SCRIPT_DIR/skills/claude ✅"
 fi
 
 # [4/4] MCP 서버 등록
@@ -369,11 +381,29 @@ if [ -d "$GEMINI_DIR" ]; then
   echo "  Gemini: settings.json에 jhw-notion 서버 추가 ✅"
 fi
 
+# OpenCode opencode.json에 추가
+if [ -d "$OPENCODE_DIR" ]; then
+  node -e "
+    const fs = require('fs');
+    const p = '$OPENCODE_DIR/opencode.json';
+    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
+    s['$schema'] = s['$schema'] || 'https://opencode.ai/config.json';
+    s.mcp = s.mcp || {};
+    s.mcp['jhw-notion'] = {
+      type: 'local',
+      command: ['node', '$SCRIPT_DIR/mcp-server/dist/index.js'],
+      enabled: true,
+    };
+    fs.writeFileSync(p, JSON.stringify(s, null, 2));
+  "
+  echo "  OpenCode: opencode.json의 mcp에 jhw-notion 서버 추가 ✅"
+fi
+
 echo ""
 echo "설치 완료!"
 echo ""
 echo "⚠️  .env 설정 필요:"
-echo "  cp $SCRIPT_DIR/.env.example $SCRIPT_DIR/.env"
+echo "  cp $SCRIPT_DIR/mcp-server/.env.example $SCRIPT_DIR/mcp-server/.env"
 echo "  NOTION_API_KEY를 입력하세요"
 ```
 

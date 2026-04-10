@@ -21,7 +21,9 @@ install.sh가 자동으로:
 1. MCP 서버 빌드 (npm install + build)
 2. 설치된 TUI 감지
 3. 스킬 심링크 생성
-4. 각 TUI settings.json에 MCP 서버 등록
+4. 각 TUI 설정 파일에 MCP 서버 등록
+   - Claude/Gemini: `settings.json`의 `mcpServers`
+   - OpenCode: `opencode.json`의 `mcp`
 
 ### Notion API Key 설정
 
@@ -78,6 +80,14 @@ npm run build --prefix mcp-server
 ```
 
 스킬은 심링크이므로 자동 반영. MCP 서버는 TUI 재시작 시 반영.
+
+## 현재 Notion DB 스키마
+
+현재 live DB 프로퍼티는 한글 라벨이 아니라 **영문 key** 기준이다. 문서보다 실제 코드를 우선 보면 된다.
+
+- `decisionLog`: `title`, `status`, `rationale`, `alternatives`, `area`, `project`, `date`
+- `projects`: `title`, `status`, `repo`, `tech_stack`, `description`, `start_date`, `end_date`
+- `preferences`: `title`, `category`, `content`, `tools`, `priority`
 
 ## 구조
 

@@ -20,7 +20,7 @@ export function registerDelete(server: McpServer) {
           await notion.pages.update({
             page_id: pageId,
             properties: {
-              "상태": { select: { name: "폐기" } },
+              "status": { select: { name: "폐기" } },
             },
           });
           return {

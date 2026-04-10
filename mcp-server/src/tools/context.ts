@@ -19,7 +19,7 @@ export function registerContext(server: McpServer) {
       const projectsRes = await notion.databases.query({
         database_id: NOTION_CONFIG.databases.projects,
         filter: {
-          property: "프로젝트명",
+          property: "title",
           title: { contains: project },
         },
       });
@@ -33,12 +33,12 @@ export function registerContext(server: McpServer) {
       const projectPage = projectsRes.results[0] as any;
       const projectInfo = {
         id: projectPage.id,
-        title: projectPage.properties["프로젝트명"]?.title?.[0]?.plain_text || "",
-        status: projectPage.properties["상태"]?.select?.name || "",
-        stack: projectPage.properties["기술 스택"]?.rich_text?.[0]?.plain_text || "",
-        repo: projectPage.properties["레포 경로"]?.rich_text?.[0]?.plain_text || "",
-        description: projectPage.properties["설명"]?.rich_text?.[0]?.plain_text || "",
-        startDate: projectPage.properties["시작일"]?.date?.start || "",
+        title: projectPage.properties["title"]?.title?.[0]?.plain_text || "",
+        status: projectPage.properties["status"]?.select?.name || "",
+        stack: projectPage.properties["tech_stack"]?.multi_select?.map((s: any) => s.name).join(", ") || "",
+        repo: projectPage.properties["repo"]?.rich_text?.[0]?.plain_text || "",
+        description: projectPage.properties["description"]?.rich_text?.[0]?.plain_text || "",
+        startDate: projectPage.properties["start_date"]?.date?.start || "",
         url: projectPage.url,
       };
 
@@ -46,19 +46,19 @@ export function registerContext(server: McpServer) {
       const decisionsRes = await notion.databases.query({
         database_id: NOTION_CONFIG.databases.decisionLog,
         filter: {
-          property: "관련 프로젝트",
+          property: "project",
           rich_text: { contains: project },
         },
-        sorts: [{ property: "날짜", direction: "descending" }],
+        sorts: [{ property: "date", direction: "descending" }],
         page_size: 10,
       });
 
       const decisions = decisionsRes.results.map((page: any) => ({
         id: page.id,
-        title: page.properties["결정"]?.title?.[0]?.plain_text || "",
-        status: page.properties["상태"]?.select?.name || "",
-        date: page.properties["날짜"]?.date?.start || "",
-        rationale: page.properties["근거"]?.rich_text?.[0]?.plain_text || "",
+        title: page.properties["title"]?.title?.[0]?.plain_text || "",
+        status: page.properties["status"]?.select?.name || "",
+        date: page.properties["date"]?.date?.start || "",
+        rationale: page.properties["rationale"]?.rich_text?.[0]?.plain_text || "",
       }));
 
       // 3. 프로젝트 페이지 본문 조회

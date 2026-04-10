@@ -36,9 +36,7 @@ export function registerSearch(server: McpServer) {
         }
 
         const title =
-          page.properties?.["결정"]?.title?.[0]?.plain_text ||
-          page.properties?.["프로젝트명"]?.title?.[0]?.plain_text ||
-          page.properties?.["규칙"]?.title?.[0]?.plain_text ||
+          page.properties?.["title"]?.title?.[0]?.plain_text ||
           page.properties?.["Name"]?.title?.[0]?.plain_text ||
           "(제목 없음)";
 

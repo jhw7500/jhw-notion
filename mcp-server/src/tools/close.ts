@@ -22,7 +22,7 @@ export function registerClose(server: McpServer) {
       const projectsRes = await notion.databases.query({
         database_id: NOTION_CONFIG.databases.projects,
         filter: {
-          property: "프로젝트명",
+          property: "title",
           title: { contains: project },
         },
       });
@@ -39,8 +39,8 @@ export function registerClose(server: McpServer) {
       await notion.pages.update({
         page_id: projectPage.id,
         properties: {
-          "상태": { select: { name: "완료" } },
-          "완료일": { date: { start: today } },
+          "status": { select: { name: "완료" } },
+          "end_date": { date: { start: today } },
         },
       });
 

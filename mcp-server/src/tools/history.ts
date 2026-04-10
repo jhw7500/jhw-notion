@@ -19,7 +19,7 @@ export function registerHistory(server: McpServer) {
       const projectsRes = await notion.databases.query({
         database_id: NOTION_CONFIG.databases.projects,
         filter: {
-          property: "프로젝트명",
+          property: "title",
           title: { contains: project },
         },
       });
@@ -31,16 +31,16 @@ export function registerHistory(server: McpServer) {
       }
 
       const projectPage = projectsRes.results[0] as any;
-      const startDate = projectPage.properties["시작일"]?.date?.start || "";
+      const startDate = projectPage.properties["start_date"]?.date?.start || "";
 
       // 2. Decision Log에서 관련 결정 (날짜 오름차순)
       const decisionsRes = await notion.databases.query({
         database_id: NOTION_CONFIG.databases.decisionLog,
         filter: {
-          property: "관련 프로젝트",
+          property: "project",
           rich_text: { contains: project },
         },
-        sorts: [{ property: "날짜", direction: "ascending" }],
+        sorts: [{ property: "date", direction: "ascending" }],
         page_size: 20,
       });
 
@@ -52,10 +52,10 @@ export function registerHistory(server: McpServer) {
 
       for (const page of decisionsRes.results as any[]) {
         timeline.push({
-          date: page.properties["날짜"]?.date?.start || "",
+          date: page.properties["date"]?.date?.start || "",
           type: "decision",
-          title: page.properties["결정"]?.title?.[0]?.plain_text || "",
-          status: page.properties["상태"]?.select?.name || "",
+          title: page.properties["title"]?.title?.[0]?.plain_text || "",
+          status: page.properties["status"]?.select?.name || "",
         });
       }
 
@@ -67,7 +67,7 @@ export function registerHistory(server: McpServer) {
             type: "text" as const,
             text: JSON.stringify(
               {
-                project: projectPage.properties["프로젝트명"]?.title?.[0]?.plain_text || "",
+                project: projectPage.properties["title"]?.title?.[0]?.plain_text || "",
                 totalEvents: timeline.length,
                 timeline,
               },

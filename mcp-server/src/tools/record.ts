@@ -26,26 +26,26 @@ function buildNotionProperties(db: string, title: string, props: any) {
   const p: Record<string, any> = {};
 
   if (db === "decisionLog") {
-    p["결정"] = { title: [{ text: { content: title } }] };
-    if (props?.status) p["상태"] = { select: { name: props.status } };
-    else p["상태"] = { select: { name: "확정" } };
-    if (props?.rationale) p["근거"] = { rich_text: [{ text: { content: props.rationale } }] };
-    if (props?.alternatives) p["대안"] = { rich_text: [{ text: { content: props.alternatives } }] };
-    if (props?.area) p["영역"] = { select: { name: props.area } };
+    p["title"] = { title: [{ text: { content: title } }] };
+    if (props?.status) p["status"] = { select: { name: props.status } };
+    else p["status"] = { select: { name: "확정" } };
+    if (props?.rationale) p["rationale"] = { rich_text: [{ text: { content: props.rationale } }] };
+    if (props?.alternatives) p["alternatives"] = { rich_text: [{ text: { content: props.alternatives } }] };
+    if (props?.area) p["area"] = { select: { name: props.area } };
     if (props?.project)
-      p["관련 프로젝트"] = { rich_text: [{ text: { content: props.project } }] };
-    p["날짜"] = { date: { start: new Date().toISOString().split("T")[0] } };
+      p["project"] = { rich_text: [{ text: { content: props.project } }] };
+    p["date"] = { date: { start: new Date().toISOString().split("T")[0] } };
   } else if (db === "preferences") {
-    p["규칙"] = { title: [{ text: { content: title } }] };
-    if (props?.category) p["범주"] = { select: { name: props.category } };
+    p["title"] = { title: [{ text: { content: title } }] };
+    if (props?.category) p["category"] = { select: { name: props.category } };
   } else if (db === "projects") {
-    p["프로젝트명"] = { title: [{ text: { content: title } }] };
-    if (props?.status) p["상태"] = { select: { name: props.status } };
-    else p["상태"] = { select: { name: "진행중" } };
-    if (props?.repo) p["레포 경로"] = { rich_text: [{ text: { content: props.repo } }] };
-    if (props?.stack) p["기술 스택"] = { rich_text: [{ text: { content: props.stack } }] };
-    if (props?.description) p["설명"] = { rich_text: [{ text: { content: props.description } }] };
-    p["시작일"] = { date: { start: new Date().toISOString().split("T")[0] } };
+    p["title"] = { title: [{ text: { content: title } }] };
+    if (props?.status) p["status"] = { select: { name: props.status } };
+    else p["status"] = { select: { name: "진행중" } };
+    if (props?.repo) p["repo"] = { rich_text: [{ text: { content: props.repo } }] };
+    if (props?.stack) p["tech_stack"] = { multi_select: props.stack.split(",").map((s: string) => ({ name: s.trim() })) };
+    if (props?.description) p["description"] = { rich_text: [{ text: { content: props.description } }] };
+    p["start_date"] = { date: { start: new Date().toISOString().split("T")[0] } };
   }
 
   return p;

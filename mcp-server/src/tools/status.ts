@@ -33,12 +33,10 @@ export function registerStatus(server: McpServer) {
 
         const items = response.results.map((page: any) => {
           const title =
-            page.properties?.["결정"]?.title?.[0]?.plain_text ||
-            page.properties?.["프로젝트명"]?.title?.[0]?.plain_text ||
-            page.properties?.["규칙"]?.title?.[0]?.plain_text ||
+            page.properties?.["title"]?.title?.[0]?.plain_text ||
             "(제목 없음)";
 
-          const status = page.properties?.["상태"]?.select?.name || null;
+          const status = page.properties?.["status"]?.select?.name || null;
 
           return { id: page.id, title, status, lastEdited: page.last_edited_time };
         });
