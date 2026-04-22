@@ -71,4 +71,64 @@ describe("jhw_record", () => {
     const result = await handler({ db: "unknown", title: "테스트" });
     expect(result.content[0].text).toContain("알 수 없는 DB");
   });
+
+  it("decisionLog의 project 키워드를 projects DB에서 검색해 relation으로 변환한다", async () => {
+    mockClient.databases.query.mockResolvedValue({
+      results: [{ id: "proj-page-id-1" }],
+    });
+    mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
+
+    await handler({
+      db: "decisionLog",
+      title: "테스트 결정",
+      properties: { project: "redmine" },
+    });
+
+    expect(mockClient.databases.query).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filter: expect.objectContaining({
+          property: "title",
+          title: { contains: "redmine" },
+        }),
+      })
+    );
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.properties["project"]).toEqual({
+      relation: [{ id: "proj-page-id-1" }],
+    });
+  });
+
+  it("decisionLog의 project가 URL이면 해당 페이지 ID를 relation으로 설정한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
+
+    await handler({
+      db: "decisionLog",
+      title: "테스트 결정",
+      properties: {
+        project:
+          "https://www.notion.so/redmine-33a8a230a04e81548fa5d96ebdd63500",
+      },
+    });
+
+    // URL에서 ID 추출 — 데이터베이스 검색 없이 바로 relation으로 변환
+    expect(mockClient.databases.query).not.toHaveBeenCalled();
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.properties["project"].relation[0].id).toBe(
+      "33a8a230-a04e-8154-8fa5-d96ebdd63500"
+    );
+  });
+
+  it("decisionLog의 project가 매칭되지 않으면 project 필드를 생략한다", async () => {
+    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
+
+    await handler({
+      db: "decisionLog",
+      title: "테스트 결정",
+      properties: { project: "존재하지 않는 프로젝트" },
+    });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.properties["project"]).toBeUndefined();
+  });
 });
