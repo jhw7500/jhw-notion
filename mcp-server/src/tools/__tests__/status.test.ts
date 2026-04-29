@@ -41,7 +41,9 @@ describe("jhw_status", () => {
     expect(parsed).toHaveProperty("projects");
     expect(parsed).toHaveProperty("preferences");
     expect(parsed).toHaveProperty("decisionLog");
-    expect(mockClient.databases.query).toHaveBeenCalledTimes(3);
+    expect(parsed).toHaveProperty("knowledgeBase");
+    expect(parsed).toHaveProperty("references");
+    expect(mockClient.databases.query).toHaveBeenCalledTimes(5);
   });
 
   it("특정 DB만 조회할 수 있다", async () => {

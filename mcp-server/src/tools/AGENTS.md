@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-04-09 | Updated: 2026-04-09 -->
+<!-- Generated: 2026-04-09 | Updated: 2026-04-29 -->
 
 # tools
 
@@ -14,8 +14,8 @@
 | `status.ts` | `jhw_status` — 워크스페이스 현황 (프로젝트/결정/선호도 요약) |
 | `context.ts` | `jhw_context` — 특정 프로젝트의 관련 정보 일괄 로드 |
 | `history.ts` | `jhw_history` — 특정 프로젝트의 시간순 활동 타임라인 |
-| `record.ts` | `jhw_record` — DB에 새 레코드 생성 (decisionLog/projects/preferences) |
-| `note.ts` | `jhw_note` — Knowledge Base 페이지에 블록 추가 |
+| `record.ts` | `jhw_record` — DB에 새 레코드 생성 (5개 DB: decisionLog/projects/preferences/knowledgeBase/references). `report` select(redmine 보고 분류) + `project` relation 자동 매칭 지원. |
+| `note.ts` | `jhw_note` — Knowledge Base **DB**에 메모 항목 생성 (이전: wrapper page에 children. 현재: DB row + properties). `category`/`tags`/`report`/`project` 지원. |
 | `delete.ts` | `jhw_delete` — 레코드 삭제 또는 archived 처리 |
 | `start.ts` | `jhw_start` — 프로젝트 시작 (projects DB + Decision Log 초기 항목 원스톱 생성) |
 | `close.ts` | `jhw_close` — 프로젝트 종료 + 회고 (상태 변경 + Knowledge Base에 회고 기록) |
@@ -26,7 +26,8 @@
 - 1 파일 = 1 도구. 파일명과 도구명이 대응 (`record.ts` → `jhw_record`).
 - 파라미터 유효성 검사에 `zod` 스키마 사용.
 - Notion API 호출은 `../notion-client.ts`의 `getNotionClient()` 사용.
-- DB/페이지 ID는 `../config.ts`의 `NOTION_CONFIG` 참조.
+- DB ID는 `../config.ts`의 `NOTION_CONFIG.databases` 참조 (5개 DB). `pages.*`는 더 이상 없음 — KB/References도 DB로 이동.
+- redmine 보고 분류용 `report` select 옵션 10종은 `REPORT_VALUES` (5개 DB 공통).
 
 ### Testing Requirements
 - 도구 추가 시: 파일 생성 → `../server.ts`에 import + register 호출 추가 → `npm run build`.

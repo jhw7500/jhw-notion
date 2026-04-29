@@ -40,3 +40,14 @@ AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬 10개. 각 스킬은 사�
 - `mcp-server/src/tools/` — 각 스킬이 대응하는 MCP 도구 호출
 
 <!-- MANUAL: -->
+
+## Custom Skills (Manual — 자동 재생성 대상 아님)
+
+위 자동 생성 목록 외에 수동으로 추가된 스킬. `jhw-notion` MCP 서버가 `AGENTS.md`를 재생성해도 이 섹션은 보존된다.
+
+| File | Description |
+|------|-------------|
+| `import.md` | Notion 검색 결과를 현재 프로젝트 `~/.claude/projects/<slug>/memory/` 폴더로 불러와 로컬 참조 파일로 저장. 다중 키워드 병렬 검색 + 승인 + 연속 실행 지원. |
+
+### Patterns
+- 불러오기 (`import`): Notion 검색 → 후보 제시 → 승인 → fetch → 로컬 memory 파일 저장 + `MEMORY.md` 인덱스 갱신.

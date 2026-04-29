@@ -2,26 +2,52 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@notionhq/client";
 import { getNotionClient } from "../notion-client.js";
-import { NOTION_CONFIG, DatabaseName } from "../config.js";
+import { NOTION_CONFIG, DatabaseName, REPORT_VALUES } from "../config.js";
 
 const RecordInput = z.object({
-  db: z.enum(["decisionLog", "preferences", "projects", "references"]).describe("저장 대상 DB"),
+  db: z
+    .enum(["decisionLog", "preferences", "projects", "references", "knowledgeBase"])
+    .describe("저장 대상 DB"),
   title: z.string().describe("레코드 제목"),
   properties: z
     .object({
-      status: z.string().optional().describe("상태 (확정/검토중/폐기)"),
+      status: z.string().optional().describe("상태 (확정/검토중/폐기 등)"),
+      report: z
+        .enum(REPORT_VALUES)
+        .optional()
+        .describe(
+          "redmine 보고 분류 (5개 DB 공통). 미설정 시 keyword fallback. 'none'=보고 제외."
+        ),
       rationale: z.string().optional().describe("근거 (decisionLog)"),
       alternatives: z.string().optional().describe("대안 (decisionLog)"),
-      area: z.string().optional().describe("영역 (decisionLog)"),
+      area: z.string().optional().describe("영역 (decisionLog의 select)"),
       project: z
         .string()
         .optional()
         .describe(
-          "관련 프로젝트 — projects DB의 페이지 title 키워드. 자동으로 검색해 relation으로 연결. 페이지 URL/ID 직접 전달 가능."
+          "관련 프로젝트 — projects DB의 페이지 title 키워드. 자동으로 검색해 relation으로 연결. URL/ID 직접 가능. (decisionLog/knowledgeBase/references 공통)"
         ),
-      category: z.string().optional().describe("범주 (preferences)"),
+      category: z
+        .string()
+        .optional()
+        .describe(
+          "범주 (preferences/knowledgeBase/references — 각 DB의 select 옵션명)"
+        ),
+      summary: z.string().optional().describe("한줄 요약 (knowledgeBase, references)"),
+      tags: z
+        .string()
+        .optional()
+        .describe("태그 (knowledgeBase multi_select, comma-separated)"),
+      tool: z
+        .string()
+        .optional()
+        .describe("도구 (references multi_select, comma-separated)"),
+      url: z.string().optional().describe("참조 URL (references)"),
       repo: z.string().optional().describe("레포 경로 (projects)"),
-      stack: z.string().optional().describe("기술 스택 (projects)"),
+      stack: z
+        .string()
+        .optional()
+        .describe("기술 스택 (projects multi_select, comma-separated)"),
       description: z.string().optional().describe("설명 (projects)"),
     })
     .optional()
@@ -30,22 +56,22 @@ const RecordInput = z.object({
 
 // projects DB에서 keyword로 페이지 검색하여 ID 반환.
 // 입력이 이미 URL/ID면 바로 파싱하여 반환.
-async function resolveProjectRelationId(
+export async function resolveProjectRelationId(
   notion: Client,
   input: string
 ): Promise<string | null> {
   const trimmed = input.trim();
   if (!trimmed) return null;
 
-  // URL에서 ID 추출 시도 (e.g., https://www.notion.so/title-abcdef...)
-  const urlMatch = trimmed.match(/([0-9a-f]{32})|([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  const urlMatch = trimmed.match(
+    /([0-9a-f]{32})|([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
+  );
   if (urlMatch) {
     return urlMatch[0].includes("-")
       ? urlMatch[0]
       : `${urlMatch[0].slice(0, 8)}-${urlMatch[0].slice(8, 12)}-${urlMatch[0].slice(12, 16)}-${urlMatch[0].slice(16, 20)}-${urlMatch[0].slice(20)}`;
   }
 
-  // keyword로 projects DB 쿼리
   try {
     const result = await notion.databases.query({
       database_id: NOTION_CONFIG.databases.projects,
@@ -58,46 +84,78 @@ async function resolveProjectRelationId(
     if (result.results.length > 0) {
       return result.results[0].id;
     }
-  } catch (err) {
+  } catch {
     // fall through
   }
   return null;
 }
 
 async function buildNotionProperties(
-  db: string,
+  db: DatabaseName,
   title: string,
   props: any,
   notion: Client
 ) {
   const p: Record<string, any> = {};
+  p["title"] = { title: [{ text: { content: title } }] };
+
+  // 5개 DB 공통: report select
+  if (props?.report) {
+    p["report"] = { select: { name: props.report } };
+  }
+
+  // 4개 DB 공통: project relation (preferences 제외)
+  if (props?.project && db !== "preferences") {
+    const relId = await resolveProjectRelationId(notion, props.project);
+    if (relId) {
+      p["project"] = { relation: [{ id: relId }] };
+    }
+  }
 
   if (db === "decisionLog") {
-    p["title"] = { title: [{ text: { content: title } }] };
-    if (props?.status) p["status"] = { select: { name: props.status } };
-    else p["status"] = { select: { name: "확정" } };
-    if (props?.rationale) p["rationale"] = { rich_text: [{ text: { content: props.rationale } }] };
-    if (props?.alternatives) p["alternatives"] = { rich_text: [{ text: { content: props.alternatives } }] };
+    p["status"] = { select: { name: props?.status ?? "확정" } };
+    if (props?.rationale)
+      p["rationale"] = { rich_text: [{ text: { content: props.rationale } }] };
+    if (props?.alternatives)
+      p["alternatives"] = { rich_text: [{ text: { content: props.alternatives } }] };
     if (props?.area) p["area"] = { select: { name: props.area } };
-    if (props?.project) {
-      const relId = await resolveProjectRelationId(notion, props.project);
-      if (relId) {
-        p["project"] = { relation: [{ id: relId }] };
-      }
-      // 매칭 실패 시 project 필드 생략 (rich_text fallback은 DB가 relation이라 에러 유발)
-    }
     p["date"] = { date: { start: new Date().toISOString().split("T")[0] } };
   } else if (db === "preferences") {
-    p["title"] = { title: [{ text: { content: title } }] };
     if (props?.category) p["category"] = { select: { name: props.category } };
   } else if (db === "projects") {
-    p["title"] = { title: [{ text: { content: title } }] };
-    if (props?.status) p["status"] = { select: { name: props.status } };
-    else p["status"] = { select: { name: "진행중" } };
+    p["status"] = { select: { name: props?.status ?? "진행중" } };
     if (props?.repo) p["repo"] = { rich_text: [{ text: { content: props.repo } }] };
-    if (props?.stack) p["tech_stack"] = { multi_select: props.stack.split(",").map((s: string) => ({ name: s.trim() })) };
-    if (props?.description) p["description"] = { rich_text: [{ text: { content: props.description } }] };
+    if (props?.stack)
+      p["tech_stack"] = {
+        multi_select: props.stack
+          .split(",")
+          .map((s: string) => ({ name: s.trim() })),
+      };
+    if (props?.description)
+      p["description"] = { rich_text: [{ text: { content: props.description } }] };
     p["start_date"] = { date: { start: new Date().toISOString().split("T")[0] } };
+  } else if (db === "knowledgeBase") {
+    if (props?.summary)
+      p["summary"] = { rich_text: [{ text: { content: props.summary } }] };
+    if (props?.category) p["category"] = { select: { name: props.category } };
+    if (props?.tags)
+      p["tags"] = {
+        multi_select: props.tags
+          .split(",")
+          .map((s: string) => ({ name: s.trim() })),
+      };
+    p["date"] = { date: { start: new Date().toISOString().split("T")[0] } };
+  } else if (db === "references") {
+    if (props?.summary)
+      p["summary"] = { rich_text: [{ text: { content: props.summary } }] };
+    if (props?.category) p["category"] = { select: { name: props.category } };
+    if (props?.tool)
+      p["tool"] = {
+        multi_select: props.tool
+          .split(",")
+          .map((s: string) => ({ name: s.trim() })),
+      };
+    if (props?.url) p["url"] = { url: props.url };
   }
 
   return p;
@@ -118,7 +176,12 @@ export function registerRecord(server: McpServer) {
         };
       }
 
-      const notionProps = await buildNotionProperties(db, title, properties, notion);
+      const notionProps = await buildNotionProperties(
+        db as DatabaseName,
+        title,
+        properties,
+        notion
+      );
 
       const page = await notion.pages.create({
         parent: { database_id: dbId },

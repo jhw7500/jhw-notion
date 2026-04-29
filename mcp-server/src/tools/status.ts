@@ -5,7 +5,7 @@ import { NOTION_CONFIG, DatabaseName } from "../config.js";
 
 const StatusInput = z.object({
   db: z
-    .enum(["projects", "preferences", "decisionLog"])
+    .enum(["projects", "preferences", "decisionLog", "knowledgeBase", "references"])
     .optional()
     .describe("특정 DB만 조회 (생략 시 전체)"),
 });

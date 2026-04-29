@@ -20,28 +20,60 @@ describe("jhw_note", () => {
     handler = capturedTools.get("jhw_note")!.handler;
   });
 
-  it("Knowledge Base에 메모를 생성한다", async () => {
+  it("Knowledge Base DB에 메모를 생성한다 (parent.database_id 사용)", async () => {
     mockClient.pages.create.mockResolvedValue({
       id: "note-1",
       url: "https://notion.so/note-1",
     });
 
-    const result = await handler({ title: "ESM 팁", content: "import에 .js 확장자 필수" });
+    const result = await handler({
+      title: "ESM 팁",
+      content: "import에 .js 확장자 필수",
+    });
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.title).toBe("ESM 팁");
     const createCall = mockClient.pages.create.mock.calls[0][0];
-    expect(createCall.parent.page_id).toBeDefined();
-    expect(createCall.children.length).toBe(2); // content + date
+    expect(createCall.parent.database_id).toBeDefined();
+    expect(createCall.properties.title.title[0].text.content).toBe("ESM 팁");
+    expect(createCall.children.length).toBe(1); // content paragraph 1개
   });
 
-  it("프로젝트가 있으면 관련 프로젝트 블록을 추가한다", async () => {
+  it("프로젝트 키워드를 projects DB에서 검색해 relation으로 연결한다", async () => {
+    mockClient.databases.query.mockResolvedValue({
+      results: [{ id: "proj-page-id" }],
+    });
     mockClient.pages.create.mockResolvedValue({ id: "n", url: "u" });
 
     await handler({ title: "팁", content: "내용", project: "my-project" });
 
     const createCall = mockClient.pages.create.mock.calls[0][0];
-    expect(createCall.children.length).toBe(3); // content + project + date
-    expect(createCall.children[1].paragraph.rich_text[0].text.content).toContain("my-project");
+    expect(createCall.properties.project).toEqual({
+      relation: [{ id: "proj-page-id" }],
+    });
+  });
+
+  it("category/tags/summary/report를 properties로 설정한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "n", url: "u" });
+
+    await handler({
+      title: "메모",
+      content: "내용",
+      summary: "한줄 요약",
+      category: "문제해결",
+      tags: "iMX93, BSP",
+      report: "wlan-bsp",
+    });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.properties.summary.rich_text[0].text.content).toBe(
+      "한줄 요약"
+    );
+    expect(createCall.properties.category.select.name).toBe("문제해결");
+    expect(createCall.properties.tags.multi_select).toEqual([
+      { name: "iMX93" },
+      { name: "BSP" },
+    ]);
+    expect(createCall.properties.report.select.name).toBe("wlan-bsp");
   });
 });

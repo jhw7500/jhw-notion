@@ -74,26 +74,23 @@ export function registerClose(server: McpServer) {
         });
       }
 
-      // 4. 배운 점이 있으면 Knowledge Base에 등록
+      // 4. 배운 점이 있으면 Knowledge Base DB에 등록
       let knowledgePage = null;
       if (lessons) {
         knowledgePage = await notion.pages.create({
-          parent: { page_id: NOTION_CONFIG.pages.knowledgeBase },
+          parent: { database_id: NOTION_CONFIG.databases.knowledgeBase },
           properties: {
             title: { title: [{ text: { content: `${project} 회고 — 배운 점` } }] },
+            summary: { rich_text: [{ text: { content: `${project} 종료 회고` } }] },
+            category: { select: { name: "베스트프랙티스" } },
+            project: { relation: [{ id: projectPage.id }] },
+            date: { date: { start: today } },
           },
           children: [
             {
               object: "block",
               type: "paragraph",
               paragraph: { rich_text: [{ text: { content: lessons } }] },
-            },
-            {
-              object: "block",
-              type: "paragraph",
-              paragraph: {
-                rich_text: [{ type: "text", text: { content: `프로젝트: ${project} | 날짜: ${today}` }, annotations: { italic: true } }],
-              },
             },
           ],
         });
