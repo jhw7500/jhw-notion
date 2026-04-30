@@ -1,28 +1,10 @@
 ---
-description: Notion AI Workspace 레코드 삭제 또는 폐기 처리
+description: (deprecated) → /jhw:save --delete 사용
 ---
 
-# /jhw:delete — Notion 레코드 삭제/폐기
+# /jhw:delete — (deprecated)
 
-1. 삭제 대상을 파악한다:
-   - 사용자가 제목/내용으로 지정 → `jhw_search`로 검색하여 대상 확인
-   - 구체적이지 않으면 → `jhw_status`로 목록 제시
+`/jhw:save --delete <id>`로 통합. alias로 동일 동작.
 
-2. 대상 레코드를 보여주고 처리 방식을 확인한다:
-   ```
-   🗑️ 삭제 대상
-   ─────────────────────
-   제목: libpcap → raw socket 전환
-   처리 방식:
-   1) 폐기 (상태를 "폐기"로 변경, 이력 보존)
-   2) 완전 삭제 (복구 불가)
-   ```
-
-3. 사용자 선택에 따라 `jhw_delete` MCP 도구를 호출한다:
-   - 폐기 → mode: "archive"
-   - 완전 삭제 → mode: "delete"
-
-## 규칙
-
-- 기본값은 **폐기** (이력 보존). 완전 삭제는 명시적 요청 시에만.
-- 삭제 전 반드시 사용자 확인을 받는다.
+→ **`/jhw:save --delete <pageId>` 권장.** (`--hard`로 완전 삭제, 기본은 archive)
+세부 사양은 `save.md` 참조.
