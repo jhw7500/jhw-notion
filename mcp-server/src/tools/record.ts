@@ -5,6 +5,7 @@ import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG, DatabaseName, REPORT_VALUES } from "../config.js";
 import { resolveProjectId } from "../notion/resolve-project.js";
 import { callNotion } from "../notion/api.js";
+import { buildPropertiesFromSchema } from "../notion/property-builder.js";
 
 const RecordInput = z.object({
   db: z
@@ -59,75 +60,18 @@ const RecordInput = z.object({
 // 공통 resolver로 위임. 외부 호환을 위해 named export 유지.
 export const resolveProjectRelationId = resolveProjectId;
 
+// schema-driven property builder로 위임 (P1-2).
+// record.ts의 input은 일부 alias가 있어 schema 키로 변환:
+// - stack → tech_stack (projects)
 async function buildNotionProperties(
   db: DatabaseName,
   title: string,
   props: any,
   notion: Client
 ) {
-  const p: Record<string, any> = {};
-  p["title"] = { title: [{ text: { content: title } }] };
-
-  // 5개 DB 공통: report select
-  if (props?.report) {
-    p["report"] = { select: { name: props.report } };
-  }
-
-  // 4개 DB 공통: project relation (preferences 제외)
-  if (props?.project && db !== "preferences") {
-    const relId = await resolveProjectId(notion, props.project);
-    if (relId) {
-      p["project"] = { relation: [{ id: relId }] };
-    }
-  }
-
-  if (db === "decisionLog") {
-    p["status"] = { select: { name: props?.status ?? "확정" } };
-    if (props?.rationale)
-      p["rationale"] = { rich_text: [{ text: { content: props.rationale } }] };
-    if (props?.alternatives)
-      p["alternatives"] = { rich_text: [{ text: { content: props.alternatives } }] };
-    if (props?.area) p["area"] = { select: { name: props.area } };
-    p["date"] = { date: { start: new Date().toISOString().split("T")[0] } };
-  } else if (db === "preferences") {
-    if (props?.category) p["category"] = { select: { name: props.category } };
-  } else if (db === "projects") {
-    p["status"] = { select: { name: props?.status ?? "진행중" } };
-    if (props?.repo) p["repo"] = { rich_text: [{ text: { content: props.repo } }] };
-    if (props?.stack)
-      p["tech_stack"] = {
-        multi_select: props.stack
-          .split(",")
-          .map((s: string) => ({ name: s.trim() })),
-      };
-    if (props?.description)
-      p["description"] = { rich_text: [{ text: { content: props.description } }] };
-    p["start_date"] = { date: { start: new Date().toISOString().split("T")[0] } };
-  } else if (db === "knowledgeBase") {
-    if (props?.summary)
-      p["summary"] = { rich_text: [{ text: { content: props.summary } }] };
-    if (props?.category) p["category"] = { select: { name: props.category } };
-    if (props?.tags)
-      p["tags"] = {
-        multi_select: props.tags
-          .split(",")
-          .map((s: string) => ({ name: s.trim() })),
-      };
-    p["date"] = { date: { start: new Date().toISOString().split("T")[0] } };
-  } else if (db === "references") {
-    if (props?.summary)
-      p["summary"] = { rich_text: [{ text: { content: props.summary } }] };
-    if (props?.category) p["category"] = { select: { name: props.category } };
-    if (props?.tool)
-      p["tool"] = {
-        multi_select: props.tool
-          .split(",")
-          .map((s: string) => ({ name: s.trim() })),
-      };
-    if (props?.url) p["url"] = { url: props.url };
-  }
-
-  return p;
+  const mapped: Record<string, any> = { ...(props ?? {}) };
+  if (props?.stack !== undefined) mapped.tech_stack = props.stack;
+  return buildPropertiesFromSchema(db, title, mapped, notion);
 }
 
 export function registerRecord(server: McpServer) {
