@@ -65,7 +65,9 @@ describe("jhw_start", () => {
 
     const decisionCreate = mockClient.pages.create.mock.calls[1][0];
     expect(decisionCreate.properties["title"].title[0].text.content).toContain("my-proj");
-    expect(decisionCreate.properties["project"].rich_text[0].text.content).toBe("my-proj");
+    // project는 relation으로 저장 — 직전 생성된 projects 페이지 ID 참조
+    expect(decisionCreate.properties["project"].relation).toEqual([{ id: "p" }]);
+    expect(decisionCreate.properties["project"].rich_text).toBeUndefined();
     expect(decisionCreate.properties["rationale"].rich_text[0].text.content).toBe("설명 텍스트");
   });
 });

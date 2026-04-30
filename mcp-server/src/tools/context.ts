@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
+import { callNotion } from "../notion/api.js";
 
 const ContextInput = z.object({
   project: z.string().describe("프로젝트명 (검색 키워드)"),
@@ -16,13 +17,17 @@ export function registerContext(server: McpServer) {
       const notion = getNotionClient();
 
       // 1. Projects DB에서 프로젝트 검색
-      const projectsRes = await notion.databases.query({
-        database_id: NOTION_CONFIG.databases.projects,
-        filter: {
-          property: "title",
-          title: { contains: project },
-        },
-      });
+      const projectsRes = await callNotion(
+        () =>
+          notion.databases.query({
+            database_id: NOTION_CONFIG.databases.projects,
+            filter: {
+              property: "title",
+              title: { contains: project },
+            },
+          }),
+        { operation: "context.projects.query" }
+      );
 
       if (projectsRes.results.length === 0) {
         return {
@@ -42,16 +47,40 @@ export function registerContext(server: McpServer) {
         url: projectPage.url,
       };
 
-      // 2. Decision Log에서 관련 결정 검색
-      const decisionsRes = await notion.databases.query({
-        database_id: NOTION_CONFIG.databases.decisionLog,
-        filter: {
-          property: "project",
-          rich_text: { contains: project },
-        },
-        sorts: [{ property: "date", direction: "descending" }],
-        page_size: 10,
-      });
+      // 2. Decision Log에서 관련 결정 검색 — relation filter 우선, legacy rich_text fallback
+      let decisionsRes = await callNotion(
+        () =>
+          notion.databases.query({
+            database_id: NOTION_CONFIG.databases.decisionLog,
+            filter: {
+              property: "project",
+              relation: { contains: projectPage.id },
+            },
+            sorts: [{ property: "date", direction: "descending" }],
+            page_size: 10,
+          }),
+        { operation: "context.decisions.query.relation" }
+      );
+      if (decisionsRes.results.length === 0) {
+        // legacy: project 필드가 rich_text로 저장된 과거 결정 fallback
+        try {
+          decisionsRes = await callNotion(
+            () =>
+              notion.databases.query({
+                database_id: NOTION_CONFIG.databases.decisionLog,
+                filter: {
+                  property: "project",
+                  rich_text: { contains: project },
+                },
+                sorts: [{ property: "date", direction: "descending" }],
+                page_size: 10,
+              }),
+            { operation: "context.decisions.query.legacy", attempts: 1 }
+          );
+        } catch {
+          // schema가 이미 relation-only면 rich_text filter는 에러. 무시하고 빈 결과 유지.
+        }
+      }
 
       const decisions = decisionsRes.results.map((page: any) => ({
         id: page.id,
@@ -62,10 +91,14 @@ export function registerContext(server: McpServer) {
       }));
 
       // 3. 프로젝트 페이지 본문 조회
-      const blocks = await notion.blocks.children.list({
-        block_id: projectPage.id,
-        page_size: 50,
-      });
+      const blocks = await callNotion(
+        () =>
+          notion.blocks.children.list({
+            block_id: projectPage.id,
+            page_size: 50,
+          }),
+        { operation: "context.blocks.list" }
+      );
 
       const pageContent = blocks.results
         .map((block: any) => {

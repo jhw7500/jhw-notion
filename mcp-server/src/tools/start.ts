@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
+import { callNotion } from "../notion/api.js";
 
 const StartInput = z.object({
   name: z.string().describe("프로젝트명"),
@@ -29,10 +30,12 @@ export function registerStart(server: McpServer) {
       if (repo) projectProps["repo"] = { rich_text: [{ text: { content: repo } }] };
       if (stack) projectProps["tech_stack"] = { multi_select: stack.split(",").map((s: string) => ({ name: s.trim() })) };
 
-      const projectPage = await notion.pages.create({
-        parent: { database_id: NOTION_CONFIG.databases.projects },
-        properties: projectProps,
-        children: [
+      const projectPage = await callNotion(
+        () =>
+          notion.pages.create({
+            parent: { database_id: NOTION_CONFIG.databases.projects },
+            properties: projectProps,
+            children: [
           { object: "block", type: "heading_2", heading_2: { rich_text: [{ text: { content: "목표" } }] } },
           { object: "block", type: "paragraph", paragraph: { rich_text: [{ text: { content: description } }] } },
           { object: "block", type: "heading_2", heading_2: { rich_text: [{ text: { content: "범위" } }] } },
@@ -41,21 +44,27 @@ export function registerStart(server: McpServer) {
           { object: "block", type: "paragraph", paragraph: { rich_text: [{ text: { content: "(작업하면서 작성)" } }] } },
           { object: "block", type: "heading_2", heading_2: { rich_text: [{ text: { content: "메모" } }] } },
           { object: "block", type: "paragraph", paragraph: { rich_text: [] } },
-        ],
-      });
+            ],
+          }),
+        { operation: "start.projects.create" }
+      );
 
-      // 2. Decision Log에 "프로젝트 시작" 기록
-      const decisionPage = await notion.pages.create({
-        parent: { database_id: NOTION_CONFIG.databases.decisionLog },
-        properties: {
-          "title": { title: [{ text: { content: `${name} 프로젝트 시작` } }] },
-          "status": { select: { name: "확정" } },
-          "area": { select: { name: "기타" } },
-          "date": { date: { start: today } },
-          "rationale": { rich_text: [{ text: { content: description } }] },
-          "project": { rich_text: [{ text: { content: name } }] },
-        },
-      });
+      // 2. Decision Log에 "프로젝트 시작" 기록 — project를 relation으로 (rich_text 아님)
+      const decisionPage = await callNotion(
+        () =>
+          notion.pages.create({
+            parent: { database_id: NOTION_CONFIG.databases.decisionLog },
+            properties: {
+              "title": { title: [{ text: { content: `${name} 프로젝트 시작` } }] },
+              "status": { select: { name: "확정" } },
+              "area": { select: { name: "기타" } },
+              "date": { date: { start: today } },
+              "rationale": { rich_text: [{ text: { content: description } }] },
+              "project": { relation: [{ id: projectPage.id }] },
+            },
+          }),
+        { operation: "start.decisionLog.create" }
+      );
 
       return {
         content: [

@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
+import { callNotion } from "../notion/api.js";
 
 const SearchInput = z.object({
   query: z.string().describe("검색 키워드"),
@@ -14,10 +15,14 @@ export function registerSearch(server: McpServer) {
     SearchInput.shape,
     async ({ query }) => {
       const notion = getNotionClient();
-      const response = await notion.search({
-        query,
-        page_size: 10,
-      });
+      const response = await callNotion(
+        () =>
+          notion.search({
+            query,
+            page_size: 10,
+          }),
+        { operation: "search.notion" }
+      );
 
       const results = response.results.map((page: any) => {
         const parentDbId =

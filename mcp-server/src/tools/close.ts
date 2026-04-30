@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
+import { callNotion } from "../notion/api.js";
 
 const CloseInput = z.object({
   project: z.string().describe("프로젝트명 (검색 키워드)"),
@@ -19,13 +20,17 @@ export function registerClose(server: McpServer) {
       const today = new Date().toISOString().split("T")[0];
 
       // 1. Projects DB에서 프로젝트 검색
-      const projectsRes = await notion.databases.query({
-        database_id: NOTION_CONFIG.databases.projects,
-        filter: {
-          property: "title",
-          title: { contains: project },
-        },
-      });
+      const projectsRes = await callNotion(
+        () =>
+          notion.databases.query({
+            database_id: NOTION_CONFIG.databases.projects,
+            filter: {
+              property: "title",
+              title: { contains: project },
+            },
+          }),
+        { operation: "close.projects.query" }
+      );
 
       if (projectsRes.results.length === 0) {
         return {
@@ -36,13 +41,17 @@ export function registerClose(server: McpServer) {
       const projectPage = projectsRes.results[0] as any;
 
       // 2. 상태 → 완료, 완료일 설정
-      await notion.pages.update({
-        page_id: projectPage.id,
-        properties: {
-          "status": { select: { name: "완료" } },
-          "end_date": { date: { start: today } },
-        },
-      });
+      await callNotion(
+        () =>
+          notion.pages.update({
+            page_id: projectPage.id,
+            properties: {
+              "status": { select: { name: "완료" } },
+              "end_date": { date: { start: today } },
+            },
+          }),
+        { operation: "close.projects.update" }
+      );
 
       // 3. 회고 섹션 추가 (있는 경우)
       if (achievement || lessons) {
@@ -68,32 +77,40 @@ export function registerClose(server: McpServer) {
           );
         }
 
-        await notion.blocks.children.append({
-          block_id: projectPage.id,
-          children: retroBlocks,
-        });
+        await callNotion(
+          () =>
+            notion.blocks.children.append({
+              block_id: projectPage.id,
+              children: retroBlocks,
+            }),
+          { operation: "close.blocks.append" }
+        );
       }
 
       // 4. 배운 점이 있으면 Knowledge Base DB에 등록
       let knowledgePage = null;
       if (lessons) {
-        knowledgePage = await notion.pages.create({
-          parent: { database_id: NOTION_CONFIG.databases.knowledgeBase },
-          properties: {
-            title: { title: [{ text: { content: `${project} 회고 — 배운 점` } }] },
-            summary: { rich_text: [{ text: { content: `${project} 종료 회고` } }] },
-            category: { select: { name: "베스트프랙티스" } },
-            project: { relation: [{ id: projectPage.id }] },
-            date: { date: { start: today } },
-          },
-          children: [
-            {
-              object: "block",
-              type: "paragraph",
-              paragraph: { rich_text: [{ text: { content: lessons } }] },
-            },
-          ],
-        });
+        knowledgePage = await callNotion(
+          () =>
+            notion.pages.create({
+              parent: { database_id: NOTION_CONFIG.databases.knowledgeBase },
+              properties: {
+                title: { title: [{ text: { content: `${project} 회고 — 배운 점` } }] },
+                summary: { rich_text: [{ text: { content: `${project} 종료 회고` } }] },
+                category: { select: { name: "베스트프랙티스" } },
+                project: { relation: [{ id: projectPage.id }] },
+                date: { date: { start: today } },
+              },
+              children: [
+                {
+                  object: "block",
+                  type: "paragraph",
+                  paragraph: { rich_text: [{ text: { content: lessons } }] },
+                },
+              ],
+            }),
+          { operation: "close.knowledgeBase.create" }
+        );
       }
 
       return {

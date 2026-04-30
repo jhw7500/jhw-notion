@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG, DatabaseName } from "../config.js";
+import { callNotion } from "../notion/api.js";
 
 const StatusInput = z.object({
   db: z
@@ -25,11 +26,15 @@ export function registerStatus(server: McpServer) {
 
       for (const dbName of dbsToQuery) {
         const dbId = NOTION_CONFIG.databases[dbName];
-        const response = await notion.databases.query({
-          database_id: dbId,
-          page_size: 5,
-          sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
-        });
+        const response = await callNotion(
+          () =>
+            notion.databases.query({
+              database_id: dbId,
+              page_size: 5,
+              sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
+            }),
+          { operation: `status.${dbName}.query` }
+        );
 
         const items = response.results.map((page: any) => {
           const title =

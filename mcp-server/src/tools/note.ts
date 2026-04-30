@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG, REPORT_VALUES } from "../config.js";
 import { resolveProjectRelationId } from "./record.js";
+import { callNotion } from "../notion/api.js";
 
 // KB DB의 category select 옵션 (8종)
 const KB_CATEGORIES = [
@@ -79,11 +80,15 @@ export function registerNote(server: McpServer) {
         },
       ];
 
-      const page = await notion.pages.create({
-        parent: { database_id: NOTION_CONFIG.databases.knowledgeBase },
-        properties,
-        children,
-      });
+      const page = await callNotion(
+        () =>
+          notion.pages.create({
+            parent: { database_id: NOTION_CONFIG.databases.knowledgeBase },
+            properties,
+            children,
+          }),
+        { operation: "note.knowledgeBase.create" }
+      );
 
       return {
         content: [

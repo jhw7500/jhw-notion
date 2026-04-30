@@ -3,6 +3,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@notionhq/client";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG, DatabaseName, REPORT_VALUES } from "../config.js";
+import { resolveProjectId } from "../notion/resolve-project.js";
+import { callNotion } from "../notion/api.js";
 
 const RecordInput = z.object({
   db: z
@@ -54,41 +56,8 @@ const RecordInput = z.object({
     .describe("추가 프로퍼티"),
 });
 
-// projects DB에서 keyword로 페이지 검색하여 ID 반환.
-// 입력이 이미 URL/ID면 바로 파싱하여 반환.
-export async function resolveProjectRelationId(
-  notion: Client,
-  input: string
-): Promise<string | null> {
-  const trimmed = input.trim();
-  if (!trimmed) return null;
-
-  const urlMatch = trimmed.match(
-    /([0-9a-f]{32})|([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
-  );
-  if (urlMatch) {
-    return urlMatch[0].includes("-")
-      ? urlMatch[0]
-      : `${urlMatch[0].slice(0, 8)}-${urlMatch[0].slice(8, 12)}-${urlMatch[0].slice(12, 16)}-${urlMatch[0].slice(16, 20)}-${urlMatch[0].slice(20)}`;
-  }
-
-  try {
-    const result = await notion.databases.query({
-      database_id: NOTION_CONFIG.databases.projects,
-      filter: {
-        property: "title",
-        title: { contains: trimmed },
-      },
-      page_size: 3,
-    });
-    if (result.results.length > 0) {
-      return result.results[0].id;
-    }
-  } catch {
-    // fall through
-  }
-  return null;
-}
+// 공통 resolver로 위임. 외부 호환을 위해 named export 유지.
+export const resolveProjectRelationId = resolveProjectId;
 
 async function buildNotionProperties(
   db: DatabaseName,
@@ -106,7 +75,7 @@ async function buildNotionProperties(
 
   // 4개 DB 공통: project relation (preferences 제외)
   if (props?.project && db !== "preferences") {
-    const relId = await resolveProjectRelationId(notion, props.project);
+    const relId = await resolveProjectId(notion, props.project);
     if (relId) {
       p["project"] = { relation: [{ id: relId }] };
     }
@@ -183,10 +152,14 @@ export function registerRecord(server: McpServer) {
         notion
       );
 
-      const page = await notion.pages.create({
-        parent: { database_id: dbId },
-        properties: notionProps,
-      });
+      const page = await callNotion(
+        () =>
+          notion.pages.create({
+            parent: { database_id: dbId },
+            properties: notionProps,
+          }),
+        { operation: `${db}.pages.create` }
+      );
 
       return {
         content: [
