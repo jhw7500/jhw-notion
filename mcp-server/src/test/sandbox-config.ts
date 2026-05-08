@@ -14,7 +14,29 @@ export interface SandboxConfig {
     knowledgeBase: string;
     references: string;
   };
+  /**
+   * Notion v5 dataSources.query() 용 data_source_id (sandbox 5개).
+   * 조회 일자: 2026-05-08 (Notion-Version: 2025-09-03).
+   * 5개 모두 1:1 (count=1). 후속 p1-3c에서 마이그레이션 시 사용.
+   * 운영 schema(schema.ts)와 분리하여 sandbox 격리 유지.
+   */
+  dataSources: {
+    projects: string;
+    preferences: string;
+    decisionLog: string;
+    knowledgeBase: string;
+    references: string;
+  };
 }
+
+/** Sandbox dataSource 매핑 (조회 일자 2026-05-08). */
+const SANDBOX_DATA_SOURCES = {
+  projects: "280d2a38-9eb0-48cd-9a99-a6fd16b27524",
+  preferences: "22ad1943-abce-4e1b-aaf8-1104a29d4bfd",
+  decisionLog: "5a60f9f2-1a92-4dd9-abbe-83c7403b3ccf",
+  knowledgeBase: "c7f269e2-aecd-4eb9-a8c4-08d208c8c597",
+  references: "03ce789f-dd74-4b36-a09c-6dd1ca800ef1",
+} as const;
 
 export function isLiveEnabled(): boolean {
   return process.env.RUN_LIVE_NOTION_TESTS === "1";
@@ -31,6 +53,7 @@ export function loadSandboxConfig(): SandboxConfig {
       knowledgeBase: process.env.NOTION_SANDBOX_DB_KNOWLEDGE_BASE ?? "",
       references: process.env.NOTION_SANDBOX_DB_REFERENCES ?? "",
     },
+    dataSources: { ...SANDBOX_DATA_SOURCES },
   };
 }
 

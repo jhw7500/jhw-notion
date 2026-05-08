@@ -188,22 +188,23 @@
 - [ ] tsc 0 errors
 - [ ] 기존 mock 102 PASS 유지
 
-### 6.4 Data Source Mapping (조회 후 채워질 자리)
+### 6.4 Data Source Mapping (조회 결과)
 
-> Phase 1.1 조회 후 채움. **현재는 미작성 — plan 진행 중 업데이트.**
+> 조회 일자: 2026-05-08, Notion-Version: `2025-09-03`, REST API `GET /v1/databases/{id}` 직접 호출.
+> **모든 DB가 1:1 (count=1)** — Plan §2.4 결정: `dataSourceId: string` 단일 타입으로 충분.
 
-| DB | DB ID (database_id) | DataSource ID(s) | env (production/sandbox) |
-|---|---|---|---|
-| projects | (config.ts) | TBD | production |
-| preferences | (config.ts) | TBD | production |
-| decisionLog | (config.ts) | TBD | production |
-| knowledgeBase | (config.ts) | TBD | production |
-| references | (config.ts) | TBD | production |
-| projects-sandbox | NOTION_SANDBOX_DB_PROJECTS | TBD | sandbox |
-| preferences-sandbox | NOTION_SANDBOX_DB_PREFERENCES | TBD | sandbox |
-| decisionLog-sandbox | NOTION_SANDBOX_DB_DECISION_LOG | TBD | sandbox |
-| knowledgeBase-sandbox | NOTION_SANDBOX_DB_KNOWLEDGE_BASE | TBD | sandbox |
-| references-sandbox | NOTION_SANDBOX_DB_REFERENCES | TBD | sandbox |
+| DB | DataSource ID | DataSource Name | count | 저장 위치 |
+|---|---|---|---:|---|
+| prod-projects | `d45ed33c-26ee-45be-ad9c-513db7c422e0` | Projects | 1 | `schema.ts` |
+| prod-preferences | `634f7b00-b7a2-447b-9514-a109b57557a8` | AI Preferences | 1 | `schema.ts` |
+| prod-decisionLog | `c1d8d3c3-538e-40a9-a306-2b694a4d8ff9` | Decision Log | 1 | `schema.ts` |
+| prod-knowledgeBase | `6a4615db-ba17-44a8-b3c7-6688dce9c2fa` | Knowledge Base | 1 | `schema.ts` |
+| prod-references | `2917f7ce-c7a7-4301-a2fc-48137876c9a7` | References | 1 | `schema.ts` |
+| sandbox-projects | `280d2a38-9eb0-48cd-9a99-a6fd16b27524` | Projects (sandbox) | 1 | `test/sandbox-config.ts` |
+| sandbox-preferences | `22ad1943-abce-4e1b-aaf8-1104a29d4bfd` | Preferences (sandbox) | 1 | `test/sandbox-config.ts` |
+| sandbox-decisionLog | `5a60f9f2-1a92-4dd9-abbe-83c7403b3ccf` | Decision Log (sandbox) | 1 | `test/sandbox-config.ts` |
+| sandbox-knowledgeBase | `c7f269e2-aecd-4eb9-a8c4-08d208c8c597` | Knowledge Base (sandbox) | 1 | `test/sandbox-config.ts` |
+| sandbox-references | `03ce789f-dd74-4b36-a09c-6dd1ca800ef1` | References (sandbox) | 1 | `test/sandbox-config.ts` |
 
 ---
 

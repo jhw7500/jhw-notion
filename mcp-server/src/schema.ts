@@ -23,6 +23,13 @@ export interface PropertyMeta {
 
 export interface DatabaseSchema {
   id: string;
+  /**
+   * Notion API v5(2025-09-03~) 의 dataSources.query() 호출에 필요한 data_source_id.
+   * 본 프로젝트의 5개 DB는 모두 1:1 (count=1) 매핑이라 단일 string.
+   * 조회 일자: 2026-05-08 (Notion-Version: 2025-09-03).
+   * 후속 사이클(p1-3c)에서 databases.query → dataSources.query 마이그레이션 시 사용.
+   */
+  dataSourceId: string;
   /** title 프로퍼티 키 */
   title: string;
   /** project 필드 정의 (없으면 undefined) */
@@ -36,6 +43,7 @@ const projectsRel: PropertyMeta = { type: "relation", target: "projects" };
 export const DATABASE_SCHEMAS: Record<DatabaseName, DatabaseSchema> = {
   projects: {
     id: NOTION_CONFIG.databases.projects,
+    dataSourceId: "d45ed33c-26ee-45be-ad9c-513db7c422e0",
     title: "title",
     properties: {
       status: { type: "select", default: "진행중" },
@@ -49,6 +57,7 @@ export const DATABASE_SCHEMAS: Record<DatabaseName, DatabaseSchema> = {
   },
   preferences: {
     id: NOTION_CONFIG.databases.preferences,
+    dataSourceId: "634f7b00-b7a2-447b-9514-a109b57557a8",
     title: "title",
     // preferences는 project 필드가 없음
     properties: {
@@ -61,6 +70,7 @@ export const DATABASE_SCHEMAS: Record<DatabaseName, DatabaseSchema> = {
   },
   decisionLog: {
     id: NOTION_CONFIG.databases.decisionLog,
+    dataSourceId: "c1d8d3c3-538e-40a9-a306-2b694a4d8ff9",
     title: "title",
     project: projectsRel,
     properties: {
@@ -74,6 +84,7 @@ export const DATABASE_SCHEMAS: Record<DatabaseName, DatabaseSchema> = {
   },
   knowledgeBase: {
     id: NOTION_CONFIG.databases.knowledgeBase,
+    dataSourceId: "6a4615db-ba17-44a8-b3c7-6688dce9c2fa",
     title: "title",
     project: projectsRel,
     properties: {
@@ -86,6 +97,7 @@ export const DATABASE_SCHEMAS: Record<DatabaseName, DatabaseSchema> = {
   },
   references: {
     id: NOTION_CONFIG.databases.references,
+    dataSourceId: "2917f7ce-c7a7-4301-a2fc-48137876c9a7",
     title: "title",
     project: projectsRel,
     properties: {
@@ -97,6 +109,14 @@ export const DATABASE_SCHEMAS: Record<DatabaseName, DatabaseSchema> = {
     },
   },
 };
+
+/**
+ * Notion v5 dataSources.query() 호출에 필요한 data_source_id 조회 헬퍼.
+ * 후속 사이클(p1-3c)에서 databases.query → dataSources.query 마이그레이션 시 사용.
+ */
+export function getDataSourceId(db: DatabaseName): string {
+  return DATABASE_SCHEMAS[db].dataSourceId;
+}
 
 export function getProjectFieldType(db: DatabaseName): PropertyType | null {
   return DATABASE_SCHEMAS[db]?.project?.type ?? null;
