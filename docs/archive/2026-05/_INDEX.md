@@ -48,12 +48,28 @@
 | **Architecture** | Option C (Pragmatic) — api.ts 확장, 신규 파일 0 |
 | **Mid-cycle Adjustment** | wrapper isFullPage 필터 → union 노출 (mock 호환을 위한 정정) |
 
+### p1-3d-cursor-pagination
+
+| Item | Value |
+|---|---|
+| **PDCA Cycle** | #5 |
+| **Started** | 2026-05-08 |
+| **Archived** | 2026-05-08 |
+| **Match Rate** | 100% |
+| **Iteration Count** | 0 |
+| **Summary** | `queryDataSource` wrapper에 `paginate?: boolean` 옵션 + cursor 자동 루프 + `MAX_PAGES=50` (5000건) hardcoded 안전장치 도입. `report/query.ts:104` 호출만 활성화 — 다른 9 호출은 의도적 N건 cap 보존. mock 4건 추가 (단일/다중/MAX/disabled). 4-layer defense 완성 (#2 메모리 필터 → #3 매핑 → #4 API 마이그레이션 → #5 cursor pagination) |
+| **Documents** | [Plan](./p1-3d-cursor-pagination/p1-3d-cursor-pagination.plan.md) · [Analysis](./p1-3d-cursor-pagination/p1-3d-cursor-pagination.analysis.md) · [Report](./p1-3d-cursor-pagination/p1-3d-cursor-pagination.report.md) |
+| **Implementation Commits** | `dbdad49` Plan + `b6dee92` feat(notion/api): paginate option + cursor loop with MAX_PAGES safety |
+| **Architecture** | Option A (Pragmatic) — wrapper 확장, design 생략 (변경 < 80 LOC) |
+| **Cycle 시간** | ~30분 (가벼운 사이클) |
+
 ---
 
 ## Statistics
 
 | Metric | Value |
 |---|---|
-| Total archived features | 3 |
-| Average match rate | 98.83% |
-| Total cycles | 3 |
+| Total archived features | 4 |
+| Average match rate | 99.13% |
+| Total cycles | 4 |
+| Highest Match | p1-3d-cursor-pagination (100%) + report-date-filter-fix (100%) |
