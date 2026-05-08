@@ -109,8 +109,12 @@ export async function queryReportItems(
         (dateProp && page.properties?.[dateProp]?.date?.start) ||
         page.last_edited_time?.split("T")[0] ||
         "";
-      // dateProp이 없는 DB는 메모리에서 기간 필터
-      if (!dateProp && dateValue) {
+      // 메모리 사이드 기간 필터 — server filter 결과를 신뢰하지 않는다.
+      // 이유: notion.databases.query의 date filter가 multi-data-source DB
+      // (Projects/DecisionLog/KnowledgeBase) 에서 silently 무시됨을
+      // 2026-05-08 시뮬레이션(CASE-A 미래기간/CASE-G 단일일)에서 확인.
+      // SDK v3 + dataSources.query 마이그레이션은 별도 plan(P1-3b).
+      if (dateValue) {
         if (dateValue < opts.start || dateValue > opts.end) continue;
       }
       const reportVal = page.properties?.report?.select?.name as
