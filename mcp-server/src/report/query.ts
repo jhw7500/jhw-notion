@@ -1,6 +1,7 @@
-// 보고서 다중 DB 조회 (P0-3).
+// 보고서 다중 DB 조회 (P0-3 + p1-3c).
 // 기간 + report 필드를 기준으로 5개 DB에서 페이지를 가져온다.
 // schema.ts 메타데이터 기반 — DB 추가 시 query 코드 변경 불필요.
+// p1-3c: notion.databases.query → notion.dataSources.query (via queryDataSource wrapper).
 import type { Client } from "@notionhq/client";
 import { DATABASE_SCHEMAS } from "../schema.js";
 import {
@@ -8,7 +9,7 @@ import {
   type ReportValue,
   REPORT_VALUES,
 } from "../config.js";
-import { callNotion } from "../notion/api.js";
+import { queryDataSource } from "../notion/api.js";
 
 export interface ReportItem {
   id: string;
@@ -86,21 +87,22 @@ export async function queryReportItems(
         ? filters[0]
         : { and: filters };
 
-    const res = await callNotion(
-      () =>
-        notion.databases.query({
-          database_id: schema.id,
-          filter,
-          sorts: dateProp
-            ? [{ property: dateProp, direction: "ascending" }]
-            : [
-                {
-                  timestamp: "last_edited_time",
-                  direction: "ascending",
-                },
-              ],
-          page_size: 100,
-        }),
+    // Design Ref: §4.3 — report/query.ts:91 마이그레이션 (dynamic db loop)
+    const res = await queryDataSource(
+      notion,
+      db,
+      {
+        filter,
+        sorts: dateProp
+          ? [{ property: dateProp, direction: "ascending" }]
+          : [
+              {
+                timestamp: "last_edited_time",
+                direction: "ascending",
+              },
+            ],
+        page_size: 100,
+      },
       { operation: `report.query.${db}` }
     );
 
@@ -113,7 +115,7 @@ export async function queryReportItems(
       // 이유: notion.databases.query의 date filter가 multi-data-source DB
       // (Projects/DecisionLog/KnowledgeBase) 에서 silently 무시됨을
       // 2026-05-08 시뮬레이션(CASE-A 미래기간/CASE-G 단일일)에서 확인.
-      // SDK v3 + dataSources.query 마이그레이션은 별도 plan(P1-3b).
+      // p1-3c에서 dataSources.query로 마이그레이션 후에도 보험으로 유지 (Plan SC FR-08).
       if (dateValue) {
         if (dateValue < opts.start || dateValue > opts.end) continue;
       }

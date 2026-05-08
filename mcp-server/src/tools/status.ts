@@ -2,7 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG, DatabaseName } from "../config.js";
-import { callNotion } from "../notion/api.js";
+import { queryDataSource } from "../notion/api.js";
 
 const StatusInput = z.object({
   db: z
@@ -25,14 +25,14 @@ export function registerStatus(server: McpServer) {
       const results: Record<string, any> = {};
 
       for (const dbName of dbsToQuery) {
-        const dbId = NOTION_CONFIG.databases[dbName];
-        const response = await callNotion(
-          () =>
-            notion.databases.query({
-              database_id: dbId,
-              page_size: 5,
-              sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
-            }),
+        // Design Ref: §4.3 — status.ts:31 마이그레이션 (dynamic db loop)
+        const response = await queryDataSource(
+          notion,
+          dbName,
+          {
+            page_size: 5,
+            sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
+          },
           { operation: `status.${dbName}.query` }
         );
 
@@ -48,7 +48,8 @@ export function registerStatus(server: McpServer) {
 
         results[dbName] = {
           count: response.results.length,
-          hasMore: response.has_more,
+          // wrapper return type에 has_more 없음 — nextCursor 존재 여부로 동등 판단
+          hasMore: Boolean(response.nextCursor),
           recentItems: items,
         };
       }

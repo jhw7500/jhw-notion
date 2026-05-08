@@ -1,8 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
-import { NOTION_CONFIG } from "../config.js";
-import { callNotion } from "../notion/api.js";
+import { queryDataSource } from "../notion/api.js";
 
 const HistoryInput = z.object({
   project: z.string().describe("프로젝트명 (검색 키워드)"),
@@ -17,15 +16,16 @@ export function registerHistory(server: McpServer) {
       const notion = getNotionClient();
 
       // 1. Projects DB에서 프로젝트 정보
-      const projectsRes = await callNotion(
-        () =>
-          notion.databases.query({
-            database_id: NOTION_CONFIG.databases.projects,
-            filter: {
-              property: "title",
-              title: { contains: project },
-            },
-          }),
+      // Design Ref: §4.3 — history.ts:22 마이그레이션 (databases.query → dataSources.query via wrapper)
+      const projectsRes = await queryDataSource(
+        notion,
+        "projects",
+        {
+          filter: {
+            property: "title",
+            title: { contains: project },
+          },
+        },
         { operation: "history.projects.query" }
       );
 
@@ -39,36 +39,38 @@ export function registerHistory(server: McpServer) {
       const startDate = projectPage.properties["start_date"]?.date?.start || "";
 
       // 2. Decision Log에서 관련 결정 — relation filter 우선, legacy rich_text fallback
-      let decisionsRes = await callNotion(
-        () =>
-          notion.databases.query({
-            database_id: NOTION_CONFIG.databases.decisionLog,
-            filter: {
-              property: "project",
-              relation: { contains: projectPage.id },
-            },
-            sorts: [{ property: "date", direction: "ascending" }],
-            page_size: 20,
-          }),
+      // Design Ref: §4.3 — history.ts:44 마이그레이션
+      let decisionsRes = await queryDataSource(
+        notion,
+        "decisionLog",
+        {
+          filter: {
+            property: "project",
+            relation: { contains: projectPage.id },
+          },
+          sorts: [{ property: "date", direction: "ascending" }],
+          page_size: 20,
+        },
         { operation: "history.decisions.query.relation" }
       );
       if (decisionsRes.results.length === 0) {
         try {
-          decisionsRes = await callNotion(
-            () =>
-              notion.databases.query({
-                database_id: NOTION_CONFIG.databases.decisionLog,
-                filter: {
-                  property: "project",
-                  rich_text: { contains: project },
-                },
-                sorts: [{ property: "date", direction: "ascending" }],
-                page_size: 20,
-              }),
+          // Design Ref: §4.3 — history.ts:59 legacy fallback (Cycle #1부터 존재한 패턴 보존)
+          decisionsRes = await queryDataSource(
+            notion,
+            "decisionLog",
+            {
+              filter: {
+                property: "project",
+                rich_text: { contains: project },
+              },
+              sorts: [{ property: "date", direction: "ascending" }],
+              page_size: 20,
+            },
             { operation: "history.decisions.query.legacy", attempts: 1 }
           );
         } catch {
-          // schema가 이미 relation-only면 무시.
+          // schema가 이미 relation-only면 rich_text filter는 에러. 무시.
         }
       }
 

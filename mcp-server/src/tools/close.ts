@@ -2,7 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
-import { callNotion } from "../notion/api.js";
+import { callNotion, queryDataSource } from "../notion/api.js";
 
 const CloseInput = z.object({
   project: z.string().describe("프로젝트명 (검색 키워드)"),
@@ -20,15 +20,16 @@ export function registerClose(server: McpServer) {
       const today = new Date().toISOString().split("T")[0];
 
       // 1. Projects DB에서 프로젝트 검색
-      const projectsRes = await callNotion(
-        () =>
-          notion.databases.query({
-            database_id: NOTION_CONFIG.databases.projects,
-            filter: {
-              property: "title",
-              title: { contains: project },
-            },
-          }),
+      // Design Ref: §4.3 — close.ts:25 마이그레이션
+      const projectsRes = await queryDataSource(
+        notion,
+        "projects",
+        {
+          filter: {
+            property: "title",
+            title: { contains: project },
+          },
+        },
         { operation: "close.projects.query" }
       );
 
@@ -40,7 +41,7 @@ export function registerClose(server: McpServer) {
 
       const projectPage = projectsRes.results[0] as any;
 
-      // 2. 상태 → 완료, 완료일 설정
+      // 2. 상태 → 완료, 완료일 설정 (pages.update — wrapper 영향 없음)
       await callNotion(
         () =>
           notion.pages.update({
@@ -87,7 +88,7 @@ export function registerClose(server: McpServer) {
         );
       }
 
-      // 4. 배운 점이 있으면 Knowledge Base DB에 등록
+      // 4. 배운 점이 있으면 Knowledge Base DB에 등록 (pages.create — wrapper 영향 없음)
       let knowledgePage = null;
       if (lessons) {
         knowledgePage = await callNotion(

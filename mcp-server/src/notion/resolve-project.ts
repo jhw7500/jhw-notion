@@ -1,9 +1,9 @@
 // 공통 project resolver.
 // projects DB에서 input(키워드/URL/UUID)으로 페이지를 찾아 ID 반환.
 // (P0-1: record/context/history/start의 4중 분산 로직 통합)
+// p1-3c: notion.databases.query → notion.dataSources.query (via queryDataSource wrapper).
 import type { Client } from "@notionhq/client";
-import { NOTION_CONFIG } from "../config.js";
-import { callNotion } from "./api.js";
+import { queryDataSource } from "./api.js";
 
 const UUID_RE =
   /([0-9a-f]{32})|([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
@@ -39,13 +39,14 @@ export async function resolveProject(
   }
 
   try {
-    const res = await callNotion(
-      () =>
-        notion.databases.query({
-          database_id: NOTION_CONFIG.databases.projects,
-          filter: { property: "title", title: { contains: trimmed } },
-          page_size: 5,
-        }),
+    // Design Ref: §4.3 — resolve-project.ts:44 마이그레이션
+    const res = await queryDataSource(
+      notion,
+      "projects",
+      {
+        filter: { property: "title", title: { contains: trimmed } },
+        page_size: 5,
+      },
       { operation: "projects.query.resolve" }
     );
     const lower = trimmed.toLowerCase();
