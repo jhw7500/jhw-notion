@@ -1,12 +1,15 @@
 // P0-2 단위 테스트 — withRetry/withTimeout/RateLimiter/NotionError.
-import { describe, it, expect, vi } from "vitest";
+// p1-3c M2 추가 — queryDataSource wrapper.
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   withRetry,
   withTimeout,
   RateLimiter,
   NotionError,
   isRetryable,
+  queryDataSource,
 } from "../api.js";
+import { DATABASE_SCHEMAS } from "../../schema.js";
 
 describe("isRetryable", () => {
   it("429/500/502/503/504는 retryable", () => {
@@ -147,5 +150,140 @@ describe("RateLimiter", () => {
     // 다음 task가 즉시 실행되어야 함 (deadlock 없음)
     const result = await limiter.run(async () => "ok");
     expect(result).toBe("ok");
+  });
+});
+
+// =====================================================================
+// p1-3c M2 — queryDataSource wrapper unit tests
+// =====================================================================
+
+function makeFullPage(id: string) {
+  return {
+    object: "page",
+    id,
+    parent: { type: "data_source_id", data_source_id: "x" },
+    created_time: "2026-01-01T00:00:00.000Z",
+    last_edited_time: "2026-01-02T00:00:00.000Z",
+    created_by: { object: "user", id: "u1" },
+    last_edited_by: { object: "user", id: "u1" },
+    in_trash: false,
+    archived: false,
+    icon: null,
+    cover: null,
+    url: `https://www.notion.so/${id}`,
+    public_url: null,
+    properties: {},
+  };
+}
+
+describe("queryDataSource (p1-3c M2)", () => {
+  let mockNotion: any;
+
+  beforeEach(() => {
+    mockNotion = {
+      dataSources: {
+        query: vi.fn(),
+      },
+    };
+  });
+
+  it("schema의 dataSourceId를 path param에 매핑해 호출한다", async () => {
+    mockNotion.dataSources.query.mockResolvedValue({ results: [], next_cursor: null });
+    await queryDataSource(
+      mockNotion,
+      "decisionLog",
+      { page_size: 50 },
+      { operation: "test.op" }
+    );
+    const expectedId = DATABASE_SCHEMAS.decisionLog.dataSourceId;
+    expect(mockNotion.dataSources.query).toHaveBeenCalledTimes(1);
+    const args = mockNotion.dataSources.query.mock.calls[0][0];
+    expect(args.data_source_id).toBe(expectedId);
+    expect(args.page_size).toBe(50);
+  });
+
+  it("응답 union(Full/Partial 혼합)을 그대로 노출한다 (호출처가 type cast 처리)", async () => {
+    const full = makeFullPage("p-full");
+    const partial = { object: "page", id: "p-partial" };
+    mockNotion.dataSources.query.mockResolvedValue({
+      results: [full, partial],
+      next_cursor: null,
+    });
+    const out = await queryDataSource(
+      mockNotion,
+      "decisionLog",
+      {},
+      { operation: "test.union" }
+    );
+    expect(out.results).toHaveLength(2);
+    expect(out.results.map((r: any) => r.id).sort()).toEqual(["p-full", "p-partial"]);
+  });
+
+  it("request_status.type === 'incomplete' 면 incomplete=true + console.warn 호출", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockNotion.dataSources.query.mockResolvedValue({
+      results: [makeFullPage("p1")],
+      next_cursor: null,
+      request_status: { type: "incomplete", incomplete_reason: "query_result_limit_reached" },
+    });
+    const out = await queryDataSource(
+      mockNotion,
+      "knowledgeBase",
+      {},
+      { operation: "test.incomplete" }
+    );
+    expect(out.incomplete).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("test.incomplete incomplete:"),
+      "query_result_limit_reached"
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("request_status가 없거나 complete면 incomplete=false + warn 안 함", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockNotion.dataSources.query.mockResolvedValue({
+      results: [makeFullPage("p1")],
+      next_cursor: null,
+      request_status: { type: "complete" },
+    });
+    const out = await queryDataSource(
+      mockNotion,
+      "projects",
+      {},
+      { operation: "test.complete" }
+    );
+    expect(out.incomplete).toBe(false);
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("nextCursor를 그대로 노출한다 (pagination preparation)", async () => {
+    mockNotion.dataSources.query.mockResolvedValue({
+      results: [makeFullPage("p1")],
+      next_cursor: "cursor-abc",
+    });
+    const out = await queryDataSource(
+      mockNotion,
+      "references",
+      {},
+      { operation: "test.cursor" }
+    );
+    expect(out.nextCursor).toBe("cursor-abc");
+  });
+
+  it("filter / sorts 인자를 그대로 전달한다", async () => {
+    mockNotion.dataSources.query.mockResolvedValue({ results: [], next_cursor: null });
+    const filter = { property: "title", title: { contains: "x" } };
+    const sorts = [{ property: "date", direction: "ascending" as const }];
+    await queryDataSource(
+      mockNotion,
+      "preferences",
+      { filter, sorts },
+      { operation: "test.passthrough" }
+    );
+    const args = mockNotion.dataSources.query.mock.calls[0][0];
+    expect(args.filter).toEqual(filter);
+    expect(args.sorts).toEqual(sorts);
   });
 });
