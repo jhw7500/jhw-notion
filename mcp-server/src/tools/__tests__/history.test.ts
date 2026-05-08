@@ -21,14 +21,14 @@ describe("jhw_history", () => {
   });
 
   it("프로젝트를 찾을 수 없으면 메시지를 반환한다", async () => {
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     const result = await handler({ project: "없는프로젝트" });
     expect(result.content[0].text).toContain("찾을 수 없습니다");
   });
 
   it("타임라인을 날짜순으로 정렬하여 반환한다", async () => {
-    mockClient.databases.query
+    mockClient.dataSources.query
       .mockResolvedValueOnce({
         results: [
           {

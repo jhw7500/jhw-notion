@@ -1,5 +1,5 @@
 // Regression test for date filter bug (2026-05-08).
-// notion.databases.query의 server-side date filter가 multi-data-source DB에서
+// notion.dataSources.query의 server-side date filter가 multi-data-source DB에서
 // silently 무시되는 케이스를 시뮬레이션하고, 메모리 사이드 필터가 기간 외
 // 데이터를 정확히 제거하는지 검증한다.
 import { describe, it, expect, beforeEach } from "vitest";
@@ -36,7 +36,7 @@ describe("queryReportItems — memory-side date filter (regression for bug 2026-
       pageWithDate("p-april-29-b", "2026-04-29", "etc"),
       pageWithDate("p-may-07", "2026-05-07", "wlan-app"),
     ];
-    notion.databases.query.mockResolvedValue({ results: rawResults, next_cursor: null });
+    notion.dataSources.query.mockResolvedValue({ results: rawResults, next_cursor: null });
 
     const items = await queryReportItems(notion as any, {
       start: "2026-04-29",
@@ -51,7 +51,7 @@ describe("queryReportItems — memory-side date filter (regression for bug 2026-
   });
 
   it("미래 기간 입력은 0건을 반환한다 (server filter가 모든 과거 데이터를 반환해도)", async () => {
-    notion.databases.query.mockResolvedValue({
+    notion.dataSources.query.mockResolvedValue({
       results: [
         pageWithDate("p-1", "2026-04-08", "etc"),
         pageWithDate("p-2", "2026-04-30", "pim-app"),
@@ -70,7 +70,7 @@ describe("queryReportItems — memory-side date filter (regression for bug 2026-
   });
 
   it("정상 기간(2026-05-01~05-07) 입력 시 해당 범위만 반환한다", async () => {
-    notion.databases.query.mockResolvedValue({
+    notion.dataSources.query.mockResolvedValue({
       results: [
         pageWithDate("p-april", "2026-04-30", "etc"),
         pageWithDate("p-may-01", "2026-05-01", "pim-app"),
@@ -93,7 +93,7 @@ describe("queryReportItems — memory-side date filter (regression for bug 2026-
   it("dateProp 없는 DB(preferences)도 last_edited_time 기반 메모리 필터가 작동한다", async () => {
     // preferences는 schema.properties에 date 키가 없음 → resolveDateProp이 null
     // → server filter는 date 조건 자체가 추가 안 됨. 메모리 필터만 작동.
-    notion.databases.query.mockResolvedValue({
+    notion.dataSources.query.mockResolvedValue({
       results: [
         {
           id: "pref-old",
@@ -128,7 +128,7 @@ describe("queryReportItems — memory-side date filter (regression for bug 2026-
   });
 
   it("select 필터(reports)는 메모리 필터와 독립적으로 동작한다 (server-side)", async () => {
-    notion.databases.query.mockResolvedValue({
+    notion.dataSources.query.mockResolvedValue({
       results: [
         pageWithDate("p-1", "2026-05-01", "pim-app"),
         pageWithDate("p-2", "2026-05-02", "etc"),
@@ -144,7 +144,7 @@ describe("queryReportItems — memory-side date filter (regression for bug 2026-
     });
 
     // server에 보낸 filter에 select=pim-app 조건이 포함되어야 한다
-    const callArgs = notion.databases.query.mock.calls[0][0];
+    const callArgs = notion.dataSources.query.mock.calls[0][0];
     const filterStr = JSON.stringify(callArgs.filter);
     expect(filterStr).toContain('"select":{"equals":"pim-app"}');
     expect(filterStr).toContain("on_or_after");

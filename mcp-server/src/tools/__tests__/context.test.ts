@@ -21,14 +21,14 @@ describe("jhw_context", () => {
   });
 
   it("프로젝트를 찾을 수 없으면 메시지를 반환한다", async () => {
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     const result = await handler({ project: "없는프로젝트" });
     expect(result.content[0].text).toContain("찾을 수 없습니다");
   });
 
   it("프로젝트 정보 + 결정 + 본문을 한 번에 로드한다", async () => {
-    mockClient.databases.query
+    mockClient.dataSources.query
       .mockResolvedValueOnce({
         results: [
           {

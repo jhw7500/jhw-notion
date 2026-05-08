@@ -40,7 +40,7 @@ describe("jhw_note", () => {
   });
 
   it("프로젝트 키워드를 projects DB에서 검색해 relation으로 연결한다", async () => {
-    mockClient.databases.query.mockResolvedValue({
+    mockClient.dataSources.query.mockResolvedValue({
       results: [{ id: "proj-page-id" }],
     });
     mockClient.pages.create.mockResolvedValue({ id: "n", url: "u" });

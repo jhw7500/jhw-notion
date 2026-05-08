@@ -21,14 +21,14 @@ describe("jhw_close", () => {
   });
 
   it("프로젝트를 찾을 수 없으면 메시지를 반환한다", async () => {
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     const result = await handler({ project: "없는프로젝트" });
     expect(result.content[0].text).toContain("찾을 수 없습니다");
   });
 
   it("프로젝트 상태를 완료로 변경한다", async () => {
-    mockClient.databases.query.mockResolvedValue({
+    mockClient.dataSources.query.mockResolvedValue({
       results: [{ id: "proj-1", properties: {} }],
     });
     mockClient.pages.update.mockResolvedValue({});
@@ -48,7 +48,7 @@ describe("jhw_close", () => {
   });
 
   it("회고가 있으면 블록을 추가하고 Knowledge Base에 등록한다", async () => {
-    mockClient.databases.query.mockResolvedValue({
+    mockClient.dataSources.query.mockResolvedValue({
       results: [{ id: "proj-1", properties: {} }],
     });
     mockClient.pages.update.mockResolvedValue({});
@@ -72,7 +72,7 @@ describe("jhw_close", () => {
   });
 
   it("lessons가 없으면 Knowledge Base에 등록하지 않는다", async () => {
-    mockClient.databases.query.mockResolvedValue({
+    mockClient.dataSources.query.mockResolvedValue({
       results: [{ id: "proj-1", properties: {} }],
     });
     mockClient.pages.update.mockResolvedValue({});

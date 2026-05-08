@@ -21,7 +21,7 @@ describe("jhw_status", () => {
   });
 
   it("전체 DB 현황을 조회한다", async () => {
-    mockClient.databases.query.mockResolvedValue({
+    mockClient.dataSources.query.mockResolvedValue({
       results: [
         {
           id: "p1",
@@ -43,11 +43,11 @@ describe("jhw_status", () => {
     expect(parsed).toHaveProperty("decisionLog");
     expect(parsed).toHaveProperty("knowledgeBase");
     expect(parsed).toHaveProperty("references");
-    expect(mockClient.databases.query).toHaveBeenCalledTimes(5);
+    expect(mockClient.dataSources.query).toHaveBeenCalledTimes(5);
   });
 
   it("특정 DB만 조회할 수 있다", async () => {
-    mockClient.databases.query.mockResolvedValue({
+    mockClient.dataSources.query.mockResolvedValue({
       results: [],
       has_more: false,
     });
@@ -57,6 +57,6 @@ describe("jhw_status", () => {
 
     expect(parsed).toHaveProperty("projects");
     expect(parsed).not.toHaveProperty("preferences");
-    expect(mockClient.databases.query).toHaveBeenCalledTimes(1);
+    expect(mockClient.dataSources.query).toHaveBeenCalledTimes(1);
   });
 });

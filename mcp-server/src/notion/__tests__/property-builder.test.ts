@@ -84,12 +84,12 @@ describe("buildPropertiesFromSchema", () => {
       notion as any
     );
     expect(props.project).toBeUndefined();
-    expect(notion.databases.query).not.toHaveBeenCalled();
+    expect(notion.dataSources.query).not.toHaveBeenCalled();
   });
 
   it("project relation: resolveProject 호출 후 [{id}]로 변환", async () => {
     const notion = setup();
-    notion.databases.query.mockResolvedValueOnce({
+    notion.dataSources.query.mockResolvedValueOnce({
       results: [
         { id: "proj-id", properties: { title: { title: [{ plain_text: "test" }] } } },
       ],
@@ -113,7 +113,7 @@ describe("buildPropertiesFromSchema", () => {
       { presetProjectId: "preset-id" }
     );
     expect(props.project.relation).toEqual([{ id: "preset-id" }]);
-    expect(notion.databases.query).not.toHaveBeenCalled();
+    expect(notion.dataSources.query).not.toHaveBeenCalled();
   });
 
   it("autoFillToday: false면 date 자동 주입 안 함", async () => {

@@ -29,7 +29,7 @@ describe("registerReportExport", () => {
   it("format=markdown은 ## 헤더, redmine은 h2 사용", async () => {
     const { server, capturedTools } = createMockServer();
     registerReportExport(server);
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     const tool = capturedTools.get("jhw_report_export")!;
     const r1 = await tool.handler({
@@ -54,7 +54,7 @@ describe("registerReportExport", () => {
   it("writeBack.enabled=false면 pages.create 호출 안 함", async () => {
     const { server, capturedTools } = createMockServer();
     registerReportExport(server);
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     const tool = capturedTools.get("jhw_report_export")!;
     const r = await tool.handler({
@@ -72,7 +72,7 @@ describe("registerReportExport", () => {
   it("writeBack.enabled=true면 KB DB에 페이지 생성", async () => {
     const { server, capturedTools } = createMockServer();
     registerReportExport(server);
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
     mockClient.pages.create.mockResolvedValue({
       id: "kb-1",
       url: "https://notion.so/kb-1",
@@ -100,7 +100,7 @@ describe("registerReportExport", () => {
   it("writeBack.db=decisionLog면 decisionLog에 저장 + status/area 포함", async () => {
     const { server, capturedTools } = createMockServer();
     registerReportExport(server);
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
     mockClient.pages.create.mockResolvedValue({
       id: "d-1",
       url: "https://notion.so/d-1",

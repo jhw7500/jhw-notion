@@ -1,8 +1,14 @@
 import { vi } from "vitest";
 
+// p1-3c: notion v5에서 databases.query 제거됨 → dataSources.query로 마이그레이션.
+// production code는 queryDataSource wrapper 경유하여 notion.dataSources.query 호출.
+// mock helper는 호환성을 위해 databases.query도 유지하지만, 실제 호출은 dataSources.query만 발생.
 export interface MockNotionClient {
   search: ReturnType<typeof vi.fn>;
   databases: {
+    query: ReturnType<typeof vi.fn>;
+  };
+  dataSources: {
     query: ReturnType<typeof vi.fn>;
   };
   pages: {
@@ -21,6 +27,9 @@ export function createMockNotionClient(): MockNotionClient {
   return {
     search: vi.fn(),
     databases: {
+      query: vi.fn(),
+    },
+    dataSources: {
       query: vi.fn(),
     },
     pages: {

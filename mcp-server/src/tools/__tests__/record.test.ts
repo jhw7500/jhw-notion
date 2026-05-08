@@ -73,7 +73,7 @@ describe("jhw_record", () => {
   });
 
   it("decisionLog의 project 키워드를 projects DB에서 검색해 relation으로 변환한다", async () => {
-    mockClient.databases.query.mockResolvedValue({
+    mockClient.dataSources.query.mockResolvedValue({
       results: [{ id: "proj-page-id-1" }],
     });
     mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
@@ -84,7 +84,7 @@ describe("jhw_record", () => {
       properties: { project: "redmine" },
     });
 
-    expect(mockClient.databases.query).toHaveBeenCalledWith(
+    expect(mockClient.dataSources.query).toHaveBeenCalledWith(
       expect.objectContaining({
         filter: expect.objectContaining({
           property: "title",
@@ -111,7 +111,7 @@ describe("jhw_record", () => {
     });
 
     // URL에서 ID 추출 — 데이터베이스 검색 없이 바로 relation으로 변환
-    expect(mockClient.databases.query).not.toHaveBeenCalled();
+    expect(mockClient.dataSources.query).not.toHaveBeenCalled();
     const createCall = mockClient.pages.create.mock.calls[0][0];
     expect(createCall.properties["project"].relation[0].id).toBe(
       "33a8a230-a04e-8154-8fa5-d96ebdd63500"
@@ -119,7 +119,7 @@ describe("jhw_record", () => {
   });
 
   it("decisionLog의 project가 매칭되지 않으면 project 필드를 생략한다", async () => {
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
     mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
 
     await handler({

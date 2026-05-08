@@ -120,7 +120,7 @@ describe("queryReportItems", () => {
 
   it("schema 기반으로 5개 DB query (decisionLog 예시)", async () => {
     // 5개 DB에 대해 각각 빈 결과
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     await queryReportItems(mockClient as any, {
       start: "2026-04-01",
@@ -129,9 +129,9 @@ describe("queryReportItems", () => {
       dbs: ["decisionLog"],
     });
 
-    expect(mockClient.databases.query).toHaveBeenCalledTimes(1);
-    const call = mockClient.databases.query.mock.calls[0][0];
-    expect(call.database_id).toBeDefined();
+    expect(mockClient.dataSources.query).toHaveBeenCalledTimes(1);
+    const call = mockClient.dataSources.query.mock.calls[0][0];
+    expect(call.data_source_id).toBeDefined();
     // filter는 and([date, or(report)])
     const filter = call.filter;
     expect(filter.and).toBeDefined();
@@ -142,7 +142,7 @@ describe("queryReportItems", () => {
   });
 
   it("결과를 ReportItem 형태로 변환", async () => {
-    mockClient.databases.query.mockResolvedValueOnce({
+    mockClient.dataSources.query.mockResolvedValueOnce({
       results: [
         {
           id: "p1",
@@ -177,7 +177,7 @@ describe("queryReportItems", () => {
   });
 
   it("none은 기본적으로 제외", async () => {
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     await queryReportItems(mockClient as any, {
       start: "2026-04-01",
@@ -185,7 +185,7 @@ describe("queryReportItems", () => {
       dbs: ["decisionLog"],
     });
 
-    const call = mockClient.databases.query.mock.calls[0][0];
+    const call = mockClient.dataSources.query.mock.calls[0][0];
     const reportOptions = call.filter.and[1].or.map(
       (f: any) => f.select.equals
     );
@@ -194,7 +194,7 @@ describe("queryReportItems", () => {
   });
 
   it("includeNone=true면 none 포함", async () => {
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     await queryReportItems(mockClient as any, {
       start: "2026-04-01",
@@ -203,7 +203,7 @@ describe("queryReportItems", () => {
       includeNone: true,
     });
 
-    const call = mockClient.databases.query.mock.calls[0][0];
+    const call = mockClient.dataSources.query.mock.calls[0][0];
     const reportOptions = call.filter.and[1].or.map(
       (f: any) => f.select.equals
     );
@@ -231,7 +231,7 @@ describe("registerReportPreview (도구 등록 + cache)", () => {
   it("동일 인자로 두 번째 호출 시 cache hit", async () => {
     const { server, capturedTools } = createMockServer();
     registerReportPreview(server);
-    mockClient.databases.query.mockResolvedValue({ results: [] });
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
 
     const tool = capturedTools.get("jhw_report_preview")!;
     const r1 = await tool.handler({
@@ -250,6 +250,6 @@ describe("registerReportPreview (도구 등록 + cache)", () => {
     expect(out1.cache.hit).toBe(false);
     expect(out2.cache.hit).toBe(true);
     // databases.query는 5개 DB × 1 (첫 호출) = 5번. 두 번째는 cache라 호출 0.
-    expect(mockClient.databases.query).toHaveBeenCalledTimes(5);
+    expect(mockClient.dataSources.query).toHaveBeenCalledTimes(5);
   });
 });

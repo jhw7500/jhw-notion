@@ -8,6 +8,7 @@ import { registerStart } from "../start.js";
 import { registerContext } from "../context.js";
 import { registerHistory } from "../history.js";
 import { NOTION_CONFIG } from "../../config.js";
+import { DATABASE_SCHEMAS } from "../../schema.js";
 import * as notionClientMod from "../../notion-client.js";
 
 describe("project field consistency (P0-1 regression)", () => {
@@ -22,7 +23,7 @@ describe("project field consistency (P0-1 regression)", () => {
     const { server, capturedTools } = createMockServer();
     registerRecord(server);
 
-    mockClient.databases.query.mockResolvedValueOnce({
+    mockClient.dataSources.query.mockResolvedValueOnce({
       results: [
         {
           id: "test-project-id",
@@ -68,7 +69,7 @@ describe("project field consistency (P0-1 regression)", () => {
     const { server, capturedTools } = createMockServer();
     registerContext(server);
 
-    mockClient.databases.query
+    mockClient.dataSources.query
       .mockResolvedValueOnce({
         results: [
           {
@@ -104,21 +105,21 @@ describe("project field consistency (P0-1 regression)", () => {
     const tool = capturedTools.get("jhw_context")!;
     await tool.handler({ project: "test" });
 
-    const decisionsCall = mockClient.databases.query.mock.calls[1][0];
-    expect(decisionsCall.database_id).toBe(NOTION_CONFIG.databases.decisionLog);
+    const decisionsCall = mockClient.dataSources.query.mock.calls[1][0];
+    expect(decisionsCall.data_source_id).toBe(DATABASE_SCHEMAS.decisionLog.dataSourceId);
     expect(decisionsCall.filter.property).toBe("project");
     expect(decisionsCall.filter.relation?.contains).toBe("proj-id");
     // rich_text fallback이 1차 시도에 들어가지 않아야 함
     expect(decisionsCall.filter.rich_text).toBeUndefined();
     // fallback이 호출되지 않았어야 함 (projects 1 + decisions 1 = 총 2회)
-    expect(mockClient.databases.query).toHaveBeenCalledTimes(2);
+    expect(mockClient.dataSources.query).toHaveBeenCalledTimes(2);
   });
 
   it("history.ts: decisionLog query 시 relation filter를 우선 사용한다", async () => {
     const { server, capturedTools } = createMockServer();
     registerHistory(server);
 
-    mockClient.databases.query
+    mockClient.dataSources.query
       .mockResolvedValueOnce({
         results: [
           {
@@ -147,11 +148,11 @@ describe("project field consistency (P0-1 regression)", () => {
     const tool = capturedTools.get("jhw_history")!;
     await tool.handler({ project: "test" });
 
-    const decisionsCall = mockClient.databases.query.mock.calls[1][0];
-    expect(decisionsCall.database_id).toBe(NOTION_CONFIG.databases.decisionLog);
+    const decisionsCall = mockClient.dataSources.query.mock.calls[1][0];
+    expect(decisionsCall.data_source_id).toBe(DATABASE_SCHEMAS.decisionLog.dataSourceId);
     expect(decisionsCall.filter.property).toBe("project");
     expect(decisionsCall.filter.relation?.contains).toBe("proj-id");
     expect(decisionsCall.filter.rich_text).toBeUndefined();
-    expect(mockClient.databases.query).toHaveBeenCalledTimes(2);
+    expect(mockClient.dataSources.query).toHaveBeenCalledTimes(2);
   });
 });
