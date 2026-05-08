@@ -286,4 +286,98 @@ describe("queryDataSource (p1-3c M2)", () => {
     expect(args.filter).toEqual(filter);
     expect(args.sorts).toEqual(sorts);
   });
+
+  // =====================================================================
+  // p1-3d: paginate 옵션 + cursor 루프 + MAX_PAGES 안전장치
+  // =====================================================================
+
+  it("paginate=true + 단일 페이지 (next_cursor=null) 면 1회 호출", async () => {
+    mockNotion.dataSources.query.mockResolvedValueOnce({
+      results: [makeFullPage("p1")],
+      next_cursor: null,
+    });
+    const out = await queryDataSource(
+      mockNotion,
+      "decisionLog",
+      {},
+      { operation: "test.paginate.single", paginate: true }
+    );
+    expect(out.results).toHaveLength(1);
+    expect(out.nextCursor).toBeNull();
+    expect(mockNotion.dataSources.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("paginate=true + 다중 페이지 (3 pages) 자동 루프 + 결과 합쳐짐", async () => {
+    mockNotion.dataSources.query
+      .mockResolvedValueOnce({
+        results: [makeFullPage("p1"), makeFullPage("p2")],
+        next_cursor: "cursor-1",
+      })
+      .mockResolvedValueOnce({
+        results: [makeFullPage("p3"), makeFullPage("p4")],
+        next_cursor: "cursor-2",
+      })
+      .mockResolvedValueOnce({
+        results: [makeFullPage("p5")],
+        next_cursor: null,
+      });
+    const out = await queryDataSource(
+      mockNotion,
+      "knowledgeBase",
+      { page_size: 2 },
+      { operation: "test.paginate.multi", paginate: true }
+    );
+    expect(out.results).toHaveLength(5);
+    expect(out.results.map((r: any) => r.id)).toEqual(["p1", "p2", "p3", "p4", "p5"]);
+    expect(out.nextCursor).toBeNull();
+    expect(mockNotion.dataSources.query).toHaveBeenCalledTimes(3);
+
+    // start_cursor가 2,3번째 호출에 정확히 전달되는지 검증
+    const call2 = mockNotion.dataSources.query.mock.calls[1][0];
+    const call3 = mockNotion.dataSources.query.mock.calls[2][0];
+    expect(call2.start_cursor).toBe("cursor-1");
+    expect(call3.start_cursor).toBe("cursor-2");
+  });
+
+  it("paginate=true 에서 MAX_PAGES(50) 도달 시 warning + 부분 결과 반환", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // 51회 응답 가능하도록 mock — wrapper는 50회에서 멈춰야 함
+    mockNotion.dataSources.query.mockImplementation(async () => ({
+      results: [makeFullPage(`page-${Math.random()}`)],
+      next_cursor: "always-has-more",
+    }));
+
+    const out = await queryDataSource(
+      mockNotion,
+      "projects",
+      {},
+      { operation: "test.paginate.max", paginate: true }
+    );
+
+    expect(mockNotion.dataSources.query).toHaveBeenCalledTimes(50);
+    expect(out.results).toHaveLength(50); // 페이지당 1건 × 50
+    expect(out.nextCursor).toBe("always-has-more"); // 마지막 cursor 보존 (호출처가 인지)
+
+    const warnCalls = warnSpy.mock.calls.flat();
+    const warned = warnCalls.some(
+      (msg) => typeof msg === "string" && msg.includes("MAX_PAGES (50) reached")
+    );
+    expect(warned).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it("paginate 미지정(default false) 면 next_cursor가 있어도 1회만 호출 (기존 호환)", async () => {
+    mockNotion.dataSources.query.mockResolvedValue({
+      results: [makeFullPage("p1")],
+      next_cursor: "more-available",
+    });
+    const out = await queryDataSource(
+      mockNotion,
+      "references",
+      {},
+      { operation: "test.paginate.disabled" }
+    );
+    expect(mockNotion.dataSources.query).toHaveBeenCalledTimes(1);
+    expect(out.nextCursor).toBe("more-available"); // 호출처가 직접 사용 가능
+  });
 });

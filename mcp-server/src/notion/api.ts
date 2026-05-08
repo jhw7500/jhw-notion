@@ -228,7 +228,19 @@ export interface QueryDataSourceMeta {
   attempts?: number;
   /** RateLimiter 주입 (테스트용) */
   limiter?: RateLimiter;
+  /**
+   * p1-3d: true 면 next_cursor 자동 루프 (max 50 pages = 5000건).
+   * 의도적 N건 cap 호출(history/context/status 등)은 미지정.
+   * 보고서 같은 "N건 모두 필요" 케이스(report/query.ts)만 활성화.
+   */
+  paginate?: boolean;
 }
+
+/**
+ * paginate 안전장치 — 무한 루프 차단 + 데이터 폭주 방지.
+ * 본 프로젝트 데이터 규모(~50건/DB)에 5000건은 충분.
+ */
+const MAX_PAGES = 50;
 
 /** v5 응답의 한 result item — 4가지 union (Page / DataSource × Full / Partial) */
 export type QueryDataSourceItem =
@@ -274,35 +286,66 @@ export async function queryDataSource(
 ): Promise<QueryDataSourceResult> {
   const dataSourceId = getDataSourceId(db);
   // Notion SDK 타입은 매우 엄격한 union — wrapper 안에서만 unknown으로 우회.
-  const requestArgs = {
+  const baseArgs = {
     data_source_id: dataSourceId,
     ...params,
-  } as Parameters<Client["dataSources"]["query"]>[0];
+  };
 
-  const res = await callNotion(() => notion.dataSources.query(requestArgs), {
-    operation: meta.operation,
-    attempts: meta.attempts,
-    limiter: meta.limiter,
-  });
+  const allResults: QueryDataSourceItem[] = [];
+  let currentCursor: string | undefined = params.start_cursor;
+  let lastNextCursor: string | null = null;
+  let lastIncomplete = false;
+  let pageCount = 0;
 
-  // v5 incomplete 감지 — cursor pagination 본격 도입은 P1-3d 분리. 여기선 alert만.
-  const requestStatus = (res as { request_status?: { type?: string; incomplete_reason?: string } })
-    .request_status;
-  const incomplete = requestStatus?.type === "incomplete";
-  if (incomplete) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `[notion.queryDataSource] ${meta.operation} incomplete:`,
-      requestStatus?.incomplete_reason ?? "unknown"
-    );
+  // p1-3d: paginate 미지정(또는 false) 시 1회 호출 (기존 동작 유지).
+  // paginate=true 면 next_cursor null 또는 MAX_PAGES 도달까지 자동 루프.
+  while (true) {
+    pageCount++;
+    const requestArgs = {
+      ...baseArgs,
+      ...(currentCursor !== undefined ? { start_cursor: currentCursor } : {}),
+    } as Parameters<Client["dataSources"]["query"]>[0];
+
+    const res = await callNotion(() => notion.dataSources.query(requestArgs), {
+      operation: meta.operation,
+      attempts: meta.attempts,
+      limiter: meta.limiter,
+    });
+
+    allResults.push(...res.results);
+    lastNextCursor = res.next_cursor;
+
+    // v5 incomplete 감지 — paginate=true 시에도 매 페이지에서 alert.
+    const requestStatus = (res as { request_status?: { type?: string; incomplete_reason?: string } })
+      .request_status;
+    const pageIncomplete = requestStatus?.type === "incomplete";
+    if (pageIncomplete) {
+      lastIncomplete = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[notion.queryDataSource] ${meta.operation} incomplete:`,
+        requestStatus?.incomplete_reason ?? "unknown"
+      );
+    }
+
+    // paginate 미활성: 1회 호출로 종료
+    if (!meta.paginate) break;
+    // 모든 페이지 소진
+    if (!lastNextCursor) break;
+    // 안전장치: MAX_PAGES 도달 — warning 후 종료 (lastNextCursor 보존하여 호출처가 인지 가능)
+    if (pageCount >= MAX_PAGES) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[notion.queryDataSource] ${meta.operation} MAX_PAGES (${MAX_PAGES}) reached at page ${pageCount}, returning partial results.`
+      );
+      break;
+    }
+    currentCursor = lastNextCursor;
   }
 
-  // 호출처는 page.properties[...] 패턴을 (page as any) 캐스팅으로 사용 (record/recall/report
-  // 9 도구 모두 동일 컨벤션). isFullPage 필터링은 SDK union을 좁히지만 mock test 호환성을
-  // 위해 results를 union 그대로 노출하고 cast 책임을 호출처에 둔다 (DRY는 wrapper 호출 일관성에서 충분).
   return {
-    results: res.results,
-    nextCursor: res.next_cursor,
-    incomplete,
+    results: allResults,
+    nextCursor: lastNextCursor,
+    incomplete: lastIncomplete,
   };
 }

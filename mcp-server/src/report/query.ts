@@ -103,7 +103,9 @@ export async function queryReportItems(
             ],
         page_size: 100,
       },
-      { operation: `report.query.${db}` }
+      // p1-3d: 보고서는 N건 모두 필요 — wrapper의 paginate 옵션으로 next_cursor 자동 루프.
+      // 다른 9 호출(history/context/status 등)은 의도적 N건 cap이라 paginate 미지정.
+      { operation: `report.query.${db}`, paginate: true }
     );
 
     for (const page of res.results as any[]) {
