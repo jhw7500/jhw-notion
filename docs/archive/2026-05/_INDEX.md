@@ -33,12 +33,27 @@
 | **Implementation Commit** | `12a815c feat(p1-3b): data_source_id 매핑 인프라 (Do 단계)` |
 | **Side Improvements** | Stop hook(`stop-text-required.py`) 도입 + CLAUDE.md 위반 사례 추가 + Notion 토큰 source 일원화 |
 
+### p1-3c-datasource-query-migration
+
+| Item | Value |
+|---|---|
+| **PDCA Cycle** | #4 |
+| **Started** | 2026-05-08 |
+| **Archived** | 2026-05-08 |
+| **Match Rate** | 99.25% |
+| **Iteration Count** | 0 |
+| **Summary** | Notion v5 SDK(@notionhq/client v2.3.0 → v5.20.0) + `notion.dataSources.query()` 호출 일괄 마이그레이션. `notion/api.ts queryDataSource` wrapper 1개로 production 10 호출 통일 (getDataSourceId 매핑 + callNotion + union 노출 + incomplete warning 캡슐화). mock 11 파일 + helper 마이그레이션. live 회귀 7건 + v5 응답 union 검증 신규 1건. 메모리 필터(report/query.ts:117-119) 보험 보존. 9 MCP 도구 외부 인터페이스 무변화 |
+| **Documents** | [Plan](./p1-3c-datasource-query-migration/p1-3c-datasource-query-migration.plan.md) · [Design](./p1-3c-datasource-query-migration/p1-3c-datasource-query-migration.design.md) · [Analysis](./p1-3c-datasource-query-migration/p1-3c-datasource-query-migration.analysis.md) · [Report](./p1-3c-datasource-query-migration/p1-3c-datasource-query-migration.report.md) |
+| **Implementation Commits** | `210cba4` chore(deps) → `ec274e7` feat(wrapper) → `6822467` refactor(callers) → `30b4438` test(mocks) → `e48b04a` test(live) (5단계, bisect 친화) |
+| **Architecture** | Option C (Pragmatic) — api.ts 확장, 신규 파일 0 |
+| **Mid-cycle Adjustment** | wrapper isFullPage 필터 → union 노출 (mock 호환을 위한 정정) |
+
 ---
 
 ## Statistics
 
 | Metric | Value |
 |---|---|
-| Total archived features | 2 |
-| Average match rate | 98.6% |
-| Total cycles | 2 |
+| Total archived features | 3 |
+| Average match rate | 98.83% |
+| Total cycles | 3 |
