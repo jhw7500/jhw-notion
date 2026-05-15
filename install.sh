@@ -31,12 +31,14 @@ register_mcp() {
     const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
     s.mcpServers = s.mcpServers || {};
     s.mcpServers['jhw-notion'] = {
+      type: 'stdio',
       command: 'node',
-      args: ['$MCP_ENTRY']
+      args: ['$MCP_ENTRY'],
+      env: { NOTION_API_KEY: '\${NOTION_API_KEY}' }
     };
     fs.writeFileSync(p, JSON.stringify(s, null, 2));
   "
-  ok "$tui_name: settings.json에 jhw-notion 서버 추가"
+  ok "$tui_name: $(basename "$settings_file")에 jhw-notion 서버 추가"
 }
 
 register_opencode_mcp() {
@@ -133,7 +135,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   done
 
   echo "[2/2] MCP 서버 등록 해제"
-  unregister_mcp "$HOME/.claude/settings.json" "Claude"
+  unregister_mcp "$HOME/.claude.json" "Claude"
   unregister_mcp "$HOME/.gemini/settings.json" "Gemini"
   unregister_opencode_mcp "$HOME/.config/opencode/opencode.json"
 
@@ -208,7 +210,7 @@ fi
 echo ""
 echo "[4/4] MCP 서버 등록"
 if [ -d "$CLAUDE_DIR" ]; then
-  register_mcp "$CLAUDE_DIR/settings.json" "Claude"
+  register_mcp "$HOME/.claude.json" "Claude"
 fi
 if [ -d "$GEMINI_DIR" ]; then
   register_mcp "$GEMINI_DIR/settings.json" "Gemini"
