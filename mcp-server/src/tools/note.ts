@@ -4,6 +4,7 @@ import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG, REPORT_VALUES } from "../config.js";
 import { resolveProjectRelationId } from "./record.js";
 import { callNotion } from "../notion/api.js";
+import { paragraphBlocks } from "../notion/blocks.js";
 
 // KB DB의 category select 옵션 (8종)
 const KB_CATEGORIES = [
@@ -70,15 +71,9 @@ export function registerNote(server: McpServer) {
         }
       }
 
-      const children: any[] = [
-        {
-          object: "block",
-          type: "paragraph",
-          paragraph: {
-            rich_text: [{ type: "text", text: { content } }],
-          },
-        },
-      ];
+      // 본문을 paragraph block 배열로 변환 — 긴 본문도 \n\n 기준으로 자동 분할
+      // (record.ts와 동일 헬퍼 사용, 2000자 한도 안전망 포함)
+      const children = paragraphBlocks(content);
 
       const page = await callNotion(
         () =>

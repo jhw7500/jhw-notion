@@ -103,7 +103,12 @@ description: 세션 마무리 시 Notion 저장 후보 정리 및 승인 저장
    - "1번 분리해" → 1번에 합쳐진 원본 항목들을 다시 별도 항목으로 풀어 표 갱신 후 재승인 요청
    - "취소" → 저장 안 함
 
-6. 승인된 항목마다 `jhw_record` (또는 `jhw_note`) MCP 도구를 호출한다. `properties.report`는 반드시 포함한다.
+6. 승인된 항목마다 `jhw_record` (또는 `jhw_note`) MCP 도구를 호출한다.
+   - `properties.report`는 반드시 포함한다.
+   - **본문이 있는 항목은 `content` 파라미터로 함께 저장한다** (3.5의 paragraph 가드를 적용한 markdown).
+     preferences/projects/references/decisionLog 모두 `jhw_record.content` 지원.
+     knowledgeBase는 `jhw_note.content` 사용.
+     별도 `notion-update-page` 호출은 불필요.
 
 7. 저장 결과 요약을 보여준다.
 

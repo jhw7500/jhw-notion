@@ -6,12 +6,20 @@ import { NOTION_CONFIG, DatabaseName, REPORT_VALUES } from "../config.js";
 import { resolveProjectId } from "../notion/resolve-project.js";
 import { callNotion } from "../notion/api.js";
 import { buildPropertiesFromSchema } from "../notion/property-builder.js";
+import { paragraphBlocks } from "../notion/blocks.js";
 
 const RecordInput = z.object({
   db: z
     .enum(["decisionLog", "preferences", "projects", "references", "knowledgeBase"])
     .describe("저장 대상 DB"),
   title: z.string().describe("레코드 제목"),
+  content: z
+    .string()
+    .optional()
+    .describe(
+      "본문 markdown (선택). `\\n\\n`으로 paragraph 분리. 각 paragraph 2000자 한도(초과 시 자동 split). " +
+        "preferences/projects 등 properties에 본문 필드가 없는 DB에서 특히 유용."
+    ),
   properties: z
     .object({
       status: z.string().optional().describe("상태 (확정/검토중/폐기 등)"),
@@ -79,7 +87,7 @@ export function registerRecord(server: McpServer) {
     "jhw_record",
     "Notion AI Workspace DB에 레코드 생성",
     RecordInput.shape,
-    async ({ db, title, properties }) => {
+    async ({ db, title, content, properties }) => {
       const notion = getNotionClient();
       const dbId = NOTION_CONFIG.databases[db as DatabaseName];
 
@@ -96,11 +104,13 @@ export function registerRecord(server: McpServer) {
         notion
       );
 
+      const children = paragraphBlocks(content);
       const page = await callNotion(
         () =>
           notion.pages.create({
             parent: { database_id: dbId },
             properties: notionProps,
+            ...(children.length > 0 ? { children } : {}),
           }),
         { operation: `${db}.pages.create` }
       );
