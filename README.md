@@ -61,7 +61,8 @@ TUI에서 `/jhw:` 접두사로 사용:
 ```
 /jhw:record   — 확정된 정보 즉시 저장
 /jhw:note     — Knowledge Base에 기술 지식 메모
-/jhw:review   — 세션 마무리 리뷰 (저장 후보 추출)
+/jhw:review   — 세션 마무리 리뷰 (저장 후보 추출 + 저장가치 평가)
+/jhw:compact  — 저장 레코드 정리 (비슷한 것 합치기 + 긴 본문 요약)
 /jhw:delete   — 레코드 삭제/폐기
 /jhw:search   — 키워드 통합 검색
 /jhw:context  — 프로젝트 컨텍스트 로드
