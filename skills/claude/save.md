@@ -34,6 +34,7 @@ argument-hint: "[--db <db>] [--delete <id>] [--hard] [내용]"
 | `pim-app*` | pim-app |
 | `pim-driver-cam*` | pim-driver-cam |
 | `pim-driver-spi*` | pim-driver-spi |
+| `wlan-package*` | wlan-app |
 | `wlan-bsp*` | wlan-bsp |
 | `wlan-app*` | wlan-app |
 | `wlan-driver*` | wlan-driver |

@@ -14,7 +14,7 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
 2. **각 후보별로 `report` 추론** (2단계 — 확실 우선, 추정은 `(추정)` 표시 + 확인):
 
    ### 2.1 cwd 슬러그 매핑 (확실)
-   작업 디렉토리 슬러그 → report 매핑 (`save.md` 표: `pim-check/pim-test*`→pim-test, `pim-app*`→pim-app, `pim-driver-cam*`→pim-driver-cam, `pim-driver-spi*`→pim-driver-spi, `wlan-bsp*`→wlan-bsp, `wlan-app*`→wlan-app, `wlan-driver*`→wlan-driver, `wlan-test*`→wlan-test, 기타 etc, 개인메모 none). 슬러그가 명확히 매칭되면 **확정**으로 표시(마커 없음).
+   작업 디렉토리 슬러그 → report 매핑 (`save.md` 표: `pim-check/pim-test*`→pim-test, `pim-app*`→pim-app, `pim-driver-cam*`→pim-driver-cam, `pim-driver-spi*`→pim-driver-spi, `wlan-package*`→wlan-app, `wlan-bsp*`→wlan-bsp, `wlan-app*`→wlan-app, `wlan-driver*`→wlan-driver, `wlan-test*`→wlan-test, 기타 etc, 개인메모 none). 슬러그가 명확히 매칭되면 **확정**으로 표시(마커 없음).
 
    ### 2.2 내용 기반 추정 (cwd 매칭 실패 `etc`/`none`, 또는 후보 도메인이 cwd와 명백히 다를 때)
    후보 본문의 도메인 신호로 report를 **추정**한다. 추정값은 표의 report 옆에 **`(추정)`**을 붙이고, **저장 전 사용자 확인 필수** (워크스페이스 "report 임의 매핑 금지" 규칙 — 임의 채택 금지).
