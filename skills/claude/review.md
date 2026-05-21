@@ -11,7 +11,29 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
    - 새로운 참조 문서 (References 후보)
    - 기술 지식/팁 (Knowledge Base 후보 — `/jhw:note`로 처리)
 
-2. **각 후보별로 `report` 자동 추론**: 작업 디렉토리 슬러그 → report 매핑 (`/jhw:record` 스킬 표 참조). 매칭 실패 시 표에서 비워두고 사용자가 일괄 입력 가능.
+2. **각 후보별로 `report` 추론** (2단계 — 확실 우선, 추정은 `(추정)` 표시 + 확인):
+
+   ### 2.1 cwd 슬러그 매핑 (확실)
+   작업 디렉토리 슬러그 → report 매핑 (`save.md` 표: `pim-check/pim-test*`→pim-test, `pim-app*`→pim-app, `pim-driver-cam*`→pim-driver-cam, `pim-driver-spi*`→pim-driver-spi, `wlan-bsp*`→wlan-bsp, `wlan-app*`→wlan-app, `wlan-driver*`→wlan-driver, `wlan-test*`→wlan-test, 기타 etc, 개인메모 none). 슬러그가 명확히 매칭되면 **확정**으로 표시(마커 없음).
+
+   ### 2.2 내용 기반 추정 (cwd 매칭 실패 `etc`/`none`, 또는 후보 도메인이 cwd와 명백히 다를 때)
+   후보 본문의 도메인 신호로 report를 **추정**한다. 추정값은 표의 report 옆에 **`(추정)`**을 붙이고, **저장 전 사용자 확인 필수** (워크스페이스 "report 임의 매핑 금지" 규칙 — 임의 채택 금지).
+
+   | 본문 도메인 신호 | 추정 report |
+   |---|---|
+   | gstApp / 녹화 / mux / RTSP / parser.cpp | pim-app |
+   | 카메라 드라이버 / max9296 / AP1302 / AR0234 / edgeconf VHL_CAM / ISP / GMSL | pim-driver-cam |
+   | SPI / sc16is7xx | pim-driver-spi |
+   | pim-check / 검증 자동화 / setup.py / verify_retry / chk_cam_operate | pim-test |
+   | mlan / moal / mcstiercfg / wbridge / L2 bridge / wlan 드라이버 | wlan-driver |
+   | pcap / tshark / 802.11 캡처 / RTT / decrypt | wlan-test |
+   | Yocto / iMX BSP / DTS / 커널 빌드 (wlan 계열) | wlan-bsp |
+   | Notion / 스킬 / MCP / 도구 / 환경 설정 | etc |
+
+   ### 2.3 추정 규칙
+   - 도메인 신호가 약하거나 **둘 이상 충돌**하면 추정하지 말고 **빈 값**으로 둔다 (보수적).
+   - 추정은 후보 제시일 뿐 — 사용자가 표에서 확정/수정한다. 확정(2.1)과 `(추정)`(2.2)을 표에서 구분 표시.
+   - cwd 슬러그 매핑이 명확하면(2.1) 그게 우선. 단 cwd와 후보 본문 도메인이 명백히 다르면 `(추정)`을 같이 제시해 사용자가 고를 수 있게 한다.
 
 3. **자동 중복 제거·합치기 + 저장가치 평가** (사용자 표시 전):
    추출된 후보들을 다음 규칙으로 정리(중복 제거·합치기)하고, 최종 후보 각각의 저장가치를 평가한 뒤 4번 표를 만든다.
@@ -105,13 +127,14 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
    ```
    📋 세션 리뷰 — Notion 저장 후보 (중복/합치기 + 저장가치 평가 적용 후)
    ───────────────────────────────────────────────────────────────────────────────────────────
-   #  DB              제목                                report         가치  근거                      저장?
-   1  Knowledge Base  edgeconf 채널 설정 종합 (통합 3개)  pim-driver-cam 상    재사용 빈번·코드서 유추불가  ✅
-   2  Knowledge Base  비채널 키 의미 정정 (통합 2개)      pim-driver-cam 중    참고용, 검색가치 보통        ✅
-   3  References      설정 가이드 + release note 보강     pim-driver-cam 중    참고용, 검색가치 보통        ✅
-   4  Preferences     문서 스타일 — 운영자용 요약 선호    etc            하    이미 저장된 선호와 중복      ❌
+   #  DB              제목                                report           가치  근거                      저장?
+   1  Knowledge Base  edgeconf 채널 설정 종합 (통합 3개)  pim-driver-cam   상    재사용 빈번·코드서 유추불가  ✅
+   2  Knowledge Base  raw socket 송수신 키 정정          pim-app (추정)   중    참고용, 검색가치 보통        ✅
+   3  References      설정 가이드 + release note 보강     pim-driver-cam   중    참고용, 검색가치 보통        ✅
+   4  Preferences     문서 스타일 — 운영자용 요약 선호    etc              하    이미 저장된 선호와 중복      ❌
    ───────────────────────────────────────────────────────────────────────────────────────────
    원본 N개 → 통합 후 M개 (합치기 K건) · 가치 상 a / 중 b / 하 c
+   report: 확정(마커없음) / (추정)=내용 기반, 확인 필요 / 빈칸=신호 약함, 보충 요망
    기본 저장 대상: 상·중 (하는 옵트인) → "OK"하면 ✅ 항목만 저장
 
    전체 저장? 또는:
@@ -119,7 +142,8 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
      - 하까지 전부: "전체 저장" (하 등급 포함)
      - 가치 등급 조정: "4번 가치=상" → 저장? 자동 갱신(상·중→✅)
      - 번호로 제외: "2번 빼"
-     - report 일괄 변경: "3번 report=wlan-bsp"
+     - report 변경/확정: "3번 report=wlan-bsp" (추정 확정도 동일: "2번 report=pim-app")
+     - 추정 일괄 수락: "추정 OK" → 모든 `(추정)` report를 확정으로
      - 합치기 되돌리기: "1번 분리해" → 합쳐진 원본 항목들 다시 분리
      - 취소: "취소"
    ```
@@ -130,9 +154,12 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
    - "4번 저장" → 하 등급 4번을 옵트인(저장? `✅`)으로 켜고 저장
    - "4번 가치=상" → 4번 가치 등급 조정 → 저장? 자동 갱신(상·중→✅) 후 저장
    - "2번 빼" → 2번 제외하고 저장
-   - "3번 report=wlan-bsp" → 3번의 report만 변경 후 저장
+   - "3번 report=wlan-bsp" → 3번의 report 변경/확정 후 저장
+   - "추정 OK" → 모든 `(추정)` report를 그대로 확정 후 저장
    - "1번 분리해" → 1번에 합쳐진 원본 항목들을 다시 별도 항목으로 풀어 표 갱신 후 재승인 요청
    - "취소" → 저장 안 함
+
+   **`(추정)` report가 남아 있으면 그냥 "OK"로 넘기지 말고**, 저장 직전 "2번 report 추정 pim-app — 맞나요?"로 한 번 더 확인한다 (임의 채택 금지). 사용자가 확정/수정한 뒤 저장.
 
 6. 승인된 항목마다 `jhw_record` (또는 `jhw_note`) MCP 도구를 호출한다.
    - `properties.report`는 반드시 포함한다.
@@ -156,5 +183,6 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
 - 이미 저장된 항목은 중복 제안하지 않는다.
 - **저장가치 평가는 합치기 후 최종 후보에 적용**한다. 기준: 재사용성·검색가치·비자명성·지속성·중복 (§3.6).
 - **가치 '하'는 기본 제외(❌) 옵트인.** "OK"는 상·중만 저장, "전체 저장"은 하 포함, "N번 저장"은 특정 하 항목만 켠다.
-- **`report` 자동 추론 우선**, 매칭 실패는 표에 빈 값으로 남겨 사용자가 일괄 보충.
+- **`report`는 2단계 추론**(§2): cwd 슬러그 매핑(확실) → 실패 시 본문 도메인 기반 추정(`(추정)` 표시). 신호 약하거나 충돌하면 빈 값.
+- **추정 report는 임의 채택 금지** — 저장 전 사용자 확인 필수("report 임의 매핑 금지" 규칙). 확정/`(추정)`/빈칸을 표에서 구분.
 - 보고서에 노출 원치 않는 항목은 `report=none`으로 명시 (보고 제외).
