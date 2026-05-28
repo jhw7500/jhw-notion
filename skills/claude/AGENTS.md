@@ -15,6 +15,7 @@ AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬. 각 스킬은 사용자 
 | `recall.md` | 통합 회상 — search/context/history 통합 (모드 자동 판별) |
 | `review.md` | 세션 마무리 시 저장 후보 정리 + 저장가치 평가(상/중/하) + 승인 저장 |
 | `compact.md` | 저장된 레코드 사후 정리 — 합치기(N→1) + 긴 본문 요약 + 저장가치 평가(상/중/하, 하=폐기 옵트인) (파괴적, 승인 필수) |
+| `match.md` | 신규 내용·키워드를 기존 Notion과 대조 — 4-tier verdict(NEW/SIMILAR/AUGMENT/DUPLICATE) 후 신규 저장·기존 append·skip 처리 |
 | `report.md` | (3주차 신규 예정) 일/주/월 보고서 — preview + export |
 | `status.md` | 워크스페이스 현황 대시보드 |
 | `import.md` | Notion 검색 결과 → 현재 프로젝트 memory 폴더로 불러오기 |
