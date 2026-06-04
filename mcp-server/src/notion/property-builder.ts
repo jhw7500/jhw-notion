@@ -5,12 +5,21 @@ import type { Client } from "@notionhq/client";
 import { DATABASE_SCHEMAS } from "../schema.js";
 import type { DatabaseName } from "../config.js";
 import { resolveProjectId } from "./resolve-project.js";
+import {
+  normalizeSelectValue,
+  normalizeMultiSelectValues,
+} from "./field-vocab.js";
 
 export interface BuildOptions {
   /** 자동 today fill을 켤지 (기본 true). date/start_date에 입력 없을 때 today 주입. */
   autoFillToday?: boolean;
   /** 미리 resolve된 project page ID. 있으면 resolveProject 호출 skip. */
   presetProjectId?: string;
+  /**
+   * multi_select 어휘 가드에서 미등록 값이 drop될 때 경고 메시지를 누적할 배열.
+   * 호출부(record/note 등)가 전달하면 사용자 응답에 노출할 수 있다.
+   */
+  warnings?: string[];
 }
 
 const TODAY_FIELDS = new Set(["date", "start_date"]);
@@ -57,7 +66,12 @@ export async function buildPropertiesFromSchema(
     switch (meta.type) {
       case "select": {
         const value = missing ? meta.default : String(raw);
-        if (value) props[key] = { select: { name: value } };
+        // 어휘 가드: 별칭 정규화 후 미허용이면 throw (vocab 없는 필드는 trim만).
+        if (value) {
+          props[key] = {
+            select: { name: normalizeSelectValue(db, key, value) },
+          };
+        }
         break;
       }
       case "rich_text": {
@@ -70,11 +84,22 @@ export async function buildPropertiesFromSchema(
       }
       case "multi_select": {
         if (!missing) {
-          const items = String(raw)
-            .split(",")
-            .map((s) => ({ name: s.trim() }))
-            .filter((i) => i.name);
-          if (items.length > 0) props[key] = { multi_select: items };
+          // 어휘 가드: 별칭 정규화 + 중복제거. 미등록 값은 drop하고 경고 수집.
+          const { kept, dropped } = normalizeMultiSelectValues(
+            db,
+            key,
+            String(raw).split(",")
+          );
+          if (dropped.length > 0 && options.warnings) {
+            options.warnings.push(
+              `[${db}.${key}] 미등록 값 ${dropped.length}개 제외: ${dropped.join(", ")}`
+            );
+          }
+          if (kept.length > 0) {
+            props[key] = {
+              multi_select: kept.map((name) => ({ name })),
+            };
+          }
         }
         break;
       }

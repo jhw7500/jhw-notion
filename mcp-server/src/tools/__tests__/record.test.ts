@@ -131,4 +131,35 @@ describe("jhw_record", () => {
     const createCall = mockClient.pages.create.mock.calls[0][0];
     expect(createCall.properties["project"]).toBeUndefined();
   });
+
+  it("미허용 select 값이면 저장하지 않고 에러 메시지를 반환한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
+
+    const result = await handler({
+      db: "projects",
+      title: "P",
+      properties: { status: "이상한상태zzz" },
+    });
+
+    expect(result.content[0].text).toContain("미허용");
+    expect(result.content[0].text).toContain("status");
+    expect(mockClient.pages.create).not.toHaveBeenCalled();
+  });
+
+  it("미등록 multi_select 값은 drop하고 응답 warnings에 포함한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
+
+    const result = await handler({
+      db: "knowledgeBase",
+      title: "K",
+      properties: { tags: "iMX93, zzz없는태그" },
+    });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.properties["tags"].multi_select).toEqual([
+      { name: "iMX93" },
+    ]);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warnings.join(" ")).toContain("zzz없는태그");
+  });
 });
