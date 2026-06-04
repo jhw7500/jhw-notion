@@ -17,12 +17,13 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 - `/jhw:match --from-review` — 직전 `/jhw:review`의 후보 카드를 대화 히스토리에서 입력으로 사용
 - `/jhw:match --db knowledgeBase "AWB 매핑"` — DB 한정
 - `/jhw:match --report pim-driver-cam "..."` — report 필터
-- `/jhw:match` — 인자 없으면 "어떤 내용을 대조할까요?" 묻고 진행
+- `/jhw:match` — 인자 없으면: 직전 대화에 `/jhw:review` 후보 카드가 있으면 그것을 입력으로 사용(= `--from-review` 자동), 없으면 "어떤 내용을 대조할까요?" 묻고 진행
 
 ## 흐름
 
 1. **입력 파싱**
    - `--from-review`: 대화 컨텍스트에서 직전 `/jhw:review`의 카드 후보(번호·DB·제목·본문) 추출.
+   - **인자 없음**: 직전 대화에 `/jhw:review` 후보 카드가 있으면 `--from-review`로 간주해 자동 추출. 없으면 "어떤 내용을 대조할까요?"로 되묻고 진행. (review 직후 대조가 가장 흔한 사용이라 `--from-review`를 사실상 기본값으로.)
    - 키워드/본문 텍스트: 그대로 사용.
    - DB 미지정 시 입력 유형 자동 판별 (knowledgeBase 기본, --db로 명시).
 
