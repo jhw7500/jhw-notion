@@ -39,6 +39,7 @@ argument-hint: "[--db <db>] [--delete <id>] [--hard] [내용]"
 | `wlan-app*` | wlan-app |
 | `wlan-driver*` | wlan-driver |
 | `wlan-test*` | wlan-test |
+| `wlan-opc*` | wlan-app |
 | 기타 매핑 미스 | etc |
 | 개인 메모/note | none |
 
