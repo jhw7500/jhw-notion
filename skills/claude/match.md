@@ -14,15 +14,16 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 ## 사용
 
 - `/jhw:match "edgeconf 채널 설정"` — 키워드로 기존 Notion 대조 + 카드
-- `/jhw:match --from-review` — 직전 `/jhw:review`의 후보 카드를 대화 히스토리에서 입력으로 사용
+- `/jhw:match --from-review` — 직전 `/jhw:review` 후보 카드를 **명시적으로 강제** 사용 (무인자 자동감지와 결과는 같지만, 의도를 분명히 하거나 자동감지가 빗나갈 때 사용)
 - `/jhw:match --db knowledgeBase "AWB 매핑"` — DB 한정
 - `/jhw:match --report pim-driver-cam "..."` — report 필터
-- `/jhw:match` — 인자 없으면 "어떤 내용을 대조할까요?" 묻고 진행
+- `/jhw:match` — 인자 없으면: 대화에서 **가장 마지막** `/jhw:review` 후보 카드가 있고 그 이후 새 저장/대조가 없었으면 그것을 입력으로 사용(= `--from-review` 자동), 없거나 stale하면 "어떤 내용을 대조할까요?" 묻고 진행
 
 ## 흐름
 
 1. **입력 파싱**
    - `--from-review`: 대화 컨텍스트에서 직전 `/jhw:review`의 카드 후보(번호·DB·제목·본문) 추출.
+   - **인자 없음**: 대화에서 **가장 마지막** `/jhw:review` 후보 카드를 찾아 `--from-review`로 간주해 자동 추출한다. 단 그 review 이후 새 저장/대조가 끼어들었거나(stale) 후보 카드를 못 찾으면 "어떤 내용을 대조할까요?"로 되묻고 진행. (review 직후 대조가 가장 흔한 사용 패턴이라 무인자에서 이를 기본 동작으로 둔 것 — `--from-review` 플래그 자체의 기본 의미가 바뀐 건 아님.)
    - 키워드/본문 텍스트: 그대로 사용.
    - DB 미지정 시 입력 유형 자동 판별 (knowledgeBase 기본, --db로 명시).
 
@@ -135,7 +136,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 
 ## 사용 시점
 
-- `/jhw:review` 직후 의심나는 항목 사후 점검 (`/jhw:match --from-review`)
+- `/jhw:review` 직후 의심나는 항목 사후 점검 — 무인자 `/jhw:match`로 충분(가장 마지막 review 자동 사용), 명시하려면 `/jhw:match --from-review`
 - 단건 저장 전 미리 검사 (`/jhw:match "<제목 또는 키워드>"`)
 - "이 주제 기존에 뭐 있나?" 빠른 확인
 - 정기적인 신규 후보 정리
@@ -150,6 +151,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 - **AUGMENT에 target_url이 비어 있으면 임의 신규 전환 금지** — 사용자 확인 필수.
 - **/jhw:compact와 역할 구분**: compact는 *기존 ↔ 기존*, match는 *신규 ↔ 기존*.
 - **/jhw:review와 역할 구분**: review는 가벼운 저장 흐름, match는 옵트인 대조.
+- **무인자 자동 from-review**: 인자 없이 `/jhw:match` 호출 시 대화의 **가장 마지막** `/jhw:review` 후보 카드를 자동 입력으로 사용한다(그 이후 새 저장/대조가 없을 때만). 없거나 stale하면 되묻는다. 명시적 `--from-review`는 강제용.
 - 매칭 결과 0건이면 카드에 NEW로 표시. 매칭이 있어도 모두 SIMILAR면 신규 저장이 기본 동작.
 
 ## 참고
