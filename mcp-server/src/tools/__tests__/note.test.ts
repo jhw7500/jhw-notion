@@ -76,4 +76,33 @@ describe("jhw_note", () => {
     ]);
     expect(createCall.properties.report.select.name).toBe("wlan-bsp");
   });
+
+  it("미등록 tags는 drop하고 허용 태그만 저장한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "n", url: "u" });
+
+    await handler({
+      title: "메모",
+      content: "내용",
+      tags: "iMX93, 절대없는태그zzz, BSP",
+    });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.properties.tags.multi_select).toEqual([
+      { name: "iMX93" },
+      { name: "BSP" },
+    ]);
+  });
+
+  it("drop된 tags가 있으면 응답 warnings에 포함한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "n", url: "u" });
+
+    const result = await handler({
+      title: "메모",
+      content: "내용",
+      tags: "iMX93, 절대없는태그zzz",
+    });
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warnings.join(" ")).toContain("절대없는태그zzz");
+  });
 });

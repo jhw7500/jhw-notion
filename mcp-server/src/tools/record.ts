@@ -6,6 +6,7 @@ import { NOTION_CONFIG, DatabaseName, REPORT_VALUES } from "../config.js";
 import { resolveProjectId } from "../notion/resolve-project.js";
 import { callNotion } from "../notion/api.js";
 import { buildPropertiesFromSchema } from "../notion/property-builder.js";
+import { FieldValidationError } from "../notion/field-vocab.js";
 import { paragraphBlocks } from "../notion/blocks.js";
 
 const RecordInput = z.object({
@@ -75,11 +76,12 @@ async function buildNotionProperties(
   db: DatabaseName,
   title: string,
   props: any,
-  notion: Client
+  notion: Client,
+  warnings?: string[]
 ) {
   const mapped: Record<string, any> = { ...(props ?? {}) };
   if (props?.stack !== undefined) mapped.tech_stack = props.stack;
-  return buildPropertiesFromSchema(db, title, mapped, notion);
+  return buildPropertiesFromSchema(db, title, mapped, notion, { warnings });
 }
 
 export function registerRecord(server: McpServer) {
@@ -97,12 +99,25 @@ export function registerRecord(server: McpServer) {
         };
       }
 
-      const notionProps = await buildNotionProperties(
-        db as DatabaseName,
-        title,
-        properties,
-        notion
-      );
+      // 어휘 가드: select 미허용은 throw(저장 차단), multi_select 미등록은 drop+경고.
+      const warnings: string[] = [];
+      let notionProps: Record<string, any>;
+      try {
+        notionProps = await buildNotionProperties(
+          db as DatabaseName,
+          title,
+          properties,
+          notion,
+          warnings
+        );
+      } catch (e) {
+        if (e instanceof FieldValidationError) {
+          return {
+            content: [{ type: "text" as const, text: e.message }],
+          };
+        }
+        throw e;
+      }
 
       const children = paragraphBlocks(content);
       const page = await callNotion(
@@ -120,7 +135,13 @@ export function registerRecord(server: McpServer) {
           {
             type: "text" as const,
             text: JSON.stringify(
-              { id: page.id, url: (page as any).url, db, title },
+              {
+                id: page.id,
+                url: (page as any).url,
+                db,
+                title,
+                ...(warnings.length > 0 ? { warnings } : {}),
+              },
               null,
               2
             ),

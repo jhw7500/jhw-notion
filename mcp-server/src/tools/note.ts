@@ -5,6 +5,7 @@ import { NOTION_CONFIG, REPORT_VALUES } from "../config.js";
 import { resolveProjectRelationId } from "./record.js";
 import { callNotion } from "../notion/api.js";
 import { paragraphBlocks } from "../notion/blocks.js";
+import { normalizeMultiSelectValues } from "../notion/field-vocab.js";
 
 // KB DB의 category select 옵션 (8종)
 const KB_CATEGORIES = [
@@ -49,6 +50,7 @@ export function registerNote(server: McpServer) {
         title: { title: [{ text: { content: title } }] },
         date: { date: { start: new Date().toISOString().split("T")[0] } },
       };
+      const warnings: string[] = [];
 
       if (summary) {
         properties["summary"] = { rich_text: [{ text: { content: summary } }] };
@@ -57,9 +59,22 @@ export function registerNote(server: McpServer) {
         properties["category"] = { select: { name: category } };
       }
       if (tags) {
-        properties["tags"] = {
-          multi_select: tags.split(",").map((s) => ({ name: s.trim() })),
-        };
+        // 어휘 가드: 별칭 정규화 + 중복제거. 미등록 태그는 drop하고 경고.
+        const { kept, dropped } = normalizeMultiSelectValues(
+          "knowledgeBase",
+          "tags",
+          tags.split(",")
+        );
+        if (dropped.length > 0) {
+          warnings.push(
+            `[knowledgeBase.tags] 미등록 값 ${dropped.length}개 제외: ${dropped.join(", ")}`
+          );
+        }
+        if (kept.length > 0) {
+          properties["tags"] = {
+            multi_select: kept.map((name) => ({ name })),
+          };
+        }
       }
       if (report) {
         properties["report"] = { select: { name: report } };
@@ -90,7 +105,12 @@ export function registerNote(server: McpServer) {
           {
             type: "text" as const,
             text: JSON.stringify(
-              { id: page.id, url: (page as any).url, title },
+              {
+                id: page.id,
+                url: (page as any).url,
+                title,
+                ...(warnings.length > 0 ? { warnings } : {}),
+              },
               null,
               2
             ),

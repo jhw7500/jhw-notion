@@ -68,7 +68,7 @@ describe("buildPropertiesFromSchema", () => {
     const props = await buildPropertiesFromSchema(
       "references",
       "T",
-      { url: "https://example.com", tool: "vitest,tsc" },
+      { url: "https://example.com", tool: "bash,jq" },
       notion as any
     );
     expect(props.url.url).toBe("https://example.com");
@@ -80,7 +80,7 @@ describe("buildPropertiesFromSchema", () => {
     const props = await buildPropertiesFromSchema(
       "preferences",
       "T",
-      { project: "test", category: "AI 사용" },
+      { project: "test", category: "AI 사용 정책" },
       notion as any
     );
     expect(props.project).toBeUndefined();

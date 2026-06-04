@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
 import { callNotion } from "../notion/api.js";
+import { normalizeMultiSelectValues } from "../notion/field-vocab.js";
 
 const StartInput = z.object({
   name: z.string().describe("프로젝트명"),
@@ -28,7 +29,19 @@ export function registerStart(server: McpServer) {
         "start_date": { date: { start: today } },
       };
       if (repo) projectProps["repo"] = { rich_text: [{ text: { content: repo } }] };
-      if (stack) projectProps["tech_stack"] = { multi_select: stack.split(",").map((s: string) => ({ name: s.trim() })) };
+      if (stack) {
+        // 어휘 가드: 별칭 정규화 + 중복제거, 미등록 스택은 drop.
+        const { kept } = normalizeMultiSelectValues(
+          "projects",
+          "tech_stack",
+          stack.split(",")
+        );
+        if (kept.length > 0) {
+          projectProps["tech_stack"] = {
+            multi_select: kept.map((name) => ({ name })),
+          };
+        }
+      }
 
       const projectPage = await callNotion(
         () =>

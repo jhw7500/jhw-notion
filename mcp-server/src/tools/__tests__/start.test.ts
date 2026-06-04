@@ -70,4 +70,21 @@ describe("jhw_start", () => {
     expect(decisionCreate.properties["project"].rich_text).toBeUndefined();
     expect(decisionCreate.properties["rationale"].rich_text[0].text.content).toBe("설명 텍스트");
   });
+
+  it("미등록 tech_stack 값은 drop하고 허용 스택만 저장한다", async () => {
+    mockClient.pages.create
+      .mockResolvedValueOnce({ id: "p", url: "u" })
+      .mockResolvedValueOnce({ id: "d", url: "u" });
+
+    await handler({
+      name: "P",
+      description: "d",
+      stack: "Python, 절대없는스택zzz",
+    });
+
+    const projectCreate = mockClient.pages.create.mock.calls[0][0];
+    expect(projectCreate.properties.tech_stack.multi_select).toEqual([
+      { name: "Python" },
+    ]);
+  });
 });
