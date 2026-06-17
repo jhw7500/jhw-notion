@@ -106,7 +106,7 @@ export function registerNote(server: McpServer) {
         db: "knowledgeBase",
         title,
         url: (page as any).url,
-        text: content ?? title,
+        text: content || title,
       });
 
       return {
