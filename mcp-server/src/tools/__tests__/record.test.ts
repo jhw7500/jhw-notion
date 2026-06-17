@@ -9,6 +9,7 @@ vi.mock("../../notion-client.js", () => ({
 }));
 
 import { registerRecord } from "../record.js";
+import { defaultPageCache } from "../../cache/page-cache.js";
 
 describe("jhw_record", () => {
   let handler: (args: any) => Promise<any>;
@@ -144,6 +145,28 @@ describe("jhw_record", () => {
     expect(result.content[0].text).toContain("미허용");
     expect(result.content[0].text).toContain("status");
     expect(mockClient.pages.create).not.toHaveBeenCalled();
+  });
+
+  it("생성한 페이지를 로컬 캐시에 적재한다 (P0-3)", async () => {
+    defaultPageCache.clear();
+    mockClient.pages.create.mockResolvedValue({
+      id: "cache-page-1",
+      url: "https://notion.so/cache-page-1",
+    });
+
+    await handler({
+      db: "decisionLog",
+      title: "캐시 검증 결정",
+      content: "raw socket 송수신 키 정정",
+    });
+
+    const hit = defaultPageCache.get("cache-page-1");
+    expect(hit).toBeDefined();
+    expect(hit!.title).toBe("캐시 검증 결정");
+    expect(hit!.db).toBe("decisionLog");
+    // 본문 토큰으로 검색 가능해야 한다 (title-only가 아님)
+    const found = defaultPageCache.search("socket");
+    expect(found.some((r) => r.page.id === "cache-page-1")).toBe(true);
   });
 
   it("미등록 multi_select 값은 drop하고 응답 warnings에 포함한다", async () => {

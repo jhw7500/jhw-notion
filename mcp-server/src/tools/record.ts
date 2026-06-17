@@ -8,6 +8,7 @@ import { callNotion } from "../notion/api.js";
 import { buildPropertiesFromSchema } from "../notion/property-builder.js";
 import { FieldValidationError } from "../notion/field-vocab.js";
 import { paragraphBlocks } from "../notion/blocks.js";
+import { cachePage } from "../cache/page-cache.js";
 
 const RecordInput = z.object({
   db: z
@@ -129,6 +130,14 @@ export function registerRecord(server: McpServer) {
           }),
         { operation: `${db}.pages.create` }
       );
+
+      cachePage({
+        id: page.id,
+        db,
+        title,
+        url: (page as any).url,
+        text: content ?? title,
+      });
 
       return {
         content: [

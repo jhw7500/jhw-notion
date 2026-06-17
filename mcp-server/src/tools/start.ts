@@ -4,6 +4,7 @@ import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
 import { callNotion } from "../notion/api.js";
 import { normalizeMultiSelectValues } from "../notion/field-vocab.js";
+import { cachePage } from "../cache/page-cache.js";
 
 const StartInput = z.object({
   name: z.string().describe("프로젝트명"),
@@ -78,6 +79,21 @@ export function registerStart(server: McpServer) {
           }),
         { operation: "start.decisionLog.create" }
       );
+
+      cachePage({
+        id: projectPage.id,
+        db: "projects",
+        title: name,
+        url: (projectPage as any).url,
+        text: description,
+      });
+      cachePage({
+        id: decisionPage.id,
+        db: "decisionLog",
+        title: `${name} 프로젝트 시작`,
+        url: (decisionPage as any).url,
+        text: description,
+      });
 
       return {
         content: [

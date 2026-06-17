@@ -117,3 +117,18 @@ export class PageCache {
 }
 
 export const defaultPageCache = new PageCache();
+
+/**
+ * 생성·조회한 페이지를 기본 캐시에 적재한다 (best-effort).
+ * - text 미지정 시 title을 본문 토큰으로 사용.
+ * - 캐시 실패가 본 작업(저장/조회)을 막지 않도록 예외를 삼킨다.
+ */
+export function cachePage(
+  input: Omit<PageInput, "text"> & { text?: string }
+): void {
+  try {
+    defaultPageCache.set({ ...input, text: input.text ?? input.title });
+  } catch {
+    /* 캐시는 best-effort — 무시 */
+  }
+}

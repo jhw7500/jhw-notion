@@ -87,4 +87,36 @@ describe("jhw_close", () => {
     expect(parsed.knowledgeBase).toBeNull();
     expect(mockClient.pages.create).not.toHaveBeenCalled();
   });
+
+  it("정확 일치가 없고 부분일치 후보가 여럿이면 종료하지 않고 후보를 안내한다 (P0-2)", async () => {
+    mockClient.dataSources.query.mockResolvedValue({
+      results: [
+        { id: "p1", properties: { title: { title: [{ plain_text: "jhw-notion" }] } } },
+        { id: "p2", properties: { title: { title: [{ plain_text: "jhw-notion-v2" }] } } },
+      ],
+    });
+
+    const result = await handler({ project: "jhw" });
+
+    expect(result.content[0].text).toContain("부분일치 후보가 2건");
+    expect(mockClient.pages.update).not.toHaveBeenCalled();
+  });
+
+  it("정확 일치 프로젝트를 부분일치보다 우선 종료한다 (P0-2)", async () => {
+    mockClient.dataSources.query.mockResolvedValue({
+      results: [
+        { id: "p2", properties: { title: { title: [{ plain_text: "jhw-notion-v2" }] } } },
+        { id: "p1", properties: { title: { title: [{ plain_text: "jhw-notion" }] } } },
+      ],
+    });
+    mockClient.pages.update.mockResolvedValue({});
+
+    const result = await handler({ project: "jhw-notion" });
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.project.status).toBe("완료");
+    expect(mockClient.pages.update).toHaveBeenCalledWith(
+      expect.objectContaining({ page_id: "p1" })
+    );
+  });
 });
