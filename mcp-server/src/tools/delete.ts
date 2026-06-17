@@ -5,7 +5,12 @@ import { callNotion } from "../notion/api.js";
 
 const DeleteInput = z.object({
   pageId: z.string().describe("삭제할 Notion 페이지 ID"),
-  mode: z.enum(["archive", "delete"]).describe("archive: 폐기(상태 변경), delete: 완전 삭제"),
+  mode: z
+    .enum(["archive", "delete"])
+    .describe(
+      "archive: 폐기(status를 '폐기'로 변경; status 필드 없으면 휴지통), " +
+        "delete: Notion 휴지통 이동(archived:true, 영구 삭제 아님 — 복구 가능)"
+    ),
 });
 
 export function registerDelete(server: McpServer) {
