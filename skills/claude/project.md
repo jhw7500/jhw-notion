@@ -38,9 +38,9 @@ argument-hint: "(--start | --close) [프로젝트명]"
 
 ## paragraph 분할 가드 (페이지 본문 / KB 등록 시)
 
-`--start` 템플릿(목표/범위/제약/메모)과 `--close` 회고·KB 본문도 `\n\n`로 paragraph를 나눠 작성한다(헤딩 위·아래 빈 줄, 한 paragraph ≤ 1800자).
+`jhw_start`/`jhw_close`는 각 본문 필드(`description`/`achievement`/`lessons`)를 **단일 `rich_text`로 그대로** Notion에 넣는다 — `jhw_record`/`jhw_note`(`blocks.ts` 자동 분할)와 달리 **`\n\n`로 나눠도 2000자 한도를 못 피한다**(한도는 `rich_text` 객체 1개의 텍스트 길이에 적용되기 때문).
 
-**주의: `jhw_start`/`jhw_close`는 본문을 단일 rich_text로 넣어 `jhw_record`/`jhw_note`와 달리 MCP 자동 분할이 없다** — 2000자에 근접하면 호출 전 반드시 `\n\n`로 나눠 둔다. 상세 분할 전략·회복 절차는 `review.md` §3.5(단일 정본) 참조. 회고 KB 본문에서 자주 발생.
+**따라서 이 경로에서는 각 필드를 2000자(안전 1800자) 이하로 유지**한다. 더 길면 핵심만 남기거나 별도 KB 항목으로 분리. (paragraph 분할 룰 일반론은 `review.md` §3.5(단일 정본) 참조 — 자동 분할되는 `jhw_record`/`jhw_note` 경로에 적용.) 회고 KB 본문에서 자주 발생.
 
 ## 규칙
 

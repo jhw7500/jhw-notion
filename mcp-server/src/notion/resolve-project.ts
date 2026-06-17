@@ -83,9 +83,12 @@ export function sortProjectsByExact<T extends { properties?: any }>(
   input: string
 ): T[] {
   const lower = input.trim().toLowerCase();
-  return [...results].sort((a, b) => {
-    const at = (a.properties?.title?.title?.[0]?.plain_text ?? "").toLowerCase();
-    const bt = (b.properties?.title?.title?.[0]?.plain_text ?? "").toLowerCase();
-    return Number(bt === lower) - Number(at === lower);
-  });
+  const plainTitle = (p: any) =>
+    (p.properties?.title?.title ?? [])
+      .map((t: any) => t.plain_text)
+      .join("")
+      .toLowerCase();
+  return [...results].sort(
+    (a, b) => Number(plainTitle(b) === lower) - Number(plainTitle(a) === lower)
+  );
 }
