@@ -27,7 +27,7 @@ argument-hint: "[week|month] [--start YYYY-MM-DD --end YYYY-MM-DD] [--report <�
 
 2. **미리보기** — `jhw_report_preview` 호출 (period/start/end/reports/dbs/groupBy/includeNone).
    - 반환된 `redmineText`(기본 표시) 또는 `markdownText`를 보여준다.
-   - `stats` 요약: `scanned`=처리 건수(`included`와 동일값), `excludedNone`은 `--include-none`일 때만 의미(기본은 none이 이미 제외되어 0).
+   - `stats` 요약: `scanned`=처리 건수(`included`와 동일값). `excludedNone`은 응답에 항상 포함되나 기본(none 제외)에서는 **항상 0**이고, `--include-none`일 때만 실제 제외 수를 뜻한다.
 
 3. **승인 + 출력 옵션 확인**
    - "OK" / "내보내기" → export 진행. 형식 기본 `redmine`. "markdown" / "json"으로 변경 가능.
@@ -36,7 +36,7 @@ argument-hint: "[week|month] [--start YYYY-MM-DD --end YYYY-MM-DD] [--report <�
 
 4. **export** — `jhw_report_export` 호출 (**preview와 동일 인자 + `format` + `writeBack`**).
    - preview 직후면 공유 캐시(5분 TTL) 히트로 Notion 재조회가 없다 — 인자를 그대로 유지할 것.
-   - `writeBack` 시 생성된 페이지의 URL을 보고.
+   - `writeBack` 시 생성된 페이지의 URL을 보고하고, **저장본은 2000자 요약**(전문 아님 — 전문은 응답 `text`)임을 함께 알린다.
 
 5. **결과 보고** — 기간 / 형식 / (저장 시) 저장 페이지 URL.
 
