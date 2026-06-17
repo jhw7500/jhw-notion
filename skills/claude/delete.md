@@ -1,5 +1,6 @@
 ---
 description: (deprecated) → /jhw:save --delete 사용
+argument-hint: "→ /jhw:save --delete <id> [--hard]"
 ---
 
 # /jhw:delete — (deprecated)

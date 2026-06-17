@@ -6,7 +6,7 @@
 ## Purpose
 AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬. 각 스킬은 사용자 의도를 해석하여 적절한 MCP 도구(`jhw_*`)를 호출하는 워크플로우를 정의한다. Claude Code, Gemini CLI, OpenCode에서 심링크로 공유된다.
 
-## 핵심 스킬 (8개)
+## 핵심 스킬 (10개)
 
 | File | Description |
 |------|-------------|
@@ -16,7 +16,7 @@ AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬. 각 스킬은 사용자 
 | `review.md` | 세션 마무리 시 저장 후보 정리 + 저장가치 평가(상/중/하) + 승인 저장 |
 | `compact.md` | 저장된 레코드 사후 정리 — 합치기(N→1) + 긴 본문 요약 + 저장가치 평가(상/중/하, 하=폐기 옵트인) (파괴적, 승인 필수) |
 | `match.md` | 신규 내용·키워드를 기존 Notion과 대조 — 4-tier verdict(NEW/SIMILAR/AUGMENT/DUPLICATE) 후 신규 저장·기존 append·skip 처리 |
-| `report.md` | (3주차 신규 예정) 일/주/월 보고서 — preview + export |
+| `report.md` | 일/주/월 업무 보고서 — preview(미리보기) → export(redmine/markdown/json, 선택적 KB/decisionLog 저장). 백엔드 `jhw_report_preview`/`jhw_report_export` |
 | `status.md` | 워크스페이스 현황 대시보드 |
 | `import.md` | Notion 검색 결과 → 현재 프로젝트 memory 폴더로 불러오기 |
 | `cclog.md` | Claude Code 세션 대화 기록 조회 (Notion이 아닌 CC JSONL) |

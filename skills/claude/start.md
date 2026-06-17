@@ -1,5 +1,6 @@
 ---
 description: (deprecated) → /jhw:project --start 사용
+argument-hint: "→ /jhw:project --start <name>"
 ---
 
 # /jhw:start — (deprecated)

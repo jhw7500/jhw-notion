@@ -44,33 +44,37 @@ Notion Integration 생성: https://www.notion.so/my-integrations
 
 | 도구 | 설명 |
 |------|------|
+| `jhw_recall` | 로컬 캐시 우선 회상 (미스 시 Notion 검색) |
 | `jhw_search` | Notion 통합 검색 |
 | `jhw_status` | 워크스페이스 현황 조회 |
 | `jhw_context` | 프로젝트 컨텍스트 로드 |
 | `jhw_history` | 프로젝트 타임라인 조회 |
 | `jhw_record` | DB에 레코드 생성 |
 | `jhw_note` | Knowledge Base에 메모 |
-| `jhw_delete` | 레코드 삭제/폐기 |
+| `jhw_delete` | 레코드 폐기(archive)/휴지통(delete) |
 | `jhw_start` | 프로젝트 시작 (원스톱) |
 | `jhw_close` | 프로젝트 종료 + 회고 |
+| `jhw_report_preview` | 기간별 업무 보고서 미리보기 |
+| `jhw_report_export` | 보고서 출력(redmine/markdown/json) + 선택 저장 |
 
 ## 스킬 (커맨드)
 
-TUI에서 `/jhw:` 접두사로 사용:
+TUI에서 `/jhw:` 접두사로 사용. 통합 진입점 위주:
 
 ```
-/jhw:record   — 확정된 정보 즉시 저장
-/jhw:note     — Knowledge Base에 기술 지식 메모
+/jhw:save     — 확정 정보 즉시 저장 (record/note/delete 흡수, DB 자동 판별)
+/jhw:recall   — 통합 회상 (search/context/history 자동 판별)
+/jhw:project  — 프로젝트 시작/종료 (--start / --close)
 /jhw:review   — 세션 마무리 리뷰 (저장 후보 추출 + 저장가치 평가)
-/jhw:compact  — 저장 레코드 정리 (합치기 + 요약 + 저장가치 평가/폐기)
-/jhw:delete   — 레코드 삭제/폐기
-/jhw:search   — 키워드 통합 검색
-/jhw:context  — 프로젝트 컨텍스트 로드
-/jhw:history  — 프로젝트 타임라인 조회
+/jhw:match    — 신규 후보를 기존 Notion과 대조 (중복/보강/유사)
+/jhw:compact  — 저장 레코드 사후 정리 (합치기 + 요약 + 폐기 평가)
+/jhw:report   — 일/주/월 업무 보고서 (preview → export)
 /jhw:status   — 워크스페이스 현황
-/jhw:start    — 새 프로젝트 시작
-/jhw:close    — 프로젝트 종료 + 회고
+/jhw:import   — Notion 검색 결과를 로컬 memory로 불러오기
+/jhw:cclog    — Claude Code 세션 대화 기록 조회 (Notion 아님)
 ```
+
+> deprecated alias(다음 메이저 릴리스에서 삭제): `/jhw:record`·`/jhw:note`·`/jhw:delete`→`/jhw:save`, `/jhw:search`·`/jhw:context`·`/jhw:history`→`/jhw:recall`, `/jhw:start`·`/jhw:close`→`/jhw:project`.
 
 ## 업데이트
 
@@ -95,9 +99,9 @@ npm run build --prefix mcp-server
 ```
 jhw-notion/
 ├── mcp-server/          # TypeScript MCP 서버 (Notion API 직접 호출)
-│   ├── src/tools/       # 9개 도구 핸들러
+│   ├── src/tools/       # 12개 도구 핸들러
 │   └── dist/            # 빌드 결과
-├── skills/claude/       # Claude Code 스킬 (10개)
+├── skills/claude/       # Claude Code 스킬 (통합 10 + deprecated alias 8)
 ├── install.sh           # 원클릭 설치/제거
 └── DESIGN.md            # 설계 문서
 ```

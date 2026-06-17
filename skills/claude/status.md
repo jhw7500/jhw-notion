@@ -1,5 +1,6 @@
 ---
 description: Notion AI Workspace 현황 조회
+argument-hint: "[db명] (projects|preferences|decisionLog|knowledgeBase|references)"
 ---
 
 # /jhw:status — Notion 워크스페이스 현황

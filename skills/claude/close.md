@@ -1,5 +1,6 @@
 ---
 description: (deprecated) → /jhw:project --close 사용
+argument-hint: "→ /jhw:project --close [name]"
 ---
 
 # /jhw:close — (deprecated)

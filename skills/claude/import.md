@@ -1,5 +1,6 @@
 ---
 description: Notion AI Workspace에서 프로젝트/키워드 관련 내용을 검색하여 현재 프로젝트 memory 폴더로 불러오기
+argument-hint: "[키워드... | \"구문\" | k1, k2; k3] (콤마/세미콜론/공백 구분, 무인자=cwd 프로젝트명)"
 ---
 
 # /jhw:import — Notion → 로컬 메모리 불러오기
@@ -80,7 +81,7 @@ query: {검색에 사용한 질의어}
 - `/jhw:import pim-package-jhw` — 단일 키워드
 - `/jhw:import file_check_reboot, chk_cam_operate, 재부팅` — 콤마 구분 다중 키워드
 - `/jhw:import "ord_vcm_conf retry"; pim-package-jhw` — 큰따옴표 구문 + 세미콜론 구분
-- `/jhw:import RTC DS1305 max9296` — 공백 구분 다중 키워드 (큰따옴표 없을 때)
+- `/jhw:import RTC DS1307 max9296` — 공백 구분 다중 키워드 (큰따옴표 없을 때)
 - `/jhw:import` (인자 없음) — cwd 기반 프로젝트명으로 자동 검색
 
 ## 규칙

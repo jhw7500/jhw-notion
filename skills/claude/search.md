@@ -1,5 +1,6 @@
 ---
 description: (deprecated) → /jhw:recall 사용 (search 모드 자동)
+argument-hint: "→ /jhw:recall <키워드>"
 ---
 
 # /jhw:search — (deprecated)
