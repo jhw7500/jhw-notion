@@ -2,7 +2,9 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
-import { callNotion, queryDataSource } from "../notion/api.js";
+import { callNotion } from "../notion/api.js";
+import { resolveProject } from "../notion/resolve-project.js";
+import { cachePage } from "../cache/page-cache.js";
 
 const CloseInput = z.object({
   project: z.string().describe("프로젝트명 (검색 키워드)"),
@@ -19,27 +21,35 @@ export function registerClose(server: McpServer) {
       const notion = getNotionClient();
       const today = new Date().toISOString().split("T")[0];
 
-      // 1. Projects DB에서 프로젝트 검색
-      // Design Ref: §4.3 — close.ts:25 마이그레이션
-      const projectsRes = await queryDataSource(
-        notion,
-        "projects",
-        {
-          filter: {
-            property: "title",
-            title: { contains: project },
-          },
-        },
-        { operation: "close.projects.query" }
-      );
+      // 1. Projects DB에서 프로젝트 검색 (exact 우선 resolver — 부분일치 오종료 방지)
+      const candidates = await resolveProject(notion, project);
 
-      if (projectsRes.results.length === 0) {
+      if (candidates.length === 0) {
         return {
           content: [{ type: "text" as const, text: `프로젝트 "${project}"를 찾을 수 없습니다.` }],
         };
       }
 
-      const projectPage = projectsRes.results[0] as any;
+      // 파괴적 작업(상태→완료)이므로 정확히 일치하는 후보가 없으면 후보 수와 무관하게
+      // 임의로 종료하지 않고 사용자에게 확인을 요청한다 (부분일치 단건도 오종료 위험).
+      const exactMatches = candidates.filter((c) => c.exact);
+      if (exactMatches.length === 0) {
+        const list = candidates.map((c) => `  - ${c.title}`).join("\n");
+        const head =
+          candidates.length === 1
+            ? `"${project}"와 정확히 일치하는 프로젝트가 없습니다. 가장 근접한 후보:`
+            : `"${project}"와 정확히 일치하는 프로젝트가 없고 부분일치 후보가 ${candidates.length}건입니다:`;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${head}\n${list}\n정확한 프로젝트명으로 다시 종료하세요.`,
+            },
+          ],
+        };
+      }
+
+      const projectPage = exactMatches[0];
 
       // 2. 상태 → 완료, 완료일 설정 (pages.update — wrapper 영향 없음)
       await callNotion(
@@ -112,6 +122,13 @@ export function registerClose(server: McpServer) {
             }),
           { operation: "close.knowledgeBase.create" }
         );
+        cachePage({
+          id: (knowledgePage as any).id,
+          db: "knowledgeBase",
+          title: `${project} 회고 — 배운 점`,
+          url: (knowledgePage as any).url,
+          text: lessons,
+        });
       }
 
       return {
@@ -120,7 +137,7 @@ export function registerClose(server: McpServer) {
             type: "text" as const,
             text: JSON.stringify(
               {
-                project: { id: projectPage.id, status: "완료" },
+                project: { id: projectPage.id, title: projectPage.title, status: "완료" },
                 retrospective: !!(achievement || lessons),
                 knowledgeBase: knowledgePage ? { id: knowledgePage.id, url: (knowledgePage as any).url } : null,
               },

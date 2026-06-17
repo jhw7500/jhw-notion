@@ -45,15 +45,17 @@ export async function resolveProject(
       "projects",
       {
         filter: { property: "title", title: { contains: trimmed } },
-        page_size: 5,
+        page_size: 25,
       },
       { operation: "projects.query.resolve" }
     );
     const lower = trimmed.toLowerCase();
     return (res.results as any[])
       .map((p) => {
-        const title: string =
-          p.properties?.title?.title?.[0]?.plain_text ?? "";
+        // 제목은 여러 rich_text 세그먼트(스타일/멘션)로 나뉠 수 있어 전체를 join.
+        const title: string = (p.properties?.title?.title ?? [])
+          .map((t: any) => t.plain_text)
+          .join("");
         return { id: p.id, title, exact: title.toLowerCase() === lower };
       })
       .sort((a, b) => Number(b.exact) - Number(a.exact));

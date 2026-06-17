@@ -6,6 +6,7 @@ import { resolveProjectRelationId } from "./record.js";
 import { callNotion } from "../notion/api.js";
 import { paragraphBlocks } from "../notion/blocks.js";
 import { normalizeMultiSelectValues } from "../notion/field-vocab.js";
+import { cachePage } from "../cache/page-cache.js";
 
 // KB DB의 category select 옵션 (8종)
 const KB_CATEGORIES = [
@@ -99,6 +100,14 @@ export function registerNote(server: McpServer) {
           }),
         { operation: "note.knowledgeBase.create" }
       );
+
+      cachePage({
+        id: page.id,
+        db: "knowledgeBase",
+        title,
+        url: (page as any).url,
+        text: content || title,
+      });
 
       return {
         content: [

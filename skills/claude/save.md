@@ -21,8 +21,8 @@ argument-hint: "[--db <db>] [--delete <id>] [--hard] [내용]"
 
 - `/jhw:save <내용>` — 자동 판별 후 저장
 - `/jhw:save --db decisionLog <내용>` — DB 강제
-- `/jhw:save --delete <pageId>` — archive 처리 (이력 보존)
-- `/jhw:save --delete <pageId> --hard` — 완전 삭제
+- `/jhw:save --delete <pageId>` — 폐기 처리 (jhw_delete `mode: archive` — status를 '폐기'로 변경; status 필드 없는 DB는 Notion 휴지통으로 이동)
+- `/jhw:save --delete <pageId> --hard` — Notion 휴지통으로 이동 (jhw_delete `mode: delete` — `archived: true`)
 
 ## report 자동 추론
 
@@ -82,4 +82,4 @@ argument-hint: "[--db <db>] [--delete <id>] [--hard] [내용]"
 
 - 중간 결과·미확정 정보·실패 시도는 저장하지 않는다.
 - 승인 이후 응답을 끊지 않고 한 흐름으로 저장 → 결과 보고까지 진행.
-- `--delete`는 기본 archive. `--hard`는 명시적일 때만.
+- `--delete`/`--hard` → MCP 매핑: `--delete`=`jhw_delete mode: archive`(status를 '폐기'로 변경), `--hard`=`jhw_delete mode: delete`(`archived: true`, Notion 휴지통 이동). **Notion API는 영구 삭제를 노출하지 않아 둘 다 30일 내 복구 가능** — '완전 삭제' 아님. `--hard`는 명시적일 때만.

@@ -9,6 +9,7 @@ vi.mock("../../notion-client.js", () => ({
 }));
 
 import { registerDelete } from "../delete.js";
+import { defaultPageCache } from "../../cache/page-cache.js";
 
 describe("jhw_delete", () => {
   let handler: (args: any) => Promise<any>;
@@ -52,10 +53,26 @@ describe("jhw_delete", () => {
     const result = await handler({ pageId: "page-1", mode: "delete" });
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(parsed.result).toBe("삭제 완료");
+    expect(parsed.result).toBe("Notion 휴지통 이동 완료 (복구 가능)");
     expect(mockClient.pages.update).toHaveBeenCalledWith({
       page_id: "page-1",
       archived: true,
     });
+  });
+
+  it("삭제 시 로컬 캐시에서 해당 페이지를 제거한다 (리뷰 피드백 — Codex)", async () => {
+    defaultPageCache.clear();
+    defaultPageCache.set({
+      id: "page-1",
+      db: "knowledgeBase",
+      title: "삭제될 메모",
+      text: "socket 내용",
+    });
+    expect(defaultPageCache.get("page-1")).toBeDefined();
+    mockClient.pages.update.mockResolvedValue({});
+
+    await handler({ pageId: "page-1", mode: "delete" });
+
+    expect(defaultPageCache.get("page-1")).toBeUndefined();
   });
 });

@@ -9,6 +9,7 @@ vi.mock("../../notion-client.js", () => ({
 }));
 
 import { registerStart } from "../start.js";
+import { defaultPageCache } from "../../cache/page-cache.js";
 
 describe("jhw_start", () => {
   let handler: (args: any) => Promise<any>;
@@ -69,6 +70,21 @@ describe("jhw_start", () => {
     expect(decisionCreate.properties["project"].relation).toEqual([{ id: "p" }]);
     expect(decisionCreate.properties["project"].rich_text).toBeUndefined();
     expect(decisionCreate.properties["rationale"].rich_text[0].text.content).toBe("설명 텍스트");
+  });
+
+  it("생성한 프로젝트/결정 페이지를 로컬 캐시에 적재한다 (P0-3)", async () => {
+    defaultPageCache.clear();
+    mockClient.pages.create
+      .mockResolvedValueOnce({ id: "proj-cache-1", url: "u1" })
+      .mockResolvedValueOnce({ id: "dec-cache-1", url: "u2" });
+
+    await handler({ name: "cache-proj", description: "캐시 적재 검증 프로젝트" });
+
+    expect(defaultPageCache.get("proj-cache-1")?.db).toBe("projects");
+    expect(defaultPageCache.get("dec-cache-1")?.db).toBe("decisionLog");
+    expect(
+      defaultPageCache.search("cache-proj").some((r) => r.page.id === "proj-cache-1")
+    ).toBe(true);
   });
 
   it("미등록 tech_stack 값은 drop하고 허용 스택만 저장한다", async () => {

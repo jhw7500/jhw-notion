@@ -19,7 +19,7 @@ argument-hint: "[--db <db>] [--report <report>] [--hard] [프로젝트명|키워
 - `/jhw:compact --db knowledgeBase` — DB 한정
 - `/jhw:compact --report pim-driver-cam` — report 값으로 한정
 - `/jhw:compact --db references jhw-notion` — 조합
-- `/jhw:compact --hard ...` — 원본/폐기 대상을 archive 대신 **완전 삭제** (위험, 명시적일 때만)
+- `/jhw:compact --hard ...` — 원본/폐기 대상을 폐기(status 변경) 대신 **Notion 휴지통으로 이동**(`mode: delete`, `archived: true`; 영구 삭제 아님, 복구 가능) (명시적일 때만)
 
 ## 흐름
 
@@ -95,7 +95,7 @@ argument-hint: "[--db <db>] [--report <report>] [--hard] [프로젝트명|키워
 - "3번 빼" → 3번 제외하고 실행
 - "1번 분리해" → 1번 합치기를 취소하고 원본을 개별 유지로 전환, 표 갱신 후 재승인
 - "2번 유지로" / "3번 요약으로" → 해당 항목 동작 변경 후 표 갱신·재승인
-- "--hard" → 이번 실행의 archive를 완전 삭제로 전환 (재확인 후)
+- "--hard" → 이번 실행의 폐기(`mode: archive`)를 Notion 휴지통 이동(`mode: delete`)으로 전환 (재확인 후)
 - "취소" → 아무것도 하지 않음
 
 ## 규칙
@@ -104,7 +104,7 @@ argument-hint: "[--db <db>] [--report <report>] [--hard] [프로젝트명|키워
 - **다른 DB는 절대 합치지 않는다** (`review.md` §3.1).
 - **저장가치 평가는 합치기/요약 판정 후 최종 세트에 적용**한다 (`review.md` §3.6 기준).
 - **가치 '하' 기존 레코드는 기본 유지, 폐기는 옵트인.** "OK"는 합치기·요약만, "정리까지"/"N번 폐기"로 폐기. (새 후보를 안 받는 review와 달리, 이미 저장된 데이터 제거는 더 위험하므로 보수적.)
-- 원본/폐기는 **archive 기본** (이력 보존). `--hard`만 완전 삭제.
+- 원본/폐기는 **폐기 기본** (`mode: archive`, status 변경으로 이력 보존). `--hard`는 Notion 휴지통 이동(`mode: delete`, `archived: true`). **둘 다 영구 삭제가 아니며 Notion에서 복구 가능.**
 - **합본 생성 성공을 확인한 뒤에만 원본을 archive** 한다. 생성 실패 시 원본을 그대로 두어 데이터 유실을 막는다.
 - properties 승계: 합칠 레코드들의 `report`/`project`가 다르면 표에 ⚠️로 표시하고 사용자에게 확인. 임의 통합 금지.
 - **paragraph 2000자 가드**(`review.md` §3.5) 적용. 합본이 한도를 넘으면 분할하거나, 분할 불가하면 그 클러스터는 합치기를 포기하고 유지.
