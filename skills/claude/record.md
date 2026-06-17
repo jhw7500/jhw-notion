@@ -1,5 +1,6 @@
 ---
 description: (deprecated) → /jhw:save 사용
+argument-hint: "→ /jhw:save <내용>"
 ---
 
 # /jhw:record — (deprecated)

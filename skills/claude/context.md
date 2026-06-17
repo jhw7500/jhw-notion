@@ -1,5 +1,6 @@
 ---
 description: (deprecated) → /jhw:recall <프로젝트명> 사용
+argument-hint: "→ /jhw:recall <프로젝트명>"
 ---
 
 # /jhw:context — (deprecated)

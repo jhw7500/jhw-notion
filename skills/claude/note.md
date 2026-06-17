@@ -1,5 +1,6 @@
 ---
 description: (deprecated) → /jhw:save 사용 (knowledgeBase 자동 라우팅)
+argument-hint: "→ /jhw:save <메모>"
 ---
 
 # /jhw:note — (deprecated)

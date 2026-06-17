@@ -5,7 +5,7 @@ argument-hint: "[세션파일경로|all] [--tools] [--last N]"
 
 # /jhw:cclog — Claude Code 세션 대화 기록 조회
 
-현재 프로젝트(`/home/jhw/ai/opencode`)의 Claude Code 세션 JSONL을 시간순으로 펼쳐본다.
+현재 작업 디렉터리(cwd)의 Claude Code 세션 JSONL을 시간순으로 펼쳐본다.
 입력(user)·출력(assistant) 및 선택적으로 도구 호출까지 포함.
 
 ## 인자
@@ -22,22 +22,20 @@ argument-hint: "[세션파일경로|all] [--tools] [--last N]"
 
 ## 동작 순서
 
-1. **세션 디렉터리 확정**
-   - 경로: `/home/jhw/.claude/projects/-home-jhw-ai-opencode/`
-   - 현재 프로젝트 경로의 `/`를 `-`로 치환한 디렉터리명
+1. **세션 디렉터리 확정** (cwd 기반 동적 — `import.md`와 동일 slug 규칙)
+   - `SESSION_DIR="$HOME/.claude/projects/$(pwd -P | sed 's#/#-#g')"`
+   - 현재 작업 디렉터리 절대경로의 `/`를 `-`로 치환한 slug (예: `/home/jhw/ai/opencode/projects/jhw-notion` → `-home-jhw-ai-opencode-projects-jhw-notion`)
 
 2. **대상 파일 선택**
    - `$1`이 경로면 해당 파일 사용
    - `$1`이 `all`이면 세션 목록 테이블로 표시 후 종료
      ```
-     ls -lt /home/jhw/.claude/projects/-home-jhw-ai-opencode/*.jsonl \
-       | grep -v '/agent-' | head -20
+     ls -lt "$SESSION_DIR"/*.jsonl | grep -v '/agent-' | head -20
      ```
      각 파일의 첫 user 메시지 요약을 `jq -r 'select(.type=="user") | .message.content' | head -1`로 첨부
    - 그 외에는 `agent-*` 제외한 가장 최근 `.jsonl` 선택:
      ```bash
-     ls -t /home/jhw/.claude/projects/-home-jhw-ai-opencode/*.jsonl \
-       | grep -v '/agent-' | head -1
+     ls -t "$SESSION_DIR"/*.jsonl | grep -v '/agent-' | head -1
      ```
 
 3. **시간순 출력** (Bash + jq)
@@ -64,7 +62,7 @@ argument-hint: "[세션파일경로|all] [--tools] [--last N]"
 ## 구현 예시 (Bash)
 
 ```bash
-SESSION_DIR=/home/jhw/.claude/projects/-home-jhw-ai-opencode
+SESSION_DIR="$HOME/.claude/projects/$(pwd -P | sed 's#/#-#g')"
 
 # 대상 파일
 if [ "$1" = "all" ]; then
@@ -95,7 +93,7 @@ jq -r '
 
 ## 규칙
 
-- **절대 경로 사용** — `$HOME` 대신 `/home/jhw/...` 명시
+- **경로 규칙** — base는 `$HOME/.claude/projects/`(install.sh가 호출 사용자 홈에 설치하므로 이식성 확보), slug는 cwd에서 동적 계산(`pwd -P` → `/`를 `-`로 치환).
 - `agent-*.jsonl`은 서브에이전트 로그이므로 기본 제외
 - 민감정보(토큰/키) 노출 우려 시 사용자에게 경고 후 출력
 - 출력이 길면 `less -R`로 파이프 권장
