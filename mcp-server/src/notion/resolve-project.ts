@@ -72,3 +72,23 @@ export async function resolveProjectId(
   const list = await resolveProject(notion, input);
   return list[0]?.id ?? null;
 }
+
+/**
+ * 이미 조회한 projects 결과 배열을 input과 정확(case-insensitive) 일치하는 페이지 우선으로 정렬.
+ * resolveProject과 달리 full page 객체를 보존하므로 properties가 필요한 호출부(context/history)에서 사용.
+ * (close.ts의 부분일치 오종료 방지와 동일한 exact-우선 정책을 조회 도구에도 적용 — P1-2)
+ */
+export function sortProjectsByExact<T extends { properties?: any }>(
+  results: T[],
+  input: string
+): T[] {
+  const lower = input.trim().toLowerCase();
+  const plainTitle = (p: any) =>
+    (p.properties?.title?.title ?? [])
+      .map((t: any) => t.plain_text)
+      .join("")
+      .toLowerCase();
+  return [...results].sort(
+    (a, b) => Number(plainTitle(b) === lower) - Number(plainTitle(a) === lower)
+  );
+}

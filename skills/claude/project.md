@@ -38,15 +38,9 @@ argument-hint: "(--start | --close) [프로젝트명]"
 
 ## paragraph 분할 가드 (페이지 본문 / KB 등록 시)
 
-`--start`의 페이지 템플릿(목표/범위/제약/메모)과 `--close`의 회고 섹션·KB 등록 본문은 Notion paragraph 한 블록의 한도(**2000자**)에 걸릴 수 있다. 본문 markdown 작성·검증·회복 룰은 `/jhw:review` §3.5와 동일하게 적용한다:
+`jhw_start`/`jhw_close`는 각 본문 필드(`description`/`achievement`/`lessons`)를 **단일 `rich_text`로 그대로** Notion에 넣는다 — `jhw_record`/`jhw_note`(`blocks.ts` 자동 분할)와 달리 **`\n\n`로 나눠도 2000자 한도를 못 피한다**(한도는 `rich_text` 객체 1개의 텍스트 길이에 적용되기 때문).
 
-- 한 paragraph(빈 줄 사이 텍스트 블록) ≤ 1800자 (안전 마진 200자)
-- 빈 줄(`\n\n`)이 paragraph 분리자 — `##`/`###` 헤딩 위·아래 빈 줄
-- 코드 블록·표·긴 목록도 paragraph로 셈
-- 호출 직전 paragraph별 길이 점검 → 1800자 초과 시 sub-heading / 목록 그룹화 / 코드·표 분할 / 자연 경계 빈 줄 순으로 자동 분할
-- 호출 실패 시 에러 `was N`으로 초과 paragraph 식별 → 분할 강화 후 재호출, 두 번째 실패면 본문을 두 KB 항목으로 분리
-
-회고 인터뷰 입력이 길어지는 케이스(특히 KB 등록 본문)에서 자주 발생. 세부 절차: `~/.claude/commands/jhw/review.md` §3.5 참조.
+**따라서 이 경로에서는 각 필드를 2000자(안전 1800자) 이하로 유지**한다. 더 길면 핵심만 남기거나 별도 KB 항목으로 분리. (paragraph 분할 룰 일반론은 `review.md` §3.5(단일 정본) 참조 — 자동 분할되는 `jhw_record`/`jhw_note` 경로에 적용.) 회고 KB 본문에서 자주 발생.
 
 ## 규칙
 
