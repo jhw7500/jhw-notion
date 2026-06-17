@@ -68,4 +68,43 @@ describe("jhw_history", () => {
     expect(parsed.timeline[1].title).toBe("결정A");
     expect(parsed.timeline[2].title).toBe("결정B");
   });
+
+  it("정확 일치 프로젝트를 부분일치보다 우선 선택한다 (P1-2)", async () => {
+    mockClient.dataSources.query
+      .mockResolvedValueOnce({
+        results: [
+          {
+            id: "p2",
+            properties: {
+              title: { title: [{ plain_text: "jhw-notion-v2" }] },
+              start_date: { date: { start: "2026-05-01" } },
+            },
+          },
+          {
+            id: "p1",
+            properties: {
+              title: { title: [{ plain_text: "jhw-notion" }] },
+              start_date: { date: { start: "2026-04-01" } },
+            },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        results: [
+          {
+            properties: {
+              title: { title: [{ plain_text: "결정A" }] },
+              date: { date: { start: "2026-04-03" } },
+              status: { select: { name: "확정" } },
+            },
+          },
+        ],
+      });
+
+    const result = await handler({ project: "jhw-notion" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.project).toBe("jhw-notion");
+    expect(parsed.timeline[0].date).toBe("2026-04-01");
+  });
 });

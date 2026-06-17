@@ -25,14 +25,14 @@ argument-hint: "[키워드 | 프로젝트명] [--mode search|context|history]"
 
 | 모드 | MCP 도구 | 출력 |
 |---|---|---|
-| search | jhw_search | DB별 그룹화된 결과 (제목/날짜/미리보기) |
+| search | jhw_recall | 로컬 캐시 우선 + 미스 시 Notion fallback. DB별 그룹화 결과 (제목/URL/출처) |
 | context | jhw_context | 프로젝트 정보 + 관련 결정 + 페이지 본문 |
 | history | jhw_history | 시간순 타임라인 (시작/결정 이벤트) |
 
 ## 흐름
 
 1. 인자 분석 → 모드 결정
-2. context/history 모드는 projects DB에서 프로젝트 페이지 ID 먼저 resolve (resolveProject)
+2. context/history 모드는 projects DB에서 프로젝트 페이지를 **exact 우선**으로 resolve (jhw_context/jhw_history가 부분일치 첫 결과 대신 정확 일치를 우선 선택 — sortProjectsByExact)
 3. 해당 MCP 도구 호출
 4. 모드별 포맷으로 결과 표시
 
@@ -44,5 +44,6 @@ argument-hint: "[키워드 | 프로젝트명] [--mode search|context|history]"
 
 ## 참고
 
+- search 모드 백엔드 `jhw_recall`은 로컬 PageCache(저장 시 자동 적재)를 먼저 본 뒤 부족분만 Notion 검색으로 보완한다 — 같은 이름의 스킬(`/jhw:recall`)과 도구(`jhw_recall`)가 이제 같은 역할(캐시 우선 검색)을 가리킨다.
 - 세션 대화 기록 조회는 `/jhw:cclog` (Notion이 아닌 Claude Code 세션 JSONL).
 - Notion → 로컬 memory 가져오기는 `/jhw:import`.

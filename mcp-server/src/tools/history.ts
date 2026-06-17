@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { queryDataSource } from "../notion/api.js";
+import { sortProjectsByExact } from "../notion/resolve-project.js";
 
 const HistoryInput = z.object({
   project: z.string().describe("프로젝트명 (검색 키워드)"),
@@ -35,7 +36,8 @@ export function registerHistory(server: McpServer) {
         };
       }
 
-      const projectPage = projectsRes.results[0] as any;
+      // exact 우선 — 부분일치 첫 결과 오매칭 방지 (recall.md §흐름과 일치)
+      const projectPage = sortProjectsByExact(projectsRes.results as any[], project)[0] as any;
       const startDate = projectPage.properties["start_date"]?.date?.start || "";
 
       // 2. Decision Log에서 관련 결정 — relation filter 우선, legacy rich_text fallback
