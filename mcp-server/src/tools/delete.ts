@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { callNotion } from "../notion/api.js";
+import { defaultPageCache } from "../cache/page-cache.js";
 
 const DeleteInput = z.object({
   pageId: z.string().describe("삭제할 Notion 페이지 ID"),
@@ -20,6 +21,10 @@ export function registerDelete(server: McpServer) {
     DeleteInput.shape,
     async ({ pageId, mode }) => {
       const notion = getNotionClient();
+
+      // 삭제/폐기 대상은 로컬 캐시에서도 제거 — jhw_recall이 archived 페이지를
+      // stale hit로 반환하지 않도록 (best-effort: API 실패 시 다음 recall에서 재적재).
+      defaultPageCache.delete(pageId);
 
       if (mode === "archive") {
         try {
@@ -67,7 +72,7 @@ export function registerDelete(server: McpServer) {
         );
         return {
           content: [
-            { type: "text" as const, text: JSON.stringify({ pageId, mode: "delete", result: "삭제 완료" }) },
+            { type: "text" as const, text: JSON.stringify({ pageId, mode: "delete", result: "Notion 휴지통 이동 완료 (복구 가능)" }) },
           ],
         };
       }

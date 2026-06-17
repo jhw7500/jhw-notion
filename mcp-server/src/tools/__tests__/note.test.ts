@@ -9,6 +9,7 @@ vi.mock("../../notion-client.js", () => ({
 }));
 
 import { registerNote } from "../note.js";
+import { defaultPageCache } from "../../cache/page-cache.js";
 
 describe("jhw_note", () => {
   let handler: (args: any) => Promise<any>;
@@ -91,6 +92,24 @@ describe("jhw_note", () => {
       { name: "iMX93" },
       { name: "BSP" },
     ]);
+  });
+
+  it("생성한 KB 페이지를 로컬 캐시에 적재한다 (P0-3)", async () => {
+    defaultPageCache.clear();
+    mockClient.pages.create.mockResolvedValue({
+      id: "note-cache-1",
+      url: "https://notion.so/note-cache-1",
+    });
+
+    await handler({ title: "캐시 메모", content: "raw socket 키 정정 메모" });
+
+    const hit = defaultPageCache.get("note-cache-1");
+    expect(hit).toBeDefined();
+    expect(hit!.db).toBe("knowledgeBase");
+    // 본문 토큰으로 검색 가능 (title-only가 아님)
+    expect(
+      defaultPageCache.search("socket").some((r) => r.page.id === "note-cache-1")
+    ).toBe(true);
   });
 
   it("drop된 tags가 있으면 응답 warnings에 포함한다", async () => {
