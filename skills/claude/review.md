@@ -65,6 +65,12 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
    API가 `body.children[0].paragraph.rich_text[0].text.content.length should be ≤ 2000`로 거절한다.
    합치기 단계에서 본문을 작성·확정하기 전에 다음 가드를 적용한다.
 
+   > **이 §3.5가 paragraph 분할 룰의 단일 정본이다** (save/project/compact/match는 여기를 참조).
+   > `jhw_record`/`jhw_note`는 MCP 레이어(`blocks.ts`)에서 2000자 초과 paragraph를 **자동 분할**하므로
+   > 길이 초과로 API가 실패하지는 않는다 — 아래 사전 가드는 분할 품질(가독성·의미 경계)을 위한 것이다.
+   > 단, `jhw_start`/`jhw_close`(project 스킬)는 본문을 단일 rich_text로 넣어 자동 분할이 없으므로
+   > 그 경로에서는 호출 전 분할이 필수다.
+
    #### 3.5.1 작성 규칙 (본문 markdown)
    - 빈 줄(`\n\n`)이 paragraph 분리자다. 모든 `##`/`###` 헤딩 위·아래는 빈 줄로 구분.
    - 한 paragraph(빈 줄 사이의 연속 텍스트 블록)는 **1800자 이하**로 유지 (안전 마진 200자).

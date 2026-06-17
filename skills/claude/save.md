@@ -54,29 +54,10 @@ argument-hint: "[--db <db>] [--delete <id>] [--hard] [내용]"
 
 ## paragraph 분할 가드 (jhw_note 본문 2000자 한도)
 
-`jhw_note`의 본문은 Notion paragraph 한 블록의 한도(**2000자**)에 걸린다. 한도를 넘으면 API가
-`body.children[0].paragraph.rich_text[0].text.content.length should be ≤ 2000`으로 거절한다.
-
-### 작성 규칙
-- 한 paragraph(빈 줄 사이 연속 텍스트 블록) **≤ 1800자** (안전 마진 200자).
-- 빈 줄(`\n\n`)이 paragraph 분리자 — 모든 `##`/`###` 헤딩 위·아래는 빈 줄.
-- 코드 블록 ```` ``` ````, markdown 표, 긴 bullet 목록도 한 paragraph로 셈.
-
-### 호출 직전 자동 검증
-1. 본문을 `\n\n`로 split해 paragraph 배열 만들기.
-2. 각 paragraph 길이 측정 (코드 펜스 포함).
-3. 1800자 초과면 자동 분할 시도.
-
-### 자동 분할 전략 (우선순위)
-1. sub-heading 추가 → 2. 긴 목록을 그룹별로 분리 → 3. 긴 코드 블록을 의미 단위로 분할 → 4. 긴 표를 카테고리별로 분할 → 5. 자연 경계(`. `, `; `, 항목 끝)에 빈 줄 → 6. 분할 불가 단일 단위면 본문 단축.
-
-### 회복 로직 (호출 실패 시)
-같은 응답 안에서:
-1. 에러의 `was N`으로 초과 paragraph 식별.
-2. 분할 전략을 한 단계 더 강하게 적용 후 재호출.
-3. 두 번째 실패면 본문을 두 KB 항목으로 분리해 각각 저장.
-
-세부 절차/예시: `~/.claude/commands/jhw/review.md` §3.5 참조.
+본문은 `\n\n`로 paragraph를 나눠 작성한다(`##`/`###` 헤딩 위·아래 빈 줄, 한 paragraph ≤ 1800자 권장).
+길이를 넘겨도 `jhw_record`/`jhw_note`가 MCP 레이어(`blocks.ts`)에서 2000자 초과 paragraph를 **자동 분할**
+하므로 길이로 API가 실패하지는 않는다 — 사전 분할은 가독성·의미 경계를 위한 것이다.
+상세 분할 전략·회복 절차는 `review.md` §3.5(단일 정본) 참조.
 
 ## 규칙
 
