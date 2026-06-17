@@ -23,7 +23,7 @@ argument-hint: "[세션파일경로|all] [--tools] [--last N]"
 ## 동작 순서
 
 1. **세션 디렉터리 확정** (cwd 기반 동적 — `import.md`와 동일 slug 규칙)
-   - `SESSION_DIR="/home/jhw/.claude/projects/$(pwd -P | sed 's#/#-#g')"`
+   - `SESSION_DIR="$HOME/.claude/projects/$(pwd -P | sed 's#/#-#g')"`
    - 현재 작업 디렉터리 절대경로의 `/`를 `-`로 치환한 slug (예: `/home/jhw/ai/opencode/projects/jhw-notion` → `-home-jhw-ai-opencode-projects-jhw-notion`)
 
 2. **대상 파일 선택**
@@ -62,7 +62,7 @@ argument-hint: "[세션파일경로|all] [--tools] [--last N]"
 ## 구현 예시 (Bash)
 
 ```bash
-SESSION_DIR="/home/jhw/.claude/projects/$(pwd -P | sed 's#/#-#g')"
+SESSION_DIR="$HOME/.claude/projects/$(pwd -P | sed 's#/#-#g')"
 
 # 대상 파일
 if [ "$1" = "all" ]; then
@@ -93,7 +93,7 @@ jq -r '
 
 ## 규칙
 
-- **경로 규칙** — base는 `/home/jhw/.claude/projects/`(절대), slug는 cwd에서 동적 계산(`pwd -P` → `/`를 `-`로 치환). `$HOME` 미사용.
+- **경로 규칙** — base는 `$HOME/.claude/projects/`(install.sh가 호출 사용자 홈에 설치하므로 이식성 확보), slug는 cwd에서 동적 계산(`pwd -P` → `/`를 `-`로 치환).
 - `agent-*.jsonl`은 서브에이전트 로그이므로 기본 제외
 - 민감정보(토큰/키) 노출 우려 시 사용자에게 경고 후 출력
 - 출력이 길면 `less -R`로 파이프 권장
