@@ -1,12 +1,12 @@
 ---
-description: PR 생성 → 리뷰 라운드 모니터링(앱·워크플로우 4채널 + 👍리액션) → 전원 CLEAN 시 머지. 타겟 장치 테스트 게이트 옵션.
-argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--reviewers a,b] [--timeout <min>] [--max-rounds <n>]"
+description: "--merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix)"
+argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--reviewers a,b] [--timeout <min>] [--max-rounds <n>] [--block-on must-fix|should-fix]"
 ---
 
 # /jhw:ship — PR 생성 + 리뷰 라운드 모니터링 + 조건부 머지
 
 브랜치를 PR로 올리고, 리포의 **자동 리뷰어들이 응답을 마칠 때까지 모니터링**한 뒤,
-지적이 없으면(전원 CLEAN) 선택적으로 머지한다. 임베디드 프로젝트는 **타겟 장치 테스트**를 머지 게이트에 추가할 수 있다.
+**블로킹 심각도 지적이 없으면**(전원 CLEAN) 선택적으로 머지한다. 임베디드 프로젝트는 **타겟 장치 테스트**를 머지 게이트에 추가할 수 있다.
 
 핵심: 리뷰어는 지적이 없을 때 **코멘트 대신 👍 리액션만** 남길 수 있으므로, 코멘트뿐 아니라
 `issues/{n}/reactions` 와 Actions run 완료까지 종합해 "응답 완료"를 판정한다.
@@ -53,6 +53,7 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 - `--reviewers <list>` — 대기할 리뷰어 부분집합(예: `codex,gemini-assist`). 기본 전체.
 - `--timeout <min>` — **한 라운드**의 폴링 최대 대기. 기본 12분, 폴링 간격 ~60s.
 - `--max-rounds <n>` — `--auto-fix` 시 재리뷰 라운드 상한(기본 3). `--timeout`이 한 라운드 한도라면, 이 값은 라운드 수를 제한.
+- `--block-on <severity>` — CLEAN 판정의 **블로킹 심각도 임계**(기본 `must-fix`). 이 미만 지적(should-fix/minor/nit 등)은 보고만 하고 머지/종료를 막지 않는다. `should-fix`로 올리면 더 엄격.
 
 ## 동작 순서
 
@@ -69,10 +70,11 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 4. **리뷰 라운드 폴링** — 각 expected 리뷰어가 terminal 신호를 낼 때까지 (또는 timeout):
    - 워크플로우 리뷰어: `actions/runs?head_sha=$SHA`(주 감지, PAT에서 동작) + `gh run watch <run-id> --exit-status`(BG, 라이브 대기). `gh pr checks`/`commits/{sha}/check-runs`는 토큰 Checks-read 권한 없으면 403이라 의존하지 않는다.
    - 앱/봇 리뷰어: 매 간격 `reviews`/`comments`/`issue-comments`/`reactions` 수집
-5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED` 판정 (actionable 여부는 코멘트 본문을 읽어 결정)
-6. **(--auto-fix & FEEDBACK)** — **모든 리뷰어가 terminal에 도달한 뒤**(PENDING 리뷰어가 있으면 대기; 즉시 재푸시는 응답 중 리뷰어의 라운드를 무효화하므로 금지) 지적을 고쳐 커밋·재푸시 → **`SHA=$(git rev-parse HEAD)` 재계산** → `synchronize`로 리뷰 재트리거 → 4로 복귀 (최대 `--max-rounds`, 기본 3). 라운드 소진 후에도 FEEDBACK이면 머지 안 하고 보고.
-7. **머지 게이트** — `--merge` AND **전원 `CLEAN`** AND (타겟 미요청 또는 타겟 `PASS`) → `gh pr merge $PR --merge --delete-branch`
+5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조).
+6. **(--auto-fix & FEEDBACK)** — **모든 리뷰어가 terminal에 도달한 뒤**(PENDING 리뷰어가 있으면 대기; 즉시 재푸시는 응답 중 리뷰어의 라운드를 무효화하므로 금지) **블로킹 지적**을 고쳐 커밋·재푸시 → **`SHA=$(git rev-parse HEAD)` 재계산** → `synchronize`로 리뷰 재트리거 → 4로 복귀. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 3) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
+7. **머지 게이트** — `--merge` AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) → `gh pr merge $PR --merge --delete-branch`
    - 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TIMEOUT}` 중 하나이거나 타겟 `FAIL`이면 **머지하지 않고** 보고
+   - **루프는 반드시 종료**: (a) 전원 CLEAN(블로킹 0) → 머지/종료, (b) `--max-rounds` 도달 → 남은 블로킹 보고 후 종료, (c) `--timeout` → 미응답 TIMEOUT 보고. 종료 조건이 "지적 0건"이 아니라 "블로킹 0건"이라 nit 무한생성에도 끝난다.
    - 리포가 squash/rebase를 강제하면 `--merge` 대신 `--squash`/`--rebase` 사용 (`gh repo view --json mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed`로 감지)
 8. **보고** — 리뷰어별 상태 표 + 타겟 결과 + 머지 결과/URL (각 봇 지적은 요약 표로)
 
@@ -113,11 +115,24 @@ collect > /tmp/ship_signals.$PR   # 매 호출 1회분. 에이전트가 읽어 �
 ### 리뷰어별 terminal 판정 규칙
 
 - **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`. 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`)는 무시. run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**.
-- **Codex**: actionable 지적이 하나라도 있으면 리액션과 무관하게 **FEEDBACK**. (a) 리뷰/diff코멘트가 있으나 actionable이 없으면(LGTM류) → **CLEAN**, (b) 리뷰·코멘트가 전혀 없고 `chatgpt-codex-connector[bot] +1` 리액션만 있으면 → **CLEAN**(무지적 신호), (c) 아무 신호도 없으면 **PENDING**.
-- **Gemini Assist**: `reviews`에 `gemini-code-assist[bot] COMMENTED` + inline `pcomments` 있으면 본문으로 CLEAN/FEEDBACK. `eyes` 리액션만이면 아직 PENDING(확인중).
-- **Claude 리뷰**: `Claude Code Review` run이 `completed`면 terminal — `claude[bot]` 리뷰 본문으로 CLEAN/FEEDBACK. run `failure`/`in_progress`면 FAILED/PENDING(게이트에선 미응답 취급 — 보고). **멈춘 in_progress run**(INTERVAL 3회 연속 in_progress 또는 TIMEOUT_MIN 초과)은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체.
+- **Codex**: **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**. (a) 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) 리뷰·코멘트가 전혀 없고 `chatgpt-codex-connector[bot] +1` 리액션만 있으면 → **CLEAN**(무지적 신호), (c) 아무 신호도 없으면 **PENDING**.
+- **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
+- **Claude 리뷰**: `Claude Code Review` run이 `completed`면 terminal — `claude[bot]` 본문 심각도로 판정(`must-fix` 있으면 **FEEDBACK**, `should-fix`/`minor`/`nit`만이면 **CLEAN**). run `failure`/`in_progress`면 FAILED/PENDING(게이트에선 미응답 취급 — 보고). **멈춘 in_progress run**(INTERVAL 3회 연속 in_progress 또는 TIMEOUT_MIN 초과)은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체.
 - **Gemini 리뷰(워크플로우)**: `Gemini Auto PR Review` `completed`면 terminal. 실패해도 Gemini Assist 앱 결과로 대체 가능(중복이면 앱 우선).
 - **미응답(timeout)**: 끝까지 PENDING인 리뷰어는 `TIMEOUT`으로 보고하고 머지 차단(전원 CLEAN 조건 미충족).
+
+### 심각도 게이트 — CLEAN/종료 정의
+
+LLM 자동 리뷰어는 라운드마다 새 nit을 만들어 "지적 0건"에 도달하지 않는다. 그래서 CLEAN은 **"블로킹 심각도 지적 0건"**으로 판정해 루프가 반드시 종료되게 한다.
+
+- **블로킹 임계** = `--block-on`(기본 `must-fix`) 이상. 리뷰어 라벨 매핑:
+  - Claude: `must-fix`(블로킹) ▸ `should-fix` ▸ `minor` ▸ `nit`/`info`
+  - Codex: `P1`(블로킹) ▸ `P2` ▸ `P3`
+  - Gemini Assist: `critical`/`high`(블로킹) ▸ `medium` ▸ `low`
+  - `--block-on should-fix`면 `should-fix`/`P2`/`medium`까지 블로킹으로 포함.
+- **CLEAN** = 응답 완료 + **열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만, 게이트 통과).
+- **결정 추적(resolved/declined)** — 이미 반영했거나 **근거와 함께 반려**한 지적은 resolved로 기록(`.jhw/ship-decisions.md` 권장)하고, 다음 라운드에 재등장해도 다시 블로킹하지 않는다. (예: "bash -c는 사용자 신뢰입력이라 인젝션 비대상" 반려.)
+- **수렴/종료** — 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) 전원 CLEAN으로 간주하고 루프를 종료(→ 머지 게이트). 그래서 nit이 무한히 나와도 항상 끝난다.
 
 ## 타겟 장치 검증 (`--target`)
 
@@ -136,7 +151,7 @@ if [ -z "$(printf '%s' "${TARGET_CMD:-}" | tr -d '[:space:]')" ]; then echo "TAR
 
 ## 규칙
 
-- **머지 안전** — 머지는 되돌리기 어려우므로 **전원 CLEAN + (요청 시)타겟 PASS** 일 때만. 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TIMEOUT}` 또는 타겟 FAIL이면 중단·보고 (전역 규칙: 롤백 불가 작업 사전 확인).
+- **머지 안전** — 머지는 되돌리기 어려우므로 **전원 CLEAN + (요청 시)타겟 PASS** 일 때만. 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TIMEOUT}` 또는 타겟 FAIL이면 중단·보고 (전역 규칙: 롤백 불가 작업 사전 확인). 여기서 CLEAN은 **'블로킹 0건'**이며, 블로킹 미만 nit은 보고만 하고 머지를 막지 않는다.
 - **리액션 타입 구분** — `+1`(👍)/`heart`=긍정(CLEAN 신호; Codex의 문서화된 무지적 신호는 `+1`), `hooray`/`rocket`=정보성(**CLEAN 판정에 사용 안 함**), `eyes`(👀)=확인중(PENDING 유지), `-1`/`confused`=부정(FEEDBACK 취급).
 - **봇 신원 보정 (동적 감지가 canonical)** — 본문 표의 신원은 이 리포 기준 **예시**. 실제 expected 집합은 폴링 첫 단계에서 동적 보정한다: 앱은 `gh api .../pulls/$PR/reviews` + `.../comments`의 `*[bot]` author 수집, 워크플로우는 `.github/workflow-config.yml`의 `auto:true` + `actions/runs`의 리뷰 워크플로우명. **`workflow-config.yml`가 없는 리포**에선 워크플로우 리뷰어를 `actions/runs`의 리뷰 워크플로우명 패턴으로만 감지한다. 모르는 `*[bot]` 응답도 표에 함께 보고.
 - **워크플로우 실패 ≠ 지적** — auto-review run이 `failure`여도(예: API 키 문제) 같은 역할의 앱 리뷰가 있으면 그쪽을 신뢰. run 실패만으로 머지 차단하지 않되 보고에 명시.
