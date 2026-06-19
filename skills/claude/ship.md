@@ -1,5 +1,5 @@
 ---
-description: "PR 생성 → 4채널 리뷰어 모니터링(앱·워크플로우 + 👍리액션) → 블로킹 심각도 0건 시 조건부 머지. 옵션 — --merge: 전원 CLEAN시 자동머지(+브랜치삭제) / --target[=cmd]: 타겟 장치 테스트를 머지 게이트에 추가(PASS여야 머지) / --auto-fix: 블로킹 지적 자동수정·재리뷰 반복 / --base <branch>: PR base(기본 main) / --reviewers <list>: 대기할 리뷰어 부분집합(예 codex,gemini-assist) / --timeout <min>: 한 라운드 폴링 한도(기본 12) / --max-rounds <n>: auto-fix 라운드 상한(기본 3) / --block-on <sev>: 블로킹 심각도 임계(기본 must-fix)"
+description: "--merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix)"
 argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--reviewers a,b] [--timeout <min>] [--max-rounds <n>] [--block-on must-fix|should-fix]"
 ---
 
