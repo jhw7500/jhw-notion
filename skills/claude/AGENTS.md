@@ -37,7 +37,7 @@ AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬. 각 스킬은 사용자 
 ## For AI Agents
 
 ### Working In This Directory
-- 각 파일은 YAML frontmatter (`description`) + 마크다운 본문 형식.
+- 각 파일은 YAML frontmatter (`description` + 선택적 `argument-hint`) + 마크다운 본문 형식.
 - 스킬은 MCP 도구를 호출하는 워크플로우 지시서. 실제 로직은 `mcp-server/src/tools/`에 있음.
 - 저장 전 반드시 사용자 승인을 받는 패턴이 공통 (1회만, 이후 한 흐름).
 - `notion-create-pages` 직접 호출 시 date 프로퍼티는 expanded 키 사용: `"date:date:start":"YYYY-MM-DD"`.
@@ -65,7 +65,9 @@ AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬. 각 스킬은 사용자 
 |------|-------------|
 | `import.md` | Notion 검색 결과를 현재 프로젝트 `~/.claude/projects/<slug>/memory/` 폴더로 불러와 로컬 참조 파일로 저장. 다중 키워드 병렬 검색 + 승인 + 연속 실행 지원. |
 | `cclog.md` | Claude Code 세션 JSONL을 시간순으로 조회 (도구 호출 포함 옵션). 대상이 Notion이 아니므로 recall에 흡수하지 않고 별도 유지. |
+| `load.md` | 세션·노션·깃 작업내역을 cwd 공통 축으로 시간순 타임라인 머지 (조회 전용). `--source`/`--last`/`--since`/`--tools`/`--author` 옵션. 세션 백엔드는 cclog와 동일 slug, 노션은 `jhw_history`. |
 
 ### Patterns
 - 불러오기 (`import`): Notion 검색 → 후보 제시 → 승인 → fetch → 로컬 memory 파일 저장 + `MEMORY.md` 인덱스 갱신.
 - 세션 조회 (`cclog`): JSONL 파싱 → 시간순 메시지/도구 호출 출력. `--last N` / `--tools` 플래그.
+- 통합 조회 (`load`): 세션+깃 로컬 머지 → 노션 `jhw_history` 이벤트 인터리브 → 단일 타임라인. 조회 전용.
