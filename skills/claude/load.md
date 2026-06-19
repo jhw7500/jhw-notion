@@ -28,7 +28,7 @@ argument-hint: "[--source session,notion,git] [--last N] [--since <when>] [--too
 1. **소스 · 기간 파싱**
    - `--source` 또는 단축 플래그로 활성 소스 집합 결정 (둘 다 오면 `--source` 우선, 기본 셋 다)
    - `--last` / `--since` 로 소스별 한도 변수 설정 (`GIT_N`, `SES_N`, `SINCE`)
-   - `PROJECT="$(basename "$(pwd -P)")"` — 노션 프로젝트 resolve 키워드
+   - `PROJECT="$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)")"` — 노션 프로젝트 resolve 키워드 (하위 디렉터리 실행 대비 git 루트 우선)
 
 2. **로컬 타임라인 생성 (bash — 세션 + 깃)**
    - 세션·깃은 로컬에서 `EPOCH<TAB>[src]<TAB>본문` 라인으로 뽑아 epoch 기준 머지·정렬 (아래 구현 예시)
@@ -57,8 +57,9 @@ argument-hint: "[--source session,notion,git] [--last N] [--since <when>] [--too
 ## 구현 예시 (로컬 타임라인 — 세션 + 깃)
 
 ```bash
-SESSION_DIR="$HOME/.claude/projects/$(pwd -P | sed 's#/#-#g')"
+SESSION_DIR="$HOME/.claude/projects/$(pwd -P | sed 's#/#-#g')"   # 세션: 실행 cwd 기준 (cclog와 동일)
 GIT_N="${GIT_N:-20}"; SES_N="${SES_N:-30}"
+SINCE_EPOCH=0; [ -n "${SINCE:-}" ] && SINCE_EPOCH="$(date -d "$SINCE" +%s 2>/dev/null || echo 0)"
 
 emit_git() {
   git rev-parse --git-dir >/dev/null 2>&1 || return 0
@@ -71,15 +72,16 @@ emit_session() {
   local f
   f="$(ls -t "$SESSION_DIR"/*.jsonl 2>/dev/null | grep -v '/agent-' | head -1)"
   [ -n "$f" ] || return 0
-  jq -r '
+  jq -r --argjson since "${SINCE_EPOCH:-0}" '
     select(.type=="user" or .type=="assistant") | select(.timestamp) |
     ((if (.message.content|type)=="string" then .message.content
       else (.message.content|map(select(.type=="text")|.text)|join(" ")) end)
      | gsub("\\s+";" ") | gsub("^ | $";"")) as $txt |
     select($txt|length>0) |
     select($txt|test("^<(command-|local-command|bash-|system-reminder|task-notification)")|not) |
-    ((try (.timestamp|sub("\\.[0-9]+";"")|fromdateiso8601) catch 0)|tostring)
-      + "\t[session]\t" + (.type[0:1]|ascii_upcase) + ": " + ($txt[0:160])
+    (try (.timestamp|sub("\\.[0-9]+";"")|fromdateiso8601) catch 0) as $ep |
+    select($since==0 or $ep>=$since) |
+    ($ep|tostring) + "\t[session]\t" + (.type[0:1]|ascii_upcase) + ": " + ($txt[0:160])
   ' "$f" | tail -n "$SES_N"
 }
 
@@ -88,7 +90,7 @@ emit_session() {
   | awk -F'\t' '($1+0)>0' \
   | sort -n -k1,1 -s \
   | while IFS=$'\t' read -r ep src txt; do
-      printf '%s  %-9s %s\n' "$(date -d "@$ep" '+%m-%d %H:%M' 2>/dev/null || echo '??-?? ??:??')" "$src" "$txt"
+      printf '%s  %-9s %s\n' "$(date -d "@$ep" '+%m-%d %H:%M' 2>/dev/null || date -r "$ep" '+%m-%d %H:%M' 2>/dev/null || echo '??-?? ??:??')" "$src" "$txt"
     done
 ```
 
@@ -99,7 +101,7 @@ emit_session() {
 ## 노션 조회 예시 (MCP)
 
 ```
-jhw_history(project="<cwd basename>")
+jhw_history(project="<git 루트 basename (없으면 cwd)>")
 → { project, totalEvents, timeline: [ {date, type:"project|decision", title, status} ] }
 ```
 
@@ -109,8 +111,8 @@ jhw_history(project="<cwd basename>")
 ## 규칙
 
 - **조회 전용** — 세션/노션/깃 어느 것도 수정하지 않는다.
-- **경로 규칙** — 세션 base는 `$HOME/.claude/projects/`, slug는 cwd 절대경로의 `/`→`-` 치환 (cclog/import와 동일).
-- **타임존 일관성** — 세션 타임스탬프(UTC Z)와 깃 `%ct`(epoch)는 모두 절대시각이므로 `date -d @epoch`로 **로컬 TZ 통일** 표기. 노션은 날짜만 있어 `00:00`에 배치.
+- **경로 규칙** — 세션 base는 `$HOME/.claude/projects/`, slug는 cwd 절대경로의 `/`→`-` 치환 (cclog/import와 동일). 세션 디렉터리는 Claude Code가 **실행 cwd 기준**으로 만들므로 cclog와 동일하게 `pwd -P`를 쓴다(하위 디렉터리에서 실행하면 cclog처럼 세션을 못 찾을 수 있음 — 같은 한계). 노션 프로젝트명만 git 루트를 우선해 하위 디렉터리 실행에 견디게 한다.
+- **타임존 일관성 / 이식성** — 세션 타임스탬프(UTC Z)와 깃 `%ct`(epoch)는 모두 절대시각이므로 epoch→로컬시각 변환으로 **로컬 TZ 통일** 표기 (GNU `date -d @epoch` 우선, BSD/macOS는 `date -r` 폴백). 노션은 날짜만 있어 `00:00`에 배치.
 - **세션 파싱 전제** — 세션 소스는 `jq` 필요. 타임스탬프는 UTC-Z 포맷을 가정하며, 파싱 실패 행은 조용히 제외된다. 하니스 주입 노이즈(`<command-*>` / `<local-command*>` / `<bash-*>` / `<system-reminder>` / `<task-notification>`)로 시작하는 행도 제외.
 - **노션 결손 허용** — `jhw_history`가 "프로젝트를 찾을 수 없습니다" 또는 어떤 오류(timeout/auth 등)든 반환하면 노션 소스만 빈 채로 두고 세션/깃 타임라인은 그대로 출력 (전체 중단 금지).
 - **빈 결과** — 모든 활성 소스가 0건이면 빈 타임라인 대신 「조회 결과 없음 (소스: …)」를 출력한다.
