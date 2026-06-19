@@ -65,6 +65,10 @@ const RecordInput = z.object({
     })
     .optional()
     .describe("추가 프로퍼티"),
+  allowNewTags: z
+    .boolean()
+    .optional()
+    .describe("미등록 multi_select 값(tags/tool/tech_stack)을 drop 대신 data source에 자동 등록(--force-tag). 기본 false."),
 });
 
 // 공통 resolver로 위임. 외부 호환을 위해 named export 유지.
@@ -78,11 +82,15 @@ async function buildNotionProperties(
   title: string,
   props: any,
   notion: Client,
-  warnings?: string[]
+  warnings?: string[],
+  allowNewTags?: boolean
 ) {
   const mapped: Record<string, any> = { ...(props ?? {}) };
   if (props?.stack !== undefined) mapped.tech_stack = props.stack;
-  return buildPropertiesFromSchema(db, title, mapped, notion, { warnings });
+  return buildPropertiesFromSchema(db, title, mapped, notion, {
+    warnings,
+    allowNewTags,
+  });
 }
 
 export function registerRecord(server: McpServer) {
@@ -90,7 +98,7 @@ export function registerRecord(server: McpServer) {
     "jhw_record",
     "Notion AI Workspace DB에 레코드 생성",
     RecordInput.shape,
-    async ({ db, title, content, properties }) => {
+    async ({ db, title, content, properties, allowNewTags }) => {
       const notion = getNotionClient();
       const dbId = NOTION_CONFIG.databases[db as DatabaseName];
 
@@ -109,7 +117,8 @@ export function registerRecord(server: McpServer) {
           title,
           properties,
           notion,
-          warnings
+          warnings,
+          allowNewTags
         );
       } catch (e) {
         if (e instanceof FieldValidationError) {
