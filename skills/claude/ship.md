@@ -26,6 +26,20 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 
 ## 인자 / 옵션
 
+한눈에 보는 요약 (상세는 아래 불릿):
+
+| 옵션 | 역할 | 기본값 |
+|---|---|---|
+| `--merge` | 머지 게이트 충족 시 자동 머지(+브랜치 삭제). 없으면 모니터링·보고만 | off (보고만) |
+| `--target[=<cmd>]` | 타겟 장치 검증을 머지 게이트에 추가(리뷰와 병렬). PASS여야 머지 | off |
+| `--auto-fix` | actionable 지적을 고쳐 재푸시 → 재리뷰 라운드 반복 | off (보고만) |
+| `--base <branch>` | PR 대상(base) 브랜치 | `main` |
+| `--reviewers <list>` | 대기할 리뷰어 부분집합 (예: `codex,gemini-assist`) | 전체 4채널 |
+| `--timeout <min>` | **한 라운드**의 폴링 최대 대기 (간격 ~60s) | 12분 |
+| `--max-rounds <n>` | `--auto-fix` 재리뷰 라운드 상한 | 3 |
+
+각 옵션 상세:
+
 - `--merge` — 머지 게이트 충족 시 **자동 머지**(+`--delete-branch`). 미지정 시 보고만.
 - `--target[=<cmd>]` — **타겟 장치 검증** 실행, 머지 게이트에 포함. 값 해석 순서:
   1. `--target=<cmd>` 명시 → 그 명령/스크립트 실행
