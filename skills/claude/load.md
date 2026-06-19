@@ -1,5 +1,5 @@
 ---
-description: 작업내역 통합 조회 — 세션·노션·깃을 시간순 타임라인으로 머지 (다중 소스 옵션)
+description: "세션·노션·깃 작업내역 시간순 머지 · --source 소스선택 · --last N 최근N · --since 기간 · --tools 도구호출포함 · --author 깃author"
 argument-hint: "[--source session,notion,git] [--last N] [--since <when>] [--tools] [--author <name>]"
 ---
 

@@ -1,5 +1,5 @@
 ---
-description: 신규 내용·키워드를 기존 Notion과 대조 — 중복/보강/유사 판정 후 정리
+description: "신규 내용을 기존 Notion과 대조(중복/보강/유사) · --from-review 직전 review 후보 · --db 대상DB · --report 대상보고서"
 argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 키워드]"
 ---
 

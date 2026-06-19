@@ -1,5 +1,5 @@
 ---
-description: 현재(또는 지정) Claude Code 세션 대화 기록을 시간순으로 조회
+description: "Claude Code 세션 대화기록 시간순 조회 · --tools 도구호출포함 · --last N 최근N턴 · 인자로 세션경로|all"
 argument-hint: "[세션파일경로|all] [--tools] [--last N]"
 ---
 
