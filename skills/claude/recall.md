@@ -1,5 +1,5 @@
 ---
-description: Notion 통합 회상 (search + context + history)
+description: "Notion 통합 회상(검색+컨텍스트+타임라인) · --mode search|context|history 모드강제"
 argument-hint: "[키워드 | 프로젝트명] [--mode search|context|history]"
 ---
 
