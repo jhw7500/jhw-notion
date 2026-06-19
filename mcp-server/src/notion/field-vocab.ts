@@ -45,6 +45,7 @@ const KB_TAGS_ALLOW = [
   "OFDMA", "WPA2", "WPA3", "EAPOL", "tshark", "pcap", "radiotap", "sniffer",
   "wpa_supplicant", "hostapd", "mgmt-frame", "host-mlme", "9098", "88Q9098",
   "mlan", "moal", "DBDC",
+  "mlanutl", "hostcmd", "NXP", "0x008b", "thermal_mgmt", "debug.conf", // wlan-driver-v2 (§3 옵션A)
   // OS/인프라
   "Linux", "linux-kernel", "kernel-module", "BSP", "Yocto", "systemd", "cron",
   "netplan", "nftables", "iptables", "bridge", "dpkg", "deb", "packaging",
@@ -65,6 +66,7 @@ const KB_TAGS_ALLOW = [
 const REF_TOOL_ALLOW = [
   "Claude Code", "Cursor", "Windsurf", "공통",
   "bash", "tcpdump", "mpstat", "jq", "awk", "git", "ssh", "scp", "dpkg",
+  "mlanconfig", "mlanutl", "uaputl", // wlan-driver-v2 (§3 옵션A)
 ] as const;
 
 export const FIELD_VOCAB: Partial<
