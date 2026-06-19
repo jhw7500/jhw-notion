@@ -1,5 +1,5 @@
 ---
-description: "Notion 즉시 저장(record+note+delete 통합) · --db 대상DB · --delete <id> 삭제 · --hard 완전삭제"
+description: "Notion 즉시 저장(record+note+delete 통합) · --db 대상DB · --delete <id> 폐기 · --hard 휴지통이동"
 argument-hint: "[--db <db>] [--delete <id>] [--hard] [내용]"
 ---
 

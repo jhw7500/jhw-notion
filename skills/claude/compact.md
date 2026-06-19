@@ -1,5 +1,5 @@
 ---
-description: "저장 레코드 정리(합치기·요약·저장가치 평가) · --db 대상DB · --report 대상보고서 · --hard 완전삭제(폐기)"
+description: "저장 레코드 정리(합치기·요약·저장가치 평가) · --db 대상DB · --report 대상보고서 · --hard 휴지통이동"
 argument-hint: "[--db <db>] [--report <report>] [--hard] [프로젝트명|키워드]"
 ---
 

@@ -1,5 +1,5 @@
 ---
-description: "일/주/월 업무 보고서(preview→export) · week|month 기간 · --start/--end 날짜범위 · --report 형식(redmine/md/json) · --db 대상DB · --by db DB별그룹 · --include-none 빈항목포함"
+description: "일/주/월 업무 보고서(preview→export) · week|month 기간 · --start/--end 날짜범위 · --report 대상보고서필터 · --db 대상DB · --by db DB별그룹 · --include-none 빈항목포함"
 argument-hint: "[week|month] [--start YYYY-MM-DD --end YYYY-MM-DD] [--report <값>...] [--db <db>...] [--by db] [--include-none]"
 ---
 
