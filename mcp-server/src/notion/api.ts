@@ -401,18 +401,23 @@ export async function appendMultiSelectOptions(
       throw new Error(`[${db}.${field}] multi_select 필드가 아니라 옵션 등록 불가`);
     }
     const existing: MultiSelectOption[] = prop.multi_select?.options ?? [];
-    const existingKeys = new Set(existing.map((o) => o.name.trim().toLowerCase()));
+    // 입력 → canonical 옵션명 매핑: 기존 옵션은 대소문자 보존, 신규는 trim한 입력.
+    // 대소문자만 다른 입력(imx93 vs iMX93)이 새 중복 옵션을 만들지 않도록 canonical을 반환한다.
+    const canonByKey = new Map<string, string>();
+    for (const o of existing) canonByKey.set(o.name.trim().toLowerCase(), o.name);
 
-    const seen = new Set<string>();
     const toAdd: string[] = [];
     for (const raw of names) {
       const t = raw.trim();
       const key = t.toLowerCase();
-      if (!t || existingKeys.has(key) || seen.has(key)) continue;
-      seen.add(key);
+      if (!t || canonByKey.has(key)) continue;
+      canonByKey.set(key, t); // 신규 등록명을 canonical로
       toAdd.push(t);
     }
-    if (toAdd.length === 0) return names; // 이미 전부 존재 — 그대로 사용 가능
+    const canonical = names.map(
+      (raw) => canonByKey.get(raw.trim().toLowerCase()) ?? raw.trim()
+    );
+    if (toAdd.length === 0) return canonical; // 신규 없음 — 기존 canonical 반환
 
     const options: MultiSelectOption[] = [
       // 기존: id(+color) 보존 재전송 → delete-recreate 방지
@@ -433,6 +438,6 @@ export async function appendMultiSelectOptions(
         } as Parameters<Client["dataSources"]["update"]>[0]),
       { operation: `vocab.append.update.${db}.${field}` }
     );
-    return names;
+    return canonical;
   });
 }
