@@ -66,8 +66,10 @@ AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬. 각 스킬은 사용자 
 | `import.md` | Notion 검색 결과를 현재 프로젝트 `~/.claude/projects/<slug>/memory/` 폴더로 불러와 로컬 참조 파일로 저장. 다중 키워드 병렬 검색 + 승인 + 연속 실행 지원. |
 | `cclog.md` | Claude Code 세션 JSONL을 시간순으로 조회 (도구 호출 포함 옵션). 대상이 Notion이 아니므로 recall에 흡수하지 않고 별도 유지. |
 | `load.md` | 세션·노션·깃 작업내역을 cwd 공통 축으로 시간순 타임라인 머지 (조회 전용). `--source`/`--last`/`--since`/`--tools`/`--author` 옵션. 세션 백엔드는 cclog와 동일 slug, 노션은 `jhw_history`. |
+| `ship.md` | 브랜치를 PR로 올리고 자동 리뷰어(앱·워크플로우 4채널 + 👍 리액션) 응답을 모니터링해 전원 CLEAN 시 조건부 머지. `--merge`/`--target`/`--auto-fix`/`--base`/`--reviewers`/`--timeout` 옵션. 리뷰어 레지스트리는 `.github/workflow-config.yml`의 auto:true 워크플로우 + 설치된 GitHub App 기준. |
 
 ### Patterns
 - 불러오기 (`import`): Notion 검색 → 후보 제시 → 승인 → fetch → 로컬 memory 파일 저장 + `MEMORY.md` 인덱스 갱신.
 - 세션 조회 (`cclog`): JSONL 파싱 → 시간순 메시지/도구 호출 출력. `--last N` / `--tools` 플래그.
 - 통합 조회 (`load`): 세션+깃 로컬 머지 → 노션 `jhw_history` 이벤트 인터리브 → 단일 타임라인. 조회 전용.
+- PR 라이프사이클 (`ship`): PR 생성/감지 → 리뷰 라운드 폴링(reviews/comments/reactions/runs) → 리뷰어별 CLEAN/FEEDBACK/TIMEOUT 판정 → `--merge` AND 전원 CLEAN AND (요청 시)타겟 PASS면 머지. 조회가 아닌 쓰기(머지)이므로 자기승인 금지·재리뷰 필수.
