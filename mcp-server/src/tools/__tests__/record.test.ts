@@ -185,4 +185,33 @@ describe("jhw_record", () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.warnings.join(" ")).toContain("zzz없는태그");
   });
+
+  it("allowNewTags=true면 미등록 multi_select를 data source에 자동 등록 후 포함한다", async () => {
+    mockClient.dataSources.retrieve.mockResolvedValue({
+      properties: {
+        tool: {
+          type: "multi_select",
+          multi_select: { options: [{ id: "1", name: "git" }] },
+        },
+      },
+    });
+    mockClient.dataSources.update.mockResolvedValue({});
+    mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
+
+    const result = await handler({
+      db: "references",
+      title: "R",
+      properties: { tool: "git, 새도구zzz" },
+      allowNewTags: true,
+    });
+
+    expect(mockClient.dataSources.update).toHaveBeenCalled();
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.properties["tool"].multi_select).toEqual([
+      { name: "git" },
+      { name: "새도구zzz" },
+    ]);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warnings.join(" ")).toContain("자동등록");
+  });
 });

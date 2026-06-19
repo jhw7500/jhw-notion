@@ -5,7 +5,7 @@ import { NOTION_CONFIG, REPORT_VALUES } from "../config.js";
 import { resolveProjectRelationId } from "./record.js";
 import { callNotion } from "../notion/api.js";
 import { paragraphBlocks } from "../notion/blocks.js";
-import { normalizeMultiSelectValues } from "../notion/field-vocab.js";
+import { applyMultiSelectGuard } from "../notion/multi-select-guard.js";
 import { cachePage } from "../cache/page-cache.js";
 
 // KB DB의 category select 옵션 (8종)
@@ -37,6 +37,10 @@ const NoteInput = z.object({
     .enum(REPORT_VALUES)
     .optional()
     .describe("redmine 보고 분류. 개인 메모는 'none' 권장."),
+  allowNewTags: z
+    .boolean()
+    .optional()
+    .describe("미등록 태그를 어휘 가드 drop 대신 KB tags에 자동 등록(--force-tag). 기본 false."),
 });
 
 export function registerNote(server: McpServer) {
@@ -44,7 +48,7 @@ export function registerNote(server: McpServer) {
     "jhw_note",
     "Knowledge Base DB에 기술 지식이나 발견 사항을 메모 (DB 항목으로 저장)",
     NoteInput.shape,
-    async ({ title, content, summary, category, tags, project, report }) => {
+    async ({ title, content, summary, category, tags, project, report, allowNewTags }) => {
       const notion = getNotionClient();
 
       const properties: Record<string, any> = {
@@ -60,20 +64,17 @@ export function registerNote(server: McpServer) {
         properties["category"] = { select: { name: category } };
       }
       if (tags) {
-        // 어휘 가드: 별칭 정규화 + 중복제거. 미등록 태그는 drop하고 경고.
-        const { kept, dropped } = normalizeMultiSelectValues(
+        // 어휘 가드(별칭 정규화+중복제거) + opt-in 자동 등록.
+        const names = await applyMultiSelectGuard(
+          notion,
           "knowledgeBase",
           "tags",
-          tags.split(",")
+          tags.split(","),
+          { allowNew: allowNewTags, warnings }
         );
-        if (dropped.length > 0) {
-          warnings.push(
-            `[knowledgeBase.tags] 미등록 값 ${dropped.length}개 제외: ${dropped.join(", ")}`
-          );
-        }
-        if (kept.length > 0) {
+        if (names.length > 0) {
           properties["tags"] = {
-            multi_select: kept.map((name) => ({ name })),
+            multi_select: names.map((name) => ({ name })),
           };
         }
       }

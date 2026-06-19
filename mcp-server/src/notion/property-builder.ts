@@ -5,10 +5,8 @@ import type { Client } from "@notionhq/client";
 import { DATABASE_SCHEMAS } from "../schema.js";
 import type { DatabaseName } from "../config.js";
 import { resolveProjectId } from "./resolve-project.js";
-import {
-  normalizeSelectValue,
-  normalizeMultiSelectValues,
-} from "./field-vocab.js";
+import { normalizeSelectValue } from "./field-vocab.js";
+import { applyMultiSelectGuard } from "./multi-select-guard.js";
 
 export interface BuildOptions {
   /** 자동 today fill을 켤지 (기본 true). date/start_date에 입력 없을 때 today 주입. */
@@ -20,6 +18,8 @@ export interface BuildOptions {
    * 호출부(record/note 등)가 전달하면 사용자 응답에 노출할 수 있다.
    */
   warnings?: string[];
+  /** true면 미등록 multi_select 값을 drop 대신 data source에 자동 등록(--force-tag). 기본 false. */
+  allowNewTags?: boolean;
 }
 
 const TODAY_FIELDS = new Set(["date", "start_date"]);
@@ -84,20 +84,17 @@ export async function buildPropertiesFromSchema(
       }
       case "multi_select": {
         if (!missing) {
-          // 어휘 가드: 별칭 정규화 + 중복제거. 미등록 값은 drop하고 경고 수집.
-          const { kept, dropped } = normalizeMultiSelectValues(
+          // 어휘 가드(별칭 정규화+중복제거) + opt-in 자동 등록.
+          const names = await applyMultiSelectGuard(
+            notion,
             db,
             key,
-            String(raw).split(",")
+            String(raw).split(","),
+            { allowNew: options.allowNewTags, warnings: options.warnings }
           );
-          if (dropped.length > 0 && options.warnings) {
-            options.warnings.push(
-              `[${db}.${key}] 미등록 값 ${dropped.length}개 제외: ${dropped.join(", ")}`
-            );
-          }
-          if (kept.length > 0) {
+          if (names.length > 0) {
             props[key] = {
-              multi_select: kept.map((name) => ({ name })),
+              multi_select: names.map((name) => ({ name })),
             };
           }
         }

@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { NOTION_CONFIG } from "../config.js";
 import { callNotion } from "../notion/api.js";
-import { normalizeMultiSelectValues } from "../notion/field-vocab.js";
+import { applyMultiSelectGuard } from "../notion/multi-select-guard.js";
 import { cachePage } from "../cache/page-cache.js";
 
 const StartInput = z.object({
@@ -11,6 +11,10 @@ const StartInput = z.object({
   repo: z.string().optional().describe("레포 경로"),
   stack: z.string().optional().describe("기술 스택"),
   description: z.string().describe("한 줄 설명"),
+  allowNewTags: z
+    .boolean()
+    .optional()
+    .describe("미등록 tech_stack 값을 drop 대신 자동 등록(--force-tag). 기본 false."),
 });
 
 export function registerStart(server: McpServer) {
@@ -18,9 +22,10 @@ export function registerStart(server: McpServer) {
     "jhw_start",
     "새 프로젝트 시작 — Projects DB 등록 + Decision Log 기록 + 페이지 템플릿",
     StartInput.shape,
-    async ({ name, repo, stack, description }) => {
+    async ({ name, repo, stack, description, allowNewTags }) => {
       const notion = getNotionClient();
       const today = new Date().toISOString().split("T")[0];
+      const warnings: string[] = [];
 
       // 1. Projects DB에 레코드 생성
       const projectProps: Record<string, any> = {
@@ -31,15 +36,17 @@ export function registerStart(server: McpServer) {
       };
       if (repo) projectProps["repo"] = { rich_text: [{ text: { content: repo } }] };
       if (stack) {
-        // 어휘 가드: 별칭 정규화 + 중복제거, 미등록 스택은 drop.
-        const { kept } = normalizeMultiSelectValues(
+        // 어휘 가드(별칭 정규화+중복제거) + opt-in 자동 등록.
+        const names = await applyMultiSelectGuard(
+          notion,
           "projects",
           "tech_stack",
-          stack.split(",")
+          stack.split(","),
+          { allowNew: allowNewTags, warnings }
         );
-        if (kept.length > 0) {
+        if (names.length > 0) {
           projectProps["tech_stack"] = {
-            multi_select: kept.map((name) => ({ name })),
+            multi_select: names.map((name) => ({ name })),
           };
         }
       }
@@ -103,6 +110,7 @@ export function registerStart(server: McpServer) {
               {
                 project: { id: projectPage.id, url: (projectPage as any).url },
                 decision: { id: decisionPage.id, url: (decisionPage as any).url },
+                ...(warnings.length > 0 ? { warnings } : {}),
               },
               null,
               2

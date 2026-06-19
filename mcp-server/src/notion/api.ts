@@ -349,3 +349,90 @@ export async function queryDataSource(
     incomplete: lastIncomplete,
   };
 }
+
+// =====================================================================
+// 옵션 B: multi_select 옵션 자동 등록 (opt-in --force-tag / allowNewTags)
+// 분석문서: docs/03-analysis/multi-select-tag-autocreate.analysis.md §3 옵션 B
+// =====================================================================
+
+interface MultiSelectOption {
+  id?: string;
+  name: string;
+  color?: string;
+}
+
+// 옵션 쓰기 직렬화 — retrieve→merge→update는 read-modify-write라 동시 호출 시 lost-update.
+// 프로세스 내 단일 chain으로 순차 실행하여 각 호출이 직전 추가분을 본다.
+// (크로스-프로세스 동시성은 범위 밖 — jhw-notion은 세션당 단일 MCP 프로세스)
+let optionWriteChain: Promise<unknown> = Promise.resolve();
+function serializeOptionWrite<T>(fn: () => Promise<T>): Promise<T> {
+  const run = optionWriteChain.then(fn, fn);
+  optionWriteChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+/**
+ * 미등록 multi_select 옵션을 data source 스키마에 등록(append)한다 (v5 SDK).
+ * - retrieve→merge→update를 `serializeOptionWrite`로 직렬화하여 lost-update 방지.
+ * - 기존 옵션은 `id`(+color) 보존하여 재전송 — 빠뜨리면 delete-recreate(새 id churn) 발생.
+ * - `names` 중 기존 옵션과 대소문자/공백 정규화로 중복되는 값은 dedup.
+ * @returns 등록 후 사용 가능한 names (입력 그대로)
+ */
+export async function appendMultiSelectOptions(
+  notion: Client,
+  db: DatabaseName,
+  field: string,
+  names: string[]
+): Promise<string[]> {
+  const dataSourceId = getDataSourceId(db);
+  return serializeOptionWrite(async () => {
+    const ds = await callNotion(
+      () =>
+        notion.dataSources.retrieve({
+          data_source_id: dataSourceId,
+        } as Parameters<Client["dataSources"]["retrieve"]>[0]),
+      { operation: `vocab.append.retrieve.${db}.${field}` }
+    );
+    const prop = (ds as { properties?: Record<string, any> }).properties?.[field];
+    if (!prop || prop.type !== "multi_select") {
+      throw new Error(`[${db}.${field}] multi_select 필드가 아니라 옵션 등록 불가`);
+    }
+    const existing: MultiSelectOption[] = prop.multi_select?.options ?? [];
+    const existingKeys = new Set(existing.map((o) => o.name.trim().toLowerCase()));
+
+    const seen = new Set<string>();
+    const toAdd: string[] = [];
+    for (const raw of names) {
+      const t = raw.trim();
+      const key = t.toLowerCase();
+      if (!t || existingKeys.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      toAdd.push(t);
+    }
+    if (toAdd.length === 0) return names; // 이미 전부 존재 — 그대로 사용 가능
+
+    const options: MultiSelectOption[] = [
+      // 기존: id(+color) 보존 재전송 → delete-recreate 방지
+      ...existing.map((o) => ({
+        ...(o.id ? { id: o.id } : {}),
+        name: o.name,
+        ...(o.color ? { color: o.color } : {}),
+      })),
+      // 신규: name만 (Notion이 id·color 부여)
+      ...toAdd.map((name) => ({ name })),
+    ];
+
+    await callNotion(
+      () =>
+        notion.dataSources.update({
+          data_source_id: dataSourceId,
+          properties: { [field]: { multi_select: { options } } },
+        } as Parameters<Client["dataSources"]["update"]>[0]),
+      { operation: `vocab.append.update.${db}.${field}` }
+    );
+    return names;
+  });
+}
