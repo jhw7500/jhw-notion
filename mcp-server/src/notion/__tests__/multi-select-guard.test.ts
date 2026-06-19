@@ -32,7 +32,8 @@ describe("multi_select 옵션 자동 등록 (옵션 B)", () => {
         ["새태그", "imx93"] // imx93은 기존 iMX93과 대소문자만 다름 → dedup
       );
 
-      expect(result).toEqual(["새태그", "iMX93"]); // imx93 입력은 기존 iMX93의 canonical로 보정
+      expect(result.canonical).toEqual(["새태그", "iMX93"]); // imx93 입력은 기존 iMX93의 canonical로 보정
+      expect(result.added).toEqual(["새태그"]); // 실제 신규 등록은 새태그만 (imx93은 canonicalize)
       const updateArg = notion.dataSources.update.mock.calls[0][0];
       expect(updateArg.data_source_id).toBeDefined();
       expect(updateArg.properties.tags.multi_select.options).toEqual([
@@ -56,7 +57,8 @@ describe("multi_select 옵션 자동 등록 (옵션 B)", () => {
         "tags",
         ["iMX93"]
       );
-      expect(result).toEqual(["iMX93"]);
+      expect(result.canonical).toEqual(["iMX93"]);
+      expect(result.added).toEqual([]);
       expect(notion.dataSources.update).not.toHaveBeenCalled();
     });
 
@@ -121,6 +123,30 @@ describe("multi_select 옵션 자동 등록 (옵션 B)", () => {
       );
       expect(names).toEqual(["iMX93"]); // 폴백 drop
       expect(warnings.join(" ")).toContain("자동등록 실패");
+    });
+
+    it("allowNew=true: Notion엔 있으나 vocab엔 없는 dropped는 canonical 보정·자동등록 카운트 제외", async () => {
+      // CustomTag는 field-vocab엔 없어 dropped이지만 Notion 옵션엔 존재(대소문자만 다름).
+      notion.dataSources.retrieve.mockResolvedValue({
+        properties: {
+          tags: {
+            type: "multi_select",
+            multi_select: { options: [{ id: "1", name: "CustomTag" }] },
+          },
+        },
+      });
+      notion.dataSources.update.mockResolvedValue({});
+      const warnings: string[] = [];
+      const names = await applyMultiSelectGuard(
+        notion as any,
+        "knowledgeBase",
+        "tags",
+        ["customtag"],
+        { allowNew: true, warnings }
+      );
+      expect(names).toEqual(["CustomTag"]); // canonical로 보정되어 페이지에 들어감
+      expect(notion.dataSources.update).not.toHaveBeenCalled(); // 신규 없음 → 등록 호출 없음
+      expect(warnings.join(" ")).not.toContain("자동등록"); // 0개 등록 — 과대 카운트 없음(Claude Bug 수정 검증)
     });
   });
 });

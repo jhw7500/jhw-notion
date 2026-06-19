@@ -379,14 +379,15 @@ function serializeOptionWrite<T>(fn: () => Promise<T>): Promise<T> {
  * - retrieve→merge→update를 `serializeOptionWrite`로 직렬화하여 lost-update 방지.
  * - 기존 옵션은 `id`(+color) 보존하여 재전송 — 빠뜨리면 delete-recreate(새 id churn) 발생.
  * - `names` 중 기존 옵션과 대소문자/공백 정규화로 중복되는 값은 dedup.
- * @returns 등록 후 사용 가능한 names (입력 그대로)
+ * @returns `{ canonical, added }` — canonical: 입력 전체를 기존 대소문자로 보정한 이름,
+ *          added: 이번에 data source에 **새로 등록된** 이름만(경고 카운트용 — canonicalize는 제외).
  */
 export async function appendMultiSelectOptions(
   notion: Client,
   db: DatabaseName,
   field: string,
   names: string[]
-): Promise<string[]> {
+): Promise<{ canonical: string[]; added: string[] }> {
   const dataSourceId = getDataSourceId(db);
   return serializeOptionWrite(async () => {
     const ds = await callNotion(
@@ -417,7 +418,7 @@ export async function appendMultiSelectOptions(
     const canonical = names.map(
       (raw) => canonByKey.get(raw.trim().toLowerCase()) ?? raw.trim()
     );
-    if (toAdd.length === 0) return canonical; // 신규 없음 — 기존 canonical 반환
+    if (toAdd.length === 0) return { canonical, added: [] }; // 신규 없음 — canonical만
 
     const options: MultiSelectOption[] = [
       // 기존: id(+color) 보존 재전송 → delete-recreate 방지
@@ -438,6 +439,6 @@ export async function appendMultiSelectOptions(
         } as Parameters<Client["dataSources"]["update"]>[0]),
       { operation: `vocab.append.update.${db}.${field}` }
     );
-    return canonical;
+    return { canonical, added: toAdd };
   });
 }

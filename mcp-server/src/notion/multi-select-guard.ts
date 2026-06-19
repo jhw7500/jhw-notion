@@ -31,17 +31,23 @@ export async function applyMultiSelectGuard(
 
   if (opts.allowNew) {
     try {
-      // appendMultiSelectOptions는 canonical(기존 대소문자 보존) 이름을 반환 — 그 값을 써야
-      // 대소문자만 다른 입력이 중복 옵션을 만들지 않는다.
-      const registered = await appendMultiSelectOptions(notion, db, field, dropped);
-      opts.warnings?.push(
-        `[${db}.${field}] 신규 옵션 ${registered.length}개 자동등록: ${registered.join(", ")}`
+      // canonical(기존 대소문자 보존)은 페이지 값으로 사용, added(실제 신규 등록분)는 경고 카운트로.
+      const { canonical, added } = await appendMultiSelectOptions(
+        notion,
+        db,
+        field,
+        dropped
       );
-      return [...kept, ...registered];
+      if (added.length > 0) {
+        opts.warnings?.push(
+          `[${db}.${field}] 신규 옵션 ${added.length}개 자동등록: ${added.join(", ")}`
+        );
+      }
+      return [...kept, ...canonical];
     } catch (e) {
       // 자동등록 실패 → drop으로 폴백(저장은 진행). 가드의 안전 우선.
       opts.warnings?.push(
-        `[${db}.${field}] 자동등록 실패로 ${dropped.length}개 제외: ${dropped.join(", ")} (${(e as Error).message})`
+        `[${db}.${field}] 자동등록 실패로 ${dropped.length}개 제외: ${dropped.join(", ")} (${e instanceof Error ? e.message : String(e)})`
       );
       return kept;
     }
