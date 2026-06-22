@@ -188,22 +188,26 @@ describe("buildPropertiesFromSchema", () => {
     expect(props["성과"].checkbox).toBe(true);
   });
 
-  it("checkbox: 문자열 'false'/'__NO__'는 false로 처리", async () => {
+  it("checkbox: false 류(false/0/no/off/__NO__/공백/대문자)는 false, 그 외는 true", async () => {
     const notion = setup();
-    const p1 = await buildPropertiesFromSchema(
-      "projects",
-      "T",
-      { 성과: "false" },
-      notion as any
-    );
-    expect(p1["성과"].checkbox).toBe(false);
-    const p2 = await buildPropertiesFromSchema(
-      "projects",
-      "T",
-      { 성과: "__NO__" },
-      notion as any
-    );
-    expect(p2["성과"].checkbox).toBe(false);
+    for (const v of ["false", "0", "no", "off", "__NO__", " False ", "FALSE"]) {
+      const p = await buildPropertiesFromSchema(
+        "projects",
+        "T",
+        { 성과: v },
+        notion as any
+      );
+      expect(p["성과"].checkbox, `'${v}' → false`).toBe(false);
+    }
+    for (const v of ["true", "__YES__", "1", "yes"]) {
+      const p = await buildPropertiesFromSchema(
+        "projects",
+        "T",
+        { 성과: v },
+        notion as any
+      );
+      expect(p["성과"].checkbox, `'${v}' → true`).toBe(true);
+    }
   });
 
   it("임팩트/성과는 미지원 DB(preferences)에는 없음 (schema에 없으면 skip)", async () => {

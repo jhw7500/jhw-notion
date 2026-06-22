@@ -116,7 +116,9 @@ export async function buildPropertiesFromSchema(
         if (!missing) {
           const val =
             typeof raw === "string"
-              ? !["false", "0", "no", "__no__"].includes(raw.toLowerCase())
+              ? !["false", "0", "no", "off", "__no__"].includes(
+                  raw.trim().toLowerCase()
+                )
               : Boolean(raw);
           props[key] = { checkbox: val };
         }
