@@ -63,6 +63,7 @@ argument-hint: "[--db <db>] [--delete <id>] [--hard] [--force-tag] [내용]"
 ## 규칙
 
 - 중간 결과·미확정 정보·실패 시도는 저장하지 않는다.
+- **성과 capture**: projects 완료·decisionLog 확정은 코드가 git에 있어도 결과·임팩트와 함께 저장한다(git 중복 아님 — git엔 결과/임팩트가 없음). 단 KB(재사용 지식·팁·방법론)는 git-유추 트리비아 제외, raw 커밋 로그 복제만 지양.
 - 승인 이후 응답을 끊지 않고 한 흐름으로 저장 → 결과 보고까지 진행.
 - `--delete`/`--hard` → MCP 매핑: `--delete`=`jhw_delete mode: archive`(status를 '폐기'로 변경), `--hard`=`jhw_delete mode: delete`(`archived: true`, Notion 휴지통 이동). **Notion API는 영구 삭제를 노출하지 않아 둘 다 30일 내 복구 가능** — '완전 삭제' 아님. `--hard`는 명시적일 때만.
 - `--force-tag` → `allowNewTags: true` 매핑: multi_select 미등록 값(KB `tags` / references `tool` / projects `tech_stack`)을 어휘 가드 drop 대신 **data source에 자동 등록 후 포함**. 기본(미지정)은 현행 drop+경고 유지 — 노이즈/오타 옵션 폭발 방지. 등록은 기존 옵션 `id` 보존·대소문자 중복제거하며, 실패 시 안전하게 drop으로 폴백. (분석: `docs/03-analysis/multi-select-tag-autocreate.analysis.md` 옵션 B)
