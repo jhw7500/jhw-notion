@@ -163,4 +163,62 @@ describe("buildPropertiesFromSchema", () => {
       expect(props.report.select.name).toBe("wlan-driver");
     }
   });
+
+  it("projects: 임팩트(rich_text) + 성과(checkbox) 매핑", async () => {
+    const notion = setup();
+    const props = await buildPropertiesFromSchema(
+      "projects",
+      "P",
+      { 임팩트: "재발률 0 달성", 성과: true },
+      notion as any
+    );
+    expect(props["임팩트"].rich_text[0].text.content).toBe("재발률 0 달성");
+    expect(props["성과"].checkbox).toBe(true);
+  });
+
+  it("decisionLog: 임팩트/성과 지원 (projects와 동일)", async () => {
+    const notion = setup();
+    const props = await buildPropertiesFromSchema(
+      "decisionLog",
+      "T",
+      { 임팩트: "근본원인 규명", 성과: true },
+      notion as any
+    );
+    expect(props["임팩트"].rich_text[0].text.content).toBe("근본원인 규명");
+    expect(props["성과"].checkbox).toBe(true);
+  });
+
+  it("checkbox: false 류(false/0/no/off/__NO__/공백/대문자)는 false, 그 외는 true", async () => {
+    const notion = setup();
+    for (const v of ["false", "0", "no", "off", "__NO__", " False ", "FALSE"]) {
+      const p = await buildPropertiesFromSchema(
+        "projects",
+        "T",
+        { 성과: v },
+        notion as any
+      );
+      expect(p["성과"].checkbox, `'${v}' → false`).toBe(false);
+    }
+    for (const v of ["true", "__YES__", "1", "yes"]) {
+      const p = await buildPropertiesFromSchema(
+        "projects",
+        "T",
+        { 성과: v },
+        notion as any
+      );
+      expect(p["성과"].checkbox, `'${v}' → true`).toBe(true);
+    }
+  });
+
+  it("임팩트/성과는 미지원 DB(preferences)에는 없음 (schema에 없으면 skip)", async () => {
+    const notion = setup();
+    const props = await buildPropertiesFromSchema(
+      "preferences",
+      "T",
+      { 임팩트: "x", 성과: true },
+      notion as any
+    );
+    expect(props["임팩트"]).toBeUndefined();
+    expect(props["성과"]).toBeUndefined();
+  });
 });

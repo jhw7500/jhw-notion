@@ -47,7 +47,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 6. **카드형 미리보기 + 승인** (§미리보기).
 
 7. **액션 분기**
-   - NEW/SIMILAR → 신규 저장 (`jhw_record`/`jhw_note`)
+   - NEW/SIMILAR → 신규 저장 (`jhw_record`/`jhw_note`). projects(완료)/decisionLog(확정)면 `impact`(성과 한 줄)+`achievement:true`도 함께 저장(사실·수치 기반, 애매하면 생략).
    - AUGMENT → 기존 페이지에 `### YYYY-MM-DD 보강` append (§AUGMENT 절차)
    - DUPLICATE → skip
 
@@ -151,6 +151,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 - **AUGMENT에 target_url이 비어 있으면 임의 신규 전환 금지** — 사용자 확인 필수.
 - **/jhw:compact와 역할 구분**: compact는 *기존 ↔ 기존*, match는 *신규 ↔ 기존*.
 - **/jhw:review와 역할 구분**: review는 가벼운 저장 흐름, match는 옵트인 대조.
+- **성과 필드 자동 채움**: NEW/SIMILAR로 projects(완료)·decisionLog(확정) 신규 저장 시 `impact`+`achievement:true`를 함께 넣는다 → 🏆 성과 뷰·보고서 자동 누적. AUGMENT는 properties 미변경 원칙이라 성과 필드도 건드리지 않는다.
 - **무인자 자동 from-review**: 인자 없이 `/jhw:match` 호출 시 대화의 **가장 마지막** `/jhw:review` 후보 카드를 자동 입력으로 사용한다(그 이후 새 저장/대조가 없을 때만). 없거나 stale하면 되묻는다. 명시적 `--from-review`는 강제용.
 - 매칭 결과 0건이면 카드에 NEW로 표시. 매칭이 있어도 모두 SIMILAR면 신규 저장이 기본 동작.
 

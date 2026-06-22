@@ -193,6 +193,7 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
      preferences/projects/references/decisionLog 모두 `jhw_record.content` 지원.
      knowledgeBase는 `jhw_note.content` 사용.
      별도 `notion-update-page` 호출은 불필요.
+   - **성과 자동 정리**: 후보가 `projects`(status=완료) 또는 `decisionLog`(status=확정)이면 `jhw_record`에 `properties.impact`(임팩트 — 성과 한 줄: 수치·결과 중심 한 문장)와 `properties.achievement: true`를 함께 넣는다. 미완료/미확정이거나 성과로 보기 애매하면 생략. 임팩트는 본문의 **사실·수치만** 사용(창작 금지). → 🏆 성과 뷰·`jhw_report` 임팩트에 자동 누적.
 
 7. 저장 결과 요약을 보여준다 (저장 N개 / 옵트인 제외된 하 등급 M개 명시).
 
@@ -212,3 +213,4 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
 - **`report`는 2단계 추론**(§2): cwd 슬러그 매핑(확실) → 실패 시 본문 도메인 기반 추정(`(추정)` 표시). 신호 약하거나 충돌하면 빈 값.
 - **추정 report는 임의 채택 금지** — 저장 전 사용자 확인 필수("report 임의 매핑 금지" 규칙). 확정/`(추정)`/빈칸을 표에서 구분.
 - 보고서에 노출 원치 않는 항목은 `report=none`으로 명시 (보고 제외).
+- **성과 필드 자동 채움**: projects(완료)·decisionLog(확정) 저장 시 `impact`(성과 한 줄)+`achievement:true`를 함께 저장 → 🏆 성과 뷰·`jhw_report` 임팩트 자동 누적. 사실·수치 기반, 미완료/애매하면 생략.
