@@ -71,7 +71,9 @@ const RecordInput = z.object({
       achievement: z
         .boolean()
         .optional()
-        .describe("성과 플래그 — 제출용 강조 체크 (projects/decisionLog)."),
+        .describe(
+          "성과 플래그 — 제출용 강조 체크 (projects/decisionLog). impact와 함께 설정 권장 (성과만 켜고 임팩트가 비면 🏆 성과 뷰에 설명 없는 항목이 남음)."
+        ),
     })
     .optional()
     .describe("추가 프로퍼티"),

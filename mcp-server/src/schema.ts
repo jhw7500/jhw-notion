@@ -54,7 +54,7 @@ export const DATABASE_SCHEMAS: Record<DatabaseName, DatabaseSchema> = {
       start_date: { type: "date" },
       end_date: { type: "date" },
       report: { type: "select" },
-      // 성과 정리용 (2026-06): 완료 작업의 성과 한 줄 + 제출 강조 플래그.
+      // 성과 정리용 — 완료 작업의 성과 한 줄 + 제출 강조 플래그.
       임팩트: { type: "rich_text" },
       성과: { type: "checkbox" },
     },
@@ -84,7 +84,7 @@ export const DATABASE_SCHEMAS: Record<DatabaseName, DatabaseSchema> = {
       area: { type: "select" },
       date: { type: "date" },
       report: { type: "select" },
-      // 성과 정리용 (2026-06): 확정 결정의 성과 한 줄 + 제출 강조 플래그.
+      // 성과 정리용 — 확정 결정의 성과 한 줄 + 제출 강조 플래그.
       임팩트: { type: "rich_text" },
       성과: { type: "checkbox" },
     },
