@@ -62,6 +62,16 @@ const RecordInput = z.object({
         .optional()
         .describe("기술 스택 (projects multi_select, comma-separated)"),
       description: z.string().optional().describe("설명 (projects)"),
+      impact: z
+        .string()
+        .optional()
+        .describe(
+          "임팩트 — 성과 한 줄 (projects 완료/decisionLog 확정 항목에 권장). 🏆 성과 뷰·보고서에 노출. 사실·수치 기반."
+        ),
+      achievement: z
+        .boolean()
+        .optional()
+        .describe("성과 플래그 — 제출용 강조 체크 (projects/decisionLog)."),
     })
     .optional()
     .describe("추가 프로퍼티"),
@@ -87,6 +97,9 @@ async function buildNotionProperties(
 ) {
   const mapped: Record<string, any> = { ...(props ?? {}) };
   if (props?.stack !== undefined) mapped.tech_stack = props.stack;
+  // 성과 자동 정리(projects 완료/decisionLog 확정): 영문 입력키 → Notion 한글 프로퍼티명.
+  if (props?.impact !== undefined) mapped["임팩트"] = props.impact;
+  if (props?.achievement !== undefined) mapped["성과"] = props.achievement;
   return buildPropertiesFromSchema(db, title, mapped, notion, {
     warnings,
     allowNewTags,

@@ -186,6 +186,26 @@ describe("jhw_record", () => {
     expect(parsed.warnings.join(" ")).toContain("zzz없는태그");
   });
 
+  it("projects: impact/achievement를 임팩트(rich_text)·성과(checkbox)로 저장한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "p", url: "u" });
+
+    await handler({
+      db: "projects",
+      title: "성과 항목",
+      properties: {
+        status: "완료",
+        impact: "무인 운용 안정성 확보",
+        achievement: true,
+      },
+    });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.properties["임팩트"].rich_text[0].text.content).toBe(
+      "무인 운용 안정성 확보"
+    );
+    expect(createCall.properties["성과"].checkbox).toBe(true);
+  });
+
   it("allowNewTags=true면 미등록 multi_select를 data source에 자동 등록 후 포함한다", async () => {
     mockClient.dataSources.retrieve.mockResolvedValue({
       properties: {

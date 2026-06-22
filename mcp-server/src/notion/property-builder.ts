@@ -112,6 +112,16 @@ export async function buildPropertiesFromSchema(
         if (!missing) props[key] = { url: String(raw) };
         break;
       }
+      case "checkbox": {
+        if (!missing) {
+          const val =
+            typeof raw === "string"
+              ? !["false", "0", "no", "__no__"].includes(raw.toLowerCase())
+              : Boolean(raw);
+          props[key] = { checkbox: val };
+        }
+        break;
+      }
       case "title":
       case "relation":
         // title/relation은 이 루프에서 처리하지 않음 (위에서 별도 처리)
