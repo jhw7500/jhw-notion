@@ -194,4 +194,63 @@ describe("queryReportItems — memory-side date filter (regression for bug 2026-
 
     expect(items[0].impact).toBeUndefined();
   });
+
+  it("임팩트 여러 rich_text 조각을 합치고 개행/연속공백을 단일 공백으로 정리한다", async () => {
+    notion.dataSources.query.mockResolvedValue({
+      results: [
+        {
+          id: "p-multi",
+          url: "https://www.notion.so/p-multi",
+          properties: {
+            title: { title: [{ plain_text: "다중 조각" }] },
+            date: { date: { start: "2026-05-03" } },
+            report: { select: { name: "wlan-app" } },
+            임팩트: {
+              rich_text: [
+                { plain_text: "재발률 0\n" },
+                { plain_text: "  달성   완료" },
+              ],
+            },
+          },
+          last_edited_time: "2026-05-03T00:00:00.000Z",
+        },
+      ],
+      next_cursor: null,
+    });
+
+    const items = await queryReportItems(notion as any, {
+      start: "2026-05-01",
+      end: "2026-05-07",
+      dbs: ["projects"],
+    });
+
+    expect(items[0].impact).toBe("재발률 0 달성 완료");
+  });
+
+  it("임팩트 rich_text가 빈 배열이면 impact는 undefined", async () => {
+    notion.dataSources.query.mockResolvedValue({
+      results: [
+        {
+          id: "p-empty",
+          url: "https://www.notion.so/p-empty",
+          properties: {
+            title: { title: [{ plain_text: "빈 임팩트" }] },
+            date: { date: { start: "2026-05-03" } },
+            report: { select: { name: "etc" } },
+            임팩트: { rich_text: [] },
+          },
+          last_edited_time: "2026-05-03T00:00:00.000Z",
+        },
+      ],
+      next_cursor: null,
+    });
+
+    const items = await queryReportItems(notion as any, {
+      start: "2026-05-01",
+      end: "2026-05-07",
+      dbs: ["projects"],
+    });
+
+    expect(items[0].impact).toBeUndefined();
+  });
 });

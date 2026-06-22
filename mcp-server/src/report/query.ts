@@ -11,6 +11,9 @@ import {
 } from "../config.js";
 import { queryDataSource } from "../notion/api.js";
 
+/** projects/decisionLog의 "임팩트"(성과 한 줄) Notion 프로퍼티 키 — 리뷰 반영: 하드코딩 단일화. */
+const IMPACT_PROP = "임팩트";
+
 export interface ReportItem {
   id: string;
   db: DatabaseName;
@@ -128,12 +131,12 @@ export async function queryReportItems(
         | undefined;
       const titleProp = page.properties?.[schema.title]?.title;
       const title = titleProp?.[0]?.plain_text ?? "(제목 없음)";
-      // 임팩트(text) — projects/decisionLog에만 존재. 여러 rich_text 조각을 합친다.
-      const impact =
-        page.properties?.["임팩트"]?.rich_text
-          ?.map((t: any) => t.plain_text ?? "")
-          .join("")
-          .trim() || undefined;
+      // 임팩트(text) — projects/decisionLog에만 존재. 여러 rich_text 조각을 합치고
+      // 개행/연속공백을 단일 공백으로 정리 (단일 라인 보고서 깨짐 방지, 리뷰 반영).
+      const impactRaw = page.properties?.[IMPACT_PROP]?.rich_text
+        ?.map((t: any) => t.plain_text ?? "")
+        .join("");
+      const impact = impactRaw?.replace(/\s+/g, " ").trim() || undefined;
       all.push({
         id: page.id,
         db,
