@@ -52,7 +52,8 @@ export function formatRedmine(
     lines.push("");
     lines.push(`h3. ${g.report}`);
     for (const item of g.items) {
-      lines.push(`* ${item.date} [${item.db}] ${item.title}`);
+      const impact = item.impact ? ` — 임팩트: ${item.impact}` : "";
+      lines.push(`* ${item.date} [${item.db}] ${item.title}${impact}`);
     }
   }
   return lines.join("\n");
@@ -69,7 +70,8 @@ export function formatMarkdown(
     lines.push("");
     lines.push(`### ${g.report}`);
     for (const item of g.items) {
-      lines.push(`- ${item.date} \`${item.db}\` ${item.title}`);
+      const impact = item.impact ? ` — 임팩트: ${item.impact}` : "";
+      lines.push(`- ${item.date} \`${item.db}\` ${item.title}${impact}`);
     }
   }
   return lines.join("\n");

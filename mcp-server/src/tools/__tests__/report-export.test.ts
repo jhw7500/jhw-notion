@@ -122,4 +122,38 @@ describe("registerReportExport", () => {
     expect(call.properties.status.select.name).toBe("확정");
     expect(call.properties.title.title[0].text.content).toBe("주간 보고");
   });
+
+  it("임팩트가 있으면 markdown 출력 라인에 포함된다", async () => {
+    const { server, capturedTools } = createMockServer();
+    registerReportExport(server);
+    mockClient.dataSources.query.mockResolvedValue({
+      results: [
+        {
+          id: "p-impact",
+          url: "https://notion.so/p-impact",
+          properties: {
+            title: { title: [{ plain_text: "wifi_checker 안정화" }] },
+            date: { date: { start: "2026-04-03" } },
+            report: { select: { name: "wlan-app" } },
+            임팩트: {
+              rich_text: [{ plain_text: "무인 운용 안정성 확보" }],
+            },
+          },
+          last_edited_time: "2026-04-03T00:00:00.000Z",
+        },
+      ],
+    });
+
+    const tool = capturedTools.get("jhw_report_export")!;
+    const r = await tool.handler({
+      period: "custom",
+      start: "2026-04-01",
+      end: "2026-04-07",
+      format: "markdown",
+      dbs: ["projects"],
+    });
+
+    const out = JSON.parse(r.content[0].text);
+    expect(out.text).toContain("임팩트: 무인 운용 안정성 확보");
+  });
 });

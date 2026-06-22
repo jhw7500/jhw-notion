@@ -19,6 +19,8 @@ export interface ReportItem {
   projectId?: string;
   url?: string;
   report?: ReportValue;
+  /** 임팩트(성과 한 줄) — projects/decisionLog DB에만 존재, 그 외 DB는 undefined */
+  impact?: string;
   /** "report" = report 필드 매칭, "keywordFallback" = report 미설정 (legacy) */
   source: "report" | "keywordFallback";
 }
@@ -126,6 +128,12 @@ export async function queryReportItems(
         | undefined;
       const titleProp = page.properties?.[schema.title]?.title;
       const title = titleProp?.[0]?.plain_text ?? "(제목 없음)";
+      // 임팩트(text) — projects/decisionLog에만 존재. 여러 rich_text 조각을 합친다.
+      const impact =
+        page.properties?.["임팩트"]?.rich_text
+          ?.map((t: any) => t.plain_text ?? "")
+          .join("")
+          .trim() || undefined;
       all.push({
         id: page.id,
         db,
@@ -134,6 +142,7 @@ export async function queryReportItems(
         projectId: page.properties?.project?.relation?.[0]?.id,
         url: page.url,
         report: reportVal,
+        impact,
         source: reportVal ? "report" : "keywordFallback",
       });
     }
