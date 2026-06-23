@@ -96,16 +96,19 @@ describe("buildScaffold", () => {
       .toEqual(["증상", "원인", "조치"]);
   });
 
-  it("references는 url이 있으면 링크 섹션을 생략", () => {
+  it("references는 url이 있으면 링크 섹션을 생략하고, 없으면 하단에 둔다", () => {
     const withUrl = buildScaffold("references", { summary: "s", url: "http://x" });
     const noUrl = buildScaffold("references", { summary: "s" });
     const hh = (b: any[]) => b.filter((x) => x.type === "heading_2").map((x) => x.heading_2.rich_text[0].text.content);
     expect(hh(withUrl)).not.toContain("🔗 링크");
     expect(hh(noUrl)).toContain("🔗 링크");
+    // 링크는 하단 fallback (design §5.5) — heading 중 마지막이어야 함
+    expect(hh(noUrl).at(-1)).toBe("🔗 링크");
   });
 
-  it("preferences는 최소 1섹션", () => {
-    const b = buildScaffold("preferences", { content: "규칙" });
+  it("preferences는 description을 본문 seed로 채운 1섹션", () => {
+    const b = buildScaffold("preferences", { description: "규칙" });
     expect(b[0].heading_2.rich_text[0].text.content).toBe("⚙️ 선호 내용");
+    expect(b[1].paragraph.rich_text[0].text.content).toBe("규칙");
   });
 });
