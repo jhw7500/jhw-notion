@@ -38,3 +38,31 @@ export function buildCloseRetro(input: { today: string; achievement?: string; le
   blocks.push(h3("다음 액션 / 후속", "🔮"), callout("💡", "이어서 할 일·미해결 이슈가 있으면 적어두세요. (없으면 비워둠)"));
   return blocks;
 }
+
+const KB_DETAIL_LABELS: Record<string, string[]> = {
+  "문제해결": ["문제", "원인", "해결"],
+  "디버깅": ["증상", "원인", "조치"],
+  "아키텍처": ["배경", "구조", "트레이드오프"],
+};
+
+function kbDetailLabels(category?: string): string[] {
+  return (category && KB_DETAIL_LABELS[category]) || ["핵심", "근거·맥락"];
+}
+
+export function buildKbScaffold(input: { summary?: string; category?: string }): any[] {
+  const { summary, category } = input;
+  const blocks: any[] = [
+    callout("💡", summary || "한 줄로 핵심을 적으세요 (테이블 summary와 동일 역할)"),
+    h2("상세", "📖"),
+  ];
+  for (const label of kbDetailLabels(category)) {
+    blocks.push(h3(label), hint("(작업하며 작성)"));
+  }
+  blocks.push(
+    h2("액션·후속", "✅"),
+    todo("(필요 시) 후속 작업 / 검증 항목"),
+    h2("관련", "🔗"),
+    hint("(관련 자료 URL / 페이지 멘션)"),
+  );
+  return blocks;
+}
