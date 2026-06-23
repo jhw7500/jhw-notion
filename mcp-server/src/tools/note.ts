@@ -5,6 +5,7 @@ import { NOTION_CONFIG, REPORT_VALUES } from "../config.js";
 import { resolveProjectRelationId } from "./record.js";
 import { callNotion } from "../notion/api.js";
 import { paragraphBlocks } from "../notion/blocks.js";
+import { buildKbScaffold } from "../notion/templates.js";
 import { applyMultiSelectGuard } from "../notion/multi-select-guard.js";
 import { cachePage } from "../cache/page-cache.js";
 
@@ -22,7 +23,7 @@ const KB_CATEGORIES = [
 
 const NoteInput = z.object({
   title: z.string().describe("메모 제목"),
-  content: z.string().describe("메모 내용 (본문 markdown)"),
+  content: z.string().optional().describe("메모 내용 (본문 markdown). 없으면 category 맞춤 스캐폴드 주입."),
   summary: z.string().optional().describe("한줄 요약 (테이블에서 보임)"),
   category: z
     .enum(KB_CATEGORIES)
@@ -88,9 +89,10 @@ export function registerNote(server: McpServer) {
         }
       }
 
-      // 본문을 paragraph block 배열로 변환 — 긴 본문도 \n\n 기준으로 자동 분할
-      // (record.ts와 동일 헬퍼 사용, 2000자 한도 안전망 포함)
-      const children = paragraphBlocks(content);
+      // content 있으면 paragraph 변환, 없으면 category 맞춤 스캐폴드 주입.
+      const children = content?.trim()
+        ? paragraphBlocks(content)
+        : buildKbScaffold({ summary, category });
 
       const page = await callNotion(
         () =>

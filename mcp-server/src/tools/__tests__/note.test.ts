@@ -124,4 +124,26 @@ describe("jhw_note", () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.warnings.join(" ")).toContain("절대없는태그zzz");
   });
+
+  it("content가 없으면 category 맞춤 스캐폴드를 주입한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "n", url: "u" });
+
+    await handler({ title: "디버그 노트", category: "디버깅" });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    const h3s = createCall.children
+      .filter((b: any) => b.type === "heading_3")
+      .map((b: any) => b.heading_3.rich_text[0].text.content);
+    expect(h3s).toEqual(["증상", "원인", "조치"]);
+  });
+
+  it("content가 있으면 기존대로 paragraph만 만든다 (회귀)", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "n", url: "u" });
+
+    await handler({ title: "t", content: "본문" });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.children.length).toBe(1);
+    expect(createCall.children[0].type).toBe("paragraph");
+  });
 });
