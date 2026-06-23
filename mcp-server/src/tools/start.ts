@@ -5,6 +5,7 @@ import { NOTION_CONFIG } from "../config.js";
 import { callNotion } from "../notion/api.js";
 import { applyMultiSelectGuard } from "../notion/multi-select-guard.js";
 import { cachePage } from "../cache/page-cache.js";
+import { buildStartBody } from "../notion/templates.js";
 
 const StartInput = z.object({
   name: z.string().describe("프로젝트명"),
@@ -56,16 +57,7 @@ export function registerStart(server: McpServer) {
           notion.pages.create({
             parent: { database_id: NOTION_CONFIG.databases.projects },
             properties: projectProps,
-            children: [
-          { object: "block", type: "heading_2", heading_2: { rich_text: [{ text: { content: "목표" } }] } },
-          { object: "block", type: "paragraph", paragraph: { rich_text: [{ text: { content: description } }] } },
-          { object: "block", type: "heading_2", heading_2: { rich_text: [{ text: { content: "범위" } }] } },
-          { object: "block", type: "paragraph", paragraph: { rich_text: [{ text: { content: "(작업하면서 작성)" } }] } },
-          { object: "block", type: "heading_2", heading_2: { rich_text: [{ text: { content: "제약사항" } }] } },
-          { object: "block", type: "paragraph", paragraph: { rich_text: [{ text: { content: "(작업하면서 작성)" } }] } },
-          { object: "block", type: "heading_2", heading_2: { rich_text: [{ text: { content: "메모" } }] } },
-          { object: "block", type: "paragraph", paragraph: { rich_text: [] } },
-            ],
+            children: buildStartBody({ description, stack, repo }),
           }),
         { operation: "start.projects.create" }
       );
