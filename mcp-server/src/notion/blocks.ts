@@ -59,3 +59,58 @@ export function paragraphBlocks(content: string | undefined | null): any[] {
   }
   return children;
 }
+
+// ── 구조 가이드형 양식용 저수준 블록 빌더 ──
+// heading은 icon 슬롯이 없어 이모지를 content prefix로, callout은 icon 슬롯 사용.
+
+export function h2(text: string, emoji?: string): any {
+  return {
+    object: "block",
+    type: "heading_2",
+    heading_2: { rich_text: [{ type: "text", text: { content: emoji ? `${emoji} ${text}` : text } }] },
+  };
+}
+
+export function h3(text: string, emoji?: string): any {
+  return {
+    object: "block",
+    type: "heading_3",
+    heading_3: { rich_text: [{ type: "text", text: { content: emoji ? `${emoji} ${text}` : text } }] },
+  };
+}
+
+export function para(text = ""): any {
+  return {
+    object: "block",
+    type: "paragraph",
+    paragraph: { rich_text: text ? [{ type: "text", text: { content: text } }] : [] },
+  };
+}
+
+export function hint(text: string): any {
+  return {
+    object: "block",
+    type: "paragraph",
+    paragraph: { rich_text: [{ type: "text", text: { content: text }, annotations: { color: "gray", italic: true } }] },
+  };
+}
+
+export function todo(text: string, checked = false): any {
+  return {
+    object: "block",
+    type: "to_do",
+    to_do: { checked, rich_text: [{ type: "text", text: { content: text } }] },
+  };
+}
+
+export function callout(emoji: string, text: string, color = "gray_background"): any {
+  return {
+    object: "block",
+    type: "callout",
+    callout: { icon: { type: "emoji", emoji }, color, rich_text: [{ type: "text", text: { content: text } }] },
+  };
+}
+
+export function divider(): any {
+  return { object: "block", type: "divider", divider: {} };
+}

@@ -53,8 +53,8 @@ describe("jhw_start", () => {
     const headings = projectCreate.children
       .filter((b: any) => b.type === "heading_2")
       .map((b: any) => b.heading_2.rich_text[0].text.content);
-    expect(headings).toContain("목표");
-    expect(headings).toContain("범위");
+    expect(headings).toContain("🎯 목표");
+    expect(headings).toContain("📦 범위 (Scope)");
   });
 
   it("Decision Log에 프로젝트명과 설명을 기록한다", async () => {

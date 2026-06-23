@@ -8,6 +8,7 @@ import { callNotion } from "../notion/api.js";
 import { buildPropertiesFromSchema } from "../notion/property-builder.js";
 import { FieldValidationError } from "../notion/field-vocab.js";
 import { paragraphBlocks } from "../notion/blocks.js";
+import { buildScaffold } from "../notion/templates.js";
 import { cachePage } from "../cache/page-cache.js";
 
 const RecordInput = z.object({
@@ -81,6 +82,10 @@ const RecordInput = z.object({
     .boolean()
     .optional()
     .describe("미등록 multi_select 값(tags/tool/tech_stack)을 drop 대신 data source에 자동 등록(--force-tag). 기본 false."),
+  scaffold: z
+    .boolean()
+    .optional()
+    .describe("content가 비었을 때만 해당 db 특성에 맞는 구조 가이드형 본문 스캐폴드를 주입. 기본 false. content가 있으면 무시(입력 본문 우선)."),
 });
 
 // 공통 resolver로 위임. 외부 호환을 위해 named export 유지.
@@ -113,7 +118,7 @@ export function registerRecord(server: McpServer) {
     "jhw_record",
     "Notion AI Workspace DB에 레코드 생성",
     RecordInput.shape,
-    async ({ db, title, content, properties, allowNewTags }) => {
+    async ({ db, title, content, properties, allowNewTags, scaffold }) => {
       const notion = getNotionClient();
       const dbId = NOTION_CONFIG.databases[db as DatabaseName];
 
@@ -144,7 +149,9 @@ export function registerRecord(server: McpServer) {
         throw e;
       }
 
-      const children = paragraphBlocks(content);
+      const children = content?.trim()
+        ? paragraphBlocks(content)
+        : (scaffold ? buildScaffold(db as DatabaseName, properties ?? {}) : []);
       const page = await callNotion(
         () =>
           notion.pages.create({

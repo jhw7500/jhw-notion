@@ -234,4 +234,34 @@ describe("jhw_record", () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.warnings.join(" ")).toContain("자동등록");
   });
+
+  it("scaffold=true + content 없음이면 db별 스캐폴드를 주입한다", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "r", url: "u" });
+
+    await handler({ db: "decisionLog", title: "결정", scaffold: true });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    const hs = createCall.children
+      .filter((b: any) => b.type === "heading_2")
+      .map((b: any) => b.heading_2.rich_text[0].text.content);
+    expect(hs).toContain("🎯 결정");
+  });
+
+  it("scaffold=true여도 content가 있으면 content 우선(스캐폴드 무시)", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "r", url: "u" });
+
+    await handler({ db: "decisionLog", title: "t", content: "내 본문", scaffold: true });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.children.every((b: any) => b.type === "paragraph")).toBe(true);
+  });
+
+  it("scaffold 미지정 + content 없음이면 children 없음(현행 회귀)", async () => {
+    mockClient.pages.create.mockResolvedValue({ id: "r", url: "u" });
+
+    await handler({ db: "decisionLog", title: "t" });
+
+    const createCall = mockClient.pages.create.mock.calls[0][0];
+    expect(createCall.children).toBeUndefined();
+  });
 });
