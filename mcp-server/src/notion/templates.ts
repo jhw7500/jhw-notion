@@ -101,15 +101,17 @@ export function buildScaffold(db: DatabaseName, props: any = {}): any[] {
 
     case "references":
       return [
-        ...(props.url ? [] : [h2("링크", "🔗"), hint("(링크: 작업하며 붙여넣기)")]),
         h2("핵심 요약", "📄"),
         fillOr(props.summary, "이 자료가 무엇인지 1~2줄"),
         h2("왜 중요한가 / 발췌", "💬"),
         callout("💡", "저장 이유 + 핵심 인용·발췌. 나중에 이 자료를 다시 찾을 이유가 한눈에 보이게."),
+        // 링크는 url props가 없을 때만 하단 fallback (design §5.5 — url은 properties가 SSOT)
+        ...(props.url ? [] : [h2("링크", "🔗"), hint("(링크: 작업하며 붙여넣기)")]),
       ];
 
     case "preferences":
-      return [h2("선호 내용", "⚙️"), fillOr(props.content ?? props.description, "AI 사용 선호/피드백")];
+      // content는 RecordInput.properties에 없어(최상위 필드) props로 들어오지 않음 — description만 본문 seed.
+      return [h2("선호 내용", "⚙️"), fillOr(props.description, "AI 사용 선호/피드백")];
 
     default:
       return [];
