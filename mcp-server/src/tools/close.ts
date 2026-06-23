@@ -5,6 +5,7 @@ import { NOTION_CONFIG } from "../config.js";
 import { callNotion } from "../notion/api.js";
 import { resolveProject } from "../notion/resolve-project.js";
 import { cachePage } from "../cache/page-cache.js";
+import { buildCloseRetro } from "../notion/templates.js";
 
 const CloseInput = z.object({
   project: z.string().describe("프로젝트명 (검색 키워드)"),
@@ -66,27 +67,7 @@ export function registerClose(server: McpServer) {
 
       // 3. 회고 섹션 추가 (있는 경우)
       if (achievement || lessons) {
-        const retroBlocks: any[] = [
-          {
-            object: "block",
-            type: "heading_2",
-            heading_2: { rich_text: [{ text: { content: `회고 (${today})` } }] },
-          },
-        ];
-
-        if (achievement) {
-          retroBlocks.push(
-            { object: "block", type: "heading_3", heading_3: { rich_text: [{ text: { content: "달성한 것" } }] } },
-            { object: "block", type: "paragraph", paragraph: { rich_text: [{ text: { content: achievement } }] } }
-          );
-        }
-
-        if (lessons) {
-          retroBlocks.push(
-            { object: "block", type: "heading_3", heading_3: { rich_text: [{ text: { content: "배운 점" } }] } },
-            { object: "block", type: "paragraph", paragraph: { rich_text: [{ text: { content: lessons } }] } }
-          );
-        }
+        const retroBlocks = buildCloseRetro({ today, achievement, lessons });
 
         await callNotion(
           () =>
