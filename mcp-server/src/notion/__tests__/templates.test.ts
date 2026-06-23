@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildStartBody, buildCloseRetro, buildKbScaffold } from "../templates.js";
+import { buildStartBody, buildCloseRetro, buildKbScaffold, buildScaffold } from "../templates.js";
 
 const headings = (blocks: any[]) =>
   blocks.filter((b) => b.type === "heading_2" || b.type === "heading_3")
@@ -65,5 +65,47 @@ describe("buildKbScaffold", () => {
     const b = buildKbScaffold({ summary: "한 줄 요약" });
     expect(b[0].type).toBe("callout");
     expect(b[0].callout.rich_text[0].text.content).toBe("한 줄 요약");
+  });
+});
+
+describe("buildScaffold", () => {
+  it("projects는 buildStartBody와 동형(목표 heading 포함)", () => {
+    const b = buildScaffold("projects", { description: "목표값" });
+    expect(b[0].heading_2.rich_text[0].text.content).toBe("🎯 목표");
+  });
+
+  it("decisionLog는 결정/근거/대안/영향 섹션", () => {
+    const b = buildScaffold("decisionLog", { rationale: "근거값", alternatives: "A, B" });
+    const hs = b.filter((x) => x.type === "heading_2").map((x) => x.heading_2.rich_text[0].text.content);
+    expect(hs).toEqual(["🎯 결정", "🧭 근거", "🔀 검토한 대안", "📊 영향·결과"]);
+    // alternatives 'A, B' → to_do 2개(첫 항목 checked)
+    const todos = b.filter((x) => x.type === "to_do");
+    expect(todos[0].to_do.checked).toBe(true);
+    expect(todos[0].to_do.rich_text[0].text.content).toBe("A");
+  });
+
+  it("decisionLog status=폐기는 영향 섹션 헤더를 바꾼다", () => {
+    const b = buildScaffold("decisionLog", { status: "폐기" });
+    const hs = b.filter((x) => x.type === "heading_2").map((x) => x.heading_2.rich_text[0].text.content);
+    expect(hs).toContain("📊 폐기 사유·대체 결정");
+  });
+
+  it("knowledgeBase는 buildKbScaffold로 위임", () => {
+    expect(buildScaffold("knowledgeBase", { category: "디버깅" })
+      .filter((x) => x.type === "heading_3").map((x) => x.heading_3.rich_text[0].text.content))
+      .toEqual(["증상", "원인", "조치"]);
+  });
+
+  it("references는 url이 있으면 링크 섹션을 생략", () => {
+    const withUrl = buildScaffold("references", { summary: "s", url: "http://x" });
+    const noUrl = buildScaffold("references", { summary: "s" });
+    const hh = (b: any[]) => b.filter((x) => x.type === "heading_2").map((x) => x.heading_2.rich_text[0].text.content);
+    expect(hh(withUrl)).not.toContain("🔗 링크");
+    expect(hh(noUrl)).toContain("🔗 링크");
+  });
+
+  it("preferences는 최소 1섹션", () => {
+    const b = buildScaffold("preferences", { content: "규칙" });
+    expect(b[0].heading_2.rich_text[0].text.content).toBe("⚙️ 선호 내용");
   });
 });

@@ -4,6 +4,7 @@
  * blocks.children.append({children})에 그대로 전달한다.
  */
 import { h2, h3, para, hint, todo, callout, divider, paragraphBlocks } from "./blocks.js";
+import type { DatabaseName } from "../config.js";
 
 export function buildStartBody(input: { description: string; stack?: string; repo?: string }): any[] {
   const { description, stack, repo } = input;
@@ -65,4 +66,52 @@ export function buildKbScaffold(input: { summary?: string; category?: string }):
     hint("(관련 자료 URL / 페이지 멘션)"),
   );
   return blocks;
+}
+
+function altBlocks(alternatives?: string): any[] {
+  const items = (alternatives || "").split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+  if (items.length) return items.map((a, i) => todo(a, i === 0)); // 첫 항목 = 채택 가정
+  return [todo("대안 A — 왜 선택하지 않았는지"), todo("대안 B — 비교 포인트")];
+}
+
+export function buildScaffold(db: DatabaseName, props: any = {}): any[] {
+  const fillOr = (val: string | undefined, hintText: string) =>
+    val && val.trim() ? para(val) : callout("💡", hintText);
+
+  switch (db) {
+    case "projects":
+      return buildStartBody({ description: props.description ?? "", stack: props.stack, repo: props.repo });
+
+    case "decisionLog":
+      return [
+        h2("결정", "🎯"),
+        props.description ? para(props.description) : hint("(무엇을 확정했는지 한 문장으로 — 제목을 풀어서)"),
+        h2("근거", "🧭"),
+        fillOr(props.rationale, "이 결정의 배경·전제·트레이드오프 — 무엇을 우선했고 무엇을 포기했는지 (props rationale은 한 줄 요약)"),
+        h2("검토한 대안", "🔀"),
+        ...altBlocks(props.alternatives),
+        h2(props.status === "폐기" ? "폐기 사유·대체 결정" : "영향·결과", "📊"),
+        ...(props.impact ? [todo(`🏆 ${props.impact}`, true)] : []),
+        todo("영향 받는 영역: (작업하며 작성)"),
+        todo("후속 확인/롤백 조건: (작업하며 작성)"),
+      ];
+
+    case "knowledgeBase":
+      return buildKbScaffold({ summary: props.summary, category: props.category });
+
+    case "references":
+      return [
+        ...(props.url ? [] : [h2("링크", "🔗"), hint("(링크: 작업하며 붙여넣기)")]),
+        h2("핵심 요약", "📄"),
+        fillOr(props.summary, "이 자료가 무엇인지 1~2줄"),
+        h2("왜 중요한가 / 발췌", "💬"),
+        callout("💡", "저장 이유 + 핵심 인용·발췌. 나중에 이 자료를 다시 찾을 이유가 한눈에 보이게."),
+      ];
+
+    case "preferences":
+      return [h2("선호 내용", "⚙️"), fillOr(props.content ?? props.description, "AI 사용 선호/피드백")];
+
+    default:
+      return [];
+  }
 }
