@@ -25,6 +25,7 @@ description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평�
    | 카메라 드라이버 / max9296 / AP1302 / AR0234 / edgeconf VHL_CAM / ISP / GMSL | pim-driver-cam |
    | SPI / sc16is7xx | pim-driver-spi |
    | pim-check / 검증 자동화 / setup.py / verify_retry / chk_cam_operate | pim-test |
+   | meta-pim / u-boot-imx / linux-imx / Laird(meta-laird-cp) / Yocto 이미지 빌드 (pim 카메라 BSP) | pim-bsp |
    | mlan / moal / mcstiercfg / wbridge / L2 bridge / wlan 드라이버 | wlan-driver |
    | pcap / tshark / 802.11 캡처 / RTT / decrypt | wlan-test |
    | Yocto / iMX BSP / DTS / 커널 빌드 (wlan 계열) | wlan-bsp |

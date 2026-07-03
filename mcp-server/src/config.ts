@@ -13,7 +13,7 @@ export const NOTION_CONFIG = {
 
 export type DatabaseName = keyof typeof NOTION_CONFIG.databases;
 
-// redmine 보고서 카테고리. 5개 DB 공통 select 옵션 정확히 10종.
+// redmine 보고서 카테고리. 5개 DB 공통 select 옵션 정확히 11종.
 // 미설정 페이지는 redmine 측 keyword fallback이 동작.
 // 'none' = 보고 제외 (개인 메모, /jhw:note 권장 기본값)
 export const REPORT_VALUES = [
@@ -21,6 +21,7 @@ export const REPORT_VALUES = [
   "pim-driver-cam",
   "pim-driver-spi",
   "pim-test",
+  "pim-bsp",
   "wlan-bsp",
   "wlan-app",
   "wlan-driver",

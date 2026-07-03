@@ -31,12 +31,13 @@ describe("config", () => {
     expect(validNames).toHaveLength(5);
   });
 
-  it("REPORT_VALUES는 redmine 가이드의 10개 옵션과 일치한다", () => {
+  it("REPORT_VALUES는 redmine 가이드의 11개 옵션과 일치한다", () => {
     expect(REPORT_VALUES).toEqual([
       "pim-app",
       "pim-driver-cam",
       "pim-driver-spi",
       "pim-test",
+      "pim-bsp",
       "wlan-bsp",
       "wlan-app",
       "wlan-driver",
