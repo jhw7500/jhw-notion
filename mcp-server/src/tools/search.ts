@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
-import { NOTION_CONFIG } from "../config.js";
+import { dbNameFromParent } from "../schema.js";
 import { callNotion } from "../notion/api.js";
 
 const SearchInput = z.object({
@@ -25,20 +25,7 @@ export function registerSearch(server: McpServer) {
       );
 
       const results = response.results.map((page: any) => {
-        const parentDbId =
-          page.parent?.type === "database_id"
-            ? page.parent.database_id.replace(/-/g, "")
-            : null;
-
-        let dbName = "page";
-        if (parentDbId) {
-          for (const [name, id] of Object.entries(NOTION_CONFIG.databases)) {
-            if (id.replace(/-/g, "") === parentDbId) {
-              dbName = name;
-              break;
-            }
-          }
-        }
+        const dbName = dbNameFromParent(page.parent);
 
         const title =
           page.properties?.["title"]?.title?.[0]?.plain_text ||

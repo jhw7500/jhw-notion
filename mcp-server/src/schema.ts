@@ -132,3 +132,18 @@ export function getProjectFieldType(db: DatabaseName): PropertyType | null {
 export function getDatabaseId(db: DatabaseName): string {
   return DATABASE_SCHEMAS[db].id;
 }
+
+/**
+ * search 결과 페이지의 parent에서 소속 DB 이름을 판정.
+ * Notion API 2025-09-03: page parent는 database_id 또는 data_source_id 변종이며 둘 다 database_id를 담는다.
+ * 따라서 type 게이트 없이 database_id로 매핑한다. (없으면 "page")
+ */
+export function dbNameFromParent(parent: unknown): DatabaseName | "page" {
+  const dbid = (parent as { database_id?: string } | null | undefined)?.database_id;
+  if (!dbid) return "page";
+  const id = dbid.replace(/-/g, "");
+  for (const [name, cid] of Object.entries(NOTION_CONFIG.databases)) {
+    if (cid.replace(/-/g, "") === id) return name as DatabaseName;
+  }
+  return "page";
+}

@@ -9,6 +9,7 @@ import { describe, it, expect } from "vitest";
 import {
   DATABASE_SCHEMAS,
   getDataSourceId,
+  dbNameFromParent,
   type DatabaseSchema,
 } from "../schema.js";
 import type { DatabaseName } from "../config.js";
@@ -92,5 +93,37 @@ describe("sandbox-config.ts — dataSources mapping (p1-3b)", () => {
     const ids = DB_NAMES.map((db) => cfg.dataSources[db]);
     const unique = new Set(ids);
     expect(unique.size).toBe(ids.length);
+  });
+});
+
+// task-4-5 follow-up: dbNameFromParent 공용화.
+// Notion API 2025-09-03: DB 소속 페이지의 parent는 database_id 또는 data_source_id
+// variant로 내려오며, 둘 다 database_id를 함께 담는다. type 게이트 없이 database_id로
+// 판정해야 recall.ts/search.ts가 data_source_id parent를 올바르게 인식한다.
+describe("dbNameFromParent (task-4-5 follow-up)", () => {
+  it("database_id parent → 올바른 DB 이름 (knowledgeBase)", () => {
+    const parent = {
+      type: "database_id",
+      database_id: "ec68d6c6-6e8e-47e6-9e8c-85d13b9f1461",
+    };
+    expect(dbNameFromParent(parent)).toBe("knowledgeBase");
+  });
+
+  it("data_source_id parent(2025-09-03) → 올바른 DB 이름 (decisionLog)", () => {
+    const parent = {
+      type: "data_source_id",
+      data_source_id: "x",
+      database_id: "6c9fbc24-c5fb-4ca9-aa61-781cacc7ecfd",
+    };
+    expect(dbNameFromParent(parent)).toBe("decisionLog");
+  });
+
+  it("알 수 없는 DB / page parent → 'page'", () => {
+    expect(dbNameFromParent({ type: "page_id", page_id: "p" })).toBe("page");
+  });
+
+  it("null/undefined parent → 'page'", () => {
+    expect(dbNameFromParent(null)).toBe("page");
+    expect(dbNameFromParent(undefined)).toBe("page");
   });
 });
