@@ -5,7 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { defaultPageCache } from "../cache/page-cache.js";
 import { callNotion } from "../notion/api.js";
-import { NOTION_CONFIG } from "../config.js";
+import { dbNameFromParent } from "../schema.js";
 
 const RecallInput = z.object({
   query: z.string().describe("검색 키워드"),
@@ -23,15 +23,6 @@ const RecallInput = z.object({
       "로컬 결과 부족 시 Notion 검색으로 보완 + 자동 캐시 저장 (기본 true)"
     ),
 });
-
-function dbNameFromParent(parent: any): string {
-  if (parent?.type !== "database_id") return "page";
-  const id = parent.database_id.replace(/-/g, "");
-  for (const [name, dbId] of Object.entries(NOTION_CONFIG.databases)) {
-    if (dbId.replace(/-/g, "") === id) return name;
-  }
-  return "page";
-}
 
 export function registerRecall(server: McpServer) {
   server.tool(
