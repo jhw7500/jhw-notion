@@ -109,7 +109,7 @@
   - `topic` (string, required) — 조회 주제 키워드
   - `project` (string, optional) — 프로젝트명/URL/UUID (스코프 부스트용)
   - `limit` (number, 1–15, default 8)
-  - `dbs` (enum[], default `["decisionLog","knowledgeBase","references"]`)
+  - `dbs` — **v1 미구현(deferred knob)**: 입력으로 노출하지 않고 `RETRIEVE_DBS` 상수로 3-DB(`decisionLog`/`knowledgeBase`/`references`) 하드코딩. 향후 파라미터화.
 - **관련성 전략 (v1 = topic-first; 반복 개선 가능한 knob)**:
   1. `notion.search({ query: topic, page_size: ~15 })` (전문검색)
   2. hit의 parent data_source가 대상 `dbs`에 속하는 것만 유지(schema 매핑)
@@ -117,7 +117,7 @@
   4. 상위 `limit`개 선택
   5. 각 항목 **병렬** fetch: 속성(summary/category/tags/date/status/rationale) + 본문 앞 ~10블록 → 스니펫(~400–600자) 구성
   6. 토큰 예산 초과 시 잘라내고 `truncated: true` 표기
-  - **폴백 knob**: `topic`이 약하고 `project`가 있으면 relation-scoped `queryDataSource`(DB별 최근 N)로 대체.
+  - **폴백 knob (v1 미구현, 향후)**: `topic`이 약하고 `project`가 있으면 relation-scoped `queryDataSource`(DB별 최근 N)로 대체. **v1은** topic 검색이 0건이면 `project`가 있어도 `used:"empty"`.
 - **출력**: `{ topic, project?, used, count, truncated, results: [{ db, title, summary, snippet, url, project, date, category?, tags?, status? }] }`
 - **비용**: search 1회 + 최대 `limit`개 fetch(RateLimiter concurrency=3로 자동 제한). `jhw_context`(2–3회)보다 약간 무겁지만 top-k·스니펫으로 상한 고정.
 - **재사용**: `resolveProject`, `queryDataSource`/`callNotion`, `schema.ts` data_source 매핑.

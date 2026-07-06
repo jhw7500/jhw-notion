@@ -619,7 +619,7 @@ Run:
 ```bash
 cd /home/jhw/ai/opencode/projects/jhw-notion/mcp-server && npx vitest run src/tools/__tests__/retrieve.test.ts
 ```
-Expected: PASS (4 tests).
+Expected: PASS (4 tests). (이후 리뷰 보강으로 13건까지 확대 — 커버리지 + 2025-09-03 `data_source_id` parent 수정.)
 
 - [ ] **Step 5: 타입 체크**
 
