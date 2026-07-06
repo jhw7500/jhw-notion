@@ -23,10 +23,14 @@ const RetrieveInput = z.object({
 });
 
 function dbNameFromParent(parent: any): DatabaseName | "page" {
-  if (parent?.type !== "database_id") return "page";
-  const id = parent.database_id.replace(/-/g, "");
-  for (const [name, dbId] of Object.entries(NOTION_CONFIG.databases)) {
-    if (dbId.replace(/-/g, "") === id) return name as DatabaseName;
+  // Notion API 2025-09-03: data source에 속한 페이지의 parent는
+  // { type:"data_source_id", data_source_id, database_id } 로 내려오며 database_id를 함께 담는다.
+  // database_id parent variant도 database_id를 가지므로 type 게이트 없이 database_id로 매핑한다.
+  const dbid: string | undefined = parent?.database_id;
+  if (!dbid) return "page";
+  const id = dbid.replace(/-/g, "");
+  for (const [name, cid] of Object.entries(NOTION_CONFIG.databases)) {
+    if (cid.replace(/-/g, "") === id) return name as DatabaseName;
   }
   return "page";
 }
@@ -75,7 +79,12 @@ export function registerRetrieve(server: McpServer) {
 
       // 1. 전문검색 (워크스페이스 전역 — search는 relation 서버필터 불가)
       const searchRes: any = await callNotion(
-        () => notion.search({ query: topic, page_size: SEARCH_PAGE_SIZE }),
+        () =>
+          notion.search({
+            query: topic,
+            page_size: SEARCH_PAGE_SIZE,
+            filter: { property: "object", value: "page" },
+          }),
         { operation: "retrieve.search" }
       );
 

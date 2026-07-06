@@ -259,4 +259,37 @@ describe("jhw_retrieve", () => {
 
     expect(parsed.results[0].snippet).toBe("");
   });
+
+  it("2025-09-03 data_source_id parent(database_id 동반)도 대상 DB로 유지한다", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [
+        {
+          id: "ds-page-1",
+          url: "https://notion.so/ds-page-1",
+          parent: { type: "data_source_id", data_source_id: "ds-1", database_id: KB_ID },
+          properties: {
+            title: { title: [{ plain_text: "데이터소스 경유 문서" }] },
+            summary: { rich_text: [{ plain_text: "요약" }] },
+          },
+        },
+      ],
+    });
+    mockClient.blocks.children.list.mockResolvedValue({ results: [] });
+
+    const result = await handler({ topic: "데이터소스" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.count).toBe(1);
+    expect(parsed.results[0].db).toBe("knowledgeBase");
+  });
+
+  it("notion.search 호출 시 object:page 필터를 전달한다", async () => {
+    mockClient.search.mockResolvedValue({ results: [] });
+
+    await handler({ topic: "필터확인" });
+
+    expect(mockClient.search.mock.calls[0][0]).toMatchObject({
+      filter: { property: "object", value: "page" },
+    });
+  });
 });
