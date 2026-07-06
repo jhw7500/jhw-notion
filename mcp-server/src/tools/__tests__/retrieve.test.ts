@@ -12,6 +12,7 @@ import { registerRetrieve } from "../retrieve.js";
 
 const KB_ID = "ec68d6c6-6e8e-47e6-9e8c-85d13b9f1461";
 const DEC_ID = "6c9fbc24-c5fb-4ca9-aa61-781cacc7ecfd";
+const REF_ID = "979a9412-73d9-4fa4-be0e-cbcafc0a2505";
 
 function kbPage(id: string, title: string, projectRelId?: string) {
   return {
@@ -121,5 +122,141 @@ describe("jhw_retrieve", () => {
     expect(r.date).toBe("2026-05-02");
     expect(r.snippet).toContain("본문내용");
     expect(r.snippet).toContain("## 섹션");
+  });
+
+  it("project relation id의 대시 표기가 달라도 정규화하여 부스트한다 (dash 정규화)", async () => {
+    // 동일 id(32-hex)를 서로 다른 대시 배치로 표기 — 양쪽 다 대시가 있지만 위치가 달라
+    // inProjectFactory/page 어느 쪽의 .replace(/-/g,'') 정규화를 제거해도 불일치가 발생한다.
+    const dashedRelId = "11111111-2222-3333-4444-555555555555"; // 8-4-4-4-12
+    const resolvedProjectId = "1111-1111-2222-3333-4444-5555-5555-5555"; // 4×8 배치 (동일 32-hex)
+
+    mockClient.search.mockResolvedValue({
+      results: [kbPage("kb-a", "무관 지식"), kbPage("kb-b", "프로젝트 지식", dashedRelId)],
+    });
+    mockClient.dataSources.query.mockResolvedValue({
+      results: [
+        { id: resolvedProjectId, properties: { title: { title: [{ plain_text: "my-project" }] } } },
+      ],
+    });
+    mockClient.blocks.children.list.mockResolvedValue({ results: [] });
+
+    const result = await handler({ topic: "지식", project: "my-project" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0].title).toBe("프로젝트 지식");
+    expect(parsed.results[0].project).toBe(true);
+    expect(parsed.results[1].project).toBe(false);
+  });
+
+  it("검색 결과가 limit보다 많으면 truncated=true, count=limit이다", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [kbPage("kb-1", "지식1"), kbPage("kb-2", "지식2")],
+    });
+    mockClient.blocks.children.list.mockResolvedValue({ results: [] });
+
+    const result = await handler({ topic: "지식", limit: 1 });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.truncated).toBe(true);
+    expect(parsed.count).toBe(1);
+  });
+
+  it("references 페이지: tool(multi_select)을 tags로 폴백하고 db=references로 유지한다", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [
+        {
+          id: "ref-1",
+          url: "https://notion.so/ref-1",
+          parent: { type: "database_id", database_id: REF_ID },
+          properties: {
+            title: { title: [{ plain_text: "레퍼런스 문서" }] },
+            summary: { rich_text: [{ plain_text: "요약" }] },
+            category: { select: { name: "가이드" } },
+            tool: { multi_select: [{ name: "eslint" }, { name: "prettier" }] },
+          },
+        },
+      ],
+    });
+    mockClient.blocks.children.list.mockResolvedValue({ results: [] });
+
+    const result = await handler({ topic: "레퍼런스" });
+    const parsed = JSON.parse(result.content[0].text);
+    const r = parsed.results[0];
+
+    expect(r.db).toBe("references");
+    expect(r.category).toBe("가이드");
+    expect(r.tags).toEqual(["eslint", "prettier"]);
+  });
+
+  it("decisionLog 페이지: category 없이 area(select)만 있으면 category로 폴백한다", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [
+        {
+          id: "dec-2",
+          url: "https://notion.so/dec-2",
+          parent: { type: "database_id", database_id: DEC_ID },
+          properties: {
+            title: { title: [{ plain_text: "아키텍처 결정" }] },
+            rationale: { rich_text: [{ plain_text: "이유" }] },
+            area: { select: { name: "인프라" } },
+          },
+        },
+      ],
+    });
+    mockClient.blocks.children.list.mockResolvedValue({ results: [] });
+
+    const result = await handler({ topic: "아키텍처" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0].category).toBe("인프라");
+  });
+
+  it("본문 블록이 500자를 초과하면 SNIPPET_MAX_CHARS(500)로 잘린다", async () => {
+    const longText = "가".repeat(300);
+    mockClient.search.mockResolvedValue({
+      results: [kbPage("kb-long", "긴 문서")],
+    });
+    mockClient.blocks.children.list.mockResolvedValue({
+      results: [
+        { type: "paragraph", paragraph: { rich_text: [{ plain_text: longText }] } },
+        { type: "paragraph", paragraph: { rich_text: [{ plain_text: longText }] } },
+        { type: "paragraph", paragraph: { rich_text: [{ plain_text: longText }] } },
+      ],
+    });
+
+    const result = await handler({ topic: "긴" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0].snippet.length).toBe(500);
+  });
+
+  it("heading_3/bulleted_list_item 블록을 ###/- 접두로 변환한다", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [kbPage("kb-blocks", "블록 문서")],
+    });
+    mockClient.blocks.children.list.mockResolvedValue({
+      results: [
+        { type: "heading_3", heading_3: { rich_text: [{ plain_text: "소제목" }] } },
+        { type: "bulleted_list_item", bulleted_list_item: { rich_text: [{ plain_text: "항목1" }] } },
+      ],
+    });
+
+    const result = await handler({ topic: "블록" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0].snippet).toContain("### 소제목");
+    expect(parsed.results[0].snippet).toContain("- 항목1");
+  });
+
+  it("blocks.children.list가 실패하면 snippet은 빈 문자열이다", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [kbPage("kb-err", "에러 문서")],
+    });
+    mockClient.blocks.children.list.mockRejectedValue(new Error("blocked"));
+
+    const result = await handler({ topic: "에러" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0].snippet).toBe("");
   });
 });
