@@ -37,7 +37,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
    - 후보마다 `mcp__jhw-notion__jhw_search`를 **한 메시지 안에서 병렬 호출**.
    - `jhw_search`를 `db=<후보 DB>`로 호출한다 — 서버가 전역 검색을 **페이지네이션(최대 500건 스캔)** 하며 해당 DB 결과만 수집해 반환하므로, 전역 top-10 한계 없이 동일 DB 매칭을 안정적으로 찾는다 (KB 후보는 `db=knowledgeBase`, References 후보는 `db=references` 등). 스캔 상한을 넘겨 잔여가 있으면 응답에 `truncated:true`가 온다.
    - top-5 결과 수집. report·project 필터는 걸지 않는다 (다른 report로 잘못 저장된 중복도 잡기 위함).
-   - 결과 0건이면 그 후보는 **NEW**로 확정 (이후 단계 건너뜀).
+   - 결과 0건 **그리고 `truncated:false`** 면 그 후보는 **NEW**로 확정 (이후 단계 건너뜀). **0건이어도 `truncated:true`면 확정 NEW 금지** — 스캔이 잘렸으니 키워드를 좁혀 재검색하거나 SIMILAR(불확실)로 보수 처리한다.
 
 4. **2단계 — 본문 fetch** (병렬)
    - ≥1건 매칭된 후보들에 대해 top-5 페이지 본문을 `mcp__notion__notion-fetch`로 **한 메시지 안에서 모두 병렬** 호출.

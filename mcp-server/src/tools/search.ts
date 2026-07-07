@@ -106,7 +106,13 @@ export function registerSearch(server: McpServer) {
           if (dbNameFromParent(p?.parent) === db) collected.push(p);
         }
         // Notion 검색 엔진이 내부 한도(query_result_limit_reached)로 결과를 잘랐으면 미완으로 본다.
-        if (response.request_status?.type === "incomplete") incomplete = true;
+        // type 없이 incomplete_reason만 오는 응답 변종도 방어적으로 포착한다.
+        if (
+          response.request_status?.type === "incomplete" ||
+          response.request_status?.incomplete_reason
+        ) {
+          incomplete = true;
+        }
 
         if (collected.length >= lim) {
           // lim 충족 — 아직 못 훑은 뒤쪽에 동일 DB 결과가 더 있을 수 있음.

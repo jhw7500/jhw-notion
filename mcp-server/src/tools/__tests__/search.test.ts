@@ -223,6 +223,19 @@ describe("jhw_search", () => {
     expect(parsed.truncated).toBe(true);
   });
 
+  it("db 한정: request_status가 type 없이 incomplete_reason만 와도 truncated=true", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [pageIn(KB_DB, "k1", "지식 A")],
+      has_more: false,
+      request_status: { incomplete_reason: "query_result_limit_reached" },
+    });
+
+    const result = await handler({ query: "지식", db: "knowledgeBase" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.truncated).toBe(true);
+  });
+
   it("db 한정: has_more지만 next_cursor가 없으면 재스캔 없이 멈추고 truncated=true", async () => {
     mockClient.search.mockResolvedValue({
       results: [pageIn(KB_DB, "k1", "지식 A")],
