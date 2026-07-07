@@ -8,6 +8,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 신규 후보(텍스트·카드·키워드)를 기존 Notion 레코드와 의미적으로 대조해, **중복은 skip / 보강은 기존 페이지에 append / 유사·신규는 별도 저장**으로 정리한다.
 
 - `/jhw:review` = 세션 후보 추출·저장 (대조 없음, 빠른 흐름).
+- **`/jhw:review --match` = 세션 후보를 저장 전에 본 스킬 verdict로 대조하는 통합 흐름** (review 추출 + match 대조 한 번에, 승인 1회).
 - `/jhw:compact` = 기존 ↔ 기존 정리.
 - **`/jhw:match` = 신규 ↔ 기존 정리** (저장 전 옵트인 점검, 또는 저장 후 사후 보강).
 
@@ -154,10 +155,12 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 - **성과 필드 자동 채움**: NEW/SIMILAR로 projects(완료)·decisionLog(확정) 신규 저장 시 `impact`+`achievement:true`를 함께 넣는다 → 🏆 성과 뷰·보고서 자동 누적. AUGMENT는 properties 미변경 원칙이라 성과 필드도 건드리지 않는다.
 - **무인자 자동 from-review**: 인자 없이 `/jhw:match` 호출 시 대화의 **가장 마지막** `/jhw:review` 후보 카드를 자동 입력으로 사용한다(그 이후 새 저장/대조가 없을 때만). 없거나 stale하면 되묻는다. 명시적 `--from-review`는 강제용.
 - 매칭 결과 0건이면 카드에 NEW로 표시. 매칭이 있어도 모두 SIMILAR면 신규 저장이 기본 동작.
+- **`/jhw:review --match` 재사용 정본**: review의 `--match` 플래그는 본 스킬의 verdict 파이프라인(§verdict)·AUGMENT 절차(§AUGMENT)를 단일 정본으로 재사용한다. 단 review --match는 **저장 전** 대조라 DUPLICATE를 애초에 생성하지 않는다(순차 `/jhw:review`→`/jhw:match`의 사후 정리와 다름). 대조 로직 변경 시 여기만 고치면 review에도 반영된다.
 
 ## 참고
 
 - 단건 저장: `/jhw:save`, `/jhw:record`, `/jhw:note`
 - 세션 저장: `/jhw:review`
+- 세션 저장+대조(저장 전): `/jhw:review --match`
 - 사후 정리: `/jhw:compact`
 - 회상/검색: `/jhw:recall`

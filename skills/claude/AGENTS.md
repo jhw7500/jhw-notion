@@ -13,7 +13,7 @@ AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬. 각 스킬은 사용자 
 | `save.md` | Notion 통합 저장 — record/note/delete 흡수, DB 자동 판별 |
 | `project.md` | 프로젝트 라이프사이클 — start/close 통합 (`--start`/`--close`) |
 | `recall.md` | 통합 회상 — search/context/history 통합 (모드 자동 판별) |
-| `review.md` | 세션 마무리 시 저장 후보 정리 + 저장가치 평가(상/중/하) + 승인 저장 |
+| `review.md` | 세션 마무리 시 저장 후보 정리 + 저장가치 평가(상/중/하) + 승인 저장 · `--match` 시 저장 전 기존 Notion 대조(중복 skip / 보강 append, verdict 파이프라인은 `match.md` 재사용) |
 | `compact.md` | 저장된 레코드 사후 정리 — 합치기(N→1) + 긴 본문 요약 + 저장가치 평가(상/중/하, 하=폐기 옵트인) (파괴적, 승인 필수) |
 | `match.md` | 신규 내용·키워드를 기존 Notion과 대조 — 4-tier verdict(NEW/SIMILAR/AUGMENT/DUPLICATE) 후 신규 저장·기존 append·skip 처리 |
 | `report.md` | 일/주/월 업무 보고서 — preview(미리보기) → export(redmine/markdown/json, 선택적 KB/decisionLog 저장). 백엔드 `jhw_report_preview`/`jhw_report_export` |
