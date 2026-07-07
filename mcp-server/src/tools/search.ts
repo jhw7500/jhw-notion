@@ -63,6 +63,14 @@ function jsonContent(payload: unknown) {
   };
 }
 
+// Notion search 응답이 내부 결과 한도로 잘렸는지 판정 (type 없이 incomplete_reason만 오는 변종도 포착).
+function isSearchIncomplete(response: any): boolean {
+  return (
+    response?.request_status?.type === "incomplete" ||
+    Boolean(response?.request_status?.incomplete_reason)
+  );
+}
+
 export function registerSearch(server: McpServer) {
   server.tool(
     "jhw_search",
@@ -81,7 +89,9 @@ export function registerSearch(server: McpServer) {
         const raw = (response.results as any[]) ?? [];
         const results = raw.map(mapPage).slice(0, lim);
         // db 한정 응답과 형태를 맞춘다: scannedItems(받은 항목 수)·truncated(잘렸는지).
-        const truncated = raw.length > lim || Boolean(response.has_more);
+        // request_status.incomplete(내부 절단)도 db 한정 경로와 동일하게 반영한다.
+        const truncated =
+          raw.length > lim || Boolean(response.has_more) || isSearchIncomplete(response);
         return jsonContent({
           query,
           db: null,
@@ -116,13 +126,7 @@ export function registerSearch(server: McpServer) {
           if (dbNameFromParent(p?.parent) === db) collected.push(p);
         }
         // Notion 검색 엔진이 내부 한도(query_result_limit_reached)로 결과를 잘랐으면 미완으로 본다.
-        // type 없이 incomplete_reason만 오는 응답 변종도 방어적으로 포착한다.
-        if (
-          response.request_status?.type === "incomplete" ||
-          response.request_status?.incomplete_reason
-        ) {
-          incomplete = true;
-        }
+        if (isSearchIncomplete(response)) incomplete = true;
 
         if (collected.length >= lim) {
           // lim 충족 — 아직 못 훑은 뒤쪽에 동일 DB 결과가 더 있을 수 있음.

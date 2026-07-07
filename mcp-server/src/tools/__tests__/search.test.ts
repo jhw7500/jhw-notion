@@ -280,4 +280,18 @@ describe("jhw_search", () => {
     // 3건 받았는데 2건만 반환 → truncated:true
     expect(parsed.truncated).toBe(true);
   });
+
+  it("전역 검색도 request_status.incomplete면 truncated=true (db 한정과 대칭)", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [pageIn(PROJECTS_DB, "g1", "일")],
+      has_more: false,
+      request_status: { incomplete_reason: "query_result_limit_reached" },
+    });
+
+    const result = await handler({ query: "전역", limit: 10 });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.db).toBe(null);
+    expect(parsed.truncated).toBe(true);
+  });
 });
