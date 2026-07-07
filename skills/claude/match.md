@@ -35,7 +35,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 
 3. **1단계 — 키워드 검색** (병렬)
    - 후보마다 `mcp__jhw-notion__jhw_search`를 **한 메시지 안에서 병렬 호출**.
-   - 같은 DB로 한정 (KB 후보는 knowledgeBase에서만, References 후보는 references에서만 등).
+   - `jhw_search`는 `{query}`만 받는 **전역 검색**이므로, 호출 후 결과를 후보와 같은 DB로 **필터링**한다 (KB 후보는 knowledgeBase 결과만, References 후보는 references 결과만 등). 도구에 DB 인자를 넘기지 않는다. 전역 top-10이 타 DB로 채워지면 동일 DB 매칭을 놓칠 수 있다(도구 한계 — `jhw_search`에 DB 필터/페이지네이션 추가는 별도 코드 과제). 이 한계 내에서 DB 필터 후 결과가 0건이면 아래 규칙대로 NEW로 확정한다.
    - top-5 결과 수집. report·project 필터는 걸지 않는다 (다른 report로 잘못 저장된 중복도 잡기 위함).
    - 결과 0건이면 그 후보는 **NEW**로 확정 (이후 단계 건너뜀).
 
@@ -48,7 +48,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 6. **카드형 미리보기 + 승인** (§미리보기).
 
 7. **액션 분기**
-   - NEW/SIMILAR → 신규 저장 (`jhw_record`/`jhw_note`). projects(완료)/decisionLog(확정)면 `impact`(성과 한 줄)+`achievement:true`도 함께 저장(사실·수치 기반, 애매하면 생략).
+   - NEW/SIMILAR → 신규 저장 (`jhw_record`/`jhw_note`). SIMILAR는 본문 하단에 `(참고: <매칭된 유사 페이지 URL>)`를 남겨 관련성을 표시한다. projects(완료)/decisionLog(확정)면 `impact`(성과 한 줄)+`achievement:true`도 함께 저장(사실·수치 기반, 애매하면 생략).
    - AUGMENT → 기존 페이지에 `### YYYY-MM-DD 보강` append (§AUGMENT 절차)
    - DUPLICATE → skip
 
@@ -144,7 +144,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 
 ## 규칙
 
-- **같은 DB 내에서만** 검색 (KB는 KB만, Decision Log는 Decision Log만).
+- **같은 DB 결과만 사용** — `jhw_search`는 전역 검색이므로 호출 후 동일 DB 결과만 필터링한다 (KB는 KB만, Decision Log는 Decision Log만; 상세 §흐름3).
 - **모든 jhw_search와 notion-fetch는 한 메시지 안에서 병렬 호출** — 순차 호출 금지 (전역 규칙).
 - **AUGMENT 본문 append 형식**: 기존 본문 끝에 `### YYYY-MM-DD 보강` + 빈 줄 + 새 본문. paragraph 2000자 가드 적용. properties는 건드리지 않는다.
 - **DUPLICATE 기본 skip**. 사용자가 "N번 신규"로 강제 신규 저장 가능.
@@ -155,7 +155,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 - **성과 필드 자동 채움**: NEW/SIMILAR로 projects(완료)·decisionLog(확정) 신규 저장 시 `impact`+`achievement:true`를 함께 넣는다 → 🏆 성과 뷰·보고서 자동 누적. AUGMENT는 properties 미변경 원칙이라 성과 필드도 건드리지 않는다.
 - **무인자 자동 from-review**: 인자 없이 `/jhw:match` 호출 시 대화의 **가장 마지막** `/jhw:review` 후보 카드를 자동 입력으로 사용한다(그 이후 새 저장/대조가 없을 때만). 없거나 stale하면 되묻는다. 명시적 `--from-review`는 강제용.
 - 매칭 결과 0건이면 카드에 NEW로 표시. 매칭이 있어도 모두 SIMILAR면 신규 저장이 기본 동작.
-- **`/jhw:review --match` 재사용 정본**: review의 `--match` 플래그는 본 스킬의 verdict 파이프라인(§verdict)·AUGMENT 절차(§AUGMENT)를 단일 정본으로 재사용한다. 단 review --match는 **저장 전** 대조라 DUPLICATE를 애초에 생성하지 않는다(순차 `/jhw:review`→`/jhw:match`의 사후 정리와 다름). 대조 로직 변경 시 여기만 고치면 review에도 반영된다.
+- **`/jhw:review --match` 재사용 정본**: review의 `--match` 플래그는 본 스킬의 verdict 파이프라인(§verdict)·AUGMENT 절차(§AUGMENT)를 단일 정본으로 재사용한다. 단 review --match는 **저장 전** 대조라 중복 페이지를 애초에 생성하지 않는다(DUPLICATE 판정 시 skip — 순차 `/jhw:review`→`/jhw:match`의 사후 정리와 다름). 대조 로직 변경 시 여기만 고치면 review에도 반영된다.
 
 ## 참고
 

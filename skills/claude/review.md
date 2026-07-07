@@ -218,7 +218,7 @@ review 흐름에는 아래 M1–M3 세 지점만 덧댄다.
 
 ### M1. 대조 단계 삽입 (§3 직후, §4 직전)
 §3에서 합치기·가치평가까지 끝난 **최종 후보 각각**에 대해 `match.md` §흐름 2–5를 실행한다:
-- 후보별 핵심어 2–3개 추출 → 후보의 DB로 한정해 `jhw_search`를 **한 메시지 안에서 병렬 호출** (report 필터 OFF — 다른 report로 잘못 저장된 중복도 잡음).
+- 후보별 핵심어 2–3개 추출 → `jhw_search`를 **한 메시지 안에서 병렬 호출**한 뒤 결과를 후보의 DB로 **필터링**한다. (`jhw_search`는 `{query}`만 받는 전역 검색이라 DB·report 인자가 없다 — DB는 호출 뒤 필터, report는 안 거른다: 다른 report로 잘못 저장된 중복도 잡기 위함. 전역 top-10 한계·처리는 `match.md §흐름3`.)
 - 매칭 ≥1건인 후보는 top-5 페이지를 `notion-fetch`로 **병렬** fetch (동일 URL은 1회만).
 - LLM 의미 판정으로 후보마다 verdict(NEW/SIMILAR/AUGMENT/DUPLICATE) + target_url + 사유를 부여한다 (`match.md §verdict`). 검색 0건인 후보는 즉시 NEW.
 - 확신 없으면 SIMILAR로 보수적 분류(`match.md` 규칙). AUGMENT 오판(엉뚱한 페이지 append)이 가장 위험.
@@ -233,10 +233,10 @@ review 흐름에는 아래 M1–M3 세 지점만 덧댄다.
   |---|---|---|
   | **NEW** | ✅ 신규저장 | ❌ 옵트인 |
   | **SIMILAR** | ✅ 신규저장(+참고) | ❌ 옵트인 |
-  | **AUGMENT** | ↻ append (delta 정보 → 가치 무관 기본 ✅) | ↻ append |
+  | **AUGMENT** | ↻ append (delta 정보 → 가치 무관 기본 ✅) | ↻ append (기본 ✅) |
   | **DUPLICATE** | ⊘ skip (가치 무관) | ⊘ skip |
 
-- 가치평가 §3.6.1의 "중복" 기준은 `--match`에서 빼고 계산한다(verdict가 권위 처리, 이중 감점 방지).
+- 가치평가 §3.6.1의 "중복" 기준은 `--match`에서 빼고 계산한다(verdict가 권위 있게 처리하므로 이중 감점 방지).
 
 카드 예시:
 ```
@@ -264,15 +264,15 @@ review 흐름에는 아래 M1–M3 세 지점만 덧댄다.
 
 ### M3. 승인·실행 (§5·§6에 verdict 명령/분기 추가)
 §5 승인 명령에 verdict 강제 명령을 합친다(기존 review 명령과 공존):
-- "OK" / "전체 실행" → 아이콘대로 실행(하 등급 NEW/SIMILAR는 ❌ 제외 유지). "전체 저장" → 하 등급 NEW/SIMILAR까지 **포함**. ⚠️ 두 명령은 한 단어 차이지만 범위가 다르다(제외 vs 포함).
+- "OK" / "전체 실행" → 아이콘대로 실행(하 등급 NEW/SIMILAR는 ❌ 제외 유지). "전체 저장" → 하 등급 NEW/SIMILAR까지 **포함**. ⚠️ 두 명령은 한 단어 차이지만 범위가 다르다(제외 vs 포함) — "전체 저장"으로 하 등급 항목이 ≥1개 포함되면 저장 전 "가치 '하' N개 포함 — 계속?"으로 1회 재확인한다.
 - verdict 강제: "N번 신규"(NEW 강제·target 무시) / "N번 중복"(DUPLICATE→skip) / "N번 보강"(AUGMENT) / "N번 보강=<URL>" / "N번 참고"(SIMILAR).
   - **verdict 강제 명령은 그 항목의 저장 옵트인도 함께 켠다 — 가치 '하'여도 저장/실행**한다(사용자가 명시했으므로 M2 표의 ❌ 기본값을 덮어씀). 즉 "3번 신규"는 3번이 하 등급이어도 신규 저장된다. 반면 "N번 저장"은 NEW/SIMILAR의 하-옵트인만 켜므로, DUPLICATE를 되살려 저장하려면 "N번 신규"를 쓴다.
 - 기존 review 명령 유지: "N번 저장"(하 옵트인) / "N번 가치=상" / "N번 report=X" / "추정 OK" / "N번 빼" / "N번 분리해" / "취소".
 - **가드**: `(추정)` report가 남아 있으면 저장 전 재확인(§5 규칙). **AUGMENT의 target_url이 비어 있으면** "N번 보강 대상 URL?" 또는 "신규 전환?"으로 재확인 — 임의 신규 전환 금지(`match.md` 규칙).
 
 §6 실행을 verdict로 분기한다:
-- **NEW / SIMILAR** → §6 그대로 신규 저장(`jhw_record`/`jhw_note`, `report` 포함, projects완료·decisionLog확정이면 `impact`+`achievement:true`). SIMILAR는 참고 맥락 표시.
-- **AUGMENT** → 신규 생성하지 않고 `match.md §AUGMENT 절차`로 target_url 본문에 `### YYYY-MM-DD 보강`을 append. properties·impact 미변경.
+- **NEW / SIMILAR** → §6 그대로 신규 저장(`jhw_record`/`jhw_note`, `report` 포함, projects완료·decisionLog확정이면 `impact`+`achievement:true`). SIMILAR는 신규 저장하되 본문 하단에 `(참고: <매칭된 유사 페이지 URL>)`를 남긴다(`match.md §흐름7`).
+- **AUGMENT** → 신규 생성하지 않고 `match.md §AUGMENT 절차`(보강 헤딩·포맷 포함)를 그대로 따라 target_url 본문에 append한다. 보강 헤딩 포맷은 review.md에 중복 기술하지 않는다(drift 방지). properties·impact 미변경.
 - **DUPLICATE** → skip.
 
 §7 결과 보고에 append/skip 수를 더한다: **신규 X / 보강(append) Y / 중복 skip Z / 하-옵트인 제외 W**. 신규·보강 URL을 각각 1줄씩 텍스트로 보고한다.
@@ -289,7 +289,7 @@ review 흐름에는 아래 M1–M3 세 지점만 덧댄다.
 - 저장 후보가 없으면 "이번 세션에서 저장할 항목이 없습니다"로 응답한다.
 - 실패한 시도나 중간 과정은 후보에서 제외한다.
 - 이미 저장된 항목은 중복 제안하지 않는다.
-- **저장가치 평가는 합치기 후 최종 후보에 적용**한다. 기준: 재사용성·검색가치·비자명성·지속성·중복 (§3.6). 단 `--match` 사용 시 "중복" 기준은 빼고 평가한다 (verdict가 권위 처리 — §3.6.1·`## --match` M2).
+- **저장가치 평가는 합치기 후 최종 후보에 적용**한다. 기준: 재사용성·검색가치·비자명성·지속성·중복 (§3.6). 단 `--match` 사용 시 "중복" 기준은 빼고 평가한다 (verdict가 권위 있게 처리 — §3.6.1·`## --match` M2).
 - **성과 후보는 git-중복으로 떨구지 않는다**: projects 완료·decisionLog 확정 결정은 코드가 git에 있어도 결과·임팩트가 있으면 저장(가치 중↑). git에는 "무엇을 바꿨나"만 있고 "결과·임팩트"는 없으므로 중복이 아니다. KB(지식·팁)는 기존대로 git-유추 트리비아 제외, raw 커밋 로그 복제만 지양.
 - **가치 '하'는 기본 제외(❌) 옵트인.** "OK"는 상·중만 저장, "전체 저장"은 하 포함, "N번 저장"은 특정 하 항목만 켠다.
 - **`report`는 2단계 추론**(§2): cwd 슬러그 매핑(확실) → 실패 시 본문 도메인 기반 추정(`(추정)` 표시). 신호 약하거나 충돌하면 빈 값.
