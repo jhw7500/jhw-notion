@@ -35,7 +35,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 
 3. **1단계 — 키워드 검색** (병렬)
    - 후보마다 `mcp__jhw-notion__jhw_search`를 **한 메시지 안에서 병렬 호출**.
-   - `jhw_search`는 `{query}`만 받는 **전역 검색**이므로, 호출 후 결과를 후보와 같은 DB로 **필터링**한다 (KB 후보는 knowledgeBase 결과만, References 후보는 references 결과만 등). 도구에 DB 인자를 넘기지 않는다. 전역 top-10이 타 DB로 채워지면 동일 DB 매칭을 놓칠 수 있으니, 매칭 0건이어도 확신이 낮으면 NEW 확정을 보수적으로 다룬다.
+   - `jhw_search`는 `{query}`만 받는 **전역 검색**이므로, 호출 후 결과를 후보와 같은 DB로 **필터링**한다 (KB 후보는 knowledgeBase 결과만, References 후보는 references 결과만 등). 도구에 DB 인자를 넘기지 않는다. 전역 top-10이 타 DB로 채워지면 동일 DB 매칭을 놓칠 수 있다(도구 한계 — `jhw_search`에 DB 필터/페이지네이션 추가는 별도 코드 과제). 이 한계 내에서 DB 필터 후 결과가 0건이면 아래 규칙대로 NEW로 확정한다.
    - top-5 결과 수집. report·project 필터는 걸지 않는다 (다른 report로 잘못 저장된 중복도 잡기 위함).
    - 결과 0건이면 그 후보는 **NEW**로 확정 (이후 단계 건너뜀).
 
@@ -144,7 +144,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 
 ## 규칙
 
-- **같은 DB 내에서만** 검색 (KB는 KB만, Decision Log는 Decision Log만).
+- **같은 DB 결과만 사용** — `jhw_search`는 전역 검색이므로 호출 후 동일 DB 결과만 필터링한다 (KB는 KB만, Decision Log는 Decision Log만; 상세 §흐름3).
 - **모든 jhw_search와 notion-fetch는 한 메시지 안에서 병렬 호출** — 순차 호출 금지 (전역 규칙).
 - **AUGMENT 본문 append 형식**: 기존 본문 끝에 `### YYYY-MM-DD 보강` + 빈 줄 + 새 본문. paragraph 2000자 가드 적용. properties는 건드리지 않는다.
 - **DUPLICATE 기본 skip**. 사용자가 "N번 신규"로 강제 신규 저장 가능.

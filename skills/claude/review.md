@@ -218,7 +218,7 @@ review 흐름에는 아래 M1–M3 세 지점만 덧댄다.
 
 ### M1. 대조 단계 삽입 (§3 직후, §4 직전)
 §3에서 합치기·가치평가까지 끝난 **최종 후보 각각**에 대해 `match.md` §흐름 2–5를 실행한다:
-- 후보별 핵심어 2–3개 추출 → `jhw_search`를 **한 메시지 안에서 병렬 호출**한 뒤 결과를 후보의 DB로 **필터링**한다. (`jhw_search`는 `{query}`만 받는 전역 검색이라 DB·report 인자가 없다 — DB는 호출 뒤 필터, report는 안 거른다: 다른 report로 잘못 저장된 중복도 잡기 위함. 전역 top-10 한계·처리는 `match.md §흐름3`.) 후보가 많으면(예: 8개 초과) 배치로 나눠 호출한다.
+- 후보별 핵심어 2–3개 추출 → `jhw_search`를 **한 메시지 안에서 병렬 호출**한 뒤 결과를 후보의 DB로 **필터링**한다. (`jhw_search`는 `{query}`만 받는 전역 검색이라 DB·report 인자가 없다 — DB는 호출 뒤 필터, report는 안 거른다: 다른 report로 잘못 저장된 중복도 잡기 위함. 전역 top-10 한계·처리는 `match.md §흐름3`.)
 - 매칭 ≥1건인 후보는 top-5 페이지를 `notion-fetch`로 **병렬** fetch (동일 URL은 1회만).
 - LLM 의미 판정으로 후보마다 verdict(NEW/SIMILAR/AUGMENT/DUPLICATE) + target_url + 사유를 부여한다 (`match.md §verdict`). 검색 0건인 후보는 즉시 NEW.
 - 확신 없으면 SIMILAR로 보수적 분류(`match.md` 규칙). AUGMENT 오판(엉뚱한 페이지 append)이 가장 위험.
