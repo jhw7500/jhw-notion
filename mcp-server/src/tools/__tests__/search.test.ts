@@ -153,7 +153,7 @@ describe("jhw_search", () => {
     );
     expect(parsed.count).toBe(1);
     expect(parsed.results[0].id).toBe("k1");
-    expect(parsed.scanned).toBe(3);
+    expect(parsed.scannedItems).toBe(3);
     expect(parsed.truncated).toBe(false);
   });
 
@@ -187,7 +187,7 @@ describe("jhw_search", () => {
 
     expect(mockClient.search).toHaveBeenCalledTimes(5);
     expect(parsed.count).toBe(0);
-    expect(parsed.scanned).toBe(5);
+    expect(parsed.scannedItems).toBe(5);
     expect(parsed.truncated).toBe(true);
   });
 
@@ -259,5 +259,25 @@ describe("jhw_search", () => {
     expect(mockClient.search).toHaveBeenCalledWith(
       expect.objectContaining({ page_size: 10 })
     );
+  });
+
+  it("전역 검색도 truncated·scannedItems를 반환한다 (db 한정과 형태 일치)", async () => {
+    mockClient.search.mockResolvedValue({
+      results: [
+        pageIn(PROJECTS_DB, "g1", "일"),
+        pageIn(KB_DB, "g2", "이"),
+        pageIn(REFERENCES_DB, "g3", "삼"),
+      ],
+      has_more: false,
+    });
+
+    const result = await handler({ query: "전역", limit: 2 });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.db).toBe(null);
+    expect(parsed.scannedItems).toBe(3);
+    expect(parsed.count).toBe(2);
+    // 3건 받았는데 2건만 반환 → truncated:true
+    expect(parsed.truncated).toBe(true);
   });
 });

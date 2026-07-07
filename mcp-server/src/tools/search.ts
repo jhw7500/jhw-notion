@@ -78,15 +78,25 @@ export function registerSearch(server: McpServer) {
           () => notion.search({ query, page_size: Math.min(Math.max(lim, 10), 100) }),
           { operation: "search.notion" }
         );
-        const results = (response.results as any[]).map(mapPage).slice(0, lim);
-        return jsonContent({ query, db: null, count: results.length, results });
+        const raw = (response.results as any[]) ?? [];
+        const results = raw.map(mapPage).slice(0, lim);
+        // db 한정 응답과 형태를 맞춘다: scannedItems(받은 항목 수)·truncated(잘렸는지).
+        const truncated = raw.length > lim || Boolean(response.has_more);
+        return jsonContent({
+          query,
+          db: null,
+          scannedItems: raw.length,
+          count: results.length,
+          truncated,
+          results,
+        });
       }
 
       // db 한정: 전역 검색을 페이지네이션하며 해당 DB 결과만 수집한다.
       // (jhw_search 자체는 DB 필터 인자가 없는 notion.search를 쓰므로, 서버측에서 parent로 필터한다.)
       const collected: any[] = [];
       let cursor: string | undefined = undefined;
-      let scanned = 0;
+      let scannedItems = 0; // 스캔한 결과 항목(페이지) 누적 수 — 페이지 수가 아님(page당 최대 100건)
       let more = false; // 스캔하지 못한 뒤쪽에 동일 DB 결과가 더 남았을 수 있음
       let incomplete = false; // Notion이 내부 결과 한도로 검색을 잘랐음(request_status)
       for (let page = 0; page < DB_SCOPED_MAX_PAGES; page++) {
@@ -101,7 +111,7 @@ export function registerSearch(server: McpServer) {
           { operation: "search.notion.dbScoped" }
         );
         const batch = (response.results as any[]) ?? [];
-        scanned += batch.length;
+        scannedItems += batch.length;
         for (const p of batch) {
           if (dbNameFromParent(p?.parent) === db) collected.push(p);
         }
@@ -138,7 +148,7 @@ export function registerSearch(server: McpServer) {
       // truncated: 미스캔 잔여(more) + 이번 스캔에서 lim 초과분을 잘라냄(collected>lim) + Notion 내부 절단(incomplete).
       // → 셋 중 하나라도면 "동일 DB 결과가 더 있을 수 있음" = 호출부가 NEW 확정에 보수적이어야 함을 신호.
       const truncated = collected.length > lim || more || incomplete;
-      return jsonContent({ query, db, scanned, count: results.length, truncated, results });
+      return jsonContent({ query, db, scannedItems, count: results.length, truncated, results });
     }
   );
 }
