@@ -37,8 +37,8 @@ const REF_TARGET = (cmd) => join("..", "..", "..", "claude", `${cmd}.md`);
 const checkOnly = process.argv.includes("--check");
 
 function extractDescription(md, file) {
-  // Windows 체크아웃(autocrlf)에서도 파싱되도록 CRLF를 허용한다.
-  const fm = md.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+  // Windows 체크아웃(autocrlf)의 CRLF와 BOM을 허용한다.
+  const fm = md.replace(/^﻿/, "").match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
   if (!fm) {
     throw new Error(`${file}: frontmatter(---)가 없습니다`);
   }
@@ -141,6 +141,7 @@ for (const file of sources) {
 }
 
 // 정본이 사라진 스킬은 남겨두면 삭제된 커맨드가 계속 노출된다.
+// 스킬 디렉토리 자체뿐 아니라 그 안에 남은 잔재(이름이 바뀐 references 등)까지 걷어낸다.
 let orphans = [];
 try {
   orphans = readdirSync(OUT_DIR)
@@ -149,6 +150,28 @@ try {
 } catch {
   mkdirSync(OUT_DIR, { recursive: true });
 }
+
+const readdirSafe = (path) => {
+  try {
+    return readdirSync(path);
+  } catch {
+    return [];   // 아직 생성 전 — SKILL.md/references 쪽 drift로 이미 보고된다.
+  }
+};
+
+for (const name of expected) {
+  const cmd = name.slice("jhw-".length);
+  const dir = join(OUT_DIR, name);
+  const allowed = new Set(["SKILL.md", "references"]);
+
+  for (const entry of readdirSafe(dir)) {
+    if (!allowed.has(entry)) orphans.push(`${name}/${entry}`);
+  }
+  for (const entry of readdirSafe(join(dir, "references"))) {
+    if (entry !== `${cmd}.md`) orphans.push(`${name}/references/${entry}`);
+  }
+}
+orphans.sort();
 
 if (!checkOnly) {
   for (const orphan of orphans) rmSync(join(OUT_DIR, orphan), { recursive: true, force: true });
