@@ -69,16 +69,39 @@ register_opencode_mcp() {
   ok "OpenCode: opencode.json에 jhw-notion 서버 추가"
 }
 
+# config.toml에는 다른 MCP 서버의 시크릿도 들어있다. 백업 사본이 무한히 쌓이지 않도록
+# 우리가 만든 것(.bak.YYYYMMDDHHMMSS)만 최근 BACKUP_KEEP개까지 남긴다.
+# 다른 도구가 만든 .bak(다른 이름 규칙)은 건드리지 않는다.
+BACKUP_KEEP=3
+
+prune_codex_backups() {
+  local config_file="$1"
+  local dir base
+  dir="$(dirname "$config_file")"
+  base="$(basename "$config_file")"
+
+  # xargs는 공백이 든 경로를 쪼개 조용히 실패한다. 한 줄씩 그대로 넘긴다.
+  find "$dir" -maxdepth 1 -type f -name "$base.bak.*" 2>/dev/null |
+    grep -E "\.bak\.[0-9]{14}$" |
+    sort -r |
+    tail -n +$((BACKUP_KEEP + 1)) |
+    while IFS= read -r old; do
+      rm -f "$old"
+    done
+}
+
 # Codex는 JSON이 아니라 ~/.codex/config.toml의 [mcp_servers.<id>] 섹션을 읽는다.
 # TOML 파서가 없으므로 섹션 단위로 라인 편집한다(기존 섹션이 있으면 교체, 없으면 추가).
 register_codex_mcp() {
   local config_file="$1"
 
-  [ -f "$config_file" ] && cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
-
   # 경로를 스크립트에 보간하면 따옴표·역슬래시가 든 경로에서 JS 구문이 깨진다.
   # 환경변수로 넘겨 보간 자체를 없앤다.
-  CODEX_CONFIG="$config_file" CODEX_MCP_ENTRY="$MCP_ENTRY" node -e "
+  # 내용이 그대로면 백업도 쓰기도 하지 않는다(exit 3) — 재설치마다 사본이 쌓이던 문제.
+  if CODEX_CONFIG="$config_file" \
+     CODEX_MCP_ENTRY="$MCP_ENTRY" \
+     CODEX_BACKUP_STAMP="$(date +%Y%m%d%H%M%S)" \
+     node -e "
     const fs = require('fs');
     const p = process.env.CODEX_CONFIG;
     const entry = [
@@ -102,9 +125,25 @@ register_codex_mcp() {
       const body = src.replace(/\n+$/, '');
       out = body.length ? [...body.split('\n'), '', ...entry, ''] : [...entry, ''];
     }
-    fs.writeFileSync(p, out.join('\n'));
-  "
-  ok "Codex: config.toml에 jhw-notion 서버 추가"
+
+    const next = out.join('\n');
+    if (next === src) process.exit(3);
+
+    if (src.length) fs.copyFileSync(p, p + '.bak.' + process.env.CODEX_BACKUP_STAMP);
+    fs.writeFileSync(p, next);
+  "; then
+    ok "Codex: config.toml에 jhw-notion 서버 추가"
+  else
+    local rc=$?
+    if [ "$rc" -eq 3 ]; then
+      skip "Codex: config.toml 이미 최신 (백업 생성 안 함)"
+    else
+      fail "Codex: config.toml 갱신 실패"
+      exit 1
+    fi
+  fi
+
+  prune_codex_backups "$config_file"
 }
 
 unregister_mcp() {
@@ -131,6 +170,7 @@ unregister_codex_mcp() {
   if [ ! -f "$config_file" ]; then return; fi
   if ! grep -q '^\[mcp_servers\.jhw-notion\]' "$config_file"; then return; fi
 
+  # 실제로 섹션이 있을 때만 여기 도달하므로 이 백업은 항상 의미가 있다.
   cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
 
   CODEX_CONFIG="$config_file" node -e "
@@ -155,6 +195,8 @@ unregister_codex_mcp() {
     fs.writeFileSync(p, [...lines.slice(0, start), ...lines.slice(end)].join('\n'));
   "
   ok "Codex: jhw-notion 서버 제거"
+
+  prune_codex_backups "$config_file"
 }
 
 unregister_opencode_mcp() {
