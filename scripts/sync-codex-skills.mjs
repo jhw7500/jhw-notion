@@ -48,6 +48,14 @@ function extractDescription(md, file) {
   }
   const value = line.slice("description:".length).trim();
 
+  // 블록 스칼라(| > 및 |- >2 같은 지시자)는 값이 다음 줄부터다. 여기서 잡지 않으면
+  // '|' 한 글자가 조용히 description으로 실린다.
+  if (/^[|>][-+0-9]*$/.test(value)) {
+    throw new Error(
+      `${file}: description에 YAML 블록 스칼라(${value})는 쓸 수 없습니다. 한 줄로 쓰세요.`,
+    );
+  }
+
   // YAML 인용 문자열의 이스케이프는 풀지 않는다. 조용히 백슬래시를 남기느니
   // 처리할 수 없다고 크게 실패한다(본문의 ''' 가드와 같은 원칙).
   if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
