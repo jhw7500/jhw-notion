@@ -76,13 +76,15 @@ register_codex_mcp() {
 
   [ -f "$config_file" ] && cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
 
-  node -e "
+  # 경로를 스크립트에 보간하면 따옴표·역슬래시가 든 경로에서 JS 구문이 깨진다.
+  # 환경변수로 넘겨 보간 자체를 없앤다.
+  CODEX_CONFIG="$config_file" CODEX_MCP_ENTRY="$MCP_ENTRY" node -e "
     const fs = require('fs');
-    const p = '$config_file';
+    const p = process.env.CODEX_CONFIG;
     const entry = [
       '[mcp_servers.jhw-notion]',
       'command = \"node\"',
-      'args = [\"$MCP_ENTRY\"]',
+      'args = [' + JSON.stringify(process.env.CODEX_MCP_ENTRY) + ']',
       'startup_timeout_sec = 60.0',
     ];
 
@@ -131,9 +133,9 @@ unregister_codex_mcp() {
 
   cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
 
-  node -e "
+  CODEX_CONFIG="$config_file" node -e "
     const fs = require('fs');
-    const p = '$config_file';
+    const p = process.env.CODEX_CONFIG;
     const lines = fs.readFileSync(p, 'utf8').split('\n');
     const start = lines.findIndex((l) => l.trim() === '[mcp_servers.jhw-notion]');
     if (start < 0) process.exit(0);

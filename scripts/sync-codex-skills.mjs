@@ -134,7 +134,7 @@ for (const file of sources) {
     drifted.push(`jhw-${cmd}/references/${cmd}.md`);
     if (!checkOnly) {
       mkdirSync(join(dir, "references"), { recursive: true });
-      rmSync(refPath, { force: true });
+      rmSync(refPath, { force: true, recursive: true });   // 디렉토리가 자리를 차지한 경우까지
       symlinkSync(REF_TARGET(cmd), refPath);
     }
   }
