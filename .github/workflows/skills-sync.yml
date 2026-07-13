@@ -15,21 +15,25 @@ on:
       - '.github/workflows/skills-sync.yml'
   workflow_dispatch:
 
+# 검사만 하므로 읽기 권한이면 충분하다 (저장소 기본 권한을 상속하지 않는다).
+permissions:
+  contents: read
+
 jobs:
   check:
-    name: codex TOML 동기화 검사
+    name: codex 스킬 동기화 검사
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # ratchet:actions/checkout@v4
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # ratchet:actions/setup-node@v4
         with:
           node-version: '20'
 
-      # skills/claude/*.md(정본)와 skills/codex/jhw/*.toml(생성물)이 어긋나면 실패한다.
+      # skills/claude/*.md(정본)와 skills/codex/jhw-<cmd>/(생성물)이 어긋나면 실패한다.
       # 로컬에서 `node scripts/sync-codex-skills.mjs` 실행 후 커밋하면 해소된다.
       - name: Check codex skills are in sync
         run: node scripts/sync-codex-skills.mjs --check

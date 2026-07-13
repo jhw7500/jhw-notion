@@ -47,10 +47,40 @@ function extractDescription(md, file) {
     throw new Error(`${file}: frontmatter에 description이 없습니다`);
   }
   const value = line.slice("description:".length).trim();
-  const quoted =
-    (value.startsWith('"') && value.endsWith('"')) ||
-    (value.startsWith("'") && value.endsWith("'"));
-  return quoted ? value.slice(1, -1) : value;
+
+  // 블록 스칼라(| > 및 |- >2 같은 지시자)는 값이 다음 줄부터다. 여기서 잡지 않으면
+  // '|' 한 글자가 조용히 description으로 실린다.
+  if (/^[|>][-+0-9]*$/.test(value)) {
+    throw new Error(
+      `${file}: description에 YAML 블록 스칼라(${value})는 쓸 수 없습니다. 한 줄로 쓰세요.`,
+    );
+  }
+
+  // YAML 인용 문자열의 이스케이프는 풀지 않는다. 조용히 백슬래시를 남기느니
+  // 처리할 수 없다고 크게 실패한다(본문의 ''' 가드와 같은 원칙).
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    const inner = value.slice(1, -1);
+    if (/[\\"]/.test(inner)) {
+      throw new Error(
+        `${file}: description의 이스케이프·내부 따옴표를 처리할 수 없습니다. ` +
+          `따옴표 없는 형태로 쓰세요 → ${value}`,
+      );
+    }
+    return inner;
+  }
+
+  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    const inner = value.slice(1, -1);
+    if (inner.includes("'")) {
+      throw new Error(
+        `${file}: description의 작은따옴표 이스케이프('')를 처리할 수 없습니다 → ${value}`,
+      );
+    }
+    return inner;
+  }
+
+  // 인용하지 않은 스칼라는 따옴표가 섞여 있어도 그대로가 값이다.
+  return value;
 }
 
 function renderSkill(md, cmd, file) {
