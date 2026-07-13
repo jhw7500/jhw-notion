@@ -1,6 +1,6 @@
 description = "Notion 통합 회상(검색+컨텍스트+타임라인) · --mode search|context|history 모드강제"
 
-prompt = """
+prompt = '''
 ---
 description: "Notion 통합 회상(검색+컨텍스트+타임라인) · --mode search|context|history 모드강제"
 argument-hint: "[키워드 | 프로젝트명] [--mode search|context|history]"
@@ -51,4 +51,4 @@ argument-hint: "[키워드 | 프로젝트명] [--mode search|context|history]"
 - 세션 대화 기록 조회는 `/jhw:cclog` (Notion이 아닌 Claude Code 세션 JSONL).
 - Notion → 로컬 memory 가져오기는 `/jhw:import`.
 
-"""
+'''

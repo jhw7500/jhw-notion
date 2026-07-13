@@ -1,6 +1,6 @@
 description = "일/주/월 업무 보고서(preview→export) · week|month 기간 · --start/--end 날짜범위 · --report 대상보고서필터 · --db 대상DB · --by db DB별그룹 · --include-none 빈항목포함"
 
-prompt = """
+prompt = '''
 ---
 description: "일/주/월 업무 보고서(preview→export) · week|month 기간 · --start/--end 날짜범위 · --report 대상보고서필터 · --db 대상DB · --by db DB별그룹 · --include-none 빈항목포함"
 argument-hint: "[week|month] [--start YYYY-MM-DD --end YYYY-MM-DD] [--report <값>...] [--db <db>...] [--by db] [--include-none]"
@@ -56,4 +56,4 @@ argument-hint: "[week|month] [--start YYYY-MM-DD --end YYYY-MM-DD] [--report <�
 - `report` 분류값 자동 추론(cwd 슬러그/도메인)은 `/jhw:save`·`/jhw:review`의 §report. **이 스킬은 그 값으로 기간 집계만** 한다(분류 자체를 바꾸지 않음).
 - 백엔드: `jhw_report_preview` / `jhw_report_export` (`mcp-server/src/tools/report-preview.ts`, `report-export.ts`).
 
-"""
+'''

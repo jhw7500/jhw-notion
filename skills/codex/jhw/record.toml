@@ -1,6 +1,6 @@
 description = "(deprecated) → /jhw:save 사용"
 
-prompt = """
+prompt = '''
 ---
 description: (deprecated) → /jhw:save 사용
 argument-hint: "→ /jhw:save <내용>"
@@ -16,4 +16,4 @@ argument-hint: "→ /jhw:save <내용>"
 사용자가 `/jhw:record`를 호출하면 `/jhw:save`와 동일한 흐름을 실행한다.
 세부 사양은 `save.md` 참조.
 
-"""
+'''

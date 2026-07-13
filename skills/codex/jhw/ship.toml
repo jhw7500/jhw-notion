@@ -1,6 +1,6 @@
 description = "--merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix)"
 
-prompt = """
+prompt = '''
 ---
 description: "--merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix)"
 argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--reviewers a,b] [--timeout <min>] [--max-rounds <n>] [--block-on must-fix|should-fix]"
@@ -185,4 +185,4 @@ if [ -z "$(printf '%s' "${TARGET_CMD:-}" | tr -d '[:space:]')" ]; then echo "TAR
 - 작업내역 회고는 `/jhw:load`(세션·노션·깃 타임라인).
 - 리뷰 워크플로우 설정: `.github/workflow-config.yml`, 상세는 `.github/README.md`.
 
-"""
+'''

@@ -5,7 +5,14 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+let loaded = false;
+
 export function loadNotionEnv(): void {
+  // 키를 못 찾으면 셸 폴백이 최대 5초 걸린다. 진입점과 notion-client에서 각각
+  // 호출되므로 가드가 없으면 기동이 두 배로 지연된다.
+  if (loaded) return;
+  loaded = true;
+
   config({ path: resolve(__dirname, "..", ".env") });
 
   if (!process.env.NOTION_API_KEY) {

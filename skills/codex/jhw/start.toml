@@ -1,6 +1,6 @@
 description = "(deprecated) → /jhw:project --start 사용"
 
-prompt = """
+prompt = '''
 ---
 description: (deprecated) → /jhw:project --start 사용
 argument-hint: "→ /jhw:project --start <name>"
@@ -12,4 +12,4 @@ argument-hint: "→ /jhw:project --start <name>"
 
 → **`/jhw:project --start <name>` 권장.** 세부 사양은 `project.md` 참조.
 
-"""
+'''

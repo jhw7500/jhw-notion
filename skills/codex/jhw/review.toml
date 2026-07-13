@@ -1,6 +1,6 @@
 description = "세션 마무리 시 Notion 저장 후보 정리·저장가치 평가 및 승인 저장 · --match 저장 전 기존 Notion 대조(중복 skip/보강 append)"
 
-prompt = """
+prompt = '''
 ---
 description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평가 및 승인 저장 · --match 저장 전 기존 Notion 대조(중복 skip/보강 append)
 argument-hint: "[--match]"
@@ -301,4 +301,4 @@ review 흐름에는 아래 M1–M3 세 지점만 덧댄다.
 - **성과 필드 자동 채움**: projects(완료)·decisionLog(확정) 저장 시 `impact`(성과 한 줄)+`achievement:true`를 함께 저장 → 🏆 성과 뷰·`jhw_report` 임팩트 자동 누적. 사실·수치 기반, 미완료/애매하면 생략.
 - **`--match` 옵트인 대조**: 플래그가 있으면 §3 최종 후보를 **저장 전에** `match.md` verdict 파이프라인으로 기존 Notion과 대조한다 — DUPLICATE=skip(중복 미생성), AUGMENT=기존 append, NEW/SIMILAR=신규 저장. 대조·AUGMENT 로직의 단일 정본은 `match.md`(여기 중복 정의 금지). 승인 1회, `(추정)` report·빈 AUGMENT target_url은 저장 전 재확인. 상세는 `## --match` 참조.
 
-"""
+'''

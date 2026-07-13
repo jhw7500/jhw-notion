@@ -21,11 +21,12 @@ const EXCLUDED = new Set(["AGENTS.md"]);
 const checkOnly = process.argv.includes("--check");
 
 function extractDescription(md, file) {
-  const fm = md.match(/^---\n([\s\S]*?)\n---\n/);
+  // Windows 체크아웃(autocrlf)에서도 파싱되도록 CRLF를 허용한다.
+  const fm = md.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
   if (!fm) {
     throw new Error(`${file}: frontmatter(---)가 없습니다`);
   }
-  const line = fm[1].split("\n").find((l) => l.startsWith("description:"));
+  const line = fm[1].split(/\r?\n/).find((l) => l.startsWith("description:"));
   if (!line) {
     throw new Error(`${file}: frontmatter에 description이 없습니다`);
   }
@@ -37,12 +38,14 @@ function extractDescription(md, file) {
 }
 
 function renderToml(md, file) {
-  if (md.includes('"""')) {
-    throw new Error(`${file}: 본문에 """가 있어 TOML 멀티라인 문자열을 깨뜨립니다`);
+  // 본문은 multiline *literal* string(''')로 감싼다. basic string(""")은 \n, \", \\ 를
+  // 이스케이프로 재해석해서 마크다운 안의 jq/셸 예제를 조용히 망가뜨린다.
+  if (md.includes("'''")) {
+    throw new Error(`${file}: 본문에 '''가 있어 TOML 리터럴 문자열을 깨뜨립니다`);
   }
-  // JSON.stringify의 이스케이프 규칙(", \, 제어문자)은 TOML basic string과 호환된다.
+  // description은 단일 행 basic string — JSON.stringify의 이스케이프 규칙과 호환된다.
   const description = JSON.stringify(extractDescription(md, file));
-  return `description = ${description}\n\nprompt = """\n${md}\n"""\n`;
+  return `description = ${description}\n\nprompt = '''\n${md}\n'''\n`;
 }
 
 function readIfExists(path) {

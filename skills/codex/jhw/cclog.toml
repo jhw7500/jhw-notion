@@ -1,6 +1,6 @@
 description = "Claude Code 세션 대화기록 시간순 조회 · --tools 도구호출포함 · --last N 최근N턴 · 인자로 세션경로|all"
 
-prompt = """
+prompt = '''
 ---
 description: "Claude Code 세션 대화기록 시간순 조회 · --tools 도구호출포함 · --last N 최근N턴 · 인자로 세션경로|all"
 argument-hint: "[세션파일경로|all] [--tools] [--last N]"
@@ -108,4 +108,4 @@ jq -r '
 - 특정 세션 복기 (`/jhw:cclog <path>`)
 - 최근 N턴만 빠르게 훑기 (`--last N`)
 
-"""
+'''

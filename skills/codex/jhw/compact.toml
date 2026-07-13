@@ -1,6 +1,6 @@
 description = "저장 레코드 정리(합치기·요약·저장가치 평가) · --db 대상DB · --report 대상보고서 · --hard 휴지통이동"
 
-prompt = """
+prompt = '''
 ---
 description: "저장 레코드 정리(합치기·요약·저장가치 평가) · --db 대상DB · --report 대상보고서 · --hard 휴지통이동"
 argument-hint: "[--db <db>] [--report <report>] [--hard] [프로젝트명|키워드]"
@@ -126,4 +126,4 @@ argument-hint: "[--db <db>] [--report <report>] [--hard] [프로젝트명|키워
 - 저장 시점의 합치기/평가는 `/jhw:review` (§3 합치기, §3.6 저장가치 평가). `compact`는 **이미 저장된** 레코드를 사후 정리하며, 같은 §3.6 평가 기준을 쓰되 결과를 **저장 여부가 아닌 폐기 여부**(하=폐기 후보, 옵트인)로 적용한다.
 - 단건 삭제/폐기는 `/jhw:save --delete <id>`.
 
-"""
+'''

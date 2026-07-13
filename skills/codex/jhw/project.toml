@@ -1,6 +1,6 @@
 description = "프로젝트 라이프사이클 통합 (start + close)"
 
-prompt = """
+prompt = '''
 ---
 description: 프로젝트 라이프사이클 통합 (start + close)
 argument-hint: "(--start | --close) [프로젝트명]"
@@ -51,4 +51,4 @@ argument-hint: "(--start | --close) [프로젝트명]"
 - 회고는 선택. 빈 회고는 KB 등록을 생략.
 - 승인 이후 한 흐름으로 진행 — 중간 멈춤 없음.
 
-"""
+'''

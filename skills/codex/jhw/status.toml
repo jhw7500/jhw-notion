@@ -1,6 +1,6 @@
 description = "Notion AI Workspace 현황 조회"
 
-prompt = """
+prompt = '''
 ---
 description: Notion AI Workspace 현황 조회
 argument-hint: "[db명] (projects|preferences|decisionLog|knowledgeBase|references)"
@@ -33,4 +33,4 @@ argument-hint: "[db명] (projects|preferences|decisionLog|knowledgeBase|referenc
 
 - 조회 전용 — 데이터를 수정하지 않는다.
 
-"""
+'''

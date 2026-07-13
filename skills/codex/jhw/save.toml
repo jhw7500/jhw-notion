@@ -1,6 +1,6 @@
 description = "Notion 즉시 저장(record+note+delete 통합) · --db 대상DB · --delete <id> 폐기 · --hard 휴지통이동 · --force-tag 미등록 태그 자동등록"
 
-prompt = """
+prompt = '''
 ---
 description: "Notion 즉시 저장(record+note+delete 통합) · --db 대상DB · --delete <id> 폐기 · --hard 휴지통이동 · --force-tag 미등록 태그 자동등록"
 argument-hint: "[--db <db>] [--delete <id>] [--hard] [--force-tag] [내용]"
@@ -71,4 +71,4 @@ argument-hint: "[--db <db>] [--delete <id>] [--hard] [--force-tag] [내용]"
 - `--delete`/`--hard` → MCP 매핑: `--delete`=`jhw_delete mode: archive`(status를 '폐기'로 변경), `--hard`=`jhw_delete mode: delete`(`archived: true`, Notion 휴지통 이동). **Notion API는 영구 삭제를 노출하지 않아 둘 다 30일 내 복구 가능** — '완전 삭제' 아님. `--hard`는 명시적일 때만.
 - `--force-tag` → `allowNewTags: true` 매핑: multi_select 미등록 값(KB `tags` / references `tool` / projects `tech_stack`)을 어휘 가드 drop 대신 **data source에 자동 등록 후 포함**. 기본(미지정)은 현행 drop+경고 유지 — 노이즈/오타 옵션 폭발 방지. 등록은 기존 옵션 `id` 보존·대소문자 중복제거하며, 실패 시 안전하게 drop으로 폴백. (분석: `docs/03-analysis/multi-select-tag-autocreate.analysis.md` 옵션 B)
 
-"""
+'''

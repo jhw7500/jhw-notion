@@ -1,6 +1,6 @@
 description = "(deprecated) → /jhw:recall 사용 (search 모드 자동)"
 
-prompt = """
+prompt = '''
 ---
 description: (deprecated) → /jhw:recall 사용 (search 모드 자동)
 argument-hint: "→ /jhw:recall <키워드>"
@@ -12,4 +12,4 @@ argument-hint: "→ /jhw:recall <키워드>"
 
 → **`/jhw:recall <키워드>` 권장.** 세부 사양은 `recall.md` 참조.
 
-"""
+'''

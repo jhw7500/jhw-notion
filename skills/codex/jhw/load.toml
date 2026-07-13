@@ -1,6 +1,6 @@
 description = "세션·노션·깃 작업내역 시간순 머지 · --source 소스선택 · --last N 최근N · --since 기간 · --tools 도구호출포함 · --author 깃author"
 
-prompt = """
+prompt = '''
 ---
 description: "세션·노션·깃 작업내역 시간순 머지 · --source 소스선택 · --last N 최근N · --since 기간 · --tools 도구호출포함 · --author 깃author"
 argument-hint: "[--source session,notion,git] [--last N] [--since <when>] [--tools] [--author <name>]"
@@ -143,4 +143,4 @@ jhw_history(project="<git 루트 basename (없으면 cwd)>")
 - 노션만: `/jhw:recall <프로젝트명> --history` — 본 스킬 노션 소스의 단일 버전
 - 깃 단독 조회 스킬은 없음 — 본 스킬의 `--git`이 그 역할
 
-"""
+'''

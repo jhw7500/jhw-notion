@@ -187,7 +187,14 @@ echo ""
 echo "[3/4] 스킬 심링크"
 
 # Codex용 TOML은 skills/claude/*.md에서 생성된다 (정본 1개 유지).
-node "$SCRIPT_DIR/scripts/sync-codex-skills.mjs" | sed 's/^/  /'
+# 파이프로 넘기면 종료 코드가 묻히므로, 출력을 받아둔 뒤 실패를 명시적으로 확인한다.
+if SYNC_OUT="$(node "$SCRIPT_DIR/scripts/sync-codex-skills.mjs" 2>&1)"; then
+  echo "$SYNC_OUT" | sed 's/^/  /'
+else
+  echo "$SYNC_OUT" | sed 's/^/  /'
+  fail "codex 스킬 동기화 실패 — 설치를 중단합니다"
+  exit 1
+fi
 
 if [ -d "$CLAUDE_DIR" ]; then
   mkdir -p "$CLAUDE_DIR/commands"

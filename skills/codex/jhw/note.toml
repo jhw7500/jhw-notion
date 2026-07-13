@@ -1,6 +1,6 @@
 description = "(deprecated) → /jhw:save 사용 (knowledgeBase 자동 라우팅)"
 
-prompt = """
+prompt = '''
 ---
 description: (deprecated) → /jhw:save 사용 (knowledgeBase 자동 라우팅)
 argument-hint: "→ /jhw:save <메모>"
@@ -16,4 +16,4 @@ argument-hint: "→ /jhw:save <메모>"
 사용자가 `/jhw:note`를 호출하면 `/jhw:save --db knowledgeBase`와 동일한 흐름을 실행.
 세부 사양은 `save.md` 참조.
 
-"""
+'''

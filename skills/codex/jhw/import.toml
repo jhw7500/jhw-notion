@@ -1,6 +1,6 @@
 description = "Notion AI Workspace에서 프로젝트/키워드 관련 내용을 검색하여 현재 프로젝트 memory 폴더로 불러오기"
 
-prompt = """
+prompt = '''
 ---
 description: Notion AI Workspace에서 프로젝트/키워드 관련 내용을 검색하여 현재 프로젝트 memory 폴더로 불러오기
 argument-hint: "[키워드... | \"구문\" | k1, k2; k3] (콤마/세미콜론/공백 구분, 무인자=cwd 프로젝트명)"
@@ -103,4 +103,4 @@ query: {검색에 사용한 질의어}
 - 특정 키워드(예: 증상, 함수명, 설정 키)에 대한 Notion의 축적된 지식을 memory 폴더로 영구 보관할 때
 - 오프라인 환경 또는 Notion API 제한이 걱정될 때 선제적으로 로컬 캐시 확보
 
-"""
+'''
