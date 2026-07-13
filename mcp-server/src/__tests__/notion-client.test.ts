@@ -7,6 +7,10 @@ vi.mock("@notionhq/client", () => ({
   },
 }));
 
+vi.mock("../env.js", () => ({
+  loadNotionEnv: vi.fn(),
+}));
+
 describe("notion-client", () => {
   beforeEach(() => {
     vi.resetModules();

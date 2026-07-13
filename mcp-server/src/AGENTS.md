@@ -10,7 +10,8 @@ MCP 서버 TypeScript 소스 코드. 엔트리포인트, 서버 초기화, Notio
 
 | File | Description |
 |------|-------------|
-| `index.ts` | 엔트리포인트 — dotenv 로딩, StdioServerTransport 생성, 서버 시작 |
+| `index.ts` | 엔트리포인트 — `loadNotionEnv()` 호출, StdioServerTransport 생성, 서버 시작 |
+| `env.ts` | 환경변수 로딩 단일 진입점 (`loadNotionEnv()`) — `.env` → `~/.bashrc` 순 |
 | `server.ts` | McpServer 인스턴스 생성 + 9개 도구 등록 (`register*` 호출) |
 | `notion-client.ts` | Notion API 클라이언트 싱글턴 팩토리 (`getNotionClient()`) |
 | `config.ts` | Notion DB/페이지 ID 상수 (`NOTION_CONFIG`) |
@@ -31,7 +32,10 @@ MCP 서버 TypeScript 소스 코드. 엔트리포인트, 서버 초기화, Notio
 
 ### Common Patterns
 - 모든 파일이 named export 사용 (default export 없음).
-- dotenv 경로: `index.ts`에서 `__dirname` 기준 상대 경로로 `.env` 로딩.
+- 환경변수 로딩: `env.ts`의 `loadNotionEnv()`가 유일한 진입점. `__dirname` 기준으로 `.env`를 읽고,
+  `NOTION_API_KEY`가 없으면 `bash -c 'source "$HOME/.bashrc"'`로 폴백한다 (MCP 서버는 비로그인 셸이라
+  `.bashrc` export를 상속받지 못함). `index.ts` 시작 시 1회, `notion-client.ts`에서 키 부재 시 지연 호출.
+  테스트에서는 `vi.mock("../env.js")`로 스텁 (프로덕션 코드에 `NODE_ENV` 분기를 두지 않는다).
 
 ## Dependencies
 
