@@ -1,0 +1,35 @@
+name: Skills Sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'skills/**'
+      - 'scripts/sync-codex-skills.mjs'
+      - '.github/workflows/skills-sync.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'skills/**'
+      - 'scripts/sync-codex-skills.mjs'
+      - '.github/workflows/skills-sync.yml'
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: codex TOML 동기화 검사
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # skills/claude/*.md(정본)와 skills/codex/jhw/*.toml(생성물)이 어긋나면 실패한다.
+      # 로컬에서 `node scripts/sync-codex-skills.mjs` 실행 후 커밋하면 해소된다.
+      - name: Check codex skills are in sync
+        run: node scripts/sync-codex-skills.mjs --check

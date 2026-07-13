@@ -1,11 +1,8 @@
-import { config } from "dotenv";
-import { fileURLToPath } from "url";
-import { dirname, resolve } from "path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "./server.js";
+import { loadNotionEnv } from "./env.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-config({ path: resolve(__dirname, "..", ".env") });
+loadNotionEnv();
 
 async function main() {
   const server = createServer();
