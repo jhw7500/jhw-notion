@@ -69,6 +69,42 @@ register_opencode_mcp() {
   ok "OpenCode: opencode.json에 jhw-notion 서버 추가"
 }
 
+# Codex는 JSON이 아니라 ~/.codex/config.toml의 [mcp_servers.<id>] 섹션을 읽는다.
+# TOML 파서가 없으므로 섹션 단위로 라인 편집한다(기존 섹션이 있으면 교체, 없으면 추가).
+register_codex_mcp() {
+  local config_file="$1"
+
+  [ -f "$config_file" ] && cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
+
+  node -e "
+    const fs = require('fs');
+    const p = '$config_file';
+    const entry = [
+      '[mcp_servers.jhw-notion]',
+      'command = \"node\"',
+      'args = [\"$MCP_ENTRY\"]',
+      'startup_timeout_sec = 60.0',
+    ];
+
+    const src = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+    const lines = src.length ? src.split('\n') : [];
+    const start = lines.findIndex((l) => l.trim() === '[mcp_servers.jhw-notion]');
+
+    let out;
+    if (start >= 0) {
+      let end = start + 1;
+      while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+      while (end > start + 1 && lines[end - 1].trim() === '') end--;   // 섹션 뒤 빈 줄 보존
+      out = [...lines.slice(0, start), ...entry, ...lines.slice(end)];
+    } else {
+      const body = src.replace(/\n+$/, '');
+      out = body.length ? [...body.split('\n'), '', ...entry, ''] : [...entry, ''];
+    }
+    fs.writeFileSync(p, out.join('\n'));
+  "
+  ok "Codex: config.toml에 jhw-notion 서버 추가"
+}
+
 unregister_mcp() {
   local settings_file="$1"
   local tui_name="$2"
@@ -85,6 +121,28 @@ unregister_mcp() {
     }
   "
   ok "$tui_name: jhw-notion 서버 제거"
+}
+
+unregister_codex_mcp() {
+  local config_file="$1"
+
+  if [ ! -f "$config_file" ]; then return; fi
+  if ! grep -q '^\[mcp_servers\.jhw-notion\]' "$config_file"; then return; fi
+
+  cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
+
+  node -e "
+    const fs = require('fs');
+    const p = '$config_file';
+    const lines = fs.readFileSync(p, 'utf8').split('\n');
+    const start = lines.findIndex((l) => l.trim() === '[mcp_servers.jhw-notion]');
+    if (start < 0) process.exit(0);
+
+    let end = start + 1;
+    while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+    fs.writeFileSync(p, [...lines.slice(0, start), ...lines.slice(end)].join('\n'));
+  "
+  ok "Codex: jhw-notion 서버 제거"
 }
 
 unregister_opencode_mcp() {
@@ -136,10 +194,11 @@ if [ "${1:-}" = "--uninstall" ]; then
 
   # Codex prompts는 평평한 디렉토리라 파일별 심링크로 깔려 있다.
   # 이 저장소를 가리키는 것만 제거하고 남의 프롬프트는 건드리지 않는다.
+  # readlink -f는 BSD(macOS)에 없다. 우리가 만든 링크는 항상 절대 경로라 -f가 필요 없다.
   removed=0
   for link in "$HOME/.codex/prompts"/*.md; do
     [ -L "$link" ] || continue
-    case "$(readlink -f "$link")" in
+    case "$(readlink "$link")" in
       "$SCRIPT_DIR"/skills/claude/*) rm "$link"; removed=$((removed + 1)) ;;
     esac
   done
@@ -149,6 +208,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   unregister_mcp "$HOME/.claude.json" "Claude"
   unregister_mcp "$HOME/.gemini/settings.json" "Gemini"
   unregister_opencode_mcp "$HOME/.config/opencode/opencode.json"
+  unregister_codex_mcp "$HOME/.codex/config.toml"
 
   echo ""
   echo "제거 완료!"
@@ -248,12 +308,19 @@ if [ -d "$CODEX_DIR" ]; then
     NAME="$(basename "$SRC")"
     [ "$NAME" = "AGENTS.md" ] && continue
     TARGET="$CODEX_DIR/prompts/$NAME"
-    if [ -e "$TARGET" ] && [ ! -L "$TARGET" ]; then
-      if [ -z "$PROMPT_BAK" ]; then
-        PROMPT_BAK="$CODEX_DIR/prompts.bak.$(date +%Y%m%d%H%M%S)"
-        mkdir -p "$PROMPT_BAK"
-      fi
-      mv "$TARGET" "$PROMPT_BAK/"
+    # review.md/status.md 같은 흔한 이름은 다른 프롬프트 팩과 충돌할 수 있다.
+    # 우리 링크가 아닌 것(일반 파일이든 남의 심링크든)은 덮어쓰지 말고 백업한다.
+    if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+      case "$(readlink "$TARGET" 2>/dev/null)" in
+        "$SCRIPT_DIR"/skills/claude/*) : ;;   # 이미 우리 링크 → 그대로 갱신
+        *)
+          if [ -z "$PROMPT_BAK" ]; then
+            PROMPT_BAK="$CODEX_DIR/prompts.bak.$(date +%Y%m%d%H%M%S)"
+            mkdir -p "$PROMPT_BAK"
+          fi
+          mv "$TARGET" "$PROMPT_BAK/"
+          ;;
+      esac
     fi
     ln -sfn "$SRC" "$TARGET"
     LINKED=$((LINKED + 1))
@@ -273,6 +340,9 @@ if [ -d "$GEMINI_DIR" ]; then
 fi
 if [ -d "$OPENCODE_DIR" ]; then
   register_opencode_mcp "$OPENCODE_DIR/opencode.json"
+fi
+if [ -d "$CODEX_DIR" ]; then
+  register_codex_mcp "$CODEX_DIR/config.toml"
 fi
 
 # .env 확인
