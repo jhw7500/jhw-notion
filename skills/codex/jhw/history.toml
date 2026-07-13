@@ -1,0 +1,15 @@
+description = "(deprecated) → /jhw:recall <프로젝트명> --history 사용"
+
+prompt = """
+---
+description: (deprecated) → /jhw:recall <프로젝트명> --history 사용
+argument-hint: "→ /jhw:recall <프로젝트명> --history"
+---
+
+# /jhw:history — (deprecated)
+
+`/jhw:recall`로 통합. `--history` 플래그로 타임라인 모드.
+
+→ **`/jhw:recall <프로젝트명> --history` 권장.** 세부 사양은 `recall.md` 참조.
+
+"""

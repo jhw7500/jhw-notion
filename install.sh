@@ -127,12 +127,23 @@ if [ "${1:-}" = "--uninstall" ]; then
   echo ""
 
   echo "[1/2] 스킬 심링크 제거"
-  for link in "$HOME/.claude/commands/jhw" "$HOME/.gemini/commands/jhw" "$HOME/.config/opencode/skills/jhw"; do
+  for link in "$HOME/.claude/commands/jhw" "$HOME/.gemini/commands/jhw" "$HOME/.config/opencode/skills/jhw" "$HOME/.codex/commands/jhw"; do
     if [ -L "$link" ]; then
       rm "$link"
       ok "$(dirname "$link") 심링크 제거"
     fi
   done
+
+  # Codex prompts는 평평한 디렉토리라 파일별 심링크로 깔려 있다.
+  # 이 저장소를 가리키는 것만 제거하고 남의 프롬프트는 건드리지 않는다.
+  removed=0
+  for link in "$HOME/.codex/prompts"/*.md; do
+    [ -L "$link" ] || continue
+    case "$(readlink -f "$link")" in
+      "$SCRIPT_DIR"/skills/claude/*) rm "$link"; removed=$((removed + 1)) ;;
+    esac
+  done
+  [ "$removed" -gt 0 ] && ok "$HOME/.codex/prompts 심링크 ${removed}개 제거"
 
   echo "[2/2] MCP 서버 등록 해제"
   unregister_mcp "$HOME/.claude.json" "Claude"
@@ -164,14 +175,20 @@ echo "[2/4] TUI 감지"
 CLAUDE_DIR="$HOME/.claude"
 GEMINI_DIR="$HOME/.gemini"
 OPENCODE_DIR="$HOME/.config/opencode"
+CODEX_DIR="$HOME/.codex"
 
 [ -d "$CLAUDE_DIR" ] && ok "Claude Code ($CLAUDE_DIR)" || skip "Claude Code (미설치)"
 [ -d "$GEMINI_DIR" ] && ok "Gemini CLI ($GEMINI_DIR)" || skip "Gemini CLI (미설치)"
 [ -d "$OPENCODE_DIR" ] && ok "OpenCode ($OPENCODE_DIR)" || skip "OpenCode (미설치)"
+[ -d "$CODEX_DIR" ] && ok "Codex CLI ($CODEX_DIR)" || skip "Codex CLI (미설치)"
 
 # [3/4] 스킬 심링크
 echo ""
 echo "[3/4] 스킬 심링크"
+
+# Codex용 TOML은 skills/claude/*.md에서 생성된다 (정본 1개 유지).
+node "$SCRIPT_DIR/scripts/sync-codex-skills.mjs" | sed 's/^/  /'
+
 if [ -d "$CLAUDE_DIR" ]; then
   mkdir -p "$CLAUDE_DIR/commands"
   TARGET="$CLAUDE_DIR/commands/jhw"
@@ -204,6 +221,38 @@ if [ -d "$OPENCODE_DIR" ]; then
   [ -L "$TARGET" ] && rm "$TARGET"
   ln -sfn "$SCRIPT_DIR/skills/claude" "$TARGET"
   ok "OpenCode: $TARGET → $SCRIPT_DIR/skills/claude"
+fi
+if [ -d "$CODEX_DIR" ]; then
+  mkdir -p "$CODEX_DIR/commands"
+  TARGET="$CODEX_DIR/commands/jhw"
+  if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then
+    mv "$TARGET" "$TARGET.bak.$(date +%Y%m%d%H%M%S)"
+    ok "Codex: 기존 jhw 디렉토리 백업"
+  fi
+  [ -L "$TARGET" ] && rm "$TARGET"
+  ln -sfn "$SCRIPT_DIR/skills/codex/jhw" "$TARGET"
+  ok "Codex: $TARGET → $SCRIPT_DIR/skills/codex/jhw"
+
+  # prompts는 평평한 디렉토리(하위 네임스페이스 없음)라 파일별로 심링크한다.
+  mkdir -p "$CODEX_DIR/prompts"
+  PROMPT_BAK=""
+  LINKED=0
+  for SRC in "$SCRIPT_DIR"/skills/claude/*.md; do
+    NAME="$(basename "$SRC")"
+    [ "$NAME" = "AGENTS.md" ] && continue
+    TARGET="$CODEX_DIR/prompts/$NAME"
+    if [ -e "$TARGET" ] && [ ! -L "$TARGET" ]; then
+      if [ -z "$PROMPT_BAK" ]; then
+        PROMPT_BAK="$CODEX_DIR/prompts.bak.$(date +%Y%m%d%H%M%S)"
+        mkdir -p "$PROMPT_BAK"
+      fi
+      mv "$TARGET" "$PROMPT_BAK/"
+    fi
+    ln -sfn "$SRC" "$TARGET"
+    LINKED=$((LINKED + 1))
+  done
+  [ -n "$PROMPT_BAK" ] && ok "Codex: 기존 prompts 복사본 백업 → $PROMPT_BAK"
+  ok "Codex: $CODEX_DIR/prompts/*.md → skills/claude/*.md (심링크 ${LINKED}개)"
 fi
 
 # [4/4] MCP 서버 등록

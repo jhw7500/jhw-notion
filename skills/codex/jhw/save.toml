@@ -1,0 +1,74 @@
+description = "Notion 즉시 저장(record+note+delete 통합) · --db 대상DB · --delete <id> 폐기 · --hard 휴지통이동 · --force-tag 미등록 태그 자동등록"
+
+prompt = """
+---
+description: "Notion 즉시 저장(record+note+delete 통합) · --db 대상DB · --delete <id> 폐기 · --hard 휴지통이동 · --force-tag 미등록 태그 자동등록"
+argument-hint: "[--db <db>] [--delete <id>] [--hard] [--force-tag] [내용]"
+---
+
+# /jhw:save — Notion 통합 저장
+
+확정된 정보를 Notion에 한 번에 저장한다. DB는 자동 판별.
+
+## DB 자동 판별
+
+| 입력 유형 | 대상 DB | 호출 도구 |
+|---|---|---|
+| 기술 결정 (A vs B, 도구 변경) | decisionLog | jhw_record |
+| AI 사용 선호도/피드백 | preferences | jhw_record |
+| 프로젝트 등록/상태 변경 | projects | jhw_record |
+| 외부 참조 문서 (URL/가이드) | references | jhw_record |
+| 기술 지식/팁/메모 | knowledgeBase | jhw_note |
+
+## 사용
+
+- `/jhw:save <내용>` — 자동 판별 후 저장
+- `/jhw:save --db decisionLog <내용>` — DB 강제
+- `/jhw:save --force-tag <내용>` — 어휘 가드 미등록 태그(tags/tool/tech_stack)를 drop 대신 Notion data source에 자동 등록 (jhw_record/jhw_note의 `allowNewTags: true`)
+- `/jhw:save --delete <pageId>` — 폐기 처리 (jhw_delete `mode: archive` — status를 '폐기'로 변경; status 필드 없는 DB는 Notion 휴지통으로 이동)
+- `/jhw:save --delete <pageId> --hard` — Notion 휴지통으로 이동 (jhw_delete `mode: delete` — `archived: true`)
+
+## report 자동 추론
+
+작업 디렉토리(`pwd`) 슬러그 → report 매핑:
+
+| 슬러그 | report |
+|---|---|
+| `pim-check` / `pim-test*` | pim-test |
+| `pim-app*` | pim-app |
+| `pim-driver-cam*` | pim-driver-cam |
+| `pim-driver-spi*` | pim-driver-spi |
+| `wlan-package*` | wlan-app |
+| `wlan-bsp*` | wlan-bsp |
+| `wlan-app*` | wlan-app |
+| `wlan-driver*` | wlan-driver |
+| `wlan-test*` | wlan-test |
+| `wlan-opc*` | wlan-app |
+| 기타 매핑 미스 | etc |
+| 개인 메모/note | none |
+
+## 흐름
+
+1. 입력 파싱 → DB / 제목 / properties / report / project 결정
+2. project 자동 추론 (cwd 디렉토리명으로 projects DB 검색)
+3. 미리보기 + 사용자 승인 (1회만)
+4. **DB가 knowledgeBase면 §paragraph 분할 가드** 적용 후 본문 확정
+5. 승인 직후 jhw_record / jhw_note / jhw_delete MCP 호출 — **중간 멈춤 없이**
+6. 결과 URL 보고 (실패 시 §회복 로직)
+
+## paragraph 분할 가드 (jhw_note 본문 2000자 한도)
+
+본문은 `\n\n`로 paragraph를 나눠 작성한다(`##`/`###` 헤딩 위·아래 빈 줄, 한 paragraph ≤ 1800자 권장).
+길이를 넘겨도 `jhw_record`/`jhw_note`가 MCP 레이어(`blocks.ts`)에서 2000자 초과 paragraph를 **자동 분할**
+하므로 길이로 API가 실패하지는 않는다 — 사전 분할은 가독성·의미 경계를 위한 것이다.
+상세 분할 전략·회복 절차는 `review.md` §3.5(단일 정본) 참조.
+
+## 규칙
+
+- 중간 결과·미확정 정보·실패 시도는 저장하지 않는다.
+- **성과 capture**: projects 완료·decisionLog 확정은 코드가 git에 있어도 결과·임팩트와 함께 저장한다(git 중복 아님 — git엔 결과/임팩트가 없음). 단 KB(재사용 지식·팁·방법론)는 git-유추 트리비아 제외, raw 커밋 로그 복제만 지양.
+- 승인 이후 응답을 끊지 않고 한 흐름으로 저장 → 결과 보고까지 진행.
+- `--delete`/`--hard` → MCP 매핑: `--delete`=`jhw_delete mode: archive`(status를 '폐기'로 변경), `--hard`=`jhw_delete mode: delete`(`archived: true`, Notion 휴지통 이동). **Notion API는 영구 삭제를 노출하지 않아 둘 다 30일 내 복구 가능** — '완전 삭제' 아님. `--hard`는 명시적일 때만.
+- `--force-tag` → `allowNewTags: true` 매핑: multi_select 미등록 값(KB `tags` / references `tool` / projects `tech_stack`)을 어휘 가드 drop 대신 **data source에 자동 등록 후 포함**. 기본(미지정)은 현행 drop+경고 유지 — 노이즈/오타 옵션 폭발 방지. 등록은 기존 옵션 `id` 보존·대소문자 중복제거하며, 실패 시 안전하게 drop으로 폴백. (분석: `docs/03-analysis/multi-select-tag-autocreate.analysis.md` 옵션 B)
+
+"""
