@@ -80,11 +80,14 @@ prune_codex_backups() {
   dir="$(dirname "$config_file")"
   base="$(basename "$config_file")"
 
+  # xargs는 공백이 든 경로를 쪼개 조용히 실패한다. 한 줄씩 그대로 넘긴다.
   find "$dir" -maxdepth 1 -type f -name "$base.bak.*" 2>/dev/null |
     grep -E "\.bak\.[0-9]{14}$" |
     sort -r |
     tail -n +$((BACKUP_KEEP + 1)) |
-    xargs -r rm -f
+    while IFS= read -r old; do
+      rm -f "$old"
+    done
 }
 
 # Codex는 JSON이 아니라 ~/.codex/config.toml의 [mcp_servers.<id>] 섹션을 읽는다.
