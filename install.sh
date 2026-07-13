@@ -140,8 +140,18 @@ unregister_codex_mcp() {
     const start = lines.findIndex((l) => l.trim() === '[mcp_servers.jhw-notion]');
     if (start < 0) process.exit(0);
 
+    // [mcp_servers.jhw-notion.env] 같은 자식 테이블도 함께 지운다.
+    // 남겨두면 command 없는 jhw-notion 서버가 되살아난다.
+    const ours = (l) => {
+      const t = l.trim();
+      return t === '[mcp_servers.jhw-notion]' || t.startsWith('[mcp_servers.jhw-notion.');
+    };
+
     let end = start + 1;
-    while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+    while (end < lines.length) {
+      if (/^\s*\[/.test(lines[end]) && !ours(lines[end])) break;
+      end++;
+    }
     fs.writeFileSync(p, [...lines.slice(0, start), ...lines.slice(end)].join('\n'));
   "
   ok "Codex: jhw-notion 서버 제거"
