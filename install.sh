@@ -195,6 +195,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   # Codex prompts는 평평한 디렉토리라 파일별 심링크로 깔려 있다.
   # 이 저장소를 가리키는 것만 제거하고 남의 프롬프트는 건드리지 않는다.
   # readlink -f는 BSD(macOS)에 없다. 우리가 만든 링크는 항상 절대 경로라 -f가 필요 없다.
+  # 이 저장소를 가리키는 링크만 제거하고 남의 프롬프트/스킬은 건드리지 않는다.
   removed=0
   for link in "$HOME/.codex/prompts"/*.md; do
     [ -L "$link" ] || continue
@@ -203,6 +204,15 @@ if [ "${1:-}" = "--uninstall" ]; then
     esac
   done
   [ "$removed" -gt 0 ] && ok "$HOME/.codex/prompts 심링크 ${removed}개 제거"
+
+  removed=0
+  for link in "$HOME/.codex/skills"/jhw-*; do
+    [ -L "$link" ] || continue
+    case "$(readlink "$link")" in
+      "$SCRIPT_DIR"/skills/codex/*) rm "$link"; removed=$((removed + 1)) ;;
+    esac
+  done
+  [ "$removed" -gt 0 ] && ok "$HOME/.codex/skills 심링크 ${removed}개 제거"
 
   echo "[2/2] MCP 서버 등록 해제"
   unregister_mcp "$HOME/.claude.json" "Claude"
@@ -290,43 +300,60 @@ if [ -d "$OPENCODE_DIR" ]; then
   ok "OpenCode: $TARGET → $SCRIPT_DIR/skills/claude"
 fi
 if [ -d "$CODEX_DIR" ]; then
-  mkdir -p "$CODEX_DIR/commands"
-  TARGET="$CODEX_DIR/commands/jhw"
-  if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then
-    mv "$TARGET" "$TARGET.bak.$(date +%Y%m%d%H%M%S)"
-    ok "Codex: 기존 jhw 디렉토리 백업"
+  # Codex는 $CODEX_HOME/skills 의 스킬 디렉토리를 자동 발견한다.
+  # (~/.codex/commands/*.toml은 스캔하지 않으므로 예전 TOML 배선은 제거한다.)
+  LEGACY="$CODEX_DIR/commands/jhw"
+  if [ -L "$LEGACY" ]; then
+    rm "$LEGACY"
+    ok "Codex: 스캔되지 않는 commands/jhw 배선 제거"
   fi
-  [ -L "$TARGET" ] && rm "$TARGET"
-  ln -sfn "$SCRIPT_DIR/skills/codex/jhw" "$TARGET"
-  ok "Codex: $TARGET → $SCRIPT_DIR/skills/codex/jhw"
 
-  # prompts는 평평한 디렉토리(하위 네임스페이스 없음)라 파일별로 심링크한다.
-  mkdir -p "$CODEX_DIR/prompts"
-  PROMPT_BAK=""
+  mkdir -p "$CODEX_DIR/skills"
+  SKILL_BAK=""
   LINKED=0
-  for SRC in "$SCRIPT_DIR"/skills/claude/*.md; do
+  for SRC in "$SCRIPT_DIR"/skills/codex/jhw-*; do
+    [ -d "$SRC" ] || continue
     NAME="$(basename "$SRC")"
-    [ "$NAME" = "AGENTS.md" ] && continue
-    TARGET="$CODEX_DIR/prompts/$NAME"
-    # review.md/status.md 같은 흔한 이름은 다른 프롬프트 팩과 충돌할 수 있다.
-    # 우리 링크가 아닌 것(일반 파일이든 남의 심링크든)은 덮어쓰지 말고 백업한다.
+    TARGET="$CODEX_DIR/skills/$NAME"
+    # 우리 링크가 아닌 기존 스킬(수동 복사본 등)은 지우지 말고 백업한다.
     if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
       case "$(readlink "$TARGET" 2>/dev/null)" in
-        "$SCRIPT_DIR"/skills/claude/*) : ;;   # 이미 우리 링크 → 그대로 갱신
+        "$SCRIPT_DIR"/skills/codex/*) : ;;   # 이미 우리 링크 → 그대로 갱신
         *)
-          if [ -z "$PROMPT_BAK" ]; then
-            PROMPT_BAK="$CODEX_DIR/prompts.bak.$(date +%Y%m%d%H%M%S)"
-            mkdir -p "$PROMPT_BAK"
+          if [ -z "$SKILL_BAK" ]; then
+            SKILL_BAK="$CODEX_DIR/skills.bak.$(date +%Y%m%d%H%M%S)"
+            mkdir -p "$SKILL_BAK"
           fi
-          mv "$TARGET" "$PROMPT_BAK/"
+          mv "$TARGET" "$SKILL_BAK/"
           ;;
       esac
     fi
     ln -sfn "$SRC" "$TARGET"
     LINKED=$((LINKED + 1))
   done
-  [ -n "$PROMPT_BAK" ] && ok "Codex: 기존 prompts 복사본 백업 → $PROMPT_BAK"
-  ok "Codex: $CODEX_DIR/prompts/*.md → skills/claude/*.md (심링크 ${LINKED}개)"
+  [ -n "$SKILL_BAK" ] && ok "Codex: 기존 jhw 스킬 백업 → $SKILL_BAK"
+  ok "Codex: $CODEX_DIR/skills/jhw-* → skills/codex/jhw-* (심링크 ${LINKED}개)"
+
+  # prompts(/prompts:<name>)는 평평한 디렉토리라 파일별 심링크로 깐다.
+  # review.md/status.md 같은 흔한 이름이 이미 있으면 남의 프롬프트를 밀어내지 않고 건너뛴다.
+  mkdir -p "$CODEX_DIR/prompts"
+  PLINKED=0
+  PSKIPPED=0
+  for SRC in "$SCRIPT_DIR"/skills/claude/*.md; do
+    NAME="$(basename "$SRC")"
+    [ "$NAME" = "AGENTS.md" ] && continue
+    TARGET="$CODEX_DIR/prompts/$NAME"
+    if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+      case "$(readlink "$TARGET" 2>/dev/null)" in
+        "$SCRIPT_DIR"/skills/claude/*) : ;;   # 우리 링크 → 갱신
+        *) PSKIPPED=$((PSKIPPED + 1)); continue ;;   # 남의 프롬프트 → 보존
+      esac
+    fi
+    ln -sfn "$SRC" "$TARGET"
+    PLINKED=$((PLINKED + 1))
+  done
+  ok "Codex: $CODEX_DIR/prompts/*.md → skills/claude/*.md (심링크 ${PLINKED}개)"
+  [ "$PSKIPPED" -gt 0 ] && skip "Codex: 이름이 겹치는 기존 프롬프트 ${PSKIPPED}개는 보존 (스킬 \$jhw-* 로 사용 가능)"
 fi
 
 # [4/4] MCP 서버 등록

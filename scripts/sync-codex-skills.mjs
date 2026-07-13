@@ -1,22 +1,38 @@
 #!/usr/bin/env node
-// skills/claude/*.md (정본) → skills/codex/jhw/*.toml (생성물) 동기화.
+// skills/claude/*.md (정본) → skills/codex/jhw-<cmd>/ (생성물) 동기화.
 //
 //   node scripts/sync-codex-skills.mjs           생성/갱신
 //   node scripts/sync-codex-skills.mjs --check   드리프트만 검사 (CI/커밋 전, 쓰기 없음)
 //
-// TOML은 Codex의 커스텀 커맨드 형식(~/.codex/commands/jhw/)이다.
-// 정본은 언제나 skills/claude/*.md — TOML을 직접 수정하지 말 것.
+// Codex는 $CODEX_HOME/skills(= ~/.codex/skills)의 스킬 디렉토리를 자동 발견한다.
+// (~/.codex/commands/*.toml은 스캔하지 않아 이전 TOML 미러는 폐기했다.)
+//
+// 각 스킬은 SKILL.md(생성물) + references/<cmd>.md(정본 심링크)로 구성한다.
+// references를 심링크로 두면 정본을 고치는 순간 반영되므로 본문이 낡을 수 없다.
+// 정본은 언제나 skills/claude/*.md — 생성물을 직접 수정하지 말 것.
 
-import { readFileSync, writeFileSync, readdirSync, mkdirSync, unlinkSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+  readlinkSync,
+  lstatSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SRC_DIR = join(ROOT, "skills", "claude");
-const OUT_DIR = join(ROOT, "skills", "codex", "jhw");
+const OUT_DIR = join(ROOT, "skills", "codex");
 
 // 스킬이 아닌 문서는 변환하지 않는다.
 const EXCLUDED = new Set(["AGENTS.md"]);
+
+// references/<cmd>.md → skills/claude/<cmd>.md (상대 경로 심링크)
+const REF_TARGET = (cmd) => join("..", "..", "..", "claude", `${cmd}.md`);
 
 const checkOnly = process.argv.includes("--check");
 
@@ -37,20 +53,48 @@ function extractDescription(md, file) {
   return quoted ? value.slice(1, -1) : value;
 }
 
-function renderToml(md, file) {
-  // 본문은 multiline *literal* string(''')로 감싼다. basic string(""")은 \n, \", \\ 를
-  // 이스케이프로 재해석해서 마크다운 안의 jq/셸 예제를 조용히 망가뜨린다.
-  if (md.includes("'''")) {
-    throw new Error(`${file}: 본문에 '''가 있어 TOML 리터럴 문자열을 깨뜨립니다`);
-  }
-  // description은 단일 행 basic string — JSON.stringify의 이스케이프 규칙과 호환된다.
-  const description = JSON.stringify(extractDescription(md, file));
-  return `description = ${description}\n\nprompt = '''\n${md}\n'''\n`;
+function renderSkill(md, cmd, file) {
+  const summary = extractDescription(md, file);
+  // description은 YAML 단일 행 — 콜론·따옴표가 섞여도 깨지지 않도록 JSON 인용.
+  const description = JSON.stringify(
+    `${summary} Use when the user invokes \`/jhw:${cmd}\`, \`$jhw-${cmd}\`, or asks to run the JHW ${cmd} command.`,
+  );
+
+  return `---
+name: jhw-${cmd}
+description: ${description}
+---
+
+# jhw-${cmd}
+
+Run the JHW \`${cmd}\` command workflow.
+
+## Workflow
+
+1. Read \`references/${cmd}.md\` — 정본 절차서다(심링크이므로 항상 최신).
+2. Follow that file's procedure, arguments, approval points, and safety rules.
+3. Preserve the command file's Korean user-facing wording where practical.
+4. If the referenced command requires a JHW MCP tool that is unavailable in the
+   current session, report the missing tool plainly instead of inventing results.
+
+## Invocation
+
+Use \`$jhw-${cmd}\`. If the user writes \`/jhw:${cmd}\`, treat it as a request to use this skill.
+`;
 }
 
 function readIfExists(path) {
   try {
     return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function symlinkTargetOf(path) {
+  try {
+    if (!lstatSync(path).isSymbolicLink()) return null;
+    return readlinkSync(path);
   } catch {
     return null;
   }
@@ -65,51 +109,69 @@ if (sources.length === 0) {
   process.exit(1);
 }
 
-mkdirSync(OUT_DIR, { recursive: true });
-
-const written = [];
+const drifted = [];
 const expected = new Set();
 
 for (const file of sources) {
+  const cmd = file.replace(/\.md$/, "");
+  const dir = join(OUT_DIR, `jhw-${cmd}`);
+  const skillPath = join(dir, "SKILL.md");
+  const refPath = join(dir, "references", `${cmd}.md`);
+  expected.add(`jhw-${cmd}`);
+
   const md = readFileSync(join(SRC_DIR, file), "utf8");
-  const toml = renderToml(md, file);
-  const outName = file.replace(/\.md$/, ".toml");
-  const outPath = join(OUT_DIR, outName);
-  expected.add(outName);
+  const skill = renderSkill(md, cmd, file);
 
-  if (readIfExists(outPath) === toml) continue;
+  if (readIfExists(skillPath) !== skill) {
+    drifted.push(`jhw-${cmd}/SKILL.md`);
+    if (!checkOnly) {
+      mkdirSync(join(dir, "references"), { recursive: true });
+      writeFileSync(skillPath, skill);
+    }
+  }
 
-  written.push(outName);
-  if (!checkOnly) writeFileSync(outPath, toml);
+  if (symlinkTargetOf(refPath) !== REF_TARGET(cmd)) {
+    drifted.push(`jhw-${cmd}/references/${cmd}.md`);
+    if (!checkOnly) {
+      mkdirSync(join(dir, "references"), { recursive: true });
+      rmSync(refPath, { force: true });
+      symlinkSync(REF_TARGET(cmd), refPath);
+    }
+  }
 }
 
-// 정본이 사라진 TOML은 남겨두면 삭제된 스킬이 계속 노출된다.
-const orphans = readdirSync(OUT_DIR)
-  .filter((f) => f.endsWith(".toml") && !expected.has(f))
-  .sort();
+// 정본이 사라진 스킬은 남겨두면 삭제된 커맨드가 계속 노출된다.
+let orphans = [];
+try {
+  orphans = readdirSync(OUT_DIR)
+    .filter((f) => f.startsWith("jhw-") && !expected.has(f))
+    .sort();
+} catch {
+  mkdirSync(OUT_DIR, { recursive: true });
+}
 
 if (!checkOnly) {
-  for (const orphan of orphans) unlinkSync(join(OUT_DIR, orphan));
+  for (const orphan of orphans) rmSync(join(OUT_DIR, orphan), { recursive: true, force: true });
 }
 
-const drifted = written.length + orphans.length;
+const total = drifted.length + orphans.length;
 
 if (checkOnly) {
-  if (drifted === 0) {
-    console.log(`✅ skills/codex/jhw 동기화 상태 (정본 ${sources.length}개)`);
+  if (total === 0) {
+    console.log(`✅ skills/codex 동기화 상태 (정본 ${sources.length}개)`);
     process.exit(0);
   }
-  console.error("❌ skills/codex/jhw가 skills/claude와 어긋났습니다:");
-  for (const f of written) console.error(`   갱신 필요: ${f}`);
+  console.error("❌ skills/codex가 skills/claude와 어긋났습니다:");
+  for (const f of drifted) console.error(`   갱신 필요: ${f}`);
   for (const f of orphans) console.error(`   정본 없음(삭제 대상): ${f}`);
   console.error("\n   node scripts/sync-codex-skills.mjs 를 실행한 뒤 커밋하세요.");
   process.exit(1);
 }
 
-if (drifted === 0) {
+if (total === 0) {
   console.log(`✅ 이미 최신 (정본 ${sources.length}개)`);
 } else {
-  for (const f of written) console.log(`   생성/갱신: ${f}`);
+  for (const f of drifted) console.log(`   생성/갱신: ${f}`);
   for (const f of orphans) console.log(`   삭제: ${f}`);
-  console.log(`✅ 동기화 완료 (정본 ${sources.length}개, 변경 ${drifted}개)`);
+  console.log(`✅ 동기화 완료 (정본 ${sources.length}개, 변경 ${total}개)`);
 }
