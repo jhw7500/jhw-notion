@@ -124,7 +124,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 target_url의 기존 페이지 본문 끝에 `### YYYY-MM-DD 보강` 헤딩 + 새 본문을 덧붙인다.
 
 1. target_url이 비어 있지 않은지 확인한다. 비어 있으면 승인 처리의 재확인 가드를 적용한다.
-2. 신규 본문에 paragraph 2000자 가드 적용 (review.md §3.5 재사용) — 1800자 초과 paragraph는 자동 분할.
+2. 신규 본문은 원문 그대로 전달한다. paragraph 2000자 제한은 `jhw_append`가 `paragraphBlocks`로 자동 분할한다.
 3. `mcp__jhw-notion__jhw_append`를 호출한다:
    - `pageId`: target_url 또는 페이지 UUID
    - `heading`: `YYYY-MM-DD 보강` (YYYY-MM-DD는 오늘 날짜)

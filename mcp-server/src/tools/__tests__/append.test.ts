@@ -16,6 +16,7 @@ import { registerAppend } from "../append.js";
 
 describe("jhw_append", () => {
   let handler: (args: any) => Promise<any>;
+  let schema: any;
 
   beforeEach(() => {
     defaultPageCache.clear();
@@ -23,7 +24,9 @@ describe("jhw_append", () => {
     mockClient.blocks.children.append.mockResolvedValue({});
     const { server, capturedTools } = createMockServer();
     registerAppend(server as any);
-    handler = capturedTools.get("jhw_append")!.handler;
+    const tool = capturedTools.get("jhw_append")!;
+    handler = tool.handler;
+    schema = tool.schema;
   });
 
   it("URL을 페이지 ID로 정규화하고 heading + paragraph를 append한다", async () => {
@@ -66,6 +69,39 @@ describe("jhw_append", () => {
     expect(mockClient.blocks.children.append.mock.calls[0][0].children).toHaveLength(100);
     expect(mockClient.blocks.children.append.mock.calls[1][0].children).toHaveLength(1);
     expect(JSON.parse(result.content[0].text).batches).toBe(2);
+  });
+
+  it("2000자를 넘는 본문은 Notion 제한보다 작은 paragraph로 나눈다", async () => {
+    const result = await handler({
+      pageId: "33a8a230-a04e-8154-8fa5-d96ebdd63500",
+      content: "가".repeat(4001),
+    });
+
+    const children = mockClient.blocks.children.append.mock.calls[0][0].children;
+    expect(children).toHaveLength(3);
+    for (const child of children) {
+      expect(child.paragraph.rich_text[0].text.content.length).toBeLessThanOrEqual(2000);
+    }
+    expect(JSON.parse(result.content[0].text).appendedBlocks).toBe(3);
+  });
+
+  it("heading은 스키마에서 200자로 제한한다", () => {
+    expect(schema.heading.safeParse("제목").success).toBe(true);
+    expect(schema.heading.safeParse("가".repeat(201)).success).toBe(false);
+  });
+
+  it("비멱등 append는 retryable 오류에도 자동 재시도하지 않는다", async () => {
+    mockClient.blocks.children.append.mockRejectedValue(
+      Object.assign(new Error("service unavailable"), { status: 503 })
+    );
+
+    await expect(
+      handler({
+        pageId: "33a8a230-a04e-8154-8fa5-d96ebdd63500",
+        content: "본문",
+      })
+    ).rejects.toThrow("service unavailable");
+    expect(mockClient.blocks.children.append).toHaveBeenCalledTimes(1);
   });
 
   it("부분 실패 시 캐시를 비우고 자동 재시도를 막는 오류를 반환한다", async () => {

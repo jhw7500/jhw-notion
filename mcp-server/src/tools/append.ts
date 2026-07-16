@@ -17,6 +17,7 @@ const AppendInput = z.object({
     .describe("페이지 끝에 추가할 본문 markdown (빈 줄로 paragraph 분리)"),
   heading: z
     .string()
+    .max(200, "heading은 200자 이내여야 합니다.")
     .optional()
     .describe("본문 앞에 추가할 heading_3 제목 (예: 2026-07-16 보강)"),
 });
@@ -53,7 +54,9 @@ export function registerAppend(server: McpServer) {
                 block_id: normalizedPageId,
                 children: batch,
               }),
-            { operation: "append.blocks.append" }
+            // append는 응답 유실 시 성공 여부를 판별할 수 없는 비멱등 호출이다.
+            // 자동 재시도하면 같은 블록이 중복될 수 있으므로 한 번만 시도한다.
+            { operation: "append.blocks.append", attempts: 1 }
           );
           batches++;
           appendedBlocks += batch.length;
