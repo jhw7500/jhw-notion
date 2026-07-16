@@ -68,6 +68,29 @@ describe("jhw_append", () => {
     expect(JSON.parse(result.content[0].text).batches).toBe(2);
   });
 
+  it("부분 실패 시 캐시를 비우고 자동 재시도를 막는 오류를 반환한다", async () => {
+    defaultPageCache.set({
+      id: "33a8a230-a04e-8154-8fa5-d96ebdd63500",
+      db: "projects",
+      title: "redmine",
+      text: "기존 캐시",
+    });
+    mockClient.blocks.children.append
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error("rate limited"));
+    const content = Array.from({ length: 101 }, (_, i) => `문단 ${i + 1}`).join("\n\n");
+
+    await expect(
+      handler({
+        pageId: "33a8a230-a04e-8154-8fa5-d96ebdd63500",
+        content,
+      })
+    ).rejects.toThrow("100개 블록 후 부분 실패");
+    expect(
+      defaultPageCache.get("33a8a230-a04e-8154-8fa5-d96ebdd63500")
+    ).toBeUndefined();
+  });
+
   it("빈 본문은 Notion API를 호출하지 않고 거부한다", async () => {
     await expect(
       handler({

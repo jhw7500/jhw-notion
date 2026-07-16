@@ -39,22 +39,33 @@ export function registerAppend(server: McpServer) {
         ...paragraphBlocks(content),
       ];
 
-      let batches = 0;
-      for (let offset = 0; offset < children.length; offset += MAX_BLOCKS_PER_REQUEST) {
-        const batch = children.slice(offset, offset + MAX_BLOCKS_PER_REQUEST);
-        await callNotion(
-          () =>
-            notion.blocks.children.append({
-              block_id: normalizedPageId,
-              children: batch,
-            }),
-          { operation: "append.blocks.append" }
-        );
-        batches++;
-      }
-
-      // 기존 본문을 캐시한 jhw_recall이 stale 결과를 반환하지 않도록 무효화한다.
+      // 첫 배치부터 원격 상태가 바뀔 수 있으므로 부분 실패 시에도 stale 캐시를 남기지 않는다.
       defaultPageCache.delete(normalizedPageId);
+
+      let batches = 0;
+      let appendedBlocks = 0;
+      try {
+        for (let offset = 0; offset < children.length; offset += MAX_BLOCKS_PER_REQUEST) {
+          const batch = children.slice(offset, offset + MAX_BLOCKS_PER_REQUEST);
+          await callNotion(
+            () =>
+              notion.blocks.children.append({
+                block_id: normalizedPageId,
+                children: batch,
+              }),
+            { operation: "append.blocks.append" }
+          );
+          batches++;
+          appendedBlocks += batch.length;
+        }
+      } catch (error) {
+        if (appendedBlocks === 0) throw error;
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Notion append가 ${appendedBlocks}개 블록 후 부분 실패했습니다. ` +
+            `이미 추가된 블록이 있으므로 동일 요청을 자동 재시도하지 마세요. 원인: ${reason}`
+        );
+      }
 
       return {
         content: [
@@ -65,7 +76,7 @@ export function registerAppend(server: McpServer) {
                 pageId: normalizedPageId,
                 target: pageId,
                 heading: normalizedHeading || null,
-                appendedBlocks: children.length,
+                appendedBlocks,
                 batches,
               },
               null,
