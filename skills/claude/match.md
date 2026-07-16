@@ -123,10 +123,13 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 
 target_url의 기존 페이지 본문 끝에 `### YYYY-MM-DD 보강` 헤딩 + 새 본문을 덧붙인다.
 
-1. `mcp__notion__notion-fetch`로 target_url 본문 markdown 확보.
-2. 본문 끝에 `\n\n### YYYY-MM-DD 보강\n\n<신규 본문>` 형태로 연결 (YYYY-MM-DD는 오늘 날짜).
-3. 합친 markdown에 paragraph 2000자 가드 적용 (review.md §3.5 재사용) — 1800자 초과 paragraph는 자동 분할.
-4. `mcp__notion__notion-update-page`로 본문 교체 (page ID·properties 유지).
+1. target_url이 비어 있지 않은지 확인한다. 비어 있으면 승인 처리의 재확인 가드를 적용한다.
+2. 신규 본문에 paragraph 2000자 가드 적용 (review.md §3.5 재사용) — 1800자 초과 paragraph는 자동 분할.
+3. `mcp__jhw-notion__jhw_append`를 호출한다:
+   - `pageId`: target_url 또는 페이지 UUID
+   - `heading`: `YYYY-MM-DD 보강` (YYYY-MM-DD는 오늘 날짜)
+   - `content`: 신규 본문
+4. `jhw_append`는 Notion blocks append API를 사용하므로 기존 본문·properties를 읽거나 교체하지 않는다. 성공 응답의 pageId/target을 결과에 사용한다.
 5. 실패 시 사용자에게 "N번 AUGMENT 실패 — 신규로 저장할까요?" 1회 안내. 자동으로 NEW 전환 금지.
 
 AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원래 그대로). 본문에만 정보를 누적.
@@ -147,7 +150,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 
 - **같은 DB 결과만 사용** — `jhw_search`를 `db=<후보 DB>`로 호출하면 서버가 해당 DB로 한정 검색한다 (KB는 `db=knowledgeBase`, Decision Log는 `db=decisionLog`; 상세 §흐름3).
 - **모든 jhw_search와 notion-fetch는 한 메시지 안에서 병렬 호출** — 순차 호출 금지 (전역 규칙).
-- **AUGMENT 본문 append 형식**: 기존 본문 끝에 `### YYYY-MM-DD 보강` + 빈 줄 + 새 본문. paragraph 2000자 가드 적용. properties는 건드리지 않는다.
+- **AUGMENT 본문 append 형식**: `jhw_append(pageId=target_url, heading="YYYY-MM-DD 보강", content=<신규 본문>)`를 호출한다. MCP가 2000자 분할·100블록 배치 append를 처리하며 properties는 건드리지 않는다.
 - **DUPLICATE 기본 skip**. 사용자가 "N번 신규"로 강제 신규 저장 가능.
 - **확신 없으면 SIMILAR로 보수적 분류**. DUPLICATE 남발은 정보 손실. AUGMENT 잘못 판정해서 엉뚱한 페이지에 append하는 것이 가장 위험.
 - **AUGMENT에 target_url이 비어 있으면 임의 신규 전환 금지** — 사용자 확인 필수.

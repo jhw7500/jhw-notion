@@ -49,8 +49,10 @@ Notion Integration 생성: https://www.notion.so/my-integrations
 | `jhw_status` | 워크스페이스 현황 조회 |
 | `jhw_context` | 프로젝트 컨텍스트 로드 |
 | `jhw_history` | 프로젝트 타임라인 조회 |
+| `jhw_retrieve` | 주제별 결정·지식·문서 본문 스니펫 조회 |
 | `jhw_record` | DB에 레코드 생성 |
 | `jhw_note` | Knowledge Base에 메모 |
+| `jhw_append` | 기존 페이지 끝에 보강 heading·본문 append |
 | `jhw_delete` | 레코드 폐기(archive)/휴지통(delete) |
 | `jhw_start` | 프로젝트 시작 (원스톱) |
 | `jhw_close` | 프로젝트 종료 + 회고 |
