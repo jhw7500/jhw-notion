@@ -12,6 +12,7 @@ import { registerReportPreview } from "./tools/report-preview.js";
 import { registerReportExport } from "./tools/report-export.js";
 import { registerRecall } from "./tools/recall.js";
 import { registerRetrieve } from "./tools/retrieve.js";
+import { registerAppend } from "./tools/append.js";
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -32,6 +33,7 @@ export function createServer(): McpServer {
   registerReportExport(server);
   registerRecall(server);
   registerRetrieve(server);
+  registerAppend(server);
 
   return server;
 }

@@ -25,7 +25,7 @@
 사용자 → TUI 스킬(얇은 가이드) → LLM → jhw-notion MCP 서버 → Notion REST API
 ```
 
-- **MCP 서버**: Notion API 직접 호출. 9개 고수준 도구 제공
+- **MCP 서버**: Notion API 직접 호출. 14개 고수준 도구 제공
 - **TUI 스킬**: LLM에게 "어떤 MCP 도구를 호출하라"만 안내 (얇은 레이어)
 - **review만 예외**: 세션 대화 분석은 LLM 역할이므로 각 TUI 스킬에 로직 유지
 
@@ -98,9 +98,9 @@ export const NOTION_CONFIG = {
 };
 ```
 
-### 4.3 MCP 도구 정의 (9개)
+### 4.3 MCP 도구 정의 (14개)
 
-#### 읽기 도구 (4개)
+#### 읽기 도구 (7개)
 
 | 도구 | 입력 | 출력 | 설명 |
 |------|------|------|------|
@@ -108,16 +108,21 @@ export const NOTION_CONFIG = {
 | `jhw_status` | `{ db?: string }` | DB별 레코드 수, 최근 항목 | 워크스페이스 현황 |
 | `jhw_context` | `{ project: string }` | 프로젝트 정보 + 관련 결정 + 페이지 본문 | 프로젝트 컨텍스트 로드 |
 | `jhw_history` | `{ project: string }` | 시간순 활동 타임라인 | 프로젝트 히스토리 |
+| `jhw_recall` | `{ query: string, notionFallback?: boolean }` | 캐시+Notion 검색 결과 | 로컬 캐시 우선 회상 |
+| `jhw_retrieve` | `{ topic: string, project?: string }` | 관련 본문 스니펫 | 주제별 결정·지식·문서 조회 |
+| `jhw_report_preview` | `{ period: string, ... }` | 기간별 보고서 미리보기 | report 필드 기반 보고서 조회 |
 
-#### 쓰기 도구 (5개)
+#### 쓰기 도구 (7개)
 
 | 도구 | 입력 | 출력 | 설명 |
 |------|------|------|------|
 | `jhw_record` | `{ db: string, title: string, properties: object }` | 생성된 페이지 ID + URL | DB에 레코드 생성 |
 | `jhw_note` | `{ title: string, content: string, project?: string }` | 생성된 페이지 ID + URL | Knowledge Base에 메모 |
+| `jhw_append` | `{ pageId: string, heading?: string, content: string }` | 추가 block 수 + 대상 ID | 기존 페이지 끝에 보강 블록 추가 |
 | `jhw_delete` | `{ pageId: string, mode: "archive" \| "delete" }` | 처리 결과 | 레코드 삭제/폐기 |
 | `jhw_start` | `{ name: string, repo?: string, stack?: string, description: string }` | 생성된 3건의 ID | 프로젝트 시작 (3단계) |
 | `jhw_close` | `{ project: string, achievement?: string, lessons?: string }` | 처리 결과 | 프로젝트 종료 + 회고 |
+| `jhw_report_export` | `{ period: string, format: string, ... }` | 보고서 출력·선택 저장 결과 | 기간별 보고서 export |
 
 #### review는 MCP 도구 없음
 
