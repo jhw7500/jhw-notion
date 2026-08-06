@@ -42,6 +42,37 @@ describe("buildPropertiesFromSchema", () => {
     expect(props.start_date.date.start).toBeTruthy();
   });
 
+  it("rich_text: 2000자 초과는 잘라내고 warnings에 사유를 남긴다", async () => {
+    const notion = setup();
+    const warnings: string[] = [];
+    // 호출부가 본문(content)을 summary에 실어 보낸 상황 재현.
+    const props = await buildPropertiesFromSchema(
+      "knowledgeBase",
+      "T",
+      { summary: "요".repeat(2602) },
+      notion as any,
+      { warnings }
+    );
+    expect(props.summary.rich_text[0].text.content).toHaveLength(2000);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("summary");
+    expect(warnings[0]).toContain("2602");
+  });
+
+  it("rich_text: 한도 이하는 그대로 두고 경고도 없다", async () => {
+    const notion = setup();
+    const warnings: string[] = [];
+    const props = await buildPropertiesFromSchema(
+      "decisionLog",
+      "T",
+      { rationale: "근거" },
+      notion as any,
+      { warnings }
+    );
+    expect(props.rationale.rich_text[0].text.content).toBe("근거");
+    expect(warnings).toEqual([]);
+  });
+
   it("knowledgeBase: summary + category + tags + date", async () => {
     const notion = setup();
     const props = await buildPropertiesFromSchema(

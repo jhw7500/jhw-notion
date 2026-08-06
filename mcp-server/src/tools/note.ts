@@ -7,6 +7,7 @@ import { callNotion } from "../notion/api.js";
 import { paragraphBlocks } from "../notion/blocks.js";
 import { buildKbScaffold } from "../notion/templates.js";
 import { applyMultiSelectGuard } from "../notion/multi-select-guard.js";
+import { clampRichText } from "../notion/rich-text.js";
 import { cachePage } from "../cache/page-cache.js";
 
 // KB DB의 category select 옵션 (8종)
@@ -59,7 +60,12 @@ export function registerNote(server: McpServer) {
       const warnings: string[] = [];
 
       if (summary) {
-        properties["summary"] = { rich_text: [{ text: { content: summary } }] };
+        // note는 property-builder를 거치지 않으므로 여기서 직접 한도 가드.
+        properties["summary"] = {
+          rich_text: [
+            { text: { content: clampRichText(summary, "summary", warnings) } },
+          ],
+        };
       }
       if (category) {
         properties["category"] = { select: { name: category } };

@@ -7,6 +7,7 @@ import type { DatabaseName } from "../config.js";
 import { resolveProjectId } from "./resolve-project.js";
 import { normalizeSelectValue } from "./field-vocab.js";
 import { applyMultiSelectGuard } from "./multi-select-guard.js";
+import { clampRichText } from "./rich-text.js";
 
 export interface BuildOptions {
   /** 자동 today fill을 켤지 (기본 true). date/start_date에 입력 없을 때 today 주입. */
@@ -76,8 +77,19 @@ export async function buildPropertiesFromSchema(
       }
       case "rich_text": {
         if (!missing) {
+          // 2000자 한도 초과는 API가 거절하므로 잘라내고 경고 (rich-text.ts).
           props[key] = {
-            rich_text: [{ text: { content: String(raw) } }],
+            rich_text: [
+              {
+                text: {
+                  content: clampRichText(
+                    String(raw),
+                    key,
+                    options.warnings
+                  ),
+                },
+              },
+            ],
           };
         }
         break;
