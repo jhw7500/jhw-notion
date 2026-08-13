@@ -412,11 +412,13 @@ export class TaskService {
     ) {
       throw handoffRetryConflict(handoffPath, "git_identity_changed");
     }
-    const current = dirtyEvidence(withoutExpectedLocalHandoff(inspection.dirty_files));
+    const current = dirtyEvidence(inspection.dirty_files);
+    const withoutLocalHandoff = dirtyEvidence(withoutExpectedLocalHandoff(inspection.dirty_files));
+    const matchesCommittedDirtyEvidence = (candidate: Pick<HandoffGitState, "dirty_count" | "dirty_digest">): boolean =>
+      candidate.dirty_count === evidence.dirty_count && candidate.dirty_digest === evidence.dirty_digest;
     if (
       inspection.dirty !== (inspection.dirty_files.length > 0) ||
-      current.dirty_count !== evidence.dirty_count ||
-      current.dirty_digest !== evidence.dirty_digest
+      (!matchesCommittedDirtyEvidence(current) && !matchesCommittedDirtyEvidence(withoutLocalHandoff))
     ) {
       throw handoffRetryConflict(handoffPath, "dirty_delta_changed");
     }

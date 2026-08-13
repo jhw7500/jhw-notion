@@ -497,6 +497,108 @@ describe("TaskService", () => {
     await expect(tasks.finish(input)).resolves.toMatchObject({ worktree_removed: false });
   });
 
+  it("retries a reused worktree when the original dirty evidence already included a visible local Handoff", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const config = configFor(fixture.registryDir);
+    const source = join(fixture.root, "source-reused-handoff");
+    await git(fixture.root, "init", "--initial-branch=main", source);
+    await git(source, "config", "user.name", "Phase1A Test");
+    await git(source, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(source, "README.md"), "# Source\n", "utf8");
+    await git(source, "add", "README.md");
+    await git(source, "commit", "-m", "Initial source");
+
+    const registry = new RegistryGit(config, new ProcessRunner());
+    const catalog = new Catalog(config, registry);
+    const alias = `${taskAlias}-reused-handoff`;
+    const task = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias,
+      goal: "retry a reused worktree with an existing local handoff",
+      done_conditions: ["release retry succeeds"],
+      expected_scope: ["src/control"],
+    });
+    const actualClaims = new ClaimService(config, registry, catalog, {
+      async inspect() {
+        return { process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 };
+      },
+    });
+    const worktrees = new WorktreeManager(config);
+    const coordinates = worktreePlan(task.id, alias);
+    const priorClaim = {
+      task_id: task.id,
+      task_alias: alias,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      session_id: "codex-prior",
+      host: config.buildHost,
+      branch: coordinates.branch,
+      worktree_ref: coordinates.worktree_ref,
+      started_at: "2026-08-13T12:00:00.000Z",
+    };
+    const seeded = await worktrees.createOrReuse(priorClaim, source);
+    await mkdir(join(seeded.path, ".ai"), { recursive: true });
+    await writeFile(join(seeded.path, ".ai", "handoff.md"), "pre-existing visible handoff\n", "utf8");
+    await expect(worktrees.inspect(priorClaim)).resolves.toMatchObject({
+      dirty: true,
+      dirty_files: [".ai/handoff.md"],
+    });
+
+    let failFirstRelease = true;
+    const claims = {
+      claimTask: actualClaims.claimTask.bind(actualClaims),
+      assertOwner: actualClaims.assertOwner.bind(actualClaims),
+      recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
+      finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
+        if (failFirstRelease) {
+          failFirstRelease = false;
+          throw new Error("injected release failure after Handoff commit");
+        }
+        return actualClaims.finishClaim(...args);
+      },
+    };
+    const tasks = new TaskService(config, claims, worktrees, registry);
+    const started = await tasks.start({
+      task_id: task.id,
+      task_alias: alias,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      session_id: "codex-reused",
+      repository_path: source,
+    });
+    expect(started.reused).toBe(true);
+    const input = {
+      task_id: task.id,
+      claim_id: started.claim.claim_id,
+      status: "handoff" as const,
+      validation: ["npm test: pass"],
+      source_task_revision: "temporary-v1",
+    };
+    const pointer = `handoffs/${task.id}/${started.claim.claim_id}.md`;
+
+    await expect(tasks.finish(input)).rejects.toThrow("injected release failure after Handoff commit");
+    expect(await registry.readHeadRegularFile(pointer)).toContain("dirty_count: 1");
+    await expect(worktrees.inspect(started.claim)).resolves.toMatchObject({
+      dirty: true,
+      dirty_files: [".ai/handoff.md"],
+    });
+
+    const unrelated = join(seeded.path, "unrelated-change.txt");
+    await writeFile(unrelated, "unrelated\n", "utf8");
+    await expect(tasks.finish(input)).rejects.toMatchObject({ code: "HANDOFF_RETRY_CONFLICT" });
+    await expect(actualClaims.getActive(task.id)).resolves.toMatchObject({ claim_id: started.claim.claim_id });
+    await unlink(unrelated);
+
+    await expect(tasks.finish(input)).resolves.toMatchObject({
+      history: { handoff_pointer: pointer },
+      worktree_removed: false,
+    });
+    await expect(actualClaims.getActive(task.id)).resolves.toBeUndefined();
+  });
+
   it("records only stable create-failure codes in real Registry Claim history", async () => {
     const fixture = await makeRegistryFixture();
     fixtures.push(fixture);
