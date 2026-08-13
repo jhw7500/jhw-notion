@@ -39,10 +39,39 @@ describe("Notion authority target resolution", () => {
       database_id: "00000000-0000-0000-0000-000000000000",
       data_source_id: DATABASE_SCHEMAS.knowledgeBase.dataSourceId,
     });
+    const matchingKnownIds = notionReturning({
+      type: "database_id",
+      database_id: NOTION_CONFIG.databases.projects,
+      data_source_id: DATABASE_SCHEMAS.projects.dataSourceId,
+    });
 
     await expect(resolveTargetDatabase("decision", withDatabase as any)).resolves.toBe("decisionLog");
     await expect(resolveTargetDatabase("knowledge", dataSourceOnly as any)).resolves.toBe("knowledgeBase");
     await expect(resolveTargetDatabase("stale-database", staleDatabaseShape as any)).resolves.toBe("knowledgeBase");
+    await expect(resolveTargetDatabase("matching-known", matchingKnownIds as any)).resolves.toBe("projects");
+  });
+
+  it.each([
+    [
+      "database parent with conflicting data source",
+      {
+        type: "database_id",
+        database_id: NOTION_CONFIG.databases.projects,
+        data_source_id: DATABASE_SCHEMAS.decisionLog.dataSourceId,
+      },
+    ],
+    [
+      "data-source parent with conflicting database",
+      {
+        type: "data_source_id",
+        database_id: NOTION_CONFIG.databases.decisionLog,
+        data_source_id: DATABASE_SCHEMAS.projects.dataSourceId,
+      },
+    ],
+  ])("fails closed for known ID conflicts: %s", async (_case, parent) => {
+    await expect(resolveTargetDatabase(TARGET, notionReturning(parent) as any)).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
+    });
   });
 
   it("returns page for an unknown or non-database parent", async () => {
@@ -52,6 +81,11 @@ describe("Notion authority target resolution", () => {
     await expect(
       resolveTargetDatabase("root", notionReturning({ type: "workspace", workspace: true }) as any),
     ).resolves.toBe("page");
+    await expect(resolveTargetDatabase("unknown-pair", notionReturning({
+      type: "data_source_id",
+      database_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      data_source_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    }) as any)).resolves.toBe("page");
   });
 
   it("walks page ancestors to the owning configured database", async () => {

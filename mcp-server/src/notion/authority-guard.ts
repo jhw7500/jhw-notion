@@ -66,15 +66,12 @@ export async function resolveTargetDatabase(
 
     if (typed.type === "database_id" || typed.type === "data_source_id") {
       const databaseId = normalizeId(typed.database_id);
-      if (databaseId) {
-        const database = databaseIds.get(databaseId);
-        if (database) return database;
-      }
       const dataSourceId = normalizeId(typed.data_source_id);
-      if (dataSourceId) {
-        const database = dataSourceIds.get(dataSourceId);
-        if (database) return database;
-      }
+      const database = databaseId ? databaseIds.get(databaseId) : undefined;
+      const dataSourceDatabase = dataSourceId ? dataSourceIds.get(dataSourceId) : undefined;
+      if (database && dataSourceDatabase && database !== dataSourceDatabase) throw targetResolutionUnavailable();
+      if (database) return database;
+      if (dataSourceDatabase) return dataSourceDatabase;
       if (databaseId || dataSourceId) return "page";
       throw targetResolutionUnavailable();
     }

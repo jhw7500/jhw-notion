@@ -1,6 +1,6 @@
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -23,6 +23,12 @@ function authority(authority_epoch: number, mode: "legacy" | "registry"): Author
     cutover_at: mode === "registry" ? "2026-08-20T00:00:00Z" : null,
     minimum_tool_version: mode === "registry" ? "1.1.0" : "1.0.0",
   };
+}
+
+function namespaceChain(stateDir: string): string[] {
+  const paths = [stateDir];
+  while (dirname(paths.at(-1)!) !== paths.at(-1)) paths.push(dirname(paths.at(-1)!));
+  return paths;
 }
 
 afterEach(async () => {
@@ -163,7 +169,7 @@ describe("Notion authority service", () => {
   });
 
   it("durably publishes the cache before load returns", async () => {
-    const { cachePath } = await temporaryCache();
+    const { root, cachePath } = await temporaryCache();
     const order: string[] = [];
     const service = createAuthorityService({
       readCentral: async () => authority(2, "registry"),
@@ -182,7 +188,12 @@ describe("Notion authority service", () => {
     });
 
     expect(decision).toMatchObject({ authority_epoch: 2, mode: "registry" });
-    expect(order).toEqual(["file-sync", "rename", "directory-sync", "return"]);
+    expect(order).toEqual([
+      "file-sync",
+      "rename",
+      ...namespaceChain(root).map(() => "directory-sync"),
+      "return",
+    ]);
     expect(await readFile(cachePath, "utf8")).toBe(`${JSON.stringify({ authority_epoch: 2, mode: "registry" })}\n`);
     expect((await lstat(cachePath)).mode & 0o777).toBe(0o600);
   });
@@ -216,6 +227,94 @@ describe("Notion authority service", () => {
       code: "AUTHORITY_UNAVAILABLE",
     });
     expect(JSON.parse(await readFile(cachePath, "utf8"))).toEqual({ authority_epoch: 2, mode: "legacy" });
+  });
+
+  it("retries namespace durability when an equal cache follows a post-rename sync failure", async () => {
+    const { root, cachePath } = await temporaryCache();
+    let syncCalls = 0;
+    const service = createAuthorityService({
+      readCentral: async () => authority(7, "registry"),
+      cachePath,
+      writesDisabled: false,
+      cacheHooks: {
+        syncDirectory: async () => {
+          syncCalls += 1;
+          if (syncCalls <= 2) throw new Error("injected namespace sync failure");
+        },
+      },
+    });
+
+    await expect(service.load()).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
+    expect(JSON.parse(await readFile(cachePath, "utf8"))).toEqual({ authority_epoch: 7, mode: "registry" });
+    expect((await readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    await expect(service.load()).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
+    expect(syncCalls).toBe(2);
+    await expect(service.load()).resolves.toMatchObject({ authority_epoch: 7, mode: "registry" });
+    expect(syncCalls).toBe(2 + namespaceChain(root).length);
+  });
+
+  it("syncs the retained state directory and its descriptor-derived ancestors before returning", async () => {
+    const { root } = await temporaryCache();
+    const stateDir = join(root, "new-parent", "new-state");
+    const cachePath = join(stateDir, "authority-cache.json");
+    const order: string[] = [];
+    const service = createAuthorityService({
+      readCentral: async () => authority(3, "legacy"),
+      cachePath,
+      writesDisabled: false,
+      cacheHooks: {
+        afterDirectorySync: async (fd) => {
+          order.push(`sync:${await readlink(`/proc/self/fd/${fd}`)}`);
+        },
+      },
+    });
+
+    await service.load().then(() => { order.push("return"); });
+
+    expect(order).toEqual([
+      ...namespaceChain(stateDir).map((path) => `sync:${path}`),
+      "return",
+    ]);
+  });
+
+  it("syncs an existing equal cache namespace before returning", async () => {
+    const { root, cachePath } = await temporaryCache();
+    await writeFile(cachePath, JSON.stringify({ authority_epoch: 4, mode: "legacy" }));
+    const synced: string[] = [];
+    const service = createAuthorityService({
+      readCentral: async () => authority(4, "legacy"),
+      cachePath,
+      writesDisabled: false,
+      cacheHooks: {
+        afterDirectorySync: async (fd) => { synced.push(await readlink(`/proc/self/fd/${fd}`)); },
+      },
+    });
+
+    await expect(service.load()).resolves.toMatchObject({ authority_epoch: 4, mode: "legacy" });
+    expect(synced).toEqual(namespaceChain(root));
+  });
+
+  it("blocks a protected write when an ancestor namespace sync fails", async () => {
+    const { cachePath } = await temporaryCache();
+    let syncCalls = 0;
+    const service = createAuthorityService({
+      readCentral: async () => authority(4, "legacy"),
+      cachePath,
+      writesDisabled: false,
+      cacheHooks: {
+        syncDirectory: async () => {
+          syncCalls += 1;
+          if (syncCalls === 2) throw new Error("injected ancestor sync failure");
+        },
+      },
+    });
+
+    await expect(service.assertNotionWriteAllowed("projects", "jhw_start")).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
+    });
+    expect(syncCalls).toBe(2);
+    await expect(service.load()).resolves.toMatchObject({ authority_epoch: 4, mode: "legacy" });
+    expect(syncCalls).toBe(2 + namespaceChain(dirname(cachePath)).length);
   });
 
   it("keeps the cache write on the descriptor-anchored state directory after an ancestor swap", async () => {

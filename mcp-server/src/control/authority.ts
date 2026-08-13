@@ -17,6 +17,7 @@ const temporaryCacheOpenFlags = constants.O_CREAT | constants.O_EXCL | constants
 const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW;
 const centralOpenFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
 const centralDirectoryOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const MAX_NAMESPACE_DEPTH = 4096;
 
 export interface AuthorityDecision {
   authority_epoch: number;
@@ -47,7 +48,7 @@ export interface AuthorityCacheHooks {
   rename?(source: string, destination: string): Promise<void>;
   afterRename?(): Promise<void> | void;
   syncDirectory?(directoryFd: number): Promise<void>;
-  afterDirectorySync?(): Promise<void> | void;
+  afterDirectorySync?(directoryFd: number): Promise<void> | void;
 }
 
 function structuredError(
@@ -162,9 +163,6 @@ async function writeCache(
     if (await published.readFile("utf8") !== expected) throw authorityUnavailable();
     await published.close();
     published = undefined;
-
-    await (hooks.syncDirectory ?? syncDirectoryFd)(directory.fd);
-    await hooks.afterDirectorySync?.();
   } catch (cause) {
     if (cause instanceof ControlError) throw cause;
     throw authorityUnavailable();
@@ -172,6 +170,56 @@ async function writeCache(
     await temporary?.close().catch(() => undefined);
     await published?.close().catch(() => undefined);
     await unlink(descriptorPath(directory, temporaryName)).catch(() => undefined);
+  }
+}
+
+async function syncCacheNamespace(
+  directory: SecureStateDirectory,
+  hooks: AuthorityCacheHooks = {},
+): Promise<void> {
+  let current: FileHandle | undefined;
+  let parent: FileHandle | undefined;
+  let retired: FileHandle | undefined;
+  const visited = new Set<string>();
+  let reachedRoot = false;
+  try {
+    current = await open(descriptorPath(directory, "."), centralDirectoryOpenFlags);
+    for (let depth = 0; depth < MAX_NAMESPACE_DEPTH; depth += 1) {
+      const currentInfo = await current.stat();
+      if (!currentInfo.isDirectory()) throw authorityUnavailable();
+      const key = `${currentInfo.dev}:${currentInfo.ino}`;
+      if (visited.has(key)) throw authorityUnavailable();
+      visited.add(key);
+
+      await (hooks.syncDirectory ?? syncDirectoryFd)(current.fd);
+      await hooks.afterDirectorySync?.(current.fd);
+
+      parent = await open(`/proc/self/fd/${current.fd}/..`, centralDirectoryOpenFlags);
+      const parentInfo = await parent.stat();
+      if (!parentInfo.isDirectory()) throw authorityUnavailable();
+      if (parentInfo.dev === currentInfo.dev && parentInfo.ino === currentInfo.ino) {
+        await parent.close();
+        parent = undefined;
+        reachedRoot = true;
+        break;
+      }
+
+      retired = current;
+      current = parent;
+      parent = undefined;
+      await retired.close();
+      retired = undefined;
+    }
+    if (!reachedRoot) throw authorityUnavailable();
+    await current.close();
+    current = undefined;
+  } catch (cause) {
+    if (cause instanceof ControlError) throw cause;
+    throw authorityUnavailable();
+  } finally {
+    await parent?.close().catch(() => undefined);
+    await retired?.close().catch(() => undefined);
+    await current?.close().catch(() => undefined);
   }
 }
 
@@ -256,6 +304,7 @@ export function createAuthorityService(options: CreateAuthorityServiceOptions): 
         if (!cache || cache.authority_epoch !== next.authority_epoch || cache.mode !== next.mode) {
           await writeCache(directory, fileName, next, options.cacheHooks);
         }
+        await syncCacheNamespace(directory, options.cacheHooks);
         return { ...next, source: "central" };
       });
     },

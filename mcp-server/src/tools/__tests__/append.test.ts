@@ -7,6 +7,7 @@ import type { MockNotionClient } from "../../__tests__/helpers/mock-notion.js";
 import { defaultPageCache } from "../../cache/page-cache.js";
 import { NOTION_CONFIG } from "../../config.js";
 import { ControlError } from "../../control/errors.js";
+import { DATABASE_SCHEMAS } from "../../schema.js";
 
 let mockClient: MockNotionClient;
 const TARGET = "33a8a230-a04e-4154-8fa5-d96ebdd63500";
@@ -107,6 +108,27 @@ describe("jhw_append", () => {
       expect(JSON.parse(result.content[0].text).code).toBe("AUTHORITY_UNAVAILABLE");
       expect(mockClient.blocks.children.append).not.toHaveBeenCalled();
     }
+  });
+
+  it("conflicting known parent IDs return a stable MCP error without append", async () => {
+    defaultPageCache.set({ id: TARGET, db: "projects", title: "kept", text: "kept" });
+    mockClient.pages.retrieve.mockResolvedValue({
+      id: TARGET,
+      parent: {
+        type: "data_source_id",
+        database_id: NOTION_CONFIG.databases.projects,
+        data_source_id: DATABASE_SCHEMAS.decisionLog.dataSourceId,
+      },
+    });
+    const { server, capturedTools } = createMockServer();
+    registerAppend(server as any, legacyAuthority);
+
+    const result = await capturedTools.get("jhw_append")!.handler({ pageId: TARGET, content: "blocked" });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ code: "AUTHORITY_UNAVAILABLE", db: "page" });
+    expect(mockClient.blocks.children.append).not.toHaveBeenCalled();
+    expect(defaultPageCache.get(TARGET)).toBeDefined();
   });
 
   it("registry authority에서는 대상 page 조회 뒤 Projects append를 캐시 변경 전에 거부한다", async () => {
