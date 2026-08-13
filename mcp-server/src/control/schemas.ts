@@ -4,11 +4,7 @@ const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm") =>
   z.string().regex(new RegExp(`^${prefix}-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`));
 
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
-// Persisted IDs retain the canonical prefix and a path-safe slug. The ID
-// validator accepts the historical one-character suffix (`repo-a`) used by
-// existing Registry records; new IDs are created through newRepositoryId,
-// which applies the stricter slug constructor validation.
-const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{0,62}$/);
+const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
 const timestamp = z.string().min(1);
 
 export const AuthorityRecordSchema = z
