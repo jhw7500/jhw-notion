@@ -183,3 +183,141 @@ describe("Catalog", () => {
     await expect(catalog.promoteTemporaryTask(temp.id, issueInput)).resolves.toEqual(promoted);
   });
 });
+
+describe("Catalog Registry integrity and public input boundaries", () => {
+  it("fails closed when a Repository source index points to a record for another GitHub node", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const sourcePath = `repositories/by-source/github/${sourceIndexKey(repositoryInput.github_node_id)}.yaml`;
+    await commitFile(
+      fixture.registryDir,
+      "repositories/repo-wlan.yaml",
+      `${JSON.stringify({ id: "repo-wlan", github_node_id: "R_kwDOOther", slug: repositoryInput.slug })}\n`,
+    );
+    await commitFile(fixture.registryDir, sourcePath, `${JSON.stringify({ repo_id: "repo-wlan" })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+
+    await expect(catalog.registerRepository(repositoryInput)).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+      details: expect.objectContaining({ sourceIndexPath: join(fixture.registryDir, sourcePath) }),
+    });
+  });
+
+  it("fails closed when a Repository source index points to a missing record", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const sourcePath = `repositories/by-source/github/${sourceIndexKey(repositoryInput.github_node_id)}.yaml`;
+    await commitFile(fixture.registryDir, sourcePath, `${JSON.stringify({ repo_id: "repo-missing" })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+
+    await expect(catalog.registerRepository(repositoryInput)).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+      details: expect.objectContaining({ expectedRecordId: "repo-missing" }),
+    });
+  });
+
+  it("fails closed when a Repository source index record path and embedded ID differ", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const sourcePath = `repositories/by-source/github/${sourceIndexKey(repositoryInput.github_node_id)}.yaml`;
+    await commitFile(
+      fixture.registryDir,
+      "repositories/repo-wlan.yaml",
+      `${JSON.stringify({ id: "repo-other", github_node_id: repositoryInput.github_node_id, slug: repositoryInput.slug })}\n`,
+    );
+    await commitFile(fixture.registryDir, sourcePath, `${JSON.stringify({ repo_id: "repo-wlan" })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+
+    await expect(catalog.registerRepository(repositoryInput)).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+      details: expect.objectContaining({ expectedRecordId: "repo-wlan", actualRecordId: "repo-other" }),
+    });
+  });
+
+  it("fails closed when a formal Task source index points to another Issue node", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const taskId = "tsk-0181f8f0-0000-7000-8000-000000000001";
+    await commitFile(
+      fixture.registryDir,
+      `tasks/${taskId}.yaml`,
+      `${JSON.stringify({
+        id: taskId,
+        kind: "formal",
+        project_id: issueInput.project_id,
+        repo_id: issueInput.repo_id,
+        aliases: [issueInput.alias],
+        issue_node_id: "I_kwDOOther",
+        issue_revision: issueInput.issue_revision,
+        issue_url: issueInput.issue_url,
+      })}\n`,
+    );
+    await commitFile(
+      fixture.registryDir,
+      `tasks/by-source/github/${sourceIndexKey(issueInput.issue_node_id)}.yaml`,
+      `${JSON.stringify({ task_id: taskId })}\n`,
+    );
+    await git(fixture.registryDir, "push", "origin", "main");
+
+    await expect(catalog.registerFormalTask(issueInput)).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+      details: expect.objectContaining({ expectedIssueNodeId: issueInput.issue_node_id, actualIssueNodeId: "I_kwDOOther" }),
+    });
+  });
+
+  it("validates repository, formal, and temporary public inputs before existing-index paths", async () => {
+    const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    await catalog.registerFormalTask(issueInput);
+
+    await expect(catalog.registerRepository({ ...repositoryInput, slug: "" })).rejects.toMatchObject({
+      code: "INVALID_REPOSITORY",
+    });
+    await expect(catalog.registerRepository({ ...repositoryInput, github_node_id: "" })).rejects.toMatchObject({
+      code: "INVALID_REPOSITORY",
+    });
+    await expect(catalog.registerFormalTask({ ...issueInput, issue_revision: "" })).rejects.toMatchObject({
+      code: "INVALID_FORMAL_TASK",
+    });
+    await expect(catalog.registerFormalTask({ ...issueInput, issue_url: "not-a-url" })).rejects.toMatchObject({
+      code: "INVALID_FORMAL_TASK",
+    });
+    await expect(catalog.registerFormalTask({ ...issueInput, alias: "" })).rejects.toMatchObject({
+      code: "INVALID_FORMAL_TASK",
+    });
+    await expect(catalog.registerFormalTask({ ...issueInput, repo_id: "bad" })).rejects.toMatchObject({
+      code: "INVALID_FORMAL_TASK",
+    });
+    await expect(catalog.registerFormalTask({ ...issueInput, issue_node_id: "" })).rejects.toMatchObject({
+      code: "INVALID_FORMAL_TASK",
+    });
+    await expect(catalog.registerTemporaryTask({
+      project_id: "bad",
+      repo_id: "repo-wlan",
+      alias: "",
+      goal: "",
+      done_conditions: [],
+      expected_scope: [],
+    })).rejects.toMatchObject({ code: "INVALID_TEMPORARY_TASK" });
+  });
+
+  it("fails closed when promotion reads a Task record whose path and embedded ID differ", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const temp = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: "wlan:tmp-20260813-01-fix",
+      goal: "fix roaming regression",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/roaming.ts"],
+    });
+    const otherTaskId = "tsk-0181f8f0-0000-7000-8000-000000000002";
+    await commitFile(
+      fixture.registryDir,
+      `tasks/${temp.id}.yaml`,
+      `${JSON.stringify({ ...temp, id: otherTaskId })}\n`,
+    );
+    await git(fixture.registryDir, "push", "origin", "main");
+
+    await expect(catalog.promoteTemporaryTask(temp.id, issueInput)).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+      details: expect.objectContaining({ expectedRecordId: temp.id, actualRecordId: otherTaskId }),
+    });
+  });
+});

@@ -60,9 +60,52 @@ Completed; commit recorded below after the final verification gate.
 
 ## Commit
 
-`42df99548ba47585d4ed6f46d2ec33c99a4d2d93` (`feat(control): add canonical registry catalog`), amended after the final review correction.
+`c50493f844f137eea08163841cd45ac075a2ea2f` (`feat(control): add canonical registry catalog`), amended after the final review correction.
 
 ## Concerns
 
 - `Catalog` currently trusts a valid source-index-to-canonical-record mapping without reverse-validating that the canonical record's immutable GitHub node ID equals the index key. Normal writes preserve this invariant; a manually corrupted Registry should be rejected with a dedicated corruption error in a later hardening pass.
 - A rejected non-fast-forward push deliberately leaves the local commit ahead while raising `REMOTE_DIVERGED`; Phase 1A does not auto-rebase, retry, force, or claim that unpushed local state is durable remotely.
+
+
+---
+
+## Fix round 1/5 — catalog integrity and public input validation
+
+### Changes
+
+- Added strict Zod input validators for all Catalog public mutation inputs before any Registry path construction or read. Repository, Issue, relation, URL, alias/revision, and temporary content values therefore cannot be bypassed through an existing source-index fast path.
+- Added `REGISTRY_CORRUPT` as the stable fail-closed integrity result. Source-index resolution now validates index syntax, referenced record existence, record-path/embedded-ID equality, and immutable GitHub Repository/Issue node-ID equality before adoption or promotion.
+- Promotion now validates the requested Task path's embedded ID before writing its formal record or Issue index.
+- Added hostile fixtures for mismatched source node IDs, missing and path-mismatched Repository records, malformed idempotent-path inputs, and promotion path-ID corruption.
+
+### TDD evidence
+
+**RED:** With `catalog.ts` temporarily restored to Task 3 base `c50493f`, `cd mcp-server && npx vitest run src/control/__tests__/catalog.test.ts --reporter=dot` produced **6 expected failures**. The base implementation silently adopted mismatched Repository/Issue records, reported a missing indexed repository as `SOURCE_ALREADY_MAPPED`, bypassed malformed idempotent inputs, and promoted a Task whose path and embedded ID disagreed.
+
+**GREEN:** `cd mcp-server && npx vitest run src/control/__tests__/registry-git.test.ts src/control/__tests__/catalog.test.ts && npm run build` passed **2 files / 24 tests** and TypeScript build exited 0.
+
+### Full verification
+
+`cd mcp-server && npm test && npm run build`
+
+- Passed: 36 test files / 317 tests; TypeScript `tsc` build exited 0; `git diff --check` found no whitespace errors.
+
+### Self-review
+
+- Confirmed `REGISTRY_CORRUPT` details include source-index and record paths plus expected/actual IDs whenever those values exist.
+- Confirmed a referenced missing or invalid record is corruption before any `SOURCE_ALREADY_MAPPED` adoption result.
+- Confirmed external public input interfaces are unchanged and all runtime inputs are strictly parsed at method entry.
+- Confirmed no deferred porcelain, Project Record, or remote verification work was broadened into this fix.
+
+### Recovery caveat
+
+`RegistryGit` remains intentionally fail-stop: if a mutation callback or declared-path integrity check rejects after writing, its checkout can remain dirty and the next mutation stops at `REGISTRY_DIRTY`. The operator must inspect and recover/clean that checkout; this round does not add rollback behavior.
+
+### Fix commit
+
+Created immediately after this final verification; recorded by the repository history alongside this report.
+
+### Concerns
+
+- A corrupted Registry is now rejected rather than silently adopted. Repairing such data remains an explicit operator action and is outside this transaction primitive.
