@@ -13,3 +13,13 @@ it("round-trips deterministic JSON-subset YAML with a trailing newline", async (
   expect(await readFile(file, "utf8")).toBe(`${JSON.stringify(value, null, 2)}\n`);
   expect(await readRecord(file, RepositoryRecordSchema)).toEqual(value);
 });
+
+it("rejects repository records without a canonical repo ID", () => {
+  expect(
+    RepositoryRecordSchema.safeParse({
+      id: "not-a-repository-id",
+      github_node_id: "R_1",
+      slug: "jhw/a",
+    }).success,
+  ).toBe(false);
+});
