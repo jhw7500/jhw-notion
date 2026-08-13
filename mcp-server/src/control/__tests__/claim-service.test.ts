@@ -1,5 +1,5 @@
-import { readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -89,6 +89,15 @@ function handoffRelativePath(active: { task_id: string; claim_id: string }): str
 
 async function commitRegistryFile(fixture: RegistryFixture, path: string, content: string): Promise<void> {
   await commitFile(fixture.registryDir, path, content);
+  await git(fixture.registryDir, "push", "origin", "main");
+}
+
+async function commitRegistrySymlink(fixture: RegistryFixture, path: string, target: string): Promise<void> {
+  const link = join(fixture.registryDir, path);
+  await mkdir(dirname(link), { recursive: true });
+  await symlink(target, link);
+  await git(fixture.registryDir, "add", "--", path);
+  await git(fixture.registryDir, "commit", "-m", `Add symlink ${path}`);
   await git(fixture.registryDir, "push", "origin", "main");
 }
 
@@ -222,6 +231,25 @@ describe("ClaimService", () => {
     expect(await claims.getActive(active.task_id)).toEqual(active);
   });
 
+  it("rejects an intermediate history symlink without writing outside the Registry", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const externalHistory = join(fixture.root, "external-history");
+    await mkdir(externalHistory, { recursive: true });
+    await commitRegistrySymlink(fixture, `claims/history/2026/${active.task_id}`, externalHistory);
+
+    await expect(
+      claims.finishClaim(active.task_id, active.claim_id, {
+        status: "completed",
+        branch: "task/wlan-roaming-fix",
+        head_sha: "0123456789abcdef",
+        validation: ["npm test: pass"],
+      }),
+    ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await exists(join(externalHistory, `${active.claim_id}.yaml`))).toBe(false);
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
   it("rejects a missing canonical Handoff pointer and retains the active Claim", async () => {
     const { claims, task } = await claimsFixture();
     const active = await claims.claimTask(claimInput(task.id));
@@ -242,6 +270,45 @@ describe("ClaimService", () => {
     const { claims, fixture, task } = await claimsFixture();
     const active = await claims.claimTask(claimInput(task.id));
     await commitRegistryFile(fixture, `${handoffRelativePath(active)}/marker`, "directory entry\n");
+
+    await expect(
+      claims.finishClaim(active.task_id, active.claim_id, {
+        status: "handoff",
+        branch: "task/wlan-roaming-fix",
+        head_sha: "0123456789abcdef",
+        validation: ["npm test: pass"],
+        handoff_path: handoffRelativePath(active),
+      }),
+    ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
+  it("rejects an ignored untracked Handoff file even when it is a regular file", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const handoffPath = handoffRelativePath(active);
+    await commitRegistryFile(fixture, ".gitignore", `${handoffPath}\n`);
+    await mkdir(dirname(join(fixture.registryDir, handoffPath)), { recursive: true });
+    await writeFile(join(fixture.registryDir, handoffPath), "# Untracked handoff\n", "utf8");
+
+    await expect(
+      claims.finishClaim(active.task_id, active.claim_id, {
+        status: "handoff",
+        branch: "task/wlan-roaming-fix",
+        head_sha: "0123456789abcdef",
+        validation: ["npm test: pass"],
+        handoff_path: handoffPath,
+      }),
+    ).rejects.toMatchObject({ code: "HANDOFF_MISSING" });
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
+  it("rejects a committed Handoff symlink even when its external target is regular", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const externalHandoff = join(fixture.root, "external-handoff.md");
+    await writeFile(externalHandoff, "# External handoff\n", "utf8");
+    await commitRegistrySymlink(fixture, handoffRelativePath(active), externalHandoff);
 
     await expect(
       claims.finishClaim(active.task_id, active.claim_id, {

@@ -1,5 +1,5 @@
-import { lstat, stat, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, realpath, stat, unlink } from "node:fs/promises";
+import { isAbsolute, join, relative, sep } from "node:path";
 
 import { z, type ZodType } from "zod";
 
@@ -99,10 +99,6 @@ function activeRelativePath(taskId: string): string {
   return `claims/active/${taskId}.yaml`;
 }
 
-function historyPath(registryDir: string, year: number, taskId: string, claimId: string): string {
-  return join(registryDir, "claims", "history", String(year), taskId, `${claimId}.yaml`);
-}
-
 function historyRelativePath(year: number, taskId: string, claimId: string): string {
   return `claims/history/${year}/${taskId}/${claimId}.yaml`;
 }
@@ -149,6 +145,11 @@ function corruption(message: string, details: Record<string, unknown>): ControlE
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function isWithin(root: string, target: string): boolean {
+  const path = relative(root, target);
+  return path === "" || (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`));
 }
 
 function stage(paths: string[]): RegistryMutationResult {
@@ -203,17 +204,20 @@ export class ClaimService {
     assertTaskId(taskId);
     assertClaimId(expectedClaimId);
     const outcome = parse(FinishOutcomeSchema, rawOutcome, "INVALID_FINISH_OUTCOME", "Invalid Claim finish outcome");
+    this.assertHandoffPath(outcome.handoff_path, taskId, expectedClaimId);
+    const releasedAt = this.timestamp();
+    const year = this.historyYear(releasedAt);
+    const historyRelative = historyRelativePath(year, taskId, expectedClaimId);
+    await this.assertRegistryPathComponents(historyRelative);
+    await this.assertRegistryPathComponents(outcome.handoff_path);
     let history: ClaimHistory | undefined;
 
     await this.registry.transact(`registry: finish claim ${expectedClaimId}`, async () => {
       const task = await this.catalog.getTask(taskId);
       const active = await this.requireOwner(task, expectedClaimId);
-      this.assertHandoffPath(outcome.handoff_path, taskId, expectedClaimId);
       await this.assertHandoffAvailable(outcome.handoff_path);
-      history = this.finishHistory(active, outcome);
-      const year = this.historyYear(history.released_at);
-      const destination = historyPath(this.config.registryDir, year, taskId, expectedClaimId);
-      await this.assertHistoryDestinationAbsent(destination, taskId, expectedClaimId);
+      history = this.finishHistory(active, outcome, releasedAt);
+      const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await writeRecord(destination, history);
       await unlink(activePath(this.config.registryDir, taskId));
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
@@ -269,14 +273,16 @@ export class ClaimService {
   }
 
   private async forceEnd(taskId: string, expectedClaimId: string): Promise<RecoveryForceEnd> {
+    const releasedAt = this.timestamp();
+    const year = this.historyYear(releasedAt);
+    const historyRelative = historyRelativePath(year, taskId, expectedClaimId);
+    await this.assertRegistryPathComponents(historyRelative);
     let history: ClaimHistory | undefined;
     await this.registry.transact(`registry: force-end claim ${expectedClaimId}`, async () => {
       const task = await this.catalog.getTask(taskId);
       const active = await this.requireOwner(task, expectedClaimId);
-      history = this.recoveryHistory(active, "force-ended");
-      const year = this.historyYear(history.released_at);
-      const destination = historyPath(this.config.registryDir, year, taskId, expectedClaimId);
-      await this.assertHistoryDestinationAbsent(destination, taskId, expectedClaimId);
+      history = this.recoveryHistory(active, "force-ended", releasedAt);
+      const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await writeRecord(destination, history);
       await unlink(activePath(this.config.registryDir, taskId));
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
@@ -286,13 +292,16 @@ export class ClaimService {
   }
 
   private async takeover(taskId: string, expectedClaimId: string, sessionId: string): Promise<RecoveryTakeover> {
+    const releasedAt = this.timestamp();
+    const year = this.historyYear(releasedAt);
+    const historyRelative = historyRelativePath(year, taskId, expectedClaimId);
+    await this.assertRegistryPathComponents(historyRelative);
     let history: ClaimHistory | undefined;
     let replacement: ActiveClaim | undefined;
     await this.registry.transact(`registry: take over claim ${expectedClaimId}`, async () => {
       const task = await this.catalog.getTask(taskId);
       const active = await this.requireOwner(task, expectedClaimId);
-      history = this.recoveryHistory(active, "taken-over");
-      const year = this.historyYear(history.released_at);
+      history = this.recoveryHistory(active, "taken-over", releasedAt);
       const started = this.timestamp();
       replacement = parse(
         ActiveClaimSchema,
@@ -306,12 +315,11 @@ export class ClaimService {
         "INVALID_CLAIM",
         "Replacement Claim record failed validation",
       );
-      const destination = historyPath(this.config.registryDir, year, taskId, expectedClaimId);
-      await this.assertHistoryDestinationAbsent(destination, taskId, expectedClaimId);
+      const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await writeRecord(destination, history);
       await unlink(activePath(this.config.registryDir, taskId));
       await writeRecord(activePath(this.config.registryDir, taskId), replacement);
-      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
+      return stage([historyRelative, activeRelativePath(taskId)]);
     });
 
     if (!history || !replacement) throw new Error("Claim takeover transaction did not produce both records");
@@ -400,17 +408,14 @@ export class ClaimService {
 
   private async assertHandoffAvailable(handoffPath: string | undefined): Promise<void> {
     if (!handoffPath) return;
+    await this.assertRegistryPathComponents(handoffPath);
+    await this.registry.assertHeadRegularFile(handoffPath);
     const path = join(this.config.registryDir, handoffPath);
     let entry: Awaited<ReturnType<typeof lstat>>;
     try {
       entry = await lstat(path);
     } catch (cause) {
-      if (isNotFound(cause)) {
-        throw new ControlError("HANDOFF_MISSING", "Handoff pointer does not reference a committed Registry file", {
-          handoff_path: handoffPath,
-        });
-      }
-      throw corruption("Handoff pointer could not be inspected", {
+      throw corruption("Committed Handoff is missing from the Registry checkout", {
         handoff_path: handoffPath,
         recordPath: path,
         cause: errorMessage(cause),
@@ -424,11 +429,17 @@ export class ClaimService {
     }
   }
 
-  private async assertHistoryDestinationAbsent(destination: string, taskId: string, claimId: string): Promise<void> {
+  private async assertHistoryDestinationAbsent(
+    historyRelative: string,
+    taskId: string,
+    claimId: string,
+  ): Promise<string> {
+    await this.assertRegistryPathComponents(historyRelative);
+    const destination = join(this.config.registryDir, historyRelative);
     try {
       await lstat(destination);
     } catch (cause) {
-      if (isNotFound(cause)) return;
+      if (isNotFound(cause)) return destination;
       throw corruption("Claim history destination could not be inspected", {
         recordPath: destination,
         task_id: taskId,
@@ -443,7 +454,66 @@ export class ClaimService {
     });
   }
 
-  private finishHistory(active: ActiveClaim, outcome: FinishOutcome): ClaimHistory {
+  private async assertRegistryPathComponents(relativePath: string | undefined): Promise<void> {
+    if (!relativePath) return;
+    const components = relativePath.split("/");
+    if (components.some((component) => !component || component === "." || component === "..")) {
+      throw corruption("Registry path contains an unsafe component", { relativePath });
+    }
+
+    let registryRoot: string;
+    try {
+      registryRoot = await realpath(this.config.registryDir);
+    } catch (cause) {
+      throw corruption("Registry root could not be resolved", {
+        registryDir: this.config.registryDir,
+        cause: errorMessage(cause),
+      });
+    }
+
+    let path = this.config.registryDir;
+    for (let index = 0; index < components.length; index += 1) {
+      path = join(path, components[index]);
+      let entry: Awaited<ReturnType<typeof lstat>>;
+      try {
+        entry = await lstat(path);
+      } catch (cause) {
+        if (isNotFound(cause)) return;
+        throw corruption("Registry path component could not be inspected", {
+          relativePath,
+          recordPath: path,
+          cause: errorMessage(cause),
+        });
+      }
+      if (entry.isSymbolicLink()) {
+        throw corruption("Registry path contains a symbolic-link component", { relativePath, recordPath: path });
+      }
+
+      let resolved: string;
+      try {
+        resolved = await realpath(path);
+      } catch (cause) {
+        throw corruption("Registry path component could not be resolved", {
+          relativePath,
+          recordPath: path,
+          cause: errorMessage(cause),
+        });
+      }
+      if (!isWithin(registryRoot, resolved)) {
+        throw corruption("Registry path component escapes the Registry root", {
+          relativePath,
+          registryRoot,
+          recordPath: path,
+          resolvedPath: resolved,
+        });
+      }
+      if (index < components.length - 1 && !entry.isDirectory()) {
+        throw corruption("Registry path contains a non-directory ancestor", { relativePath, recordPath: path });
+      }
+    }
+  }
+
+  private finishHistory(active: ActiveClaim, outcome: FinishOutcome, releasedAt: string): ClaimHistory {
     return parse(
       ClaimHistorySchema,
       {
@@ -451,7 +521,7 @@ export class ClaimService {
         branch: outcome.branch,
         head_sha: outcome.head_sha,
         validation_summary: outcome.validation.join("\n"),
-        released_at: this.timestamp(),
+        released_at: releasedAt,
         status: outcome.status,
         ...(outcome.outcome ? { outcome: outcome.outcome } : {}),
         ...(outcome.handoff_path ? { handoff_path: outcome.handoff_path } : {}),
@@ -461,12 +531,16 @@ export class ClaimService {
     );
   }
 
-  private recoveryHistory(active: ActiveClaim, status: "force-ended" | "taken-over"): ClaimHistory {
+  private recoveryHistory(
+    active: ActiveClaim,
+    status: "force-ended" | "taken-over",
+    releasedAt: string,
+  ): ClaimHistory {
     return parse(
       ClaimHistorySchema,
       {
         ...active,
-        released_at: this.timestamp(),
+        released_at: releasedAt,
         status,
       },
       "INVALID_CLAIM_HISTORY",

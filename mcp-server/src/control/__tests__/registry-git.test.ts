@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -162,6 +162,56 @@ describe("RegistryGit", () => {
       await writeFile(join(registryDir, "governance/unrelated.json"), "{}\n", "utf8");
       return mutation(["governance/staged.json"]);
     })).rejects.toMatchObject({ code: "MUTATION_PATH_MISMATCH" });
+  });
+
+  it("reads an exact regular file from the current HEAD tree", async () => {
+    const { registryDir } = await fixture();
+    await commitFile(registryDir, "handoffs/regular.md", "# Durable handoff\n");
+    await git(registryDir, "push", "origin", "main");
+    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.assertHeadRegularFile("handoffs/regular.md")).resolves.toBeUndefined();
+  });
+
+  it("rejects a regular file absent from HEAD rather than trusting the working tree", async () => {
+    const { registryDir } = await fixture();
+    await writeFile(join(registryDir, "handoffs-untracked.md"), "not committed\n", "utf8");
+    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.assertHeadRegularFile("handoffs-untracked.md")).rejects.toMatchObject({
+      code: "HANDOFF_MISSING",
+    });
+  });
+
+  it("rejects a committed symlink even when it targets a regular external file", async () => {
+    const created = await fixture();
+    const target = join(created.root, "external-handoff.md");
+    await writeFile(target, "# External\n", "utf8");
+    await symlink(target, join(created.registryDir, "handoff-link.md"));
+    await git(created.registryDir, "add", "--", "handoff-link.md");
+    await git(created.registryDir, "commit", "-m", "Add handoff symlink");
+    await git(created.registryDir, "push", "origin", "main");
+    const registry = new RegistryGit(configFor(created.registryDir), new ProcessRunner());
+
+    await expect(registry.assertHeadRegularFile("handoff-link.md")).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+    });
+  });
+
+  it("maps HEAD inspection command failures without exposing captured command output", async () => {
+    const { registryDir } = await fixture();
+    const registry = new RegistryGit(configFor(registryDir), {
+      async run() {
+        throw new ControlError("COMMAND_FAILED", "command failed", {
+          stdout: "sensitive command output",
+          stderr: "sensitive command output",
+        });
+      },
+    });
+
+    const error = await registry.assertHeadRegularFile("handoffs/missing.md").catch((cause: unknown) => cause);
+    expect(error).toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(JSON.stringify(error)).not.toContain("sensitive command output");
   });
 
   it("rejects absolute and parent-traversal stage paths", async () => {

@@ -49,6 +49,44 @@ export class RegistryGit {
     private readonly runner: ProcessRunnerLike,
   ) {}
 
+  /**
+   * Requires an exact path in the current clean HEAD tree to be a regular file.
+   * This deliberately consults Git metadata rather than trusting the worktree.
+   */
+  async assertHeadRegularFile(relativePath: string): Promise<void> {
+    if (!isSafeRegistryRelativePath(relativePath)) {
+      throw new ControlError("INVALID_REGISTRY_PATH", "Registry file path must be a safe relative path", { relativePath });
+    }
+
+    let output: string;
+    try {
+      output = (await this.git(["ls-tree", "-z", "HEAD", "--", relativePath])).stdout;
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD file", { relativePath });
+    }
+
+    const entries = output.split("\0").filter((entry) => entry.length > 0);
+    if (entries.length === 0) {
+      throw new ControlError("HANDOFF_MISSING", "Registry HEAD does not contain the required file", { relativePath });
+    }
+    if (entries.length !== 1) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD returned an ambiguous file entry", { relativePath });
+    }
+
+    const tab = entries[0].indexOf("\t");
+    const metadata = tab >= 0 ? entries[0].slice(0, tab).split(" ") : [];
+    const entryPath = tab >= 0 ? entries[0].slice(tab + 1) : "";
+    const [mode, type, objectId] = metadata;
+    if (
+      entryPath !== relativePath ||
+      (mode !== "100644" && mode !== "100755") ||
+      type !== "blob" ||
+      !/^[0-9a-f]{40,64}$/.test(objectId ?? "")
+    ) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD path is not a regular file", { relativePath });
+    }
+  }
+
   async transact(message: string, mutate: RegistryMutation): Promise<RegistryTransactionResult> {
     const initialStatus = await this.git(["status", "--porcelain"]);
     if (initialStatus.stdout.trim()) {
