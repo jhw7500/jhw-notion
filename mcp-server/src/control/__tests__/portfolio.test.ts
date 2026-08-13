@@ -124,7 +124,7 @@ describe("PortfolioService", () => {
     expect(parsed).toMatchObject({ schema_version: 1, total_count: 23, project_node_id: "PVT_project" });
   });
 
-  it("rejects an existing symbolic current pointer without touching its target", async () => {
+  it("atomically replaces a symbolic current pointer without touching its target", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
     roots.push(root);
     const stateDir = join(root, "state");
@@ -139,8 +139,80 @@ describe("PortfolioService", () => {
       now: () => new Date("2026-08-13T12:34:56.000Z"),
     });
 
-    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "UNSAFE_SNAPSHOT_PATH" });
+    await expect(portfolio.exportSnapshot()).resolves.toMatchObject({ checksum: expect.stringMatching(/^[0-9a-f]{64}$/) });
     expect(await readFile(external, "utf8")).toBe("outside\n");
-    expect((await lstat(join(snapshots, "current"))).isSymbolicLink()).toBe(true);
+    expect((await lstat(join(snapshots, "current"))).isFile()).toBe(true);
+    expect(await readFile(join(snapshots, "current"), "utf8")).toBe("2026-08-13T12-34-56.000Z\n");
+  });
+
+  it("reopens actual artifacts and refuses promotion after portfolio JSON is tampered", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      beforeSnapshotValidation: async (snapshotDirectory) => {
+        await writeFile(join(snapshotDirectory, "portfolio.json"), "{}\n", "utf8");
+      },
+    });
+
+    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SNAPSHOT_VALIDATION_FAILED" });
+    await expect(lstat(join(stateDir, "snapshots", "current"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("recomputes the checksum from the actual on-disk portfolio JSON", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      beforeSnapshotValidation: async (snapshotDirectory) => {
+        const path = join(snapshotDirectory, "portfolio.json");
+        const payload = JSON.parse(await readFile(path, "utf8")) as { items: Array<{ objective: string }> };
+        payload.items[0]!.objective = "tampered after write";
+        await writeFile(path, `${JSON.stringify(payload)}\n`, "utf8");
+      },
+    });
+
+    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SNAPSHOT_VALIDATION_FAILED" });
+    await expect(lstat(join(stateDir, "snapshots", "current"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reopens and verifies actual on-disk Markdown page content", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      beforeSnapshotValidation: async (snapshotDirectory) => {
+        await writeFile(join(snapshotDirectory, "portfolio.md"), "tampered after write\n", "utf8");
+      },
+    });
+
+    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SNAPSHOT_VALIDATION_FAILED" });
+    await expect(lstat(join(stateDir, "snapshots", "current"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("verifies the exact on-disk page set and content before current promotion", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source(23) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      beforeSnapshotValidation: async (snapshotDirectory) => {
+        await writeFile(join(snapshotDirectory, "portfolio.page-3.md"), "unexpected\n", "utf8");
+      },
+    });
+
+    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SNAPSHOT_VALIDATION_FAILED" });
+    await expect(lstat(join(stateDir, "snapshots", "current"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

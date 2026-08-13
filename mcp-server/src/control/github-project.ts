@@ -20,6 +20,7 @@ import {
 const API_VERSION = "2026-03-10";
 const MAX_PROJECT_PAGES = 10_000;
 const MAX_ISSUE_PAGES = 10_000;
+const PROJECT_RECORD_LABELS = ["trial", "project-record"] as const;
 const REQUIRED_OPTIONS = {
   Status: ["proposed", "active", "paused", "completed", "cancelled"],
   Priority: ["P0", "P1", "P2", "P3"],
@@ -206,6 +207,7 @@ const IssueSchema = z.object({
   labels: z.array(z.object({ name: z.string().min(1) }).passthrough()),
   pull_request: z.unknown().optional(),
 }).passthrough();
+const IssuePagesSchema = z.array(z.array(IssueSchema).max(100)).max(MAX_ISSUE_PAGES);
 const MutationItemSchema = z.object({
   data: z.object({ addProjectV2ItemById: z.object({ item: z.object({ id: z.string().min(1) }).strict() }).strict() }).strict(),
 }).passthrough();
@@ -244,6 +246,7 @@ export interface GitHubProjectClientOptions {
   githubOwner: string;
   projectNumber: number;
   registryRepository: string;
+  preflightProjectItemId: string;
   runner: GitHubRunner;
   catalog: GitHubCatalogPort;
   now?: () => Date;
@@ -354,8 +357,9 @@ function bodyFor(input: RegisterProjectInput): string {
   return JSON.stringify({ id: input.project_id, objective: input.objective, repositories: input.repo_ids });
 }
 
-function trialLabel(issue: Issue): boolean {
-  return issue.labels.some((label) => label.name === "trial");
+function hasLabels(issue: Issue, expected: readonly string[]): boolean {
+  const names = new Set(issue.labels.map((label) => label.name));
+  return expected.every((label) => names.has(label));
 }
 
 function issueEqual(issue: Issue, input: RegisterProjectInput): boolean {
@@ -524,33 +528,52 @@ export class GitHubProjectClient {
     return ["-H", "Accept: application/vnd.github+json", "-H", `X-GitHub-Api-Version: ${API_VERSION}`];
   }
 
-  private async listTrialIssues(): Promise<Issue[]> {
+  private async listIssues(requiredLabels: readonly string[]): Promise<Issue[]> {
     this.assertSupportedOwner();
     const endpoint = `repos/${this.options.registryRepository}/issues`;
-    const issues: Issue[] = [];
-    for (let page = 1; page <= MAX_ISSUE_PAGES; page += 1) {
-      const args = [
-        "api", "--method", "GET", endpoint,
-        ...this.issueHeaders(),
-        "--raw-field", "state=all",
-        "--raw-field", "labels=trial",
-        "--field", "per_page=100",
-        "--field", `page=${page}`,
-      ];
-      const raw = jsonFrom((await this.options.runner.runGh(args, "repo")).stdout, z.array(IssueSchema), "INVALID_ISSUE_RESPONSE");
-      for (const issue of raw) {
-        if (issue.pull_request !== undefined) continue;
-        if (!trialLabel(issue)) throw new ControlError("INVALID_PROJECT_RECORD", "A trial Issue listing omitted the trial label");
-        projectBody(issue.body);
-        issues.push(issue);
-      }
-      if (raw.length < 100) break;
-      if (page === MAX_ISSUE_PAGES) throw new ControlError("INCOMPLETE_ISSUE_READ", "Registry Issue pagination exceeded its safety bound");
-    }
-    if (new Set(issues.map((issue) => issue.node_id)).size !== issues.length || new Set(issues.map((issue) => issue.number)).size !== issues.length) {
+    const args = [
+      "api", "--method", "GET", endpoint,
+      ...this.issueHeaders(),
+      "--paginate", "--slurp",
+      "--raw-field", "state=all",
+      "--raw-field", `labels=${requiredLabels.join(",")}`,
+      "--field", "per_page=100",
+    ];
+    const pages = jsonFrom(
+      (await this.options.runner.runGh(args, "repo")).stdout,
+      IssuePagesSchema,
+      "INVALID_ISSUE_RESPONSE",
+    );
+    const allIssues = pages.flat().filter((issue) => issue.pull_request === undefined);
+    if (
+      new Set(allIssues.map((issue) => issue.node_id)).size !== allIssues.length ||
+      new Set(allIssues.map((issue) => issue.number)).size !== allIssues.length
+    ) {
       throw new ControlError("INCOMPLETE_ISSUE_READ", "Registry Issue pagination returned duplicate records");
     }
+    return allIssues.filter((issue) => hasLabels(issue, requiredLabels));
+  }
+
+  private async listProjectRecordIssues(): Promise<Issue[]> {
+    const issues = await this.listIssues(PROJECT_RECORD_LABELS);
+    for (const issue of issues) projectBody(issue.body);
     return issues;
+  }
+
+  private async incompleteProjectRecord(projectId: string): Promise<Issue[]> {
+    const candidates: Issue[] = [];
+    for (const issue of await this.listIssues(["trial"])) {
+      let body: ProjectRecordBody;
+      try {
+        body = projectBody(issue.body);
+      } catch {
+        // A dedicated preflight fixture is trial-only and intentionally is not
+        // a Project Record. Ignore any body that does not parse canonically.
+        continue;
+      }
+      if (body.id === projectId && !hasLabels(issue, PROJECT_RECORD_LABELS)) candidates.push(issue);
+    }
+    return candidates;
   }
 
   private async readIssue(number: number): Promise<Issue> {
@@ -571,6 +594,7 @@ export class GitHubProjectClient {
         "--raw-field", `title=${input.title}`,
         "--raw-field", `body=${bodyFor(input)}`,
         "--raw-field", "labels[]=trial",
+        "--raw-field", "labels[]=project-record",
       ], "repo")).stdout,
       IssueSchema,
       "INVALID_ISSUE_RESPONSE",
@@ -578,8 +602,19 @@ export class GitHubProjectClient {
   }
 
   private verifyIssue(issue: Issue, expected: RegisterProjectInput, expectedNodeId?: string): void {
-    if (!trialLabel(issue) || !issueEqual(issue, expected) || (expectedNodeId !== undefined && issue.node_id !== expectedNodeId)) {
+    if (!issueEqual(issue, expected) || (expectedNodeId !== undefined && issue.node_id !== expectedNodeId)) {
       throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Project Record Issue does not match the approved registration payload");
+    }
+    if (!hasLabels(issue, PROJECT_RECORD_LABELS)) {
+      const names = new Set(issue.labels.map((label) => label.name));
+      throw new ControlError(
+        "PROJECT_RECORD_LABEL_RECOVERY_REQUIRED",
+        "Project Record Issue is missing its disjoint classification labels",
+        {
+          issue_number: issue.number,
+          missing_labels: PROJECT_RECORD_LABELS.filter((label) => !names.has(label)),
+        },
+      );
     }
   }
 
@@ -629,13 +664,13 @@ export class GitHubProjectClient {
   async readAll(): Promise<ProjectSnapshotSource> {
     const initial = await this.initialPage();
     const structure = await this.structure(initial);
-    const itemNodes = await this.items(initial);
+    const itemNodes = (await this.items(initial)).filter((node) => node.id !== this.options.preflightProjectItemId);
     const parsedItems = itemNodes.map((node) => {
       const source = sourceId(node.content);
       if (!source) throw new ControlError("PROJECT_SOURCE_REDACTED", "Project item source identity is unavailable", { project_item_id: node.id });
       return { node, source, fields: operatingFields(node, structure) };
     });
-    const issues = await this.listTrialIssues();
+    const issues = await this.listProjectRecordIssues();
     const byNode = new Map(issues.map((issue) => [issue.node_id, issue]));
     const output: ProjectSnapshotItem[] = [];
     for (const { node, source, fields } of parsedItems) {
@@ -677,7 +712,7 @@ export class GitHubProjectClient {
 
     const initial = await this.initialPage();
     const structure = await this.structure(initial);
-    const issues = await this.listTrialIssues();
+    const issues = await this.listProjectRecordIssues();
     const matches = issues.filter((issue) => projectBody(issue.body).id === input.data.project_id);
     if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple trial Issues use the requested Project ID");
     let issue: Issue;
@@ -685,6 +720,14 @@ export class GitHubProjectClient {
       issue = matches[0] as Issue;
       this.verifyIssue(issue, input.data);
     } else {
+      const incomplete = await this.incompleteProjectRecord(input.data.project_id);
+      if (incomplete.length > 1) {
+        throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple incomplete trial Issues use the requested Project ID");
+      }
+      if (incomplete.length === 1) {
+        this.verifyIssue(incomplete[0] as Issue, input.data);
+        throw new Error("unreachable");
+      }
       issue = await this.createIssue(input.data);
       this.verifyIssue(issue, input.data);
     }

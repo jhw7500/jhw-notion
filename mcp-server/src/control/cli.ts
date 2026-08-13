@@ -99,6 +99,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     githubOwner: config.githubOwner,
     projectNumber: config.projectNumber,
     registryRepository: config.registryRepository,
+    preflightProjectItemId: config.preflightProjectItemId,
     runner,
     catalog,
   });
@@ -259,6 +260,13 @@ function exitCode(cause: unknown): CliResult["exitCode"] {
     "PORTFOLIO_UNAVAILABLE",
     "PREFLIGHT_UNAVAILABLE",
     "INVALID_CONFIG",
+    "CREDENTIALS_NOT_SEPARATE",
+    "PROJECT_SCOPE_UNVERIFIABLE",
+    "PROJECT_TOKEN_HAS_REPO_SCOPE",
+    "PROJECT_SCOPE_MISSING",
+    "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
+    "UNSUPPORTED_REGISTRY_OWNER",
+    "REGISTRY_REMOTE_NOT_SSH",
   ]).has(code)) return 78;
   if (code === "INVALID_CLI_ARGUMENT") return 2;
   return 1;
@@ -600,6 +608,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
 
 /** True only for lifecycle mutations that require the host-global callback lock. */
 export function requiresMutationLock(argv: readonly string[]): boolean {
+  if (argv.length === 1 && argv[0] === "preflight") return true;
   if (argv[0] === "task" && (argv[1] === "start" || argv[1] === "finish")) return true;
   if (argv[0] === "project" && argv[1] === "register") return true;
   if (argv[0] !== "task" || argv[1] !== "recover") return false;

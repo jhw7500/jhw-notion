@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, open, rename, type FileHandle } from "node:fs/promises";
+import { mkdir, open, readdir, rename, unlink, type FileHandle } from "node:fs/promises";
 
 import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
@@ -18,6 +18,7 @@ const MAX_PAYLOAD_BYTES = 12 * 1024;
 const MAX_PAGE_ITEMS = 20;
 const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const createFileFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW;
+const readFileFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
 
 export interface ProjectSnapshotReader {
   readAll(): Promise<ProjectSnapshotSource>;
@@ -43,6 +44,8 @@ export interface PortfolioServiceOptions {
   projectClient: ProjectSnapshotReader;
   stateDir: string;
   now?: () => Date;
+  /** Test-only synchronization point after writes and before disk validation. */
+  beforeSnapshotValidation?(snapshotDirectory: string): Promise<void> | void;
 }
 
 interface DirectoryAnchor {
@@ -226,31 +229,93 @@ async function writeNewFile(directoryFd: number, name: string, contents: string)
   }
 }
 
-async function updateCurrentPointer(snapshotsFd: number, directoryName: string): Promise<void> {
+async function readVerifiedFile(directoryFd: number, name: string): Promise<string> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+    throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "Snapshot component name is unsafe");
+  }
+  let handle: FileHandle | undefined;
   try {
-    const existing = await lstat(`/proc/self/fd/${snapshotsFd}/current`);
-    if (existing.isSymbolicLink() || !existing.isFile()) {
-      throw new ControlError("UNSAFE_SNAPSHOT_PATH", "Current snapshot pointer is not a regular file");
-    }
-  } catch (cause) {
-    if (cause instanceof ControlError) throw cause;
-    if (!(typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT")) {
-      throw new ControlError("UNSAFE_SNAPSHOT_PATH", "Unable to inspect the current snapshot pointer");
+    handle = await open(`/proc/self/fd/${directoryFd}/${name}`, readFileFlags);
+    const info = await handle.stat();
+    if (!info.isFile() || (info.mode & 0o777) !== 0o600) throw new Error("invalid type or mode");
+    return await handle.readFile("utf8");
+  } catch {
+    throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "Snapshot component failed descriptor-relative verification");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function syncDirectory(directory: DirectoryAnchor): Promise<void> {
+  try {
+    await directory.handle.sync();
+  } catch {
+    throw new ControlError("SNAPSHOT_SYNC_FAILED", "Unable to durably sync the snapshot namespace");
+  }
+}
+
+async function verifyWrittenSnapshot(
+  snapshot: DirectoryAnchor,
+  expectedJson: string,
+  expectedPages: readonly string[],
+  expectedChecksum: string,
+): Promise<void> {
+  let names: string[];
+  try {
+    names = (await readdir(`/proc/self/fd/${snapshot.fd}`)).sort();
+  } catch {
+    throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "Unable to enumerate written snapshot components");
+  }
+  const expectedNames = [
+    "portfolio.json",
+    ...expectedPages.map((_, index) => index === 0 ? "portfolio.md" : `portfolio.page-${index + 1}.md`),
+  ].sort();
+  if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
+    throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "Snapshot page set does not match the expected export");
+  }
+
+  const actualJson = await readVerifiedFile(snapshot.fd, "portfolio.json");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(actualJson);
+  } catch {
+    throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "On-disk portfolio JSON is invalid");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "On-disk portfolio JSON is not an object");
+  }
+  const disk = parsed as Record<string, unknown>;
+  const { checksum, ...withoutChecksum } = disk;
+  if (
+    checksum !== expectedChecksum ||
+    createHash("sha256").update(JSON.stringify(withoutChecksum)).digest("hex") !== expectedChecksum ||
+    actualJson !== expectedJson ||
+    !ProjectSnapshotSourceSchema.safeParse({
+      project_node_id: disk.project_node_id,
+      source_revision: disk.source_revision,
+      field_definitions: disk.field_definitions,
+      items: disk.items,
+      total_count: disk.total_count,
+    }).success
+  ) {
+    throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "On-disk portfolio JSON checksum or schema is invalid");
+  }
+  for (const [index, expected] of expectedPages.entries()) {
+    const name = index === 0 ? "portfolio.md" : `portfolio.page-${index + 1}.md`;
+    if (await readVerifiedFile(snapshot.fd, name) !== expected) {
+      throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "On-disk portfolio page differs from the generated snapshot");
     }
   }
+}
+
+async function updateCurrentPointer(snapshotsFd: number, directoryName: string): Promise<void> {
   const temporary = `.current.${randomUUID()}.tmp`;
   try {
     await writeNewFile(snapshotsFd, temporary, `${directoryName}\n`);
     await rename(`/proc/self/fd/${snapshotsFd}/${temporary}`, `/proc/self/fd/${snapshotsFd}/current`);
-    const current = await open(`/proc/self/fd/${snapshotsFd}/current`, constants.O_RDONLY | constants.O_NOFOLLOW);
-    try {
-      const info = await current.stat();
-      if (!info.isFile()) throw new Error("not a regular file");
-      await current.chmod(0o600);
-    } finally {
-      await current.close();
-    }
+    if (await readVerifiedFile(snapshotsFd, "current") !== `${directoryName}\n`) throw new Error("pointer mismatch");
   } catch (cause) {
+    await unlink(`/proc/self/fd/${snapshotsFd}/${temporary}`).catch(() => undefined);
     if (cause instanceof ControlError) throw cause;
     throw new ControlError("SNAPSHOT_POINTER_FAILED", "Unable to advance the current snapshot pointer");
   }
@@ -311,18 +376,11 @@ export class PortfolioService {
       for (const [index, markdown] of pages.entries()) {
         await writeNewFile(snapshot.fd, index === 0 ? "portfolio.md" : `portfolio.page-${index + 1}.md`, markdown);
       }
-
-      const verified = ProjectSnapshotSourceSchema.safeParse({
-        project_node_id: payloadWithoutChecksum.project_node_id,
-        source_revision: payloadWithoutChecksum.source_revision,
-        field_definitions: payloadWithoutChecksum.field_definitions,
-        items: payloadWithoutChecksum.items,
-        total_count: payloadWithoutChecksum.total_count,
-      });
-      if (!verified.success || createHash("sha256").update(JSON.stringify(payloadWithoutChecksum)).digest("hex") !== checksum) {
-        throw new ControlError("SNAPSHOT_VALIDATION_FAILED", "Snapshot validation failed before pointer advancement");
-      }
+      await this.options.beforeSnapshotValidation?.(`/proc/self/fd/${snapshot.fd}`);
+      await verifyWrittenSnapshot(snapshot, json, pages, checksum);
+      await syncDirectory(snapshot);
       await updateCurrentPointer(snapshots.fd, directoryName);
+      await syncDirectory(snapshots);
     } finally {
       await snapshot?.handle.close().catch(() => undefined);
       await snapshots?.handle.close().catch(() => undefined);

@@ -294,20 +294,24 @@ describe("runCli", () => {
     expect(requiresMutationLock(["task", "finish"])).toBe(true);
     expect(requiresMutationLock(["task", "recover", "--action", "takeover"])).toBe(true);
     expect(requiresMutationLock(["project", "register"])).toBe(true);
+    expect(requiresMutationLock(["preflight"])).toBe(true);
     expect(requiresMutationLock(["task", "status"])).toBe(false);
     expect(requiresMutationLock(["task", "recover", "--action", "status"])).toBe(false);
+    expect(requiresMutationLock(["portfolio", "status"])).toBe(false);
     expect(requiresMutationLock(["portfolio", "export"])).toBe(false);
   });
 
-  it("invokes the injected lock exactly once for a mutation while read-only commands bypass it", async () => {
+  it("locks preflight exactly once while portfolio status/export remain lock-free", async () => {
     const mutationLock = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
     const dependencies = makeCliDependencies({ mutationLock });
 
-    const mutation = await runCli(registerArgs(), dependencies);
-    const readOnly = await runCli(["portfolio", "status"], dependencies);
+    const preflight = await runCli(["preflight"], dependencies);
+    const status = await runCli(["portfolio", "status"], dependencies);
+    const exported = await runCli(["portfolio", "export"], dependencies);
 
-    expect(mutation.exitCode).toBe(0);
-    expect(readOnly.exitCode).toBe(0);
+    expect(preflight.exitCode).toBe(0);
+    expect(status.exitCode).toBe(0);
+    expect(exported.exitCode).toBe(0);
     expect(mutationLock.run).toHaveBeenCalledTimes(1);
   });
 
@@ -566,6 +570,23 @@ describe("runCli", () => {
 
     expect(unavailable.exitCode).toBe(78);
     expect(diverged.exitCode).toBe(75);
+  });
+
+  it.each([
+    "CREDENTIALS_NOT_SEPARATE",
+    "PROJECT_SCOPE_UNVERIFIABLE",
+    "PROJECT_TOKEN_HAS_REPO_SCOPE",
+    "PROJECT_SCOPE_MISSING",
+    "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
+    "UNSUPPORTED_REGISTRY_OWNER",
+    "REGISTRY_REMOTE_NOT_SSH",
+  ])("maps preflight policy-unavailable error %s to exit 78", async (code) => {
+    const result = await runCli(["preflight"], makeCliDependencies({
+      preflight: { run: async () => { throw new ControlError(code, "untrusted policy diagnostic"); } },
+    }));
+
+    expect(result.exitCode).toBe(78);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code } });
   });
 
   it("lists every Phase 1A command in JSON help output", async () => {

@@ -80,7 +80,7 @@ function issueFixture(index: number) {
     number: index,
     title: `Project ${index}`,
     body: JSON.stringify({ id: `prj-project-${index}`, objective: `Objective ${index}`, repositories: ["repo-control"] }),
-    labels: [{ name: "trial" }],
+    labels: [{ name: "trial" }, { name: "project-record" }],
   };
 }
 
@@ -96,6 +96,7 @@ function client(gh: QueuedGhRunner, catalog = catalogFixture()) {
     githubOwner: "owner",
     projectNumber: 7,
     registryRepository: "owner/registry",
+    preflightProjectItemId: "PVTI_preflight",
     runner: gh,
     catalog,
     now: () => new Date("2026-08-13T00:00:00Z"),
@@ -109,8 +110,10 @@ describe("GitHubProjectClient", () => {
     gh.enqueue(
       projectPageFixture({ count: 100, totalCount: 101, hasNextPage: true, endCursor: "c1" }),
       projectPageFixture({ start: 101, count: 1, totalCount: 101, hasNextPage: false, endCursor: null }),
-      Array.from({ length: 100 }, (_, index) => issueFixture(index + 1)),
-      [issueFixture(101)],
+      [
+        Array.from({ length: 100 }, (_, index) => issueFixture(index + 1)),
+        [issueFixture(101)],
+      ],
     );
 
     const source = await github.readAll();
@@ -120,12 +123,15 @@ describe("GitHubProjectClient", () => {
     expect(gh.calls[0]?.args.join("\n")).toContain("archivedStates: [ARCHIVED, NOT_ARCHIVED]");
     expect(gh.calls[0]?.args).not.toContain("itemCursor=c1");
     expect(gh.calls[1]?.args).toContain("itemCursor=c1");
-    expect(gh.calls.filter((call) => call.credential === "repo")).toHaveLength(2);
+    expect(gh.calls.filter((call) => call.credential === "repo")).toHaveLength(1);
+    const issueCall = gh.calls.find((call) => call.credential === "repo");
+    expect(issueCall?.args).toEqual(expect.arrayContaining(["--paginate", "--slurp", "--raw-field", "labels=trial,project-record"]));
+    expect(issueCall?.args.some((arg) => arg.startsWith("page="))).toBe(false);
 
     const incomplete = new QueuedGhRunner();
     incomplete.enqueue(
       projectPageFixture({ count: 1, totalCount: 2, hasNextPage: false, endCursor: null }),
-      [issueFixture(1)],
+      [[issueFixture(1)]],
     );
     await expect(client(incomplete).readAll()).rejects.toMatchObject({ code: "INCOMPLETE_PROJECT_READ" });
   });
@@ -175,11 +181,18 @@ describe("GitHubProjectClient", () => {
       number: 77,
       title: "Example",
       body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels: [{ name: "trial" }],
+      labels: [{ name: "trial" }, { name: "project-record" }],
     };
     gh.enqueue(
       project,
-      [],
+      [[]],
+      [[{
+        node_id: "I_preflight",
+        number: 900,
+        title: "Preflight fixture",
+        body: "unchanged",
+        labels: [{ name: "trial" }],
+      }]],
       issue,
       issue,
       { data: { addProjectV2ItemById: { item: { id: "PVTI_new" } } } },
@@ -218,6 +231,7 @@ describe("GitHubProjectClient", () => {
     expect(create?.args).toEqual(expect.arrayContaining([
       "-H", "X-GitHub-Api-Version: 2026-03-10",
       "--raw-field", "labels[]=trial",
+      "--raw-field", "labels[]=project-record",
     ]));
     expect(gh.calls.some((call) => call.args.includes("itemId=PVTI_new"))).toBe(true);
     expect(gh.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(5);
@@ -229,7 +243,7 @@ describe("GitHubProjectClient", () => {
     existing.body = JSON.stringify({ id: "prj-example", objective: "different", repositories: ["repo-example"] });
     mismatch.enqueue(
       projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [existing],
+      [[existing]],
     );
     await expect(client(mismatch).registerProject({
       project_id: "prj-example",
@@ -262,10 +276,69 @@ describe("GitHubProjectClient", () => {
     page.data.user.projectV2.items.nodes[1]!.priority.optionId = "priority-P0";
     page.data.user.projectV2.items.nodes[1]!.nextAction.text = "wait:done";
     page.data.user.projectV2.items.nodes[1]!.lastReviewed.date = "2020-01-01";
-    gh.enqueue(page, [issueFixture(1), issueFixture(2)]);
+    gh.enqueue(page, [[issueFixture(1), issueFixture(2)]]);
 
     const result = await client(gh).readAll();
 
     expect(result.items.map((entry) => entry.stale)).toEqual([true, false]);
+  });
+
+  it("follows slurped Link pages even when the first page is short and ignores the trial-only preflight fixture", async () => {
+    const gh = new QueuedGhRunner();
+    const page = projectPageFixture({ count: 2, totalCount: 3, hasNextPage: false, endCursor: null });
+    page.data.user.projectV2.items.nodes.push({
+      id: "PVTI_preflight",
+      isArchived: false,
+      type: "ISSUE",
+      content: { __typename: "Issue", id: "I_preflight" },
+      status: null,
+      priority: null,
+      health: null,
+      nextAction: null,
+      lastReviewed: { __typename: "ProjectV2ItemFieldDateValue", date: "2026-08-13" },
+    });
+    const preflightFixture = {
+      node_id: "I_preflight",
+      number: 900,
+      title: "Preflight fixture",
+      body: "unchanged",
+      labels: [{ name: "trial" }],
+    };
+    gh.enqueue(page, [[preflightFixture, issueFixture(1)], [issueFixture(2)]]);
+
+    const result = await client(gh).readAll();
+
+    expect(result.items.map((entry) => entry.project_id)).toEqual(["prj-project-1", "prj-project-2"]);
+    expect(gh.calls.filter((call) => call.credential === "repo")).toHaveLength(1);
+  });
+
+  it("fails closed without creating a duplicate when an exact interrupted record is missing project-record", async () => {
+    const gh = new QueuedGhRunner();
+    const partial = {
+      node_id: "I_partial",
+      number: 77,
+      title: "Example",
+      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
+      labels: [{ name: "trial" }],
+    };
+    gh.enqueue(
+      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
+      [[]],
+      [[partial]],
+    );
+
+    const error = await client(gh).registerProject({
+      project_id: "prj-example",
+      title: "Example",
+      objective: "Prove the trial flow",
+      repo_ids: ["repo-example"],
+      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
+    }).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({
+      code: "PROJECT_RECORD_LABEL_RECOVERY_REQUIRED",
+      details: { issue_number: 77, missing_labels: ["project-record"] },
+    });
+    expect(gh.calls.some((call) => call.args.includes("POST") && call.args.includes("repos/owner/registry/issues"))).toBe(false);
   });
 });
