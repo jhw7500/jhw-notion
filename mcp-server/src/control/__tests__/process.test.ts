@@ -1,17 +1,43 @@
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
 import { describe, expect, it } from "vitest";
 
 import { loadControlConfig } from "../config.js";
-import { ProcessRunner } from "../process.js";
+import { ProcessRunner, reexecUnderMutationLock, type MutationLockRuntime } from "../process.js";
+
+function configForLock() {
+  return loadControlConfig({
+    HOME: "/home/jhw",
+    JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
+    JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
+    JHW_BUILD_HOST: "cantopsbuildserver",
+    JHW_GITHUB_OWNER: "jhw7500",
+    JHW_PROJECT_NUMBER: "7",
+    JHW_CONTROL_STATE_DIR: "/srv/jhw/state",
+  });
+}
+
+function lockRuntime(status: number | null, exits: number[]): MutationLockRuntime {
+  return {
+    environment: {},
+    mkdirSync: () => undefined,
+    spawnSync: () => ({ status }),
+    exit: (code) => { exits.push(code); },
+  };
+}
 
 describe("control process boundary", () => {
   it("never includes secret environment values in a failed command", async () => {
     const runner = new ProcessRunner({ GH_PROJECT_TOKEN: "secret-project-token" });
     const error = await runner
-      .run("bash", ["-c", "echo \"$GH_PROJECT_TOKEN\" >&2; exit 2"])
+      .run("bash", ["-c", "echo secret-project-token >&2; exit 2"])
       .catch((cause: unknown) => cause);
 
     expect(error).toMatchObject({ code: "COMMAND_FAILED" });
     expect(JSON.stringify(error)).not.toContain("secret-project-token");
+    expect(JSON.stringify(error)).toContain("[REDACTED]");
   });
 
   it("requires build-server coordinates but not tokens in config files", () => {
@@ -50,21 +76,66 @@ describe("control process boundary", () => {
     });
   });
 
-  it("re-execs under flock without terminating an injected test runtime", async () => {
-    const { reexecUnderMutationLock } = await import("../process.js");
-    const config = loadControlConfig({
-      HOME: "/home/jhw",
-      JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
-      JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
-      JHW_BUILD_HOST: "cantopsbuildserver",
-      JHW_GITHUB_OWNER: "jhw7500",
-      JHW_PROJECT_NUMBER: "7",
-      JHW_CONTROL_STATE_DIR: "/srv/jhw/state",
+  it("removes inherited and override secrets from ordinary child environments", async () => {
+    const result = await new ProcessRunner({ GH_PROJECT_TOKEN: "inherited-token" }).run(
+      "bash",
+      ["-c", "printf '%s|%s' \"${GH_PROJECT_TOKEN:-missing}\" \"${APP_SECRET:-missing}\""],
+      { env: { APP_SECRET: "override-secret" } },
+    );
+
+    expect(result.stdout).toBe("missing|missing");
+  });
+
+  it("requires an explicit selected credential for gh execution", async () => {
+    const runner = new ProcessRunner({});
+    await expect(runner.runGh(["--version"], "project")).rejects.toMatchObject({
+      code: "MISSING_CREDENTIAL",
     });
+  });
+
+  it("injects only the selected credential into the gh child", async () => {
+    const bin = await mkdtemp(join(tmpdir(), "jhw-control-gh-"));
+    await writeFile(join(bin, "gh"), "#!/bin/sh\nprintf '%s|%s|%s' \"$GH_TOKEN\" \"${GH_PROJECT_TOKEN:-missing}\" \"${GH_REPO_TOKEN:-missing}\"\n");
+    await chmod(join(bin, "gh"), 0o755);
+    try {
+      const result = await new ProcessRunner({
+        GH_PROJECT_TOKEN: "project-token",
+        GH_REPO_TOKEN: "repo-token",
+      }).runGh([], "project", { env: { PATH: bin } });
+
+      expect(result.stdout).toBe("[REDACTED]|missing|missing");
+    } finally {
+      await rm(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("does not leak a secret prefix that crosses the safe output boundary", async () => {
+    const secret = "crossing-secret";
+    const result = await new ProcessRunner({ CROSSING_TOKEN: secret }).run("bash", [
+      "-c",
+      `head -c ${1024 * 1024 - 4} /dev/zero | tr '\\0' x; printf '${secret}'`,
+    ]);
+
+    expect(result.stdout).not.toContain(secret);
+    expect(result.stdout).not.toContain(secret.slice(0, 4));
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it("caps redacted output after short-secret replacement expansion", async () => {
+    const result = await new ProcessRunner({ SHORT_TOKEN: "a" }).run("bash", [
+      "-c",
+      `head -c ${1024 * 1024} /dev/zero | tr '\\0' a`,
+    ]);
+
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+    expect(result.stdout).not.toContain("a");
+  });
+
+  it("re-execs under flock without terminating an injected test runtime", () => {
     const calls: unknown[][] = [];
     let exitCode: number | undefined;
 
-    reexecUnderMutationLock(["project", "register"], config, {
+    reexecUnderMutationLock(["project", "register"], configForLock(), {
       environment: {},
       mkdirSync: (...args) => calls.push(["mkdir", ...args]),
       spawnSync: (...args) => {
@@ -83,9 +154,11 @@ describe("control process boundary", () => {
         "flock",
         [
           "-n",
+          "-E",
+          "75",
           "/srv/jhw/state/registry.lock",
           process.execPath,
-          expect.stringMatching(/process\.ts$/),
+          expect.stringMatching(/cli\.js$/),
           "project",
           "register",
         ],
@@ -96,5 +169,34 @@ describe("control process boundary", () => {
       ],
     ]);
     expect(exitCode).toBe(42);
+  });
+
+  it("does not re-exec when the mutation lock is already held", () => {
+    const config = configForLock();
+    let spawned = false;
+
+    reexecUnderMutationLock(["task", "start"], config, {
+      environment: { JHW_CONTROL_LOCK_HELD: "1" },
+      mkdirSync: () => { throw new Error("must not create lock directory"); },
+      spawnSync: () => {
+        spawned = true;
+        return { status: 0 };
+      },
+      exit: () => { throw new Error("must not exit"); },
+    });
+
+    expect(spawned).toBe(false);
+  });
+
+  it("preserves flock contention exit code 75", () => {
+    const exits: number[] = [];
+    reexecUnderMutationLock(["task", "start"], configForLock(), lockRuntime(75, exits));
+    expect(exits).toEqual([75]);
+  });
+
+  it("uses temporary-failure exit code when flock has no status", () => {
+    const exits: number[] = [];
+    reexecUnderMutationLock(["task", "start"], configForLock(), lockRuntime(null, exits));
+    expect(exits).toEqual([75]);
   });
 });

@@ -1,7 +1,8 @@
 import { spawn, spawnSync, type SpawnSyncOptions } from "node:child_process";
 import { mkdirSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 import type { Readable } from "node:stream";
 
 import type { ControlConfig } from "./config.js";
@@ -9,6 +10,7 @@ import { ControlError } from "./errors.js";
 
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const SECRET_ENV_KEY = /_(?:TOKEN|KEY|SECRET)$/;
+const DEFAULT_CLI_ENTRY_PATH = fileURLToPath(new URL("./cli.js", import.meta.url));
 
 export interface ProcessResult {
   command: string;
@@ -23,23 +25,11 @@ export interface ProcessRunOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-function boundedCapture(stream: Readable | null): Promise<Buffer> {
-  if (!stream) return Promise.resolve(Buffer.alloc(0));
+export type GhCredential = "project" | "repo";
 
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let captured = 0;
-    stream.on("data", (chunk: Buffer | string) => {
-      if (captured >= MAX_CAPTURE_BYTES) return;
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      const remaining = MAX_CAPTURE_BYTES - captured;
-      const bounded = buffer.subarray(0, remaining);
-      chunks.push(bounded);
-      captured += bounded.length;
-    });
-    stream.once("end", () => resolve(Buffer.concat(chunks)));
-    stream.once("error", reject);
-  });
+/** Removes credentials before spawning ordinary host subprocesses. */
+export function sanitizedChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !SECRET_ENV_KEY.test(key)));
 }
 
 function secretValues(env: NodeJS.ProcessEnv): string[] {
@@ -54,22 +44,111 @@ function redact(value: string, secrets: readonly string[]): string {
   return secrets.reduce((result, secret) => result.replaceAll(secret, "[REDACTED]"), value);
 }
 
+function partialSecretPrefixLength(value: string, secrets: readonly string[]): number {
+  const longest = Math.max(0, ...secrets.map((secret) => secret.length - 1));
+  for (let length = Math.min(longest, value.length); length > 0; length -= 1) {
+    const suffix = value.slice(-length);
+    if (secrets.some((secret) => secret.startsWith(suffix))) return length;
+  }
+  return 0;
+}
+
+/**
+ * Redacts each stream incrementally. The rolling tail keeps a possible secret
+ * prefix until its remainder arrives, so a capture boundary cannot expose it.
+ */
+function redactingCapture(stream: Readable | null, secrets: readonly string[]): Promise<Buffer> {
+  if (!stream) return Promise.resolve(Buffer.alloc(0));
+
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const decoder = new StringDecoder("utf8");
+    let captured = 0;
+    let pending = "";
+
+    const append = (value: string) => {
+      if (captured >= MAX_CAPTURE_BYTES || !value) return;
+      const encoded = Buffer.from(value, "utf8");
+      const remaining = MAX_CAPTURE_BYTES - captured;
+      if (encoded.length <= remaining) {
+        chunks.push(encoded);
+        captured += encoded.length;
+        return;
+      }
+      let completeCharacters = encoded.subarray(0, remaining).toString("utf8");
+      while (Buffer.byteLength(completeCharacters, "utf8") > remaining) {
+        completeCharacters = completeCharacters.slice(0, -1);
+      }
+      const bounded = Buffer.from(completeCharacters, "utf8");
+      chunks.push(bounded);
+      captured += bounded.length;
+    };
+    const emitAvailable = () => {
+      const tailLength = partialSecretPrefixLength(pending, secrets);
+      const safePrefix = pending.slice(0, pending.length - tailLength);
+      pending = pending.slice(pending.length - tailLength);
+      append(redact(safePrefix, secrets));
+    };
+
+    stream.on("data", (chunk: Buffer | string) => {
+      pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      emitAvailable();
+    });
+    stream.once("end", () => {
+      pending += decoder.end();
+      append(redact(pending, secrets));
+      resolve(Buffer.concat(chunks));
+    });
+    stream.once("error", reject);
+  });
+}
+
 export class ProcessRunner {
   constructor(private readonly environment: NodeJS.ProcessEnv = process.env) {}
 
   async run(command: string, args: string[], options: ProcessRunOptions = {}): Promise<ProcessResult> {
-    const env = { ...this.environment, ...options.env };
-    const secrets = secretValues(env);
+    const rawEnvironment = { ...this.environment, ...options.env };
+    return this.runWithEnvironment(
+      command,
+      args,
+      options.cwd,
+      sanitizedChildEnvironment(rawEnvironment),
+      secretValues(rawEnvironment),
+    );
+  }
+
+  /** Executes `gh` with only the selected host credential exposed as GH_TOKEN. */
+  async runGh(args: string[], credential: GhCredential, options: ProcessRunOptions = {}): Promise<ProcessResult> {
+    const rawEnvironment = { ...this.environment, ...options.env };
+    const credentialKey = credential === "project" ? "GH_PROJECT_TOKEN" : "GH_REPO_TOKEN";
+    const token = rawEnvironment[credentialKey];
+    if (!token) {
+      throw new ControlError("MISSING_CREDENTIAL", `Missing host credential: ${credentialKey}`, {
+        key: credentialKey,
+      });
+    }
+    return this.runWithEnvironment(
+      "gh",
+      args,
+      options.cwd,
+      { ...sanitizedChildEnvironment(rawEnvironment), GH_TOKEN: token },
+      secretValues(rawEnvironment),
+    );
+  }
+
+  private async runWithEnvironment(
+    command: string,
+    args: string[],
+    cwd: string | undefined,
+    env: NodeJS.ProcessEnv,
+    secrets: readonly string[],
+  ): Promise<ProcessResult> {
     const safeCommand = redact(command, secrets);
     const safeArgs = args.map((arg) => redact(arg, secrets));
     let child: ReturnType<typeof spawn>;
 
     try {
-      child = spawn(command, args, {
-        cwd: options.cwd,
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       throw new ControlError("COMMAND_FAILED", `Unable to start command: ${safeCommand}`, {
@@ -80,8 +159,8 @@ export class ProcessRunner {
       });
     }
 
-    const stdout = boundedCapture(child.stdout);
-    const stderr = boundedCapture(child.stderr);
+    const stdout = redactingCapture(child.stdout, secrets);
+    const stderr = redactingCapture(child.stderr, secrets);
     const exit = await new Promise<{ exitCode: number | null; cause?: string }>((resolve) => {
       let settled = false;
       const settle = (result: { exitCode: number | null; cause?: string }) => {
@@ -99,8 +178,8 @@ export class ProcessRunner {
     const result = {
       command: safeCommand,
       args: safeArgs,
-      stdout: redact(stdoutBuffer.toString("utf8"), secrets),
-      stderr: redact(stderrBuffer.toString("utf8"), secrets),
+      stdout: stdoutBuffer.toString("utf8"),
+      stderr: stderrBuffer.toString("utf8"),
       exitCode: exit.exitCode,
     };
 
@@ -135,13 +214,14 @@ const productionLockRuntime: MutationLockRuntime = {
 };
 
 /**
- * Replaces the current process with a flock-guarded child before a registry mutation.
- * The optional runtime keeps decision and spawn construction directly testable.
+ * Replaces the current process with a flock-guarded CLI child before a mutation.
+ * Runtime and CLI path are injectable to test construction without exiting Vitest.
  */
 export function reexecUnderMutationLock(
   argv: string[],
   config: ControlConfig,
   runtime: MutationLockRuntime = productionLockRuntime,
+  cliEntryPath = DEFAULT_CLI_ENTRY_PATH,
 ): void {
   if (runtime.environment.JHW_CONTROL_LOCK_HELD === "1") return;
 
@@ -149,8 +229,11 @@ export function reexecUnderMutationLock(
   runtime.mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
   const child = runtime.spawnSync(
     "flock",
-    ["-n", lock, process.execPath, fileURLToPath(import.meta.url), ...argv],
-    { stdio: "inherit", env: { ...runtime.environment, JHW_CONTROL_LOCK_HELD: "1" } },
+    ["-n", "-E", "75", lock, process.execPath, cliEntryPath, ...argv],
+    {
+      stdio: "inherit",
+      env: { ...sanitizedChildEnvironment(runtime.environment), JHW_CONTROL_LOCK_HELD: "1" },
+    },
   );
   runtime.exit(child.status ?? 75);
 }

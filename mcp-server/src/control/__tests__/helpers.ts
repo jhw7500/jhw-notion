@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import type { ControlConfig } from "../config.js";
+import { sanitizedChildEnvironment } from "../process.js";
 
 const execFile = promisify(execFileCallback);
 const TEST_NAME = "Phase1A Test";
@@ -14,7 +15,7 @@ export async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await execFile("git", args, {
     cwd,
     encoding: "utf8",
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    env: { ...sanitizedChildEnvironment(process.env), GIT_TERMINAL_PROMPT: "0" },
   });
   return stdout;
 }
