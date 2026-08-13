@@ -101,6 +101,23 @@ describe("PreflightService", () => {
     await expect(preflight.run()).rejects.toMatchObject({ code: "PROJECT_TOKEN_HAS_REPO_SCOPE" });
   });
 
+  it("rejects a preflight fixture that is also labeled as a Project Record", async () => {
+    const runner = new QueuedRunner();
+    runner.enqueueGh(
+      { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
+      { stdout: `${JSON.stringify({
+        node_id: "I_fixture",
+        title: "trial",
+        body: "unchanged",
+        labels: [{ name: "trial" }, { name: "project-record" }],
+      })}\n` },
+    );
+    const { preflight } = service({ runner });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "INVALID_PREFLIGHT_ISSUE" });
+    expect(runner.ghCalls).toHaveLength(2);
+  });
+
   it("restores Last Reviewed in finally when the write probe fails", async () => {
     const writes: string[] = [];
     const project = projectPort({

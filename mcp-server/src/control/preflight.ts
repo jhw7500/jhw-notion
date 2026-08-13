@@ -109,8 +109,9 @@ export class PreflightService {
       IssueResponseSchema,
       "INVALID_PREFLIGHT_ISSUE",
     );
-    if (!issue.labels.some((label) => label.name === "trial")) {
-      throw new ControlError("INVALID_PREFLIGHT_ISSUE", "The Registry preflight Issue is not a trial fixture");
+    const fixtureLabels = new Set(issue.labels.map((label) => label.name));
+    if (!fixtureLabels.has("trial") || fixtureLabels.has("project-record")) {
+      throw new ControlError("INVALID_PREFLIGHT_ISSUE", "The Registry preflight Issue must be trial-only");
     }
 
     await this.options.project.verifyFields();

@@ -528,7 +528,7 @@ export class GitHubProjectClient {
     return ["-H", "Accept: application/vnd.github+json", "-H", `X-GitHub-Api-Version: ${API_VERSION}`];
   }
 
-  private async listIssues(requiredLabels: readonly string[]): Promise<Issue[]> {
+  private async listIssues(requiredLabels?: readonly string[]): Promise<Issue[]> {
     this.assertSupportedOwner();
     const endpoint = `repos/${this.options.registryRepository}/issues`;
     const args = [
@@ -536,7 +536,7 @@ export class GitHubProjectClient {
       ...this.issueHeaders(),
       "--paginate", "--slurp",
       "--raw-field", "state=all",
-      "--raw-field", `labels=${requiredLabels.join(",")}`,
+      ...(requiredLabels === undefined ? [] : ["--raw-field", `labels=${requiredLabels.join(",")}`]),
       "--field", "per_page=100",
     ];
     const pages = jsonFrom(
@@ -551,7 +551,9 @@ export class GitHubProjectClient {
     ) {
       throw new ControlError("INCOMPLETE_ISSUE_READ", "Registry Issue pagination returned duplicate records");
     }
-    return allIssues.filter((issue) => hasLabels(issue, requiredLabels));
+    return requiredLabels === undefined
+      ? allIssues
+      : allIssues.filter((issue) => hasLabels(issue, requiredLabels));
   }
 
   private async listProjectRecordIssues(): Promise<Issue[]> {
@@ -560,18 +562,18 @@ export class GitHubProjectClient {
     return issues;
   }
 
-  private async incompleteProjectRecord(projectId: string): Promise<Issue[]> {
+  private async canonicalProjectRecords(projectId: string): Promise<Issue[]> {
     const candidates: Issue[] = [];
-    for (const issue of await this.listIssues(["trial"])) {
+    for (const issue of await this.listIssues()) {
       let body: ProjectRecordBody;
       try {
         body = projectBody(issue.body);
       } catch {
-        // A dedicated preflight fixture is trial-only and intentionally is not
-        // a Project Record. Ignore any body that does not parse canonically.
+        // Recovery scans every Issue independent of labels. Only canonical
+        // Project Record bodies participate in idempotency decisions.
         continue;
       }
-      if (body.id === projectId && !hasLabels(issue, PROJECT_RECORD_LABELS)) candidates.push(issue);
+      if (body.id === projectId) candidates.push(issue);
     }
     return candidates;
   }
@@ -712,22 +714,13 @@ export class GitHubProjectClient {
 
     const initial = await this.initialPage();
     const structure = await this.structure(initial);
-    const issues = await this.listProjectRecordIssues();
-    const matches = issues.filter((issue) => projectBody(issue.body).id === input.data.project_id);
-    if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple trial Issues use the requested Project ID");
+    const matches = await this.canonicalProjectRecords(input.data.project_id);
+    if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple canonical Issues use the requested Project ID");
     let issue: Issue;
     if (matches.length === 1) {
       issue = matches[0] as Issue;
       this.verifyIssue(issue, input.data);
     } else {
-      const incomplete = await this.incompleteProjectRecord(input.data.project_id);
-      if (incomplete.length > 1) {
-        throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple incomplete trial Issues use the requested Project ID");
-      }
-      if (incomplete.length === 1) {
-        this.verifyIssue(incomplete[0] as Issue, input.data);
-        throw new Error("unreachable");
-      }
       issue = await this.createIssue(input.data);
       this.verifyIssue(issue, input.data);
     }

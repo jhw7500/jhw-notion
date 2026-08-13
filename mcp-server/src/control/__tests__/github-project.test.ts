@@ -185,7 +185,6 @@ describe("GitHubProjectClient", () => {
     };
     gh.enqueue(
       project,
-      [[]],
       [[{
         node_id: "I_preflight",
         number: 900,
@@ -323,7 +322,6 @@ describe("GitHubProjectClient", () => {
     };
     gh.enqueue(
       projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [[]],
       [[partial]],
     );
 
@@ -339,6 +337,69 @@ describe("GitHubProjectClient", () => {
       code: "PROJECT_RECORD_LABEL_RECOVERY_REQUIRED",
       details: { issue_number: 77, missing_labels: ["project-record"] },
     });
+    expect(gh.calls.some((call) => call.args.includes("POST") && call.args.includes("repos/owner/registry/issues"))).toBe(false);
+  });
+
+  it.each([
+    ["project-record-only", [{ name: "project-record" }], ["trial"]],
+    ["unlabeled", [], ["trial", "project-record"]],
+  ])("finds a canonical %s interrupted record without a label-filtered query", async (_case, labels, missingLabels) => {
+    const gh = new QueuedGhRunner();
+    const partial = {
+      node_id: "I_partial",
+      number: 78,
+      title: "Example",
+      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
+      labels,
+    };
+    gh.enqueue(
+      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
+      [[partial]],
+    );
+
+    const error = await client(gh).registerProject({
+      project_id: "prj-example",
+      title: "Example",
+      objective: "Prove the trial flow",
+      repo_ids: ["repo-example"],
+      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
+    }).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({
+      code: "PROJECT_RECORD_LABEL_RECOVERY_REQUIRED",
+      details: { issue_number: 78, missing_labels: missingLabels },
+    });
+    const issueList = gh.calls.find((call) => call.credential === "repo");
+    expect(issueList?.args).toEqual(expect.arrayContaining(["--paginate", "--slurp"]));
+    expect(issueList?.args.some((arg) => arg.startsWith("labels="))).toBe(false);
+    expect(gh.calls.some((call) => call.args.includes("POST") && call.args.includes("repos/owner/registry/issues"))).toBe(false);
+  });
+
+  it("detects a complete and partial canonical record with the same ID before any create or adoption", async () => {
+    const gh = new QueuedGhRunner();
+    const complete = {
+      node_id: "I_complete",
+      number: 79,
+      title: "Example",
+      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
+      labels: [{ name: "trial" }, { name: "project-record" }],
+    };
+    const partial = { ...complete, node_id: "I_partial", number: 80, labels: [{ name: "trial" }] };
+    gh.enqueue(
+      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
+      [[complete, partial]],
+    );
+
+    await expect(client(gh).registerProject({
+      project_id: "prj-example",
+      title: "Example",
+      objective: "Prove the trial flow",
+      repo_ids: ["repo-example"],
+      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
+    })).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_RECORD" });
+
+    const issueList = gh.calls.find((call) => call.credential === "repo");
+    expect(issueList?.args.some((arg) => arg.startsWith("labels="))).toBe(false);
     expect(gh.calls.some((call) => call.args.includes("POST") && call.args.includes("repos/owner/registry/issues"))).toBe(false);
   });
 });
