@@ -5,28 +5,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
 import { loadControlConfig } from "../config.js";
-import { ProcessRunner, reexecUnderMutationLock, type MutationLockRuntime } from "../process.js";
-
-function configForLock() {
-  return loadControlConfig({
-    HOME: "/home/jhw",
-    JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
-    JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
-    JHW_BUILD_HOST: "cantopsbuildserver",
-    JHW_GITHUB_OWNER: "jhw7500",
-    JHW_PROJECT_NUMBER: "7",
-    JHW_CONTROL_STATE_DIR: "/srv/jhw/state",
-  });
-}
-
-function lockRuntime(status: number | null, exits: number[]): MutationLockRuntime {
-  return {
-    environment: {},
-    mkdirSync: () => undefined,
-    spawnSync: () => ({ status }),
-    exit: (code) => { exits.push(code); },
-  };
-}
+import { ProcessRunner } from "../process.js";
 
 describe("control process boundary", () => {
   it("never includes secret environment values in a failed command", async () => {
@@ -250,72 +229,5 @@ describe("control process boundary", () => {
     expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
   });
 
-  it("re-execs under flock without terminating an injected test runtime", () => {
-    const calls: unknown[][] = [];
-    let exitCode: number | undefined;
 
-    reexecUnderMutationLock(["project", "register"], configForLock(), {
-      environment: {},
-      mkdirSync: (...args) => calls.push(["mkdir", ...args]),
-      spawnSync: (...args) => {
-        calls.push(["spawn", ...args]);
-        return { status: 42 };
-      },
-      exit: (code) => {
-        exitCode = code;
-      },
-    });
-
-    expect(calls).toEqual([
-      ["mkdir", "/srv/jhw/state", { recursive: true, mode: 0o700 }],
-      [
-        "spawn",
-        "flock",
-        [
-          "-n",
-          "-E",
-          "75",
-          "/srv/jhw/state/registry.lock",
-          process.execPath,
-          expect.stringMatching(/cli\.js$/),
-          "project",
-          "register",
-        ],
-        {
-          stdio: "inherit",
-          env: { JHW_CONTROL_LOCK_HELD: "1" },
-        },
-      ],
-    ]);
-    expect(exitCode).toBe(42);
-  });
-
-  it("does not re-exec when the mutation lock is already held", () => {
-    const config = configForLock();
-    let spawned = false;
-
-    reexecUnderMutationLock(["task", "start"], config, {
-      environment: { JHW_CONTROL_LOCK_HELD: "1" },
-      mkdirSync: () => { throw new Error("must not create lock directory"); },
-      spawnSync: () => {
-        spawned = true;
-        return { status: 0 };
-      },
-      exit: () => { throw new Error("must not exit"); },
-    });
-
-    expect(spawned).toBe(false);
-  });
-
-  it("preserves flock contention exit code 75", () => {
-    const exits: number[] = [];
-    reexecUnderMutationLock(["task", "start"], configForLock(), lockRuntime(75, exits));
-    expect(exits).toEqual([75]);
-  });
-
-  it("uses temporary-failure exit code when flock has no status", () => {
-    const exits: number[] = [];
-    reexecUnderMutationLock(["task", "start"], configForLock(), lockRuntime(null, exits));
-    expect(exits).toEqual([75]);
-  });
 });

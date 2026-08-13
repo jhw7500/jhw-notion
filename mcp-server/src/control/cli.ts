@@ -1,13 +1,13 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
 
 import { Catalog } from "./catalog.js";
 import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
-import { ProcessRunner, reexecUnderMutationLock } from "./process.js";
+import { ProcessRunner, runUnderMutationLock } from "./process.js";
 import { RegistryGit } from "./registry-git.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
@@ -17,8 +17,7 @@ const TASK_ID = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const CLAIM_ID = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PROJECT_ID = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const REPO_ID = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
-const SHA = /^[0-9a-fA-F]{7,128}$/;
-const SECRET_ENV_KEY = /_(?:TOKEN|KEY|SECRET)$/;
+const SHA = /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/;
 
 const commandNames = [
   "task start",
@@ -271,25 +270,10 @@ function retainedClaim(cause: unknown): Record<string, string> | undefined {
   return { task_id, claim_id, state: claim_state };
 }
 
-function errorJson(cause: unknown): CliResult {
+export function controlErrorResult(cause: unknown): CliResult {
   const retained = retainedClaim(cause);
   const error = { code: errorCode(cause), ...(retained ? { retained_claim: retained } : {}) };
   return { exitCode: exitCode(cause), stdout: "", stderr: `${JSON.stringify({ error })}\n` };
-}
-
-function secretValues(env: NodeJS.ProcessEnv): string[] {
-  return [...new Set(Object.entries(env)
-    .filter(([key, entry]) => SECRET_ENV_KEY.test(key) && entry)
-    .map(([, entry]) => entry as string))]
-    .sort((left, right) => right.length - left.length);
-}
-
-function redactSecrets(value: string, env: NodeJS.ProcessEnv): string {
-  return secretValues(env).reduce((rendered, secret) => rendered.replaceAll(secret, "[REDACTED]"), value);
-}
-
-function redacted(result: CliResult, env: NodeJS.ProcessEnv): CliResult {
-  return { ...result, stdout: redactSecrets(result.stdout, env), stderr: redactSecrets(result.stderr, env) };
 }
 
 function journalMetadata(command: CommandName, flags: ParsedFlags | undefined): {
@@ -415,6 +399,8 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     if (validation.length === 0) usage("Task finish requires validation");
     const outcome = value(flags, "--outcome")?.trim();
     const source_task_revision = value(flags, "--source-task-revision")?.trim();
+    // Validate friction input before the lifecycle service or journal can mutate.
+    assertPositiveNumber(value(flags, "--active-work-minutes"));
     if (status === "completed" && !outcome) usage("Completed Task finish requires outcome");
     if (status === "handoff" && (!source_task_revision || source_task_revision === "unknown")) {
       usage("Handoff Task finish requires source-task-revision");
@@ -457,7 +443,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const actionName = required(flags, "--action");
     let action: TaskRecoverInput["action"];
     if (actionName === "status" || actionName === "force-end") {
-      if (value(flags, "--session")) usage("Recovery action does not accept session");
+      // The documented session is advisory for non-takeover recovery.
       action = { kind: actionName };
     } else if (actionName === "takeover") {
       action = { kind: "takeover", session_id: required(flags, "--session") };
@@ -470,12 +456,20 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       result: resultJson(command, {
         kind: recovered.kind,
         task_id,
-        claim_id,
         ...(recovered.kind === "status" ? {
+          claim_id,
           process_exists: recovered.process_exists,
           worktree_mapped: recovered.worktree_mapped,
           dirty: recovered.dirty,
           ahead: recovered.ahead,
+        } : {}),
+        ...(recovered.kind === "takeover" ? {
+          active: {
+            task_id: recovered.active.task_id,
+            claim_id: recovered.active.claim_id,
+            session_id: recovered.active.session_id,
+            host: recovered.active.host,
+          },
         } : {}),
       }),
     };
@@ -533,12 +527,14 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
   } catch (cause) {
     if (cause instanceof ParsedCommandFailure) {
       flags = cause.flags;
-      result = errorJson(cause.originalCause);
+      result = controlErrorResult(cause.originalCause);
     } else {
-      result = errorJson(cause);
+      result = controlErrorResult(cause);
     }
+    // Argument rejection is not a command execution and therefore must not
+    // invoke the measurement journal.
+    if (result.exitCode === 2) return result;
   }
-  result = redacted(result, dependencies.env);
 
   const finished = dependencies.now?.() ?? new Date();
   const elapsed = Math.max(0, finished.getTime() - started.getTime());
@@ -555,7 +551,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
       ...metadata,
     });
   } catch {
-    return errorJson(new ControlError("JOURNAL_WRITE_FAILED", "Unable to append the pilot journal"));
+    return controlErrorResult(new ControlError("JOURNAL_WRITE_FAILED", "Unable to append the pilot journal"));
   }
   return result;
 }
@@ -578,23 +574,33 @@ async function main(): Promise<void> {
     process.exit(0);
     return;
   }
-  let dependencies: CliDependencies;
   try {
-    dependencies = createCliDependencies(process.env);
-    if (requiresMutationLock(argv) && process.env.JHW_CONTROL_LOCK_HELD !== "1") {
-      reexecUnderMutationLock(argv, loadControlConfig(process.env));
+    if (requiresMutationLock(argv)) {
+      const result = await runUnderMutationLock(argv, loadControlConfig(process.env), process.env);
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      process.exit(result.exitCode);
       return;
     }
-    const result = await runCli(argv, dependencies);
+    const result = await runCli(argv, createCliDependencies(process.env));
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     process.exit(result.exitCode);
   } catch (cause) {
-    const result = errorJson(cause);
-    if (result.stderr) process.stderr.write(redactSecrets(result.stderr, process.env));
+    const result = controlErrorResult(cause);
+    if (result.stderr) process.stderr.write(result.stderr);
     process.exit(result.exitCode);
   }
 }
 
-const entryPath = process.argv[1] ? resolve(process.argv[1]) : "";
-if (entryPath === fileURLToPath(import.meta.url)) void main();
+/** Safely recognizes direct or npm-bin symlink execution without trusting argv text. */
+export function isCliEntrypointInvocation(invokedPath: string | undefined, modulePath: string): boolean {
+  if (!invokedPath) return false;
+  try {
+    return realpathSync(invokedPath) === realpathSync(modulePath);
+  } catch {
+    return false;
+  }
+}
+
+if (isCliEntrypointInvocation(process.argv[1], fileURLToPath(import.meta.url))) void main();

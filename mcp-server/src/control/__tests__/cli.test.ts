@@ -66,6 +66,7 @@ type Overrides = {
   catalog?: Record<string, unknown>;
   portfolio?: Record<string, unknown>;
   preflight?: Record<string, unknown>;
+  journal?: { append: ReturnType<typeof vi.fn> };
 };
 
 function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
@@ -119,6 +120,7 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     catalog,
     portfolio,
     preflight,
+    ...(overrides.journal ? { journal: overrides.journal } : {}),
   } as unknown as CliDependencies;
 }
 
@@ -236,6 +238,25 @@ describe("runCli", () => {
     expect(dependencies.taskService.finish).not.toHaveBeenCalled();
   });
 
+  it.each(["0", "-1", "NaN", "Infinity"])("rejects invalid active-work-minutes %s before service or journal mutation", async (minutes) => {
+    const journal = { append: vi.fn() };
+    const dependencies = makeCliDependencies({ journal });
+
+    const result = await runCli([
+      "task", "finish",
+      "--task", TASK_ID,
+      "--claim", CLAIM_ID,
+      "--status", "completed",
+      "--outcome", "shipped",
+      "--validation", "targeted test",
+      "--active-work-minutes", minutes,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.taskService.finish).not.toHaveBeenCalled();
+    expect(journal.append).not.toHaveBeenCalled();
+  });
+
   it("records active work minutes without writing validation text to the journal", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-"));
     const dependencies = makeCliDependencies({ stateDir });
@@ -311,6 +332,24 @@ describe("runCli", () => {
     expect(result.stderr).not.toContain("/private/secret");
   });
 
+  it.each(["a".repeat(7), "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65)])(
+    "rejects non-40/64 hexadecimal SHA length %s before project registration", async (sha) => {
+      const dependencies = makeCliDependencies();
+      const result = await runCli(["project", "register", "--project", PROJECT_ID, "--base-sha", sha], dependencies);
+
+      expect(result.exitCode).toBe(2);
+      expect(dependencies.portfolio.registerProject).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["A".repeat(40), "b".repeat(64)])("accepts hexadecimal SHA length %d", async (sha) => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli(["project", "register", "--project", PROJECT_ID, "--base-sha", sha], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.portfolio.registerProject).toHaveBeenCalledWith(expect.objectContaining({ base_sha: sha.toLowerCase() }));
+  });
+
   it("validates base and head SHA values before an unavailable project registration port runs", async () => {
     const dependencies = makeCliDependencies({
       portfolio: { registerProject: vi.fn(async () => { throw new ControlError("PORTFOLIO_UNAVAILABLE", "not wired"); }) },
@@ -325,6 +364,51 @@ describe("runCli", () => {
 
     expect(result.exitCode).toBe(2);
     expect(dependencies.portfolio.registerProject).not.toHaveBeenCalled();
+  });
+
+  it("allows an optional session for status/force-end recovery and reports the takeover's new Claim", async () => {
+    const replacement = {
+      ...activeClaim,
+      claim_id: "clm-0198e748-3a00-7000-8000-000000000003",
+      session_id: "codex-new",
+      host: "new-host",
+    };
+    const dependencies = makeCliDependencies({
+      taskService: {
+        recover: vi.fn()
+          .mockResolvedValueOnce({ kind: "status", active: activeClaim, process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 })
+          .mockResolvedValueOnce({ kind: "force-end", history: { ...activeClaim, status: "force-ended", released_at: "2026-08-13T00:01:00.000Z" } })
+          .mockResolvedValueOnce({ kind: "takeover", active: replacement, history: { ...replacement, status: "taken-over", released_at: "2026-08-13T00:01:00.000Z" } }),
+      },
+    });
+
+    const status = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "status", "--session", "optional-session"], dependencies);
+    const forceEnd = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "force-end", "--session", "optional-session"], dependencies);
+    const takeover = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "takeover", "--session", "codex-new"], dependencies);
+    const newClaim = JSON.parse(takeover.stdout).result.active.claim_id;
+    const owner = await runCli(["task", "assert-owner", "--task", TASK_ID, "--claim", newClaim], dependencies);
+
+    expect(status.exitCode).toBe(0);
+    expect(forceEnd.exitCode).toBe(0);
+    expect(takeover.exitCode).toBe(0);
+    expect(dependencies.taskService.recover).toHaveBeenNthCalledWith(1, { task_id: TASK_ID, claim_id: CLAIM_ID, action: { kind: "status" } });
+    expect(dependencies.taskService.recover).toHaveBeenNthCalledWith(2, { task_id: TASK_ID, claim_id: CLAIM_ID, action: { kind: "force-end" } });
+    expect(JSON.parse(takeover.stdout)).toMatchObject({
+      result: { kind: "takeover", active: { claim_id: replacement.claim_id, session_id: "codex-new", host: "new-host" } },
+    });
+    expect(newClaim).toBe(replacement.claim_id);
+    expect(owner.exitCode).toBe(0);
+    expect(dependencies.taskService.assertOwner).toHaveBeenLastCalledWith(TASK_ID, replacement.claim_id);
+  });
+
+  it.each(['"', "error", "a"])("keeps JSON valid for hostile ambient secret value %j", async (secret) => {
+    const result = await runCli(["preflight"], makeCliDependencies({
+      env: { GH_PROJECT_TOKEN: secret },
+      preflight: { run: async () => { throw new ControlError("PREFLIGHT_UNAVAILABLE", `untrusted ${secret}`); } },
+    }));
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "PREFLIGHT_UNAVAILABLE" } });
+    expect(Object.keys(JSON.parse(result.stderr).error)).toEqual(["code"]);
   });
 
   it("maps an ownership Claim conflict to exit code 4", async () => {

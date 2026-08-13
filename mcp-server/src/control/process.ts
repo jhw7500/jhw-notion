@@ -1,16 +1,15 @@
-import { spawn, spawnSync, type SpawnSyncOptions } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import { ensureSecureStateDirectory, PilotJournal } from "./journal.js";
 
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const SECRET_ENV_KEY = /_(?:TOKEN|KEY|SECRET)$/;
-const DEFAULT_CLI_ENTRY_PATH = fileURLToPath(new URL("./cli.js", import.meta.url));
 
 export interface ProcessResult {
   command: string;
@@ -369,45 +368,253 @@ export class ProcessRunner {
   }
 }
 
+const MAX_CREDENTIAL_ENVELOPE_BYTES = 16 * 1024;
+const DEFAULT_LOCKED_CLI_ENTRY_PATH = fileURLToPath(new URL("./locked-cli.js", import.meta.url));
+const stableExitCodes = new Set([0, 1, 2, 4, 75, 78]);
+
+export interface MutationLockChild {
+  stdin: Writable | null;
+  stdout: Readable | null;
+  stderr: Readable | null;
+  once(event: string, listener: (...args: unknown[]) => void): unknown;
+}
+
 export interface MutationLockRuntime {
-  environment: NodeJS.ProcessEnv;
-  mkdirSync: (path: string, options: { recursive: true; mode: number }) => void;
-  spawnSync: (
+  spawn: (
     command: string,
     args: string[],
-    options: SpawnSyncOptions,
-  ) => { status: number | null };
-  exit: (code: number) => void;
+    options: { env: NodeJS.ProcessEnv; stdio: ["pipe", "pipe", "pipe"] },
+  ) => MutationLockChild;
+}
+
+export interface MutationLockResult {
+  exitCode: 0 | 1 | 2 | 4 | 75 | 78;
+  stdout: string;
+  stderr: string;
 }
 
 const productionLockRuntime: MutationLockRuntime = {
-  environment: process.env,
-  mkdirSync,
-  spawnSync,
-  exit: (code) => process.exit(code),
+  spawn: (command, args, options) => spawn(command, args, options),
 };
 
+function safeCommandName(argv: readonly string[]): string {
+  if (argv[0] === "task" && ["start", "status", "finish", "recover", "assert-owner"].includes(argv[1] ?? "")) {
+    return `task ${argv[1]}`;
+  }
+  if (argv[0] === "portfolio" && ["status", "export"].includes(argv[1] ?? "")) return `portfolio ${argv[1]}`;
+  if (argv[0] === "project" && argv[1] === "register") return "project register";
+  if (argv[0] === "preflight") return "preflight";
+  return "invalid";
+}
+
+function lockError(code: string, exitCode: 1 | 75): MutationLockResult {
+  return {
+    exitCode,
+    stdout: "",
+    stderr: `${JSON.stringify({ error: { code } })}\n`,
+  };
+}
+
+async function recordLockFailure(config: ControlConfig, argv: readonly string[], result: MutationLockResult): Promise<void> {
+  const now = new Date();
+  const error = JSON.parse(result.stderr) as { error: { code: string } };
+  await new PilotJournal(config.stateDir).append({
+    command: safeCommandName(argv),
+    started_at: now.toISOString(),
+    finished_at: now.toISOString(),
+    elapsed_ms: 0,
+    ok: false,
+    error_code: error.error.code,
+    payload_bytes: Buffer.byteLength(result.stderr, "utf8"),
+  }).catch(() => undefined);
+}
+
+function credentialsFromEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
+  const credentials: Record<string, string> = {};
+  for (const key of ["GH_PROJECT_TOKEN", "GH_REPO_TOKEN"] as const) {
+    const value = env[key];
+    if (typeof value === "string") credentials[key] = value;
+  }
+  return credentials;
+}
+
+/** Serializes the only credentials permitted across the flock boundary. */
+export function privateCredentialEnvelope(env: NodeJS.ProcessEnv): string {
+  const envelope = JSON.stringify(credentialsFromEnvironment(env));
+  if (Buffer.byteLength(envelope, "utf8") > MAX_CREDENTIAL_ENVELOPE_BYTES) {
+    throw new ControlError("CREDENTIAL_ENVELOPE_TOO_LARGE", "Credential envelope exceeds its private input bound");
+  }
+  return envelope;
+}
+
+/** Reads one bounded private credential envelope from the locked child stdin. */
+export async function readPrivateCredentialEnvelope(stream: AsyncIterable<Buffer | string>): Promise<NodeJS.ProcessEnv> {
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of stream) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+    length += bytes.length;
+    if (length > MAX_CREDENTIAL_ENVELOPE_BYTES) {
+      throw new ControlError("CREDENTIAL_ENVELOPE_TOO_LARGE", "Credential envelope exceeds its private input bound");
+    }
+    chunks.push(bytes);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw) return {};
+  let candidate: unknown;
+  try {
+    candidate = JSON.parse(raw);
+  } catch {
+    throw new ControlError("CREDENTIAL_ENVELOPE_INVALID", "Credential envelope is invalid");
+  }
+  if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+    throw new ControlError("CREDENTIAL_ENVELOPE_INVALID", "Credential envelope is invalid");
+  }
+  const output: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(candidate)) {
+    if ((key !== "GH_PROJECT_TOKEN" && key !== "GH_REPO_TOKEN") || typeof value !== "string") {
+      throw new ControlError("CREDENTIAL_ENVELOPE_INVALID", "Credential envelope is invalid");
+    }
+    output[key] = value;
+  }
+  return output;
+}
+
+function captureLockStream(stream: Readable | null): Promise<{ value: string; tooLarge: boolean }> {
+  if (!stream) return Promise.resolve({ value: "", tooLarge: false });
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let length = 0;
+    let tooLarge = false;
+    stream.on("data", (chunk: Buffer | string) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (length + bytes.length > MAX_CAPTURE_BYTES) {
+        tooLarge = true;
+        const remaining = Math.max(0, MAX_CAPTURE_BYTES - length);
+        if (remaining) {
+          chunks.push(bytes.subarray(0, remaining));
+          length += remaining;
+        }
+        return;
+      }
+      chunks.push(bytes);
+      length += bytes.length;
+    });
+    stream.once("end", () => resolve({ value: Buffer.concat(chunks).toString("utf8"), tooLarge }));
+    stream.once("error", () => resolve({ value: "", tooLarge: true }));
+  });
+}
+
+function waitForLockChild(child: MutationLockChild): Promise<{ kind: "close"; status: number | null } | { kind: "spawn-error" }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (result: { kind: "close"; status: number | null } | { kind: "spawn-error" }) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    child.once("error", () => settle({ kind: "spawn-error" }));
+    child.once("close", (status) => settle({ kind: "close", status: typeof status === "number" ? status : null }));
+  });
+}
+
+function validForwardedResult(status: number | null, stdout: string, stderr: string): MutationLockResult | undefined {
+  if (status === null || !stableExitCodes.has(status)) return undefined;
+  try {
+    if (status === 0 && !stderr) {
+      const parsed = JSON.parse(stdout) as { command?: unknown; result?: unknown };
+      if (typeof parsed === "object" && parsed !== null && typeof parsed.command === "string" && "result" in parsed) {
+        return { exitCode: 0, stdout, stderr: "" };
+      }
+    }
+    if (status !== 0 && !stdout) {
+      const parsed = JSON.parse(stderr) as { error?: { code?: unknown } };
+      if (typeof parsed?.error?.code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(parsed.error.code)) {
+        return { exitCode: status as MutationLockResult["exitCode"], stdout: "", stderr };
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 /**
- * Replaces the current process with a flock-guarded CLI child before a mutation.
- * Runtime and CLI path are injectable to test construction without exiting Vitest.
+ * Executes the private locked entrypoint under flock. The installed caller never
+ * trusts an environment marker: every mutation passes through this boundary.
+ * Credentials are removed from flock's argv/environment and cross only stdin.
  */
-export function reexecUnderMutationLock(
+export async function runUnderMutationLock(
   argv: string[],
   config: ControlConfig,
+  environment: NodeJS.ProcessEnv = process.env,
   runtime: MutationLockRuntime = productionLockRuntime,
-  cliEntryPath = DEFAULT_CLI_ENTRY_PATH,
-): void {
-  if (runtime.environment.JHW_CONTROL_LOCK_HELD === "1") return;
+  lockedCliEntryPath = DEFAULT_LOCKED_CLI_ENTRY_PATH,
+): Promise<MutationLockResult> {
+  try {
+    await ensureSecureStateDirectory(config.stateDir);
+  } catch {
+    return lockError("LOCK_SETUP_FAILED", 1);
+  }
 
+  let envelope: string;
+  try {
+    envelope = privateCredentialEnvelope(environment);
+  } catch {
+    const result = lockError("CREDENTIAL_ENVELOPE_TOO_LARGE", 1);
+    await recordLockFailure(config, argv, result);
+    return result;
+  }
+  const childEnvironment = sanitizedChildEnvironment(environment);
+  delete childEnvironment.JHW_CONTROL_LOCK_HELD;
   const lock = join(config.stateDir, "registry.lock");
-  runtime.mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
-  const child = runtime.spawnSync(
-    "flock",
-    ["-n", "-E", "75", lock, process.execPath, cliEntryPath, ...argv],
-    {
-      stdio: "inherit",
-      env: { ...sanitizedChildEnvironment(runtime.environment), JHW_CONTROL_LOCK_HELD: "1" },
-    },
-  );
-  runtime.exit(child.status ?? 75);
+  let child: MutationLockChild;
+  try {
+    child = runtime.spawn(
+      "flock",
+      ["-n", "-E", "75", lock, process.execPath, lockedCliEntryPath, ...argv],
+      { stdio: ["pipe", "pipe", "pipe"], env: childEnvironment },
+    );
+  } catch {
+    const result = lockError("LOCK_SPAWN_FAILED", 1);
+    await recordLockFailure(config, argv, result);
+    return result;
+  }
+
+  if (!child.stdin) {
+    const result = lockError("LOCK_STDIN_FAILED", 1);
+    await recordLockFailure(config, argv, result);
+    return result;
+  }
+  let stdinFailed = false;
+  child.stdin.once("error", () => { stdinFailed = true; });
+  try {
+    child.stdin.end(envelope);
+  } catch {
+    stdinFailed = true;
+  }
+  const stdoutCapture = captureLockStream(child.stdout);
+  const stderrCapture = captureLockStream(child.stderr);
+  const outcome = await waitForLockChild(child);
+  if (outcome.kind === "spawn-error") {
+    const result = lockError("LOCK_SPAWN_FAILED", 1);
+    await recordLockFailure(config, argv, result);
+    return result;
+  }
+  const [stdout, stderr] = await Promise.all([stdoutCapture, stderrCapture]);
+  if (stdinFailed || stdout.tooLarge || stderr.tooLarge) {
+    const result = lockError(stdinFailed ? "LOCK_STDIN_FAILED" : "LOCK_OUTPUT_INVALID", 1);
+    await recordLockFailure(config, argv, result);
+    return result;
+  }
+  const forwarded = validForwardedResult(outcome.status, stdout.value, stderr.value);
+  if (forwarded) return forwarded;
+  if (outcome.status === 75 && !stdout.value && !stderr.value) {
+    const result = lockError("LOCK_CONTENDED", 75);
+    await recordLockFailure(config, argv, result);
+    return result;
+  }
+  const result = lockError("LOCK_EXEC_FAILED", 1);
+  await recordLockFailure(config, argv, result);
+  return result;
 }
