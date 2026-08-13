@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -265,7 +265,70 @@ describe("TaskService", () => {
     expect(claims.finishClaim).toHaveBeenCalledTimes(1);
   });
 
-  it("uses real RegistryGit and ClaimService evidence for a failed Handoff release retry", async () => {
+  it.each([
+    ["a non-canonical count", "01", "0".repeat(64)],
+    ["a non-hex digest", "0", "G".repeat(64)],
+  ])("fails closed for committed dirty digest evidence with %s", async (_reason, dirtyCount, dirtyDigest) => {
+    const { tasks, claims, fixture } = await taskFixture();
+    const pointer = join(fixture.registryDir, "handoffs", TASK_ID, `${CLAIM_ID}.md`);
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(pointer, buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: "issue-revision-7",
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+      git_state: [
+        `branch: ${plan.branch}`,
+        "head_sha: 0123456789abcdef",
+        `dirty_count: ${dirtyCount}`,
+        `dirty_digest: ${dirtyDigest}`,
+        "ahead: 0",
+        "behind: 0",
+      ],
+      validation: ["npm test: pass"],
+    }), "utf8");
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+    })).rejects.toMatchObject({ code: "HANDOFF_RETRY_CONFLICT" });
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+  });
+
+  it("accepts only safely verifiable empty legacy dirty evidence", async () => {
+    const { tasks, claims, fixture } = await taskFixture();
+    const pointer = join(fixture.registryDir, "handoffs", TASK_ID, `${CLAIM_ID}.md`);
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(pointer, buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: "issue-revision-7",
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+      git_state: [
+        `branch: ${plan.branch}`,
+        "head_sha: 0123456789abcdef",
+        "dirty_files: 0",
+        "dirty_paths: []",
+        "ahead: 0",
+        "behind: 0",
+      ],
+      validation: ["npm test: pass"],
+    }), "utf8");
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+    })).resolves.toMatchObject({ worktree_removed: false });
+    expect(claims.finishClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses bounded dirty evidence for a visible .ai Handoff with long reordered paths", async () => {
     const fixture = await makeRegistryFixture();
     fixtures.push(fixture);
     const config = configFor(fixture.registryDir);
@@ -293,6 +356,15 @@ describe("TaskService", () => {
     };
     const actualClaims = new ClaimService(config, registry, catalog, inspection);
     const worktrees = new WorktreeManager(config);
+    let reorderInspection = false;
+    const taskWorktrees = {
+      createOrReuse: worktrees.createOrReuse.bind(worktrees),
+      inspect: async (...args: Parameters<WorktreeManager["inspect"]>) => {
+        const current = await worktrees.inspect(...args);
+        return reorderInspection ? { ...current, dirty_files: [...current.dirty_files].reverse() } : current;
+      },
+      removeIfSafe: worktrees.removeIfSafe.bind(worktrees),
+    };
     let failFirstRelease = true;
     const claims = {
       claimTask: actualClaims.claimTask.bind(actualClaims),
@@ -310,7 +382,7 @@ describe("TaskService", () => {
       new Date("2026-08-13T12:36:56.789Z"),
       new Date("2026-08-13T12:37:56.789Z"),
     ];
-    const tasks = new TaskService(config, claims, worktrees, registry, () => timestamps.shift() ?? new Date("2026-08-13T12:38:56.789Z"));
+    const tasks = new TaskService(config, claims, taskWorktrees, registry, () => timestamps.shift() ?? new Date("2026-08-13T12:38:56.789Z"));
     const started = await tasks.start({
       task_id: task.id,
       task_alias: taskAlias,
@@ -328,15 +400,101 @@ describe("TaskService", () => {
       progress: "Durable Registry copy is the retry source.",
     };
     const pointer = `handoffs/${task.id}/${started.claim.claim_id}.md`;
+    const allocation = await worktrees.inspect(started.claim);
+    const dirtyDirectory = join(allocation.path, "dirty");
+    await mkdir(dirtyDirectory, { recursive: true });
+    const dirtyCount = 48;
+    await Promise.all(Array.from({ length: dirtyCount }, async (_, index) => {
+      await writeFile(join(dirtyDirectory, `${String(index).padStart(3, "0")}-${"x".repeat(64)}.txt`), "dirty\n", "utf8");
+    }));
 
     await expect(tasks.finish(input)).rejects.toThrow("injected release failure");
     await registry.assertHeadRegularFile(pointer);
     const committed = await registry.readHeadRegularFile(pointer);
+    expect(committed).toContain(`dirty_count: ${dirtyCount}`);
+    expect(committed).toMatch(/dirty_digest: [0-9a-f]{64}/);
+    expect(committed).not.toContain("dirty_paths:");
+    expect(committed).not.toContain("dirty/000-");
+    expect(Buffer.byteLength(committed, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect((await worktrees.inspect(started.claim)).dirty_files).toContain(".ai/handoff.md");
+
+    const unrelated = join(allocation.path, "unrelated-change.txt");
+    await writeFile(unrelated, "unrelated\n", "utf8");
+    reorderInspection = true;
+    await expect(tasks.finish(input)).rejects.toMatchObject({ code: "HANDOFF_RETRY_CONFLICT" });
+    await expect(actualClaims.getActive(task.id)).resolves.toMatchObject({ claim_id: started.claim.claim_id });
+    await unlink(unrelated);
     await expect(tasks.finish(input)).resolves.toMatchObject({ history: { handoff_pointer: pointer } });
 
     expect(await registry.readHeadRegularFile(pointer)).toBe(committed);
     expect(await actualClaims.getActive(task.id)).toBeUndefined();
     expect(timestamps).toHaveLength(1);
+  });
+
+  it("accepts an ignored .ai Handoff retry when Git exposes no local delta", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const config = configFor(fixture.registryDir);
+    const source = join(fixture.root, "source-ignored-ai");
+    await git(fixture.root, "init", "--initial-branch=main", source);
+    await git(source, "config", "user.name", "Phase1A Test");
+    await git(source, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(source, ".gitignore"), ".ai/\n", "utf8");
+    await writeFile(join(source, "README.md"), "# Source\n", "utf8");
+    await git(source, "add", ".gitignore", "README.md");
+    await git(source, "commit", "-m", "Ignore local AI handoffs");
+    const registry = new RegistryGit(config, new ProcessRunner());
+    const catalog = new Catalog(config, registry);
+    const task = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: `${taskAlias}-ignored`,
+      goal: "temporary ignored handoff",
+      done_conditions: ["retry"],
+      expected_scope: ["src/control"],
+    });
+    const actualClaims = new ClaimService(config, registry, catalog, {
+      async inspect() {
+        return { process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 };
+      },
+    });
+    const worktrees = new WorktreeManager(config);
+    let failFirstRelease = true;
+    const claims = {
+      claimTask: actualClaims.claimTask.bind(actualClaims),
+      assertOwner: actualClaims.assertOwner.bind(actualClaims),
+      recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
+      finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
+        if (failFirstRelease) {
+          failFirstRelease = false;
+          throw new Error("injected release failure");
+        }
+        return actualClaims.finishClaim(...args);
+      },
+    };
+    const tasks = new TaskService(config, claims, worktrees, registry);
+    const started = await tasks.start({
+      task_id: task.id,
+      task_alias: `${taskAlias}-ignored`,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      session_id: "codex-ignored-ai",
+      repository_path: source,
+    });
+    const input = {
+      task_id: task.id,
+      claim_id: started.claim.claim_id,
+      status: "handoff" as const,
+      validation: ["npm test: pass"],
+      source_task_revision: "temporary-v1",
+    };
+
+    await expect(tasks.finish(input)).rejects.toThrow("injected release failure");
+    const current = await worktrees.inspect(started.claim);
+    expect(current.dirty).toBe(false);
+    expect(current.dirty_files).toEqual([]);
+    await expect(readFile(join(current.path, ".ai", "handoff.md"), "utf8")).resolves.toContain("# Handoff:");
+    await expect(tasks.finish(input)).resolves.toMatchObject({ worktree_removed: false });
   });
 
   it("records only stable create-failure codes in real Registry Claim history", async () => {

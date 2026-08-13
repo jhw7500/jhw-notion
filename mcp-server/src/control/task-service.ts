@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   ClaimTaskInput,
   FinishOutcome,
@@ -119,8 +121,8 @@ function assertValidation(validation: string[]): void {
 interface HandoffGitState {
   branch: string;
   head_sha: string;
-  dirty_files: number;
-  dirty_paths: string[];
+  dirty_count: number;
+  dirty_digest: string;
   ahead: number;
   behind: number;
 }
@@ -132,18 +134,47 @@ function handoffRetryConflict(handoffPath: string, reason: string): ControlError
   });
 }
 
+function canonicalDirtyPaths(paths: readonly string[]): string {
+  // JSON string encoding is unambiguous for arbitrary path characters; sorting
+  // makes Git status enumeration order irrelevant without storing paths in the
+  // bounded Handoff evidence.
+  return JSON.stringify([...paths].sort());
+}
+
+function dirtyEvidence(paths: readonly string[]): Pick<HandoffGitState, "dirty_count" | "dirty_digest"> {
+  return {
+    dirty_count: paths.length,
+    dirty_digest: createHash("sha256").update(canonicalDirtyPaths(paths), "utf8").digest("hex"),
+  };
+}
+
+function withoutExpectedLocalHandoff(paths: readonly string[]): string[] {
+  const index = paths.indexOf(".ai/handoff.md");
+  if (index < 0) return [...paths];
+  // Remove one precise expected retry delta. A duplicated entry remains part
+  // of evidence and therefore fails closed rather than being silently hidden.
+  return paths.filter((_, current) => current !== index);
+}
+
 function parseHandoffGitState(value: string, handoffPath: string): HandoffGitState {
   const values = new Map<string, string>();
-  const permitted = new Set(["branch", "head_sha", "dirty_files", "dirty_paths", "ahead", "behind"]);
   for (const line of value.split("\n")) {
     const separator = line.indexOf(": ");
     if (separator <= 0) throw handoffRetryConflict(handoffPath, "invalid_git_state_line");
     const key = line.slice(0, separator);
-    if (!permitted.has(key)) throw handoffRetryConflict(handoffPath, "unexpected_git_state_key");
     if (values.has(key)) throw handoffRetryConflict(handoffPath, "duplicate_git_state_key");
     values.set(key, line.slice(separator + 2));
   }
-  const required = ["branch", "head_sha", "dirty_files", "ahead", "behind"];
+  const currentKeys = new Set(["branch", "head_sha", "dirty_count", "dirty_digest", "ahead", "behind"]);
+  const legacyKeys = new Set(["branch", "head_sha", "dirty_files", "dirty_paths", "ahead", "behind"]);
+  const hasCurrentEvidence = values.has("dirty_count") || values.has("dirty_digest");
+  const allowed = hasCurrentEvidence ? currentKeys : legacyKeys;
+  if ([...values.keys()].some((key) => !allowed.has(key))) {
+    throw handoffRetryConflict(handoffPath, "unexpected_git_state_key");
+  }
+  const required = hasCurrentEvidence
+    ? ["branch", "head_sha", "dirty_count", "dirty_digest", "ahead", "behind"]
+    : ["branch", "head_sha", "dirty_files", "ahead", "behind"];
   if (required.some((key) => !values.has(key))) throw handoffRetryConflict(handoffPath, "missing_git_state_key");
   const count = (key: string): number => {
     const raw = values.get(key) ?? "";
@@ -152,25 +183,38 @@ function parseHandoffGitState(value: string, handoffPath: string): HandoffGitSta
     if (!Number.isSafeInteger(parsed)) throw handoffRetryConflict(handoffPath, "invalid_git_state_count");
     return parsed;
   };
-  const dirty_files = count("dirty_files");
-  let dirty_paths: unknown = dirty_files === 0 ? [] : undefined;
-  if (values.has("dirty_paths")) {
-    try {
-      dirty_paths = JSON.parse(values.get("dirty_paths") ?? "");
-    } catch {
-      throw handoffRetryConflict(handoffPath, "invalid_dirty_paths");
-    }
-  }
-  if (!Array.isArray(dirty_paths) || dirty_paths.some((path) => typeof path !== "string" || !path)) {
-    throw handoffRetryConflict(handoffPath, "invalid_dirty_paths");
-  }
-  if (new Set(dirty_paths).size !== dirty_paths.length || dirty_paths.length !== dirty_files) {
-    throw handoffRetryConflict(handoffPath, "dirty_paths_count_mismatch");
-  }
   const branch = values.get("branch") ?? "";
   const head_sha = values.get("head_sha") ?? "";
   if (!branch || !head_sha) throw handoffRetryConflict(handoffPath, "missing_git_identity");
-  return { branch, head_sha, dirty_files, dirty_paths, ahead: count("ahead"), behind: count("behind") };
+  if (hasCurrentEvidence) {
+    const dirty_digest = values.get("dirty_digest") ?? "";
+    if (!/^[0-9a-f]{64}$/.test(dirty_digest)) {
+      throw handoffRetryConflict(handoffPath, "invalid_dirty_digest");
+    }
+    return {
+      branch,
+      head_sha,
+      dirty_count: count("dirty_count"),
+      dirty_digest,
+      ahead: count("ahead"),
+      behind: count("behind"),
+    };
+  }
+
+  // Round-2 paths can be safely verified only for the empty original set.
+  // Any nonempty legacy evidence is deliberately fail-closed rather than
+  // retaining its unbounded/truncatable path list in the new contract.
+  if (count("dirty_files") !== 0) throw handoffRetryConflict(handoffPath, "legacy_dirty_evidence_ambiguous");
+  if (values.has("dirty_paths") && values.get("dirty_paths") !== "[]") {
+    throw handoffRetryConflict(handoffPath, "legacy_dirty_evidence_ambiguous");
+  }
+  return {
+    branch,
+    head_sha,
+    ...dirtyEvidence([]),
+    ahead: count("ahead"),
+    behind: count("behind"),
+  };
 }
 
 /**
@@ -336,8 +380,8 @@ export class TaskService {
     return [
       `branch: ${state.branch}`,
       `head_sha: ${state.head_sha}`,
-      `dirty_files: ${state.dirty_files}`,
-      `dirty_paths: ${JSON.stringify(state.dirty_paths)}`,
+      `dirty_count: ${state.dirty_count}`,
+      `dirty_digest: ${state.dirty_digest}`,
       `ahead: ${state.ahead}`,
       `behind: ${state.behind}`,
     ];
@@ -347,8 +391,9 @@ export class TaskService {
     return {
       branch: inspection.branch,
       head_sha: inspection.head_sha,
-      dirty_files: inspection.dirty_files.length,
-      dirty_paths: [...inspection.dirty_files].sort(),
+      // This runs before the local Handoff write, so it records the complete
+      // original dirty set rather than an expected retry-only local delta.
+      ...dirtyEvidence(inspection.dirty_files),
       ahead: inspection.ahead,
       behind: inspection.behind,
     };
@@ -367,13 +412,11 @@ export class TaskService {
     ) {
       throw handoffRetryConflict(handoffPath, "git_identity_changed");
     }
-    const expectedDirty = new Set([...evidence.dirty_paths, ".ai/handoff.md"]);
-    const actualDirty = new Set(inspection.dirty_files);
+    const current = dirtyEvidence(withoutExpectedLocalHandoff(inspection.dirty_files));
     if (
       inspection.dirty !== (inspection.dirty_files.length > 0) ||
-      actualDirty.size !== inspection.dirty_files.length ||
-      actualDirty.size !== expectedDirty.size ||
-      [...expectedDirty].some((path) => !actualDirty.has(path))
+      current.dirty_count !== evidence.dirty_count ||
+      current.dirty_digest !== evidence.dirty_digest
     ) {
       throw handoffRetryConflict(handoffPath, "dirty_delta_changed");
     }

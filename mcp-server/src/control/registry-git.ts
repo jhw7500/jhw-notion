@@ -109,6 +109,7 @@ export class RegistryGit {
     if (typeof rawRunner.runRaw !== "function") {
       throw new ControlError("REGISTRY_CORRUPT", "Registry runner cannot read committed blob bytes", { relativePath });
     }
+    await this.assertHeadBlobSize(relativePath, objectId);
     try {
       const bytes = await rawRunner.runRaw(
         "git",
@@ -124,6 +125,32 @@ export class RegistryGit {
     } catch {
       // In particular, never attach a Buffer or raw subprocess output here.
       throw new ControlError("REGISTRY_CORRUPT", "Unable to read Registry HEAD blob", {
+        relativePath,
+        object_id: objectId,
+      });
+    }
+  }
+
+  /** Proves a HEAD-selected blob is bounded before requesting its content. */
+  private async assertHeadBlobSize(relativePath: string, objectId: string): Promise<void> {
+    let output: string;
+    try {
+      output = (await this.git(["cat-file", "-s", objectId])).stdout;
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD blob size", {
+        relativePath,
+        object_id: objectId,
+      });
+    }
+    if (!/^(?:0|[1-9][0-9]*)\n?$/.test(output)) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD blob size is invalid", {
+        relativePath,
+        object_id: objectId,
+      });
+    }
+    const size = BigInt(output.endsWith("\n") ? output.slice(0, -1) : output);
+    if (size > BigInt(MAX_HANDOFF_BYTES)) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD blob exceeds the Handoff byte limit", {
         relativePath,
         object_id: objectId,
       });
