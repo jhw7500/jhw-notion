@@ -1,0 +1,336 @@
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
+
+import { z, type ZodType } from "zod";
+
+import { readRecord, writeRecord } from "./codec.js";
+import type { ControlConfig } from "./config.js";
+import { ControlError } from "./errors.js";
+import { newTaskId, sourceIndexKey } from "./ids.js";
+import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
+import {
+  FormalTaskSchema,
+  RepositoryRecordSchema,
+  TaskRecordSchema,
+  TemporaryTaskSchema,
+  type FormalTask,
+  type RepositoryRecord,
+  type TaskRecord,
+  type TemporaryTask,
+} from "./schemas.js";
+
+const repositoryIdPattern = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
+const taskIdPattern = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+const RepositorySourceIndexSchema = z.object({ repo_id: z.string().regex(repositoryIdPattern) }).strict();
+const TaskSourceIndexSchema = z.object({ task_id: z.string().regex(taskIdPattern) }).strict();
+
+export interface RegisterRepositoryInput {
+  repo_id: string;
+  github_node_id: string;
+  slug: string;
+}
+
+export interface RegisterFormalTaskInput {
+  project_id: string;
+  repo_id: string;
+  issue_node_id: string;
+  issue_revision: string;
+  issue_url: string;
+  alias: string;
+}
+
+export interface RegisterTemporaryTaskInput {
+  project_id: string;
+  repo_id: string;
+  alias: string;
+  goal: string;
+  done_conditions: string[];
+  expected_scope: string[];
+  lifecycle?: string;
+}
+
+export interface RepositoryRegistration {
+  repository: RepositoryRecord;
+  created: boolean;
+}
+
+export interface FormalTaskRegistration {
+  task: FormalTask;
+  created: boolean;
+}
+
+function repositoryPath(registryDir: string, repoId: string): string {
+  return join(registryDir, "repositories", `${repoId}.yaml`);
+}
+
+function repositorySourcePath(registryDir: string, githubNodeId: string): string {
+  return join(registryDir, "repositories", "by-source", "github", `${sourceIndexKey(githubNodeId)}.yaml`);
+}
+
+function taskPath(registryDir: string, taskId: string): string {
+  return join(registryDir, "tasks", `${taskId}.yaml`);
+}
+
+function taskSourcePath(registryDir: string, githubNodeId: string): string {
+  return join(registryDir, "tasks", "by-source", "github", `${sourceIndexKey(githubNodeId)}.yaml`);
+}
+
+function repositoryRelativePath(repoId: string): string {
+  return `repositories/${repoId}.yaml`;
+}
+
+function repositorySourceRelativePath(githubNodeId: string): string {
+  return `repositories/by-source/github/${sourceIndexKey(githubNodeId)}.yaml`;
+}
+
+function taskRelativePath(taskId: string): string {
+  return `tasks/${taskId}.yaml`;
+}
+
+function taskSourceRelativePath(githubNodeId: string): string {
+  return `tasks/by-source/github/${sourceIndexKey(githubNodeId)}.yaml`;
+}
+
+async function readOptionalRecord<T>(path: string, schema: ZodType<T>): Promise<T | undefined> {
+  try {
+    await stat(path);
+  } catch (cause) {
+    if (isNotFound(cause)) return undefined;
+    throw cause;
+  }
+  return readRecord(path, schema);
+}
+
+function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
+  return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
+}
+
+function validated<T>(schema: ZodType<T>, value: unknown, code: string): T {
+  const result = schema.safeParse(value);
+  if (result.success) return result.data;
+  throw new ControlError(code, "Invalid catalog record", { issues: result.error.issues });
+}
+
+function distinctAliases(aliases: readonly string[], alias: string): string[] {
+  return [...new Set([...aliases, alias])];
+}
+
+function assertRepositoryId(repoId: string): void {
+  if (!repositoryIdPattern.test(repoId)) {
+    throw new ControlError("INVALID_REPOSITORY", "Invalid canonical Repository ID", { repoId });
+  }
+}
+
+function assertTaskId(taskId: string): void {
+  if (!taskIdPattern.test(taskId)) {
+    throw new ControlError("INVALID_TASK_ID", "Invalid canonical Task ID", { taskId });
+  }
+}
+
+/** Canonical Registry catalog with source-index collision protection. */
+export class Catalog {
+  constructor(
+    private readonly config: ControlConfig,
+    private readonly registry: RegistryGit,
+  ) {}
+
+  async registerRepository(input: RegisterRepositoryInput): Promise<RepositoryRegistration> {
+    assertRepositoryId(input.repo_id);
+    let registration: RepositoryRegistration | undefined;
+    await this.registry.transact(`registry: register repository ${input.repo_id}`, async () => {
+      const sourcePath = repositorySourcePath(this.config.registryDir, input.github_node_id);
+      const source = await readOptionalRecord(sourcePath, RepositorySourceIndexSchema);
+      if (source) {
+        if (source.repo_id !== input.repo_id) {
+          throw new ControlError("SOURCE_ALREADY_MAPPED", "GitHub Repository source is already mapped to another repo_id", {
+            github_node_id: input.github_node_id,
+            existing_repo_id: source.repo_id,
+            requested_repo_id: input.repo_id,
+          });
+        }
+        const repository = await readRecord(repositoryPath(this.config.registryDir, source.repo_id), RepositoryRecordSchema);
+        registration = { repository, created: false };
+        return noChanges();
+      }
+
+      const recordPath = repositoryPath(this.config.registryDir, input.repo_id);
+      const existing = await readOptionalRecord(recordPath, RepositoryRecordSchema);
+      if (existing) {
+        if (existing.github_node_id !== input.github_node_id) {
+          throw new ControlError("REPOSITORY_ID_COLLISION", "repo_id is already mapped to another GitHub Repository", {
+            repo_id: input.repo_id,
+            existing_github_node_id: existing.github_node_id,
+            requested_github_node_id: input.github_node_id,
+          });
+        }
+        await writeRecord(sourcePath, { repo_id: existing.id });
+        registration = { repository: existing, created: false };
+        return stage([repositorySourceRelativePath(input.github_node_id)]);
+      }
+
+      const repository = validated(
+        RepositoryRecordSchema,
+        { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug },
+        "INVALID_REPOSITORY",
+      );
+      await writeRecord(recordPath, repository);
+      await writeRecord(sourcePath, { repo_id: repository.id });
+      registration = { repository, created: true };
+      return stage([repositoryRelativePath(repository.id), repositorySourceRelativePath(repository.github_node_id)]);
+    });
+
+    return requiredRegistration(registration);
+  }
+
+  async registerFormalTask(input: RegisterFormalTaskInput): Promise<FormalTaskRegistration> {
+    let registration: FormalTaskRegistration | undefined;
+    await this.registry.transact(`registry: register formal task ${input.alias}`, async () => {
+      const source = await readOptionalRecord(
+        taskSourcePath(this.config.registryDir, input.issue_node_id),
+        TaskSourceIndexSchema,
+      );
+      if (source) {
+        const task = await readRecord(taskPath(this.config.registryDir, source.task_id), TaskRecordSchema);
+        if (task.kind !== "formal") {
+          throw new ControlError("SOURCE_ALREADY_MAPPED", "GitHub Issue source is mapped to a non-formal Task", {
+            issue_node_id: input.issue_node_id,
+            task_id: source.task_id,
+          });
+        }
+        registration = { task, created: false };
+        return noChanges();
+      }
+
+      const task = validated(
+        FormalTaskSchema,
+        {
+          id: newTaskId(),
+          kind: "formal",
+          project_id: input.project_id,
+          repo_id: input.repo_id,
+          aliases: [input.alias],
+          issue_node_id: input.issue_node_id,
+          issue_revision: input.issue_revision,
+          issue_url: input.issue_url,
+        },
+        "INVALID_FORMAL_TASK",
+      );
+      await writeRecord(taskPath(this.config.registryDir, task.id), task);
+      await writeRecord(taskSourcePath(this.config.registryDir, input.issue_node_id), { task_id: task.id });
+      registration = { task, created: true };
+      return stage([taskRelativePath(task.id), taskSourceRelativePath(input.issue_node_id)]);
+    });
+
+    return requiredRegistration(registration);
+  }
+
+  async registerTemporaryTask(input: RegisterTemporaryTaskInput): Promise<TemporaryTask> {
+    let task: TemporaryTask | undefined;
+    await this.registry.transact(`registry: register temporary task ${input.alias}`, async () => {
+      task = validated(
+        TemporaryTaskSchema,
+        {
+          id: newTaskId(),
+          kind: "temporary",
+          project_id: input.project_id,
+          repo_id: input.repo_id,
+          aliases: [input.alias],
+          goal: input.goal,
+          done_conditions: input.done_conditions,
+          expected_scope: input.expected_scope,
+          lifecycle: input.lifecycle ?? "active",
+        },
+        "INVALID_TEMPORARY_TASK",
+      );
+      await writeRecord(taskPath(this.config.registryDir, task.id), task);
+      return stage([taskRelativePath(task.id)]);
+    });
+
+    if (!task) throw new Error("Temporary Task registration did not produce a record");
+    return task;
+  }
+
+  async promoteTemporaryTask(taskId: string, input: RegisterFormalTaskInput): Promise<FormalTask> {
+    assertTaskId(taskId);
+    let promoted: FormalTask | undefined;
+    await this.registry.transact(`registry: promote temporary task ${taskId}`, async () => {
+      const sourcePath = taskSourcePath(this.config.registryDir, input.issue_node_id);
+      const source = await readOptionalRecord(sourcePath, TaskSourceIndexSchema);
+      if (source && source.task_id !== taskId) {
+        throw new ControlError("SOURCE_ALREADY_MAPPED", "GitHub Issue source is already mapped to another Task", {
+          issue_node_id: input.issue_node_id,
+          existing_task_id: source.task_id,
+          requested_task_id: taskId,
+        });
+      }
+
+      const current = await readRecord(taskPath(this.config.registryDir, taskId), TaskRecordSchema);
+      if (current.kind === "formal") {
+        if (current.issue_node_id !== input.issue_node_id) {
+          throw new ControlError("TASK_ALREADY_FORMAL", "Task is already formalized for another GitHub Issue", {
+            task_id: taskId,
+            issue_node_id: current.issue_node_id,
+          });
+        }
+        promoted = current;
+        if (source) return noChanges();
+        await writeRecord(sourcePath, { task_id: current.id });
+        return stage([taskSourceRelativePath(input.issue_node_id)]);
+      }
+
+      if (current.project_id !== input.project_id || current.repo_id !== input.repo_id) {
+        throw new ControlError("TASK_SCOPE_MISMATCH", "Temporary Task project/repository does not match the GitHub Issue", {
+          task_id: taskId,
+          task_project_id: current.project_id,
+          task_repo_id: current.repo_id,
+          issue_project_id: input.project_id,
+          issue_repo_id: input.repo_id,
+        });
+      }
+
+      const formal = validated(
+        FormalTaskSchema,
+        {
+          id: current.id,
+          kind: "formal",
+          project_id: input.project_id,
+          repo_id: input.repo_id,
+          aliases: distinctAliases(current.aliases, input.alias),
+          issue_node_id: input.issue_node_id,
+          issue_revision: input.issue_revision,
+          issue_url: input.issue_url,
+        },
+        "INVALID_FORMAL_TASK",
+      );
+      await writeRecord(taskPath(this.config.registryDir, current.id), formal);
+      if (!source) await writeRecord(sourcePath, { task_id: current.id });
+      promoted = formal;
+      return stage([
+        taskRelativePath(current.id),
+        ...(source ? [] : [taskSourceRelativePath(input.issue_node_id)]),
+      ]);
+    });
+
+    if (!promoted) throw new Error("Temporary Task promotion did not produce a formal record");
+    return promoted;
+  }
+
+  async getTask(taskId: string): Promise<TaskRecord> {
+    assertTaskId(taskId);
+    return readRecord(taskPath(this.config.registryDir, taskId), TaskRecordSchema);
+  }
+}
+
+function noChanges(): RegistryMutationResult {
+  return { paths: [] };
+}
+
+function stage(paths: string[]): RegistryMutationResult {
+  return { paths };
+}
+
+function requiredRegistration<T>(registration: T | undefined): T {
+  if (!registration) throw new Error("Catalog registration did not produce a result");
+  return registration;
+}
