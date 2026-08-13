@@ -97,6 +97,15 @@ function renderMasked(value: string, spans: readonly SecretSpan[]): string {
   return rendered + value.slice(cursor);
 }
 
+function pullBackFromSplitSurrogate(value: string, limit: number): number {
+  if (limit <= 0 || limit >= value.length) return limit;
+  const previous = value.charCodeAt(limit - 1);
+  const next = value.charCodeAt(limit);
+  return previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff
+    ? limit - 1
+    : limit;
+}
+
 /**
  * Redacts each stream incrementally, masking the union of all complete secret
  * spans before retaining a suffix that might complete in a later chunk.
@@ -119,10 +128,7 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
         captured += encoded.length;
         return;
       }
-      let completeCharacters = encoded.subarray(0, remaining).toString("utf8");
-      while (Buffer.byteLength(completeCharacters, "utf8") > remaining) {
-        completeCharacters = completeCharacters.slice(0, -1);
-      }
+      const completeCharacters = new StringDecoder("utf8").write(encoded.subarray(0, remaining));
       const bounded = Buffer.from(completeCharacters, "utf8");
       chunks.push(bounded);
       captured += bounded.length;
@@ -134,6 +140,11 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
       let changed = true;
       while (changed) {
         changed = false;
+        const codePointBoundary = pullBackFromSplitSurrogate(pending, limit);
+        if (codePointBoundary < limit) {
+          limit = codePointBoundary;
+          changed = true;
+        }
         for (const span of spans) {
           if (span.start < limit && span.end > limit) {
             limit = span.start;

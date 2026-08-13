@@ -186,6 +186,17 @@ describe("control process boundary", () => {
     expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
   });
 
+  it("preserves an emoji when the streaming retention boundary bisects its surrogate pair", async () => {
+    const result = await new ProcessRunner({ CROSSING_TOKEN: "secret" }).run(process.execPath, [
+      "-e",
+      "process.stdout.write('A😀xxxx'); setTimeout(() => process.stdout.write('secretZ'), 20)",
+    ]);
+
+    expect(result.stdout).toBe("A😀xxxx[REDACTED]Z");
+    expect(result.stdout).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
   it("does not leak a secret prefix that crosses the safe output boundary", async () => {
     const secret = "crossing-secret";
     const result = await new ProcessRunner({ CROSSING_TOKEN: secret }).run("bash", [
@@ -206,6 +217,22 @@ describe("control process boundary", () => {
 
     expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
     expect(result.stdout).not.toContain("a");
+  });
+
+  it("preserves complete UTF-8 when the final capture cap bisects an emoji", async () => {
+    const marker = "[REDACTED]";
+    const safeBytesBeforeEmoji = 1024 * 1024 - 3;
+    const fillerLength = safeBytesBeforeEmoji - Buffer.byteLength(marker);
+    const result = await new ProcessRunner({ ONE_TOKEN: "a" }).run("bash", [
+      "-c",
+      `printf a; head -c ${fillerLength} /dev/zero | tr '\\0' x; printf '😀tail'`,
+    ]);
+
+    expect(result.stdout.startsWith(marker)).toBe(true);
+    expect(result.stdout).toHaveLength(marker.length + fillerLength);
+    expect(result.stdout.slice(marker.length).replaceAll("x", "")).toBe("");
+    expect(result.stdout).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
   });
 
   it("re-execs under flock without terminating an injected test runtime", () => {
