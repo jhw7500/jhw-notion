@@ -53,21 +53,53 @@ function partialSecretPrefixLength(value: string, secrets: readonly string[]): n
   return 0;
 }
 
-function firstSecretMatch(value: string, secrets: readonly string[]): { index: number; secret: string } | undefined {
-  let match: { index: number; secret: string } | undefined;
+interface SecretSpan {
+  start: number;
+  end: number;
+}
+
+function secretSpans(value: string, secrets: readonly string[]): SecretSpan[] {
+  const spans: SecretSpan[] = [];
   for (const secret of secrets) {
-    const index = value.indexOf(secret);
-    if (index === -1 || (match && (index > match.index || (index === match.index && secret.length <= match.secret.length)))) {
-      continue;
+    let from = 0;
+    while (from < value.length) {
+      const start = value.indexOf(secret, from);
+      if (start === -1) break;
+      spans.push({ start, end: start + secret.length });
+      from = start + 1;
     }
-    match = { index, secret };
   }
-  return match;
+  return mergeSecretSpans(spans);
+}
+
+function mergeSecretSpans(spans: readonly SecretSpan[]): SecretSpan[] {
+  const ordered = [...spans].sort((left, right) => left.start - right.start || right.end - left.end);
+  const merged: SecretSpan[] = [];
+  for (const span of ordered) {
+    const previous = merged.at(-1);
+    if (previous && span.start <= previous.end) {
+      previous.end = Math.max(previous.end, span.end);
+    } else {
+      merged.push({ ...span });
+    }
+  }
+  return merged;
+}
+
+function renderMasked(value: string, spans: readonly SecretSpan[]): string {
+  let cursor = 0;
+  let rendered = "";
+  for (const span of spans) {
+    rendered += value.slice(cursor, span.start);
+    rendered += "[REDACTED]";
+    cursor = span.end;
+  }
+  return rendered + value.slice(cursor);
 }
 
 /**
- * Redacts each stream incrementally. Complete matches are consumed before a
- * possible trailing prefix is retained, including self-overlapping secrets.
+ * Redacts each stream incrementally, masking the union of all complete secret
+ * spans before retaining a suffix that might complete in a later chunk.
  */
 function redactingCapture(stream: Readable | null, secrets: readonly string[]): Promise<Buffer> {
   if (!stream) return Promise.resolve(Buffer.alloc(0));
@@ -96,21 +128,21 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
       captured += bounded.length;
     };
     const emitAvailable = () => {
-      let safe = "";
-      while (pending) {
-        const match = firstSecretMatch(pending, secrets);
-        if (match) {
-          safe += pending.slice(0, match.index);
-          safe += "[REDACTED]";
-          pending = pending.slice(match.index + match.secret.length);
-          continue;
+      const spans = secretSpans(pending, secrets);
+      const longest = Math.max(0, ...secrets.map((secret) => secret.length));
+      let limit = Math.max(0, pending.length - Math.max(0, longest - 1));
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const span of spans) {
+          if (span.start < limit && span.end > limit) {
+            limit = span.start;
+            changed = true;
+          }
         }
-        const tailLength = partialSecretPrefixLength(pending, secrets);
-        safe += pending.slice(0, pending.length - tailLength);
-        pending = pending.slice(pending.length - tailLength);
-        break;
       }
-      append(safe);
+      append(renderMasked(pending.slice(0, limit), spans.filter((span) => span.end <= limit)));
+      pending = pending.slice(limit);
     };
 
     stream.on("data", (chunk: Buffer | string) => {
@@ -119,9 +151,11 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
     });
     stream.once("end", () => {
       pending += decoder.end();
-      emitAvailable();
-      // An EOF prefix cannot become a complete credential; retain no prefix bytes.
-      if (pending) append("[REDACTED]");
+      const spans = secretSpans(pending, secrets);
+      const prefixLength = partialSecretPrefixLength(pending, secrets);
+      if (prefixLength) spans.push({ start: pending.length - prefixLength, end: pending.length });
+      append(renderMasked(pending, mergeSecretSpans(spans)));
+      pending = "";
       resolve(Buffer.concat(chunks));
     });
     stream.once("error", reject);

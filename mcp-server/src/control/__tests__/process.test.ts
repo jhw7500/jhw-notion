@@ -138,6 +138,54 @@ describe("control process boundary", () => {
     expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
   });
 
+  it("masks the union of distinct overlapping secrets in one chunk", async () => {
+    const result = await new ProcessRunner({ FIRST_TOKEN: "abc", SECOND_TOKEN: "bcd" }).run(
+      "bash",
+      ["-c", "printf abcd"],
+    );
+
+    expect(result.stdout).toBe("[REDACTED]");
+    expect(result.stdout).not.toContain("abc");
+    expect(result.stdout).not.toContain("bcd");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it("masks the union of distinct overlapping secrets split across chunks", async () => {
+    const result = await new ProcessRunner({ FIRST_TOKEN: "abc", SECOND_TOKEN: "bcd" }).run(process.execPath, [
+      "-e",
+      "process.stdout.write('ab'); setTimeout(() => process.stdout.write('cd'), 20)",
+    ]);
+
+    expect(result.stdout).toBe("[REDACTED]");
+    expect(result.stdout).not.toContain("d");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it("masks containment relationships without exposing a suffix", async () => {
+    const result = await new ProcessRunner({ SHORT_TOKEN: "abc", LONG_TOKEN: "abcde" }).run(
+      "bash",
+      ["-c", "printf abcde"],
+    );
+
+    expect(result.stdout).toBe("[REDACTED]");
+    expect(result.stdout).not.toContain("abc");
+    expect(result.stdout).not.toContain("de");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it("masks every span in a three-secret overlap chain", async () => {
+    const result = await new ProcessRunner({ FIRST_TOKEN: "abc", SECOND_TOKEN: "bcd", THIRD_TOKEN: "cde" }).run(
+      "bash",
+      ["-c", "printf abcde"],
+    );
+
+    expect(result.stdout).toBe("[REDACTED]");
+    expect(result.stdout).not.toContain("abc");
+    expect(result.stdout).not.toContain("bcd");
+    expect(result.stdout).not.toContain("cde");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
   it("does not leak a secret prefix that crosses the safe output boundary", async () => {
     const secret = "crossing-secret";
     const result = await new ProcessRunner({ CROSSING_TOKEN: secret }).run("bash", [
