@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -101,7 +101,35 @@ async function commitRegistrySymlink(fixture: RegistryFixture, path: string, tar
   await git(fixture.registryDir, "push", "origin", "main");
 }
 
+async function replaceActiveWithExternalSymlink(
+  fixture: RegistryFixture,
+  active: { task_id: string; claim_id: string },
+  content: string,
+): Promise<{ externalDir: string; externalPath: string }> {
+  const externalDir = join(fixture.root, `external-active-${active.claim_id}`);
+  const externalPath = join(externalDir, `${active.task_id}.yaml`);
+  await mkdir(externalDir, { recursive: true });
+  await writeFile(externalPath, content, "utf8");
+  await unlink(join(fixture.registryDir, "claims", "active", `${active.task_id}.yaml`));
+  await rmdir(join(fixture.registryDir, "claims", "active"));
+  await symlink(externalDir, join(fixture.registryDir, "claims", "active"));
+  await git(fixture.registryDir, "add", "-A", "--", "claims/active");
+  await git(fixture.registryDir, "commit", "-m", "Redirect active claims");
+  await git(fixture.registryDir, "push", "origin", "main");
+  return { externalDir, externalPath };
+}
+
 describe("ClaimService", () => {
+  it("creates the normal absent active-Claim directory inside the Registry", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const path = join(fixture.registryDir, "claims", "active", `${task.id}.yaml`);
+
+    expect(await exists(path)).toBe(false);
+    const active = await claims.claimTask(claimInput(task.id));
+
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(active);
+  });
+
   it("rejects a second active Claim for the same canonical Task", async () => {
     const { claims, task } = await claimsFixture();
     const ownerA = claimInput(task.id, { session_id: "codex-a" });
@@ -110,6 +138,35 @@ describe("ClaimService", () => {
 
     await expect(claims.claimTask(ownerB)).rejects.toMatchObject({ code: "TASK_ALREADY_CLAIMED" });
     expect((await claims.getActive(first.task_id))?.claim_id).toBe(first.claim_id);
+  });
+
+  it("rejects claim creation when the active-Claim ancestor is an external symlink", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const externalDir = join(fixture.root, "external-active-create");
+    await mkdir(externalDir, { recursive: true });
+    await commitRegistrySymlink(fixture, "claims/active", externalDir);
+
+    await expect(claims.claimTask(claimInput(task.id))).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await exists(join(externalDir, `${task.id}.yaml`))).toBe(false);
+  });
+
+  it("rejects getActive and assertOwner when active-Claim reads traverse an external symlink", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const externalDir = join(fixture.root, "external-active-read");
+    const externalClaim = {
+      ...claimInput(task.id),
+      claim_id: "clm-00000000-0000-7000-8000-000000000000",
+      started_at: fixedNow.toISOString(),
+    };
+    await mkdir(externalDir, { recursive: true });
+    const externalPath = join(externalDir, `${task.id}.yaml`);
+    const content = `${JSON.stringify(externalClaim)}\n`;
+    await writeFile(externalPath, content, "utf8");
+    await commitRegistrySymlink(fixture, "claims/active", externalDir);
+
+    await expect(claims.getActive(task.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    await expect(claims.assertOwner(task.id, externalClaim.claim_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await readFile(externalPath, "utf8")).toBe(content);
   });
 
   it("cannot release a Claim owned by another generation", async () => {
@@ -153,6 +210,49 @@ describe("ClaimService", () => {
     await expect(claims.assertOwner(first.task_id, first.claim_id)).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
     expect(await claims.assertOwner(first.task_id, recovered.active.claim_id)).toEqual(recovered.active);
     expect(await exists(join(fixture.registryDir, "claims", "history", "2026", first.task_id, `${first.claim_id}.yaml`))).toBe(true);
+  });
+
+  it("rejects finish when the active Claim is redirected outside the Registry", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const content = `${JSON.stringify(active)}\n`;
+    const { externalDir, externalPath } = await replaceActiveWithExternalSymlink(fixture, active, content);
+
+    await expect(
+      claims.finishClaim(active.task_id, active.claim_id, {
+        status: "completed",
+        branch: "task/wlan-roaming-fix",
+        head_sha: "0123456789abcdef",
+        validation: ["npm test: pass"],
+      }),
+    ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await readFile(externalPath, "utf8")).toBe(content);
+    expect(await exists(join(externalDir, `${active.claim_id}.yaml`))).toBe(false);
+  });
+
+  it("rejects force-end when the active Claim is redirected outside the Registry", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const content = `${JSON.stringify(active)}\n`;
+    const { externalPath } = await replaceActiveWithExternalSymlink(fixture, active, content);
+
+    await expect(claims.recoverClaim(active.task_id, active.claim_id, { kind: "force-end" })).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+    });
+    expect(await readFile(externalPath, "utf8")).toBe(content);
+  });
+
+  it("rejects takeover when the active Claim is redirected outside the Registry", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const content = `${JSON.stringify(active)}\n`;
+    const { externalDir, externalPath } = await replaceActiveWithExternalSymlink(fixture, active, content);
+
+    await expect(
+      claims.recoverClaim(active.task_id, active.claim_id, { kind: "takeover", session_id: "codex-new" }),
+    ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await readFile(externalPath, "utf8")).toBe(content);
+    expect(await exists(join(externalDir, `${active.claim_id}.yaml`))).toBe(false);
   });
 
   it("finishes by atomically archiving the expected Claim and removing the active record", async () => {

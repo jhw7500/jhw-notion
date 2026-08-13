@@ -168,6 +168,7 @@ export class ClaimService {
 
   async claimTask(rawInput: ClaimTaskInput): Promise<ActiveClaim> {
     const input = parse(ClaimTaskInputSchema, rawInput, "INVALID_CLAIM", "Invalid Claim input");
+    await this.assertActivePathComponents(input.task_id);
     let claimed: ActiveClaim | undefined;
 
     await this.registry.transact(`registry: claim task ${input.task_id}`, async () => {
@@ -192,6 +193,7 @@ export class ClaimService {
         "INVALID_CLAIM",
         "Claim record failed validation",
       );
+      await this.assertActivePathComponents(input.task_id);
       await writeRecord(activePath(this.config.registryDir, input.task_id), claimed);
       return stage([activeRelativePath(input.task_id)]);
     });
@@ -205,6 +207,7 @@ export class ClaimService {
     assertClaimId(expectedClaimId);
     const outcome = parse(FinishOutcomeSchema, rawOutcome, "INVALID_FINISH_OUTCOME", "Invalid Claim finish outcome");
     this.assertHandoffPath(outcome.handoff_path, taskId, expectedClaimId);
+    await this.assertActivePathComponents(taskId);
     const releasedAt = this.timestamp();
     const year = this.historyYear(releasedAt);
     const historyRelative = historyRelativePath(year, taskId, expectedClaimId);
@@ -219,6 +222,7 @@ export class ClaimService {
       history = this.finishHistory(active, outcome, releasedAt);
       const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await writeRecord(destination, history);
+      await this.assertActivePathComponents(taskId);
       await unlink(activePath(this.config.registryDir, taskId));
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
     });
@@ -273,6 +277,7 @@ export class ClaimService {
   }
 
   private async forceEnd(taskId: string, expectedClaimId: string): Promise<RecoveryForceEnd> {
+    await this.assertActivePathComponents(taskId);
     const releasedAt = this.timestamp();
     const year = this.historyYear(releasedAt);
     const historyRelative = historyRelativePath(year, taskId, expectedClaimId);
@@ -284,6 +289,7 @@ export class ClaimService {
       history = this.recoveryHistory(active, "force-ended", releasedAt);
       const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await writeRecord(destination, history);
+      await this.assertActivePathComponents(taskId);
       await unlink(activePath(this.config.registryDir, taskId));
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
     });
@@ -292,6 +298,7 @@ export class ClaimService {
   }
 
   private async takeover(taskId: string, expectedClaimId: string, sessionId: string): Promise<RecoveryTakeover> {
+    await this.assertActivePathComponents(taskId);
     const releasedAt = this.timestamp();
     const year = this.historyYear(releasedAt);
     const historyRelative = historyRelativePath(year, taskId, expectedClaimId);
@@ -317,7 +324,9 @@ export class ClaimService {
       );
       const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await writeRecord(destination, history);
+      await this.assertActivePathComponents(taskId);
       await unlink(activePath(this.config.registryDir, taskId));
+      await this.assertActivePathComponents(taskId);
       await writeRecord(activePath(this.config.registryDir, taskId), replacement);
       return stage([historyRelative, activeRelativePath(taskId)]);
     });
@@ -328,6 +337,7 @@ export class ClaimService {
   }
 
   private async readActive(task: TaskRecord): Promise<ActiveClaim | undefined> {
+    await this.assertActivePathComponents(task.id);
     const recordPath = activePath(this.config.registryDir, task.id);
     let active: ActiveClaim | undefined;
     try {
@@ -404,6 +414,10 @@ export class ClaimService {
         expected_handoff_path: expectedHandoffPath(taskId, claimId),
       });
     }
+  }
+
+  private async assertActivePathComponents(taskId: string): Promise<void> {
+    await this.assertRegistryPathComponents(activeRelativePath(taskId));
   }
 
   private async assertHandoffAvailable(handoffPath: string | undefined): Promise<void> {
