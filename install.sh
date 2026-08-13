@@ -3,6 +3,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_ENTRY="$SCRIPT_DIR/mcp-server/dist/index.js"
+CONTROL_ENTRY="$SCRIPT_DIR/mcp-server/dist/control/cli.js"
+CONTROL_LINK="$HOME/.local/bin/jhw-control"
 
 # Colors
 RED='\033[0;31m'
@@ -16,9 +18,51 @@ fail() { echo -e "  ${RED}❌ $1${NC}"; }
 
 usage() {
   echo "Usage: $0 [--uninstall]"
-  echo "  (no args)    설치: MCP 서버 빌드 + 스킬 심링크 + MCP 등록"
-  echo "  --uninstall  제거: 심링크 삭제 + MCP 등록 해제"
+  echo "  (no args)    설치: MCP 서버 빌드 + jhw-control/스킬 심링크 + MCP 등록"
+  echo "  --uninstall  제거: 이 저장소 소유 심링크 삭제 + MCP 등록 해제"
   exit 0
+}
+
+# readlink -f 결과가 저장소 root와 같거나 그 아래일 때만 project-owned로
+# 취급한다. 단순 문자열 prefix 비교(`/repo-foreign`)는 허용하지 않는다.
+is_repo_owned_symlink() {
+  local link="$1"
+  local resolved_link resolved_repo
+  [ -L "$link" ] || return 1
+  resolved_link="$(readlink -f -- "$link" 2>/dev/null)" || return 1
+  resolved_repo="$(readlink -f -- "$SCRIPT_DIR" 2>/dev/null)" || return 1
+  case "$resolved_link" in
+    "$resolved_repo"|"$resolved_repo"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_control_cli() {
+  if [ ! -x "$CONTROL_ENTRY" ]; then
+    fail "jhw-control 빌드 결과가 없거나 실행할 수 없습니다: $CONTROL_ENTRY"
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "$CONTROL_LINK")"
+  if [ -e "$CONTROL_LINK" ] || [ -L "$CONTROL_LINK" ]; then
+    if is_repo_owned_symlink "$CONTROL_LINK"; then
+      rm -- "$CONTROL_LINK"
+    else
+      fail "$CONTROL_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
+      exit 1
+    fi
+  fi
+  ln -s "$CONTROL_ENTRY" "$CONTROL_LINK"
+  ok "$CONTROL_LINK → $CONTROL_ENTRY"
+}
+
+uninstall_control_cli() {
+  if is_repo_owned_symlink "$CONTROL_LINK"; then
+    rm -- "$CONTROL_LINK"
+    ok "$CONTROL_LINK 심링크 제거"
+  elif [ -e "$CONTROL_LINK" ] || [ -L "$CONTROL_LINK" ]; then
+    skip "$CONTROL_LINK 는 이 저장소 소유가 아니므로 보존"
+  fi
 }
 
 register_mcp() {
@@ -238,7 +282,10 @@ if [ "${1:-}" = "--uninstall" ]; then
   echo "jhw-notion 제거를 시작합니다..."
   echo ""
 
-  echo "[1/2] 스킬 심링크 제거"
+  echo "[1/3] jhw-control 심링크 제거"
+  uninstall_control_cli
+
+  echo "[2/3] 스킬 심링크 제거"
   for link in "$HOME/.claude/commands/jhw" "$HOME/.gemini/commands/jhw" "$HOME/.config/opencode/skills/jhw" "$HOME/.codex/commands/jhw"; do
     if [ -L "$link" ]; then
       rm "$link"
@@ -268,7 +315,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   done
   [ "$removed" -gt 0 ] && ok "$HOME/.codex/skills 심링크 ${removed}개 제거"
 
-  echo "[2/2] MCP 서버 등록 해제"
+  echo "[3/3] MCP 서버 등록 해제"
   unregister_mcp "$HOME/.claude.json" "Claude"
   unregister_mcp "$HOME/.gemini/settings.json" "Gemini"
   unregister_opencode_mcp "$HOME/.config/opencode/opencode.json"
@@ -285,17 +332,22 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then usage; fi
 echo "jhw-notion 설치를 시작합니다..."
 echo ""
 
-# [1/4] MCP 서버 빌드
-echo "[1/4] MCP 서버 빌드"
+# [1/5] MCP 서버 빌드
+echo "[1/5] MCP 서버 빌드"
 cd "$SCRIPT_DIR/mcp-server"
 npm install --silent 2>&1 | tail -1
 npm run build 2>&1
 ok "빌드 완료"
 cd "$SCRIPT_DIR"
 
-# [2/4] TUI 감지
+# [2/5] jhw-control 심링크
 echo ""
-echo "[2/4] TUI 감지"
+echo "[2/5] jhw-control 심링크"
+install_control_cli
+
+# [3/5] TUI 감지
+echo ""
+echo "[3/5] TUI 감지"
 CLAUDE_DIR="$HOME/.claude"
 GEMINI_DIR="$HOME/.gemini"
 OPENCODE_DIR="$HOME/.config/opencode"
@@ -306,9 +358,9 @@ CODEX_DIR="$HOME/.codex"
 [ -d "$OPENCODE_DIR" ] && ok "OpenCode ($OPENCODE_DIR)" || skip "OpenCode (미설치)"
 [ -d "$CODEX_DIR" ] && ok "Codex CLI ($CODEX_DIR)" || skip "Codex CLI (미설치)"
 
-# [3/4] 스킬 심링크
+# [4/5] 스킬 심링크
 echo ""
-echo "[3/4] 스킬 심링크"
+echo "[4/5] 스킬 심링크"
 
 # Codex용 TOML은 skills/claude/*.md에서 생성된다 (정본 1개 유지).
 # 파이프로 넘기면 종료 코드가 묻히므로, 출력을 받아둔 뒤 실패를 명시적으로 확인한다.
@@ -410,9 +462,9 @@ if [ -d "$CODEX_DIR" ]; then
   [ "$PSKIPPED" -gt 0 ] && skip "Codex: 이름이 겹치는 기존 프롬프트 ${PSKIPPED}개는 보존 (스킬 \$jhw-* 로 사용 가능)"
 fi
 
-# [4/4] MCP 서버 등록
+# [5/5] MCP 서버 등록
 echo ""
-echo "[4/4] MCP 서버 등록"
+echo "[5/5] MCP 서버 등록"
 if [ -d "$CLAUDE_DIR" ]; then
   register_mcp "$HOME/.claude.json" "Claude"
 fi

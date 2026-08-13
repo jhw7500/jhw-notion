@@ -1,31 +1,21 @@
 ---
-description: Notion AI Workspace 현황 조회
+description: Use when the user requests status for the existing Notion AI Workspace or one of its databases
 argument-hint: "[db명] (projects|preferences|decisionLog|knowledgeBase|references)"
 ---
 
 # /jhw:status — Notion 워크스페이스 현황
 
-1. `jhw_status` MCP 도구를 호출한다.
-   - 인자가 있으면 특정 DB만: `/jhw:status projects`
+1. `jhw_status` MCP 도구를 호출한다. 인자가 있으면 해당 Notion DB만 조회한다.
+2. DB별 레코드 수와 최근 항목을 읽기 전용 표로 보여준다.
+3. 필요하면 상세 조회를 제안한다.
 
-2. 결과를 테이블로 보여준다:
-   ```
-   📊 Notion AI Workspace 현황
-   ─────────────────────────────────────
-   DB              레코드   최근 항목
-   projects        3       wlan-bridge (진행중)
-   preferences     5       Notion 저장 규칙
-   decisionLog     4       파일→Notion 마이그레이션
-   ─────────────────────────────────────
-   ```
+```text
+/jhw:status
+/jhw:status projects
+```
 
-3. 선택적으로 상세 조회를 제안한다.
+## Phase 1A 경계
 
-## 사용 예시
-
-- `/jhw:status` — 전체 현황
-- `/jhw:status projects` — Projects DB만
-
-## 규칙
-
-- 조회 전용 — 데이터를 수정하지 않는다.
+- 이 명령은 계속 **기존 Notion live authority**의 현황이다. 데이터를 수정하지 않는다.
+- Project Control 시험 현황은 사용자가 명시적으로 `/jhw:portfolio status`를 요청할 때만 조회한다.
+- 일반 `/jhw:status`를 Registry나 portfolio로 자동 라우팅하거나 두 결과를 자동 병합하지 않는다.

@@ -1,6 +1,6 @@
 ---
 name: jhw-status
-description: "Notion AI Workspace 현황 조회 Use when the user invokes `/jhw:status`, `$jhw-status`, or asks to run the JHW status command."
+description: "Use when the user requests status for the existing Notion AI Workspace or one of its databases Use when the user invokes `/jhw:status`, `$jhw-status`, or asks to run the JHW status command."
 ---
 
 # jhw-status

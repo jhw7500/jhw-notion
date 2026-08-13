@@ -19,9 +19,10 @@ cd jhw-notion
 
 install.sh가 자동으로:
 1. MCP 서버 빌드 (npm install + build)
-2. 설치된 TUI 감지
-3. 스킬 심링크 생성
-4. 각 TUI 설정 파일에 MCP 서버 등록
+2. `~/.local/bin/jhw-control` 심링크 생성
+3. 설치된 TUI 감지
+4. 스킬 심링크 생성
+5. 각 TUI 설정 파일에 MCP 서버 등록
    - Claude/Gemini: `settings.json`의 `mcpServers`
    - OpenCode: `opencode.json`의 `mcp`
 
@@ -39,6 +40,8 @@ Notion Integration 생성: https://www.notion.so/my-integrations
 ```bash
 ./install.sh --uninstall
 ```
+
+`jhw-control`은 이 저장소 안의 빌드 결과를 가리키는 심링크일 때만 제거된다. 다른 파일이나 다른 프로젝트의 링크는 덮어쓰거나 삭제하지 않는다.
 
 ## MCP 도구
 
@@ -67,6 +70,8 @@ TUI에서 `/jhw:` 접두사로 사용. 통합 진입점 위주:
 /jhw:save     — 확정 정보 즉시 저장 (record/note/delete 흡수, DB 자동 판별)
 /jhw:recall   — 통합 회상 (search/context/history 자동 판별)
 /jhw:project  — 프로젝트 시작/종료 (--start / --close)
+/jhw:task     — 명시적 Project Control Task 시작·재개·종료·복구
+/jhw:portfolio — 명시적 Project Control status/export/preflight
 /jhw:review   — 세션 마무리 리뷰 (저장 후보 추출 + 저장가치 평가)
 /jhw:match    — 신규 후보를 기존 Notion과 대조 (중복/보강/유사)
 /jhw:compact  — 저장 레코드 사후 정리 (합치기 + 요약 + 폐기 평가)
@@ -77,6 +82,20 @@ TUI에서 `/jhw:` 접두사로 사용. 통합 진입점 위주:
 ```
 
 > deprecated alias(다음 메이저 릴리스에서 삭제): `/jhw:record`·`/jhw:note`·`/jhw:delete`→`/jhw:save`, `/jhw:search`·`/jhw:context`·`/jhw:history`→`/jhw:recall`, `/jhw:start`·`/jhw:close`→`/jhw:project`.
+
+## Project Control Phase 1A
+
+Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Registry, 개인 GitHub Project, build-server `jhw-control`을 사용한다. `task` Claim/worktree lifecycle, 제한된 portfolio 조회·단방향 export, live preflight, 중앙 authority guard를 제공한다.
+
+경계는 의도적으로 단순하다.
+
+- 사용자가 `/jhw:task`, `/jhw:portfolio`, 또는 `/jhw:project --trial`을 명시해야만 trial control을 사용한다.
+- 현재 요청과 현재 저장소 사실만 쓴다. 이전 세션, Notion, memory, recall/load/cclog, 광범위 Git history를 자동 주입하지 않는다.
+- 일반 `/jhw:project`/`--start`/`--close`와 `/jhw:status`는 계속 기존 Notion workflow다. **Phase 1A에서 Notion이 변경 없이 live authority**이며 Registry trial은 authority flip이나 migration이 아니다.
+- 개인 Project는 fine-grained PAT로 제어할 수 없어 별도 short-lived classic Project token이 필요하다. Registry token과 분리하고 scope를 자동 확장하지 않는다. 실제 API를 검사하는 `jhw-control preflight`가 운영 go/no-go다.
+- build server에서 manual/on-demand로 실행한다. Phase 1A에는 GitHub Actions workflow/minutes 의존과 schedule이 없다.
+
+설정, 안전한 credential 주입, stable exit code, 세 번의 자연 Task cycle, 중단 기준은 [Phase 1A runbook](docs/project-control/phase1a-runbook.md)을 따른다. Phase 1B/cutover는 별도 승인 계획이 필요하다.
 
 ## 업데이트
 
@@ -103,7 +122,9 @@ jhw-notion/
 ├── mcp-server/          # TypeScript MCP 서버 (Notion API 직접 호출)
 │   ├── src/tools/       # 12개 도구 핸들러
 │   └── dist/            # 빌드 결과
-├── skills/claude/       # Claude Code 스킬 (통합 10 + deprecated alias 8)
+├── skills/claude/       # 공유 TUI 스킬 정본 (Project Control 명시적 진입점 포함)
 ├── install.sh           # 원클릭 설치/제거
 └── DESIGN.md            # 설계 문서
 ```
+
+`PLAN.md`는 초기 구현 계획의 **원본 snapshot**이다. live 기준은 `README.md`, `DESIGN.md`, runbook, 그리고 실제 코드다.

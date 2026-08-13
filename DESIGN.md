@@ -29,6 +29,34 @@
 - **TUI 스킬**: LLM에게 "어떤 MCP 도구를 호출하라"만 안내 (얇은 레이어)
 - **review만 예외**: 세션 대화 분석은 LLM 역할이므로 각 TUI 스킬에 로직 유지
 
+### 2.1 Project Control Phase 1A 경계
+
+Phase 1A는 위 Notion workspace를 대체하지 않는 dry-run control plane이다.
+
+```text
+명시적 /jhw:task, /jhw:portfolio, /jhw:project --trial
+        ↓
+build server의 jhw-control CLI
+        ├─ 별도 private Registry checkout (identity, Task, Claim, governance)
+        ├─ personal private GitHub Project (5 operational fields)
+        └─ private local state/snapshot (measurement, export)
+
+일반 /jhw:project, /jhw:status → 기존 Notion live authority
+```
+
+- Registry는 `jhw-notion` 워킹 트리 안의 디렉터리가 아니라 독립된 GitHub 저장소/checkout이다.
+- `jhw-control` task lifecycle은 persistent Task, immutable Claim, branch/worktree, durable finish/recovery를 하나의 명시적 CLI surface로 묶는다. portfolio는 12 KiB/20 item 제한과 page metadata를 준다.
+- 새 세션에 이전 세션·Notion·memory·Git history를 자동 주입하지 않는다. 현재 요청과 현재 저장소 사실에서 시작하고 사용자가 지정한 Project/Task/page만 확장한다.
+- 중앙 `governance/authority.yaml`과 server-side Notion guard가 authority epoch를 검증한다. local cache는 이전에 관찰한 강한 정책을 되돌리지 못하게 할 뿐 authority를 선택하지 않는다.
+- Phase 1A Registry의 authority record는 epoch 1 / `legacy`이며 기존 Notion이 변경 없이 live authority다. Registry trial registration은 authority flip, cutover, reconciliation, migration이 아니다.
+- Phase 1B/cutover, daily export, cross-host retry, `legacy → registry` 전환은 자연 Task evidence 후 별도 승인 계획을 요구한다.
+
+### 2.2 운영·credential 제약
+
+개인 계정 소유 GitHub Project에는 fine-grained PAT를 사용할 수 없어 short-lived classic Project PAT가 필요하다. classic PAT의 Project scope는 특정 personal Project 하나로 격리되지 않으므로 Registry전용 token과 분리하고 Project token에 `repo` scope를 추가하지 않는다. host credential store가 두 token을 process environment에만 주입하며 `jhw-control preflight`가 실제 scope, Project item/write/restore, Registry Issue, SSH Git fetch/dry-run push를 go/no-go로 검사한다.
+
+Phase 1A는 현재 build server의 manual/on-demand 실행이다. 이 control plane을 위한 GitHub-hosted Actions workflow를 만들지 않아 Actions minutes를 사용하지 않으며 schedule도 없다. 운영 순서와 stable exit은 `docs/project-control/phase1a-runbook.md`가 정본이다.
+
 ## 3. 저장소 구조
 
 ```
@@ -72,6 +100,8 @@ jhw-notion/
 ├── .env.example
 └── README.md
 ```
+
+위 트리는 초기 구조를 설명한다. 현재 live 파일과 Phase 1A 경계는 실제 코드, `README.md`, 본 문서, runbook을 우선한다. `PLAN.md`는 초기 계획의 원본 snapshot으로 유지하며 live architecture로 다시 쓰지 않는다.
 
 ## 4. MCP 서버 설계
 
