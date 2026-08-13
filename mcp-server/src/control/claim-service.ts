@@ -1,4 +1,4 @@
-import { stat, unlink } from "node:fs/promises";
+import { lstat, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import { z, type ZodType } from "zod";
@@ -209,9 +209,12 @@ export class ClaimService {
       const task = await this.catalog.getTask(taskId);
       const active = await this.requireOwner(task, expectedClaimId);
       this.assertHandoffPath(outcome.handoff_path, taskId, expectedClaimId);
+      await this.assertHandoffAvailable(outcome.handoff_path);
       history = this.finishHistory(active, outcome);
       const year = this.historyYear(history.released_at);
-      await writeRecord(historyPath(this.config.registryDir, year, taskId, expectedClaimId), history);
+      const destination = historyPath(this.config.registryDir, year, taskId, expectedClaimId);
+      await this.assertHistoryDestinationAbsent(destination, taskId, expectedClaimId);
+      await writeRecord(destination, history);
       await unlink(activePath(this.config.registryDir, taskId));
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
     });
@@ -272,7 +275,9 @@ export class ClaimService {
       const active = await this.requireOwner(task, expectedClaimId);
       history = this.recoveryHistory(active, "force-ended");
       const year = this.historyYear(history.released_at);
-      await writeRecord(historyPath(this.config.registryDir, year, taskId, expectedClaimId), history);
+      const destination = historyPath(this.config.registryDir, year, taskId, expectedClaimId);
+      await this.assertHistoryDestinationAbsent(destination, taskId, expectedClaimId);
+      await writeRecord(destination, history);
       await unlink(activePath(this.config.registryDir, taskId));
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
     });
@@ -301,7 +306,9 @@ export class ClaimService {
         "INVALID_CLAIM",
         "Replacement Claim record failed validation",
       );
-      await writeRecord(historyPath(this.config.registryDir, year, taskId, expectedClaimId), history);
+      const destination = historyPath(this.config.registryDir, year, taskId, expectedClaimId);
+      await this.assertHistoryDestinationAbsent(destination, taskId, expectedClaimId);
+      await writeRecord(destination, history);
       await unlink(activePath(this.config.registryDir, taskId));
       await writeRecord(activePath(this.config.registryDir, taskId), replacement);
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
@@ -389,6 +396,51 @@ export class ClaimService {
         expected_handoff_path: expectedHandoffPath(taskId, claimId),
       });
     }
+  }
+
+  private async assertHandoffAvailable(handoffPath: string | undefined): Promise<void> {
+    if (!handoffPath) return;
+    const path = join(this.config.registryDir, handoffPath);
+    let entry: Awaited<ReturnType<typeof lstat>>;
+    try {
+      entry = await lstat(path);
+    } catch (cause) {
+      if (isNotFound(cause)) {
+        throw new ControlError("HANDOFF_MISSING", "Handoff pointer does not reference a committed Registry file", {
+          handoff_path: handoffPath,
+        });
+      }
+      throw corruption("Handoff pointer could not be inspected", {
+        handoff_path: handoffPath,
+        recordPath: path,
+        cause: errorMessage(cause),
+      });
+    }
+    if (!entry.isFile()) {
+      throw corruption("Handoff pointer does not reference a regular Registry file", {
+        handoff_path: handoffPath,
+        recordPath: path,
+      });
+    }
+  }
+
+  private async assertHistoryDestinationAbsent(destination: string, taskId: string, claimId: string): Promise<void> {
+    try {
+      await lstat(destination);
+    } catch (cause) {
+      if (isNotFound(cause)) return;
+      throw corruption("Claim history destination could not be inspected", {
+        recordPath: destination,
+        task_id: taskId,
+        claim_id: claimId,
+        cause: errorMessage(cause),
+      });
+    }
+    throw corruption("Claim history destination already exists", {
+      recordPath: destination,
+      task_id: taskId,
+      claim_id: claimId,
+    });
   }
 
   private finishHistory(active: ActiveClaim, outcome: FinishOutcome): ClaimHistory {

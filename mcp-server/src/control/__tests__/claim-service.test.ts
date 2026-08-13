@@ -7,7 +7,7 @@ import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
-import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 const fixedNow = new Date("2026-08-13T12:34:56.789Z");
@@ -22,7 +22,7 @@ afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
 });
 
-async function claimsFixture(): Promise<{
+async function claimsFixture(now: () => Date = () => fixedNow): Promise<{
   fixture: RegistryFixture;
   claims: ClaimService;
   task: Awaited<ReturnType<Catalog["registerTemporaryTask"]>>;
@@ -42,12 +42,20 @@ async function claimsFixture(): Promise<{
   });
   return {
     fixture,
-    claims: new ClaimService(config, registry, catalog, inspection, () => fixedNow),
+    claims: new ClaimService(config, registry, catalog, inspection, now),
     task,
   };
 }
 
-function claimInput(taskId: string, overrides: Partial<{ session_id: string }> = {}) {
+function claimInput(
+  taskId: string,
+  overrides: Partial<{
+    session_id: string;
+    host: string;
+    branch: string;
+    worktree_ref: string;
+  }> = {},
+) {
   return {
     task_id: taskId,
     task_alias: "wlan:tmp-20260813-01-fix",
@@ -69,6 +77,19 @@ async function exists(path: string): Promise<boolean> {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
     throw error;
   }
+}
+
+function historyRelativePath(active: { task_id: string; claim_id: string }): string {
+  return `claims/history/2026/${active.task_id}/${active.claim_id}.yaml`;
+}
+
+function handoffRelativePath(active: { task_id: string; claim_id: string }): string {
+  return `handoffs/${active.task_id}/${active.claim_id}.md`;
+}
+
+async function commitRegistryFile(fixture: RegistryFixture, path: string, content: string): Promise<void> {
+  await commitFile(fixture.registryDir, path, content);
+  await git(fixture.registryDir, "push", "origin", "main");
 }
 
 describe("ClaimService", () => {
@@ -96,9 +117,14 @@ describe("ClaimService", () => {
     ).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
   });
 
-  it("takeover archives the old Claim and installs a fresh Claim ID atomically", async () => {
-    const { claims, fixture, task } = await claimsFixture();
-    const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-a" }));
+  it("takeover archives the old Claim and installs a fresh configured-host Claim atomically", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-a", host: "old-build-host" }));
 
     const recovered = await claims.recoverClaim(first.task_id, first.claim_id, {
       kind: "takeover",
@@ -107,7 +133,14 @@ describe("ClaimService", () => {
 
     expect(recovered.active.claim_id).not.toBe(first.claim_id);
     expect(recovered.active.session_id).toBe("codex-new");
-    expect(recovered.history).toMatchObject({ claim_id: first.claim_id, status: "taken-over" });
+    expect(recovered.active.host).toBe("cantopsbuildserver");
+    expect(new Date(recovered.active.started_at).getTime()).toBeGreaterThan(new Date(first.started_at).getTime());
+    expect(recovered.history).toMatchObject({
+      claim_id: first.claim_id,
+      status: "taken-over",
+      session_id: "codex-a",
+      host: "old-build-host",
+    });
     await expect(claims.assertOwner(first.task_id, first.claim_id)).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
     expect(await claims.assertOwner(first.task_id, recovered.active.claim_id)).toEqual(recovered.active);
     expect(await exists(join(fixture.registryDir, "claims", "history", "2026", first.task_id, `${first.claim_id}.yaml`))).toBe(true);
@@ -123,7 +156,6 @@ describe("ClaimService", () => {
       branch: "task/wlan-roaming-fix",
       head_sha: "0123456789abcdef",
       validation: ["npm test: pass", "npm run build: pass"],
-      handoff_path: `handoffs/${active.task_id}/${active.claim_id}.md`,
     });
 
     expect(history).toMatchObject({
@@ -131,7 +163,6 @@ describe("ClaimService", () => {
       status: "completed",
       released_at: fixedNow.toISOString(),
       validation_summary: "npm test: pass\nnpm run build: pass",
-      handoff_path: `handoffs/${active.task_id}/${active.claim_id}.md`,
     });
     expect(await claims.getActive(active.task_id)).toBeUndefined();
     expect(
@@ -142,6 +173,103 @@ describe("ClaimService", () => {
         ),
       ),
     ).toEqual(history);
+  });
+
+  it("fails closed for a valid existing completed-history path and retains the active Claim", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    await commitRegistryFile(
+      fixture,
+      historyRelativePath(active),
+      `${JSON.stringify({
+        ...active,
+        claim_id: "clm-00000000-0000-7000-8000-000000000000",
+        released_at: fixedNow.toISOString(),
+        status: "completed",
+      })}\n`,
+    );
+
+    await expect(
+      claims.finishClaim(active.task_id, active.claim_id, {
+        status: "completed",
+        branch: "task/wlan-roaming-fix",
+        head_sha: "0123456789abcdef",
+        validation: ["npm test: pass"],
+      }),
+    ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
+  it("fails closed for an invalid existing force-end history path and retains the active Claim", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    await commitRegistryFile(fixture, historyRelativePath(active), "not a ClaimHistory record\n");
+
+    await expect(claims.recoverClaim(active.task_id, active.claim_id, { kind: "force-end" })).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+    });
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
+  it("fails closed for a non-regular existing takeover history path and retains the active Claim", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    await commitRegistryFile(fixture, `${historyRelativePath(active)}/marker`, "directory entry\n");
+
+    await expect(
+      claims.recoverClaim(active.task_id, active.claim_id, { kind: "takeover", session_id: "codex-new" }),
+    ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
+  it("rejects a missing canonical Handoff pointer and retains the active Claim", async () => {
+    const { claims, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+
+    await expect(
+      claims.finishClaim(active.task_id, active.claim_id, {
+        status: "handoff",
+        branch: "task/wlan-roaming-fix",
+        head_sha: "0123456789abcdef",
+        validation: ["npm test: pass"],
+        handoff_path: handoffRelativePath(active),
+      }),
+    ).rejects.toMatchObject({ code: "HANDOFF_MISSING" });
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
+  it("rejects a non-regular canonical Handoff pointer and retains the active Claim", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    await commitRegistryFile(fixture, `${handoffRelativePath(active)}/marker`, "directory entry\n");
+
+    await expect(
+      claims.finishClaim(active.task_id, active.claim_id, {
+        status: "handoff",
+        branch: "task/wlan-roaming-fix",
+        head_sha: "0123456789abcdef",
+        validation: ["npm test: pass"],
+        handoff_path: handoffRelativePath(active),
+      }),
+    ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
+  it("finishes only after the canonical Handoff file is durably committed", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    await commitRegistryFile(fixture, handoffRelativePath(active), "# Handoff\n\nDurable content.\n");
+
+    const history = await claims.finishClaim(active.task_id, active.claim_id, {
+      status: "handoff",
+      branch: "task/wlan-roaming-fix",
+      head_sha: "0123456789abcdef",
+      validation: ["npm test: pass"],
+      handoff_path: handoffRelativePath(active),
+    });
+
+    expect(history).toMatchObject({ status: "handoff", handoff_path: handoffRelativePath(active) });
+    expect(await claims.getActive(active.task_id)).toBeUndefined();
   });
 
   it("reports recovery status without creating a Registry commit", async () => {
