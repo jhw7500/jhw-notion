@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { type FileHandle } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
-import { fileURLToPath } from "node:url";
 import type { Readable, Writable } from "node:stream";
 
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
-import { ensureSecureStateDirectory, PilotJournal } from "./journal.js";
+import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
 
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const SECRET_ENV_KEY = /_(?:TOKEN|KEY|SECRET)$/;
@@ -368,14 +368,17 @@ export class ProcessRunner {
   }
 }
 
-const MAX_CREDENTIAL_ENVELOPE_BYTES = 16 * 1024;
-const DEFAULT_LOCKED_CLI_ENTRY_PATH = fileURLToPath(new URL("./locked-cli.js", import.meta.url));
-const stableExitCodes = new Set([0, 1, 2, 4, 75, 78]);
+const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW;
+const READY = "READY\n";
+const HOLDER_COMMAND = ["/bin/sh", "-c", "printf 'READY\\n'; cat >/dev/null"] as const;
+
+export interface MutationLockPort {
+  run<T>(callback: () => Promise<T>): Promise<T>;
+}
 
 export interface MutationLockChild {
   stdin: Writable | null;
   stdout: Readable | null;
-  stderr: Readable | null;
   once(event: string, listener: (...args: unknown[]) => void): unknown;
 }
 
@@ -383,238 +386,161 @@ export interface MutationLockRuntime {
   spawn: (
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; stdio: ["pipe", "pipe", "pipe"] },
+    options: { env: NodeJS.ProcessEnv; stdio: ["pipe", "pipe", "ignore", number] },
   ) => MutationLockChild;
-}
-
-export interface MutationLockResult {
-  exitCode: 0 | 1 | 2 | 4 | 75 | 78;
-  stdout: string;
-  stderr: string;
 }
 
 const productionLockRuntime: MutationLockRuntime = {
   spawn: (command, args, options) => spawn(command, args, options),
 };
 
-function safeCommandName(argv: readonly string[]): string {
-  if (argv[0] === "task" && ["start", "status", "finish", "recover", "assert-owner"].includes(argv[1] ?? "")) {
-    return `task ${argv[1]}`;
-  }
-  if (argv[0] === "portfolio" && ["status", "export"].includes(argv[1] ?? "")) return `portfolio ${argv[1]}`;
-  if (argv[0] === "project" && argv[1] === "register") return "project register";
-  if (argv[0] === "preflight") return "preflight";
-  return "invalid";
+interface HolderExit {
+  kind: "close" | "spawn-error";
+  status?: number | null;
 }
 
-function lockError(code: string, exitCode: 1 | 75): MutationLockResult {
-  return {
-    exitCode,
-    stdout: "",
-    stderr: `${JSON.stringify({ error: { code } })}\n`,
+interface HolderObservation {
+  ready: Promise<void>;
+  closed: Promise<HolderExit>;
+}
+
+function lockFailure(exit: HolderExit): ControlError {
+  if (exit.kind === "spawn-error") {
+    return new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock holder");
+  }
+  if (exit.status === 75) {
+    return new ControlError("LOCK_CONTENDED", "Host mutation lock is already held");
+  }
+  return new ControlError("LOCK_READY_FAILED", "Host lock holder did not acknowledge acquisition");
+}
+
+function observeHolder(child: MutationLockChild): HolderObservation {
+  let resolveClose: (exit: HolderExit) => void = () => undefined;
+  const closed = new Promise<HolderExit>((resolve) => { resolveClose = resolve; });
+  let closedOnce = false;
+  const settleClose = (exit: HolderExit) => {
+    if (closedOnce) return;
+    closedOnce = true;
+    resolveClose(exit);
   };
-}
+  child.once("error", () => settleClose({ kind: "spawn-error" }));
+  child.once("close", (status) => settleClose({
+    kind: "close",
+    status: typeof status === "number" ? status : null,
+  }));
 
-async function recordLockFailure(config: ControlConfig, argv: readonly string[], result: MutationLockResult): Promise<void> {
-  const now = new Date();
-  const error = JSON.parse(result.stderr) as { error: { code: string } };
-  await new PilotJournal(config.stateDir).append({
-    command: safeCommandName(argv),
-    started_at: now.toISOString(),
-    finished_at: now.toISOString(),
-    elapsed_ms: 0,
-    ok: false,
-    error_code: error.error.code,
-    payload_bytes: Buffer.byteLength(result.stderr, "utf8"),
-  }).catch(() => undefined);
-}
-
-function credentialsFromEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
-  const credentials: Record<string, string> = {};
-  for (const key of ["GH_PROJECT_TOKEN", "GH_REPO_TOKEN"] as const) {
-    const value = env[key];
-    if (typeof value === "string") credentials[key] = value;
-  }
-  return credentials;
-}
-
-/** Serializes the only credentials permitted across the flock boundary. */
-export function privateCredentialEnvelope(env: NodeJS.ProcessEnv): string {
-  const envelope = JSON.stringify(credentialsFromEnvironment(env));
-  if (Buffer.byteLength(envelope, "utf8") > MAX_CREDENTIAL_ENVELOPE_BYTES) {
-    throw new ControlError("CREDENTIAL_ENVELOPE_TOO_LARGE", "Credential envelope exceeds its private input bound");
-  }
-  return envelope;
-}
-
-/** Reads one bounded private credential envelope from the locked child stdin. */
-export async function readPrivateCredentialEnvelope(stream: AsyncIterable<Buffer | string>): Promise<NodeJS.ProcessEnv> {
-  const chunks: Buffer[] = [];
-  let length = 0;
-  for await (const chunk of stream) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
-    length += bytes.length;
-    if (length > MAX_CREDENTIAL_ENVELOPE_BYTES) {
-      throw new ControlError("CREDENTIAL_ENVELOPE_TOO_LARGE", "Credential envelope exceeds its private input bound");
+  const ready = new Promise<void>((resolve, reject) => {
+    if (!child.stdout) {
+      reject(new ControlError("LOCK_READY_FAILED", "Host lock holder has no ready stream"));
+      return;
     }
-    chunks.push(bytes);
-  }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw) return {};
-  let candidate: unknown;
-  try {
-    candidate = JSON.parse(raw);
-  } catch {
-    throw new ControlError("CREDENTIAL_ENVELOPE_INVALID", "Credential envelope is invalid");
-  }
-  if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
-    throw new ControlError("CREDENTIAL_ENVELOPE_INVALID", "Credential envelope is invalid");
-  }
-  const output: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(candidate)) {
-    if ((key !== "GH_PROJECT_TOKEN" && key !== "GH_REPO_TOKEN") || typeof value !== "string") {
-      throw new ControlError("CREDENTIAL_ENVELOPE_INVALID", "Credential envelope is invalid");
-    }
-    output[key] = value;
-  }
-  return output;
-}
-
-function captureLockStream(stream: Readable | null): Promise<{ value: string; tooLarge: boolean }> {
-  if (!stream) return Promise.resolve({ value: "", tooLarge: false });
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
-    let length = 0;
-    let tooLarge = false;
-    stream.on("data", (chunk: Buffer | string) => {
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (length + bytes.length > MAX_CAPTURE_BYTES) {
-        tooLarge = true;
-        const remaining = Math.max(0, MAX_CAPTURE_BYTES - length);
-        if (remaining) {
-          chunks.push(bytes.subarray(0, remaining));
-          length += remaining;
-        }
-        return;
-      }
-      chunks.push(bytes);
-      length += bytes.length;
-    });
-    stream.once("end", () => resolve({ value: Buffer.concat(chunks).toString("utf8"), tooLarge }));
-    stream.once("error", () => resolve({ value: "", tooLarge: true }));
-  });
-}
-
-function waitForLockChild(child: MutationLockChild): Promise<{ kind: "close"; status: number | null } | { kind: "spawn-error" }> {
-  return new Promise((resolve) => {
     let settled = false;
-    const settle = (result: { kind: "close"; status: number | null } | { kind: "spawn-error" }) => {
+    let output = "";
+    const fail = (cause: ControlError) => {
       if (settled) return;
       settled = true;
-      resolve(result);
+      reject(cause);
     };
-    child.once("error", () => settle({ kind: "spawn-error" }));
-    child.once("close", (status) => settle({ kind: "close", status: typeof status === "number" ? status : null }));
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      if (settled) return;
+      output += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+      if (output === READY) {
+        settled = true;
+        resolve();
+      } else if (!READY.startsWith(output) || output.length >= READY.length) {
+        fail(new ControlError("LOCK_READY_FAILED", "Host lock holder emitted an invalid ready acknowledgement"));
+      }
+    });
+    child.stdout.once("error", () => fail(new ControlError("LOCK_READY_FAILED", "Host lock holder ready stream failed")));
+    child.stdout.once("end", () => {
+      if (!settled) fail(new ControlError("LOCK_READY_FAILED", "Host lock holder closed before ready"));
+    });
+    void closed.then((exit) => {
+      if (!settled) fail(lockFailure(exit));
+    });
   });
-}
-
-function validForwardedResult(status: number | null, stdout: string, stderr: string): MutationLockResult | undefined {
-  if (status === null || !stableExitCodes.has(status)) return undefined;
-  try {
-    if (status === 0 && !stderr) {
-      const parsed = JSON.parse(stdout) as { command?: unknown; result?: unknown };
-      if (typeof parsed === "object" && parsed !== null && typeof parsed.command === "string" && "result" in parsed) {
-        return { exitCode: 0, stdout, stderr: "" };
-      }
-    }
-    if (status !== 0 && !stdout) {
-      const parsed = JSON.parse(stderr) as { error?: { code?: unknown } };
-      if (typeof parsed?.error?.code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(parsed.error.code)) {
-        return { exitCode: status as MutationLockResult["exitCode"], stdout: "", stderr };
-      }
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
+  return { ready, closed };
 }
 
 /**
- * Executes the private locked entrypoint under flock. The installed caller never
- * trusts an environment marker: every mutation passes through this boundary.
- * Credentials are removed from flock's argv/environment and cross only stdin.
+ * Holds the host-global flock in a credential-sanitized helper while the
+ * callback remains in this original process. The helper receives no CLI
+ * arguments or credentials and has no mutation dispatcher to invoke.
  */
-export async function runUnderMutationLock(
-  argv: string[],
-  config: ControlConfig,
-  environment: NodeJS.ProcessEnv = process.env,
-  runtime: MutationLockRuntime = productionLockRuntime,
-  lockedCliEntryPath = DEFAULT_LOCKED_CLI_ENTRY_PATH,
-): Promise<MutationLockResult> {
-  try {
-    await ensureSecureStateDirectory(config.stateDir);
-  } catch {
-    return lockError("LOCK_SETUP_FAILED", 1);
-  }
+export class MutationLock implements MutationLockPort {
+  constructor(
+    private readonly config: ControlConfig,
+    private readonly environment: NodeJS.ProcessEnv = process.env,
+    private readonly runtime: MutationLockRuntime = productionLockRuntime,
+    private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
+  ) {}
 
-  let envelope: string;
-  try {
-    envelope = privateCredentialEnvelope(environment);
-  } catch {
-    const result = lockError("CREDENTIAL_ENVELOPE_TOO_LARGE", 1);
-    await recordLockFailure(config, argv, result);
-    return result;
-  }
-  const childEnvironment = sanitizedChildEnvironment(environment);
-  delete childEnvironment.JHW_CONTROL_LOCK_HELD;
-  const lock = join(config.stateDir, "registry.lock");
-  let child: MutationLockChild;
-  try {
-    child = runtime.spawn(
-      "flock",
-      ["-n", "-E", "75", lock, process.execPath, lockedCliEntryPath, ...argv],
-      { stdio: ["pipe", "pipe", "pipe"], env: childEnvironment },
-    );
-  } catch {
-    const result = lockError("LOCK_SPAWN_FAILED", 1);
-    await recordLockFailure(config, argv, result);
-    return result;
-  }
+  async run<T>(callback: () => Promise<T>): Promise<T> {
+    let directory: SecureStateDirectory | undefined;
+    let lockFile: FileHandle | undefined;
+    let observation: HolderObservation | undefined;
+    let child: MutationLockChild | undefined;
+    try {
+      try {
+        directory = await openSecureStateDirectory(this.config.stateDir, this.secureDirectoryHooks);
+        lockFile = await directory.openFile("registry.lock", lockOpenFlags, 0o600);
+        const info = await lockFile.stat();
+        if (!info.isFile()) throw new ControlError("UNSAFE_STATE_PATH", "Host lock is not a regular file");
+        await lockFile.chmod(0o600);
+      } catch (cause) {
+        if (cause instanceof ControlError && cause.code === "UNSAFE_STATE_PATH") throw cause;
+        if (typeof cause === "object" && cause !== null && "code" in cause && (cause.code === "ELOOP" || cause.code === "ENOTDIR")) {
+          throw new ControlError("UNSAFE_STATE_PATH", "Host lock path is unsafe");
+        }
+        throw new ControlError("LOCK_SETUP_FAILED", "Unable to prepare host mutation lock");
+      }
 
-  if (!child.stdin) {
-    const result = lockError("LOCK_STDIN_FAILED", 1);
-    await recordLockFailure(config, argv, result);
-    return result;
+      const helperEnvironment = sanitizedChildEnvironment(this.environment);
+      // Deliberately ignore the retired marker; it is neither an authority nor
+      // forwarded to the helper process.
+      delete helperEnvironment.JHW_CONTROL_LOCK_HELD;
+      try {
+        child = this.runtime.spawn(
+          "flock",
+          ["-n", "-E", "75", "/proc/self/fd/3", ...HOLDER_COMMAND],
+          { env: helperEnvironment, stdio: ["pipe", "pipe", "ignore", lockFile.fd] },
+        );
+      } catch {
+        throw new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock holder");
+      }
+      observation = observeHolder(child);
+      await observation.ready;
+      // If the holder dies while callback work is pending, fail rather than
+      // returning a result that may have run after the flock was released.
+      let callbackSettled = false;
+      const callbackResult = callback().then(
+        (value) => {
+          callbackSettled = true;
+          return value;
+        },
+        (cause: unknown) => {
+          callbackSettled = true;
+          throw cause;
+        },
+      );
+      return await Promise.race([
+        callbackResult,
+        observation.closed.then((exit) => {
+          if (!callbackSettled) throw lockFailure(exit);
+          return new Promise<T>(() => undefined);
+        }),
+      ]);
+    } finally {
+      if (child?.stdin) {
+        try {
+          child.stdin.end();
+        } catch {
+          // The ready/close observation supplies the stable error mapping.
+        }
+      }
+      if (observation) await observation.closed;
+      await lockFile?.close();
+      await directory?.close();
+    }
   }
-  let stdinFailed = false;
-  child.stdin.once("error", () => { stdinFailed = true; });
-  try {
-    child.stdin.end(envelope);
-  } catch {
-    stdinFailed = true;
-  }
-  const stdoutCapture = captureLockStream(child.stdout);
-  const stderrCapture = captureLockStream(child.stderr);
-  const outcome = await waitForLockChild(child);
-  if (outcome.kind === "spawn-error") {
-    const result = lockError("LOCK_SPAWN_FAILED", 1);
-    await recordLockFailure(config, argv, result);
-    return result;
-  }
-  const [stdout, stderr] = await Promise.all([stdoutCapture, stderrCapture]);
-  if (stdinFailed || stdout.tooLarge || stderr.tooLarge) {
-    const result = lockError(stdinFailed ? "LOCK_STDIN_FAILED" : "LOCK_OUTPUT_INVALID", 1);
-    await recordLockFailure(config, argv, result);
-    return result;
-  }
-  const forwarded = validForwardedResult(outcome.status, stdout.value, stderr.value);
-  if (forwarded) return forwarded;
-  if (outcome.status === 75 && !stdout.value && !stderr.value) {
-    const result = lockError("LOCK_CONTENDED", 75);
-    await recordLockFailure(config, argv, result);
-    return result;
-  }
-  const result = lockError("LOCK_EXEC_FAILED", 1);
-  await recordLockFailure(config, argv, result);
-  return result;
 }

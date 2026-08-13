@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, open } from "node:fs/promises";
+import { lstat, mkdir, open, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 import { ControlError } from "./errors.js";
@@ -27,6 +27,18 @@ export interface JournalPort {
   append(event: JournalEvent): Promise<void>;
 }
 
+/** Test-only synchronization point after the state directory has an FD anchor. */
+export interface SecureStateDirectoryHooks {
+  afterDirectoryOpen?(directory: SecureStateDirectory): Promise<void> | void;
+}
+
+export interface SecureStateDirectory {
+  readonly path: string;
+  readonly fd: number;
+  openFile(name: string, flags: number, mode?: number): Promise<FileHandle>;
+  close(): Promise<void>;
+}
+
 function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
 }
@@ -38,6 +50,10 @@ function isWithin(root: string, candidate: string): boolean {
 
 function unsafeStatePath(): ControlError {
   return new ControlError("UNSAFE_STATE_PATH", "Control state directory is not a private non-symbolic directory");
+}
+
+function safeStateFileName(name: string): boolean {
+  return name.length > 0 && name !== "." && name !== ".." && !name.includes("/") && !name.includes("\\");
 }
 
 async function secureDirectoryAt(path: string): Promise<void> {
@@ -58,16 +74,40 @@ async function secureDirectoryAt(path: string): Promise<void> {
   if (info.isSymbolicLink() || !info.isDirectory()) throw unsafeStatePath();
 }
 
+class AnchoredStateDirectory implements SecureStateDirectory {
+  constructor(readonly path: string, private readonly handle: FileHandle) {}
+
+  get fd(): number {
+    return this.handle.fd;
+  }
+
+  async openFile(name: string, flags: number, mode?: number): Promise<FileHandle> {
+    if (!safeStateFileName(name)) throw unsafeStatePath();
+    // The descriptor-backed path retains the directory inode even if a hostile
+    // concurrent actor renames a validated ancestor after the open below.
+    return open(`/proc/self/fd/${this.handle.fd}/${name}`, flags | constants.O_NOFOLLOW, mode);
+  }
+
+  async close(): Promise<void> {
+    await this.handle.close();
+  }
+}
+
 /**
- * Creates only missing configured state-directory components and rejects every
- * symbolic or non-directory component before obtaining a non-following final
- * directory descriptor. The descriptor is chmodded, never a potentially raced
- * path string.
+ * Validates every configured component and returns a retained, non-following
+ * descriptor for the final state directory. Consumers must open child files
+ * through this descriptor rather than re-resolving the configured path.
  */
-export async function ensureSecureStateDirectory(stateDir: string): Promise<string> {
+export async function openSecureStateDirectory(
+  stateDir: string,
+  hooks: SecureStateDirectoryHooks = {},
+): Promise<SecureStateDirectory> {
   if (!isAbsolute(stateDir)) throw unsafeStatePath();
   const root = parse(resolve(stateDir)).root;
   const target = resolve(stateDir);
+  // Never treat a filesystem root as application-owned state: enforcing 0700
+  // on it would alter a shared ancestor rather than a configured state dir.
+  if (target === root) throw unsafeStatePath();
   const components = relative(root, target).split(sep).filter(Boolean);
   let current = root;
   for (const component of components) {
@@ -76,23 +116,24 @@ export async function ensureSecureStateDirectory(stateDir: string): Promise<stri
   }
   if (!isWithin(target, join(target, JOURNAL_FILE))) throw unsafeStatePath();
 
-  let directory;
+  let handle: FileHandle;
   try {
-    directory = await open(target, directoryOpenFlags);
+    handle = await open(target, directoryOpenFlags);
   } catch {
     throw unsafeStatePath();
   }
   try {
-    const info = await directory.stat();
+    const info = await handle.stat();
     if (!info.isDirectory()) throw unsafeStatePath();
-    await directory.chmod(0o700);
+    await handle.chmod(0o700);
+    const directory = new AnchoredStateDirectory(target, handle);
+    await hooks.afterDirectoryOpen?.(directory);
+    return directory;
   } catch (cause) {
+    await handle.close();
     if (cause instanceof ControlError) throw cause;
     throw unsafeStatePath();
-  } finally {
-    await directory.close();
   }
-  return target;
 }
 
 /**
@@ -100,7 +141,10 @@ export async function ensureSecureStateDirectory(stateDir: string): Promise<stri
  * command metadata, never argument values or host-local paths.
  */
 export class PilotJournal implements JournalPort {
-  constructor(private readonly stateDir: string) {}
+  constructor(
+    private readonly stateDir: string,
+    private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
+  ) {}
 
   async append(event: JournalEvent): Promise<void> {
     const line = `${JSON.stringify(event)}\n`;
@@ -108,19 +152,10 @@ export class PilotJournal implements JournalPort {
       throw new ControlError("JOURNAL_EVENT_TOO_LARGE", "Pilot journal event exceeds the atomic append boundary");
     }
 
-    let stateDir: string;
+    let directory: SecureStateDirectory | undefined;
     try {
-      stateDir = await ensureSecureStateDirectory(this.stateDir);
-      const journalPath = join(stateDir, JOURNAL_FILE);
-      if (!isWithin(stateDir, journalPath)) throw unsafeStatePath();
-      try {
-        const existing = await lstat(journalPath);
-        if (existing.isSymbolicLink() || !existing.isFile()) throw unsafeStatePath();
-      } catch (cause) {
-        if (!isNotFound(cause)) throw cause;
-      }
-
-      const file = await open(journalPath, journalOpenFlags, 0o600);
+      directory = await openSecureStateDirectory(this.stateDir, this.secureDirectoryHooks);
+      const file = await directory.openFile(JOURNAL_FILE, journalOpenFlags, 0o600);
       try {
         const info = await file.stat();
         if (!info.isFile()) throw unsafeStatePath();
@@ -137,6 +172,8 @@ export class PilotJournal implements JournalPort {
         throw unsafeStatePath();
       }
       throw new ControlError("JOURNAL_WRITE_FAILED", "Unable to append the pilot journal");
+    } finally {
+      await directory?.close();
     }
   }
 }

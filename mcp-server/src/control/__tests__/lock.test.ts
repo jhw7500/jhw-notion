@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { runUnderMutationLock } from "../process.js";
+import { MutationLock, ProcessRunner, type MutationLockRuntime } from "../process.js";
 import type { ControlConfig } from "../config.js";
 
 const roots: string[] = [];
@@ -24,146 +24,147 @@ function configFor(stateDir: string): ControlConfig {
   };
 }
 
-function child(status: number | null, stdout = "", stderr = "") {
-  const process = new EventEmitter() as EventEmitter & {
+function holder(options: { ready?: string; status?: number; error?: boolean } = {}) {
+  const child = new EventEmitter() as EventEmitter & {
     stdin: PassThrough;
     stdout: PassThrough;
-    stderr: PassThrough;
   };
-  process.stdin = new PassThrough();
-  process.stdout = new PassThrough();
-  process.stderr = new PassThrough();
-  process.stdin.once("finish", () => queueMicrotask(() => {
-    if (stdout) process.stdout.end(stdout);
-    else process.stdout.end();
-    if (stderr) process.stderr.end(stderr);
-    else process.stderr.end();
-    process.emit("close", status);
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  queueMicrotask(() => {
+    if (options.error) {
+      child.emit("error", new Error("flock missing"));
+      return;
+    }
+    if (options.ready !== undefined) child.stdout.write(options.ready);
+    if (options.status !== undefined) {
+      child.stdout.end();
+      child.emit("close", options.status);
+    }
+  });
+  child.stdin.once("finish", () => queueMicrotask(() => {
+    child.stdout.end();
+    child.emit("close", 0);
   }));
-  return process;
+  return child;
 }
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe("mutation lock boundary", () => {
-  it("does not trust a caller lock marker and puts credentials only in the stdin envelope", async () => {
+describe("callback mutation lock", () => {
+  it("runs the callback under one credential-free holder and ignores a caller marker", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
     const seen: { args?: string[]; env?: NodeJS.ProcessEnv; stdin?: string } = {};
-    const fake = child(75);
-    fake.stdin.on("data", (chunk: Buffer) => { seen.stdin = `${seen.stdin ?? ""}${chunk.toString("utf8")}`; });
-    const spawn = vi.fn((_command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
-      seen.args = args;
-      seen.env = options.env;
-      return fake;
-    });
+    const runtime: MutationLockRuntime = {
+      spawn: vi.fn((_command, args, options) => {
+        seen.args = args;
+        seen.env = options.env;
+        const child = holder({ ready: "READY\n" });
+        child.stdin.on("data", (chunk: Buffer) => { seen.stdin = `${seen.stdin ?? ""}${chunk}`; });
+        return child;
+      }),
+    };
 
-    const result = await runUnderMutationLock(
-      ["task", "start"],
+    const value = await new MutationLock(
       configFor(join(root, "state")),
       { PATH: process.env.PATH, JHW_CONTROL_LOCK_HELD: "1", GH_PROJECT_TOKEN: "project-token", GH_REPO_TOKEN: "repo-token" },
-      { spawn },
-      "/private/locked-cli.js",
-    );
+      runtime,
+    ).run(async () => "original-process-credential-retained");
 
-    expect(result.exitCode).toBe(75);
-    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "LOCK_CONTENDED" } });
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(seen.args?.join(" ")).not.toContain("project-token");
-    expect(seen.args?.join(" ")).not.toContain("repo-token");
+    expect(value).toBe("original-process-credential-retained");
+    expect((runtime.spawn as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
+    expect(seen.args).toEqual(["-n", "-E", "75", "/proc/self/fd/3", "/bin/sh", "-c", "printf 'READY\\n'; cat >/dev/null"]);
     expect(seen.env).not.toHaveProperty("GH_PROJECT_TOKEN");
     expect(seen.env).not.toHaveProperty("GH_REPO_TOKEN");
     expect(seen.env).not.toHaveProperty("JHW_CONTROL_LOCK_HELD");
-    expect(JSON.parse(seen.stdin ?? "")).toEqual({ GH_PROJECT_TOKEN: "project-token", GH_REPO_TOKEN: "repo-token" });
-    const journal = await readFile(join(root, "state", "pilot-journal.jsonl"), "utf8");
-    expect(JSON.parse(journal)).toMatchObject({ command: "task start", ok: false, error_code: "LOCK_CONTENDED" });
+    expect(seen.stdin ?? "").toBe("");
   });
 
-  it("returns stable JSON and a journal event when flock cannot spawn", async () => {
+  it("maps immediate contention before READY to LOCK_CONTENDED", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
+    const lock = new MutationLock(configFor(join(root, "state")), {}, { spawn: () => holder({ status: 75 }) });
 
-    const result = await runUnderMutationLock(
-      ["task", "start"],
-      configFor(join(root, "state")),
-      { PATH: process.env.PATH },
-      { spawn: () => { throw new Error("flock missing"); } },
-      "/private/locked-cli.js",
-    );
-
-    expect(result.exitCode).toBe(1);
-    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "LOCK_SPAWN_FAILED" } });
-    const journal = await readFile(join(root, "state", "pilot-journal.jsonl"), "utf8");
-    expect(JSON.parse(journal)).toMatchObject({ command: "task start", ok: false, error_code: "LOCK_SPAWN_FAILED" });
+    await expect(lock.run(async () => "must-not-run")).rejects.toMatchObject({ code: "LOCK_CONTENDED" });
   });
 
-  it("does not wait for stdio closure after an asynchronous flock spawn error", async () => {
+  it("maps spawn and malformed READY failures before invoking the callback", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
-    const failed = new EventEmitter() as EventEmitter & { stdin: PassThrough; stdout: PassThrough; stderr: PassThrough };
-    failed.stdin = new PassThrough();
-    failed.stdout = new PassThrough();
-    failed.stderr = new PassThrough();
-    failed.stdin.once("finish", () => queueMicrotask(() => failed.emit("error", new Error("flock missing"))));
+    const spawn = new MutationLock(configFor(join(root, "state")), {}, { spawn: () => { throw new Error("missing"); } });
+    const badReady = new MutationLock(configFor(join(root, "state-two")), {}, { spawn: () => holder({ ready: "NOPE\n", status: 1 }) });
 
-    const result = await runUnderMutationLock(
-      ["task", "start"],
-      configFor(join(root, "state")),
-      { PATH: process.env.PATH },
-      { spawn: () => failed },
-      "/private/locked-cli.js",
-    );
-
-    expect(result.exitCode).toBe(1);
-    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "LOCK_SPAWN_FAILED" } });
+    await expect(spawn.run(async () => "must-not-run")).rejects.toMatchObject({ code: "LOCK_SPAWN_FAILED" });
+    await expect(badReady.run(async () => "must-not-run")).rejects.toMatchObject({ code: "LOCK_READY_FAILED" });
   });
 
-  it("delivers a selected credential through stdin to the locked gh-only execution path", async () => {
+  it("retains the selected credential only in the original ProcessRunner gh path", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
     const bin = join(root, "bin");
-    await rm(bin, { recursive: true, force: true });
-    await (await import("node:fs/promises")).mkdir(bin);
-    const observedArgs = join(root, "flock-args.txt");
-    const observedEnv = join(root, "flock-env.txt");
-    const lockedEntry = join(root, "locked-probe.mjs");
-    await writeFile(join(bin, "flock"), `#!/bin/sh
-printf '%s\\n' "$@" > ${JSON.stringify(observedArgs)}
-env > ${JSON.stringify(observedEnv)}
-while [ "$1" = "-n" ]; do shift; done
-if [ "$1" = "-E" ]; then shift 2; fi
-shift
-exec "$@"
-`, "utf8");
-    await writeFile(join(bin, "gh"), "#!/bin/sh\n[ \"$GH_TOKEN\" = \"project-token\" ] && printf credential-seen\n", "utf8");
-    await chmod(join(bin, "flock"), 0o755);
-    await chmod(join(bin, "gh"), 0o755);
-    await writeFile(lockedEntry, `
-import { spawnSync } from "node:child_process";
-const chunks = [];
-for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
-const envelope = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-if (process.env.GH_PROJECT_TOKEN || process.env.GH_REPO_TOKEN) process.exit(9);
-const gh = spawnSync("gh", [], { encoding: "utf8", env: { ...process.env, GH_TOKEN: envelope.GH_PROJECT_TOKEN } });
-if (gh.status !== 0) process.exit(8);
-process.stdout.write(JSON.stringify({ command: "probe", result: { credential_path: gh.stdout } }) + "\\n");
-`, "utf8");
+    await mkdir(bin);
+    const gh = join(bin, "gh");
+    await writeFile(gh, "#!/bin/sh\n[ \"$GH_TOKEN\" = \"project-token\" ] && printf credential-seen\n", "utf8");
+    await chmod(gh, 0o755);
+    const environment = { PATH: `${bin}:${process.env.PATH}`, GH_PROJECT_TOKEN: "project-token", GH_REPO_TOKEN: "repo-token" };
+    const seen: { env?: NodeJS.ProcessEnv } = {};
+    const runtime: MutationLockRuntime = {
+      spawn: vi.fn((_command, _args, options) => {
+        seen.env = options.env;
+        return holder({ ready: "READY\n" });
+      }),
+    };
 
-    const result = await runUnderMutationLock(
-      ["task", "start"],
-      configFor(join(root, "state")),
-      { PATH: `${bin}:${process.env.PATH}`, GH_PROJECT_TOKEN: "project-token", GH_REPO_TOKEN: "repo-token" },
-      undefined,
-      lockedEntry,
+    const output = await new MutationLock(configFor(join(root, "state")), environment, runtime).run(async () =>
+      (await new ProcessRunner(environment).runGh([], "project")).stdout,
     );
 
-    expect(result.exitCode).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ result: { credential_path: "credential-seen" } });
-    expect(await readFile(observedArgs, "utf8")).not.toContain("project-token");
-    expect(await readFile(observedArgs, "utf8")).not.toContain("repo-token");
-    expect(await readFile(observedEnv, "utf8")).not.toContain("GH_PROJECT_TOKEN=project-token");
-    expect(await readFile(observedEnv, "utf8")).not.toContain("GH_REPO_TOKEN=repo-token");
+    expect(output).toBe("credential-seen");
+    expect(seen.env).not.toHaveProperty("GH_PROJECT_TOKEN");
+    expect(seen.env).not.toHaveProperty("GH_REPO_TOKEN");
+  });
+
+  it("keeps registry.lock on the opened state-directory inode after an ancestor swap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const originalParent = join(root, "original-parent");
+    const stateDir = join(originalParent, "state");
+    const movedParent = join(root, "moved-parent");
+    const externalParent = join(root, "external-parent");
+    await mkdir(stateDir, { recursive: true });
+    await mkdir(externalParent);
+    const lock = new MutationLock(configFor(stateDir), {}, { spawn: () => holder({ ready: "READY\n" }) }, {
+      afterDirectoryOpen: async () => {
+        await rename(originalParent, movedParent);
+        await mkdir(originalParent);
+        await rename(externalParent, join(originalParent, "state"));
+      },
+    });
+
+    await lock.run(async () => undefined);
+
+    expect((await lstat(join(movedParent, "state", "registry.lock"))).isFile()).toBe(true);
+    await expect(lstat(join(originalParent, "state", "registry.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a final registry lock symlink without touching its external target", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const external = join(root, "external-lock");
+    await mkdir(stateDir);
+    await writeFile(external, "outside", "utf8");
+    await chmod(external, 0o644);
+    await symlink(external, join(stateDir, "registry.lock"));
+    const spawn = vi.fn();
+
+    await expect(new MutationLock(configFor(stateDir), {}, { spawn }).run(async () => undefined)).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+
+    expect(await readFile(external, "utf8")).toBe("outside");
+    expect((await lstat(external)).mode & 0o777).toBe(0o644);
+    expect(spawn).not.toHaveBeenCalled();
   });
 });

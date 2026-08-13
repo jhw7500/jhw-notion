@@ -7,7 +7,7 @@ import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
-import { ProcessRunner, runUnderMutationLock } from "./process.js";
+import { MutationLock, ProcessRunner, type MutationLockPort } from "./process.js";
 import { RegistryGit } from "./registry-git.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
@@ -60,6 +60,7 @@ export interface CliDependencies {
   catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask">;
   portfolio: PortfolioPort;
   preflight: PreflightPort;
+  mutationLock: MutationLockPort;
   journal?: JournalPort;
 }
 
@@ -133,6 +134,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     catalog,
     portfolio: new UnavailablePortfolioPort(),
     preflight: new UnavailablePreflightPort(),
+    mutationLock: new MutationLock(config, env),
   };
 }
 
@@ -467,8 +469,6 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
           active: {
             task_id: recovered.active.task_id,
             claim_id: recovered.active.claim_id,
-            session_id: recovered.active.session_id,
-            host: recovered.active.host,
           },
         } : {}),
       }),
@@ -521,7 +521,12 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
   let flags: ParsedFlags | undefined;
   let result: CliResult;
   try {
-    const execution = await execute(command, argv, dependencies);
+    // Lifecycle work cannot reach a production service path without first
+    // acquiring the injected host-global callback lock. Read-only commands
+    // intentionally remain lock-free.
+    const execution = requiresMutationLock(argv)
+      ? await dependencies.mutationLock.run(() => execute(command, argv, dependencies))
+      : await execute(command, argv, dependencies);
     result = execution.result;
     flags = execution.flags;
   } catch (cause) {
@@ -556,7 +561,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
   return result;
 }
 
-/** True only for lifecycle mutations that must re-exec beneath host-global flock. */
+/** True only for lifecycle mutations that require the host-global callback lock. */
 export function requiresMutationLock(argv: readonly string[]): boolean {
   if (argv[0] === "task" && (argv[1] === "start" || argv[1] === "finish")) return true;
   if (argv[0] === "project" && argv[1] === "register") return true;
@@ -575,13 +580,6 @@ async function main(): Promise<void> {
     return;
   }
   try {
-    if (requiresMutationLock(argv)) {
-      const result = await runUnderMutationLock(argv, loadControlConfig(process.env), process.env);
-      if (result.stdout) process.stdout.write(result.stdout);
-      if (result.stderr) process.stderr.write(result.stderr);
-      process.exit(result.exitCode);
-      return;
-    }
     const result = await runCli(argv, createCliDependencies(process.env));
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);

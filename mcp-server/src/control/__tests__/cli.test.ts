@@ -1,16 +1,48 @@
 import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
 import { requiresMutationLock, runCli, type CliDependencies } from "../cli.js";
 import { ControlError } from "../errors.js";
+import { MutationLock, type MutationLockRuntime } from "../process.js";
+import type { ControlConfig } from "../config.js";
 
 const TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000001";
 const CLAIM_ID = "clm-0198e748-3a00-7000-8000-000000000002";
 const PROJECT_ID = "prj-control";
 const REPO_ID = "repo-control";
+
+function lockConfig(stateDir: string): ControlConfig {
+  return {
+    registryDir: "/srv/registry",
+    registryRemote: "origin",
+    registryBranch: "main",
+    worktreeRoot: "/srv/worktrees",
+    buildHost: "build-host",
+    githubOwner: "owner",
+    projectNumber: 1,
+    stateDir,
+  };
+}
+
+function immediateContentionRuntime(): MutationLockRuntime {
+  return {
+    spawn: () => {
+      const child = new EventEmitter() as EventEmitter & { stdin: PassThrough; stdout: PassThrough };
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      queueMicrotask(() => {
+        child.stdout.end();
+        child.emit("close", 75);
+      });
+      return child;
+    },
+  };
+}
 
 const activeClaim = {
   task_id: TASK_ID,
@@ -66,6 +98,7 @@ type Overrides = {
   catalog?: Record<string, unknown>;
   portfolio?: Record<string, unknown>;
   preflight?: Record<string, unknown>;
+  mutationLock?: { run: ReturnType<typeof vi.fn> };
   journal?: { append: ReturnType<typeof vi.fn> };
 };
 
@@ -110,6 +143,9 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     run: vi.fn().mockResolvedValue({ ready: true }),
     ...overrides.preflight,
   };
+  const mutationLock = overrides.mutationLock ?? {
+    run: vi.fn(async <T>(callback: () => Promise<T>) => callback()),
+  };
 
   return {
     stateDir: overrides.stateDir ?? join(tmpdir(), "jhw-control-cli-state"),
@@ -120,6 +156,7 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     catalog,
     portfolio,
     preflight,
+    mutationLock,
     ...(overrides.journal ? { journal: overrides.journal } : {}),
   } as unknown as CliDependencies;
 }
@@ -224,6 +261,57 @@ describe("runCli", () => {
     expect(requiresMutationLock(["task", "status"])).toBe(false);
     expect(requiresMutationLock(["task", "recover", "--action", "status"])).toBe(false);
     expect(requiresMutationLock(["portfolio", "export"])).toBe(false);
+  });
+
+  it("invokes the injected lock exactly once for a mutation while read-only commands bypass it", async () => {
+    const mutationLock = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
+    const dependencies = makeCliDependencies({ mutationLock });
+
+    const mutation = await runCli(["project", "register", "--project", PROJECT_ID, "--base-sha", "a".repeat(40)], dependencies);
+    const readOnly = await runCli(["portfolio", "status"], dependencies);
+
+    expect(mutation.exitCode).toBe(0);
+    expect(readOnly.exitCode).toBe(0);
+    expect(mutationLock.run).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["LOCK_CONTENDED", 75],
+    ["LOCK_SPAWN_FAILED", 1],
+    ["LOCK_READY_FAILED", 1],
+  ] as const)("journals stable %s lock failures before a mutation runs", async (code, expectedExit) => {
+    const journal = { append: vi.fn() };
+    const mutationLock = {
+      run: vi.fn(async () => { throw new ControlError(code, "untrusted lock diagnostic"); }),
+    };
+    const dependencies = makeCliDependencies({ mutationLock, journal });
+
+    const result = await runCli(["project", "register", "--project", PROJECT_ID, "--base-sha", "a".repeat(40)], dependencies);
+
+    expect(result.exitCode).toBe(expectedExit);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code } });
+    expect(dependencies.portfolio.registerProject).not.toHaveBeenCalled();
+    expect(journal.append).toHaveBeenCalledWith(expect.objectContaining({ command: "project register", ok: false, error_code: code }));
+  });
+
+  it("maps immediate contention to exit 75 and appends one complete journal event per concurrent command", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-contention-"));
+    const mutationLock = new MutationLock(lockConfig(stateDir), {}, immediateContentionRuntime());
+    const dependencies = makeCliDependencies({ stateDir, mutationLock });
+    const args = ["project", "register", "--project", PROJECT_ID, "--base-sha", "a".repeat(40)];
+
+    const results = await Promise.all(Array.from({ length: 20 }, () => runCli(args, dependencies)));
+    const lines = (await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8")).trim().split("\n");
+
+    expect(results).toHaveLength(20);
+    for (const result of results) {
+      expect(result.exitCode).toBe(75);
+      expect(JSON.parse(result.stderr)).toEqual({ error: { code: "LOCK_CONTENDED" } });
+    }
+    expect(lines).toHaveLength(20);
+    for (const line of lines) {
+      expect(JSON.parse(line)).toMatchObject({ command: "project register", error_code: "LOCK_CONTENDED" });
+    }
   });
 
   it("requires a non-unknown revision for Handoff and an outcome for completion", async () => {
@@ -366,7 +454,7 @@ describe("runCli", () => {
     expect(dependencies.portfolio.registerProject).not.toHaveBeenCalled();
   });
 
-  it("allows an optional session for status/force-end recovery and reports the takeover's new Claim", async () => {
+  it("allows an optional session for status/force-end recovery without echoing a takeover session", async () => {
     const replacement = {
       ...activeClaim,
       claim_id: "clm-0198e748-3a00-7000-8000-000000000003",
@@ -394,8 +482,10 @@ describe("runCli", () => {
     expect(dependencies.taskService.recover).toHaveBeenNthCalledWith(1, { task_id: TASK_ID, claim_id: CLAIM_ID, action: { kind: "status" } });
     expect(dependencies.taskService.recover).toHaveBeenNthCalledWith(2, { task_id: TASK_ID, claim_id: CLAIM_ID, action: { kind: "force-end" } });
     expect(JSON.parse(takeover.stdout)).toMatchObject({
-      result: { kind: "takeover", active: { claim_id: replacement.claim_id, session_id: "codex-new", host: "new-host" } },
+      result: { kind: "takeover", active: { task_id: TASK_ID, claim_id: replacement.claim_id } },
     });
+    expect(takeover.stdout).not.toContain("codex-new");
+    expect(takeover.stdout).not.toContain("new-host");
     expect(newClaim).toBe(replacement.claim_id);
     expect(owner.exitCode).toBe(0);
     expect(dependencies.taskService.assertOwner).toHaveBeenLastCalledWith(TASK_ID, replacement.claim_id);

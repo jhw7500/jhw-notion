@@ -42,11 +42,13 @@ describe("jhw-control installed entry", () => {
     expect(stdout).not.toContain("entry-token");
   });
 
-  it("routes a marker-bearing mutation through the locked internal entrypoint", async () => {
+  it("does not let a marker-bearing installed bin bypass the callback lock", async () => {
     await execFile("npm", ["run", "build"], { cwd: mcpRoot, encoding: "utf8" });
     const root = await mkdtemp(join(tmpdir(), "jhw-control-bin-"));
     paths.push(root);
-    const installedBin = join(root, "jhw-control");
+    const npmBin = join(root, "node_modules", ".bin");
+    await mkdir(npmBin, { recursive: true });
+    const installedBin = join(npmBin, "jhw-control");
     const stateDir = join(root, "state");
     await symlink(join(mcpRoot, "dist", "control", "cli.js"), installedBin);
     const sha = "a".repeat(40);

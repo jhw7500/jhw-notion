@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +24,10 @@ function event() {
 }
 
 describe("PilotJournal", () => {
+  it("refuses a filesystem root rather than chmodding a shared ancestor", async () => {
+    await expect(new PilotJournal("/").append(event())).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+  });
+
   it("creates a private state directory and journal file", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-journal-"));
     roots.push(root);
@@ -67,5 +71,27 @@ describe("PilotJournal", () => {
 
     expect(await readFile(external, "utf8")).toBe("outside");
     expect((await lstat(external)).mode & 0o777).toBe(0o644);
+  });
+
+  it("keeps the journal on the opened state-directory inode after an ancestor swap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-journal-"));
+    roots.push(root);
+    const originalParent = join(root, "original-parent");
+    const stateDir = join(originalParent, "state");
+    const movedParent = join(root, "moved-parent");
+    const externalParent = join(root, "external-parent");
+    await mkdir(stateDir, { recursive: true });
+    await mkdir(externalParent);
+
+    await new PilotJournal(stateDir, {
+      afterDirectoryOpen: async () => {
+        await rename(originalParent, movedParent);
+        await mkdir(originalParent);
+        await rename(externalParent, join(originalParent, "state"));
+      },
+    }).append(event());
+
+    expect(JSON.parse(await readFile(join(movedParent, "state", "pilot-journal.jsonl"), "utf8"))).toMatchObject({ command: "portfolio status" });
+    await expect(lstat(join(originalParent, "state", "pilot-journal.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
