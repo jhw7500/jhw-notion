@@ -7,10 +7,12 @@ import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
 
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 const canonicalTaskId = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const canonicalClaimId = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const logicalRef = /^wt-[a-z0-9][a-z0-9-]{1,120}$/;
+
+type WorktreeLifecycle = "pending-create" | "active" | "pending-remove" | "removed";
 
 export interface WorktreePlan {
   branch: string;
@@ -44,6 +46,12 @@ export interface WorktreeRunner {
   run(command: string, args: string[], options?: ProcessRunOptions): Promise<ProcessResult>;
 }
 
+/** Test-only fault boundaries for durable state failure-window coverage. */
+export interface WorktreeStateHooks {
+  beforeSave?: () => void | Promise<void>;
+  afterSave?: () => void | Promise<void>;
+}
+
 type WorktreeClaim = Pick<
   ActiveClaim,
   "task_id" | "task_alias" | "claim_id" | "session_id" | "host" | "branch" | "worktree_ref"
@@ -59,11 +67,11 @@ interface WorktreeMapping {
   repository_identity: string;
   path: string;
   base_sha: string;
-  incomplete: true;
+  lifecycle: WorktreeLifecycle;
 }
 
 interface WorktreeState {
-  version: 1;
+  version: 2;
   worktrees: Record<string, WorktreeMapping>;
 }
 
@@ -126,6 +134,10 @@ function validateClaim(claim: WorktreeClaim): WorktreePlan {
   return plan;
 }
 
+function isLifecycle(value: unknown): value is WorktreeLifecycle {
+  return value === "pending-create" || value === "active" || value === "pending-remove" || value === "removed";
+}
+
 function asMapping(value: unknown, ref: string): WorktreeMapping {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ControlError("INVALID_WORKTREE_STATE", "Worktree mapping is not an object", { worktree_ref: ref });
@@ -142,7 +154,7 @@ function asMapping(value: unknown, ref: string): WorktreeMapping {
     "path",
     "base_sha",
   ];
-  if (required.some((key) => typeof record[key] !== "string") || record.incomplete !== true) {
+  if (required.some((key) => typeof record[key] !== "string") || !isLifecycle(record.lifecycle)) {
     throw new ControlError("INVALID_WORKTREE_STATE", "Worktree mapping has invalid fields", { worktree_ref: ref });
   }
   if (!isAbsolute(record.repository_path as string) || !isAbsolute(record.path as string)) {
@@ -192,6 +204,7 @@ export class WorktreeManager {
   constructor(
     private readonly config: ControlConfig,
     private readonly runner: WorktreeRunner = new ProcessRunner(),
+    private readonly stateHooks: WorktreeStateHooks = {},
   ) {}
 
   async createOrReuse(claim: WorktreeClaim, repositoryPath: string): Promise<WorktreeCreateResult> {
@@ -200,47 +213,42 @@ export class WorktreeManager {
     const repository = await this.repositoryInfo(repositoryPath);
     const state = await this.loadState();
     const root = await this.worktreeRoot();
-    const existing = state.worktrees[claim.worktree_ref];
+    let mapping = state.worktrees[claim.worktree_ref];
 
-    if (existing) {
-      this.assertExistingMapping(existing, claim, repository.identity, root, true);
-      await this.verifyWorktree(existing.path, claim.branch, repository.identity, root);
-      existing.claim_id = claim.claim_id;
-      existing.session_id = claim.session_id;
-      existing.repository_path = repository.root;
-      await this.saveState(state);
-      return { path: existing.path, branch: existing.branch, worktree_ref: claim.worktree_ref, reused: true };
+    if (mapping) {
+      this.assertCoordinates(mapping, claim, repository.identity, root);
+      if (mapping.lifecycle === "pending-remove") {
+        await this.resolvePendingRemove(state, claim, mapping, root);
+        mapping = state.worktrees[claim.worktree_ref];
+      }
+      if (mapping.lifecycle === "active") {
+        await this.verifyWorktree(mapping.path, claim.branch, repository.identity, root);
+        this.adoptClaim(mapping, claim, repository);
+        await this.saveState(state);
+        return this.created(mapping, true);
+      }
+      if (mapping.lifecycle === "pending-create" && await this.mappedWorktreeExists(mapping.path, root)) {
+        await this.verifyWorktree(mapping.path, claim.branch, repository.identity, root);
+        this.adoptClaim(mapping, claim, repository);
+        mapping.lifecycle = "active";
+        await this.saveState(state);
+        return this.created(mapping, true);
+      }
     }
 
-    const path = this.worktreePath(root, claim.worktree_ref);
-    try {
-      await lstat(path);
-      throw new ControlError("WORKTREE_PATH_EXISTS", "A worktree path exists without a host-local mapping", {
-        path,
-        worktree_ref: claim.worktree_ref,
-      });
-    } catch (cause) {
-      if (cause instanceof ControlError) throw cause;
-      if (!isNotFound(cause)) throw cause;
-    }
-
-    await this.git(["-C", repository.root, "worktree", "add", "-b", claim.branch, path, "HEAD"]);
-    const mapping: WorktreeMapping = {
-      task_id: claim.task_id,
-      claim_id: claim.claim_id,
-      session_id: claim.session_id,
-      host: claim.host,
-      branch: claim.branch,
-      repository_path: repository.root,
-      repository_identity: repository.identity,
-      path,
-      base_sha: repository.head,
-      incomplete: true,
-    };
-    await this.verifyWorktree(mapping.path, mapping.branch, mapping.repository_identity, root);
+    mapping = this.pendingCreateMapping(claim, repository, root);
     state.worktrees[claim.worktree_ref] = mapping;
+    // Persist this intent before Git can create any filesystem artifact.
     await this.saveState(state);
-    return { path, branch: claim.branch, worktree_ref: claim.worktree_ref, reused: false };
+    const addArguments = await this.branchExists(repository.root, claim.branch)
+      ? ["-C", repository.root, "worktree", "add", mapping.path, claim.branch]
+      : ["-C", repository.root, "worktree", "add", "-b", claim.branch, mapping.path, "HEAD"];
+    await this.git(addArguments);
+    await this.verifyWorktree(mapping.path, mapping.branch, mapping.repository_identity, root);
+    mapping.lifecycle = "active";
+    // A failure here leaves the durable pending-create record for recovery.
+    await this.saveState(state);
+    return this.created(mapping, false);
   }
 
   async inspect(claim: WorktreeClaim): Promise<WorktreeInspection> {
@@ -256,37 +264,36 @@ export class WorktreeManager {
         worktree_ref: claim.worktree_ref,
       });
     }
+    if (mapping.lifecycle === "pending-create") {
+      throw new ControlError("WORKTREE_CREATE_PENDING", "Worktree creation requires recovery before inspection", { worktree_ref: claim.worktree_ref });
+    }
+    if (mapping.lifecycle === "pending-remove") {
+      throw new ControlError("WORKTREE_REMOVE_PENDING", "Worktree removal requires recovery before inspection", { worktree_ref: claim.worktree_ref });
+    }
+    if (mapping.lifecycle === "removed") {
+      throw new ControlError("WORKTREE_REMOVED", "Worktree has a durable removal tombstone", { worktree_ref: claim.worktree_ref });
+    }
     const repository = await this.repositoryInfo(mapping.repository_path);
-    this.assertExistingMapping(mapping, claim, repository.identity, root);
-    await this.verifyWorktree(mapping.path, claim.branch, repository.identity, root);
-
-    const status = await this.git(["-C", mapping.path, "status", "--porcelain"]);
-    const dirtyFiles = status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3));
-    const head = (await this.git(["-C", mapping.path, "rev-parse", "HEAD"])).stdout.trim();
-    const upstream = (await this.git([
-      "-C",
-      mapping.path,
-      "for-each-ref",
-      "--format=%(upstream:short)",
-      `refs/heads/${claim.branch}`,
-    ])).stdout.trim();
-    const counts = upstream
-      ? parseAheadBehind((await this.git(["-C", mapping.path, "rev-list", "--left-right", "--count", `${upstream}...HEAD`])).stdout)
-      : { behind: 0, ahead: parseCount((await this.git(["-C", mapping.path, "rev-list", "--count", `${mapping.base_sha}..HEAD`])).stdout, "INVALID_GIT_STATE") };
-
-    return {
-      path: mapping.path,
-      branch: claim.branch,
-      worktree_ref: claim.worktree_ref,
-      head_sha: head,
-      dirty: dirtyFiles.length > 0,
-      dirty_files: dirtyFiles,
-      ahead: counts.ahead,
-      behind: counts.behind,
-    };
+    this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
+    return this.inspectMapped(mapping, claim, root);
   }
 
   async removeIfSafe(claim: WorktreeClaim): Promise<WorktreeRemovalResult> {
+    validateClaim(claim);
+    this.assertLocalHost(claim);
+    const firstState = await this.loadState();
+    const root = await this.worktreeRoot();
+    const first = firstState.worktrees[claim.worktree_ref];
+    if (first?.lifecycle === "pending-remove") {
+      this.assertPendingGeneration(first, claim, root);
+      if (!await this.mappedWorktreeExists(first.path, root)) {
+        first.lifecycle = "removed";
+        await this.saveState(firstState);
+        return { removed: true };
+      }
+      throw new ControlError("WORKTREE_REMOVE_PENDING", "A prior worktree removal is still pending", { worktree_ref: claim.worktree_ref });
+    }
+
     const inspection = await this.inspect(claim);
     if (inspection.dirty) {
       throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a dirty worktree", {
@@ -304,10 +311,85 @@ export class WorktreeManager {
     const state = await this.loadState();
     const mapping = state.worktrees[claim.worktree_ref];
     if (!mapping) throw new ControlError("WORKTREE_NOT_MAPPED", "Claim has no host-local worktree mapping", { worktree_ref: claim.worktree_ref });
-    await this.git(["-C", mapping.repository_path, "worktree", "remove", inspection.path]);
-    delete state.worktrees[claim.worktree_ref];
+    const repository = await this.repositoryInfo(mapping.repository_path);
+    this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
+    mapping.lifecycle = "pending-remove";
+    // Persist the destructive intent before invoking Git.
     await this.saveState(state);
+
+    // Re-read durable state and revalidate the exact generation immediately
+    // before destructive removal. A successor generation must never be removed.
+    const reloaded = await this.loadState();
+    const pending = reloaded.worktrees[claim.worktree_ref];
+    if (!pending) throw new ControlError("WORKTREE_NOT_MAPPED", "Pending removal state disappeared", { worktree_ref: claim.worktree_ref });
+    const pendingRepository = await this.repositoryInfo(pending.repository_path);
+    this.assertExactGeneration(pending, claim, pendingRepository.identity, root, "pending-remove");
+    const current = await this.inspectMapped(pending, claim, root);
+    if (current.dirty) {
+      throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a newly dirty worktree", {
+        worktree_ref: current.worktree_ref,
+        dirty_files: current.dirty_files,
+      });
+    }
+    if (current.ahead > 0) {
+      throw new ControlError("WORKTREE_UNPUSHED", "Refusing to remove a worktree with newly unpushed commits", {
+        worktree_ref: current.worktree_ref,
+        ahead: current.ahead,
+      });
+    }
+
+    await this.git(["-C", pending.repository_path, "worktree", "remove", current.path]);
+    pending.lifecycle = "removed";
+    // If this persistence fails, the prior on-disk pending-remove record is a
+    // tombstone. Future starts recover it before creating a successor.
+    await this.saveState(reloaded);
     return { removed: true };
+  }
+
+  private created(mapping: WorktreeMapping, reused: boolean): WorktreeCreateResult {
+    return { path: mapping.path, branch: mapping.branch, worktree_ref: this.refFor(mapping), reused };
+  }
+
+  private refFor(mapping: WorktreeMapping): string {
+    const ref = mapping.path.split(sep).at(-1) ?? "";
+    if (!logicalRef.test(ref)) throw new ControlError("INVALID_WORKTREE_STATE", "Worktree mapping path has no logical ref", { path: mapping.path });
+    return ref;
+  }
+
+  private pendingCreateMapping(claim: WorktreeClaim, repository: RepositoryInfo, root: string): WorktreeMapping {
+    return {
+      task_id: claim.task_id,
+      claim_id: claim.claim_id,
+      session_id: claim.session_id,
+      host: claim.host,
+      branch: claim.branch,
+      repository_path: repository.root,
+      repository_identity: repository.identity,
+      path: this.worktreePath(root, claim.worktree_ref),
+      base_sha: repository.head,
+      lifecycle: "pending-create",
+    };
+  }
+
+  private adoptClaim(mapping: WorktreeMapping, claim: WorktreeClaim, repository: RepositoryInfo): void {
+    mapping.claim_id = claim.claim_id;
+    mapping.session_id = claim.session_id;
+    mapping.repository_path = repository.root;
+    mapping.base_sha = mapping.base_sha || repository.head;
+  }
+
+  private async resolvePendingRemove(
+    state: WorktreeState,
+    claim: WorktreeClaim,
+    mapping: WorktreeMapping,
+    root: string,
+  ): Promise<void> {
+    this.assertCoordinates(mapping, claim, mapping.repository_identity, root);
+    if (await this.mappedWorktreeExists(mapping.path, root)) {
+      throw new ControlError("WORKTREE_REMOVE_PENDING", "A prior worktree removal is still pending", { worktree_ref: claim.worktree_ref });
+    }
+    mapping.lifecycle = "removed";
+    await this.saveState(state);
   }
 
   private assertLocalHost(claim: WorktreeClaim): void {
@@ -333,6 +415,44 @@ export class WorktreeManager {
     return { root: resolvedRoot, identity, head };
   }
 
+  private async branchExists(repositoryPath: string, branch: string): Promise<boolean> {
+    const output = (await this.git([
+      "-C",
+      repositoryPath,
+      "for-each-ref",
+      "--format=%(refname)",
+      `refs/heads/${branch}`,
+    ])).stdout.trim();
+    return output === `refs/heads/${branch}`;
+  }
+
+  private async inspectMapped(mapping: WorktreeMapping, claim: WorktreeClaim, root: string): Promise<WorktreeInspection> {
+    await this.verifyWorktree(mapping.path, claim.branch, mapping.repository_identity, root);
+    const status = await this.git(["-C", mapping.path, "status", "--porcelain"]);
+    const dirtyFiles = status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3));
+    const head = (await this.git(["-C", mapping.path, "rev-parse", "HEAD"])).stdout.trim();
+    const upstream = (await this.git([
+      "-C",
+      mapping.path,
+      "for-each-ref",
+      "--format=%(upstream:short)",
+      `refs/heads/${claim.branch}`,
+    ])).stdout.trim();
+    const counts = upstream
+      ? parseAheadBehind((await this.git(["-C", mapping.path, "rev-list", "--left-right", "--count", `${upstream}...HEAD`])).stdout)
+      : { behind: 0, ahead: parseCount((await this.git(["-C", mapping.path, "rev-list", "--count", `${mapping.base_sha}..HEAD`])).stdout, "INVALID_GIT_STATE") };
+    return {
+      path: mapping.path,
+      branch: claim.branch,
+      worktree_ref: claim.worktree_ref,
+      head_sha: head,
+      dirty: dirtyFiles.length > 0,
+      dirty_files: dirtyFiles,
+      ahead: counts.ahead,
+      behind: counts.behind,
+    };
+  }
+
   private async verifyWorktree(path: string, branch: string, repositoryIdentity: string, root: string): Promise<void> {
     await this.assertMappedPath(path, root);
     const currentBranch = (await this.git(["-C", path, "branch", "--show-current"])).stdout.trim();
@@ -354,27 +474,14 @@ export class WorktreeManager {
     }
   }
 
-  private assertExistingMapping(
-    mapping: WorktreeMapping,
-    claim: WorktreeClaim,
-    repositoryIdentity: string,
-    root: string,
-    allowClaimReplacement = false,
-  ): void {
-    if (!allowClaimReplacement && mapping.claim_id !== claim.claim_id) {
-      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Host-local worktree mapping belongs to a different Claim generation", {
-        task_id: claim.task_id,
-        expected_claim_id: claim.claim_id,
-        actual_claim_id: mapping.claim_id,
-        worktree_ref: claim.worktree_ref,
-      });
-    }
+  private assertCoordinates(mapping: WorktreeMapping, claim: WorktreeClaim, repositoryIdentity: string, root: string): void {
+    const expectedPath = this.worktreePath(root, claim.worktree_ref);
     if (
       mapping.task_id !== claim.task_id ||
       mapping.host !== claim.host ||
       mapping.branch !== claim.branch ||
       mapping.repository_identity !== repositoryIdentity ||
-      !mapping.incomplete
+      mapping.path !== expectedPath
     ) {
       throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Host-local worktree mapping does not match the active Claim", {
         task_id: claim.task_id,
@@ -382,7 +489,44 @@ export class WorktreeManager {
         worktree_ref: claim.worktree_ref,
       });
     }
-    void root;
+  }
+
+  private assertExactGeneration(
+    mapping: WorktreeMapping,
+    claim: WorktreeClaim,
+    repositoryIdentity: string,
+    root: string,
+    lifecycle: WorktreeLifecycle,
+  ): void {
+    if (mapping.claim_id !== claim.claim_id) {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Host-local worktree mapping belongs to a different Claim generation", {
+        task_id: claim.task_id,
+        expected_claim_id: claim.claim_id,
+        actual_claim_id: mapping.claim_id,
+        worktree_ref: claim.worktree_ref,
+      });
+    }
+    this.assertCoordinates(mapping, claim, repositoryIdentity, root);
+    if (mapping.lifecycle !== lifecycle) {
+      throw new ControlError("WORKTREE_LIFECYCLE_MISMATCH", "Worktree state changed during lifecycle operation", {
+        worktree_ref: claim.worktree_ref,
+        expected_lifecycle: lifecycle,
+        actual_lifecycle: mapping.lifecycle,
+      });
+    }
+  }
+
+  private assertPendingGeneration(mapping: WorktreeMapping, claim: WorktreeClaim, root: string): void {
+    if (mapping.claim_id !== claim.claim_id) {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Pending worktree removal belongs to another Claim generation", {
+        worktree_ref: claim.worktree_ref,
+      });
+    }
+    if (mapping.path !== this.worktreePath(root, claim.worktree_ref) || mapping.lifecycle !== "pending-remove") {
+      throw new ControlError("WORKTREE_LIFECYCLE_MISMATCH", "Pending worktree removal does not match the Claim", {
+        worktree_ref: claim.worktree_ref,
+      });
+    }
   }
 
   private async worktreeRoot(): Promise<string> {
@@ -405,6 +549,16 @@ export class WorktreeManager {
     const path = join(root, ref);
     if (!isWithin(root, path)) throw new ControlError("UNSAFE_WORKTREE_PATH", "Worktree path escapes configured root", { root, path });
     return path;
+  }
+
+  private async mappedWorktreeExists(path: string, root: string): Promise<boolean> {
+    try {
+      await this.assertMappedPath(path, root);
+      return true;
+    } catch (cause) {
+      if (isNotFound(cause)) return false;
+      throw cause;
+    }
   }
 
   private async assertMappedPath(path: string, root: string): Promise<void> {
@@ -445,6 +599,7 @@ export class WorktreeManager {
   }
 
   private async saveState(state: WorktreeState): Promise<void> {
+    await this.stateHooks.beforeSave?.();
     const statePath = await this.statePath();
     try {
       const existing = await lstat(statePath);
@@ -470,6 +625,7 @@ export class WorktreeManager {
       await unlink(temporary).catch(() => undefined);
       throw cause;
     }
+    await this.stateHooks.afterSave?.();
   }
 
   private async statePath(): Promise<string> {

@@ -173,6 +173,16 @@ describe("RegistryGit", () => {
     await expect(registry.assertHeadRegularFile("handoffs/regular.md")).resolves.toBeUndefined();
   });
 
+  it("reads exact committed Handoff bytes from HEAD rather than the mutable checkout", async () => {
+    const { registryDir } = await fixture();
+    await commitFile(registryDir, "handoffs/regular.md", "# Durable handoff\nfirst\n");
+    await git(registryDir, "push", "origin", "main");
+    await writeFile(join(registryDir, "handoffs", "regular.md"), "mutable checkout\n", "utf8");
+    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.readHeadRegularFile("handoffs/regular.md")).resolves.toBe("# Durable handoff\nfirst\n");
+  });
+
   it("rejects a regular file absent from HEAD rather than trusting the working tree", async () => {
     const { registryDir } = await fixture();
     await writeFile(join(registryDir, "handoffs-untracked.md"), "not committed\n", "utf8");

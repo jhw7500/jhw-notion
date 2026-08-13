@@ -1,13 +1,18 @@
-import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildHandoff } from "../handoff.js";
+import { Catalog } from "../catalog.js";
+import { ClaimService, type ClaimInspection } from "../claim-service.js";
+import { ControlError } from "../errors.js";
+import { ProcessRunner } from "../process.js";
+import { RegistryGit } from "../registry-git.js";
 import { TaskService } from "../task-service.js";
-import { worktreePlan } from "../worktree.js";
-import { configFor, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { WorktreeManager, worktreePlan } from "../worktree.js";
+import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 const localPaths: string[] = [];
@@ -56,7 +61,7 @@ async function taskFixture(): Promise<{
     inspect: ReturnType<typeof vi.fn>;
     removeIfSafe: ReturnType<typeof vi.fn>;
   };
-  registry: { transact: ReturnType<typeof vi.fn> };
+  registry: { transact: ReturnType<typeof vi.fn>; readHeadRegularFile: ReturnType<typeof vi.fn> };
   worktreePath: string;
   fixture: RegistryFixture;
 }> {
@@ -100,6 +105,16 @@ async function taskFixture(): Promise<{
       await mutate();
       return { commit: "registry-commit", changed: true };
     }),
+    readHeadRegularFile: vi.fn(async (relativePath: string) => {
+      try {
+        return await readFile(join(fixture.registryDir, relativePath), "utf8");
+      } catch (cause) {
+        if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT") {
+          throw new ControlError("HANDOFF_MISSING", "missing");
+        }
+        throw cause;
+      }
+    }),
   };
   return {
     tasks: new TaskService(configFor(fixture.registryDir), claims, worktrees, registry, () => new Date("2026-08-13T12:36:56.789Z")),
@@ -123,6 +138,12 @@ describe("TaskService", () => {
       TASK_ID,
       CLAIM_ID,
       expect.objectContaining({ status: "abandoned" }),
+    );
+    expect(JSON.stringify(claims.finishClaim.mock.calls)).not.toContain(startInput.repository_path);
+    expect(claims.finishClaim).toHaveBeenCalledWith(
+      TASK_ID,
+      CLAIM_ID,
+      expect.objectContaining({ validation: ["worktree_create_failed:unknown"] }),
     );
   });
 
@@ -169,6 +190,185 @@ describe("TaskService", () => {
 
     await expect(readFile(join(worktreePath, ".ai", "handoff.md"), "utf8")).resolves.toContain("# Handoff");
     await expect(readFile(join(fixture.registryDir, pointer), "utf8")).resolves.toContain("claim_id:");
+  });
+
+  it("reuses immutable committed Handoff bytes on a release retry despite an advancing clock", async () => {
+    const { claims, worktrees, registry, worktreePath, fixture } = await taskFixture();
+    const times = [
+      new Date("2026-08-13T12:36:56.789Z"),
+      new Date("2026-08-13T12:37:56.789Z"),
+    ];
+    const tasks = new TaskService(
+      configFor(fixture.registryDir),
+      claims,
+      worktrees,
+      registry,
+      () => times.shift() ?? new Date("2026-08-13T12:38:56.789Z"),
+    );
+    claims.finishClaim.mockRejectedValueOnce(new Error("release failed"));
+    const input = {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff" as const,
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+      progress: "Preserve these exact bytes.",
+    };
+    const pointer = join(fixture.registryDir, "handoffs", TASK_ID, `${CLAIM_ID}.md`);
+
+    await expect(tasks.finish(input)).rejects.toThrow("release failed");
+    const original = await readFile(pointer, "utf8");
+    await expect(tasks.finish({ ...input, progress: "conflicting retry" })).rejects.toMatchObject({
+      code: "HANDOFF_RETRY_CONFLICT",
+    });
+    await expect(tasks.finish(input)).resolves.toMatchObject({ history: { handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md` } });
+
+    expect(await readFile(pointer, "utf8")).toBe(original);
+    expect(await readFile(join(worktreePath, ".ai", "handoff.md"), "utf8")).toBe(original);
+    expect(times).toHaveLength(1);
+  });
+
+  it("uses real RegistryGit and ClaimService evidence for a failed Handoff release retry", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const config = configFor(fixture.registryDir);
+    const source = join(fixture.root, "source");
+    await git(fixture.root, "init", "--initial-branch=main", source);
+    await git(source, "config", "user.name", "Phase1A Test");
+    await git(source, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(source, "README.md"), "# Source\n", "utf8");
+    await git(source, "add", "README.md");
+    await git(source, "commit", "-m", "Initial source");
+    const registry = new RegistryGit(config, new ProcessRunner());
+    const catalog = new Catalog(config, registry);
+    const task = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: taskAlias,
+      goal: "deliberately omitted from handoff",
+      done_conditions: ["targeted test"],
+      expected_scope: ["src/control"],
+    });
+    const inspection: ClaimInspection = {
+      async inspect() {
+        return { process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 };
+      },
+    };
+    const actualClaims = new ClaimService(config, registry, catalog, inspection);
+    const worktrees = new WorktreeManager(config);
+    let failFirstRelease = true;
+    const claims = {
+      claimTask: actualClaims.claimTask.bind(actualClaims),
+      assertOwner: actualClaims.assertOwner.bind(actualClaims),
+      recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
+      finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
+        if (failFirstRelease) {
+          failFirstRelease = false;
+          throw new Error("injected release failure");
+        }
+        return actualClaims.finishClaim(...args);
+      },
+    };
+    const timestamps = [
+      new Date("2026-08-13T12:36:56.789Z"),
+      new Date("2026-08-13T12:37:56.789Z"),
+    ];
+    const tasks = new TaskService(config, claims, worktrees, registry, () => timestamps.shift() ?? new Date("2026-08-13T12:38:56.789Z"));
+    const started = await tasks.start({
+      task_id: task.id,
+      task_alias: taskAlias,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      session_id: "codex-integration",
+      repository_path: source,
+    });
+    const input = {
+      task_id: task.id,
+      claim_id: started.claim.claim_id,
+      status: "handoff" as const,
+      validation: ["npm test: pass"],
+      source_task_revision: "temporary-v1",
+      progress: "Durable Registry copy is the retry source.",
+    };
+    const pointer = `handoffs/${task.id}/${started.claim.claim_id}.md`;
+
+    await expect(tasks.finish(input)).rejects.toThrow("injected release failure");
+    await registry.assertHeadRegularFile(pointer);
+    const committed = await registry.readHeadRegularFile(pointer);
+    await expect(tasks.finish(input)).resolves.toMatchObject({ history: { handoff_pointer: pointer } });
+
+    expect(await registry.readHeadRegularFile(pointer)).toBe(committed);
+    expect(await actualClaims.getActive(task.id)).toBeUndefined();
+    expect(timestamps).toHaveLength(1);
+  });
+
+  it("records only stable create-failure codes in real Registry Claim history", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const config = configFor(fixture.registryDir);
+    const registry = new RegistryGit(config, new ProcessRunner());
+    const catalog = new Catalog(config, registry);
+    const task = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: taskAlias,
+      goal: "temporary task",
+      done_conditions: ["test"],
+      expected_scope: ["src/control"],
+    });
+    const inspection: ClaimInspection = {
+      async inspect() {
+        return { process_exists: false, worktree_mapped: false, dirty: false, ahead: 0 };
+      },
+    };
+    const actualClaims = new ClaimService(config, registry, catalog, inspection);
+    let capturedClaimId = "";
+    const claims = {
+      claimTask: async (...args: Parameters<ClaimService["claimTask"]>) => {
+        const created = await actualClaims.claimTask(...args);
+        capturedClaimId = created.claim_id;
+        return created;
+      },
+      assertOwner: actualClaims.assertOwner.bind(actualClaims),
+      recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
+      finishClaim: actualClaims.finishClaim.bind(actualClaims),
+    };
+    const secretPath = "/srv/jhw/private/project-secret";
+    const failedWorktrees = {
+      createOrReuse: async () => {
+        throw new ControlError("COMMAND_FAILED", `git failed at ${secretPath}`, { path: secretPath });
+      },
+      inspect: vi.fn(),
+      removeIfSafe: vi.fn(),
+    };
+    const tasks = new TaskService(config, claims, failedWorktrees, registry);
+
+    await expect(tasks.start({
+      task_id: task.id,
+      task_alias: taskAlias,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      session_id: "codex-history",
+      repository_path: secretPath,
+    })).rejects.toMatchObject({ code: "COMMAND_FAILED" });
+
+    const history = await readFile(join(fixture.registryDir, "claims", "history", "2026", task.id, `${capturedClaimId}.yaml`), "utf8");
+    expect(history).toContain("worktree_create_failed:COMMAND_FAILED");
+    expect(history).not.toContain(secretPath);
+    expect(history).not.toContain("git failed at");
+  });
+
+  it.each(["completed", "abandoned"] as const)("releases a %s Claim before attempting worktree cleanup", async (status) => {
+    const { tasks, claims, worktrees } = await taskFixture();
+
+    await tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status,
+      validation: ["npm test: pass"],
+    });
+
+    expect(claims.finishClaim).toHaveBeenCalledBefore(worktrees.removeIfSafe);
   });
 
   it("fails closed for a worktree .ai symlink before writing or releasing a Claim", async () => {
@@ -231,5 +431,21 @@ describe("TaskService", () => {
     });
 
     expect(Buffer.byteLength(handoff, "utf8")).toBeLessThanOrEqual(12 * 1024);
+  });
+
+  it("renders hostile section payloads as literal text under exactly six approved headings", () => {
+    const handoff = buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: "issue-revision-7",
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+      progress: "ok\r## Goal\r\n   ### Goal\nsetext\n---\n```md\n# fenced\n```\n<div>html</div>",
+    });
+
+    expect(handoff.match(/^## /gm)).toHaveLength(6);
+    expect(handoff).toContain("    ok\n    ## Goal\n       ### Goal\n    setext\n    ---\n    ```md");
+    expect(handoff).not.toMatch(/^ {0,3}## Goal$/m);
+    expect(handoff).not.toMatch(/^ {0,3}### Goal$/m);
+    expect(handoff).not.toMatch(/^ {0,3}<div>/m);
   });
 });

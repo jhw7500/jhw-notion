@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -45,6 +45,29 @@ async function worktreeFixture(): Promise<{
   return { fixture, repoDir, manager: new WorktreeManager(config) };
 }
 
+async function worktreeFixtureWithHooks(hooks: { beforeSave?: () => void; afterSave?: () => void }): Promise<{
+  fixture: RegistryFixture;
+  repoDir: string;
+  manager: WorktreeManager;
+}> {
+  const fixture = await makeRegistryFixture();
+  fixtures.push(fixture);
+  const repoDir = join(fixture.root, "source-repository");
+  await git(fixture.root, "init", "--initial-branch=main", repoDir);
+  await git(repoDir, "config", "user.name", "Phase1A Test");
+  await git(repoDir, "config", "user.email", "phase1a@example.invalid");
+  await writeFile(join(repoDir, "README.md"), "# Source\n", "utf8");
+  await git(repoDir, "add", "README.md");
+  await git(repoDir, "commit", "-m", "Initial source");
+  const config = configFor(fixture.registryDir);
+  const Constructor = WorktreeManager as unknown as new (
+    config: ReturnType<typeof configFor>,
+    runner: undefined,
+    hooks: { beforeSave?: () => void; afterSave?: () => void },
+  ) => WorktreeManager;
+  return { fixture, repoDir, manager: new Constructor(config, undefined, hooks) };
+}
+
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
 });
@@ -76,6 +99,7 @@ describe("WorktreeManager", () => {
       path: created.path,
       repository_path: repoDir,
       branch: initial.branch,
+      lifecycle: "active",
     });
     expect(stateMode).toBe(0o600);
     expect(stateDirMode).toBe(0o700);
@@ -112,6 +136,85 @@ describe("WorktreeManager", () => {
     await manager.createOrReuse(replacement, repoDir);
 
     await expect(manager.removeIfSafe(original)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    await expect(stat(created.path)).resolves.toBeDefined();
+  });
+
+  it("rejects actual ahead commits as unpushed before removal", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await writeFile(join(created.path, "committed.txt"), "commit\n", "utf8");
+    await git(created.path, "add", "committed.txt");
+    await git(created.path, "commit", "-m", "Task change");
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_UNPUSHED" });
+    await expect(stat(created.path)).resolves.toBeDefined();
+  });
+
+  it("persists pending-create before Git allocation so a post-create state-save failure is recoverable", async () => {
+    let saves = 0;
+    const { fixture, repoDir, manager } = await worktreeFixtureWithHooks({
+      beforeSave: () => {
+        saves += 1;
+        if (saves === 2) throw new Error("state write failed after git create");
+      },
+    });
+    const active = claim();
+
+    await expect(manager.createOrReuse(active, repoDir)).rejects.toThrow("state write failed after git create");
+
+    const state = JSON.parse(await readFile(join(fixture.root, "state", "worktrees.json"), "utf8"));
+    expect(state.worktrees[active.worktree_ref]).toMatchObject({
+      claim_id: active.claim_id,
+      lifecycle: "pending-create",
+    });
+    await expect(stat(join(fixture.root, "worktrees", active.worktree_ref))).resolves.toBeDefined();
+    const successor = claim({ claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac", session_id: "codex-successor" });
+    await expect(manager.createOrReuse(successor, repoDir)).resolves.toMatchObject({ reused: true });
+  });
+
+  it("marks pending-remove before deletion and leaves a recoverable tombstone when post-remove state persistence fails", async () => {
+    let saves = 0;
+    const { fixture, repoDir, manager } = await worktreeFixtureWithHooks({
+      beforeSave: () => {
+        saves += 1;
+        if (saves === 4) throw new Error("state write failed after git remove");
+      },
+    });
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.removeIfSafe(active)).rejects.toThrow("state write failed after git remove");
+    await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
+    const state = JSON.parse(await readFile(join(fixture.root, "state", "worktrees.json"), "utf8"));
+    expect(state.worktrees[active.worktree_ref]).toMatchObject({ lifecycle: "pending-remove", claim_id: active.claim_id });
+    const successor = claim({ claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac", session_id: "codex-successor" });
+    await expect(manager.createOrReuse(successor, repoDir)).resolves.toMatchObject({ reused: false });
+  });
+
+  it("re-reads the pending-remove generation before deletion and rejects a successor swap", async () => {
+    let saves = 0;
+    let fixture: RegistryFixture | undefined;
+    const { fixture: createdFixture, repoDir, manager } = await worktreeFixtureWithHooks({
+      afterSave: () => {
+        saves += 1;
+        if (saves !== 3 || !fixture) return;
+        const statePath = join(fixture.root, "state", "worktrees.json");
+        return readFile(statePath, "utf8").then(async (serialized) => {
+          const state = JSON.parse(serialized);
+          state.worktrees[claim().worktree_ref].claim_id = "clm-0198aabb-ccdd-7eef-8abc-0123456789ac";
+          state.worktrees[claim().worktree_ref].session_id = "codex-successor";
+          state.worktrees[claim().worktree_ref].lifecycle = "active";
+          await writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+          await chmod(statePath, 0o600);
+        });
+      },
+    });
+    fixture = createdFixture;
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
     await expect(stat(created.path)).resolves.toBeDefined();
   });
 

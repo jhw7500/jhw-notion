@@ -9,6 +9,8 @@ import { ControlError } from "./errors.js";
 import {
   buildHandoff,
   canonicalHandoffPath,
+  parseHandoffMetadata,
+  parseHandoffSections,
   writeRegistryHandoff,
   writeWorktreeHandoff,
   type HandoffInput,
@@ -32,6 +34,7 @@ export interface WorktreeManagerPort {
 
 export interface RegistryGitPort {
   transact(message: string, mutate: () => Promise<RegistryMutationResult>): Promise<RegistryTransactionResult>;
+  readHeadRegularFile(relativePath: string): Promise<string>;
 }
 
 export interface TaskStartInput {
@@ -88,6 +91,25 @@ function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
+const safeWorktreeCreateCodes = new Set([
+  "COMMAND_FAILED",
+  "HOST_MISMATCH",
+  "INVALID_GIT_STATE",
+  "INVALID_REPOSITORY_PATH",
+  "UNSAFE_STATE_PATH",
+  "UNSAFE_WORKTREE_PATH",
+  "UNSAFE_WORKTREE_ROOT",
+  "WORKTREE_BRANCH_MISMATCH",
+  "WORKTREE_MAPPING_MISMATCH",
+  "WORKTREE_PATH_EXISTS",
+  "WORKTREE_REPOSITORY_MISMATCH",
+]);
+
+function worktreeCreateValidation(cause: unknown): string {
+  const code = cause instanceof ControlError && safeWorktreeCreateCodes.has(cause.code) ? cause.code : "unknown";
+  return `worktree_create_failed:${code}`;
+}
+
 function assertValidation(validation: string[]): void {
   if (!Array.isArray(validation) || validation.length === 0 || validation.some((line) => !line.trim())) {
     throw new ControlError("INVALID_FINISH_OUTCOME", "Task finish requires at least one non-empty validation result");
@@ -128,10 +150,10 @@ export class TaskService {
       // the original failure even if the best-effort archival transaction also fails.
       await this.claims.finishClaim(claim.task_id, claim.claim_id, {
         status: "abandoned",
-        outcome: "worktree creation failed",
+        outcome: "worktree_create_failed",
         branch: claim.branch,
         head_sha: "unavailable",
-        validation: [`worktree creation failed: ${errorMessage(cause)}`],
+        validation: [worktreeCreateValidation(cause)],
       }).catch(() => undefined);
       throw cause;
     }
@@ -164,18 +186,40 @@ export class TaskService {
 
     if (input.status === "handoff") {
       handoffPath = canonicalHandoffPath(active.task_id, active.claim_id);
-      const handoff = buildHandoff({
-        task_id: active.task_id,
-        source_task_revision: input.source_task_revision ?? "unknown",
-        claim_id: active.claim_id,
-        generated_at: this.timestamp(),
-        progress: input.progress,
-        git_state: this.gitState(inspection),
-        validation: input.validation,
-        failures: input.failures,
-        next_step: input.next_step,
-        related_adr_and_evidence: input.related_adr_and_evidence,
-      });
+      const revision = input.source_task_revision ?? "unknown";
+      const committed = await this.committedHandoff(handoffPath);
+      let handoff: string;
+      if (committed) {
+        const metadata = parseHandoffMetadata(committed);
+        if (
+          metadata.task_id !== active.task_id ||
+          metadata.claim_id !== active.claim_id ||
+          metadata.source_task_revision !== revision
+        ) {
+          throw new ControlError("HANDOFF_RETRY_CONFLICT", "Committed Handoff metadata conflicts with the requested release", {
+            handoff_path: handoffPath,
+          });
+        }
+        // Current Git state legitimately changes because `.ai/handoff.md` is
+        // written during the first attempt. Reuse the committed Git snapshot
+        // while validating every caller-controlled section against its bytes.
+        const sections = parseHandoffSections(committed);
+        const requested = this.buildRequestedHandoff(
+          active,
+          inspection,
+          input,
+          metadata.generated_at,
+          sections["Git State"],
+        );
+        if (requested !== committed) {
+          throw new ControlError("HANDOFF_RETRY_CONFLICT", "Committed Handoff conflicts with requested retry fields", {
+            handoff_path: handoffPath,
+          });
+        }
+        handoff = committed;
+      } else {
+        handoff = this.buildRequestedHandoff(active, inspection, input, this.timestamp());
+      }
 
       await writeWorktreeHandoff(inspection.path, handoff);
       // This transaction must complete (including push verification) before the
@@ -232,5 +276,35 @@ export class TaskService {
       `ahead: ${inspection.ahead}`,
       `behind: ${inspection.behind}`,
     ];
+  }
+
+  private buildRequestedHandoff(
+    active: ActiveClaim,
+    inspection: WorktreeInspection,
+    input: TaskFinishInput,
+    generatedAt: string,
+    gitState: HandoffInput["git_state"] = this.gitState(inspection),
+  ): string {
+    return buildHandoff({
+      task_id: active.task_id,
+      source_task_revision: input.source_task_revision ?? "unknown",
+      claim_id: active.claim_id,
+      generated_at: generatedAt,
+      progress: input.progress,
+      git_state: gitState,
+      validation: input.validation,
+      failures: input.failures,
+      next_step: input.next_step,
+      related_adr_and_evidence: input.related_adr_and_evidence,
+    });
+  }
+
+  private async committedHandoff(relativePath: string): Promise<string | undefined> {
+    try {
+      return await this.registry.readHeadRegularFile(relativePath);
+    } catch (cause) {
+      if (cause instanceof ControlError && cause.code === "HANDOFF_MISSING") return undefined;
+      throw cause;
+    }
   }
 }

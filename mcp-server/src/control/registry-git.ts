@@ -87,6 +87,16 @@ export class RegistryGit {
     }
   }
 
+  /** Reads exact bytes only after proving the current HEAD entry is a regular file. */
+  async readHeadRegularFile(relativePath: string): Promise<string> {
+    await this.assertHeadRegularFile(relativePath);
+    try {
+      return (await this.git(["show", `HEAD:${relativePath}`])).stdout;
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to read Registry HEAD file", { relativePath });
+    }
+  }
+
   async transact(message: string, mutate: RegistryMutation): Promise<RegistryTransactionResult> {
     const initialStatus = await this.git(["status", "--porcelain"]);
     if (initialStatus.stdout.trim()) {

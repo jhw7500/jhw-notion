@@ -40,13 +40,12 @@ function oneLine(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
 }
 
-function text(value: string | readonly string[] | undefined): string {
+function literalText(value: string | readonly string[] | undefined): string {
   const joined = typeof value === "string" ? value : value?.join("\n");
-  const nonEmpty = joined?.trim() || "None recorded.";
-  return nonEmpty
-    .split("\n")
-    .map((line) => (/^#{1,6}\s/.test(line) ? `\\${line}` : line))
-    .join("\n");
+  const normalized = joined?.replace(/\r\n?|\n/g, "\n").trim() || "None recorded.";
+  // Four leading spaces make every payload line literal Markdown code. This
+  // neutralizes ATX/setext headings, fences, HTML, and CR-derived newlines.
+  return normalized.split("\n").map((line) => `    ${line}`).join("\n");
 }
 
 /** Truncates at a JavaScript code point boundary, never in the middle of UTF-8. */
@@ -97,10 +96,76 @@ export function buildHandoff(input: HandoffInput): string {
   );
   const perSection = Math.max(0, Math.floor((MAX_HANDOFF_BYTES - reserved) / sections.length));
   const body = sections.map((section) => {
-    const bounded = truncateUtf8(text(section.value), perSection);
+    const bounded = truncateUtf8(literalText(section.value), perSection);
     return `## ${section.title}\n${bounded}\n`;
   }).join("\n");
   return `${header}\n${body}`;
+}
+
+export interface HandoffMetadata {
+  task_id: string;
+  source_task_revision: string;
+  claim_id: string;
+  generated_at: string;
+}
+
+const handoffSectionTitles = [
+  "Progress Since Last Checkpoint",
+  "Git State",
+  "Validation Performed",
+  "Failures and Uncertainty",
+  "Session-Local Next Step",
+  "Related ADR and Evidence",
+] as const;
+
+export type HandoffSectionTitle = typeof handoffSectionTitles[number];
+
+/** Parses only the fixed metadata header of a previously committed Handoff. */
+export function parseHandoffMetadata(content: string): HandoffMetadata {
+  const lines = content.split("\n");
+  const title = lines[0]?.match(/^# Handoff: (.+)$/);
+  const task = lines[1]?.match(/^source_task_id: (.+)$/);
+  const revision = lines[2]?.match(/^source_task_revision: (.+)$/);
+  const claim = lines[3]?.match(/^claim_id: (.+)$/);
+  const generated = lines[4]?.match(/^generated_at: (.+)$/);
+  if (!title || !task || !revision || !claim || !generated || title[1] !== task[1]) {
+    throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Committed Handoff has an invalid metadata header");
+  }
+  return {
+    task_id: task[1],
+    source_task_revision: revision[1],
+    claim_id: claim[1],
+    generated_at: generated[1],
+  };
+}
+
+/** Reads literal payloads from the fixed six-section Handoff structure. */
+export function parseHandoffSections(content: string): Record<HandoffSectionTitle, string> {
+  const sections = {} as Record<HandoffSectionTitle, string>;
+  let cursor = content.indexOf("\n## ");
+  if (cursor < 0) throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Committed Handoff has no section body");
+  for (let index = 0; index < handoffSectionTitles.length; index += 1) {
+    const title = handoffSectionTitles[index];
+    const marker = `\n## ${title}\n`;
+    if (!content.startsWith(marker, cursor)) {
+      throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Committed Handoff section order is invalid", { title });
+    }
+    const payloadStart = cursor + marker.length;
+    const next = index + 1 < handoffSectionTitles.length
+      ? content.indexOf(`\n## ${handoffSectionTitles[index + 1]}\n`, payloadStart)
+      : content.length;
+    if (next < 0) {
+      throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Committed Handoff section is missing", { title });
+    }
+    const payload = content.slice(payloadStart, next).replace(/\n$/, "");
+    const lines = payload.split("\n");
+    if (lines.some((line) => !line.startsWith("    "))) {
+      throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Committed Handoff section is not literal text", { title });
+    }
+    sections[title] = lines.map((line) => line.slice(4)).join("\n");
+    cursor = next;
+  }
+  return sections;
 }
 
 export function canonicalHandoffPath(taskId: string, claimId: string): string {
