@@ -257,16 +257,31 @@ export class TaskService {
     try {
       created = await this.worktrees.createOrReuse(claim, input.repository_path);
     } catch (cause) {
-      // Do not leave an uncontended Claim after local allocation failed.  Preserve
-      // the original failure even if the best-effort archival transaction also fails.
+      // Do not leave an uncontended Claim after local allocation failed. If the
+      // best-effort release fails, the caller must receive its retained Claim
+      // coordinates without leaking the host-local allocation failure details.
+      let claimState: "active" | "released" = "active";
       await this.claims.finishClaim(claim.task_id, claim.claim_id, {
         status: "abandoned",
         outcome: "worktree_create_failed",
         branch: claim.branch,
         head_sha: "unavailable",
         validation: [worktreeCreateValidation(cause)],
+      }).then(() => {
+        claimState = "released";
       }).catch(() => undefined);
-      throw cause;
+      if (cause instanceof ControlError) {
+        throw new ControlError(cause.code, cause.message, {
+          task_id: claim.task_id,
+          claim_id: claim.claim_id,
+          claim_state: claimState,
+        });
+      }
+      throw new ControlError("TASK_START_FAILED", errorMessage(cause), {
+        task_id: claim.task_id,
+        claim_id: claim.claim_id,
+        claim_state: claimState,
+      });
     }
 
     const owner = await this.claims.assertOwner(claim.task_id, claim.claim_id);

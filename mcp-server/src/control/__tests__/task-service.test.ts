@@ -147,6 +147,21 @@ describe("TaskService", () => {
     );
   });
 
+  it("reports retained Claim coordinates after a worktree creation failure", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    const privatePath = "/private/worktree";
+    worktrees.createOrReuse.mockRejectedValue(new ControlError("COMMAND_FAILED", `git failed at ${privatePath}`, { path: privatePath }));
+    claims.finishClaim.mockRejectedValueOnce(new Error("archive failed"));
+
+    const failure = await tasks.start(startInput).catch((cause: unknown) => cause);
+
+    expect(failure).toMatchObject({
+      code: "COMMAND_FAILED",
+      details: { task_id: TASK_ID, claim_id: CLAIM_ID, claim_state: "active" },
+    });
+    expect(JSON.stringify(failure)).not.toContain(privatePath);
+  });
+
   it("keeps an incomplete same-host worktree and writes a durable Registry Handoff before release", async () => {
     const { tasks, claims, worktrees, registry, worktreePath, fixture } = await taskFixture();
 
