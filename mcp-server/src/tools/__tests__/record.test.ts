@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createMockNotionClient, createMockServer } from "../../__tests__/helpers/mock-notion.js";
 import type { MockNotionClient } from "../../__tests__/helpers/mock-notion.js";
+import { ControlError } from "../../control/errors.js";
 
 let mockClient: MockNotionClient;
 
@@ -11,14 +12,61 @@ vi.mock("../../notion-client.js", () => ({
 import { registerRecord } from "../record.js";
 import { defaultPageCache } from "../../cache/page-cache.js";
 
+const legacyAuthority = { assertNotionWriteAllowed: vi.fn(async () => undefined) };
+const registryAuthority = {
+  assertNotionWriteAllowed: vi.fn(async () => {
+    throw new ControlError("AUTHORITY_MOVED", "moved");
+  }),
+};
+
 describe("jhw_record", () => {
   let handler: (args: any) => Promise<any>;
 
   beforeEach(() => {
     mockClient = createMockNotionClient();
     const { server, capturedTools } = createMockServer();
-    registerRecord(server as any);
+    legacyAuthority.assertNotionWriteAllowed.mockClear();
+    registryAuthority.assertNotionWriteAllowed.mockClear();
+    registerRecord(server as any, legacyAuthority);
     handler = capturedTools.get("jhw_record")!.handler;
+  });
+
+  it.each([
+    ["projects", "jhw-control project register"],
+    ["decisionLog", "Git ADR"],
+  ])("registry authority에서는 %s property 작업과 생성을 모두 거부한다", async (db, route) => {
+    const { server, capturedTools } = createMockServer();
+    registerRecord(server as any, registryAuthority);
+
+    const result = await capturedTools.get("jhw_record")!.handler({
+      db,
+      title: "blocked",
+      properties: { project: "would-search", stack: "would-register" },
+      allowNewTags: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).route).toContain(route);
+    expect(mockClient.pages.create).not.toHaveBeenCalled();
+    expect(mockClient.dataSources.query).not.toHaveBeenCalled();
+    expect(mockClient.dataSources.retrieve).not.toHaveBeenCalled();
+    expect(mockClient.dataSources.update).not.toHaveBeenCalled();
+  });
+
+  it("registry authority에서도 Knowledge Base 레코드는 기존 경로로 생성한다", async () => {
+    const selectiveAuthority = {
+      assertNotionWriteAllowed: vi.fn(async (db: string) => {
+        if (db === "projects" || db === "decisionLog") throw new ControlError("AUTHORITY_MOVED", "moved");
+      }),
+    };
+    const { server, capturedTools } = createMockServer();
+    registerRecord(server as any, selectiveAuthority);
+    mockClient.pages.create.mockResolvedValue({ id: "kb", url: "u" });
+
+    const result = await capturedTools.get("jhw_record")!.handler({ db: "knowledgeBase", title: "allowed" });
+
+    expect(JSON.parse(result.content[0].text).id).toBe("kb");
+    expect(mockClient.pages.create).toHaveBeenCalledTimes(1);
   });
 
   it("decisionLog에 레코드를 생성한다", async () => {

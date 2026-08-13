@@ -6,6 +6,11 @@ import { callNotion } from "../notion/api.js";
 import { applyMultiSelectGuard } from "../notion/multi-select-guard.js";
 import { cachePage } from "../cache/page-cache.js";
 import { buildStartBody } from "../notion/templates.js";
+import {
+  authorityMcpError,
+  defaultNotionAuthorityGuard,
+  type NotionAuthorityGuard,
+} from "../notion/authority-guard.js";
 
 const StartInput = z.object({
   name: z.string().describe("프로젝트명"),
@@ -18,12 +23,20 @@ const StartInput = z.object({
     .describe("미등록 tech_stack 값을 drop 대신 자동 등록(--force-tag). 기본 false."),
 });
 
-export function registerStart(server: McpServer) {
+export function registerStart(server: McpServer, authority: NotionAuthorityGuard = defaultNotionAuthorityGuard) {
   server.tool(
     "jhw_start",
     "새 프로젝트 시작 — Projects DB 등록 + Decision Log 기록 + 페이지 템플릿",
     StartInput.shape,
     async ({ name, repo, stack, description, allowNewTags }) => {
+      try {
+        await authority.assertNotionWriteAllowed("projects", "jhw_start");
+        await authority.assertNotionWriteAllowed("decisionLog", "jhw_start");
+      } catch (cause) {
+        const denied = authorityMcpError(cause, "projects", "jhw_start");
+        if (denied) return denied;
+        throw cause;
+      }
       const notion = getNotionClient();
       const today = new Date().toISOString().split("T")[0];
       const warnings: string[] = [];

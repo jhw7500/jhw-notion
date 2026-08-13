@@ -10,6 +10,11 @@ import { FieldValidationError } from "../notion/field-vocab.js";
 import { paragraphBlocks } from "../notion/blocks.js";
 import { buildScaffold } from "../notion/templates.js";
 import { cachePage } from "../cache/page-cache.js";
+import {
+  authorityMcpError,
+  defaultNotionAuthorityGuard,
+  type NotionAuthorityGuard,
+} from "../notion/authority-guard.js";
 
 const RecordInput = z.object({
   db: z
@@ -113,7 +118,7 @@ async function buildNotionProperties(
   });
 }
 
-export function registerRecord(server: McpServer) {
+export function registerRecord(server: McpServer, authority: NotionAuthorityGuard = defaultNotionAuthorityGuard) {
   server.tool(
     "jhw_record",
     "Notion AI Workspace DB에 레코드 생성",
@@ -126,6 +131,14 @@ export function registerRecord(server: McpServer) {
         return {
           content: [{ type: "text" as const, text: `알 수 없는 DB: ${db}` }],
         };
+      }
+
+      try {
+        await authority.assertNotionWriteAllowed(db as DatabaseName, "jhw_record");
+      } catch (cause) {
+        const denied = authorityMcpError(cause, db as DatabaseName, "jhw_record");
+        if (denied) return denied;
+        throw cause;
       }
 
       // 어휘 가드: select 미허용은 throw(저장 차단), multi_select 미등록은 drop+경고.

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createMockNotionClient, createMockServer } from "../../__tests__/helpers/mock-notion.js";
 import type { MockNotionClient } from "../../__tests__/helpers/mock-notion.js";
+import { ControlError } from "../../control/errors.js";
 
 let mockClient: MockNotionClient;
 
@@ -10,14 +11,40 @@ vi.mock("../../notion-client.js", () => ({
 
 import { registerClose } from "../close.js";
 
+const legacyAuthority = { assertNotionWriteAllowed: vi.fn(async () => undefined) };
+const registryAuthority = {
+  assertNotionWriteAllowed: vi.fn(async () => {
+    throw new ControlError("AUTHORITY_MOVED", "moved");
+  }),
+};
+
 describe("jhw_close", () => {
   let handler: (args: any) => Promise<any>;
 
   beforeEach(() => {
     mockClient = createMockNotionClient();
     const { server, capturedTools } = createMockServer();
-    registerClose(server as any);
+    legacyAuthority.assertNotionWriteAllowed.mockClear();
+    registryAuthority.assertNotionWriteAllowed.mockClear();
+    registerClose(server as any, legacyAuthority);
     handler = capturedTools.get("jhw_close")!.handler;
+  });
+
+  it("registry authority에서는 프로젝트 검색과 허용된 회고 side effect까지 모두 거부한다", async () => {
+    const { server, capturedTools } = createMockServer();
+    registerClose(server as any, registryAuthority);
+
+    const result = await capturedTools.get("jhw_close")!.handler({
+      project: "my-project",
+      lessons: "Knowledge Base에도 쓰면 안 됨",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).route).toContain("Project workflow");
+    expect(mockClient.dataSources.query).not.toHaveBeenCalled();
+    expect(mockClient.pages.update).not.toHaveBeenCalled();
+    expect(mockClient.pages.create).not.toHaveBeenCalled();
+    expect(mockClient.blocks.children.append).not.toHaveBeenCalled();
   });
 
   it("프로젝트를 찾을 수 없으면 메시지를 반환한다", async () => {

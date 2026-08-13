@@ -5,6 +5,13 @@ import { callNotion } from "../notion/api.js";
 import { h3, paragraphBlocks } from "../notion/blocks.js";
 import { normalizePageId } from "../notion/page-id.js";
 import { defaultPageCache } from "../cache/page-cache.js";
+import {
+  authorityMcpError,
+  assertTargetWriteAllowed,
+  defaultNotionAuthorityGuard,
+  resolveTargetDatabase,
+  type NotionAuthorityGuard,
+} from "../notion/authority-guard.js";
 
 const MAX_BLOCKS_PER_REQUEST = 100;
 
@@ -22,7 +29,7 @@ const AppendInput = z.object({
     .describe("본문 앞에 추가할 heading_3 제목 (예: 2026-07-16 보강)"),
 });
 
-export function registerAppend(server: McpServer) {
+export function registerAppend(server: McpServer, authority: NotionAuthorityGuard = defaultNotionAuthorityGuard) {
   server.tool(
     "jhw_append",
     "기존 Notion 페이지 끝에 heading과 본문 블록을 추가 (properties 유지)",
@@ -34,6 +41,14 @@ export function registerAppend(server: McpServer) {
 
       const notion = getNotionClient();
       const normalizedPageId = normalizePageId(pageId);
+      const targetDatabase = await resolveTargetDatabase(normalizedPageId, notion);
+      try {
+        await assertTargetWriteAllowed(authority, targetDatabase, "jhw_append");
+      } catch (cause) {
+        const denied = authorityMcpError(cause, targetDatabase, "jhw_append");
+        if (denied) return denied;
+        throw cause;
+      }
       const normalizedHeading = heading?.trim();
       const children = [
         ...(normalizedHeading ? [h3(normalizedHeading)] : []),

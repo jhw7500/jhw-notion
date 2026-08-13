@@ -6,6 +6,11 @@ import { callNotion } from "../notion/api.js";
 import { resolveProject } from "../notion/resolve-project.js";
 import { cachePage } from "../cache/page-cache.js";
 import { buildCloseRetro } from "../notion/templates.js";
+import {
+  authorityMcpError,
+  defaultNotionAuthorityGuard,
+  type NotionAuthorityGuard,
+} from "../notion/authority-guard.js";
 
 const CloseInput = z.object({
   project: z.string().describe("프로젝트명 (검색 키워드)"),
@@ -13,12 +18,19 @@ const CloseInput = z.object({
   lessons: z.string().optional().describe("배운 점"),
 });
 
-export function registerClose(server: McpServer) {
+export function registerClose(server: McpServer, authority: NotionAuthorityGuard = defaultNotionAuthorityGuard) {
   server.tool(
     "jhw_close",
     "프로젝트 종료 — 상태 완료 + 회고 추가 + Knowledge Base 학습사항",
     CloseInput.shape,
     async ({ project, achievement, lessons }) => {
+      try {
+        await authority.assertNotionWriteAllowed("projects", "jhw_close");
+      } catch (cause) {
+        const denied = authorityMcpError(cause, "projects", "jhw_close");
+        if (denied) return denied;
+        throw cause;
+      }
       const notion = getNotionClient();
       const today = new Date().toISOString().split("T")[0];
 

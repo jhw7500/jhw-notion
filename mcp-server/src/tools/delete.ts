@@ -3,6 +3,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { getNotionClient } from "../notion-client.js";
 import { callNotion } from "../notion/api.js";
 import { defaultPageCache } from "../cache/page-cache.js";
+import {
+  authorityMcpError,
+  assertTargetWriteAllowed,
+  defaultNotionAuthorityGuard,
+  resolveTargetDatabase,
+  type NotionAuthorityGuard,
+} from "../notion/authority-guard.js";
 
 const DeleteInput = z.object({
   pageId: z.string().describe("삭제할 Notion 페이지 ID"),
@@ -14,13 +21,21 @@ const DeleteInput = z.object({
     ),
 });
 
-export function registerDelete(server: McpServer) {
+export function registerDelete(server: McpServer, authority: NotionAuthorityGuard = defaultNotionAuthorityGuard) {
   server.tool(
     "jhw_delete",
     "Notion 레코드 삭제 또는 폐기 처리",
     DeleteInput.shape,
     async ({ pageId, mode }) => {
       const notion = getNotionClient();
+      const targetDatabase = await resolveTargetDatabase(pageId, notion);
+      try {
+        await assertTargetWriteAllowed(authority, targetDatabase, "jhw_delete");
+      } catch (cause) {
+        const denied = authorityMcpError(cause, targetDatabase, "jhw_delete");
+        if (denied) return denied;
+        throw cause;
+      }
 
       // 삭제/폐기 대상은 로컬 캐시에서도 제거 — jhw_recall이 archived 페이지를
       // stale hit로 반환하지 않도록 (best-effort: API 실패 시 다음 recall에서 재적재).

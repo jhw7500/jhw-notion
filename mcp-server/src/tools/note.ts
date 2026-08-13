@@ -9,6 +9,11 @@ import { buildKbScaffold } from "../notion/templates.js";
 import { applyMultiSelectGuard } from "../notion/multi-select-guard.js";
 import { clampRichText } from "../notion/rich-text.js";
 import { cachePage } from "../cache/page-cache.js";
+import {
+  authorityMcpError,
+  defaultNotionAuthorityGuard,
+  type NotionAuthorityGuard,
+} from "../notion/authority-guard.js";
 
 // KB DB의 category select 옵션 (8종)
 const KB_CATEGORIES = [
@@ -45,12 +50,19 @@ const NoteInput = z.object({
     .describe("미등록 태그를 어휘 가드 drop 대신 KB tags에 자동 등록(--force-tag). 기본 false."),
 });
 
-export function registerNote(server: McpServer) {
+export function registerNote(server: McpServer, authority: NotionAuthorityGuard = defaultNotionAuthorityGuard) {
   server.tool(
     "jhw_note",
     "Knowledge Base DB에 기술 지식이나 발견 사항을 메모 (DB 항목으로 저장)",
     NoteInput.shape,
     async ({ title, content, summary, category, tags, project, report, allowNewTags }) => {
+      try {
+        await authority.assertNotionWriteAllowed("knowledgeBase", "jhw_note");
+      } catch (cause) {
+        const denied = authorityMcpError(cause, "knowledgeBase", "jhw_note");
+        if (denied) return denied;
+        throw cause;
+      }
       const notion = getNotionClient();
 
       const properties: Record<string, any> = {

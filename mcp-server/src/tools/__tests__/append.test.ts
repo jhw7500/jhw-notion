@@ -5,6 +5,8 @@ import {
 } from "../../__tests__/helpers/mock-notion.js";
 import type { MockNotionClient } from "../../__tests__/helpers/mock-notion.js";
 import { defaultPageCache } from "../../cache/page-cache.js";
+import { NOTION_CONFIG } from "../../config.js";
+import { ControlError } from "../../control/errors.js";
 
 let mockClient: MockNotionClient;
 
@@ -14,6 +16,13 @@ vi.mock("../../notion-client.js", () => ({
 
 import { registerAppend } from "../append.js";
 
+const legacyAuthority = { assertNotionWriteAllowed: vi.fn(async () => undefined) };
+const registryAuthority = {
+  assertNotionWriteAllowed: vi.fn(async () => {
+    throw new ControlError("AUTHORITY_MOVED", "moved");
+  }),
+};
+
 describe("jhw_append", () => {
   let handler: (args: any) => Promise<any>;
   let schema: any;
@@ -21,12 +30,71 @@ describe("jhw_append", () => {
   beforeEach(() => {
     defaultPageCache.clear();
     mockClient = createMockNotionClient();
+    mockClient.pages.retrieve.mockResolvedValue({ parent: { type: "page_id", page_id: "parent" } });
     mockClient.blocks.children.append.mockResolvedValue({});
     const { server, capturedTools } = createMockServer();
-    registerAppend(server as any);
+    legacyAuthority.assertNotionWriteAllowed.mockClear();
+    registryAuthority.assertNotionWriteAllowed.mockClear();
+    registerAppend(server as any, legacyAuthority);
     const tool = capturedTools.get("jhw_append")!;
     handler = tool.handler;
     schema = tool.schema;
+  });
+
+  it("registry authority에서는 대상 page 조회 뒤 Projects append를 캐시 변경 전에 거부한다", async () => {
+    const pageId = "33a8a230-a04e-8154-8fa5-d96ebdd63500";
+    defaultPageCache.set({ id: pageId, db: "projects", title: "kept", text: "kept" });
+    mockClient.pages.retrieve.mockResolvedValue({
+      parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects },
+    });
+    const { server, capturedTools } = createMockServer();
+    registerAppend(server as any, registryAuthority);
+
+    const result = await capturedTools.get("jhw_append")!.handler({ pageId, content: "blocked" });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).code).toBe("AUTHORITY_MOVED");
+    expect(mockClient.pages.retrieve).toHaveBeenCalledWith({ page_id: pageId });
+    expect(mockClient.blocks.children.append).not.toHaveBeenCalled();
+    expect(defaultPageCache.get(pageId)).toBeDefined();
+  });
+
+  it("registry authority에서도 Knowledge Base append는 기존 경로로 처리한다", async () => {
+    const pageId = "33a8a230-a04e-8154-8fa5-d96ebdd63500";
+    mockClient.pages.retrieve.mockResolvedValue({
+      parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase },
+    });
+    const selectiveAuthority = {
+      assertNotionWriteAllowed: vi.fn(async (db: string) => {
+        if (db === "projects" || db === "decisionLog") throw new ControlError("AUTHORITY_MOVED", "moved");
+      }),
+    };
+    const { server, capturedTools } = createMockServer();
+    registerAppend(server as any, selectiveAuthority);
+
+    const result = await capturedTools.get("jhw_append")!.handler({ pageId, content: "allowed" });
+
+    expect(JSON.parse(result.content[0].text).appendedBlocks).toBe(1);
+    expect(mockClient.blocks.children.append).toHaveBeenCalledTimes(1);
+  });
+
+  it("unknown page scope에서도 local writes-disabled는 append를 차단한다", async () => {
+    const disabled = {
+      assertNotionWriteAllowed: vi.fn(async () => {
+        throw new ControlError("NOTION_WRITES_DISABLED", "disabled");
+      }),
+    };
+    const { server, capturedTools } = createMockServer();
+    registerAppend(server as any, disabled);
+
+    const result = await capturedTools.get("jhw_append")!.handler({
+      pageId: "33a8a230-a04e-8154-8fa5-d96ebdd63500",
+      content: "blocked",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).code).toBe("NOTION_WRITES_DISABLED");
+    expect(mockClient.blocks.children.append).not.toHaveBeenCalled();
   });
 
   it("URL을 페이지 ID로 정규화하고 heading + paragraph를 append한다", async () => {

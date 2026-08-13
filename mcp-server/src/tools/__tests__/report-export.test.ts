@@ -8,6 +8,19 @@ import {
 } from "../../__tests__/helpers/mock-notion.js";
 import { NOTION_CONFIG } from "../../config.js";
 import * as notionClientMod from "../../notion-client.js";
+import { ControlError } from "../../control/errors.js";
+
+const legacyAuthority = { assertNotionWriteAllowed: vi.fn(async () => undefined) };
+const registryAuthority = {
+  assertNotionWriteAllowed: vi.fn(async (db: string) => {
+    if (db === "decisionLog") throw new ControlError("AUTHORITY_MOVED", "moved");
+  }),
+};
+const disabledAuthority = {
+  assertNotionWriteAllowed: vi.fn(async () => {
+    throw new ControlError("NOTION_WRITES_DISABLED", "disabled");
+  }),
+};
 
 describe("registerReportExport", () => {
   let mockClient: ReturnType<typeof createMockNotionClient>;
@@ -18,6 +31,9 @@ describe("registerReportExport", () => {
       mockClient as any
     );
     __cache.clear();
+    legacyAuthority.assertNotionWriteAllowed.mockClear();
+    registryAuthority.assertNotionWriteAllowed.mockClear();
+    disabledAuthority.assertNotionWriteAllowed.mockClear();
   });
 
   it("등록 시 jhw_report_export 도구가 노출된다", () => {
@@ -121,6 +137,60 @@ describe("registerReportExport", () => {
     );
     expect(call.properties.status.select.name).toBe("확정");
     expect(call.properties.title.title[0].text.content).toBe("주간 보고");
+  });
+
+  it("registry authority에서는 Decision Log writeBack만 mutation 전에 거부한다", async () => {
+    const { server, capturedTools } = createMockServer();
+    registerReportExport(server, registryAuthority);
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
+
+    const result = await capturedTools.get("jhw_report_export")!.handler({
+      period: "custom",
+      start: "2026-04-01",
+      end: "2026-04-07",
+      format: "markdown",
+      writeBack: { enabled: true, db: "decisionLog" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).route).toContain("Git ADR");
+    expect(mockClient.pages.create).not.toHaveBeenCalled();
+  });
+
+  it("registry authority에서도 기본 Knowledge Base writeBack은 허용한다", async () => {
+    const { server, capturedTools } = createMockServer();
+    registerReportExport(server, registryAuthority);
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
+    mockClient.pages.create.mockResolvedValue({ id: "kb", url: "u" });
+
+    const result = await capturedTools.get("jhw_report_export")!.handler({
+      period: "custom",
+      start: "2026-04-01",
+      end: "2026-04-07",
+      format: "markdown",
+      writeBack: { enabled: true },
+    });
+
+    expect(JSON.parse(result.content[0].text).writeBack.db).toBe("knowledgeBase");
+    expect(mockClient.pages.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("local writes-disabled에서는 Knowledge Base writeBack을 mutation 전에 거부한다", async () => {
+    const { server, capturedTools } = createMockServer();
+    registerReportExport(server, disabledAuthority);
+    mockClient.dataSources.query.mockResolvedValue({ results: [] });
+
+    const result = await capturedTools.get("jhw_report_export")!.handler({
+      period: "custom",
+      start: "2026-04-01",
+      end: "2026-04-07",
+      format: "markdown",
+      writeBack: { enabled: true },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).code).toBe("NOTION_WRITES_DISABLED");
+    expect(mockClient.pages.create).not.toHaveBeenCalled();
   });
 
   it("임팩트가 있으면 markdown 출력 라인에 포함된다", async () => {

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createMockNotionClient, createMockServer } from "../../__tests__/helpers/mock-notion.js";
 import type { MockNotionClient } from "../../__tests__/helpers/mock-notion.js";
+import { ControlError } from "../../control/errors.js";
 
 let mockClient: MockNotionClient;
 
@@ -11,14 +12,44 @@ vi.mock("../../notion-client.js", () => ({
 import { registerStart } from "../start.js";
 import { defaultPageCache } from "../../cache/page-cache.js";
 
+const legacyAuthority = { assertNotionWriteAllowed: vi.fn(async () => undefined) };
+const registryAuthority = {
+  assertNotionWriteAllowed: vi.fn(async () => {
+    throw new ControlError("AUTHORITY_MOVED", "moved");
+  }),
+};
+
 describe("jhw_start", () => {
   let handler: (args: any) => Promise<any>;
 
   beforeEach(() => {
     mockClient = createMockNotionClient();
     const { server, capturedTools } = createMockServer();
-    registerStart(server as any);
+    legacyAuthority.assertNotionWriteAllowed.mockClear();
+    registryAuthority.assertNotionWriteAllowed.mockClear();
+    registerStart(server as any, legacyAuthority);
     handler = capturedTools.get("jhw_start")!.handler;
+  });
+
+  it("registry authority에서는 첫 조회나 변경 전에 전체 시작 작업을 거부한다", async () => {
+    const { server, capturedTools } = createMockServer();
+    registerStart(server as any, registryAuthority);
+
+    const result = await capturedTools.get("jhw_start")!.handler({
+      name: "blocked-project",
+      description: "must use Registry",
+      stack: "새스택",
+      allowNewTags: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      code: "AUTHORITY_MOVED",
+      route: expect.stringContaining("jhw-control project register"),
+    });
+    expect(mockClient.pages.create).not.toHaveBeenCalled();
+    expect(mockClient.dataSources.retrieve).not.toHaveBeenCalled();
+    expect(mockClient.dataSources.update).not.toHaveBeenCalled();
   });
 
   it("프로젝트 + Decision Log 두 페이지를 생성한다", async () => {

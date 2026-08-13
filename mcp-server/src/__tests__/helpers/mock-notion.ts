@@ -15,6 +15,7 @@ export interface MockNotionClient {
   };
   pages: {
     create: ReturnType<typeof vi.fn>;
+    retrieve: ReturnType<typeof vi.fn>;
     update: ReturnType<typeof vi.fn>;
   };
   blocks: {
@@ -38,6 +39,7 @@ export function createMockNotionClient(): MockNotionClient {
     },
     pages: {
       create: vi.fn(),
+      retrieve: vi.fn(),
       update: vi.fn(),
     },
     blocks: {

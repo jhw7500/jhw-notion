@@ -19,6 +19,11 @@ import {
 } from "../report/format.js";
 import { resolvePeriod, __cache } from "./report-preview.js";
 import { callNotion } from "../notion/api.js";
+import {
+  authorityMcpError,
+  defaultNotionAuthorityGuard,
+  type NotionAuthorityGuard,
+} from "../notion/authority-guard.js";
 
 const ExportInput = z.object({
   period: z.enum(["week", "month", "custom"]),
@@ -63,7 +68,7 @@ function buildCacheKey(args: any, period: { start: string; end: string }) {
   });
 }
 
-export function registerReportExport(server: McpServer) {
+export function registerReportExport(server: McpServer, authority: NotionAuthorityGuard = defaultNotionAuthorityGuard) {
   server.tool(
     "jhw_report_export",
     "보고서를 markdown/redmine/json으로 출력 + 선택적으로 KB/decisionLog에 자동 저장",
@@ -110,6 +115,13 @@ export function registerReportExport(server: McpServer) {
 
       if (args.writeBack?.enabled) {
         const wbDb = args.writeBack.db ?? "knowledgeBase";
+        try {
+          await authority.assertNotionWriteAllowed(wbDb, "jhw_report_export");
+        } catch (cause) {
+          const denied = authorityMcpError(cause, wbDb, "jhw_report_export");
+          if (denied) return denied;
+          throw cause;
+        }
         const dbId = NOTION_CONFIG.databases[wbDb];
         const title =
           args.writeBack.title ??

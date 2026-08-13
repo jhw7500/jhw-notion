@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createMockNotionClient, createMockServer } from "../../__tests__/helpers/mock-notion.js";
 import type { MockNotionClient } from "../../__tests__/helpers/mock-notion.js";
+import { ControlError } from "../../control/errors.js";
 
 let mockClient: MockNotionClient;
 
@@ -9,6 +10,14 @@ vi.mock("../../notion-client.js", () => ({
 }));
 
 import { registerNote } from "../note.js";
+
+const legacyAuthority = { assertNotionWriteAllowed: vi.fn(async () => undefined) };
+const registryAuthority = { assertNotionWriteAllowed: vi.fn(async () => undefined) };
+const disabledAuthority = {
+  assertNotionWriteAllowed: vi.fn(async () => {
+    throw new ControlError("NOTION_WRITES_DISABLED", "disabled");
+  }),
+};
 import { defaultPageCache } from "../../cache/page-cache.js";
 
 describe("jhw_note", () => {
@@ -17,8 +26,40 @@ describe("jhw_note", () => {
   beforeEach(() => {
     mockClient = createMockNotionClient();
     const { server, capturedTools } = createMockServer();
-    registerNote(server as any);
+    legacyAuthority.assertNotionWriteAllowed.mockClear();
+    registryAuthority.assertNotionWriteAllowed.mockClear();
+    disabledAuthority.assertNotionWriteAllowed.mockClear();
+    registerNote(server as any, legacyAuthority);
     handler = capturedTools.get("jhw_note")!.handler;
+  });
+
+  it("registry authority에서도 Knowledge Base note는 기존 경로로 생성한다", async () => {
+    const { server, capturedTools } = createMockServer();
+    registerNote(server as any, registryAuthority);
+    mockClient.pages.create.mockResolvedValue({ id: "kb", url: "u" });
+
+    const result = await capturedTools.get("jhw_note")!.handler({ title: "allowed", content: "note" });
+
+    expect(JSON.parse(result.content[0].text).id).toBe("kb");
+    expect(mockClient.pages.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("local writes-disabled에서는 tag/schema/page 작업 전에 note를 거부한다", async () => {
+    const { server, capturedTools } = createMockServer();
+    registerNote(server as any, disabledAuthority);
+
+    const result = await capturedTools.get("jhw_note")!.handler({
+      title: "blocked",
+      content: "note",
+      tags: "new-tag",
+      allowNewTags: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).code).toBe("NOTION_WRITES_DISABLED");
+    expect(mockClient.dataSources.retrieve).not.toHaveBeenCalled();
+    expect(mockClient.dataSources.update).not.toHaveBeenCalled();
+    expect(mockClient.pages.create).not.toHaveBeenCalled();
   });
 
   it("Knowledge Base DB에 메모를 생성한다 (parent.database_id 사용)", async () => {
