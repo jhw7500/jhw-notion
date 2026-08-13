@@ -187,6 +187,110 @@ export class ProcessRunner {
     );
   }
 
+  /**
+   * Reads a small, committed binary object without decoding or redacting it.
+   * This is deliberately separate from `run`: Registry evidence is data, not
+   * diagnostic output, so applying output redaction would silently mutate it.
+   */
+  async runRaw(
+    command: string,
+    args: string[],
+    options: ProcessRunOptions = {},
+    maximumBytes: number,
+  ): Promise<Buffer> {
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+      throw new ControlError("RAW_OUTPUT_LIMIT_INVALID", "Raw command output limit must be a non-negative integer", {
+        maximumBytes,
+      });
+    }
+
+    const rawEnvironment = { ...this.environment, ...options.env };
+    const secrets = secretValues(rawEnvironment);
+    const safeCommand = redact(command, secrets);
+    const safeArgs = args.map((arg) => redact(arg, secrets));
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env: sanitizedChildEnvironment(rawEnvironment),
+        // stderr is intentionally not captured: an arbitrary blob error must
+        // never become an unredacted diagnostic payload.
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      throw new ControlError("RAW_COMMAND_FAILED", "Unable to start raw command", {
+        command: safeCommand,
+        args: safeArgs,
+        exitCode: null,
+      });
+    }
+
+    const output = new Promise<{ bytes: Buffer; tooLarge: boolean }>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let captured = 0;
+      let tooLarge = false;
+      const snapshot = () => ({ bytes: Buffer.concat(chunks), tooLarge });
+      child.stdout?.on("data", (chunk: Buffer | string) => {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const remaining = maximumBytes - captured;
+        if (remaining <= 0) {
+          if (bytes.length > 0) tooLarge = true;
+          return;
+        }
+        if (bytes.length > remaining) {
+          chunks.push(bytes.subarray(0, remaining));
+          captured += remaining;
+          tooLarge = true;
+          return;
+        }
+        chunks.push(bytes);
+        captured += bytes.length;
+      });
+      child.stdout?.once("end", () => resolve(snapshot()));
+      child.stdout?.once("error", reject);
+      // A failed spawn is not guaranteed to emit stdout's `end`; settle this
+      // capture as well so the stable command error below can be returned.
+      child.once("error", () => resolve(snapshot()));
+      if (!child.stdout) resolve({ bytes: Buffer.alloc(0), tooLarge: false });
+    });
+    const exit = await new Promise<number | null>((resolve) => {
+      let settled = false;
+      const settle = (value: number | null) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      child.once("error", () => settle(null));
+      child.once("close", (exitCode) => settle(exitCode));
+    });
+    let captured: { bytes: Buffer; tooLarge: boolean };
+    try {
+      captured = await output;
+    } catch {
+      throw new ControlError("RAW_COMMAND_FAILED", "Unable to read raw command output", {
+        command: safeCommand,
+        args: safeArgs,
+        exitCode: exit,
+      });
+    }
+    if (captured.tooLarge) {
+      throw new ControlError("RAW_OUTPUT_TOO_LARGE", "Raw command output exceeds its byte bound", {
+        command: safeCommand,
+        args: safeArgs,
+        exitCode: exit,
+        maximumBytes,
+      });
+    }
+    if (exit !== 0) {
+      throw new ControlError("RAW_COMMAND_FAILED", "Raw command failed", {
+        command: safeCommand,
+        args: safeArgs,
+        exitCode: exit,
+      });
+    }
+    return captured.bytes;
+  }
+
   /** Executes `gh` with only the selected host credential exposed as GH_TOKEN. */
   async runGh(args: string[], credential: GhCredential, options: ProcessRunOptions = {}): Promise<ProcessResult> {
     const rawEnvironment = { ...this.environment, ...options.env };

@@ -2,6 +2,7 @@ import { isAbsolute, normalize, sep } from "node:path";
 
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import { MAX_HANDOFF_BYTES } from "./handoff.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
 
 export interface RegistryMutationResult {
@@ -13,6 +14,10 @@ export type RegistryMutation = () => Promise<RegistryMutationResult>;
 
 export interface ProcessRunnerLike {
   run(command: string, args: string[], options?: ProcessRunOptions): Promise<ProcessResult>;
+}
+
+interface RawProcessRunnerLike extends ProcessRunnerLike {
+  runRaw(command: string, args: string[], options: ProcessRunOptions | undefined, maximumBytes: number): Promise<Buffer>;
 }
 
 export interface RegistryTransactionResult {
@@ -54,6 +59,11 @@ export class RegistryGit {
    * This deliberately consults Git metadata rather than trusting the worktree.
    */
   async assertHeadRegularFile(relativePath: string): Promise<void> {
+    await this.headRegularBlobObject(relativePath);
+  }
+
+  /** Reads the exact regular blob object ID selected by HEAD tree metadata. */
+  private async headRegularBlobObject(relativePath: string): Promise<string> {
     if (!isSafeRegistryRelativePath(relativePath)) {
       throw new ControlError("INVALID_REGISTRY_PATH", "Registry file path must be a safe relative path", { relativePath });
     }
@@ -85,15 +95,48 @@ export class RegistryGit {
     ) {
       throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD path is not a regular file", { relativePath });
     }
+    return objectId as string;
   }
 
-  /** Reads exact bytes only after proving the current HEAD entry is a regular file. */
-  async readHeadRegularFile(relativePath: string): Promise<string> {
-    await this.assertHeadRegularFile(relativePath);
+  /**
+   * Reads exact committed blob bytes. This bypasses the text/redacting process
+   * path because a Handoff is immutable evidence and must survive restoration
+   * byte-for-byte (including content that happens to equal a host secret).
+   */
+  async readHeadRegularBlob(relativePath: string): Promise<Buffer> {
+    const objectId = await this.headRegularBlobObject(relativePath);
+    const rawRunner = this.runner as Partial<RawProcessRunnerLike>;
+    if (typeof rawRunner.runRaw !== "function") {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry runner cannot read committed blob bytes", { relativePath });
+    }
     try {
-      return (await this.git(["show", `HEAD:${relativePath}`])).stdout;
+      const bytes = await rawRunner.runRaw(
+        "git",
+        ["cat-file", "blob", objectId],
+        { cwd: this.config.registryDir },
+        MAX_HANDOFF_BYTES,
+      );
+      if (bytes.length > MAX_HANDOFF_BYTES) {
+        // Defend the contract even for alternate ProcessRunner implementations.
+        throw new ControlError("RAW_OUTPUT_TOO_LARGE", "Raw blob exceeds the Handoff byte limit");
+      }
+      return bytes;
     } catch {
-      throw new ControlError("REGISTRY_CORRUPT", "Unable to read Registry HEAD file", { relativePath });
+      // In particular, never attach a Buffer or raw subprocess output here.
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to read Registry HEAD blob", {
+        relativePath,
+        object_id: objectId,
+      });
+    }
+  }
+
+  /** Reads a bounded, valid UTF-8 Handoff from a proven regular HEAD blob. */
+  async readHeadRegularFile(relativePath: string): Promise<string> {
+    try {
+      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await this.readHeadRegularBlob(relativePath));
+    } catch (cause) {
+      if (cause instanceof ControlError && cause.code === "HANDOFF_MISSING") throw cause;
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD blob is not valid UTF-8", { relativePath });
     }
   }
 

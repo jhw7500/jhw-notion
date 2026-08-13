@@ -76,6 +76,21 @@ describe("control process boundary", () => {
     });
   });
 
+  it("returns bounded raw bytes without decoding or redacting committed blob content", async () => {
+    const secret = "blob-secret";
+    const bytes = await new ProcessRunner({ BLOB_TOKEN: secret }).runRaw("bash", ["-c", `printf '${secret}'`], {}, 64);
+
+    expect(bytes).toEqual(Buffer.from(secret, "utf8"));
+  });
+
+  it("fails raw capture by stable metadata when output exceeds its byte bound", async () => {
+    const error = await new ProcessRunner({}).runRaw("bash", ["-c", "head -c 16 /dev/zero"], {}, 8)
+      .catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "RAW_OUTPUT_TOO_LARGE" });
+    expect(JSON.stringify(error)).not.toContain("\\u0000");
+  });
+
   it("removes inherited and override secrets from ordinary child environments", async () => {
     const result = await new ProcessRunner({ GH_PROJECT_TOKEN: "inherited-token" }).run(
       "bash",

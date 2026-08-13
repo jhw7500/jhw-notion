@@ -116,6 +116,63 @@ function assertValidation(validation: string[]): void {
   }
 }
 
+interface HandoffGitState {
+  branch: string;
+  head_sha: string;
+  dirty_files: number;
+  dirty_paths: string[];
+  ahead: number;
+  behind: number;
+}
+
+function handoffRetryConflict(handoffPath: string, reason: string): ControlError {
+  return new ControlError("HANDOFF_RETRY_CONFLICT", "Committed Handoff conflicts with current Git evidence", {
+    handoff_path: handoffPath,
+    reason,
+  });
+}
+
+function parseHandoffGitState(value: string, handoffPath: string): HandoffGitState {
+  const values = new Map<string, string>();
+  const permitted = new Set(["branch", "head_sha", "dirty_files", "dirty_paths", "ahead", "behind"]);
+  for (const line of value.split("\n")) {
+    const separator = line.indexOf(": ");
+    if (separator <= 0) throw handoffRetryConflict(handoffPath, "invalid_git_state_line");
+    const key = line.slice(0, separator);
+    if (!permitted.has(key)) throw handoffRetryConflict(handoffPath, "unexpected_git_state_key");
+    if (values.has(key)) throw handoffRetryConflict(handoffPath, "duplicate_git_state_key");
+    values.set(key, line.slice(separator + 2));
+  }
+  const required = ["branch", "head_sha", "dirty_files", "ahead", "behind"];
+  if (required.some((key) => !values.has(key))) throw handoffRetryConflict(handoffPath, "missing_git_state_key");
+  const count = (key: string): number => {
+    const raw = values.get(key) ?? "";
+    if (!/^(?:0|[1-9][0-9]*)$/.test(raw)) throw handoffRetryConflict(handoffPath, "invalid_git_state_count");
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed)) throw handoffRetryConflict(handoffPath, "invalid_git_state_count");
+    return parsed;
+  };
+  const dirty_files = count("dirty_files");
+  let dirty_paths: unknown = dirty_files === 0 ? [] : undefined;
+  if (values.has("dirty_paths")) {
+    try {
+      dirty_paths = JSON.parse(values.get("dirty_paths") ?? "");
+    } catch {
+      throw handoffRetryConflict(handoffPath, "invalid_dirty_paths");
+    }
+  }
+  if (!Array.isArray(dirty_paths) || dirty_paths.some((path) => typeof path !== "string" || !path)) {
+    throw handoffRetryConflict(handoffPath, "invalid_dirty_paths");
+  }
+  if (new Set(dirty_paths).size !== dirty_paths.length || dirty_paths.length !== dirty_files) {
+    throw handoffRetryConflict(handoffPath, "dirty_paths_count_mismatch");
+  }
+  const branch = values.get("branch") ?? "";
+  const head_sha = values.get("head_sha") ?? "";
+  if (!branch || !head_sha) throw handoffRetryConflict(handoffPath, "missing_git_identity");
+  return { branch, head_sha, dirty_files, dirty_paths, ahead: count("ahead"), behind: count("behind") };
+}
+
 /**
  * High-level Task lifecycle coordinator. Registry Claim changes remain the sole
  * source of release; host-local worktree removal is strictly post-release cleanup.
@@ -183,6 +240,7 @@ export class TaskService {
     const active = await this.assertOwner(input.task_id, input.claim_id);
     const inspection = await this.worktrees.inspect(active);
     let handoffPath: string | undefined;
+    let evidenceGitState: HandoffGitState | undefined;
 
     if (input.status === "handoff") {
       handoffPath = canonicalHandoffPath(active.task_id, active.claim_id);
@@ -200,10 +258,11 @@ export class TaskService {
             handoff_path: handoffPath,
           });
         }
-        // Current Git state legitimately changes because `.ai/handoff.md` is
-        // written during the first attempt. Reuse the committed Git snapshot
-        // while validating every caller-controlled section against its bytes.
         const sections = parseHandoffSections(committed);
+        evidenceGitState = parseHandoffGitState(sections["Git State"], handoffPath);
+        this.assertRetryGitEvidence(inspection, evidenceGitState, handoffPath);
+        // Reuse the committed Git snapshot while validating every
+        // caller-controlled section against its immutable bytes.
         const requested = this.buildRequestedHandoff(
           active,
           inspection,
@@ -218,6 +277,7 @@ export class TaskService {
         }
         handoff = committed;
       } else {
+        evidenceGitState = this.handoffGitState(inspection);
         handoff = this.buildRequestedHandoff(active, inspection, input, this.timestamp());
       }
 
@@ -233,8 +293,11 @@ export class TaskService {
     const history = await this.claims.finishClaim(active.task_id, active.claim_id, {
       status: input.status,
       ...(input.outcome ? { outcome: input.outcome } : {}),
-      branch: inspection.branch,
-      head_sha: inspection.head_sha,
+      // The release history is bound to the committed evidence.  A retry was
+      // already rejected if live state differs, but using evidence directly
+      // keeps that invariant explicit at this critical boundary.
+      branch: evidenceGitState?.branch ?? inspection.branch,
+      head_sha: evidenceGitState?.head_sha ?? inspection.head_sha,
       validation: input.validation,
       ...(handoffPath ? { handoff_path: handoffPath } : {}),
     });
@@ -269,13 +332,51 @@ export class TaskService {
   }
 
   private gitState(inspection: WorktreeInspection): string[] {
+    const state = this.handoffGitState(inspection);
     return [
-      `branch: ${inspection.branch}`,
-      `head_sha: ${inspection.head_sha}`,
-      `dirty_files: ${inspection.dirty_files.length}`,
-      `ahead: ${inspection.ahead}`,
-      `behind: ${inspection.behind}`,
+      `branch: ${state.branch}`,
+      `head_sha: ${state.head_sha}`,
+      `dirty_files: ${state.dirty_files}`,
+      `dirty_paths: ${JSON.stringify(state.dirty_paths)}`,
+      `ahead: ${state.ahead}`,
+      `behind: ${state.behind}`,
     ];
+  }
+
+  private handoffGitState(inspection: WorktreeInspection): HandoffGitState {
+    return {
+      branch: inspection.branch,
+      head_sha: inspection.head_sha,
+      dirty_files: inspection.dirty_files.length,
+      dirty_paths: [...inspection.dirty_files].sort(),
+      ahead: inspection.ahead,
+      behind: inspection.behind,
+    };
+  }
+
+  private assertRetryGitEvidence(
+    inspection: WorktreeInspection,
+    evidence: HandoffGitState,
+    handoffPath: string,
+  ): void {
+    if (
+      inspection.branch !== evidence.branch ||
+      inspection.head_sha !== evidence.head_sha ||
+      inspection.ahead !== evidence.ahead ||
+      inspection.behind !== evidence.behind
+    ) {
+      throw handoffRetryConflict(handoffPath, "git_identity_changed");
+    }
+    const expectedDirty = new Set([...evidence.dirty_paths, ".ai/handoff.md"]);
+    const actualDirty = new Set(inspection.dirty_files);
+    if (
+      inspection.dirty !== (inspection.dirty_files.length > 0) ||
+      actualDirty.size !== inspection.dirty_files.length ||
+      actualDirty.size !== expectedDirty.size ||
+      [...expectedDirty].some((path) => !actualDirty.has(path))
+    ) {
+      throw handoffRetryConflict(handoffPath, "dirty_delta_changed");
+    }
   }
 
   private buildRequestedHandoff(

@@ -218,6 +218,16 @@ describe("TaskService", () => {
 
     await expect(tasks.finish(input)).rejects.toThrow("release failed");
     const original = await readFile(pointer, "utf8");
+    worktrees.inspect.mockResolvedValue({
+      path: worktreePath,
+      worktree_ref: plan.worktree_ref,
+      branch: plan.branch,
+      head_sha: "0123456789abcdef",
+      dirty: true,
+      dirty_files: [".ai/handoff.md"],
+      ahead: 0,
+      behind: 0,
+    });
     await expect(tasks.finish({ ...input, progress: "conflicting retry" })).rejects.toMatchObject({
       code: "HANDOFF_RETRY_CONFLICT",
     });
@@ -226,6 +236,33 @@ describe("TaskService", () => {
     expect(await readFile(pointer, "utf8")).toBe(original);
     expect(await readFile(join(worktreePath, ".ai", "handoff.md"), "utf8")).toBe(original);
     expect(times).toHaveLength(1);
+  });
+
+  it.each([
+    ["a new commit", { head_sha: "deadbeef", dirty: true, dirty_files: [".ai/handoff.md"], ahead: 0, behind: 0 }],
+    ["an unrelated dirty file", { head_sha: "0123456789abcdef", dirty: true, dirty_files: ["src/unrelated.ts"], ahead: 0, behind: 0 }],
+    ["advanced ahead state", { head_sha: "0123456789abcdef", dirty: true, dirty_files: [".ai/handoff.md"], ahead: 1, behind: 0 }],
+  ] as const)("retains the Claim when retry Git evidence is stale due to %s", async (_reason, changed) => {
+    const { tasks, claims, worktrees, worktreePath } = await taskFixture();
+    claims.finishClaim.mockRejectedValueOnce(new Error("release failed"));
+    const input = {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff" as const,
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+    };
+
+    await expect(tasks.finish(input)).rejects.toThrow("release failed");
+    worktrees.inspect.mockResolvedValue({
+      path: worktreePath,
+      worktree_ref: plan.worktree_ref,
+      branch: plan.branch,
+      ...changed,
+    });
+
+    await expect(tasks.finish(input)).rejects.toMatchObject({ code: "HANDOFF_RETRY_CONFLICT" });
+    expect(claims.finishClaim).toHaveBeenCalledTimes(1);
   });
 
   it("uses real RegistryGit and ClaimService evidence for a failed Handoff release retry", async () => {

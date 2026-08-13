@@ -3,6 +3,8 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { ProcessRunner } from "../process.js";
+import { ControlError } from "../errors.js";
 import { WorktreeManager, worktreePlan } from "../worktree.js";
 import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
@@ -189,7 +191,51 @@ describe("WorktreeManager", () => {
     const state = JSON.parse(await readFile(join(fixture.root, "state", "worktrees.json"), "utf8"));
     expect(state.worktrees[active.worktree_ref]).toMatchObject({ lifecycle: "pending-remove", claim_id: active.claim_id });
     const successor = claim({ claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac", session_id: "codex-successor" });
+    await expect(manager.removeIfSafe(successor)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true, recovered: true, lifecycle: "removed" });
     await expect(manager.createOrReuse(successor, repoDir)).resolves.toMatchObject({ reused: false });
+  });
+
+  it("reinspects a same-generation pending removal and retries after a second safety check fails", async () => {
+    let saves = 0;
+    let root = "";
+    const { fixture, repoDir, manager } = await worktreeFixtureWithHooks({
+      afterSave: async () => {
+        saves += 1;
+        if (saves === 3) await writeFile(join(root, "worktrees", claim().worktree_ref, "raced.txt"), "dirty\n", "utf8");
+      },
+    });
+    root = fixture.root;
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_DIRTY" });
+    await expect(manager.recoveryStatus(active)).resolves.toMatchObject({ lifecycle: "pending-remove", path_exists: true });
+    await git(created.path, "clean", "-fd");
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true, recovered: true, lifecycle: "removed" });
+  });
+
+  it("retries a failed Git removal for the same pending generation without allowing a successor", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const realRunner = new ProcessRunner();
+    let failRemove = true;
+    (manager as unknown as { runner: { run: ProcessRunner["run"] } }).runner = {
+      run: async (command, args, options) => {
+        if (failRemove && args.includes("worktree") && args.includes("remove")) {
+          failRemove = false;
+          throw new ControlError("COMMAND_FAILED", "injected git remove failure");
+        }
+        return realRunner.run(command, args, options);
+      },
+    };
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "COMMAND_FAILED" });
+    const successor = claim({ claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac", session_id: "codex-successor" });
+    await expect(manager.removeIfSafe(successor)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true, recovered: true, lifecycle: "removed" });
+    await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("re-reads the pending-remove generation before deletion and rejects a successor swap", async () => {

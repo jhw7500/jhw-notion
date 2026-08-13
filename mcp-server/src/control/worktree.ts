@@ -12,7 +12,7 @@ const canonicalTaskId = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f
 const canonicalClaimId = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const logicalRef = /^wt-[a-z0-9][a-z0-9-]{1,120}$/;
 
-type WorktreeLifecycle = "pending-create" | "active" | "pending-remove" | "removed";
+export type WorktreeLifecycle = "pending-create" | "active" | "pending-remove" | "removed";
 
 export interface WorktreePlan {
   branch: string;
@@ -40,6 +40,17 @@ export interface WorktreeInspection {
 
 export interface WorktreeRemovalResult {
   removed: boolean;
+  /** True when this invocation completed a prior durable pending-remove intent. */
+  recovered: boolean;
+  lifecycle: "removed";
+}
+
+/** A non-destructive view used by a future CLI to guide pending recovery. */
+export interface WorktreeRecoveryStatus {
+  worktree_ref: string;
+  claim_id: string;
+  lifecycle: WorktreeLifecycle;
+  path_exists: boolean;
 }
 
 export interface WorktreeRunner {
@@ -285,13 +296,7 @@ export class WorktreeManager {
     const root = await this.worktreeRoot();
     const first = firstState.worktrees[claim.worktree_ref];
     if (first?.lifecycle === "pending-remove") {
-      this.assertPendingGeneration(first, claim, root);
-      if (!await this.mappedWorktreeExists(first.path, root)) {
-        first.lifecycle = "removed";
-        await this.saveState(firstState);
-        return { removed: true };
-      }
-      throw new ControlError("WORKTREE_REMOVE_PENDING", "A prior worktree removal is still pending", { worktree_ref: claim.worktree_ref });
+      return this.resumePendingRemove(claim, root, true);
     }
 
     const inspection = await this.inspect(claim);
@@ -317,33 +322,37 @@ export class WorktreeManager {
     // Persist the destructive intent before invoking Git.
     await this.saveState(state);
 
-    // Re-read durable state and revalidate the exact generation immediately
-    // before destructive removal. A successor generation must never be removed.
-    const reloaded = await this.loadState();
-    const pending = reloaded.worktrees[claim.worktree_ref];
-    if (!pending) throw new ControlError("WORKTREE_NOT_MAPPED", "Pending removal state disappeared", { worktree_ref: claim.worktree_ref });
-    const pendingRepository = await this.repositoryInfo(pending.repository_path);
-    this.assertExactGeneration(pending, claim, pendingRepository.identity, root, "pending-remove");
-    const current = await this.inspectMapped(pending, claim, root);
-    if (current.dirty) {
-      throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a newly dirty worktree", {
-        worktree_ref: current.worktree_ref,
-        dirty_files: current.dirty_files,
-      });
-    }
-    if (current.ahead > 0) {
-      throw new ControlError("WORKTREE_UNPUSHED", "Refusing to remove a worktree with newly unpushed commits", {
-        worktree_ref: current.worktree_ref,
-        ahead: current.ahead,
-      });
-    }
+    return this.resumePendingRemove(claim, root, false);
+  }
 
-    await this.git(["-C", pending.repository_path, "worktree", "remove", current.path]);
-    pending.lifecycle = "removed";
-    // If this persistence fails, the prior on-disk pending-remove record is a
-    // tombstone. Future starts recover it before creating a successor.
-    await this.saveState(reloaded);
-    return { removed: true };
+  /**
+   * Gives recovery callers a durable lifecycle plus only logical coordinates.
+   * It deliberately validates Claim ownership before exposing a prior
+   * generation's host-local record.
+   */
+  async recoveryStatus(claim: WorktreeClaim): Promise<WorktreeRecoveryStatus> {
+    validateClaim(claim);
+    this.assertLocalHost(claim);
+    const state = await this.loadState();
+    const root = await this.worktreeRoot();
+    const mapping = state.worktrees[claim.worktree_ref];
+    if (!mapping) {
+      throw new ControlError("WORKTREE_NOT_MAPPED", "Claim has no host-local worktree mapping", {
+        worktree_ref: claim.worktree_ref,
+      });
+    }
+    if (mapping.claim_id !== claim.claim_id) {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Worktree recovery belongs to a different Claim generation", {
+        worktree_ref: claim.worktree_ref,
+      });
+    }
+    this.assertCoordinates(mapping, claim, mapping.repository_identity, root);
+    return {
+      worktree_ref: claim.worktree_ref,
+      claim_id: claim.claim_id,
+      lifecycle: mapping.lifecycle,
+      path_exists: await this.mappedWorktreeExists(mapping.path, root),
+    };
   }
 
   private created(mapping: WorktreeMapping, reused: boolean): WorktreeCreateResult {
@@ -392,6 +401,73 @@ export class WorktreeManager {
     await this.saveState(state);
   }
 
+  /**
+   * Resumes a durable destructive intent.  The state is re-read from disk so
+   * a stale caller can never remove a successor generation.  If Git already
+   * removed the path but persisting the tombstone failed, the same routine
+   * merely finalizes that tombstone on retry.
+   */
+  private async resumePendingRemove(
+    claim: WorktreeClaim,
+    root: string,
+    recovered: boolean,
+  ): Promise<WorktreeRemovalResult> {
+    const state = await this.loadState();
+    const mapping = state.worktrees[claim.worktree_ref];
+    if (!mapping) {
+      throw new ControlError("WORKTREE_NOT_MAPPED", "Pending removal state disappeared", { worktree_ref: claim.worktree_ref });
+    }
+    // Validate the logical generation before even finalizing an already absent
+    // path.  That needs no repository I/O and lets a durable tombstone recover
+    // after a host cleanup has already removed the checkout.
+    if (mapping.claim_id !== claim.claim_id) {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Pending worktree removal belongs to a different Claim generation", {
+        worktree_ref: claim.worktree_ref,
+      });
+    }
+    this.assertCoordinates(mapping, claim, mapping.repository_identity, root);
+    if (mapping.lifecycle !== "pending-remove") {
+      throw new ControlError("WORKTREE_LIFECYCLE_MISMATCH", "Worktree state changed during lifecycle operation", {
+        worktree_ref: claim.worktree_ref,
+        expected_lifecycle: "pending-remove",
+        actual_lifecycle: mapping.lifecycle,
+      });
+    }
+
+    if (!await this.mappedWorktreeExists(mapping.path, root)) {
+      mapping.lifecycle = "removed";
+      // A failed final save deliberately retains the pending-remove tombstone.
+      await this.saveState(state);
+      return { removed: true, recovered, lifecycle: "removed" };
+    }
+
+    const repository = await this.repositoryInfo(mapping.repository_path);
+    this.assertExactGeneration(mapping, claim, repository.identity, root, "pending-remove");
+
+    // This is deliberately after the durable intent write and immediately
+    // before `git worktree remove`: dirty/ahead state can change meanwhile.
+    const current = await this.inspectMapped(mapping, claim, root);
+    if (current.dirty) {
+      throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a newly dirty worktree", {
+        worktree_ref: current.worktree_ref,
+        dirty_files: current.dirty_files,
+      });
+    }
+    if (current.ahead > 0) {
+      throw new ControlError("WORKTREE_UNPUSHED", "Refusing to remove a worktree with newly unpushed commits", {
+        worktree_ref: current.worktree_ref,
+        ahead: current.ahead,
+      });
+    }
+
+    await this.git(["-C", mapping.repository_path, "worktree", "remove", current.path]);
+    mapping.lifecycle = "removed";
+    // If this persistence fails, the original pending-remove state remains a
+    // recoverable tombstone and a successor cannot be mistaken for it.
+    await this.saveState(state);
+    return { removed: true, recovered, lifecycle: "removed" };
+  }
+
   private assertLocalHost(claim: WorktreeClaim): void {
     if (claim.host !== this.config.buildHost) {
       throw new ControlError("HOST_MISMATCH", "Worktree operations are allowed only on the Claim host", {
@@ -428,7 +504,9 @@ export class WorktreeManager {
 
   private async inspectMapped(mapping: WorktreeMapping, claim: WorktreeClaim, root: string): Promise<WorktreeInspection> {
     await this.verifyWorktree(mapping.path, claim.branch, mapping.repository_identity, root);
-    const status = await this.git(["-C", mapping.path, "status", "--porcelain"]);
+    // Enumerate untracked files rather than collapsing a new `.ai/` directory;
+    // retry evidence permits exactly `.ai/handoff.md`, never an opaque folder.
+    const status = await this.git(["-C", mapping.path, "status", "--porcelain", "--untracked-files=all"]);
     const dirtyFiles = status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3));
     const head = (await this.git(["-C", mapping.path, "rev-parse", "HEAD"])).stdout.trim();
     const upstream = (await this.git([
@@ -512,19 +590,6 @@ export class WorktreeManager {
         worktree_ref: claim.worktree_ref,
         expected_lifecycle: lifecycle,
         actual_lifecycle: mapping.lifecycle,
-      });
-    }
-  }
-
-  private assertPendingGeneration(mapping: WorktreeMapping, claim: WorktreeClaim, root: string): void {
-    if (mapping.claim_id !== claim.claim_id) {
-      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Pending worktree removal belongs to another Claim generation", {
-        worktree_ref: claim.worktree_ref,
-      });
-    }
-    if (mapping.path !== this.worktreePath(root, claim.worktree_ref) || mapping.lifecycle !== "pending-remove") {
-      throw new ControlError("WORKTREE_LIFECYCLE_MISMATCH", "Pending worktree removal does not match the Claim", {
-        worktree_ref: claim.worktree_ref,
       });
     }
   }

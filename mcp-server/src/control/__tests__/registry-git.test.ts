@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ControlError } from "../errors.js";
+import { MAX_HANDOFF_BYTES } from "../handoff.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit, type ProcessRunnerLike, type RegistryMutationResult } from "../registry-git.js";
 import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
@@ -181,6 +182,54 @@ describe("RegistryGit", () => {
     const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.readHeadRegularFile("handoffs/regular.md")).resolves.toBe("# Durable handoff\nfirst\n");
+  });
+
+  it("preserves a committed secret-valued substring because blob bytes bypass text redaction", async () => {
+    const { registryDir } = await fixture();
+    const secret = "registry-secret-value";
+    await commitFile(registryDir, "handoffs/secret.md", `# Handoff\n${secret}\n`);
+    await git(registryDir, "push", "origin", "main");
+    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner({ HIDDEN_TOKEN: secret }));
+
+    await expect(registry.readHeadRegularFile("handoffs/secret.md")).resolves.toContain(secret);
+  });
+
+  it("rejects invalid UTF-8 committed blob bytes without exposing them", async () => {
+    const { registryDir } = await fixture();
+    const path = join(registryDir, "handoffs", "invalid.md");
+    await mkdir(join(registryDir, "handoffs"), { recursive: true });
+    await writeFile(path, Buffer.from([0xc3, 0x28]));
+    await git(registryDir, "add", "--", "handoffs/invalid.md");
+    await git(registryDir, "commit", "-m", "Invalid blob");
+    await git(registryDir, "push", "origin", "main");
+    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+
+    const error = await registry.readHeadRegularFile("handoffs/invalid.md").catch((cause: unknown) => cause);
+    expect(error).toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(JSON.stringify(error)).not.toContain("c3");
+  });
+
+  it("rejects a committed Handoff blob larger than 12 KiB", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "handoffs"), { recursive: true });
+    await writeFile(join(registryDir, "handoffs", "large.md"), Buffer.alloc(MAX_HANDOFF_BYTES + 1, "x"));
+    await git(registryDir, "add", "--", "handoffs/large.md");
+    await git(registryDir, "commit", "-m", "Large blob");
+    await git(registryDir, "push", "origin", "main");
+    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.readHeadRegularFile("handoffs/large.md")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("round-trips exact Unicode blob bytes", async () => {
+    const { registryDir } = await fixture();
+    const content = "# Handoff\n😀 한글\n";
+    await commitFile(registryDir, "handoffs/unicode.md", content);
+    await git(registryDir, "push", "origin", "main");
+    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+
+    const restored = await registry.readHeadRegularFile("handoffs/unicode.md");
+    expect(Buffer.from(restored, "utf8")).toEqual(Buffer.from(content, "utf8"));
   });
 
   it("rejects a regular file absent from HEAD rather than trusting the working tree", async () => {
