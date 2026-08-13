@@ -192,6 +192,108 @@ describe("TaskService", () => {
     await expect(readFile(join(fixture.registryDir, pointer), "utf8")).resolves.toContain("claim_id:");
   });
 
+  it("rejects duplicate pre-existing local Handoff entries before generating evidence", async () => {
+    const { tasks, claims, worktrees, registry, worktreePath } = await taskFixture();
+    worktrees.inspect.mockResolvedValue({
+      path: worktreePath,
+      worktree_ref: plan.worktree_ref,
+      branch: plan.branch,
+      head_sha: "0123456789abcdef",
+      dirty: true,
+      dirty_files: [".ai/handoff.md", ".ai/handoff.md"],
+      ahead: 0,
+      behind: 0,
+    });
+
+    const failure = await tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+    }).catch((cause: unknown) => cause);
+
+    expect(failure).toMatchObject({
+      code: "INVALID_WORKTREE_INSPECTION",
+      message: "Worktree inspection contains duplicate dirty-file entries",
+      details: { reason: "duplicate_dirty_files" },
+    });
+    expect(JSON.stringify(failure)).not.toContain(".ai/handoff.md");
+    expect(registry.transact).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+  });
+
+  it("rejects a duplicate local Handoff entry introduced only on retry", async () => {
+    const { tasks, claims, worktrees, worktreePath } = await taskFixture();
+    claims.finishClaim.mockRejectedValueOnce(new Error("release failed"));
+    worktrees.inspect.mockResolvedValueOnce({
+      path: worktreePath,
+      worktree_ref: plan.worktree_ref,
+      branch: plan.branch,
+      head_sha: "0123456789abcdef",
+      dirty: true,
+      dirty_files: [".ai/handoff.md"],
+      ahead: 0,
+      behind: 0,
+    });
+    const input = {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff" as const,
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+    };
+
+    await expect(tasks.finish(input)).rejects.toThrow("release failed");
+    worktrees.inspect.mockResolvedValue({
+      path: worktreePath,
+      worktree_ref: plan.worktree_ref,
+      branch: plan.branch,
+      head_sha: "0123456789abcdef",
+      dirty: true,
+      dirty_files: [".ai/handoff.md", ".ai/handoff.md"],
+      ahead: 0,
+      behind: 0,
+    });
+
+    await expect(tasks.finish(input)).rejects.toMatchObject({
+      code: "INVALID_WORKTREE_INSPECTION",
+      details: { reason: "duplicate_dirty_files" },
+    });
+    expect(claims.finishClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects duplicate unrelated dirty paths without exposing the path", async () => {
+    const { tasks, claims, worktrees, registry, worktreePath } = await taskFixture();
+    const privatePath = "src/customer-secret.ts";
+    worktrees.inspect.mockResolvedValue({
+      path: worktreePath,
+      worktree_ref: plan.worktree_ref,
+      branch: plan.branch,
+      head_sha: "0123456789abcdef",
+      dirty: true,
+      dirty_files: [privatePath, privatePath],
+      ahead: 0,
+      behind: 0,
+    });
+
+    const failure = await tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+    }).catch((cause: unknown) => cause);
+
+    expect(failure).toMatchObject({
+      code: "INVALID_WORKTREE_INSPECTION",
+      details: { reason: "duplicate_dirty_files" },
+    });
+    expect(JSON.stringify(failure)).not.toContain(privatePath);
+    expect(registry.transact).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+  });
+
   it("reuses immutable committed Handoff bytes on a release retry despite an advancing clock", async () => {
     const { claims, worktrees, registry, worktreePath, fixture } = await taskFixture();
     const times = [

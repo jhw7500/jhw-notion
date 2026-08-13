@@ -148,6 +148,16 @@ function dirtyEvidence(paths: readonly string[]): Pick<HandoffGitState, "dirty_c
   };
 }
 
+function assertUniqueDirtyFiles(inspection: WorktreeInspection): void {
+  if (new Set(inspection.dirty_files).size !== inspection.dirty_files.length) {
+    throw new ControlError(
+      "INVALID_WORKTREE_INSPECTION",
+      "Worktree inspection contains duplicate dirty-file entries",
+      { reason: "duplicate_dirty_files" },
+    );
+  }
+}
+
 function withoutExpectedLocalHandoff(paths: readonly string[]): string[] {
   const index = paths.indexOf(".ai/handoff.md");
   if (index < 0) return [...paths];
@@ -283,6 +293,10 @@ export class TaskService {
     assertValidation(input.validation);
     const active = await this.assertOwner(input.task_id, input.claim_id);
     const inspection = await this.worktrees.inspect(active);
+    // Inspection is a port boundary. Duplicate entries turn the dirty digest
+    // into multiset evidence and can make the two-candidate retry check
+    // ambiguous, so reject them before either initial generation or retry.
+    assertUniqueDirtyFiles(inspection);
     let handoffPath: string | undefined;
     let evidenceGitState: HandoffGitState | undefined;
 
