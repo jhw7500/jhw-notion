@@ -6,3 +6,5 @@ dist/
 .bkit/
 tmp/
 .claude/
+
+.worktrees/
