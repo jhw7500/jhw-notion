@@ -53,9 +53,21 @@ function partialSecretPrefixLength(value: string, secrets: readonly string[]): n
   return 0;
 }
 
+function firstSecretMatch(value: string, secrets: readonly string[]): { index: number; secret: string } | undefined {
+  let match: { index: number; secret: string } | undefined;
+  for (const secret of secrets) {
+    const index = value.indexOf(secret);
+    if (index === -1 || (match && (index > match.index || (index === match.index && secret.length <= match.secret.length)))) {
+      continue;
+    }
+    match = { index, secret };
+  }
+  return match;
+}
+
 /**
- * Redacts each stream incrementally. The rolling tail keeps a possible secret
- * prefix until its remainder arrives, so a capture boundary cannot expose it.
+ * Redacts each stream incrementally. Complete matches are consumed before a
+ * possible trailing prefix is retained, including self-overlapping secrets.
  */
 function redactingCapture(stream: Readable | null, secrets: readonly string[]): Promise<Buffer> {
   if (!stream) return Promise.resolve(Buffer.alloc(0));
@@ -84,10 +96,21 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
       captured += bounded.length;
     };
     const emitAvailable = () => {
-      const tailLength = partialSecretPrefixLength(pending, secrets);
-      const safePrefix = pending.slice(0, pending.length - tailLength);
-      pending = pending.slice(pending.length - tailLength);
-      append(redact(safePrefix, secrets));
+      let safe = "";
+      while (pending) {
+        const match = firstSecretMatch(pending, secrets);
+        if (match) {
+          safe += pending.slice(0, match.index);
+          safe += "[REDACTED]";
+          pending = pending.slice(match.index + match.secret.length);
+          continue;
+        }
+        const tailLength = partialSecretPrefixLength(pending, secrets);
+        safe += pending.slice(0, pending.length - tailLength);
+        pending = pending.slice(pending.length - tailLength);
+        break;
+      }
+      append(safe);
     };
 
     stream.on("data", (chunk: Buffer | string) => {
@@ -96,7 +119,9 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
     });
     stream.once("end", () => {
       pending += decoder.end();
-      append(redact(pending, secrets));
+      emitAvailable();
+      // An EOF prefix cannot become a complete credential; retain no prefix bytes.
+      if (pending) append("[REDACTED]");
       resolve(Buffer.concat(chunks));
     });
     stream.once("error", reject);

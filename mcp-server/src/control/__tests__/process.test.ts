@@ -109,6 +109,35 @@ describe("control process boundary", () => {
     }
   });
 
+  it("redacts a self-overlapping secret emitted in one chunk", async () => {
+    const result = await new ProcessRunner({ AAA_TOKEN: "aaa" }).run("bash", ["-c", "printf aaa"]);
+
+    expect(result.stdout).toBe("[REDACTED]");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it("redacts a self-overlapping secret split across child output chunks", async () => {
+    const result = await new ProcessRunner({ AAA_TOKEN: "aaa" }).run(process.execPath, [
+      "-e",
+      "process.stdout.write('a'); setTimeout(() => process.stdout.write('aa'), 20)",
+    ]);
+
+    expect(result.stdout).toBe("[REDACTED]");
+    expect(result.stdout).not.toContain("a");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it("redacts an overlapping secret across arbitrary output splits", async () => {
+    const result = await new ProcessRunner({ ABAB_TOKEN: "abab" }).run(process.execPath, [
+      "-e",
+      "process.stdout.write('ab'); setTimeout(() => process.stdout.write('ab'), 20)",
+    ]);
+
+    expect(result.stdout).toBe("[REDACTED]");
+    expect(result.stdout).not.toContain("ab");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
   it("does not leak a secret prefix that crosses the safe output boundary", async () => {
     const secret = "crossing-secret";
     const result = await new ProcessRunner({ CROSSING_TOKEN: secret }).run("bash", [
