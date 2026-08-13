@@ -5,6 +5,8 @@ import { NOTION_CONFIG } from "../../config.js";
 import { ControlError } from "../../control/errors.js";
 
 let mockClient: MockNotionClient;
+const TARGET = "55a8a230-a04e-4154-8fa5-d96ebdd63500";
+const PARENT = "66a8a230-a04e-4154-8fa5-d96ebdd63500";
 
 vi.mock("../../notion-client.js", () => ({
   getNotionClient: () => mockClient,
@@ -25,12 +27,47 @@ describe("jhw_delete", () => {
 
   beforeEach(() => {
     mockClient = createMockNotionClient();
-    mockClient.pages.retrieve.mockResolvedValue({ parent: { type: "page_id", page_id: "parent" } });
+    mockClient.pages.retrieve.mockResolvedValue({ parent: { type: "workspace", workspace: true } });
     const { server, capturedTools } = createMockServer();
     legacyAuthority.assertNotionWriteAllowed.mockClear();
     registryAuthority.assertNotionWriteAllowed.mockClear();
     registerDelete(server as any, legacyAuthority);
     handler = capturedTools.get("jhw_delete")!.handler;
+  });
+
+  it("registry authority에서 Decision Log descendant delete를 거부한다", async () => {
+    mockClient.pages.retrieve.mockImplementation(async ({ page_id }: { page_id: string }) => page_id === TARGET
+      ? { id: TARGET, parent: { type: "page_id", page_id: PARENT } }
+      : { id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.decisionLog } });
+    const selectiveAuthority = {
+      assertNotionWriteAllowed: vi.fn(async (db: string) => {
+        if (db === "decisionLog") throw new ControlError("AUTHORITY_MOVED", "moved");
+      }),
+    };
+    const { server, capturedTools } = createMockServer();
+    registerDelete(server as any, selectiveAuthority);
+
+    const result = await capturedTools.get("jhw_delete")!.handler({ pageId: TARGET, mode: "delete" });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ code: "AUTHORITY_MOVED", db: "decisionLog" });
+    expect(mockClient.pages.update).not.toHaveBeenCalled();
+  });
+
+  it("ancestor retrieve failure returns stable MCP error without cache/update mutation", async () => {
+    defaultPageCache.clear();
+    defaultPageCache.set({ id: TARGET, db: "decisionLog", title: "kept", text: "kept" });
+    mockClient.pages.retrieve.mockRejectedValue(new Error("sensitive upstream failure"));
+    const { server, capturedTools } = createMockServer();
+    registerDelete(server as any, legacyAuthority);
+
+    const result = await capturedTools.get("jhw_delete")!.handler({ pageId: TARGET, mode: "delete" });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ code: "AUTHORITY_UNAVAILABLE", db: "page" });
+    expect(result.content[0].text).not.toContain("sensitive upstream");
+    expect(defaultPageCache.get(TARGET)).toBeDefined();
+    expect(mockClient.pages.update).not.toHaveBeenCalled();
   });
 
   it("registry authority에서는 대상 page 조회 뒤 Decision Log 삭제를 캐시 변경 전에 거부한다", async () => {

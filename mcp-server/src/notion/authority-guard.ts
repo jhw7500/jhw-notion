@@ -20,20 +20,72 @@ for (const [name, schema] of Object.entries(DATABASE_SCHEMAS)) {
   if (dataSource) dataSourceIds.set(dataSource, name as DatabaseName);
 }
 
+const MAX_PARENT_DEPTH = 16;
+
+function targetResolutionUnavailable(): ControlError {
+  const payload = {
+    code: "AUTHORITY_UNAVAILABLE",
+    operation: "authority.resolve_target",
+    db: "page",
+    route: "Retry only after the Notion target authority can be resolved; do not bypass the guard.",
+  };
+  return new ControlError(payload.code, JSON.stringify(payload), payload);
+}
+
+function pageKey(pageId: string): string {
+  const trimmed = pageId.trim();
+  return normalizeId(trimmed) ?? trimmed.toLowerCase();
+}
+
 export async function resolveTargetDatabase(
   pageId: string,
   notion: Pick<Client, "pages">,
 ): Promise<DatabaseName | "page"> {
-  const page = await notion.pages.retrieve({ page_id: pageId });
-  const parent = (page as { parent?: { database_id?: unknown; data_source_id?: unknown } }).parent;
-  const databaseId = normalizeId(parent?.database_id);
-  if (databaseId) {
-    const database = databaseIds.get(databaseId);
-    if (database) return database;
+  let currentPageId = pageId.trim();
+  const visited = new Set<string>();
+  for (let depth = 0; depth < MAX_PARENT_DEPTH; depth += 1) {
+    const key = pageKey(currentPageId);
+    if (!key || visited.has(key)) throw targetResolutionUnavailable();
+    visited.add(key);
+
+    let page: unknown;
+    try {
+      page = await notion.pages.retrieve({ page_id: currentPageId });
+    } catch {
+      throw targetResolutionUnavailable();
+    }
+    const parent = (page as { parent?: unknown } | null)?.parent;
+    if (typeof parent !== "object" || parent === null) throw targetResolutionUnavailable();
+    const typed = parent as {
+      type?: unknown;
+      database_id?: unknown;
+      data_source_id?: unknown;
+      page_id?: unknown;
+      workspace?: unknown;
+    };
+
+    if (typed.type === "database_id" || typed.type === "data_source_id") {
+      const databaseId = normalizeId(typed.database_id);
+      if (databaseId) {
+        const database = databaseIds.get(databaseId);
+        if (database) return database;
+      }
+      const dataSourceId = normalizeId(typed.data_source_id);
+      if (dataSourceId) {
+        const database = dataSourceIds.get(dataSourceId);
+        if (database) return database;
+      }
+      if (databaseId || dataSourceId) return "page";
+      throw targetResolutionUnavailable();
+    }
+
+    if (typed.type === "workspace" && typed.workspace === true) return "page";
+    if (typed.type !== "page_id") throw targetResolutionUnavailable();
+    const parentPageId = typeof typed.page_id === "string" ? typed.page_id.trim() : "";
+    if (!normalizeId(parentPageId)) throw targetResolutionUnavailable();
+    currentPageId = parentPageId;
   }
-  const dataSourceId = normalizeId(parent?.data_source_id);
-  if (dataSourceId) return dataSourceIds.get(dataSourceId) ?? "page";
-  return "page";
+  throw targetResolutionUnavailable();
 }
 
 export type NotionAuthorityGuard = Pick<AuthorityService, "assertNotionWriteAllowed">;

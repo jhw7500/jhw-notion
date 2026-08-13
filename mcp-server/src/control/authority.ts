@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { constants } from "node:fs";
-import { open, type FileHandle } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { constants, fsync } from "node:fs";
+import { open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, basename, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 
@@ -12,7 +13,7 @@ import type { DatabaseName } from "../config.js";
 const CACHE_SCHEMA = AuthorityRecordSchema.pick({ authority_epoch: true, mode: true });
 const CACHE_FILE = "authority-cache.json";
 const LOCK_FILE = "authority-cache.lock";
-const cacheOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW;
+const temporaryCacheOpenFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW;
 const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW;
 const centralOpenFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
 const centralDirectoryOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
@@ -37,6 +38,16 @@ export interface CreateAuthorityServiceOptions {
   readCentral(): Promise<AuthorityRecord | null>;
   cachePath: string;
   writesDisabled: boolean;
+  /** Deterministic durability/failure hooks for tests; omitted in production. */
+  cacheHooks?: AuthorityCacheHooks;
+}
+
+export interface AuthorityCacheHooks {
+  afterTemporaryFileSync?(): Promise<void> | void;
+  rename?(source: string, destination: string): Promise<void>;
+  afterRename?(): Promise<void> | void;
+  syncDirectory?(directoryFd: number): Promise<void>;
+  afterDirectorySync?(): Promise<void> | void;
 }
 
 function structuredError(
@@ -107,21 +118,60 @@ async function readCache(directory: SecureStateDirectory, fileName: string): Pro
   }
 }
 
-async function writeCache(directory: SecureStateDirectory, fileName: string, cache: AuthorityCache): Promise<void> {
-  let file: FileHandle | undefined;
+function descriptorPath(directory: SecureStateDirectory, name: string): string {
+  return `/proc/self/fd/${directory.fd}/${name}`;
+}
+
+function syncDirectoryFd(directoryFd: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    fsync(directoryFd, (error) => error ? reject(error) : resolve());
+  });
+}
+
+async function writeCache(
+  directory: SecureStateDirectory,
+  fileName: string,
+  cache: AuthorityCache,
+  hooks: AuthorityCacheHooks = {},
+): Promise<void> {
+  const expected = `${JSON.stringify(cache)}\n`;
+  const temporaryName = `.${fileName}.${randomUUID()}.tmp`;
+  let temporary: FileHandle | undefined;
+  let published: FileHandle | undefined;
   try {
-    file = await directory.openFile(fileName, cacheOpenFlags, 0o600);
-    const info = await file.stat();
+    temporary = await directory.openFile(temporaryName, temporaryCacheOpenFlags, 0o600);
+    let info = await temporary.stat();
     if (!info.isFile() || info.nlink !== 1) throw authorityUnavailable();
-    await file.chmod(0o600);
-    await file.truncate(0);
-    await file.writeFile(`${JSON.stringify(cache)}\n`, "utf8");
-    await file.sync();
+    await temporary.chmod(0o600);
+    info = await temporary.stat();
+    if ((info.mode & 0o777) !== 0o600) throw authorityUnavailable();
+    await temporary.writeFile(expected, "utf8");
+    await temporary.sync();
+    await hooks.afterTemporaryFileSync?.();
+    await temporary.close();
+    temporary = undefined;
+
+    await (hooks.rename ?? rename)(descriptorPath(directory, temporaryName), descriptorPath(directory, fileName));
+    await hooks.afterRename?.();
+
+    published = await directory.openFile(fileName, constants.O_RDONLY);
+    const publishedInfo = await published.stat();
+    if (!publishedInfo.isFile() || publishedInfo.nlink !== 1 || (publishedInfo.mode & 0o777) !== 0o600) {
+      throw authorityUnavailable();
+    }
+    if (await published.readFile("utf8") !== expected) throw authorityUnavailable();
+    await published.close();
+    published = undefined;
+
+    await (hooks.syncDirectory ?? syncDirectoryFd)(directory.fd);
+    await hooks.afterDirectorySync?.();
   } catch (cause) {
     if (cause instanceof ControlError) throw cause;
     throw authorityUnavailable();
   } finally {
-    await file?.close();
+    await temporary?.close().catch(() => undefined);
+    await published?.close().catch(() => undefined);
+    await unlink(descriptorPath(directory, temporaryName)).catch(() => undefined);
   }
 }
 
@@ -189,7 +239,7 @@ export function createAuthorityService(options: CreateAuthorityServiceOptions): 
           central = validateCentral(await options.readCentral());
         } catch (cause) {
           if (cause instanceof ControlError) throw cause;
-          central = null;
+          throw authorityUnavailable();
         }
 
         if (!central) {
@@ -204,7 +254,7 @@ export function createAuthorityService(options: CreateAuthorityServiceOptions): 
           mode: central.mode,
         };
         if (!cache || cache.authority_epoch !== next.authority_epoch || cache.mode !== next.mode) {
-          await writeCache(directory, fileName, next);
+          await writeCache(directory, fileName, next, options.cacheHooks);
         }
         return { ...next, source: "central" };
       });
@@ -212,19 +262,8 @@ export function createAuthorityService(options: CreateAuthorityServiceOptions): 
 
     async assertNotionWriteAllowed(db: DatabaseName, operation: string): Promise<void> {
       const protectedDatabase = db === "projects" || db === "decisionLog";
-      if (!protectedDatabase) {
-        if (options.writesDisabled) {
-          throw structuredError(
-            "NOTION_WRITES_DISABLED",
-            operation,
-            db,
-            "Local policy disables Notion writes; use the owning workflow or ask the operator to re-enable writes.",
-          );
-        }
-        return;
-      }
-      const decision = await this.load();
       if (options.writesDisabled) {
+        await this.load();
         throw structuredError(
           "NOTION_WRITES_DISABLED",
           operation,
@@ -232,6 +271,8 @@ export function createAuthorityService(options: CreateAuthorityServiceOptions): 
           "Local policy disables Notion writes; use the owning workflow or ask the operator to re-enable writes.",
         );
       }
+      if (!protectedDatabase) return;
+      const decision = await this.load();
       if (decision.mode === "registry") {
         throw moved(operation, db);
       }
@@ -245,15 +286,17 @@ function strictWritesDisabled(env: NodeJS.ProcessEnv): boolean {
 
 async function readCentralFromEnvironment(env: NodeJS.ProcessEnv): Promise<AuthorityRecord | null> {
   const registryDir = env.JHW_REGISTRY_DIR?.trim();
-  if (!registryDir || !isAbsolute(registryDir)) return null;
+  if (!registryDir) return null;
+  if (!isAbsolute(registryDir)) throw authorityUnavailable();
   let registry: FileHandle | undefined;
   let governance: FileHandle | undefined;
   let file: FileHandle | undefined;
   try {
     const target = resolve(registryDir);
     const root = parse(target).root;
-    let current = await open(root, centralDirectoryOpenFlags);
+    let current: FileHandle | undefined;
     try {
+      current = await open(root, centralDirectoryOpenFlags);
       for (const component of relative(root, target).split(sep).filter(Boolean)) {
         const next = await open(`/proc/self/fd/${current.fd}/${component}`, centralDirectoryOpenFlags);
         if (!(await next.stat()).isDirectory()) {
@@ -264,20 +307,30 @@ async function readCentralFromEnvironment(env: NodeJS.ProcessEnv): Promise<Autho
         current = next;
       }
       registry = current;
-    } catch (cause) {
-      await current.close();
-      throw cause;
+    } catch {
+      await current?.close().catch(() => undefined);
+      throw authorityUnavailable();
     }
-    governance = await open(`/proc/self/fd/${registry.fd}/governance`, centralDirectoryOpenFlags);
-    if (!(await governance.stat()).isDirectory()) throw authorityUnavailable();
-    file = await open(`/proc/self/fd/${governance.fd}/authority.yaml`, centralOpenFlags);
-    if (!(await file.stat()).isFile()) throw authorityUnavailable();
+    try {
+      governance = await open(`/proc/self/fd/${registry.fd}/governance`, centralDirectoryOpenFlags);
+      if (!(await governance.stat()).isDirectory()) throw authorityUnavailable();
+    } catch (cause) {
+      if (cause instanceof ControlError) throw cause;
+      throw authorityUnavailable();
+    }
+    try {
+      file = await open(`/proc/self/fd/${governance.fd}/authority.yaml`, centralOpenFlags);
+    } catch (cause) {
+      if (isNotFound(cause)) return null;
+      throw authorityUnavailable();
+    }
+    const fileInfo = await file.stat();
+    if (!fileInfo.isFile() || fileInfo.nlink !== 1) throw authorityUnavailable();
     const parsed: unknown = JSON.parse(await file.readFile("utf8"));
     const result = AuthorityRecordSchema.safeParse(parsed);
     if (!result.success) throw authorityUnavailable();
     return result.data;
   } catch (cause) {
-    if (isNotFound(cause)) return null;
     if (cause instanceof ControlError && cause.code === "AUTHORITY_UNAVAILABLE") throw cause;
     throw authorityUnavailable();
   } finally {

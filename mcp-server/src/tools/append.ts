@@ -11,6 +11,7 @@ import {
   defaultNotionAuthorityGuard,
   resolveTargetDatabase,
   type NotionAuthorityGuard,
+  type NotionWriteTarget,
 } from "../notion/authority-guard.js";
 
 const MAX_BLOCKS_PER_REQUEST = 100;
@@ -41,8 +42,9 @@ export function registerAppend(server: McpServer, authority: NotionAuthorityGuar
 
       const notion = getNotionClient();
       const normalizedPageId = normalizePageId(pageId);
-      const targetDatabase = await resolveTargetDatabase(normalizedPageId, notion);
+      let targetDatabase: NotionWriteTarget = "page";
       try {
+        targetDatabase = await resolveTargetDatabase(normalizedPageId, notion);
         await assertTargetWriteAllowed(authority, targetDatabase, "jhw_append");
       } catch (cause) {
         const denied = authorityMcpError(cause, targetDatabase, "jhw_append");

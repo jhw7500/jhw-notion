@@ -9,6 +9,8 @@ import { NOTION_CONFIG } from "../../config.js";
 import { ControlError } from "../../control/errors.js";
 
 let mockClient: MockNotionClient;
+const TARGET = "33a8a230-a04e-4154-8fa5-d96ebdd63500";
+const PARENT = "44a8a230-a04e-4154-8fa5-d96ebdd63500";
 
 vi.mock("../../notion-client.js", () => ({
   getNotionClient: () => mockClient,
@@ -30,7 +32,7 @@ describe("jhw_append", () => {
   beforeEach(() => {
     defaultPageCache.clear();
     mockClient = createMockNotionClient();
-    mockClient.pages.retrieve.mockResolvedValue({ parent: { type: "page_id", page_id: "parent" } });
+    mockClient.pages.retrieve.mockResolvedValue({ parent: { type: "workspace", workspace: true } });
     mockClient.blocks.children.append.mockResolvedValue({});
     const { server, capturedTools } = createMockServer();
     legacyAuthority.assertNotionWriteAllowed.mockClear();
@@ -39,6 +41,72 @@ describe("jhw_append", () => {
     const tool = capturedTools.get("jhw_append")!;
     handler = tool.handler;
     schema = tool.schema;
+  });
+
+  it("registry authority에서 Projects descendant append를 거부한다", async () => {
+    mockClient.pages.retrieve.mockImplementation(async ({ page_id }: { page_id: string }) => page_id === TARGET
+      ? { id: TARGET, parent: { type: "page_id", page_id: PARENT } }
+      : { id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects } });
+    const selectiveAuthority = {
+      assertNotionWriteAllowed: vi.fn(async (db: string) => {
+        if (db === "projects") throw new ControlError("AUTHORITY_MOVED", "moved");
+      }),
+    };
+    const { server, capturedTools } = createMockServer();
+    registerAppend(server as any, selectiveAuthority);
+
+    const result = await capturedTools.get("jhw_append")!.handler({ pageId: TARGET, content: "blocked" });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ code: "AUTHORITY_MOVED", db: "projects" });
+    expect(mockClient.blocks.children.append).not.toHaveBeenCalled();
+  });
+
+  it("registry authority에서 Knowledge Base descendant append는 허용한다", async () => {
+    mockClient.pages.retrieve.mockImplementation(async ({ page_id }: { page_id: string }) => page_id === TARGET
+      ? { id: TARGET, parent: { type: "page_id", page_id: PARENT } }
+      : { id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase } });
+    const selectiveAuthority = {
+      assertNotionWriteAllowed: vi.fn(async (db: string) => {
+        if (db === "projects" || db === "decisionLog") throw new ControlError("AUTHORITY_MOVED", "moved");
+      }),
+    };
+    const { server, capturedTools } = createMockServer();
+    registerAppend(server as any, selectiveAuthority);
+
+    const result = await capturedTools.get("jhw_append")!.handler({ pageId: TARGET, content: "allowed" });
+
+    expect(JSON.parse(result.content[0].text).appendedBlocks).toBe(1);
+    expect(mockClient.blocks.children.append).toHaveBeenCalledTimes(1);
+  });
+
+  it("ancestor cycle/depth failures return stable MCP errors without append", async () => {
+    const ids = Array.from({ length: 64 }, (_, index) => `${(index + 1).toString(16).padStart(8, "0")}-0000-4000-8000-000000000000`);
+    const cases = [
+      {
+        start: TARGET,
+        retrieve: vi.fn(async ({ page_id }: { page_id: string }) => ({
+          id: page_id,
+          parent: { type: "page_id", page_id: page_id === TARGET ? PARENT : TARGET },
+        })),
+      },
+      {
+        start: ids[0],
+        retrieve: vi.fn(async ({ page_id }: { page_id: string }) => {
+          const index = ids.indexOf(page_id);
+          return { id: page_id, parent: { type: "page_id", page_id: ids[index + 1] ?? ids.at(-1) } };
+        }),
+      },
+    ];
+    for (const { start, retrieve } of cases) {
+      mockClient.pages.retrieve = retrieve;
+      const { server, capturedTools } = createMockServer();
+      registerAppend(server as any, legacyAuthority);
+      const result = await capturedTools.get("jhw_append")!.handler({ pageId: start, content: "blocked" });
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text).code).toBe("AUTHORITY_UNAVAILABLE");
+      expect(mockClient.blocks.children.append).not.toHaveBeenCalled();
+    }
   });
 
   it("registry authority에서는 대상 page 조회 뒤 Projects append를 캐시 변경 전에 거부한다", async () => {

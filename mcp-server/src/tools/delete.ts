@@ -9,6 +9,7 @@ import {
   defaultNotionAuthorityGuard,
   resolveTargetDatabase,
   type NotionAuthorityGuard,
+  type NotionWriteTarget,
 } from "../notion/authority-guard.js";
 
 const DeleteInput = z.object({
@@ -28,8 +29,9 @@ export function registerDelete(server: McpServer, authority: NotionAuthorityGuar
     DeleteInput.shape,
     async ({ pageId, mode }) => {
       const notion = getNotionClient();
-      const targetDatabase = await resolveTargetDatabase(pageId, notion);
+      let targetDatabase: NotionWriteTarget = "page";
       try {
+        targetDatabase = await resolveTargetDatabase(pageId, notion);
         await assertTargetWriteAllowed(authority, targetDatabase, "jhw_delete");
       } catch (cause) {
         const denied = authorityMcpError(cause, targetDatabase, "jhw_delete");
