@@ -61,8 +61,18 @@ describe("jhw-control installed entry", () => {
     const installedBin = join(npmBin, "jhw-control");
     const stateDir = join(root, "state");
     await symlink(join(mcpRoot, "dist", "control", "cli.js"), installedBin);
-    const sha = "a".repeat(40);
-    const failure = await execFile(installedBin, ["project", "register", "--project", "prj-control", "--base-sha", sha], {
+    const failure = await execFile(installedBin, [
+      "project", "register",
+      "--project", "prj-control",
+      "--title", "Control Trial",
+      "--objective", "Prove callback locking",
+      "--repo-id", "repo-control",
+      "--status", "proposed",
+      "--priority", "P2",
+      "--health", "unknown",
+      "--next-action", "wait:fixture",
+      "--last-reviewed", "2026-08-13",
+    ], {
       cwd: mcpRoot,
       encoding: "utf8",
       env: {
@@ -73,18 +83,24 @@ describe("jhw-control installed entry", () => {
         JHW_BUILD_HOST: "build-host",
         JHW_GITHUB_OWNER: "owner",
         JHW_PROJECT_NUMBER: "1",
+        JHW_REGISTRY_REPOSITORY: "owner/registry",
+        JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+        JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
         JHW_CONTROL_STATE_DIR: stateDir,
         JHW_CONTROL_LOCK_HELD: "1",
         GH_PROJECT_TOKEN: "entry-project-token",
+        GH_REPO_TOKEN: "entry-repo-token",
       },
     }).catch((cause: unknown) => cause as { code: number; stdout: string; stderr: string });
 
-    expect(failure).toMatchObject({ code: 78, stdout: "" });
-    expect(JSON.parse(failure.stderr)).toEqual({ error: { code: "PORTFOLIO_UNAVAILABLE" } });
+    expect(failure).toMatchObject({ code: 1, stdout: "" });
+    expect(JSON.parse(failure.stderr)).toEqual({ error: { code: "REPOSITORY_NOT_FOUND" } });
     expect(failure.stderr).not.toContain("entry-project-token");
+    expect(failure.stderr).not.toContain("entry-repo-token");
     expect((await lstat(join(stateDir, "registry.lock"))).isFile()).toBe(true);
     const journal = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
     expect(journal).not.toContain("entry-project-token");
-    expect(JSON.parse(journal)).toMatchObject({ command: "project register", error_code: "PORTFOLIO_UNAVAILABLE" });
+    expect(journal).not.toContain("entry-repo-token");
+    expect(JSON.parse(journal)).toMatchObject({ command: "project register", error_code: "REPOSITORY_NOT_FOUND" });
   });
 });

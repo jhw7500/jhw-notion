@@ -27,10 +27,40 @@ describe("control process boundary", () => {
       JHW_BUILD_HOST: "cantopsbuildserver",
       JHW_GITHUB_OWNER: "jhw7500",
       JHW_PROJECT_NUMBER: "7",
+      JHW_REGISTRY_REPOSITORY: "jhw7500/project-registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+      JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
     });
 
     expect(config.registryBranch).toBe("main");
+    expect(config).toMatchObject({
+      registryRepository: "jhw7500/project-registry",
+      preflightProjectItemId: "PVTI_trial",
+      preflightRegistryIssueNumber: 1,
+    });
     expect(JSON.stringify(config)).not.toContain("TOKEN");
+  });
+
+  it.each([
+    ["JHW_REGISTRY_REPOSITORY", "invalid"],
+    ["JHW_REGISTRY_REPOSITORY", "another-owner/project-registry"],
+    ["JHW_PREFLIGHT_PROJECT_ITEM_ID", "I_not-project-item"],
+    ["JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER", "0"],
+  ])("fails closed for invalid non-secret preflight coordinate %s", (key, value) => {
+    const env = {
+      HOME: "/home/jhw",
+      JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
+      JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
+      JHW_BUILD_HOST: "cantopsbuildserver",
+      JHW_GITHUB_OWNER: "jhw7500",
+      JHW_PROJECT_NUMBER: "7",
+      JHW_REGISTRY_REPOSITORY: "jhw7500/project-registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+      JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+      [key]: value,
+    };
+
+    expect(() => loadControlConfig(env)).toThrow(expect.objectContaining({ code: "INVALID_CONFIG" }));
   });
 
   it("rejects incomplete build-server coordinates", () => {

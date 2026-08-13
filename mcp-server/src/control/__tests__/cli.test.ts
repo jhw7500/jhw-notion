@@ -25,6 +25,9 @@ function lockConfig(stateDir: string): ControlConfig {
     buildHost: "build-host",
     githubOwner: "owner",
     projectNumber: 1,
+    registryRepository: "owner/registry",
+    preflightProjectItemId: "PVTI_trial",
+    preflightRegistryIssueNumber: 1,
     stateDir,
   };
 }
@@ -134,13 +137,31 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     ...overrides.catalog,
   };
   const portfolio = {
-    status: vi.fn().mockResolvedValue({ projects: [] }),
-    export: vi.fn().mockResolvedValue({ projects: [] }),
-    registerProject: vi.fn().mockResolvedValue({ registered: true }),
+    status: vi.fn().mockResolvedValue({
+      page_id: "page-1",
+      markdown: "# Portfolio\n",
+      items: [],
+      truncated: false,
+      total_items: 0,
+    }),
+    exportSnapshot: vi.fn().mockResolvedValue({
+      jsonPath: "2026-08-13T00-00-00.000Z/portfolio.json",
+      markdownPath: "2026-08-13T00-00-00.000Z/portfolio.md",
+      checksum: "a".repeat(64),
+    }),
+    registerProject: vi.fn(async (input: { project_id: string }) => ({
+      project_id: input.project_id,
+      project_item_id: "PVTI_control",
+      source_node_id: "I_control",
+      issue_number: 1,
+    })),
     ...overrides.portfolio,
   };
   const preflight = {
-    run: vi.fn().mockResolvedValue({ ready: true }),
+    run: vi.fn().mockResolvedValue({
+      status: "ready",
+      checks: { credentials: "ok", project: "ok", registry_issue: "ok", registry_git: "ok" },
+    }),
     ...overrides.preflight,
   };
   const mutationLock = overrides.mutationLock ?? {
@@ -171,6 +192,21 @@ function formalStartArgs(): string[] {
     "--issue-url", "https://github.com/example/control/issues/1",
     "--issue-revision", "2026-08-13T00:00:00Z",
     "--session", "codex-123",
+  ];
+}
+
+function registerArgs(): string[] {
+  return [
+    "project", "register",
+    "--project", PROJECT_ID,
+    "--title", "Control Trial",
+    "--objective", "Prove the control flow",
+    "--repo-id", REPO_ID,
+    "--status", "proposed",
+    "--priority", "P2",
+    "--health", "unknown",
+    "--next-action", "wait:select-first-task",
+    "--last-reviewed", "2026-08-13",
   ];
 }
 
@@ -267,7 +303,7 @@ describe("runCli", () => {
     const mutationLock = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
     const dependencies = makeCliDependencies({ mutationLock });
 
-    const mutation = await runCli(["project", "register", "--project", PROJECT_ID, "--base-sha", "a".repeat(40)], dependencies);
+    const mutation = await runCli(registerArgs(), dependencies);
     const readOnly = await runCli(["portfolio", "status"], dependencies);
 
     expect(mutation.exitCode).toBe(0);
@@ -286,7 +322,7 @@ describe("runCli", () => {
     };
     const dependencies = makeCliDependencies({ mutationLock, journal });
 
-    const result = await runCli(["project", "register", "--project", PROJECT_ID, "--base-sha", "a".repeat(40)], dependencies);
+    const result = await runCli(registerArgs(), dependencies);
 
     expect(result.exitCode).toBe(expectedExit);
     expect(JSON.parse(result.stderr)).toEqual({ error: { code } });
@@ -298,7 +334,7 @@ describe("runCli", () => {
     const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-contention-"));
     const mutationLock = new MutationLock(lockConfig(stateDir), {}, immediateContentionRuntime());
     const dependencies = makeCliDependencies({ stateDir, mutationLock });
-    const args = ["project", "register", "--project", PROJECT_ID, "--base-sha", "a".repeat(40)];
+    const args = registerArgs();
 
     const results = await Promise.all(Array.from({ length: 20 }, () => runCli(args, dependencies)));
     const lines = (await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8")).trim().split("\n");
@@ -420,35 +456,45 @@ describe("runCli", () => {
     expect(result.stderr).not.toContain("/private/secret");
   });
 
-  it.each(["a".repeat(7), "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65)])(
-    "rejects non-40/64 hexadecimal SHA length %s before project registration", async (sha) => {
-      const dependencies = makeCliDependencies();
-      const result = await runCli(["project", "register", "--project", PROJECT_ID, "--base-sha", sha], dependencies);
-
-      expect(result.exitCode).toBe(2);
-      expect(dependencies.portfolio.registerProject).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each(["A".repeat(40), "b".repeat(64)])("accepts hexadecimal SHA length %d", async (sha) => {
+  it("passes one explicit approved registration payload without hidden defaults", async () => {
     const dependencies = makeCliDependencies();
-    const result = await runCli(["project", "register", "--project", PROJECT_ID, "--base-sha", sha], dependencies);
-
-    expect(result.exitCode).toBe(0);
-    expect(dependencies.portfolio.registerProject).toHaveBeenCalledWith(expect.objectContaining({ base_sha: sha.toLowerCase() }));
-  });
-
-  it("validates base and head SHA values before an unavailable project registration port runs", async () => {
-    const dependencies = makeCliDependencies({
-      portfolio: { registerProject: vi.fn(async () => { throw new ControlError("PORTFOLIO_UNAVAILABLE", "not wired"); }) },
-    });
-
     const result = await runCli([
       "project", "register",
-      "--project", PROJECT_ID,
-      "--base-sha", "not-a-sha",
-      "--head-sha", "0123456789abcdef",
+      "--project", "prj-example",
+      "--title", "Example",
+      "--objective", "Prove the trial flow",
+      "--repo-id", "repo-example",
+      "--status", "proposed",
+      "--priority", "P2",
+      "--health", "unknown",
+      "--next-action", "wait:select-first-task",
+      "--last-reviewed", "2026-08-13",
     ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.portfolio.registerProject).toHaveBeenCalledWith({
+      project_id: "prj-example",
+      title: "Example",
+      objective: "Prove the trial flow",
+      repo_ids: ["repo-example"],
+      fields: {
+        status: "proposed",
+        priority: "P2",
+        health: "unknown",
+        next_action: "wait:select-first-task",
+        last_reviewed: "2026-08-13",
+      },
+    });
+    expect(result.stdout).not.toContain("Prove the trial flow");
+  });
+
+  it.each([
+    registerArgs().filter((_, index) => index < 4 || index > 5),
+    [...registerArgs(), "--base-sha", "a".repeat(40)],
+    [...registerArgs().slice(0, -2), "2026-02-30"],
+  ])("rejects incomplete, superseded, or invalid registration inputs before the port", async (args) => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli(args, dependencies);
 
     expect(result.exitCode).toBe(2);
     expect(dependencies.portfolio.registerProject).not.toHaveBeenCalled();
@@ -515,7 +561,7 @@ describe("runCli", () => {
       preflight: { run: async () => { throw new ControlError("PREFLIGHT_UNAVAILABLE", "not wired"); } },
     }));
     const diverged = await runCli(["portfolio", "export"], makeCliDependencies({
-      portfolio: { export: async () => { throw new ControlError("REMOTE_DIVERGED", "fetch failed"); } },
+      portfolio: { exportSnapshot: async () => { throw new ControlError("REMOTE_DIVERGED", "fetch failed"); } },
     }));
 
     expect(unavailable.exitCode).toBe(78);
@@ -557,17 +603,54 @@ describe("runCli", () => {
     expect(lines.join("\n")).not.toContain("journal-token");
   });
 
-  it("does not echo an untrusted deferred-port response", async () => {
+  it("returns the bounded actual portfolio result and rejects an untrusted deferred-port response", async () => {
     const dependencies = makeCliDependencies({
       portfolio: {
-        status: vi.fn().mockResolvedValue({ page_id: "raw-page-input", nested: { path: "/private/portfolio" } }),
+        status: vi.fn()
+          .mockResolvedValueOnce({ page_id: "page-1", markdown: "# Portfolio\n", items: [], truncated: false, total_items: 0 })
+          .mockResolvedValueOnce({ page_id: "raw-page-input", nested: { path: "/private/portfolio" } }),
       },
     });
 
-    const result = await runCli(["portfolio", "status", "--page", "raw-page-input"], dependencies);
+    const valid = await runCli(["portfolio", "status"], dependencies);
+    const invalid = await runCli(["portfolio", "status", "--page", "raw-page-input"], dependencies);
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).not.toContain("raw-page-input");
-    expect(result.stdout).not.toContain("/private/portfolio");
+    expect(valid.exitCode).toBe(0);
+    expect(JSON.parse(valid.stdout)).toMatchObject({ result: { page_id: "page-1", total_items: 0 } });
+    expect(invalid.exitCode).toBe(1);
+    expect(invalid.stderr).not.toContain("raw-page-input");
+    expect(invalid.stderr).not.toContain("/private/portfolio");
+  });
+
+  it("rejects non-snapshot-relative export paths from an injected portfolio port", async () => {
+    const result = await runCli(["portfolio", "export"], makeCliDependencies({
+      portfolio: {
+        exportSnapshot: async () => ({
+          jsonPath: "../portfolio.json",
+          markdownPath: "../portfolio.md",
+          checksum: "a".repeat(64),
+        }),
+      },
+    }));
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "INVALID_SNAPSHOT_RESULT" } });
+    expect(`${result.stdout}${result.stderr}`).not.toContain("../");
+  });
+
+  it("rejects swapped JSON/Markdown snapshot paths from an injected portfolio port", async () => {
+    const prefix = "2026-08-13T00-00-00.000Z";
+    const result = await runCli(["portfolio", "export"], makeCliDependencies({
+      portfolio: {
+        exportSnapshot: async () => ({
+          jsonPath: `${prefix}/portfolio.md`,
+          markdownPath: `${prefix}/portfolio.json`,
+          checksum: "a".repeat(64),
+        }),
+      },
+    }));
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "INVALID_SNAPSHOT_RESULT" } });
   });
 });

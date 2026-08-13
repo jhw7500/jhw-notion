@@ -1,23 +1,39 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import type { ZodType } from "zod";
 
 import { Catalog } from "./catalog.js";
 import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import { GitHubProjectClient } from "./github-project.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
 import { MutationLock, ProcessRunner, type MutationLockPort } from "./process.js";
+import { PortfolioService } from "./portfolio.js";
+import { PreflightService } from "./preflight.js";
 import { RegistryGit } from "./registry-git.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
-import type { ActiveClaim, TaskRecord } from "./schemas.js";
+import {
+  BoundedPortfolioPayloadSchema,
+  PreflightResultSchema,
+  ProjectRecordLinkSchema,
+  RegisterProjectInputSchema,
+  SnapshotExportResultSchema,
+  type ActiveClaim,
+  type BoundedPortfolioPayload,
+  type PreflightResult,
+  type ProjectRecordLink,
+  type RegisterProjectInput,
+  type SnapshotExportResult,
+  type TaskRecord,
+} from "./schemas.js";
 
 const TASK_ID = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CLAIM_ID = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PROJECT_ID = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const REPO_ID = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
-const SHA = /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/;
 
 const commandNames = [
   "task start",
@@ -42,13 +58,13 @@ export interface CliResult {
 }
 
 export interface PortfolioPort {
-  status(input: { project_id?: string; page_id?: string }): Promise<unknown>;
-  export(): Promise<unknown>;
-  registerProject(input: { project_id: string; base_sha?: string; head_sha?: string }): Promise<unknown>;
+  status(projectId?: string, pageId?: string): Promise<BoundedPortfolioPayload>;
+  exportSnapshot(): Promise<SnapshotExportResult>;
+  registerProject(input: RegisterProjectInput): Promise<ProjectRecordLink>;
 }
 
 export interface PreflightPort {
-  run(): Promise<unknown>;
+  run(): Promise<PreflightResult>;
 }
 
 export interface CliDependencies {
@@ -73,32 +89,19 @@ class ParsedCommandFailure extends Error {
   }
 }
 
-class UnavailablePortfolioPort implements PortfolioPort {
-  async status(): Promise<never> {
-    throw new ControlError("PORTFOLIO_UNAVAILABLE", "Portfolio authority is not wired for Phase 1A");
-  }
-
-  async export(): Promise<never> {
-    throw new ControlError("PORTFOLIO_UNAVAILABLE", "Portfolio authority is not wired for Phase 1A");
-  }
-
-  async registerProject(): Promise<never> {
-    throw new ControlError("PORTFOLIO_UNAVAILABLE", "Portfolio authority is not wired for Phase 1A");
-  }
-}
-
-class UnavailablePreflightPort implements PreflightPort {
-  async run(): Promise<never> {
-    throw new ControlError("PREFLIGHT_UNAVAILABLE", "Preflight authority is not wired for Phase 1A");
-  }
-}
-
 /** Builds the production graph while retaining explicitly injectable future ports. */
 export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): CliDependencies {
   const config = loadControlConfig(env);
   const runner = new ProcessRunner(env);
   const registry = new RegistryGit(config, runner);
   const catalog = new Catalog(config, registry);
+  const githubProject = new GitHubProjectClient({
+    githubOwner: config.githubOwner,
+    projectNumber: config.projectNumber,
+    registryRepository: config.registryRepository,
+    runner,
+    catalog,
+  });
   const worktrees = new WorktreeManager(config, runner);
   const claims = new ClaimService(config, registry, catalog, {
     async inspect(claim) {
@@ -132,8 +135,8 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     taskService: new TaskService(config, claims, worktrees, registry),
     claimService: claims,
     catalog,
-    portfolio: new UnavailablePortfolioPort(),
-    preflight: new UnavailablePreflightPort(),
+    portfolio: new PortfolioService({ projectClient: githubProject, stateDir: config.stateDir }),
+    preflight: new PreflightService({ config, environment: env, runner, project: githubProject }),
     mutationLock: new MutationLock(config, env),
   };
 }
@@ -199,12 +202,6 @@ function assertPattern(raw: string, pattern: RegExp): string {
   return raw;
 }
 
-function assertSha(raw: string | undefined): string | undefined {
-  if (raw === undefined) return undefined;
-  if (!SHA.test(raw)) usage("Invalid Git SHA");
-  return raw.toLowerCase();
-}
-
 function assertPositiveNumber(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
   const parsed = Number(raw);
@@ -239,6 +236,12 @@ function taskSummary(task: TaskRecord): Record<string, unknown> {
 
 function resultJson(command: CommandName, result: unknown): CliResult {
   return { exitCode: 0, stdout: `${JSON.stringify({ command, result })}\n`, stderr: "" };
+}
+
+function validatedPortResult<T>(schema: ZodType<T>, raw: unknown, code: string): T {
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) throw new ControlError(code, "A control port returned an invalid result");
+  return parsed.data;
 }
 
 function errorCode(cause: unknown): string {
@@ -487,28 +490,62 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     if (project) assertPattern(project, PROJECT_ID);
     const page = value(flags, "--page");
     if (page !== undefined && !isNonEmpty(page)) usage("Invalid portfolio page");
-    await dependencies.portfolio.status({ ...(project ? { project_id: project } : {}), ...(page ? { page_id: page } : {}) });
-    return { flags, result: resultJson(command, { portfolio_available: true }) };
+    const status = validatedPortResult(
+      BoundedPortfolioPayloadSchema,
+      await dependencies.portfolio.status(project, page),
+      "INVALID_PORTFOLIO_RESULT",
+    );
+    const result = resultJson(command, status);
+    if (Buffer.byteLength(result.stdout, "utf8") > 12 * 1024) {
+      throw new ControlError("PORTFOLIO_PAYLOAD_TOO_LARGE", "Portfolio CLI payload exceeds the byte boundary");
+    }
+    return { flags, result };
   }
 
   if (command === "portfolio export") {
     const flags = parseFlags(argv.slice(2), new Set());
-    await dependencies.portfolio.export();
-    return { flags, result: resultJson(command, { exported: true }) };
+    const exported = validatedPortResult(
+      SnapshotExportResultSchema,
+      await dependencies.portfolio.exportSnapshot(),
+      "INVALID_SNAPSHOT_RESULT",
+    );
+    return { flags, result: resultJson(command, exported) };
   }
 
   if (command === "project register") {
-    const flags = parseFlags(argv.slice(2), new Set(["--project", "--base-sha", "--head-sha"]));
-    const project_id = assertPattern(required(flags, "--project"), PROJECT_ID);
-    const base_sha = assertSha(value(flags, "--base-sha"));
-    const head_sha = assertSha(value(flags, "--head-sha"));
-    await dependencies.portfolio.registerProject({ project_id, ...(base_sha ? { base_sha } : {}), ...(head_sha ? { head_sha } : {}) });
-    return { flags, result: resultJson(command, { registered: true }) };
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--project", "--title", "--objective", "--repo-id", "--status", "--priority", "--health",
+      "--next-action", "--last-reviewed",
+    ]), new Set(["--repo-id"]));
+    const parsedInput = RegisterProjectInputSchema.safeParse({
+      project_id: required(flags, "--project"),
+      title: required(flags, "--title"),
+      objective: required(flags, "--objective"),
+      repo_ids: values(flags, "--repo-id"),
+      fields: {
+        status: required(flags, "--status"),
+        priority: required(flags, "--priority"),
+        health: required(flags, "--health"),
+        next_action: required(flags, "--next-action"),
+        last_reviewed: required(flags, "--last-reviewed"),
+      },
+    });
+    if (!parsedInput.success) usage("Invalid project registration arguments");
+    const registered = validatedPortResult(
+      ProjectRecordLinkSchema,
+      await dependencies.portfolio.registerProject(parsedInput.data),
+      "INVALID_PROJECT_REGISTRATION_RESULT",
+    );
+    if (registered.project_id !== parsedInput.data.project_id) {
+      throw new ControlError("INVALID_PROJECT_REGISTRATION_RESULT", "Registered Project ID does not match the request");
+    }
+    return { flags, result: resultJson(command, registered) };
   }
 
   if (command === "preflight") {
-    await dependencies.preflight.run();
-    return { result: resultJson(command, { preflight_ready: true }) };
+    const flags = parseFlags(argv.slice(1), new Set());
+    const preflight = validatedPortResult(PreflightResultSchema, await dependencies.preflight.run(), "INVALID_PREFLIGHT_RESULT");
+    return { flags, result: resultJson(command, preflight) };
   }
 
   usage("Unknown command");

@@ -22,6 +22,9 @@ function configFor(stateDir: string): ControlConfig {
     buildHost: "build-host",
     githubOwner: "owner",
     projectNumber: 1,
+    registryRepository: "owner/registry",
+    preflightProjectItemId: "PVTI_trial",
+    preflightRegistryIssueNumber: 1,
     stateDir,
   };
 }

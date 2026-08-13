@@ -71,6 +71,19 @@ describe("Catalog", () => {
     });
   });
 
+  it("exposes a narrowly validated canonical Repository lookup", async () => {
+    const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+
+    await expect(catalog.getRepository("repo-wlan")).resolves.toEqual({
+      id: "repo-wlan",
+      github_node_id: "R_kwDOExample",
+      slug: "jhw7500/wlan",
+    });
+    await expect(catalog.getRepository("repo-missing")).rejects.toMatchObject({ code: "REPOSITORY_NOT_FOUND" });
+    await expect(catalog.getRepository("../escape")).rejects.toMatchObject({ code: "INVALID_REPOSITORY_ID" });
+  });
+
   it("rejects a malformed repo_id before resolving a Registry path", async () => {
     const { catalog, fixture } = await catalogFixture();
     await commitFile(

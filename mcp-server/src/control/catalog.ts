@@ -162,6 +162,12 @@ function assertTaskId(taskId: string): void {
   }
 }
 
+function assertRepositoryId(repoId: string): void {
+  if (!repositoryIdPattern.test(repoId)) {
+    throw new ControlError("INVALID_REPOSITORY_ID", "Invalid canonical Repository ID", { repoId });
+  }
+}
+
 /** Canonical Registry catalog with source-index collision protection. */
 export class Catalog {
   constructor(
@@ -345,6 +351,13 @@ export class Catalog {
   async getTask(taskId: string): Promise<TaskRecord> {
     assertTaskId(taskId);
     return this.taskAt(taskId);
+  }
+
+  async getRepository(repoId: string): Promise<RepositoryRecord> {
+    assertRepositoryId(repoId);
+    const repository = await this.repositoryAt(repoId);
+    if (!repository) throw new ControlError("REPOSITORY_NOT_FOUND", "Canonical Repository record does not exist", { repo_id: repoId });
+    return repository;
   }
 
   private async repositoryForSource(

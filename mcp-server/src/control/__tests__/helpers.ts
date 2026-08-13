@@ -78,6 +78,9 @@ export function configFor(registryDir: string): ControlConfig {
     buildHost: "cantopsbuildserver",
     githubOwner: "jhw7500",
     projectNumber: 7,
+    registryRepository: "jhw7500/project-registry",
+    preflightProjectItemId: "PVTI_trial",
+    preflightRegistryIssueNumber: 1,
     stateDir: join(dirname(registryDir), "state"),
   };
 }
