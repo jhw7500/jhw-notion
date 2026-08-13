@@ -21,6 +21,7 @@
 - Do not create GitHub-hosted Actions workflows or spend GitHub Actions minutes.
 - Personal Project access uses a short-lived host-only classic PAT. Registry Issue/API access uses a separate repository-scoped credential where possible; Registry Git should use a repository-specific SSH credential.
 - Secrets never appear in Git, Handoff, snapshot, logs, command output, or AI context.
+- Phase 1A Project registration keeps the user surface to one explicit proposal/approval; only the internal CLI carries the complete validated field set, with no registration file or hidden defaults.
 - ESM imports include `.js`; production files use named exports; tests are written before implementation.
 - Required verification after every code task: `cd mcp-server && npm test && npm run build`.
 - Do not modify or stage the unrelated untracked `docs/notion-architecture-review.md`.
@@ -634,6 +635,7 @@ jhw-control task recover --task tsk-... --expect clm-... --action status|force-e
 jhw-control task assert-owner --task tsk-... --claim clm-...
 jhw-control portfolio status [--project prj-x] [--page page-id]
 jhw-control portfolio export
+jhw-control project register --project prj-x --title "Project X" --objective "objective" --repo-id repo-x [--repo-id repo-y ...] --status proposed --priority P2 --health unknown --next-action wait:select-first-task --last-reviewed 2026-08-13
 jhw-control preflight
 ```
 
@@ -692,11 +694,18 @@ git commit -m "feat(control): expose explicit phase1a commands"
 - Create: `mcp-server/src/control/portfolio.ts`
 - Create: `mcp-server/src/control/__tests__/github-project.test.ts`
 - Create: `mcp-server/src/control/__tests__/portfolio.test.ts`
+- Modify: `mcp-server/src/control/config.ts`
+- Modify: `mcp-server/src/control/schemas.ts`
+- Modify: `mcp-server/src/control/catalog.ts`
+- Modify: `mcp-server/src/control/cli.ts`
+- Modify: `mcp-server/src/control/__tests__/cli.test.ts`
+- Modify: `mcp-server/.env.example`
 
 **Interfaces:**
 - Produces: `GitHubProjectClient.readAll(): Promise<ProjectSnapshotSource>` and `registerProject(input): Promise<ProjectRecordLink>`.
 - Produces: `PortfolioService.status(projectId?, pageId?): Promise<BoundedPayload>`.
 - Produces: `PortfolioService.exportSnapshot(): Promise<{ jsonPath; markdownPath; checksum }>`.
+- `registerProject` consumes `{ project_id, title, objective, repo_ids, fields }`, where `repo_ids` is non-empty and `fields` is `ProjectOperationalFields`; returned paths are snapshot-relative, never host-absolute.
 
 - [ ] **Step 1: Write failing pagination and cap tests**
 
@@ -717,6 +726,32 @@ it("caps portfolio markdown at 12 KiB or 20 items and emits page IDs", async () 
   expect(Buffer.byteLength(output.markdown)).toBeLessThanOrEqual(12 * 1024);
   expect(output.items).toHaveLength(20);
   expect(output).toMatchObject({ truncated: true, total_items: 23, next_page_id: "page-2" });
+});
+
+it("passes one explicit approved registration payload without hidden defaults", async () => {
+  const result = await runCli([
+    "project", "register",
+    "--project", "prj-example",
+    "--title", "Example",
+    "--objective", "Prove the trial flow",
+    "--repo-id", "repo-example",
+    "--status", "proposed",
+    "--priority", "P2",
+    "--health", "unknown",
+    "--next-action", "wait:select-first-task",
+    "--last-reviewed", "2026-08-13",
+  ], dependencies);
+  expect(result.exitCode).toBe(0);
+  expect(dependencies.portfolio.registerProject).toHaveBeenCalledWith({
+    project_id: "prj-example",
+    title: "Example",
+    objective: "Prove the trial flow",
+    repo_ids: ["repo-example"],
+    fields: {
+      status: "proposed", priority: "P2", health: "unknown",
+      next_action: "wait:select-first-task", last_reviewed: "2026-08-13",
+    },
+  });
 });
 ```
 
@@ -742,9 +777,15 @@ Last Reviewed: YYYY-MM-DD
 
 The Project item title is the linked Project Record Issue title; do not create a duplicate Project/title custom field. `registerProject` creates a `trial`-labeled Issue in the private Registry repository with `id`, `objective`, and `repo_id` list, adds it to the Project, and writes the five fields. It rejects a non-canonical Task Next Action and computes stale using the shortest applicable cadence.
 
+The internal CLI requires `--title`, `--objective`, one or more `--repo-id`, `--status`, `--priority`, `--health`, `--next-action`, and `--last-reviewed`; it has no project registration file and no silent defaults. Remove the superseded `--base-sha`/`--head-sha` registration placeholders. Validate every `repo_id` against an existing Repository Record and every `task:` value against an existing canonical Task. For `active`, require `wait:` when Health is `blocked` and `task:` otherwise. Non-active states still accept only the two defined syntaxes, and every `task:` must resolve.
+
+Treat `project_id` as the idempotency key. Search `trial` Registry Issues with the repository credential and parse only the deterministic JSON-subset body. Zero matches creates the Issue; one identical match is adopted so an interrupted run can finish Project attachment/fields; multiple matches or a mismatch in ID/objective/repository relationships fails closed. Never delete an Issue to hide a partial cross-system registration.
+
 - [ ] **Step 4: Implement export integrity and paging**
 
 Write snapshots below `${JHW_CONTROL_STATE_DIR}/snapshots/<generated-at>/` with directory `0700`, files `0600`, and a `current` pointer updated only after complete validation. `portfolio.json` includes `schema_version`, `generated_at`, source revision, field definitions/options, item/source IDs, total count, and SHA-256 checksum. `portfolio.md` is a bounded L0 index containing only IDs, title, Status, Priority, Health, Next Action, Last Reviewed, and stale warning. Extra items go to `portfolio.page-2.md`, `portfolio.page-3.md`, and so on.
+
+The checksum is SHA-256 over the deterministic JSON payload with its `checksum` member omitted; add that checksum and then serialize the final file. `current` is an atomic `0600` text pointer containing only the relative generated-at directory name, not a symlink or absolute path. Reject symbolic/non-regular snapshot components and keep file opens descriptor-anchored. The actual `portfolio status` CLI stdout, including its JSON envelope, must remain at or below 12 KiB as well as 20 items; pagination occurs before either limit is exceeded.
 
 Never include tokens, raw API responses, private absolute paths, raw Evidence, or Notion content. Export is one-way; no import path is implemented.
 
@@ -761,6 +802,8 @@ Never include tokens, raw API responses, private absolute paths, raw Evidence, o
 7. fail closed if any check fails.
 
 If personal Project mutation requires `repo`, report `PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE` and stop; do not add the scope automatically.
+
+Add three non-secret, fail-closed coordinates: `JHW_REGISTRY_REPOSITORY=<owner/name>`, `JHW_PREFLIGHT_PROJECT_ITEM_ID=<PVTI...>`, and `JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER=<positive-integer>`. The designated Project item and Registry Issue are dedicated `trial` fixtures. Require the classic Project token to expose `project` and not `repo` in `X-OAuth-Scopes`; update/restore the fixture's `Last Reviewed` in `finally`. With the repository token, read the designated Issue and submit an unchanged-body update to prove write permission without changing canonical content. Verify the configured Registry remote is SSH, fetch it, and use a non-mutating dry-run push; never create a preflight commit.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -896,6 +939,8 @@ git commit -m "feat(control): fail closed on moved notion authority"
 `task.md` must require an explicit Task/Issue/temporary-work request, run `jhw-control task status` before resuming, show Claim owner conflicts without takeover, request user approval before `force-end` or `takeover`, and run `task assert-owner` before shared push/PR/merge/deploy. It must never auto-call recall or load session history.
 
 `portfolio.md` must expose only `status`, `export`, and `preflight`; display truncation/page metadata; and fetch another page only when the user asks.
+
+For an explicit `/jhw:project --trial` or equivalent “Phase 1A trial registration” request, `project.md` must derive only from the current request/repository context, present project ID/title/objective/repository IDs/five operational fields together, ask for one approval, and then invoke the complete `jhw-control project register` argument set. It asks only for fields it cannot safely infer, never creates a registration file, never auto-loads prior sessions/Notion, and never routes an ordinary `/jhw:project` invocation to the trial Registry path.
 
 Update `project.md` and `status.md` to state that Phase 1A trial control uses the explicit new skills while existing Notion operations remain the live authority. Do not route normal `/jhw:project` writes to Registry in this plan.
 

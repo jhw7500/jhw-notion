@@ -169,6 +169,35 @@ next_action: task:tsk-0198...
 last_reviewed: 2026-08-13
 ```
 
+#### Phase 1A 시험 등록 UX와 입력 계약
+
+일반 사용자는 내부 CLI의 긴 인자를 직접 작성하지 않는다. 명시적으로 `Phase 1A 시험 프로젝트 등록`을 요청하면 AI skill은 현재 요청과 현재 저장소 맥락만 사용해 다음 항목을 한 번에 제안한다.
+
+- `project_id`, Issue `title`, `objective`
+- 하나 이상의 canonical `repo_id`
+- `Status`, `Priority`, `Health`, `Next Action`, `Last Reviewed`
+
+과거 세션·Notion recall을 자동 실행하지 않고, 현재 맥락으로 판단할 수 없는 항목만 짧게 묻는다. 전체 제안을 사용자가 한 번 승인한 뒤 skill이 다음 내부 명령을 실행한다.
+
+```text
+jhw-control project register \
+  --project prj-<slug> \
+  --title "<issue-title>" \
+  --objective "<objective>" \
+  --repo-id repo-<slug> [--repo-id repo-<slug> ...] \
+  --status proposed|active|paused|completed|cancelled \
+  --priority P0|P1|P2|P3 \
+  --health on-track|at-risk|blocked|unknown \
+  --next-action task:<canonical-task-id>|wait:<short-condition> \
+  --last-reviewed YYYY-MM-DD
+```
+
+별도 등록 JSON 파일이나 프로젝트별 설정을 두지 않는다. CLI는 모든 항목을 명시적으로 검증하고 필드 값이나 원문 인자를 저널·출력에 반향하지 않는다. 일반 `/jhw:project` 작업은 자동으로 이 시험 등록을 실행하지 않으며, 사용자가 `--trial` 또는 동등한 명시적 요청을 한 경우에만 실행한다.
+
+Issue 본문은 JSON-subset YAML로 `id`, `objective`, `repositories` 세 필드만 보유하고, 제목은 Issue title에만 보유한다. `repo_id`는 모두 기존 Repository Record와 일치해야 한다. `task:` Next Action은 기존 canonical Task를 참조해야 한다. `active` 프로젝트에서 `Health=blocked`이면 `wait:`, 그 외이면 `task:`를 요구한다. 비활성 상태에서도 두 형식 중 하나만 허용하며 `task:`는 항상 실존을 검증한다.
+
+등록은 `project_id`를 idempotency key로 사용한다. 중간 실패 후 재실행하면 동일 `trial` Issue를 채택해 Project item/필드 설정을 이어서 완료하고, 동일 ID의 본문 식별자·목표·저장소 관계가 입력과 다르거나 동일 ID Issue가 둘 이상이면 자동 선택하지 않고 fail-closed한다. 일부 성공을 숨기기 위한 Issue 자동 삭제·rollback은 하지 않는다.
+
 ### 5.2 상태와 Health
 
 프로젝트 상태:
@@ -603,6 +632,7 @@ Gateway 추가 조건은 일반 Task Recall이 반복적으로 불필요하게 �
 - Claim에는 host alias와 `worktree_ref`만 저장하고 실제 absolute path는 host-local mapping에 둔다.
 - export와 Recall은 allowlist된 필드만 포함한다. token, raw Evidence, 고객 식별자, 비밀 경로, 환경변수는 제외한다.
 - credential 폐기·교체 절차를 문서화하고 cutover·reverse-cutover 시 사용하지 않는 credential을 즉시 revoke한다.
+- preflight의 비밀이 아닌 시험 좌표는 `JHW_REGISTRY_REPOSITORY=<owner/name>`, `JHW_PREFLIGHT_PROJECT_ITEM_ID=<PVTI...>`, `JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER=<positive-integer>` 세 값으로 고정한다. Project item과 Registry Issue는 전용 `trial` fixture이며 실제 프로젝트 데이터에 의존하지 않는다. 값이 없거나 형식이 틀리면 추론하지 않고 fail-closed한다.
 - snapshot 보존 기본값은 daily 30개와 weekly 12개다. 더 긴 보존은 근거가 있을 때만 추가한다.
 
 ### 12.3 초기 export
