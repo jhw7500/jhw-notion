@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,16 @@ afterEach(async () => {
 });
 
 describe("jhw-control installed entry", () => {
+  it("removes stale deleted control outputs before compiling", async () => {
+    const stale = join(mcpRoot, "dist", "control", "locked-cli.js");
+    await mkdir(dirname(stale), { recursive: true });
+    await writeFile(stale, "stale", "utf8");
+
+    await execFile("npm", ["run", "build"], { cwd: mcpRoot, encoding: "utf8" });
+
+    await expect(lstat(stale)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("executes JSON help through an npm-bin-style symlink", async () => {
     await execFile("npm", ["run", "build"], { cwd: mcpRoot, encoding: "utf8" });
     const root = await mkdtemp(join(tmpdir(), "jhw-control-bin-"));

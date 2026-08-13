@@ -278,7 +278,7 @@ describe("runCli", () => {
   it.each([
     ["LOCK_CONTENDED", 75],
     ["LOCK_SPAWN_FAILED", 1],
-    ["LOCK_READY_FAILED", 1],
+    ["LOCK_ACQUIRE_FAILED", 1],
   ] as const)("journals stable %s lock failures before a mutation runs", async (code, expectedExit) => {
     const journal = { append: vi.fn() };
     const mutationLock = {

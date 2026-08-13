@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { type FileHandle } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
-import type { Readable, Writable } from "node:stream";
+import type { Readable } from "node:stream";
 
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
@@ -369,16 +369,12 @@ export class ProcessRunner {
 }
 
 const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW;
-const READY = "READY\n";
-const HOLDER_COMMAND = ["/bin/sh", "-c", "printf 'READY\\n'; cat >/dev/null"] as const;
 
 export interface MutationLockPort {
   run<T>(callback: () => Promise<T>): Promise<T>;
 }
 
 export interface MutationLockChild {
-  stdin: Writable | null;
-  stdout: Readable | null;
   once(event: string, listener: (...args: unknown[]) => void): unknown;
 }
 
@@ -386,7 +382,7 @@ export interface MutationLockRuntime {
   spawn: (
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; stdio: ["pipe", "pipe", "ignore", number] },
+    options: { env: NodeJS.ProcessEnv; stdio: ["ignore", "ignore", "ignore", number] },
   ) => MutationLockChild;
 }
 
@@ -394,78 +390,33 @@ const productionLockRuntime: MutationLockRuntime = {
   spawn: (command, args, options) => spawn(command, args, options),
 };
 
-interface HolderExit {
-  kind: "close" | "spawn-error";
-  status?: number | null;
+function acquisitionFailure(status: number | null): ControlError {
+  if (status === 75) return new ControlError("LOCK_CONTENDED", "Host mutation lock is already held");
+  return new ControlError("LOCK_ACQUIRE_FAILED", "Host lock acquisition command failed");
 }
 
-interface HolderObservation {
-  ready: Promise<void>;
-  closed: Promise<HolderExit>;
-}
-
-function lockFailure(exit: HolderExit): ControlError {
-  if (exit.kind === "spawn-error") {
-    return new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock holder");
-  }
-  if (exit.status === 75) {
-    return new ControlError("LOCK_CONTENDED", "Host mutation lock is already held");
-  }
-  return new ControlError("LOCK_READY_FAILED", "Host lock holder did not acknowledge acquisition");
-}
-
-function observeHolder(child: MutationLockChild): HolderObservation {
-  let resolveClose: (exit: HolderExit) => void = () => undefined;
-  const closed = new Promise<HolderExit>((resolve) => { resolveClose = resolve; });
-  let closedOnce = false;
-  const settleClose = (exit: HolderExit) => {
-    if (closedOnce) return;
-    closedOnce = true;
-    resolveClose(exit);
-  };
-  child.once("error", () => settleClose({ kind: "spawn-error" }));
-  child.once("close", (status) => settleClose({
-    kind: "close",
-    status: typeof status === "number" ? status : null,
-  }));
-
-  const ready = new Promise<void>((resolve, reject) => {
-    if (!child.stdout) {
-      reject(new ControlError("LOCK_READY_FAILED", "Host lock holder has no ready stream"));
-      return;
-    }
+/** Waits for one flock acquisition process; it owns no long-lived child streams. */
+function acquireLock(child: MutationLockChild): Promise<void> {
+  return new Promise((resolve, reject) => {
     let settled = false;
-    let output = "";
-    const fail = (cause: ControlError) => {
+    const settle = (result: () => void) => {
       if (settled) return;
       settled = true;
-      reject(cause);
+      result();
     };
-    child.stdout.on("data", (chunk: Buffer | string) => {
-      if (settled) return;
-      output += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
-      if (output === READY) {
-        settled = true;
-        resolve();
-      } else if (!READY.startsWith(output) || output.length >= READY.length) {
-        fail(new ControlError("LOCK_READY_FAILED", "Host lock holder emitted an invalid ready acknowledgement"));
-      }
-    });
-    child.stdout.once("error", () => fail(new ControlError("LOCK_READY_FAILED", "Host lock holder ready stream failed")));
-    child.stdout.once("end", () => {
-      if (!settled) fail(new ControlError("LOCK_READY_FAILED", "Host lock holder closed before ready"));
-    });
-    void closed.then((exit) => {
-      if (!settled) fail(lockFailure(exit));
-    });
+    child.once("error", () => settle(() => reject(new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock acquisition"))));
+    child.once("close", (status) => settle(() => {
+      const code = typeof status === "number" ? status : null;
+      if (code === 0) resolve();
+      else reject(acquisitionFailure(code));
+    }));
   });
-  return { ready, closed };
 }
 
 /**
- * Holds the host-global flock in a credential-sanitized helper while the
- * callback remains in this original process. The helper receives no CLI
- * arguments or credentials and has no mutation dispatcher to invoke.
+ * Acquires flock on the same inherited open-file-description as the retained
+ * parent FileHandle. Linux keeps that flock active after this short child exits
+ * until the parent finally closes its descriptor after the callback completes.
  */
 export class MutationLock implements MutationLockPort {
   constructor(
@@ -478,8 +429,6 @@ export class MutationLock implements MutationLockPort {
   async run<T>(callback: () => Promise<T>): Promise<T> {
     let directory: SecureStateDirectory | undefined;
     let lockFile: FileHandle | undefined;
-    let observation: HolderObservation | undefined;
-    let child: MutationLockChild | undefined;
     try {
       try {
         directory = await openSecureStateDirectory(this.config.stateDir, this.secureDirectoryHooks);
@@ -496,49 +445,21 @@ export class MutationLock implements MutationLockPort {
       }
 
       const helperEnvironment = sanitizedChildEnvironment(this.environment);
-      // Deliberately ignore the retired marker; it is neither an authority nor
-      // forwarded to the helper process.
+      // The historic marker has no authority and is never passed to the helper.
       delete helperEnvironment.JHW_CONTROL_LOCK_HELD;
+      let child: MutationLockChild;
       try {
         child = this.runtime.spawn(
           "flock",
-          ["-n", "-E", "75", "/proc/self/fd/3", ...HOLDER_COMMAND],
-          { env: helperEnvironment, stdio: ["pipe", "pipe", "ignore", lockFile.fd] },
+          ["-n", "-E", "75", "3"],
+          { env: helperEnvironment, stdio: ["ignore", "ignore", "ignore", lockFile.fd] },
         );
       } catch {
-        throw new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock holder");
+        throw new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock acquisition");
       }
-      observation = observeHolder(child);
-      await observation.ready;
-      // If the holder dies while callback work is pending, fail rather than
-      // returning a result that may have run after the flock was released.
-      let callbackSettled = false;
-      const callbackResult = callback().then(
-        (value) => {
-          callbackSettled = true;
-          return value;
-        },
-        (cause: unknown) => {
-          callbackSettled = true;
-          throw cause;
-        },
-      );
-      return await Promise.race([
-        callbackResult,
-        observation.closed.then((exit) => {
-          if (!callbackSettled) throw lockFailure(exit);
-          return new Promise<T>(() => undefined);
-        }),
-      ]);
+      await acquireLock(child);
+      return await callback();
     } finally {
-      if (child?.stdin) {
-        try {
-          child.stdin.end();
-        } catch {
-          // The ready/close observation supplies the stable error mapping.
-        }
-      }
-      if (observation) await observation.closed;
       await lockFile?.close();
       await directory?.close();
     }

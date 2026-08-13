@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc && chmod +x dist/control/cli.js",
+    "build": "node scripts/clean-dist.mjs && tsc && chmod +x dist/control/cli.js",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "test": "vitest run",

@@ -1,14 +1,16 @@
+import { execFile as execFileCallback, spawn as spawnChild } from "node:child_process";
 import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { MutationLock, ProcessRunner, type MutationLockRuntime } from "../process.js";
 import type { ControlConfig } from "../config.js";
 
+const execFile = promisify(execFileCallback);
 const roots: string[] = [];
 
 function configFor(stateDir: string): ControlConfig {
@@ -24,29 +26,25 @@ function configFor(stateDir: string): ControlConfig {
   };
 }
 
-function holder(options: { ready?: string; status?: number; error?: boolean } = {}) {
-  const child = new EventEmitter() as EventEmitter & {
-    stdin: PassThrough;
-    stdout: PassThrough;
-  };
-  child.stdin = new PassThrough();
-  child.stdout = new PassThrough();
+function completedAcquisition(status: number, error = false) {
+  const child = new EventEmitter() as EventEmitter;
   queueMicrotask(() => {
-    if (options.error) {
-      child.emit("error", new Error("flock missing"));
-      return;
-    }
-    if (options.ready !== undefined) child.stdout.write(options.ready);
-    if (options.status !== undefined) {
-      child.stdout.end();
-      child.emit("close", options.status);
-    }
+    if (error) child.emit("error", new Error("flock unavailable"));
+    else child.emit("close", status);
   });
-  child.stdin.once("finish", () => queueMicrotask(() => {
-    child.stdout.end();
-    child.emit("close", 0);
-  }));
   return child;
+}
+
+async function contender(lockPath: string): Promise<{ code: number | undefined }> {
+  return execFile("flock", ["-n", "-E", "75", lockPath, "/bin/sh", "-c", "exit 0"], { encoding: "utf8" })
+    .then(() => ({ code: 0 }))
+    .catch((cause: unknown) => ({ code: (cause as { code?: number }).code }));
+}
+
+function deferred() {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 afterEach(async () => {
@@ -54,17 +52,16 @@ afterEach(async () => {
 });
 
 describe("callback mutation lock", () => {
-  it("runs the callback under one credential-free holder and ignores a caller marker", async () => {
+  it("runs the callback only after one credential-free acquisition and ignores a caller marker", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
-    const seen: { args?: string[]; env?: NodeJS.ProcessEnv; stdin?: string } = {};
+    const seen: { args?: string[]; env?: NodeJS.ProcessEnv; stdio?: unknown } = {};
     const runtime: MutationLockRuntime = {
       spawn: vi.fn((_command, args, options) => {
         seen.args = args;
         seen.env = options.env;
-        const child = holder({ ready: "READY\n" });
-        child.stdin.on("data", (chunk: Buffer) => { seen.stdin = `${seen.stdin ?? ""}${chunk}`; });
-        return child;
+        seen.stdio = options.stdio;
+        return completedAcquisition(0);
       }),
     };
 
@@ -76,29 +73,72 @@ describe("callback mutation lock", () => {
 
     expect(value).toBe("original-process-credential-retained");
     expect((runtime.spawn as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
-    expect(seen.args).toEqual(["-n", "-E", "75", "/proc/self/fd/3", "/bin/sh", "-c", "printf 'READY\\n'; cat >/dev/null"]);
+    expect(seen.args).toEqual(["-n", "-E", "75", "3"]);
+    expect(seen.stdio).toEqual(["ignore", "ignore", "ignore", expect.any(Number)]);
     expect(seen.env).not.toHaveProperty("GH_PROJECT_TOKEN");
     expect(seen.env).not.toHaveProperty("GH_REPO_TOKEN");
     expect(seen.env).not.toHaveProperty("JHW_CONTROL_LOCK_HELD");
-    expect(seen.stdin ?? "").toBe("");
   });
 
-  it("maps immediate contention before READY to LOCK_CONTENDED", async () => {
+  it("does not invoke the callback on contention, nonzero acquisition, spawn, or child error", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
-    const lock = new MutationLock(configFor(join(root, "state")), {}, { spawn: () => holder({ status: 75 }) });
+    const callback = vi.fn(async () => "must-not-run");
+    const contended = new MutationLock(configFor(join(root, "contended")), {}, { spawn: () => completedAcquisition(75) });
+    const nonzero = new MutationLock(configFor(join(root, "nonzero")), {}, { spawn: () => completedAcquisition(1) });
+    const spawnFailure = new MutationLock(configFor(join(root, "spawn")), {}, { spawn: () => { throw new Error("missing"); } });
+    const childError = new MutationLock(configFor(join(root, "child-error")), {}, { spawn: () => completedAcquisition(1, true) });
 
-    await expect(lock.run(async () => "must-not-run")).rejects.toMatchObject({ code: "LOCK_CONTENDED" });
+    await expect(contended.run(callback)).rejects.toMatchObject({ code: "LOCK_CONTENDED" });
+    await expect(nonzero.run(callback)).rejects.toMatchObject({ code: "LOCK_ACQUIRE_FAILED" });
+    await expect(spawnFailure.run(callback)).rejects.toMatchObject({ code: "LOCK_SPAWN_FAILED" });
+    await expect(childError.run(callback)).rejects.toMatchObject({ code: "LOCK_SPAWN_FAILED" });
+    expect(callback).not.toHaveBeenCalled();
   });
 
-  it("maps spawn and malformed READY failures before invoking the callback", async () => {
+  it("keeps a real flock after its acquisition process exits until the pending callback returns", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
-    const spawn = new MutationLock(configFor(join(root, "state")), {}, { spawn: () => { throw new Error("missing"); } });
-    const badReady = new MutationLock(configFor(join(root, "state-two")), {}, { spawn: () => holder({ ready: "NOPE\n", status: 1 }) });
+    const stateDir = join(root, "state");
+    const acquiredExited = deferred();
+    let acquisitionStatus: number | null = null;
+    const runtime: MutationLockRuntime = {
+      spawn: (command, args, options) => {
+        const child = spawnChild(command, args, options);
+        child.once("close", (status) => {
+          acquisitionStatus = status;
+          acquiredExited.resolve();
+        });
+        return child;
+      },
+    };
+    const callbackEntered = deferred();
+    const releaseCallback = deferred();
+    const lock = new MutationLock(configFor(stateDir), {}, runtime);
+    const running = lock.run(async () => {
+      callbackEntered.resolve();
+      await releaseCallback.promise;
+      expect((await contender(join(stateDir, "registry.lock"))).code).toBe(75);
+    });
 
-    await expect(spawn.run(async () => "must-not-run")).rejects.toMatchObject({ code: "LOCK_SPAWN_FAILED" });
-    await expect(badReady.run(async () => "must-not-run")).rejects.toMatchObject({ code: "LOCK_READY_FAILED" });
+    await callbackEntered.promise;
+    await acquiredExited.promise;
+    expect(acquisitionStatus).toBe(0);
+    expect((await contender(join(stateDir, "registry.lock"))).code).toBe(75);
+    releaseCallback.resolve();
+    await running;
+    expect((await contender(join(stateDir, "registry.lock"))).code).toBe(0);
+  });
+
+  it("releases the inherited lock FD after a callback error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const lock = new MutationLock(configFor(stateDir));
+
+    await expect(lock.run(async () => { throw new Error("callback failed"); })).rejects.toThrow("callback failed");
+
+    expect((await contender(join(stateDir, "registry.lock"))).code).toBe(0);
   });
 
   it("retains the selected credential only in the original ProcessRunner gh path", async () => {
@@ -114,7 +154,7 @@ describe("callback mutation lock", () => {
     const runtime: MutationLockRuntime = {
       spawn: vi.fn((_command, _args, options) => {
         seen.env = options.env;
-        return holder({ ready: "READY\n" });
+        return completedAcquisition(0);
       }),
     };
 
@@ -136,7 +176,7 @@ describe("callback mutation lock", () => {
     const externalParent = join(root, "external-parent");
     await mkdir(stateDir, { recursive: true });
     await mkdir(externalParent);
-    const lock = new MutationLock(configFor(stateDir), {}, { spawn: () => holder({ ready: "READY\n" }) }, {
+    const lock = new MutationLock(configFor(stateDir), {}, { spawn: () => completedAcquisition(0) }, {
       afterDirectoryOpen: async () => {
         await rename(originalParent, movedParent);
         await mkdir(originalParent);
