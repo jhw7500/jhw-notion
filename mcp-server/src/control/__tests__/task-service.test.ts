@@ -700,6 +700,30 @@ describe("TaskService", () => {
     expect(claims.latestHandoffHistory).not.toHaveBeenCalled();
   });
 
+  it("rejects an absolute host path restored from a committed Handoff", async () => {
+    const { tasks, claims, fixture } = await taskFixture();
+    const relativePath = `handoffs/${TASK_ID}/${CLAIM_ID}.md`;
+    const content = buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: activeClaim.source_task_revision,
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+      progress: "Continue from /srv/private/source-checkout/src/control/task-service.ts",
+    });
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(join(fixture.registryDir, relativePath), content, "utf8");
+    claims.getClaimHistory.mockResolvedValue({
+      ...activeClaim,
+      released_at: "2026-08-13T12:36:56.789Z",
+      status: "handoff",
+      handoff_path: relativePath,
+    });
+
+    await expect(tasks.handoff(TASK_ID, CLAIM_ID)).rejects.toMatchObject({
+      code: "SENSITIVE_DATA_REJECTED",
+    });
+  });
+
   it("rejects a committed Handoff with bytes outside the fixed schema", async () => {
     const { tasks, claims, fixture } = await taskFixture();
     const relativePath = `handoffs/${TASK_ID}/${CLAIM_ID}.md`;

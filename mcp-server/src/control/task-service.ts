@@ -21,7 +21,7 @@ import {
 } from "./handoff.js";
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
 import type { ActiveClaim, ClaimHistory } from "./schemas.js";
-import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import { worktreePlan, type WorktreeCreateResult, type WorktreeInspection, type WorktreeRemovalResult } from "./worktree.js";
 
 export interface ClaimServicePort {
@@ -465,6 +465,7 @@ export class TaskService {
     }
     await this.records.assertCommittedRegularFile(expectedPath);
     const content = await this.registry.readHeadRegularFile(expectedPath);
+    assertNoAbsoluteHostPaths(content);
     if (Buffer.byteLength(content, "utf8") > MAX_HANDOFF_BYTES) {
       throw new ControlError("REGISTRY_CORRUPT", "Committed Handoff exceeds its byte boundary");
     }
@@ -708,7 +709,9 @@ export class TaskService {
   private async committedHandoff(relativePath: string): Promise<string | undefined> {
     try {
       await this.records.assertCommittedRegularFile(relativePath);
-      return await this.registry.readHeadRegularFile(relativePath);
+      const content = await this.registry.readHeadRegularFile(relativePath);
+      assertNoAbsoluteHostPaths(content);
+      return content;
     } catch (cause) {
       if (cause instanceof ControlError && cause.code === "HANDOFF_MISSING") return undefined;
       throw cause;
