@@ -122,6 +122,10 @@ function corruption(message: string, details: Record<string, unknown>): ControlE
   return new ControlError("REGISTRY_CORRUPT", message, details);
 }
 
+function rethrowSensitive(cause: unknown): void {
+  if (cause instanceof ControlError && cause.code.startsWith("SENSITIVE_")) throw cause;
+}
+
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -152,12 +156,12 @@ export class Catalog {
     private readonly registry: RegistryGit,
     sensitiveData?: SensitiveDataPolicy,
   ) {
-    this.records = new RegistryRecordStore(config.registryDir, registry);
     this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [
       config.registryDir,
       config.stateDir,
       config.worktreeRoot,
     ]);
+    this.records = new RegistryRecordStore(config.registryDir, registry, this.sensitiveData);
   }
 
   async registerRepository(rawInput: RegisterRepositoryInput): Promise<RepositoryRegistration> {
@@ -524,6 +528,7 @@ export class Catalog {
     try {
       return await this.records.readOptionalJson(path, schema);
     } catch (cause) {
+      rethrowSensitive(cause);
       throw corruption("Registry source index is invalid", {
         sourceIndexPath: join(this.config.registryDir, path),
         cause: errorMessage(cause),
@@ -538,6 +543,7 @@ export class Catalog {
     try {
       repository = await this.records.readOptionalJson(relativePath, RepositoryRecordSchema, { field: "id", value: repoId });
     } catch (cause) {
+      rethrowSensitive(cause);
       throw corruption("Repository record referenced by Registry is invalid", {
         sourceIndexPath,
         recordPath,
@@ -710,6 +716,7 @@ export class Catalog {
     try {
       task = await this.records.readJson(relativePath, TaskRecordSchema, { field: "id", value: taskId });
     } catch (cause) {
+      rethrowSensitive(cause);
       throw corruption("Task record referenced by Registry is invalid or missing", {
         sourceIndexPath,
         recordPath,

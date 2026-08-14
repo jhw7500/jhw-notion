@@ -124,7 +124,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     sensitiveData,
   });
   const source = new GitHubSourceService({ runner, catalog, projects: githubProject, sensitiveData });
-  const records = new RegistryRecordStore(config.registryDir, registry);
+  const records = new RegistryRecordStore(config.registryDir, registry, sensitiveData);
   const readCommittedAuthority = async () => {
     try {
       await records.assertCommittedRegularFile("governance/authority.yaml");

@@ -660,6 +660,31 @@ describe("ClaimService", () => {
     await expect(claims.latestClaimHistory(active.task_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
   });
 
+  it("orders offset Claim history by instant and rejects equal-instant ambiguity", async () => {
+    const times = [
+      new Date("2026-08-13T10:00:00Z"), new Date("2026-08-13T10:30:00Z"),
+      new Date("2026-08-14T11:00:00Z"), new Date("2026-08-14T11:45:00Z"),
+    ];
+    const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id));
+    const firstHistory = (await claims.recoverClaim(task.id, first.claim_id, { kind: "force-end" })).history;
+    const second = await claims.claimTask(claimInput(task.id, { session_id: "codex-second" }));
+    const secondHistory = (await claims.recoverClaim(task.id, second.claim_id, { kind: "force-end" })).history;
+    await commitRegistryFile(fixture, historyRelativePath(first), `${JSON.stringify({
+      ...firstHistory, released_at: "2026-08-14T00:30:00+14:00",
+    })}\n`);
+    await commitRegistryFile(fixture, historyRelativePath(second), `${JSON.stringify({
+      ...secondHistory, released_at: "2026-08-13T23:45:00-12:00",
+    })}\n`);
+
+    await expect(claims.latestClaimHistory(task.id)).resolves.toMatchObject({ claim_id: second.claim_id });
+
+    await commitRegistryFile(fixture, historyRelativePath(second), `${JSON.stringify({
+      ...secondHistory, released_at: "2026-08-13T10:30:00Z",
+    })}\n`);
+    await expect(claims.latestClaimHistory(task.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
   it("rejects a dirty deletion that would hide committed Claim history", async () => {
     const { claims, fixture, task } = await claimsFixture();
     const active = await claims.claimTask(claimInput(task.id));

@@ -5,6 +5,7 @@ import { isAbsolute, normalize, parse, relative, resolve, sep } from "node:path"
 import type { ZodType } from "zod";
 
 import { ControlError } from "./errors.js";
+import type { SensitiveDataPolicy } from "./sensitive-data.js";
 
 const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
@@ -67,6 +68,7 @@ export class RegistryRecordStore {
   constructor(
     private readonly configuredRoot: string,
     private readonly head: RegistryHeadPort,
+    private readonly sensitiveData: SensitiveDataPolicy,
   ) {}
 
   async readJson<T>(relativePath: string, schema: ZodType<T>, identity?: RecordIdentity): Promise<T> {
@@ -118,6 +120,7 @@ export class RegistryRecordStore {
           throw corrupt("Registry record path and embedded identity disagree", relativePath);
         }
       }
+      this.sensitiveData.assertSafe(parsed.data);
       return parsed.data;
     } catch (cause) {
       if (cause instanceof ControlError) throw cause;
@@ -130,6 +133,7 @@ export class RegistryRecordStore {
   }
 
   async writeJson(relativePath: string, value: unknown): Promise<void> {
+    this.sensitiveData.assertSafe(value);
     await this.writeText(relativePath, `${JSON.stringify(value, null, 2)}\n`);
   }
 
@@ -146,6 +150,7 @@ export class RegistryRecordStore {
       throw new ControlError("INVALID_REGISTRY_BOUND", "Registry listing requires a positive deterministic bound");
     }
     const committed = await this.head.listHeadDirectoryEntries(relativeDirectory, maximumEntries);
+    this.sensitiveData.assertSafe(committed);
     let root: FileHandle | undefined;
     let directory: FileHandle | undefined;
     try {
@@ -182,6 +187,7 @@ export class RegistryRecordStore {
   async assertCommittedRegularFile(relativePath: string): Promise<void> {
     const components = safeRelativePath(relativePath);
     const committed = await this.head.readHeadRegularBlob(relativePath);
+    this.sensitiveData.assertSafe(new TextDecoder("utf-8", { fatal: true }).decode(committed));
     let root: FileHandle | undefined;
     let parent: FileHandle | undefined;
     let file: FileHandle | undefined;
@@ -262,6 +268,7 @@ export class RegistryRecordStore {
       const committed = await this.head.readHeadRegularBlob(relativePath).catch(() => {
         throw corrupt("Registry record to remove is not a regular HEAD blob", relativePath);
       });
+      this.sensitiveData.assertSafe(new TextDecoder("utf-8", { fatal: true }).decode(committed));
       if (!(await this.boundedFileBytes(file, before, relativePath)).equals(committed)) {
         throw corrupt("Registry record to remove disagrees with HEAD", relativePath);
       }
@@ -278,6 +285,7 @@ export class RegistryRecordStore {
   }
 
   async writeText(relativePath: string, contents: string): Promise<void> {
+    this.sensitiveData.assertSafe(contents);
     if (Buffer.byteLength(contents, "utf8") > MAX_REGISTRY_RECORD_BYTES) {
       throw corrupt("Registry record exceeds its byte boundary", relativePath);
     }

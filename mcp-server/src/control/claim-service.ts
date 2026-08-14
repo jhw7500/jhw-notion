@@ -355,8 +355,8 @@ export class ClaimService {
   }
 
   private latestUniqueHistory(taskId: string, candidates: ClaimHistory[]): ClaimHistory {
-    candidates.sort((left, right) => right.released_at.localeCompare(left.released_at));
-    if (candidates[1]?.released_at === candidates[0]?.released_at) {
+    candidates.sort((left, right) => Date.parse(right.released_at) - Date.parse(left.released_at));
+    if (candidates[1] && Date.parse(candidates[1].released_at) === Date.parse(candidates[0]?.released_at ?? "")) {
       throw corruption("Latest Task Claim history is ambiguous", { task_id: taskId });
     }
     return candidates[0] as ClaimHistory;

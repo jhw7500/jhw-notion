@@ -84,6 +84,52 @@ describe("Catalog", () => {
     expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
   });
 
+  it("enforces protected-content policy inside the shared Registry store", async () => {
+    const secret = "unmistakably-fake-store-token";
+    const { catalog, fixture } = await catalogFixture(createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
+
+    await expect(catalog.records.writeJson("scratch/protected.yaml", { value: secret }))
+      .rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    await expect(readFile(join(fixture.registryDir, "scratch", "protected.yaml"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects protected restored Repository content during reverse-index audit", async () => {
+    const secret = "unmistakably-fake-repository-token";
+    const { catalog, fixture } = await catalogFixture(createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
+    const registered = await catalog.registerRepository(repositoryInput);
+    await commitFile(fixture.registryDir, `repositories/${registered.repository.id}.yaml`, `${JSON.stringify({
+      ...registered.repository, slug: `owner/${secret}`,
+    })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerTemporaryTask({
+      project_id: "prj-wlan", repo_id: registered.repository.id, alias: "wlan:protected-repository",
+      goal: "safe", done_conditions: ["safe"], expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+  });
+
+  it("rejects restored noncanonical Repository slugs and foreign formal-looking aliases", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const repository = (await catalog.registerRepository(repositoryInput)).repository;
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+
+    await commitFile(fixture.registryDir, `repositories/${repository.id}.yaml`, `${JSON.stringify({
+      ...repository, slug: "not-a-slug",
+    })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    await expect(catalog.getRepository(repository.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    await commitFile(fixture.registryDir, `repositories/${repository.id}.yaml`, `${JSON.stringify(repository)}\n`);
+    await commitFile(fixture.registryDir, `tasks/${formal.id}.yaml`, `${JSON.stringify({
+      ...formal, aliases: ["evil/repository#1", ...formal.aliases],
+    })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    await expect(catalog.getTask(formal.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
   it("registers a Repository and its GitHub source index in one transaction", async () => {
     const { catalog, fixture } = await catalogFixture();
 
@@ -440,11 +486,10 @@ describe("Catalog", () => {
     await expect(catalog.promoteTemporaryTask(temp.id, {
       ...issueInput,
       issue_revision: "2026-08-14T00:00:00Z",
-      alias: "jhw7500/wlan-renamed#1",
     })).resolves.toMatchObject({
       id: temp.id,
       issue_revision: "2026-08-14T00:00:00Z",
-      aliases: ["wlan:tmp-20260813-01-fix", "jhw7500/wlan#1", "jhw7500/wlan-renamed#1"],
+      aliases: ["wlan:tmp-20260813-01-fix", "jhw7500/wlan#1"],
     });
   });
 });

@@ -217,7 +217,7 @@ export class GitHubSourceService {
       throw new ControlError("TASK_COMPLETED", "Completed temporary Tasks cannot be resumed");
     }
     const alias = task.kind === "formal"
-      ? task.aliases.find((candidate) => /^.+\/.+#[1-9][0-9]*$/.test(candidate))
+      ? task.aliases.find((candidate) => candidate === `${context.repository.slug}#${issueCoordinates(task.issue_url).number}`)
       : task.aliases[0];
     if (!alias) throw new ControlError("REGISTRY_CORRUPT", "Task has no usable canonical alias");
     return {

@@ -213,6 +213,17 @@ describe("GitHubSourceService", () => {
     expect(projects.requireProjectRepository).toHaveBeenCalledWith("prj-wlan", "repo-wlan");
   });
 
+  it("selects the exact verified formal alias instead of a preserved temporary lookalike", async () => {
+    const { service, catalog } = fixture();
+    catalog.registerFormalTask.mockResolvedValueOnce({
+      task: { ...formal, aliases: ["evil/repository#7", "wlan:temporary", "jhw7500/wlan#7"] },
+      created: false,
+    });
+
+    await expect(service.prepareExistingTask({ task_id: formal.id, repository_path: checkout }))
+      .resolves.toMatchObject({ alias: "jhw7500/wlan#7" });
+  });
+
   it("refuses a closed formal Issue before existing Task ownership is created", async () => {
     const { service, catalog } = fixture({ issueState: "closed" });
 

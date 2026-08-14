@@ -5,6 +5,9 @@ const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm") =>
 
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
 const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
+const githubSlugPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+const formalAliasPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}#[1-9][0-9]*$/;
+const canonicalIssueUrlPattern = /^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100})\/issues\/([1-9][0-9]*)$/;
 const boundedUtf8 = (maximumBytes: number) => z.string().min(1).max(maximumBytes)
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
 const boundedCoordinate = (maximumBytes: number) => z.string().min(1).max(maximumBytes)
@@ -42,7 +45,7 @@ export const RepositoryRecordSchema = z
   .object({
     id: repositoryId,
     github_node_id: githubNodeId,
-    slug: z.string().min(1),
+    slug: z.string().regex(githubSlugPattern),
   })
   .strict();
 export type RepositoryRecord = z.infer<typeof RepositoryRecordSchema>;
@@ -63,7 +66,21 @@ export const FormalTaskSchema = z
     issue_revision: OffsetDateTimeSchema,
     issue_url: z.string().max(512).url(),
   })
-  .strict();
+  .strict()
+  .superRefine((task, context) => {
+    const coordinates = task.issue_url.match(canonicalIssueUrlPattern);
+    if (!coordinates || !Number.isSafeInteger(Number(coordinates[3]))) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["issue_url"], message: "Formal Task requires a canonical safe GitHub Issue URL" });
+      return;
+    }
+    const canonicalAlias = `${coordinates[1]}/${coordinates[2]}#${coordinates[3]}`;
+    if (!task.aliases.includes(canonicalAlias)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["aliases"], message: "Formal Task is missing its canonical Issue alias" });
+    }
+    if (task.aliases.some((alias) => formalAliasPattern.test(alias) && alias !== canonicalAlias)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["aliases"], message: "Formal-looking Task alias disagrees with its Issue URL" });
+    }
+  });
 export type FormalTask = z.infer<typeof FormalTaskSchema>;
 
 export const TemporaryTaskSchema = z
@@ -78,7 +95,7 @@ export const TemporaryTaskSchema = z
   .strict();
 export type TemporaryTask = z.infer<typeof TemporaryTaskSchema>;
 
-export const TaskRecordSchema = z.discriminatedUnion("kind", [FormalTaskSchema, TemporaryTaskSchema]);
+export const TaskRecordSchema = z.union([FormalTaskSchema, TemporaryTaskSchema]);
 export type TaskRecord = z.infer<typeof TaskRecordSchema>;
 
 export const ActiveClaimSchema = z

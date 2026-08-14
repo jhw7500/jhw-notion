@@ -305,12 +305,12 @@ export class TaskService {
     sensitiveData?: SensitiveDataPolicy,
     private readonly hooks: TaskServiceHooks = {},
   ) {
-    this.records = new RegistryRecordStore(config.registryDir, registry);
     this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [
       config.registryDir,
       config.stateDir,
       config.worktreeRoot,
     ]);
+    this.records = new RegistryRecordStore(config.registryDir, registry, this.sensitiveData);
   }
 
   async start(input: TaskStartInput): Promise<TaskStartResult> {
