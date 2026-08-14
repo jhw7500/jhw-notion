@@ -82,6 +82,11 @@ describe("control process boundary", () => {
     ["JHW_REGISTRY_REPOSITORY", "another-owner/project-registry"],
     ["JHW_PREFLIGHT_PROJECT_ITEM_ID", "I_not-project-item"],
     ["JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER", "0"],
+    ["JHW_REGISTRY_REMOTE", "--upload-pack=helper"],
+    ["JHW_REGISTRY_BRANCH", "--force"],
+    ["JHW_BUILD_HOST", `host\n${"x".repeat(256)}`],
+    ["JHW_REGISTRY_DIR", "/"],
+    ["JHW_WORKTREE_ROOT", "/"],
   ])("fails closed for invalid non-secret preflight coordinate %s", (key, value) => {
     const env = {
       HOME: "/home/jhw",

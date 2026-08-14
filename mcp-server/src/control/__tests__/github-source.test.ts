@@ -16,7 +16,13 @@ const formal = {
   issue_url: "https://github.com/jhw7500/wlan/issues/7",
 };
 
-function fixture(overrides: { remote?: string; private?: boolean; fullName?: string; issueState?: "open" | "closed" } = {}) {
+function fixture(overrides: {
+  remote?: string;
+  pushRemote?: string;
+  private?: boolean;
+  fullName?: string;
+  issueState?: "open" | "closed";
+} = {}) {
   const catalog = {
     registerRepository: vi.fn(async (input) => ({ repository: { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug }, created: true })),
     getRepository: vi.fn(async () => repository),
@@ -33,7 +39,11 @@ function fixture(overrides: { remote?: string; private?: boolean; fullName?: str
   const runner = {
     run: vi.fn(async (_command: string, args: string[]) => ({
       command: "git", args,
-      stdout: args[0] === "rev-parse" ? `${checkout}\n` : (overrides.remote ?? "git@github.com:jhw7500/wlan.git\n"),
+      stdout: args[0] === "rev-parse"
+        ? `${checkout}\n`
+        : args.includes("--push")
+          ? (overrides.pushRemote ?? overrides.remote ?? "git@github.com:jhw7500/wlan.git\n")
+          : (overrides.remote ?? "git@github.com:jhw7500/wlan.git\n"),
       stderr: "", exitCode: 0,
     })),
     runGh: vi.fn(async (args: string[]) => ({
@@ -134,6 +144,7 @@ describe("GitHubSourceService", () => {
     ["public repository", { private: false }, "REPOSITORY_NOT_PRIVATE"],
     ["API slug mismatch", { fullName: "jhw7500/other" }, "REPOSITORY_IDENTITY_MISMATCH"],
     ["remote mismatch", { remote: "git@github.com:jhw7500/other.git\n" }, "CHECKOUT_REMOTE_MISMATCH"],
+    ["push remote mismatch", { pushRemote: "git@github.com:jhw7500/other.git\n" }, "CHECKOUT_REMOTE_MISMATCH"],
     ["ambiguous origin", { remote: "git@github.com:jhw7500/wlan.git\ngit@github.com:jhw7500/wlan.git\n" }, "AMBIGUOUS_CHECKOUT_ORIGIN"],
   ])("rejects %s before Catalog mutation", async (_label, overrides, code) => {
     const { service, catalog } = fixture(overrides);

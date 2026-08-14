@@ -5,6 +5,7 @@ import type { PreflightResult } from "./schemas.js";
 import { z } from "zod";
 import { githubSlugFromRemote } from "./github-source.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import { realpath } from "node:fs/promises";
 
 export interface PreflightRunner {
   runGh(args: string[], credential: "project" | "repo", options?: ProcessRunOptions): Promise<ProcessResult>;
@@ -42,6 +43,8 @@ export interface PreflightServiceOptions {
   repository: PreflightRepositoryPort;
   sensitiveData?: SensitiveDataPolicy;
   remoteUrl?: () => Promise<string>;
+  pushRemoteUrl?: () => Promise<string>;
+  registryRoot?: () => Promise<string>;
   today?: () => string;
 }
 
@@ -128,6 +131,24 @@ export class PreflightService {
 
     await this.options.repository.verifyPrivateRepository(this.options.config.registryRepository);
 
+    const observedRoot = this.options.registryRoot
+      ? await this.options.registryRoot()
+      : (await this.options.runner.run("git", ["rev-parse", "--show-toplevel"], {
+        cwd: this.options.config.registryDir,
+      })).stdout.trim();
+    let configuredRoot: string;
+    let actualRoot: string;
+    try {
+      [configuredRoot, actualRoot] = this.options.registryRoot
+        ? [this.options.config.registryDir, observedRoot]
+        : await Promise.all([realpath(this.options.config.registryDir), realpath(observedRoot)]);
+    } catch {
+      throw new ControlError("REGISTRY_ROOT_MISMATCH", "Registry directory is not the exact Git checkout root");
+    }
+    if (configuredRoot !== actualRoot) {
+      throw new ControlError("REGISTRY_ROOT_MISMATCH", "Registry directory is not the exact Git checkout root");
+    }
+
     const remote = this.options.remoteUrl
       ? await this.options.remoteUrl()
       : (await this.options.runner.run("git", ["remote", "get-url", "--all", this.options.config.registryRemote], {
@@ -138,6 +159,48 @@ export class PreflightService {
     const remoteSlug = githubSlugFromRemote(remoteLines[0] as string, true);
     if (remoteSlug.toLowerCase() !== this.options.config.registryRepository.toLowerCase()) {
       throw new ControlError("REGISTRY_REMOTE_MISMATCH", "Registry remote does not match configured repository identity");
+    }
+    const pushRemote = this.options.pushRemoteUrl
+      ? await this.options.pushRemoteUrl()
+      : this.options.remoteUrl
+        ? await this.options.remoteUrl()
+        : (await this.options.runner.run(
+          "git",
+          ["remote", "get-url", "--push", "--all", this.options.config.registryRemote],
+          { cwd: this.options.config.registryDir },
+        )).stdout.trim();
+    const pushRemoteLines = pushRemote.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (pushRemoteLines.length !== 1) {
+      throw new ControlError("AMBIGUOUS_REGISTRY_REMOTE", "Registry remote must have exactly one effective push URL");
+    }
+    const pushRemoteSlug = githubSlugFromRemote(pushRemoteLines[0] as string, true);
+    if (pushRemoteSlug.toLowerCase() !== this.options.config.registryRepository.toLowerCase()) {
+      throw new ControlError("REGISTRY_REMOTE_MISMATCH", "Registry push URL does not match configured repository identity");
+    }
+
+    const registryStatus = await this.options.runner.run(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { cwd: this.options.config.registryDir },
+    );
+    if (registryStatus.stdout.length > 0) {
+      throw new ControlError("REGISTRY_DIRTY", "Registry checkout must be clean before live preflight");
+    }
+    await this.options.runner.run(
+      "git",
+      ["fetch", this.options.config.registryRemote, this.options.config.registryBranch],
+      { cwd: this.options.config.registryDir },
+    );
+    const localHead = (await this.options.runner.run("git", ["rev-parse", "HEAD"], {
+      cwd: this.options.config.registryDir,
+    })).stdout.trim();
+    const remoteHead = (await this.options.runner.run(
+      "git",
+      ["rev-parse", `${this.options.config.registryRemote}/${this.options.config.registryBranch}`],
+      { cwd: this.options.config.registryDir },
+    )).stdout.trim();
+    if (localHead !== remoteHead) {
+      throw new ControlError("REMOTE_DIVERGED", "Registry checkout must equal the fetched remote branch head");
     }
 
     const issuePath = `repos/${this.options.config.registryRepository}/issues/${this.options.config.preflightRegistryIssueNumber}`;
@@ -205,7 +268,6 @@ export class PreflightService {
       throw new ControlError("INVALID_PREFLIGHT_ISSUE", "Registry Issue unchanged-write verification failed");
     }
 
-    await this.options.runner.run("git", ["fetch", this.options.config.registryRemote, this.options.config.registryBranch], { cwd: this.options.config.registryDir });
     await this.options.runner.run("git", ["push", "--dry-run", this.options.config.registryRemote, `HEAD:${this.options.config.registryBranch}`], {
       cwd: this.options.config.registryDir,
     });

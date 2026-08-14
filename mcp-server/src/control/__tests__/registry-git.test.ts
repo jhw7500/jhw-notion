@@ -26,31 +26,75 @@ function mutation(paths: string[]): RegistryMutationResult {
   return { paths };
 }
 
+function fixtureRegistryGit(
+  config: ReturnType<typeof configFor>,
+  runner: ProcessRunnerLike,
+  sensitiveData?: ReturnType<typeof createSensitiveDataPolicy>,
+): RegistryGit {
+  return new RegistryGit(config, runner, sensitiveData, async () => undefined);
+}
+
 function runnerThatRejectsPush(stderr: string): ProcessRunnerLike {
-  const responses = [
-    { stdout: "", stderr: "", exitCode: 0 },
-    { stdout: "", stderr: "", exitCode: 0 },
-    { stdout: "base\n", stderr: "", exitCode: 0 },
-    { stdout: "base\n", stderr: "", exitCode: 0 },
-    { stdout: "?? record.yaml\n", stderr: "", exitCode: 0 },
-    { stdout: "", stderr: "", exitCode: 0 },
-    { stdout: "", stderr: "", exitCode: 0 },
-    { stdout: "local\n", stderr: "", exitCode: 0 },
-  ];
+  let revisionCalls = 0;
+  let statusCalls = 0;
   return {
-    async run() {
-      const response = responses.shift();
-      if (response) return { command: "git", args: [], ...response };
-      throw new ControlError("COMMAND_FAILED", "Command failed", { stderr });
+    async run(_command, args) {
+      if (args[0] === "push") throw new ControlError("COMMAND_FAILED", "Command failed", { stderr });
+      const stdout = args[0] === "rev-parse" ? (++revisionCalls <= 2 ? "base\n" : "local\n") : "";
+      return { command: "git", args, stdout, stderr: "", exitCode: 0 };
+    },
+    async runRaw(_command, args) {
+      if (args[0] === "ls-files") return Buffer.from("H README.md\0", "utf8");
+      if (args[0] === "status") {
+        statusCalls += 1;
+        return Buffer.from(statusCalls === 1 ? "" : statusCalls === 2 ? "?? record.yaml\0" : "A  record.yaml\0", "utf8");
+      }
+      if (args[0] === "diff") return Buffer.from("record.yaml\0", "utf8");
+      throw new Error(`unexpected raw Git command: ${args.join(" ")}`);
     },
   };
 }
 
 describe("RegistryGit", () => {
+  it("rejects a foreign effective push URL before Registry mutation", async () => {
+    const { registryDir } = await fixture();
+    const mutate = vi.fn(async () => mutation([]));
+    const run = vi.fn(async (_command: string, args: string[]) => ({
+      command: "git",
+      args,
+      stdout: args[0] === "rev-parse"
+        ? `${registryDir}\n`
+        : args.includes("--push")
+          ? "git@github.com:jhw7500/other.git\n"
+          : "git@github.com:jhw7500/project-registry.git\n",
+      stderr: "",
+      exitCode: 0,
+    }));
+    const registry = new RegistryGit(configFor(registryDir), { run });
+
+    await expect(registry.transact("must-not-mutate", mutate)).rejects.toMatchObject({
+      code: "REGISTRY_REMOTE_MISMATCH",
+    });
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Registry subdirectory before mutation", async () => {
+    const { registryDir } = await fixture();
+    const nestedRegistryDir = join(registryDir, "nested");
+    await mkdir(nestedRegistryDir);
+    const mutate = vi.fn(async () => mutation([]));
+    const registry = new RegistryGit(configFor(nestedRegistryDir), new ProcessRunner());
+
+    await expect(registry.transact("must-not-mutate", mutate)).rejects.toMatchObject({
+      code: "REGISTRY_ROOT_MISMATCH",
+    });
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
   it("rejects a dirty checkout before fetching or mutating", async () => {
     const { registryDir } = await fixture();
     await writeFile(join(registryDir, "governance.json"), "{}\n", "utf8");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.transact("test", async () => mutation([]))).rejects.toMatchObject({
       code: "REGISTRY_DIRTY",
@@ -61,7 +105,7 @@ describe("RegistryGit", () => {
     const { registryDir, otherCloneDir } = await fixture();
     await commitFile(otherCloneDir, "governance/other.json", "{}\n");
     await git(otherCloneDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.transact("test", async () => mutation([]))).rejects.toMatchObject({
       code: "REMOTE_DIVERGED",
@@ -71,7 +115,7 @@ describe("RegistryGit", () => {
 
   it("creates one commit, pushes fast-forward, refetches, and verifies remote HEAD", async () => {
     const { registryDir } = await fixture();
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     const result = await registry.transact("registry test mutation", async () => {
       const path = "governance/record.json";
@@ -89,7 +133,7 @@ describe("RegistryGit", () => {
 
   it("returns the current commit without creating one when a mutation reports no paths", async () => {
     const { registryDir } = await fixture();
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
     const head = (await git(registryDir, "rev-parse", "HEAD")).trim();
 
     await expect(registry.transact("idempotent", async () => mutation([]))).resolves.toEqual({
@@ -99,9 +143,69 @@ describe("RegistryGit", () => {
     expect((await git(registryDir, "rev-parse", "HEAD")).trim()).toBe(head);
   });
 
+  it.each([
+    ["tracked assume-unchanged", ["--assume-unchanged"]],
+    ["tracked skip-worktree", ["--skip-worktree"]],
+  ])("rejects %s index state before mutation", async (_label, indexArgs) => {
+    const { registryDir } = await fixture();
+    await commitFile(registryDir, "governance/indexed.json", "{}\n");
+    await git(registryDir, "push", "origin", "main");
+    await git(registryDir, "update-index", ...indexArgs, "--", "governance/indexed.json");
+    const mutate = vi.fn(async () => mutation([]));
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.transact("must-not-mutate", mutate)).rejects.toMatchObject({
+      code: "REGISTRY_INDEX_UNSAFE",
+    });
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a tracked .gitignore", ".gitignore"],
+    ["the local info exclude", ".git/info/exclude"],
+  ])("force-stages a declared canonical path hidden by %s", async (_label, ignoreFile) => {
+    const { registryDir } = await fixture();
+    const ignoredPath = "governance/ignored.json";
+    if (ignoreFile === ".gitignore") {
+      await commitFile(registryDir, ignoreFile, `${ignoredPath}\n`);
+      await git(registryDir, "push", "origin", "main");
+    } else {
+      await writeFile(join(registryDir, ignoreFile), `${ignoredPath}\n`, "utf8");
+    }
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    const result = await registry.transact("commit declared ignored record", async () => {
+      await mkdir(join(registryDir, "governance"), { recursive: true });
+      await writeFile(join(registryDir, ignoredPath), "{\"committed\":true}\n", "utf8");
+      return mutation([ignoredPath]);
+    });
+
+    expect(result.changed).toBe(true);
+    expect(await git(registryDir, "show", `HEAD:${ignoredPath}`)).toBe("{\"committed\":true}\n");
+    expect(await git(registryDir, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  });
+
+  it("rejects an ignored unreported mutation before commit or push", async () => {
+    const { registryDir } = await fixture();
+    await commitFile(registryDir, ".gitignore", "governance/hidden.json\n");
+    await git(registryDir, "push", "origin", "main");
+    const initialHead = (await git(registryDir, "rev-parse", "HEAD")).trim();
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.transact("partial mutation", async () => {
+      await mkdir(join(registryDir, "governance"), { recursive: true });
+      await writeFile(join(registryDir, "governance/reported.json"), "{}\n", "utf8");
+      await writeFile(join(registryDir, "governance/hidden.json"), "{}\n", "utf8");
+      return mutation(["governance/reported.json"]);
+    })).rejects.toMatchObject({ code: "MUTATION_PATH_MISMATCH" });
+
+    expect((await git(registryDir, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect((await git(registryDir, "rev-parse", "origin/main")).trim()).toBe(initialHead);
+  });
+
   it("preserves a non-divergence push failure", async () => {
     const { registryDir } = await fixture();
-    const registry = new RegistryGit(
+    const registry = fixtureRegistryGit(
       configFor(registryDir),
       runnerThatRejectsPush("remote: permission denied to update this repository"),
     );
@@ -113,7 +217,7 @@ describe("RegistryGit", () => {
 
   it("preserves a protected-branch push rejection that is not non-fast-forward", async () => {
     const { registryDir } = await fixture();
-    const registry = new RegistryGit(
+    const registry = fixtureRegistryGit(
       configFor(registryDir),
       runnerThatRejectsPush(
         "! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs",
@@ -127,7 +231,7 @@ describe("RegistryGit", () => {
 
   it("maps a rejected non-fast-forward push to REMOTE_DIVERGED without retrying", async () => {
     const { registryDir, otherCloneDir } = await fixture();
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.transact("racing mutation", async () => {
       const path = "governance/racing.json";
@@ -145,7 +249,7 @@ describe("RegistryGit", () => {
 
   it("rejects a changed mutation that returns no stage paths", async () => {
     const { registryDir } = await fixture();
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.transact("missing paths", async () => {
       await mkdir(join(registryDir, "governance"), { recursive: true });
@@ -156,7 +260,7 @@ describe("RegistryGit", () => {
 
   it("rejects a mutation that changes paths it did not explicitly return for staging", async () => {
     const { registryDir } = await fixture();
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.transact("partial paths", async () => {
       await mkdir(join(registryDir, "governance"), { recursive: true });
@@ -170,7 +274,7 @@ describe("RegistryGit", () => {
     const { registryDir } = await fixture();
     await commitFile(registryDir, "handoffs/regular.md", "# Durable handoff\n");
     await git(registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.assertHeadRegularFile("handoffs/regular.md")).resolves.toBeUndefined();
   });
@@ -179,7 +283,7 @@ describe("RegistryGit", () => {
     const { registryDir } = await fixture();
     await commitFile(registryDir, "tasks/revision.yaml", "{}\n");
     await git(registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
     const expected = (await git(registryDir, "rev-parse", "HEAD:tasks/revision.yaml")).trim();
 
     await expect(registry.headRegularBlobObjectId("tasks/revision.yaml")).resolves.toBe(expected);
@@ -193,7 +297,7 @@ describe("RegistryGit", () => {
   ])("rejects noncanonical Registry authority path %s before Git", async (path) => {
     const { registryDir } = await fixture();
     const run = vi.fn();
-    const registry = new RegistryGit(configFor(registryDir), { run });
+    const registry = fixtureRegistryGit(configFor(registryDir), { run });
 
     await expect(registry.headRegularBlobObjectId(path)).rejects.toMatchObject({ code: "INVALID_REGISTRY_PATH" });
     expect(run).not.toHaveBeenCalled();
@@ -204,7 +308,7 @@ describe("RegistryGit", () => {
     await commitFile(registryDir, "claims/history/2026/task.yaml", "{}\n");
     await commitFile(registryDir, "claims/active.yaml", "{}\n");
     await git(registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.listHeadDirectoryEntries("claims", 10)).resolves.toEqual([
       { name: "active.yaml", kind: "file" },
@@ -220,7 +324,7 @@ describe("RegistryGit", () => {
     const runRaw = vi.fn()
       .mockResolvedValueOnce(Buffer.from(`040000 tree ${treeId}\tclaims\0`, "utf8"))
       .mockResolvedValueOnce(Buffer.from(`100644 blob ${"b".repeat(40)}\tactive.yaml`, "utf8"));
-    const registry = new RegistryGit(configFor(registryDir), { run, runRaw });
+    const registry = fixtureRegistryGit(configFor(registryDir), { run, runRaw });
 
     await expect(registry.listHeadDirectoryEntries("claims", 10)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     expect(run).not.toHaveBeenCalled();
@@ -232,7 +336,7 @@ describe("RegistryGit", () => {
     await commitFile(registryDir, "handoffs/regular.md", "# Durable handoff\nfirst\n");
     await git(registryDir, "push", "origin", "main");
     await writeFile(join(registryDir, "handoffs", "regular.md"), "mutable checkout\n", "utf8");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.readHeadRegularFile("handoffs/regular.md")).resolves.toBe("# Durable handoff\nfirst\n");
   });
@@ -242,7 +346,7 @@ describe("RegistryGit", () => {
     const secret = "registry-secret-value";
     await commitFile(registryDir, "handoffs/secret.md", `# Handoff\n${secret}\n`);
     await git(registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(
+    const registry = fixtureRegistryGit(
       configFor(registryDir),
       new ProcessRunner({ HIDDEN_TOKEN: secret }),
       createSensitiveDataPolicy({ HIDDEN_TOKEN: secret }),
@@ -261,7 +365,7 @@ describe("RegistryGit", () => {
     await git(registryDir, "add", "--", "handoffs/invalid.md");
     await git(registryDir, "commit", "-m", "Invalid blob");
     await git(registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     const error = await registry.readHeadRegularFile("handoffs/invalid.md").catch((cause: unknown) => cause);
     expect(error).toMatchObject({ code: "REGISTRY_CORRUPT" });
@@ -275,7 +379,7 @@ describe("RegistryGit", () => {
     await git(registryDir, "add", "--", "handoffs/large.md");
     await git(registryDir, "commit", "-m", "Large blob");
     await git(registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.readHeadRegularFile("handoffs/large.md")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
   });
@@ -293,7 +397,7 @@ describe("RegistryGit", () => {
       throw new Error(`unexpected command: ${args.join(" ")}`);
     });
     const runRaw = vi.fn();
-    const registry = new RegistryGit(configFor(registryDir), { run, runRaw });
+    const registry = fixtureRegistryGit(configFor(registryDir), { run, runRaw });
 
     await expect(registry.readHeadRegularFile("handoffs/large.md")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     expect(run).toHaveBeenCalledWith("git", ["cat-file", "-s", objectId], { cwd: registryDir });
@@ -313,7 +417,7 @@ describe("RegistryGit", () => {
       throw new Error(`unexpected command: ${args.join(" ")}`);
     });
     const runRaw = vi.fn();
-    const registry = new RegistryGit(configFor(registryDir), { run, runRaw });
+    const registry = fixtureRegistryGit(configFor(registryDir), { run, runRaw });
 
     await expect(registry.readHeadRegularFile("handoffs/invalid-size.md")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     expect(run).toHaveBeenCalledWith("git", ["cat-file", "-s", objectId], { cwd: registryDir });
@@ -333,7 +437,7 @@ describe("RegistryGit", () => {
       throw new Error(`unexpected command: ${args.join(" ")}`);
     });
     const runRaw = vi.fn(async () => Buffer.from("# Exact\n", "utf8"));
-    const registry = new RegistryGit(configFor(registryDir), { run, runRaw });
+    const registry = fixtureRegistryGit(configFor(registryDir), { run, runRaw });
 
     await expect(registry.readHeadRegularFile("handoffs/exact.md")).resolves.toBe("# Exact\n");
     expect(runRaw).toHaveBeenCalledWith(
@@ -349,7 +453,7 @@ describe("RegistryGit", () => {
     const content = "# Handoff\n😀 한글\n";
     await commitFile(registryDir, "handoffs/unicode.md", content);
     await git(registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     const restored = await registry.readHeadRegularFile("handoffs/unicode.md");
     expect(Buffer.from(restored, "utf8")).toEqual(Buffer.from(content, "utf8"));
@@ -358,7 +462,7 @@ describe("RegistryGit", () => {
   it("rejects a regular file absent from HEAD rather than trusting the working tree", async () => {
     const { registryDir } = await fixture();
     await writeFile(join(registryDir, "handoffs-untracked.md"), "not committed\n", "utf8");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.assertHeadRegularFile("handoffs-untracked.md")).rejects.toMatchObject({
       code: "HANDOFF_MISSING",
@@ -373,7 +477,7 @@ describe("RegistryGit", () => {
     await git(created.registryDir, "add", "--", "handoff-link.md");
     await git(created.registryDir, "commit", "-m", "Add handoff symlink");
     await git(created.registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(created.registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(created.registryDir), new ProcessRunner());
 
     await expect(registry.assertHeadRegularFile("handoff-link.md")).rejects.toMatchObject({
       code: "REGISTRY_CORRUPT",
@@ -382,7 +486,7 @@ describe("RegistryGit", () => {
 
   it("maps HEAD inspection command failures without exposing captured command output", async () => {
     const { registryDir } = await fixture();
-    const registry = new RegistryGit(configFor(registryDir), {
+    const registry = fixtureRegistryGit(configFor(registryDir), {
       async run() {
         throw new ControlError("COMMAND_FAILED", "command failed", {
           stdout: "sensitive command output",
@@ -398,7 +502,7 @@ describe("RegistryGit", () => {
 
   it("rejects absolute and parent-traversal stage paths", async () => {
     const { registryDir } = await fixture();
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
 
     await expect(registry.transact("unsafe", async () => mutation(["../outside.yaml"]))).rejects.toMatchObject({
       code: "INVALID_MUTATION_PATH",

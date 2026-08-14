@@ -8,7 +8,7 @@ import { sourceIndexKey } from "../ids.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
-import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { commitFile, configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 
@@ -22,7 +22,7 @@ async function catalogFixture(sensitiveData?: SensitiveDataPolicy): Promise<{ fi
   const config = configFor(fixture.registryDir);
   return {
     fixture,
-    catalog: new Catalog(config, new RegistryGit(config, new ProcessRunner()), sensitiveData),
+    catalog: new Catalog(config, isolatedRegistryGit(config, new ProcessRunner()), sensitiveData),
   };
 }
 

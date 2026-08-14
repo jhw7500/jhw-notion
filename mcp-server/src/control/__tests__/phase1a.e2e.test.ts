@@ -18,7 +18,7 @@ import { RegistryGit, type ProcessRunnerLike } from "../registry-git.js";
 import { sourceIndexKey } from "../ids.js";
 import { TaskService } from "../task-service.js";
 import { WorktreeManager, type WorktreeStateHooks } from "../worktree.js";
-import { configFor, git, makeRegistryFixture } from "./helpers.js";
+import { configFor, git, isolatedRegistryGit, makeRegistryFixture } from "./helpers.js";
 
 interface GateFixture {
   root: string;
@@ -109,7 +109,7 @@ function graphFor(
 ): Graph {
   const config = fixtureConfig(fixture, registryDir);
   const runner = options.runner ?? new ProcessRunner();
-  const registry = new RegistryGit(config, runner);
+  const registry = isolatedRegistryGit(config, runner);
   const catalog = new Catalog(config, registry);
   const worktrees = new WorktreeManager(config, runner, options.worktreeHooks);
   const inspection: ClaimInspection = {
@@ -240,6 +240,11 @@ class PushGateRunner implements ProcessRunnerLike {
       await this.releasePush.promise;
     }
     return this.delegate.run(command, args, options);
+  }
+
+  async runRaw(command: string, args: string[], options: ProcessRunOptions | undefined, maximumBytes: number): Promise<Buffer> {
+    this.calls.push({ command, args: [...args] });
+    return this.delegate.runRaw(command, args, options, maximumBytes);
   }
 }
 
@@ -394,8 +399,8 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const rightRunner = new PushGateRunner(new ProcessRunner(), "2026-08-13T00:00:02Z");
     const leftConfig = fixtureConfig(fixture, fixture.cloneA);
     const rightConfig = fixtureConfig(fixture, fixture.cloneB);
-    const left = new Catalog(leftConfig, new RegistryGit(leftConfig, leftRunner));
-    const right = new Catalog(rightConfig, new RegistryGit(rightConfig, rightRunner));
+    const left = new Catalog(leftConfig, isolatedRegistryGit(leftConfig, leftRunner));
+    const right = new Catalog(rightConfig, isolatedRegistryGit(rightConfig, rightRunner));
 
     const results = await runDeterministicPushRace(
       () => left.registerRepository(repositoryInput),
@@ -431,8 +436,8 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const rightRunner = new PushGateRunner(new ProcessRunner(), "2026-08-13T00:00:02Z");
     const leftConfig = fixtureConfig(fixture, fixture.cloneA);
     const rightConfig = fixtureConfig(fixture, fixture.cloneB);
-    const left = new Catalog(leftConfig, new RegistryGit(leftConfig, leftRunner));
-    const right = new Catalog(rightConfig, new RegistryGit(rightConfig, rightRunner));
+    const left = new Catalog(leftConfig, isolatedRegistryGit(leftConfig, leftRunner));
+    const right = new Catalog(rightConfig, isolatedRegistryGit(rightConfig, rightRunner));
 
     const results = await runDeterministicPushRace(
       () => left.registerFormalTask(issueInput),
@@ -536,9 +541,13 @@ describe("Phase 1A deterministic adversarial gate", () => {
         calls.push([...args]);
         return delegate.run(command, args, options);
       },
+      async runRaw(command, args, options, maximumBytes) {
+        calls.push([...args]);
+        return delegate.runRaw(command, args, options, maximumBytes);
+      },
     };
     const config = fixtureConfig(fixture, fixture.cloneA);
-    const registry = new RegistryGit(config, runner);
+    const registry = isolatedRegistryGit(config, runner);
 
     await expect(registry.transact("must diverge", async () => ({ paths: [] }))).rejects.toMatchObject({ code: "REMOTE_DIVERGED" });
     const flat = calls.flat();
@@ -555,8 +564,12 @@ describe("Phase 1A deterministic adversarial gate", () => {
         racingCalls.push([...args]);
         return racingDelegate.run(command, args, options);
       },
+      async runRaw(command, args, options, maximumBytes) {
+        racingCalls.push([...args]);
+        return racingDelegate.runRaw(command, args, options, maximumBytes);
+      },
     };
-    const racingRegistry = new RegistryGit(fixtureConfig(racingFixture, racingFixture.cloneA), racingRunner);
+    const racingRegistry = isolatedRegistryGit(fixtureConfig(racingFixture, racingFixture.cloneA), racingRunner);
     await expect(racingRegistry.transact("lose deterministic push window", async () => {
       const localPath = "governance/push-window-loser.json";
       await Promise.all([

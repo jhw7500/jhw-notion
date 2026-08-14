@@ -1,4 +1,4 @@
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, parse, resolve } from "node:path";
 
 import { ControlError } from "./errors.js";
 
@@ -59,6 +59,44 @@ function absolutePath(env: NodeJS.ProcessEnv, key: string, fallback?: string): s
   if (!isAbsolute(value)) {
     throw new ControlError("INVALID_CONFIG", `${key} must be an absolute path`, { key });
   }
+  if (resolve(value) === parse(resolve(value)).root) {
+    throw new ControlError("INVALID_CONFIG", `${key} must not be a filesystem root`, { key });
+  }
+  return value;
+}
+
+function boundedText(value: string, key: string): string {
+  if (Buffer.byteLength(value, "utf8") > 255 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new ControlError("INVALID_CONFIG", `${key} must be bounded single-line text`, { key });
+  }
+  return value;
+}
+
+function registryRemote(env: NodeJS.ProcessEnv): string {
+  const value = optional(env, "JHW_REGISTRY_REMOTE", "origin");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) {
+    throw new ControlError("INVALID_CONFIG", "JHW_REGISTRY_REMOTE must be a canonical remote name", {
+      key: "JHW_REGISTRY_REMOTE",
+    });
+  }
+  return value;
+}
+
+function registryBranch(env: NodeJS.ProcessEnv): string {
+  const value = optional(env, "JHW_REGISTRY_BRANCH", "main");
+  const components = value.split("/");
+  if (
+    value.length > 255 ||
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value) ||
+    value.includes("..") ||
+    value.includes("@{") ||
+    value.endsWith(".") ||
+    components.some((component) => !component || component === "." || component === ".." || component.endsWith(".lock"))
+  ) {
+    throw new ControlError("INVALID_CONFIG", "JHW_REGISTRY_BRANCH must be a canonical branch name", {
+      key: "JHW_REGISTRY_BRANCH",
+    });
+  }
   return value;
 }
 
@@ -85,19 +123,19 @@ export function loadControlConfig(env: NodeJS.ProcessEnv = process.env): Control
   }
   return {
     registryDir: absolutePath(env, "JHW_REGISTRY_DIR"),
-    registryRemote: optional(env, "JHW_REGISTRY_REMOTE", "origin"),
-    registryBranch: optional(env, "JHW_REGISTRY_BRANCH", "main"),
+    registryRemote: registryRemote(env),
+    registryBranch: registryBranch(env),
     worktreeRoot: absolutePath(env, "JHW_WORKTREE_ROOT"),
-    buildHost: required(env, "JHW_BUILD_HOST"),
+    buildHost: boundedText(required(env, "JHW_BUILD_HOST"), "JHW_BUILD_HOST"),
     githubOwner,
     projectNumber: projectNumber(env),
     registryRepository,
-    preflightProjectItemId: coordinate(
+    preflightProjectItemId: boundedText(coordinate(
       env,
       "JHW_PREFLIGHT_PROJECT_ITEM_ID",
       /^PVTI_[A-Za-z0-9_-]+$/,
       "must be a ProjectV2 item node ID",
-    ),
+    ), "JHW_PREFLIGHT_PROJECT_ITEM_ID"),
     preflightRegistryIssueNumber: positiveInteger(env, "JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER"),
     stateDir,
   };

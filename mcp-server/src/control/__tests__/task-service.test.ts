@@ -13,7 +13,7 @@ import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { TaskService } from "../task-service.js";
 import { WorktreeManager, worktreePlan } from "../worktree.js";
-import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 const localPaths: string[] = [];
@@ -522,7 +522,7 @@ describe("TaskService", () => {
     await writeFile(join(source, "README.md"), "# Source\n", "utf8");
     await git(source, "add", "README.md");
     await git(source, "commit", "-m", "Initial source");
-    const registry = new RegistryGit(config, new ProcessRunner());
+    const registry = isolatedRegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
     await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const alias = `${taskAlias}-release-crash`;
@@ -984,7 +984,7 @@ describe("TaskService", () => {
     await writeFile(join(source, "README.md"), "# Source\n", "utf8");
     await git(source, "add", "README.md");
     await git(source, "commit", "-m", "Initial source");
-    const registry = new RegistryGit(config, new ProcessRunner());
+    const registry = isolatedRegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
     await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const task = await catalog.registerTemporaryTask({
@@ -1114,7 +1114,7 @@ describe("TaskService", () => {
     await writeFile(join(source, "README.md"), "# Source\n", "utf8");
     await git(source, "add", ".gitignore", "README.md");
     await git(source, "commit", "-m", "Ignore local AI handoffs");
-    const registry = new RegistryGit(config, new ProcessRunner());
+    const registry = isolatedRegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
     await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const task = await catalog.registerTemporaryTask({
@@ -1184,7 +1184,7 @@ describe("TaskService", () => {
     await git(source, "add", "README.md");
     await git(source, "commit", "-m", "Initial source");
 
-    const registry = new RegistryGit(config, new ProcessRunner());
+    const registry = isolatedRegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
     await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const alias = `${taskAlias}-reused-handoff`;
@@ -1287,7 +1287,7 @@ describe("TaskService", () => {
     const fixture = await makeRegistryFixture();
     fixtures.push(fixture);
     const config = configFor(fixture.registryDir);
-    const registry = new RegistryGit(config, new ProcessRunner());
+    const registry = isolatedRegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
     await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const task = await catalog.registerTemporaryTask({

@@ -1,4 +1,5 @@
 import { isAbsolute, normalize, sep } from "node:path";
+import { realpath } from "node:fs/promises";
 
 import type { ControlConfig } from "./config.js";
 import { MAX_REGISTRY_RECORD_BYTES, type RegistryDirectoryEntry } from "./codec.js";
@@ -6,6 +7,7 @@ import { ControlError } from "./errors.js";
 import { MAX_HANDOFF_BYTES } from "./handoff.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import { githubSlugFromRemote } from "./github-source.js";
 
 export interface RegistryMutationResult {
   /** Exact registry-relative paths that this mutation changed and must stage. */
@@ -16,6 +18,7 @@ export type RegistryMutation = () => Promise<RegistryMutationResult>;
 
 export interface ProcessRunnerLike {
   run(command: string, args: string[], options?: ProcessRunOptions): Promise<ProcessResult>;
+  runRaw?(command: string, args: string[], options: ProcessRunOptions | undefined, maximumBytes: number): Promise<Buffer>;
 }
 
 interface RawProcessRunnerLike extends ProcessRunnerLike {
@@ -28,14 +31,6 @@ const MAX_HEAD_TREE_ROW_BYTES = 384;
 export interface RegistryTransactionResult {
   commit: string;
   changed: boolean;
-}
-
-function nonEmptyLines(output: string): string[] {
-  return output.split("\n").filter((line) => line.length > 0);
-}
-
-function changedPaths(status: string): string[] {
-  return nonEmptyLines(status).map((line) => line.slice(3));
 }
 
 function isSafeRegistryRelativePath(path: string): boolean {
@@ -63,6 +58,7 @@ export class RegistryGit {
       config.stateDir,
       config.worktreeRoot,
     ]),
+    private readonly isolatedFixtureRemote?: () => Promise<void>,
   ) {}
 
   /**
@@ -252,11 +248,11 @@ export class RegistryGit {
   }
 
   async transact(message: string, mutate: RegistryMutation): Promise<RegistryTransactionResult> {
-    const initialStatus = await this.git(["status", "--porcelain"]);
-    if (initialStatus.stdout.trim()) {
-      throw new ControlError("REGISTRY_DIRTY", "Registry checkout has pre-existing changes", {
-        registryDir: this.config.registryDir,
-      });
+    await this.assertRemoteIdentity();
+    await this.assertVisibleIndex();
+    const initialStatus = await this.registryStatus();
+    if (initialStatus.length > 0) {
+      throw new ControlError("REGISTRY_DIRTY", "Registry checkout has pre-existing or ignored changes");
     }
 
     await this.git(["fetch", this.config.registryRemote, this.config.registryBranch]);
@@ -271,14 +267,17 @@ export class RegistryGit {
 
     const mutation = await mutate();
     const stagedPaths = [...mutation.paths];
+    if (new Set(stagedPaths).size !== stagedPaths.length || stagedPaths.length > MAX_HEAD_DIRECTORY_ENTRIES) {
+      throw new ControlError("INVALID_MUTATION_PATH", "Registry mutation paths must be unique and bounded");
+    }
     for (const path of stagedPaths) {
       if (!isSafeRegistryRelativePath(path)) {
-        throw new ControlError("INVALID_MUTATION_PATH", "Registry mutations must return safe relative paths", { path });
+        throw new ControlError("INVALID_MUTATION_PATH", "Registry mutations must return safe relative paths");
       }
     }
 
-    const statusAfterMutation = await this.git(["status", "--porcelain", "--untracked-files=all"]);
-    const changed = changedPaths(statusAfterMutation.stdout);
+    await this.assertVisibleIndex();
+    const changed = (await this.registryStatus()).map((entry) => entry.path);
     if (changed.length === 0) {
       return { commit: initialHead, changed: false };
     }
@@ -289,15 +288,29 @@ export class RegistryGit {
       throw new ControlError(
         "MUTATION_PATH_MISMATCH",
         "Registry mutation changed paths not explicitly returned for staging",
-        { changed, stagedPaths, unreported },
       );
     }
 
-    await this.git(["add", "--", ...stagedPaths]);
+    // Force-add only the caller-declared canonical paths. This prevents a
+    // tracked/local exclude from turning a successful transaction into an
+    // uncommitted worktree-only record while retaining the exact path audit.
+    await this.git(["add", "-f", "--", ...stagedPaths]);
+    await this.assertVisibleIndex();
+    const staged = await this.nulPathList(["diff", "--cached", "--name-only", "-z", "HEAD", "--"]);
+    const unreportedStaged = staged.filter((path) => !stagedPathSet.has(path));
+    if (staged.length === 0 || unreportedStaged.length > 0) {
+      throw new ControlError("MUTATION_PATH_MISMATCH", "Registry staged tree does not match declared mutation paths");
+    }
+    const remaining = await this.registryStatus();
+    const remainingUnreported = remaining.map((entry) => entry.path).filter((path) => !stagedPathSet.has(path));
+    if (remainingUnreported.length > 0) {
+      throw new ControlError("MUTATION_PATH_MISMATCH", "Registry mutation left an unreported working-tree path");
+    }
     await this.git(["commit", "-m", message]);
     const commit = await this.revision("HEAD");
 
     try {
+      await this.assertRemoteIdentity();
       await this.git(["push", this.config.registryRemote, `HEAD:${this.config.registryBranch}`]);
     } catch (cause) {
       if (cause instanceof ControlError && cause.code === "COMMAND_FAILED" && isNonFastForwardPushFailure(cause)) {
@@ -326,6 +339,117 @@ export class RegistryGit {
     }
 
     return { commit, changed: true };
+  }
+
+  private async assertRemoteIdentity(): Promise<void> {
+    if (this.isolatedFixtureRemote) return this.isolatedFixtureRemote();
+    const observedRoot = (await this.git(["rev-parse", "--show-toplevel"])).stdout.trim();
+    let configuredRoot: string;
+    let actualRoot: string;
+    try {
+      [configuredRoot, actualRoot] = await Promise.all([
+        realpath(this.config.registryDir),
+        realpath(observedRoot),
+      ]);
+    } catch {
+      throw new ControlError("REGISTRY_ROOT_MISMATCH", "Registry directory is not the exact Git checkout root");
+    }
+    if (configuredRoot !== actualRoot) {
+      throw new ControlError("REGISTRY_ROOT_MISMATCH", "Registry directory is not the exact Git checkout root");
+    }
+    const fetchUrls = (await this.git([
+      "remote", "get-url", "--all", this.config.registryRemote,
+    ])).stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+    const pushUrls = (await this.git([
+      "remote", "get-url", "--push", "--all", this.config.registryRemote,
+    ])).stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (fetchUrls.length !== 1 || pushUrls.length !== 1) {
+      throw new ControlError("AMBIGUOUS_REGISTRY_REMOTE", "Registry remote must have exactly one fetch and push URL");
+    }
+    let fetchSlug: string;
+    let pushSlug: string;
+    try {
+      fetchSlug = githubSlugFromRemote(fetchUrls[0] as string, true);
+      pushSlug = githubSlugFromRemote(pushUrls[0] as string, true);
+    } catch {
+      throw new ControlError("REGISTRY_REMOTE_NOT_SSH", "Registry fetch and push URLs must be canonical GitHub SSH URLs");
+    }
+    if (
+      fetchSlug.toLowerCase() !== this.config.registryRepository.toLowerCase() ||
+      pushSlug.toLowerCase() !== this.config.registryRepository.toLowerCase()
+    ) {
+      throw new ControlError("REGISTRY_REMOTE_MISMATCH", "Registry fetch or push URL does not match configured repository identity");
+    }
+  }
+
+  private async assertVisibleIndex(): Promise<void> {
+    let rows: string[];
+    try {
+      rows = this.decodeNulRows(await this.rawGit(
+        ["ls-files", "-v", "-z", "--"],
+        MAX_HEAD_DIRECTORY_ENTRIES * MAX_HEAD_TREE_ROW_BYTES,
+      ));
+    } catch {
+      throw new ControlError("REGISTRY_INDEX_UNSAFE", "Registry index visibility could not be proven");
+    }
+    if (rows.length > MAX_HEAD_DIRECTORY_ENTRIES) {
+      throw new ControlError("REGISTRY_INDEX_UNSAFE", "Registry index exceeds its bounded audit");
+    }
+    for (const row of rows) {
+      if (!row.startsWith("H ") || !isSafeRegistryRelativePath(row.slice(2))) {
+        throw new ControlError(
+          "REGISTRY_INDEX_UNSAFE",
+          "Registry index contains a hidden, sparse, or noncanonical entry",
+        );
+      }
+    }
+  }
+
+  private async registryStatus(): Promise<Array<{ status: string; path: string }>> {
+    let rows: string[];
+    try {
+      rows = this.decodeNulRows(await this.rawGit(
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
+        MAX_HEAD_DIRECTORY_ENTRIES * MAX_HEAD_TREE_ROW_BYTES,
+      ));
+    } catch {
+      throw new ControlError("REGISTRY_DIRTY", "Registry checkout status could not be proven exactly");
+    }
+    if (rows.length > MAX_HEAD_DIRECTORY_ENTRIES) {
+      throw new ControlError("REGISTRY_DIRTY", "Registry checkout status exceeds its bounded audit");
+    }
+    const entries: Array<{ status: string; path: string }> = [];
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index] as string;
+      const status = row.slice(0, 2);
+      const path = row.slice(3);
+      if (row.length < 4 || row[2] !== " " || !isSafeRegistryRelativePath(path)) {
+        throw new ControlError("REGISTRY_DIRTY", "Registry checkout status contains an ambiguous path");
+      }
+      entries.push({ status, path });
+      if (/[RC]/.test(status)) {
+        const originalPath = rows[index + 1];
+        if (!originalPath || !isSafeRegistryRelativePath(originalPath)) {
+          throw new ControlError("REGISTRY_DIRTY", "Registry checkout rename source is invalid");
+        }
+        index += 1;
+        if (status.includes("R")) entries.push({ status, path: originalPath });
+      }
+    }
+    return entries;
+  }
+
+  private async nulPathList(args: string[]): Promise<string[]> {
+    let rows: string[];
+    try {
+      rows = this.decodeNulRows(await this.rawGit(args, MAX_HEAD_DIRECTORY_ENTRIES * MAX_HEAD_TREE_ROW_BYTES));
+    } catch {
+      throw new ControlError("MUTATION_PATH_MISMATCH", "Registry staged paths could not be proven exactly");
+    }
+    if (rows.length > MAX_HEAD_DIRECTORY_ENTRIES || rows.some((path) => !isSafeRegistryRelativePath(path))) {
+      throw new ControlError("MUTATION_PATH_MISMATCH", "Registry staged path audit is invalid");
+    }
+    return rows;
   }
 
   private async git(args: string[]): Promise<ProcessResult> {

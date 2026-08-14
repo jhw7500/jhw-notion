@@ -280,6 +280,18 @@ export class GitHubSourceService {
     if (!sameSlug(actualSlug, expectedSlug)) {
       throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout origin does not match the canonical Repository");
     }
+    const pushLines = (await this.options.runner.run(
+      "git",
+      ["remote", "get-url", "--push", "--all", "origin"],
+      { cwd: repositoryPath },
+    )).stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (pushLines.length !== 1) {
+      throw new ControlError("AMBIGUOUS_CHECKOUT_ORIGIN", "Checkout must have exactly one effective push URL");
+    }
+    const pushSlug = githubSlugFromRemote(pushLines[0] as string);
+    if (!sameSlug(pushSlug, expectedSlug)) {
+      throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout push URL does not match the canonical Repository");
+    }
   }
 
   private assertCheckoutSafe(value: unknown, repositoryPath: string): void {

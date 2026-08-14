@@ -8,7 +8,7 @@ import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitiv
 function config(): ControlConfig {
   return {
     registryDir: "/srv/registry",
-    registryRemote: "git@github.com:owner/registry.git",
+    registryRemote: "origin",
     registryBranch: "main",
     worktreeRoot: "/srv/worktrees",
     buildHost: "build-host",
@@ -60,6 +60,8 @@ function service(input: {
   runner?: QueuedRunner;
   project?: PreflightProjectPort;
   remoteUrl?: string;
+  pushRemoteUrl?: string;
+  registryRoot?: string;
   authority?: { observeCommittedLegacy(): Promise<void> };
   notion?: { verifyReadOnlyRoutes(): Promise<void> };
   repository?: { verifyPrivateRepository(slug: string): Promise<void> };
@@ -83,6 +85,8 @@ function service(input: {
       repository: input.repository ?? { verifyPrivateRepository: async () => undefined },
       sensitiveData: input.sensitiveData,
       remoteUrl: async () => input.remoteUrl ?? "git@github.com:owner/registry.git",
+      pushRemoteUrl: async () => input.pushRemoteUrl ?? input.remoteUrl ?? "git@github.com:owner/registry.git",
+      registryRoot: async () => input.registryRoot ?? config().registryDir,
       today: () => "2026-08-13",
     }),
   };
@@ -268,8 +272,11 @@ describe("PreflightService", () => {
       "--raw-field", "body=unchanged",
     ]);
     expect(runner.calls).toEqual([
-      { command: "git", args: ["fetch", "git@github.com:owner/registry.git", "main"], cwd: "/srv/registry" },
-      { command: "git", args: ["push", "--dry-run", "git@github.com:owner/registry.git", "HEAD:main"], cwd: "/srv/registry" },
+      { command: "git", args: ["status", "--porcelain=v1", "--untracked-files=all"], cwd: "/srv/registry" },
+      { command: "git", args: ["fetch", "origin", "main"], cwd: "/srv/registry" },
+      { command: "git", args: ["rev-parse", "HEAD"], cwd: "/srv/registry" },
+      { command: "git", args: ["rev-parse", "origin/main"], cwd: "/srv/registry" },
+      { command: "git", args: ["push", "--dry-run", "origin", "HEAD:main"], cwd: "/srv/registry" },
     ]);
   });
 
@@ -289,5 +296,68 @@ describe("PreflightService", () => {
 
     await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_REMOTE_MISMATCH" });
     expect(runner.calls).toEqual([]);
+  });
+
+  it("rejects a different effective Registry push URL before trial mutations", async () => {
+    let projectCalls = 0;
+    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const { preflight, runner } = service({
+      pushRemoteUrl: "git@github.com:owner/other.git",
+      project,
+    });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_REMOTE_MISMATCH" });
+    expect(projectCalls).toBe(0);
+    expect(runner.ghCalls).toHaveLength(1);
+  });
+
+  it("rejects a Registry subdirectory before trial mutations", async () => {
+    let projectCalls = 0;
+    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const { preflight, runner } = service({
+      registryRoot: "/srv/registry-parent",
+      project,
+    });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_ROOT_MISMATCH" });
+    expect(projectCalls).toBe(0);
+    expect(runner.ghCalls).toHaveLength(1);
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  it("rejects a dirty Registry checkout before trial mutations", async () => {
+    const runner = new QueuedRunner();
+    const run = runner.run.bind(runner);
+    runner.run = async (command, args, options) => args[0] === "status"
+      ? { command, args, stdout: "?? repositories/untracked.yaml\n", stderr: "", exitCode: 0 }
+      : run(command, args, options);
+    let projectCalls = 0;
+    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const { preflight } = service({ runner, project });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_DIRTY" });
+    expect(projectCalls).toBe(0);
+    expect(runner.ghCalls).toHaveLength(1);
+  });
+
+  it("rejects a locally ahead Registry checkout before trial mutations", async () => {
+    const runner = new QueuedRunner();
+    const run = runner.run.bind(runner);
+    runner.run = async (command, args, options) => args[0] === "rev-parse"
+      ? {
+        command,
+        args,
+        stdout: args[1] === "HEAD" ? `${"a".repeat(40)}\n` : `${"b".repeat(40)}\n`,
+        stderr: "",
+        exitCode: 0,
+      }
+      : run(command, args, options);
+    let projectCalls = 0;
+    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const { preflight } = service({ runner, project });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "REMOTE_DIVERGED" });
+    expect(projectCalls).toBe(0);
+    expect(runner.ghCalls).toHaveLength(1);
   });
 });

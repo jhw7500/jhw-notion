@@ -8,7 +8,7 @@ import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
-import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { commitFile, configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 const fixedNow = new Date("2026-08-13T12:34:56.789Z");
@@ -31,7 +31,7 @@ async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: S
   const fixture = await makeRegistryFixture();
   fixtures.push(fixture);
   const config = configFor(fixture.registryDir);
-  const registry = new RegistryGit(config, new ProcessRunner());
+  const registry = isolatedRegistryGit(config, new ProcessRunner());
   const catalog = new Catalog(config, registry);
   await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
   const task = await catalog.registerTemporaryTask({
@@ -722,7 +722,7 @@ describe("ClaimService", () => {
         validation: ["npm test: pass"],
         handoff_path: handoffPath,
       }),
-    ).rejects.toMatchObject({ code: "HANDOFF_MISSING" });
+    ).rejects.toMatchObject({ code: "REGISTRY_DIRTY" });
     expect(await claims.getActive(active.task_id)).toEqual(active);
   });
 

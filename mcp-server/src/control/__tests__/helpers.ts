@@ -6,6 +6,9 @@ import { promisify } from "node:util";
 
 import type { ControlConfig } from "../config.js";
 import { sanitizedChildEnvironment } from "../process.js";
+import type { ProcessRunnerLike } from "../registry-git.js";
+import { RegistryGit } from "../registry-git.js";
+import type { SensitiveDataPolicy } from "../sensitive-data.js";
 
 const execFile = promisify(execFileCallback);
 const TEST_NAME = "Phase1A Test";
@@ -83,4 +86,13 @@ export function configFor(registryDir: string): ControlConfig {
     preflightRegistryIssueNumber: 1,
     stateDir: join(dirname(registryDir), "state"),
   };
+}
+
+/** Explicit local-bare-remote identity injection for isolated unit fixtures only. */
+export function isolatedRegistryGit(
+  config: ControlConfig,
+  runner: ProcessRunnerLike,
+  sensitiveData?: SensitiveDataPolicy,
+): RegistryGit {
+  return new RegistryGit(config, runner, sensitiveData, async () => undefined);
 }
