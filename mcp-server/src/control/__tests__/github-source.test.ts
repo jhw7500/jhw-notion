@@ -175,6 +175,23 @@ describe("GitHubSourceService", () => {
     });
   });
 
+  it("rejects an unsafe Issue number before any checkout or GitHub request", async () => {
+    const { service, catalog, projects, runner } = fixture();
+
+    await expect(service.registerFormalTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      repository_path: checkout,
+      issue_url: `https://github.com/jhw7500/wlan/issues/${"9".repeat(400)}`,
+    })).rejects.toMatchObject({ code: "INVALID_ISSUE_URL" });
+
+    expect(catalog.getRepository).not.toHaveBeenCalled();
+    expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+    expect(projects.requireProjectRepository).not.toHaveBeenCalled();
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(runner.runGh).not.toHaveBeenCalled();
+  });
+
   it("rejects caller compatibility coordinates that disagree with the verified Issue", async () => {
     const { service, catalog } = fixture();
 

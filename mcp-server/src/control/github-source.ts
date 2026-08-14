@@ -28,7 +28,7 @@ const RepositoryResponseSchema = z.object({
 
 const IssueResponseSchema = z.object({
   node_id: githubNodeId,
-  number: z.number().int().positive(),
+  number: z.number().int().positive().safe(),
   html_url: z.string().url(),
   updated_at: z.string().datetime({ offset: true }),
   state: z.enum(["open", "closed"]),
@@ -124,7 +124,11 @@ function issueCoordinates(issueUrl: string): { slug: string; number: number; can
     throw new ControlError("INVALID_ISSUE_URL", "Issue URL must be a canonical GitHub Issue URL");
   }
   const slug = `${match[1]}/${match[2]}`;
-  return { slug, number: Number(match[3]), canonicalUrl: `https://github.com/${slug}/issues/${match[3]}` };
+  const number = Number(match[3]);
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw new ControlError("INVALID_ISSUE_URL", "Issue URL contains an unsafe Issue number");
+  }
+  return { slug, number, canonicalUrl: `https://github.com/${slug}/issues/${match[3]}` };
 }
 
 export class GitHubSourceService {
@@ -162,6 +166,7 @@ export class GitHubSourceService {
     expected_issue_node_id?: string;
     expected_issue_revision?: string;
   }): Promise<FormalTaskRegistration> {
+    issueCoordinates(input.issue_url);
     const { repository_path: _repositoryPath, ...content } = input;
     this.assertCheckoutSafe(content, input.repository_path);
     const context = await this.requireContext(input.project_id, input.repo_id, input.repository_path);
@@ -195,6 +200,7 @@ export class GitHubSourceService {
     this.assertCheckoutSafe(task, input.repository_path);
     const context = await this.requireContext(task.project_id, task.repo_id, input.repository_path);
     if (task.kind === "formal") {
+      issueCoordinates(task.issue_url);
       const issue = await this.resolveIssue(context.repository, task.issue_url);
       if (issue.issue_node_id !== task.issue_node_id) {
         throw new ControlError("ISSUE_IDENTITY_MISMATCH", "Canonical Task and verified Issue node ID disagree");
@@ -228,6 +234,7 @@ export class GitHubSourceService {
     expected_issue_node_id?: string;
     expected_issue_revision?: string;
   }): Promise<FormalTask> {
+    issueCoordinates(input.issue_url);
     const { repository_path: _repositoryPath, ...content } = input;
     this.assertCheckoutSafe(content, input.repository_path);
     const current = await this.options.catalog.getTask(input.task_id);

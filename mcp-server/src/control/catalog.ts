@@ -388,6 +388,14 @@ export class Catalog {
         return paths.length > 0 ? stage(paths) : noChanges();
       }
 
+      if (current.lifecycle === "completed") {
+        throw new ControlError("TASK_COMPLETED", "Completed temporary Tasks cannot be promoted");
+      }
+      const activeClaim = await this.records.readOptionalJson(`claims/active/${taskId}.yaml`, z.unknown());
+      if (activeClaim !== undefined) {
+        throw new ControlError("TASK_ACTIVE_CLAIM", "Temporary Tasks with an active Claim cannot be promoted");
+      }
+
       if (current.project_id !== input.project_id || current.repo_id !== input.repo_id) {
         throw new ControlError("TASK_SCOPE_MISMATCH", "Temporary Task project/repository does not match the GitHub Issue", {
           task_id: taskId,
@@ -628,6 +636,7 @@ export class Catalog {
       seenTasks.add(task.id);
     }
     const taskEntries = await this.records.listDirectoryEntries("tasks", maximumCatalogEntries);
+    const seenAliases = new Set<string>();
     for (const entry of taskEntries) {
       if (entry.kind === "directory") {
         if (entry.name !== "by-source") throw corruption("Task directory contains an unexpected subdirectory", { entry: entry.name });
@@ -639,6 +648,10 @@ export class Catalog {
       const id = entry.name.slice(0, -".yaml".length);
       if (!taskIdPattern.test(id)) throw corruption("Task directory contains a malformed Task ID", { entry: entry.name });
       const task = await this.taskAt(id);
+      for (const alias of task.aliases) {
+        if (seenAliases.has(alias)) throw corruption("Task alias is mapped more than once", { alias });
+        seenAliases.add(alias);
+      }
       if (task.kind === "formal" && !seenTasks.has(task.id)) {
         throw corruption("Formal Task record has no exact source index", { task_id: task.id });
       }
