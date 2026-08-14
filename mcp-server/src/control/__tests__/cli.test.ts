@@ -927,6 +927,34 @@ describe("runCli", () => {
     expect(JSON.parse(result.stderr)).toEqual({ error: { code } });
   });
 
+  it.each([
+    "PREFLIGHT_RESTORE_FAILED",
+    "PREFLIGHT_PROJECT_INTEGRITY",
+    "INVALID_PREFLIGHT_ISSUE",
+    "INVALID_PREFLIGHT_ITEM",
+    "INVALID_PROJECT_FIELDS",
+    "INVALID_PROJECT_RESPONSE",
+    "INVALID_REPOSITORY_RESPONSE",
+    "COMMAND_ABORTED",
+    "SENSITIVE_DATA_REJECTED",
+  ])("maps malformed or indeterminate preflight error %s to exit 78", async (code) => {
+    const result = await runCli(["preflight"], makeCliDependencies({
+      preflight: { run: async () => { throw new ControlError(code, "untrusted diagnostic"); } },
+    }));
+
+    expect(result.exitCode).toBe(78);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code } });
+  });
+
+  it("maps a preflight lock-acquisition timeout to retryable exit 75", async () => {
+    const result = await runCli(["preflight"], makeCliDependencies({
+      preflight: { run: async () => { throw new ControlError("LOCK_ACQUIRE_TIMEOUT", "untrusted diagnostic"); } },
+    }));
+
+    expect(result.exitCode).toBe(75);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "LOCK_ACQUIRE_TIMEOUT" } });
+  });
+
   it("lists every Phase 1A command in JSON help output", async () => {
     const result = await runCli(["--help"], makeCliDependencies());
     const help = result.stdout;

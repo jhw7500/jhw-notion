@@ -959,6 +959,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       authority: { observeCommittedLegacy: async () => undefined },
       notion: { verifyReadOnlyRoutes: async () => undefined },
       repository: { verifyPrivateRepository: async () => undefined },
+      registry: { assertReady: async () => undefined },
     });
     const caughtMetadata: RawErrorAudit[] = [];
     const auditedPreflight = {

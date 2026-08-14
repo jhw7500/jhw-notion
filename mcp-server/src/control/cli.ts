@@ -370,10 +370,17 @@ function errorCode(cause: unknown): string {
   return cause.code;
 }
 
-function exitCode(cause: unknown): CliResult["exitCode"] {
+function exitCode(cause: unknown, command?: CommandName): CliResult["exitCode"] {
   const code = errorCode(cause);
   if (new Set(["TASK_ALREADY_CLAIMED", "CLAIM_MISMATCH", "CLAIM_NOT_FOUND"]).has(code)) return 4;
-  if (new Set(["REMOTE_DIVERGED", "REMOTE_VERIFY_FAILED", "REGISTRY_DIRTY", "LOCK_BUSY", "LOCK_CONTENDED"]).has(code)) return 75;
+  if (new Set([
+    "REMOTE_DIVERGED", "REMOTE_VERIFY_FAILED", "REGISTRY_DIRTY", "LOCK_BUSY", "LOCK_CONTENDED", "LOCK_ACQUIRE_TIMEOUT",
+  ]).has(code)) return 75;
+  if (code === "INVALID_CLI_ARGUMENT") return 2;
+  // A syntactically valid live-preflight invocation is a go/no-go probe. Any
+  // indeterminate, malformed, unavailable, privacy, or restore failure is a
+  // stable configuration/policy NO-GO rather than an ordinary command error.
+  if (command === "preflight") return 78;
   if (new Set([
     "AUTHORITY_UNAVAILABLE",
     "AUTHORITY_EPOCH_ROLLBACK",
@@ -398,7 +405,6 @@ function exitCode(cause: unknown): CliResult["exitCode"] {
     "REPOSITORY_NOT_PRIVATE",
     "COMMAND_TIMEOUT",
   ]).has(code)) return 78;
-  if (code === "INVALID_CLI_ARGUMENT") return 2;
   return 1;
 }
 
@@ -419,7 +425,7 @@ function conflictingClaim(cause: unknown): ConflictingClaimSummary | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
-export function controlErrorResult(cause: unknown): CliResult {
+export function controlErrorResult(cause: unknown, command?: CommandName): CliResult {
   const code = errorCode(cause);
   const conflict = conflictingClaim(cause);
   const retained = code === "TASK_ALREADY_CLAIMED" ? undefined : retainedClaim(cause);
@@ -428,7 +434,7 @@ export function controlErrorResult(cause: unknown): CliResult {
     ...(conflict ? { conflicting_claim: conflict } : {}),
     ...(retained ? { retained_claim: retained } : {}),
   };
-  return { exitCode: exitCode(cause), stdout: "", stderr: `${JSON.stringify({ error })}\n` };
+  return { exitCode: exitCode(cause, command), stdout: "", stderr: `${JSON.stringify({ error })}\n` };
 }
 
 function journalMetadata(command: CommandName, flags: ParsedFlags | undefined): {
@@ -825,9 +831,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
   } catch (cause) {
     if (cause instanceof ParsedCommandFailure) {
       flags = cause.flags;
-      result = controlErrorResult(cause.originalCause);
+      result = controlErrorResult(cause.originalCause, command);
     } else {
-      result = controlErrorResult(cause);
+      result = controlErrorResult(cause, command);
     }
     // Argument rejection is not a command execution and therefore must not
     // invoke the measurement journal.

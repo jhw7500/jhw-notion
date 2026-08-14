@@ -45,7 +45,7 @@ export interface PreflightServiceOptions {
   authority: PreflightAuthorityPort;
   notion: PreflightNotionPort;
   repository: PreflightRepositoryPort;
-  registry?: PreflightRegistryPort;
+  registry: PreflightRegistryPort;
   sensitiveData?: SensitiveDataPolicy;
   remoteUrl?: () => Promise<string>;
   pushRemoteUrl?: () => Promise<string>;
@@ -130,6 +130,9 @@ export class PreflightService {
   private readonly sensitiveData: SensitiveDataPolicy;
 
   constructor(private readonly options: PreflightServiceOptions) {
+    if (!options.registry || typeof options.registry.assertReady !== "function") {
+      throw new ControlError("INVALID_CONFIG", "Preflight requires the exact Registry readiness authority port");
+    }
     this.today = options.today ?? (() => new Date().toISOString().slice(0, 10));
     this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy(options.environment, [
       options.config.registryDir,
@@ -154,7 +157,7 @@ export class PreflightService {
     if (scopes.size !== 1) throw new ControlError("PROJECT_SCOPE_NOT_EXACT", "Project token must expose exactly project scope");
 
     await this.options.repository.verifyPrivateRepository(this.options.config.registryRepository);
-    await this.options.registry?.assertReady();
+    await this.options.registry.assertReady();
 
     const observedRoot = this.options.registryRoot
       ? await this.options.registryRoot()

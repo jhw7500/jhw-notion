@@ -105,6 +105,18 @@ function service(input: {
 }
 
 describe("PreflightService", () => {
+  it("requires the exact Registry readiness authority port", () => {
+    expect(() => new PreflightService({
+      config: config(),
+      environment: { GH_PROJECT_TOKEN: "project-secret", GH_REPO_TOKEN: "repo-secret" },
+      runner: new QueuedRunner(),
+      project: projectPort(),
+      authority: { observeCommittedLegacy: async () => undefined },
+      notion: { verifyReadOnlyRoutes: async () => undefined },
+      repository: { verifyPrivateRepository: async () => undefined },
+    } as any)).toThrow(expect.objectContaining({ code: "INVALID_CONFIG" }));
+  });
+
   it("rejects protected Registry Issue content before an unchanged write or Project mutation", async () => {
     const secret = "unmistakably-fake-preflight-token";
     const runner = new QueuedRunner();
