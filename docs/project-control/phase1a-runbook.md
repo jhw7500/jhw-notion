@@ -136,7 +136,7 @@ jhw-control repository register \
   --repo-id <repo-id> --slug <owner/name> --repo-path <absolute-checkout-root>
 ```
 
-이 명령은 exact checkout root, 단 하나의 matching GitHub origin, private repository, GitHub node ID를 검증한 뒤 Repository Record를 만든다. 동일 node/slug 재호출은 idempotent다. 저장소 rename 후 origin과 `--slug`가 새 이름을 가리키더라도 GitHub node ID가 같으면 Repository Record와 종속 formal Task의 Issue URL·정식 alias를 한 Registry transaction에서 갱신하므로 기존 `task_id`로 재개할 수 있다. 다른 node 충돌에서는 멈춘다.
+이 명령은 exact checkout root, 단 하나의 matching GitHub origin, private repository, GitHub node ID를 검증한 뒤 Repository Record를 만든다. 동일 node/slug 재호출은 idempotent다. 저장소 rename 후 origin과 `--slug`가 새 이름을 가리키더라도 GitHub node ID가 같으면 Repository Record와 종속 formal Task의 Issue URL·현재 정식 alias를 한 Registry transaction에서 갱신한다. 이미 생성된 Claim·Handoff·worktree 좌표가 참조하는 이전 정식 alias는 같은 `task_id`의 호환 alias로 보존하므로 active 작업과 기존 Handoff를 계속 종료·재개할 수 있다. 다른 node 또는 전역 alias 충돌에서는 Registry를 바꾸지 않고 멈춘다.
 
 그 다음 `/jhw:project --trial`에서 Project ID, title, objective, repository ID 목록, 다섯 운영 필드를 하나의 제안으로 보고 한 번 승인한다.
 

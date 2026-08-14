@@ -132,7 +132,7 @@ describe("Catalog", () => {
     });
   });
 
-  it("rejects restored noncanonical Repository slugs and foreign formal-looking aliases", async () => {
+  it("rejects restored noncanonical Repository slugs and formal aliases for another Issue number", async () => {
     const { catalog, fixture } = await catalogFixture();
     const repository = (await catalog.registerRepository(repositoryInput)).repository;
     const formal = (await catalog.registerFormalTask(issueInput)).task;
@@ -145,7 +145,7 @@ describe("Catalog", () => {
 
     await commitFile(fixture.registryDir, `repositories/${repository.id}.yaml`, `${JSON.stringify(repository)}\n`);
     await commitFile(fixture.registryDir, `tasks/${formal.id}.yaml`, `${JSON.stringify({
-      ...formal, aliases: ["evil/repository#1", ...formal.aliases],
+      ...formal, aliases: ["evil/repository#2", ...formal.aliases],
     })}\n`);
     await git(fixture.registryDir, "push", "origin", "main");
     await expect(catalog.getTask(formal.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
@@ -224,7 +224,16 @@ describe("Catalog", () => {
   it("atomically migrates dependent formal Task locators on a verified same-node Repository rename", async () => {
     const { catalog } = await catalogFixture();
     await catalog.registerRepository(repositoryInput);
-    const formal = await catalog.registerFormalTask(issueInput);
+    const temporaryAlias = "wlan:pre-rename-work";
+    const temporary = await catalog.registerTemporaryTask({
+      project_id: issueInput.project_id,
+      repo_id: issueInput.repo_id,
+      alias: temporaryAlias,
+      goal: "preserve the existing alias across a verified rename",
+      done_conditions: ["rename remains resumable"],
+      expected_scope: ["src/control"],
+    });
+    const formal = { task: await catalog.promoteTemporaryTask(temporary.id, issueInput) };
     const renamedSlug = "jhw7500/wlan-renamed";
     const renamedIssue = {
       ...issueInput,
@@ -242,12 +251,39 @@ describe("Catalog", () => {
       repo_id: repositoryInput.repo_id,
       issue_node_id: issueInput.issue_node_id,
       issue_url: renamedIssue.issue_url,
-      aliases: [renamedIssue.alias],
+      aliases: [renamedIssue.alias, temporaryAlias, issueInput.alias],
     });
     await expect(catalog.registerFormalTask(renamedIssue)).resolves.toMatchObject({
-      task: { id: formal.task.id, issue_url: renamedIssue.issue_url, aliases: [renamedIssue.alias] },
+      task: {
+        id: formal.task.id,
+        issue_url: renamedIssue.issue_url,
+        aliases: [renamedIssue.alias, temporaryAlias, issueInput.alias],
+      },
       created: false,
     });
+  });
+
+  it("fails a same-node Repository rename before mutation when its target alias belongs to another Task", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = await catalog.registerFormalTask(issueInput);
+    const renamedSlug = "jhw7500/wlan-renamed";
+    await catalog.registerTemporaryTask({
+      project_id: issueInput.project_id,
+      repo_id: issueInput.repo_id,
+      alias: `${renamedSlug}#1`,
+      goal: "reserve the target alias",
+      done_conditions: ["rename fails closed"],
+      expected_scope: ["src/control"],
+    });
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerRepository({ ...repositoryInput, slug: renamedSlug }))
+      .rejects.toMatchObject({ code: "TASK_ALIAS_CONFLICT" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+    await expect(catalog.getRepository(repositoryInput.repo_id)).resolves.toMatchObject({ slug: repositoryInput.slug });
+    await expect(catalog.getTask(formal.task.id)).resolves.toMatchObject({ aliases: [issueInput.alias] });
   });
 
   it("requires a canonical Repository record before creating any Task", async () => {

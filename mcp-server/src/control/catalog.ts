@@ -637,7 +637,10 @@ export class Catalog {
       const previousAlias = `${coordinates[1]}/${coordinates[2]}#${issueNumber}`;
       const nextAlias = `${nextSlug}#${issueNumber}`;
       await this.assertAliasAvailable(nextAlias, task.id);
-      const aliases = task.aliases.map((alias) => alias === previousAlias ? nextAlias : alias);
+      // Claims and worktree coordinates freeze the alias used at acquisition.
+      // Keep every previous locator attached to this canonical task_id while
+      // placing the newly verified canonical alias first for new Claims.
+      const aliases = [nextAlias, ...task.aliases.filter((alias) => alias !== nextAlias)];
       const updated = record(FormalTaskSchema, {
         ...task,
         aliases,

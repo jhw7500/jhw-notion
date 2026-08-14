@@ -77,8 +77,15 @@ export const FormalTaskSchema = z
     if (!task.aliases.includes(canonicalAlias)) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["aliases"], message: "Formal Task is missing its canonical Issue alias" });
     }
-    if (task.aliases.some((alias) => formalAliasPattern.test(alias) && alias !== canonicalAlias)) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ["aliases"], message: "Formal-looking Task alias disagrees with its Issue URL" });
+    if (task.aliases.some((alias) => {
+      if (!formalAliasPattern.test(alias) || alias === canonicalAlias) return false;
+      return alias.slice(alias.lastIndexOf("#") + 1) !== coordinates[3];
+    })) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["aliases"],
+        message: "Historical formal Task alias disagrees with its canonical Issue number",
+      });
     }
   });
 export type FormalTask = z.infer<typeof FormalTaskSchema>;

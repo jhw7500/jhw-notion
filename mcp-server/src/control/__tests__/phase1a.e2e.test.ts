@@ -1673,6 +1673,29 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
     const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const secondIssue = {
+      ...issueInput,
+      issue_node_id: "I_phase1a_second",
+      issue_url: "https://github.com/jhw7500/control/issues/2",
+      alias: "jhw7500/control#2",
+    };
+    const releasedBeforeRename = (await graph.catalog.registerFormalTask(secondIssue)).task;
+    const initialDependencies = cliDependencies(graph);
+    const initialStart = await runCli([
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-before-repository-rename",
+    ], initialDependencies);
+    expect(initialStart.exitCode).toBe(0);
+    const initialClaimId = JSON.parse(initialStart.stdout).result.claim.claim_id as string;
+    const releasedStart = await runCli([
+      "task", "start", "--task", releasedBeforeRename.id, "--repo-path", fixture.sourceRepo,
+      "--session", "codex-released-before-repository-rename",
+    ], initialDependencies);
+    expect(releasedStart.exitCode).toBe(0);
+    const releasedClaimId = JSON.parse(releasedStart.stdout).result.claim.claim_id as string;
+    expect((await runCli([
+      "task", "finish", "--task", releasedBeforeRename.id, "--claim", releasedClaimId, "--status", "handoff",
+      "--validation", "pre-rename handoff: pass", "--progress", "resume after the repository rename",
+    ], initialDependencies)).exitCode).toBe(0);
     const renamedSlug = "jhw7500/control-renamed";
     await git(fixture.sourceRepo, "remote", "add", "origin", `git@github.com:${renamedSlug}.git`);
 
@@ -1699,6 +1722,18 @@ describe("Phase 1A deterministic adversarial gate", () => {
             })}\n`,
           };
         }
+        if (route === `repos/${renamedSlug}/issues/2`) {
+          return {
+            command: "gh", args, stderr: "", exitCode: 0,
+            stdout: `${JSON.stringify({
+              node_id: secondIssue.issue_node_id,
+              number: 2,
+              html_url: `https://github.com/${renamedSlug}/issues/2`,
+              updated_at: secondIssue.issue_revision,
+              state: "open",
+            })}\n`,
+          };
+        }
         throw new Error(`Unexpected fake GitHub route: ${route ?? "missing"}`);
       },
     };
@@ -1720,12 +1755,30 @@ describe("Phase 1A deterministic adversarial gate", () => {
       id: formal.id,
       issue_node_id: issueInput.issue_node_id,
       issue_url: `https://github.com/${renamedSlug}/issues/1`,
-      aliases: [`${renamedSlug}#1`],
+      aliases: [`${renamedSlug}#1`, issueInput.alias],
     });
+    await expect(graph.catalog.getTask(releasedBeforeRename.id)).resolves.toMatchObject({
+      id: releasedBeforeRename.id,
+      issue_node_id: secondIssue.issue_node_id,
+      issue_url: `https://github.com/${renamedSlug}/issues/2`,
+      aliases: [`${renamedSlug}#2`, secondIssue.alias],
+    });
+
+    const renamedDependencies = cliDependencies(graph, { source });
+    expect((await runCli([
+      "task", "status", "--task", formal.id, "--claim", initialClaimId,
+    ], renamedDependencies)).exitCode).toBe(0);
+    expect((await runCli([
+      "task", "recover", "--task", formal.id, "--expect", initialClaimId, "--action", "status",
+    ], renamedDependencies)).exitCode).toBe(0);
+    expect((await runCli([
+      "task", "finish", "--task", formal.id, "--claim", initialClaimId, "--status", "handoff",
+      "--validation", "rename lifecycle: pass", "--progress", "resume after verified rename",
+    ], renamedDependencies)).exitCode).toBe(0);
 
     const resumed = await runCli([
       "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-after-repository-rename",
-    ], cliDependencies(graph, { source }));
+    ], renamedDependencies);
     expect(resumed.exitCode).toBe(0);
     expect(JSON.parse(resumed.stdout).result).toMatchObject({
       task: { task_id: formal.id },
@@ -1733,7 +1786,16 @@ describe("Phase 1A deterministic adversarial gate", () => {
     });
     await expect(graph.claims.getActive(formal.id)).resolves.toMatchObject({
       task_id: formal.id,
-      task_alias: `${renamedSlug}#1`,
+      task_alias: issueInput.alias,
     });
-  }, 20_000);
+    const resumedReleased = await runCli([
+      "task", "start", "--task", releasedBeforeRename.id, "--repo-path", fixture.sourceRepo,
+      "--session", "codex-after-pre-rename-handoff",
+    ], renamedDependencies);
+    expect(resumedReleased.exitCode).toBe(0);
+    await expect(graph.claims.getActive(releasedBeforeRename.id)).resolves.toMatchObject({
+      task_id: releasedBeforeRename.id,
+      task_alias: secondIssue.alias,
+    });
+  }, 30_000);
 });
