@@ -126,6 +126,10 @@ export interface TaskCleanupRecoveryResult {
 
 export type TaskRecoveryResult = RecoveryResult | TaskCleanupRecoveryResult;
 
+export interface TaskServiceHooks {
+  afterClaim?: (claim: ActiveClaim) => void | Promise<void>;
+}
+
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -279,6 +283,7 @@ export class TaskService {
     private readonly registry: RegistryGitPort,
     private readonly now: () => Date = () => new Date(),
     sensitiveData?: SensitiveDataPolicy,
+    private readonly hooks: TaskServiceHooks = {},
   ) {
     this.records = new RegistryRecordStore(config.registryDir, registry);
     this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [
@@ -294,19 +299,17 @@ export class TaskService {
     createSensitiveDataPolicy(process.env, [input.repository_path]).assertSafe(content);
     const currentActive = await this.claims.getActive(input.task_id);
     let latestHistory: ClaimHistory | undefined;
-    if (!currentActive) {
-      try {
-        latestHistory = await this.claims.latestClaimHistory(input.task_id);
-      } catch (cause) {
-        if (!(cause instanceof ControlError && cause.code === "CLAIM_HISTORY_NOT_FOUND")) throw cause;
-      }
+    try {
+      latestHistory = await this.claims.latestClaimHistory(input.task_id);
+    } catch (cause) {
+      if (!(cause instanceof ControlError && cause.code === "CLAIM_HISTORY_NOT_FOUND")) throw cause;
     }
     const reusableHistory = latestHistory?.task_alias && (
       latestHistory.status === "handoff" ||
       latestHistory.status === "force-ended" ||
       (latestHistory.status === "abandoned" && latestHistory.outcome === "worktree_create_failed")
     ) ? latestHistory : undefined;
-    const taskAlias = reusableHistory?.task_alias ?? input.task_alias;
+    const taskAlias = currentActive?.task_alias ?? reusableHistory?.task_alias ?? input.task_alias;
     const plan = worktreePlan(input.task_id, taskAlias);
     if (reusableHistory && (
       reusableHistory.task_id !== input.task_id ||
@@ -317,8 +320,32 @@ export class TaskService {
     )) {
       throw new ControlError("REGISTRY_CORRUPT", "Released Claim history has inconsistent Task coordinates");
     }
-    const retained = currentActive
-      ? { claim_id: currentActive.claim_id, worktree_ref: currentActive.worktree_ref, disposition: "active" as const }
+    if (currentActive && (
+      currentActive.task_id !== input.task_id ||
+      currentActive.project_id !== input.project_id ||
+      currentActive.repo_id !== input.repo_id ||
+      currentActive.host !== this.config.buildHost ||
+      currentActive.branch !== plan.branch ||
+      currentActive.worktree_ref !== plan.worktree_ref
+    )) {
+      throw new ControlError("REGISTRY_CORRUPT", "Active Claim has inconsistent Task/worktree coordinates");
+    }
+    if (currentActive?.predecessor_claim_id && currentActive.predecessor_claim_id !== reusableHistory?.claim_id) {
+      throw new ControlError("REGISTRY_CORRUPT", "Active Claim predecessor is not the exact latest reusable release");
+    }
+    const retained = currentActive?.predecessor_claim_id && reusableHistory
+      ? {
+          claim_id: reusableHistory.claim_id,
+          successor_claim_id: currentActive.claim_id,
+          worktree_ref: reusableHistory.worktree_ref,
+          disposition: reusableHistory.status === "handoff"
+            ? "handoff" as const
+            : reusableHistory.status === "force-ended"
+              ? "force-ended" as const
+              : "create-failed" as const,
+        }
+      : currentActive
+        ? { claim_id: currentActive.claim_id, worktree_ref: currentActive.worktree_ref, disposition: "active" as const }
       : reusableHistory
         ? {
             claim_id: reusableHistory.claim_id,
@@ -335,16 +362,19 @@ export class TaskService {
       taskAlias,
       retained,
     );
-    const claim = await this.claims.claimTask({
-      task_id: input.task_id,
-      task_alias: taskAlias,
-      project_id: input.project_id,
-      repo_id: input.repo_id,
-      session_id: input.session_id,
-      host: this.config.buildHost,
-      branch: plan.branch,
-      worktree_ref: plan.worktree_ref,
-    });
+    const claim = currentActive?.session_id === input.session_id
+      ? currentActive
+      : await this.claims.claimTask({
+          task_id: input.task_id,
+          task_alias: taskAlias,
+          project_id: input.project_id,
+          repo_id: input.repo_id,
+          session_id: input.session_id,
+          host: this.config.buildHost,
+          branch: plan.branch,
+          worktree_ref: plan.worktree_ref,
+        });
+    await this.hooks.afterClaim?.(claim);
 
     let created: WorktreeCreateResult;
     try {

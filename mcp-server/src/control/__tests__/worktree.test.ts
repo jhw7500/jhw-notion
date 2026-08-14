@@ -798,6 +798,24 @@ describe("WorktreeManager", () => {
     })).rejects.toMatchObject({ code: "WORKTREE_CREATE_PENDING" });
   });
 
+  it("rejects a pending-create mapping that contradicts Handoff lifecycle evidence", async () => {
+    let saves = 0;
+    const { repoDir, manager } = await worktreeFixtureWithHooks({
+      beforeSave: () => {
+        saves += 1;
+        if (saves === 2) throw new Error("state write failed after git create");
+      },
+    });
+    const active = claim();
+    await expect(manager.createOrReuse(active, repoDir)).rejects.toThrow("state write failed after git create");
+
+    await expect(manager.assertStartReady(active.task_id, active.task_alias, {
+      claim_id: active.claim_id,
+      worktree_ref: active.worktree_ref,
+      disposition: "handoff",
+    })).rejects.toMatchObject({ code: "WORKTREE_CREATE_PENDING" });
+  });
+
   it("cleans up only the exact released same-host generation and is idempotent", async () => {
     const { repoDir, manager } = await worktreeFixture();
     const active = claim();
@@ -865,6 +883,27 @@ describe("WorktreeManager", () => {
     await manager.createOrReuse(current, repoDir);
 
     await expect(manager.assertTakeoverEligible(current)).resolves.toBeUndefined();
+  });
+
+  it("blocks Task start when a removed tombstone path has reappeared", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const history: ClaimHistory = {
+      ...active,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "completed",
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    };
+    await manager.cleanupReleased(history);
+    await mkdir(created.path);
+
+    await expect(manager.assertStartReady(active.task_id, "owner/repository#77")).rejects.toMatchObject({
+      code: "WORKTREE_LIFECYCLE_MISMATCH",
+      details: { worktree_ref: active.worktree_ref },
+    });
   });
 
   it("reinspects a same-generation pending removal and retries after a second safety check fails", async () => {

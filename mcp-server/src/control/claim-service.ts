@@ -196,6 +196,7 @@ export class ClaimService {
           summary.success ? { conflicting_claim: summary.data } : {},
         );
       }
+      const predecessor = await this.latestReusablePredecessor(task, input);
       const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(task.id, "active");
 
       const started = this.timestamp();
@@ -206,6 +207,7 @@ export class ClaimService {
           source_task_revision: sourceTaskRevision,
           claim_id: newClaimId(Date.parse(started)),
           started_at: started,
+          ...(predecessor ? { predecessor_claim_id: predecessor.claim_id } : {}),
         },
         "INVALID_CLAIM",
         "Claim record failed validation",
@@ -347,6 +349,38 @@ export class ClaimService {
     return candidates[0] as ClaimHistory;
   }
 
+  private async latestReusablePredecessor(
+    task: TaskRecord,
+    input: ClaimTaskInput,
+  ): Promise<ClaimHistory | undefined> {
+    let latest: ClaimHistory;
+    try {
+      latest = await this.latestClaimHistory(task.id);
+    } catch (cause) {
+      if (cause instanceof ControlError && cause.code === "CLAIM_HISTORY_NOT_FOUND") return undefined;
+      throw cause;
+    }
+    const reusable = latest.status === "handoff" ||
+      latest.status === "force-ended" ||
+      (latest.status === "abandoned" && latest.outcome === "worktree_create_failed");
+    if (!reusable) return undefined;
+    if (
+      latest.task_id !== input.task_id ||
+      latest.task_alias !== input.task_alias ||
+      latest.project_id !== input.project_id ||
+      latest.repo_id !== input.repo_id ||
+      latest.host !== input.host ||
+      latest.branch !== input.branch ||
+      latest.worktree_ref !== input.worktree_ref
+    ) {
+      throw corruption("Reusable Claim predecessor disagrees with the requested successor coordinates", {
+        task_id: task.id,
+        claim_id: latest.claim_id,
+      });
+    }
+    return latest;
+  }
+
   private async recoveryStatus(taskId: string, expectedClaimId: string): Promise<RecoveryStatus> {
     const active = await this.assertOwner(taskId, expectedClaimId);
     const observed = parse(
@@ -410,10 +444,11 @@ export class ClaimService {
         });
       }
       const started = this.timestamp();
+      const { predecessor_claim_id: _allocationPredecessor, ...takeoverBase } = active;
       replacement = parse(
         ActiveClaimSchema,
         {
-          ...active,
+          ...takeoverBase,
           claim_id: newClaimId(Date.parse(started)),
           session_id: sessionId,
           host: this.config.buildHost,

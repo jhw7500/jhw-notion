@@ -179,9 +179,21 @@ describe("ClaimService", () => {
     await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-resume" }))).resolves.toMatchObject({
       task_id: task.id,
       session_id: "codex-resume",
+      predecessor_claim_id: active.claim_id,
     });
     const resumed = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
     expect(resumed.lifecycle).toBe("active");
+  });
+
+  it("rejects a caller-supplied predecessor instead of trusting a forged recovery link", async () => {
+    const { claims, task } = await claimsFixture();
+    const forged = {
+      ...claimInput(task.id),
+      predecessor_claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ff",
+    };
+
+    await expect(claims.claimTask(forged as never)).rejects.toMatchObject({ code: "INVALID_CLAIM" });
+    await expect(claims.getActive(task.id)).resolves.toBeUndefined();
   });
 
   it("rejects a second active Claim for the same canonical Task", async () => {
@@ -308,6 +320,29 @@ describe("ClaimService", () => {
     await expect(claims.assertOwner(first.task_id, first.claim_id)).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
     expect(await claims.assertOwner(first.task_id, recovered.active.claim_id)).toEqual(recovered.active);
     expect(await exists(join(fixture.registryDir, "claims", "history", "2026", first.task_id, `${first.claim_id}.yaml`))).toBe(true);
+  });
+
+  it("clears an allocation predecessor when takeover rotates a resumed Claim", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+      new Date("2026-08-13T12:34:59.789Z"),
+      new Date("2026-08-13T12:35:00.789Z"),
+    ];
+    const { claims, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id));
+    await claims.recoverClaim(task.id, first.claim_id, { kind: "force-end" });
+    const resumed = await claims.claimTask(claimInput(task.id, { session_id: "codex-resume" }));
+    expect(resumed.predecessor_claim_id).toBe(first.claim_id);
+
+    const takeover = await claims.recoverClaim(task.id, resumed.claim_id, {
+      kind: "takeover",
+      session_id: "codex-takeover",
+    });
+
+    expect(takeover.active.predecessor_claim_id).toBeUndefined();
+    expect(takeover.history.successor_claim_id).toBe(takeover.active.claim_id);
   });
 
   it("reconciles only the exact remotely linked takeover retry without another commit", async () => {

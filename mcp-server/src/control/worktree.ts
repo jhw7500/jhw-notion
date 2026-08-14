@@ -313,16 +313,25 @@ export class WorktreeManager {
     taskAlias: string,
     retained?: Pick<ActiveClaim, "claim_id" | "worktree_ref"> & {
       disposition: "active" | "handoff" | "force-ended" | "create-failed";
+      successor_claim_id?: string;
     },
   ): Promise<void> {
     const plan = worktreePlan(taskId, taskAlias);
     const state = await this.loadState();
+    const root = await this.worktreeRoot();
     const planned = state.worktrees[plan.worktree_ref];
     if (planned?.task_id !== undefined && planned.task_id !== taskId) {
       throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Task worktree reference belongs to another Task", {
         task_id: taskId,
         worktree_ref: plan.worktree_ref,
       });
+    }
+    for (const [ref, mapping] of Object.entries(state.worktrees)) {
+      if (mapping.task_id === taskId && mapping.lifecycle === "removed" && await this.mappedWorktreeExists(mapping.path, root)) {
+        throw new ControlError("WORKTREE_LIFECYCLE_MISMATCH", "Removed worktree tombstone still has a checkout", {
+          worktree_ref: ref,
+        });
+      }
     }
     const candidates = Object.entries(state.worktrees).filter(([, mapping]) =>
       mapping.task_id === taskId && mapping.lifecycle !== "removed");
@@ -338,7 +347,12 @@ export class WorktreeManager {
     const retainedMatches = retained?.claim_id === mapping.claim_id &&
       retained.worktree_ref === worktreeRef &&
       plan.worktree_ref === worktreeRef;
-    if (mapping.lifecycle === "pending-create" && !retainedMatches) {
+    const lifecycleAllowed = retained?.disposition === "active" || retained?.disposition === "create-failed"
+      ? mapping.lifecycle === "active" || mapping.lifecycle === "pending-create"
+      : retained?.disposition === "handoff" || retained?.disposition === "force-ended"
+        ? mapping.lifecycle === "active"
+        : false;
+    if (mapping.lifecycle === "pending-create" && !(retainedMatches && lifecycleAllowed)) {
       throw new ControlError("WORKTREE_CREATE_PENDING", "Worktree creation requires recovery before Task start", {
         task_id: taskId,
         worktree_ref: worktreeRef,
@@ -346,9 +360,9 @@ export class WorktreeManager {
     }
     if (
       mapping.lifecycle === "active" &&
-      retainedMatches
+      retainedMatches && lifecycleAllowed
     ) return;
-    if (mapping.lifecycle === "pending-create" && retainedMatches) return;
+    if (mapping.lifecycle === "pending-create" && retainedMatches && lifecycleAllowed) return;
     if (mapping.lifecycle === "active" || mapping.lifecycle === "pending-remove") {
       throw new ControlError(
         "WORKTREE_CLEANUP_REQUIRED",

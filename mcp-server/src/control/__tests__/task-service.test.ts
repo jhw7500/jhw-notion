@@ -285,6 +285,54 @@ describe("TaskService", () => {
     });
   });
 
+  it("reconciles a directly linked successor after crashing between Claim commit and local rebind", async () => {
+    const { claims, worktrees, registry, fixture } = await taskFixture();
+    const predecessor = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "handoff" as const,
+      handoff_path: `handoffs/${TASK_ID}/${CLAIM_ID}.md`,
+    };
+    const successor = {
+      ...activeClaim,
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      predecessor_claim_id: CLAIM_ID,
+      started_at: "2026-08-13T12:36:56.789Z",
+    };
+    claims.latestClaimHistory.mockResolvedValue(predecessor);
+    claims.claimTask.mockResolvedValue(successor);
+    const Constructor = TaskService as unknown as new (
+      config: ReturnType<typeof configFor>,
+      claimPort: typeof claims,
+      worktreePort: typeof worktrees,
+      registryPort: typeof registry,
+      now?: () => Date,
+      sensitiveData?: SensitiveDataPolicy,
+      hooks?: { afterClaim?: () => void | Promise<void> },
+    ) => TaskService;
+    const crashed = new Constructor(
+      configFor(fixture.registryDir), claims, worktrees, registry, undefined, undefined,
+      { afterClaim: () => { throw new Error("injected post-Claim crash"); } },
+    );
+
+    await expect(crashed.start(startInput)).rejects.toThrow("injected post-Claim crash");
+    expect(worktrees.createOrReuse).not.toHaveBeenCalled();
+
+    claims.getActive.mockResolvedValue(successor);
+    claims.assertOwner.mockResolvedValue(successor);
+    const restarted = new TaskService(configFor(fixture.registryDir), claims, worktrees, registry);
+    await expect(restarted.start(startInput)).resolves.toMatchObject({ claim: successor });
+
+    expect(claims.claimTask).toHaveBeenCalledTimes(1);
+    expect(worktrees.assertStartReady).toHaveBeenLastCalledWith(startInput.task_id, startInput.task_alias, {
+      claim_id: predecessor.claim_id,
+      successor_claim_id: successor.claim_id,
+      worktree_ref: predecessor.worktree_ref,
+      disposition: "handoff",
+    });
+    expect(worktrees.createOrReuse).toHaveBeenCalledWith(successor, startInput.repository_path);
+  });
+
   it("claims before creating a worktree and abandons the Claim if creation fails", async () => {
     const { tasks, claims, worktrees } = await taskFixture();
     worktrees.createOrReuse.mockRejectedValue(new Error("worktree failed"));
