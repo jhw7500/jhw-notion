@@ -108,6 +108,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
     cleanupReleased: vi.fn().mockResolvedValue({ removed: true, recovered: true, lifecycle: "removed" }),
     inspect: vi.fn().mockResolvedValue({
       path: worktreePath,
+      repository_path: startInput.repository_path,
       worktree_ref: plan.worktree_ref,
       branch: plan.branch,
       head_sha: "0123456789abcdef",
@@ -160,6 +161,24 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
 }
 
 describe("TaskService", () => {
+  it("rejects the trusted source-checkout path in Handoff fields before persistence or release", async () => {
+    const { tasks, claims, registry, worktreePath } = await taskFixture();
+
+    const error = await tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      progress: `do not persist ${startInput.repository_path}`,
+      validation: ["targeted tests pass"],
+    }).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(startInput.repository_path);
+    expect(registry.transact).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+    await expect(readFile(join(worktreePath, ".ai", "handoff.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("rejects protected finish content before reading or mutating Claim/worktree state", async () => {
     const secret = "unmistakably-fake-task-token";
     const { tasks, claims, worktrees } = await taskFixture(createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
@@ -504,6 +523,7 @@ describe("TaskService", () => {
     const { tasks, claims, worktrees, registry, worktreePath } = await taskFixture();
     worktrees.inspect.mockResolvedValue({
       path: worktreePath,
+      repository_path: startInput.repository_path,
       worktree_ref: plan.worktree_ref,
       branch: plan.branch,
       head_sha: "0123456789abcdef",
@@ -536,6 +556,7 @@ describe("TaskService", () => {
     claims.finishClaim.mockRejectedValueOnce(new Error("release failed"));
     worktrees.inspect.mockResolvedValueOnce({
       path: worktreePath,
+      repository_path: startInput.repository_path,
       worktree_ref: plan.worktree_ref,
       branch: plan.branch,
       head_sha: "0123456789abcdef",
@@ -555,6 +576,7 @@ describe("TaskService", () => {
     await expect(tasks.finish(input)).rejects.toThrow("release failed");
     worktrees.inspect.mockResolvedValue({
       path: worktreePath,
+      repository_path: startInput.repository_path,
       worktree_ref: plan.worktree_ref,
       branch: plan.branch,
       head_sha: "0123456789abcdef",
@@ -576,6 +598,7 @@ describe("TaskService", () => {
     const privatePath = "src/customer-secret.ts";
     worktrees.inspect.mockResolvedValue({
       path: worktreePath,
+      repository_path: startInput.repository_path,
       worktree_ref: plan.worktree_ref,
       branch: plan.branch,
       head_sha: "0123456789abcdef",
@@ -630,6 +653,7 @@ describe("TaskService", () => {
     const original = await readFile(pointer, "utf8");
     worktrees.inspect.mockResolvedValue({
       path: worktreePath,
+      repository_path: startInput.repository_path,
       worktree_ref: plan.worktree_ref,
       branch: plan.branch,
       head_sha: "0123456789abcdef",
@@ -666,6 +690,7 @@ describe("TaskService", () => {
     await expect(tasks.finish(input)).rejects.toThrow("release failed");
     worktrees.inspect.mockResolvedValue({
       path: worktreePath,
+      repository_path: startInput.repository_path,
       worktree_ref: plan.worktree_ref,
       branch: plan.branch,
       ...changed,

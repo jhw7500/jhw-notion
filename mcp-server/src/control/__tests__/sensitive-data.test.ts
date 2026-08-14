@@ -21,4 +21,17 @@ describe("SensitiveDataPolicy", () => {
     expect(() => policy.assertSafe({ text: "short ordinary-long-value", nested: ["safe"] })).not.toThrow();
     expect(() => policy.assertSafe("x".repeat(300_000))).toThrowError(expect.objectContaining({ code: "SENSITIVE_SCAN_TOO_LARGE" }));
   });
+
+  it("fails closed instead of dropping a recognized credential when the term bound is exceeded", () => {
+    const credential = "unmistakably-fake-priority-credential";
+    const environment: NodeJS.ProcessEnv = { GH_REPO_TOKEN: credential };
+    for (let index = 0; index < 128; index += 1) {
+      environment[`LONG_SECRET_${index}`] = `${"x".repeat(128)}-${index}`;
+    }
+    const policy = createSensitiveDataPolicy(environment);
+
+    expect(() => policy.assertSafe(`contains ${credential}`)).toThrowError(expect.objectContaining({
+      code: "SENSITIVE_SCAN_TOO_LARGE",
+    }));
+  });
 });

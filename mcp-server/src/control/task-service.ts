@@ -68,7 +68,7 @@ export interface TaskStartResult {
 
 export interface TaskStatusResult {
   active: ActiveClaim;
-  worktree: Omit<WorktreeInspection, "path">;
+  worktree: Omit<WorktreeInspection, "path" | "repository_path">;
 }
 
 export interface TaskFinishInput {
@@ -343,7 +343,7 @@ export class TaskService {
   async status(taskId: string, claimId: string): Promise<TaskStatusResult> {
     const active = await this.assertOwner(taskId, claimId);
     const inspection = await this.worktrees.inspect(active);
-    const { path: _path, ...worktree } = inspection;
+    const { path: _path, repository_path: _repositoryPath, ...worktree } = inspection;
     const result = { active, worktree };
     this.sensitiveData.assertSafe(result);
     return result;
@@ -390,6 +390,10 @@ export class TaskService {
     assertValidation(input.validation);
     const active = await this.assertOwner(input.task_id, input.claim_id);
     const inspection = await this.worktrees.inspect(active);
+    if (typeof inspection.repository_path !== "string") {
+      throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Worktree inspection lacks its trusted Repository root");
+    }
+    createSensitiveDataPolicy({}, [inspection.repository_path]).assertSafe(input);
     // Inspection is a port boundary. Duplicate entries turn the dirty digest
     // into multiset evidence and can make the two-candidate retry check
     // ambiguous, so reject them before either initial generation or retry.

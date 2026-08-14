@@ -31,6 +31,8 @@ export interface WorktreeCreateResult {
 export interface WorktreeInspection {
   /** Host-local absolute path. Never persist this in a Claim or Registry record. */
   path: string;
+  /** Trusted source checkout root. Never return it through the public CLI. */
+  repository_path: string;
   branch: string;
   worktree_ref: string;
   head_sha: string;
@@ -675,6 +677,7 @@ export class WorktreeManager {
       : { behind: 0, ahead: parseCount((await this.git(["-C", mapping.path, "rev-list", "--count", `${mapping.base_sha}..HEAD`])).stdout, "INVALID_GIT_STATE") };
     return {
       path: mapping.path,
+      repository_path: mapping.repository_path,
       branch: claim.branch,
       worktree_ref: claim.worktree_ref,
       head_sha: head,

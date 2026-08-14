@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { GitHubSourceService } from "../github-source.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
-const checkout = "/srv/jhw/source/wlan";
+const checkout = "/fixture/private-source/wlan";
 const repository = { id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" };
 const formal = {
   id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab",
@@ -53,6 +53,26 @@ function fixture(overrides: { remote?: string; private?: boolean; fullName?: str
 }
 
 describe("GitHubSourceService", () => {
+  it("rejects the per-call checkout path before direct temporary Catalog mutation", async () => {
+    const { service, catalog, projects, runner } = fixture();
+
+    const error = await service.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      repository_path: checkout,
+      alias: "wlan:tmp-20260814-01-path",
+      goal: `do not persist ${checkout}`,
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/control"],
+    }).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(checkout);
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+    expect(projects.requireProjectRepository).not.toHaveBeenCalled();
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
   it("rejects protected GitHub responses before Catalog mutation", async () => {
     const secret = "unmistakably-fake-source-token";
     const { catalog, projects, runner } = fixture();

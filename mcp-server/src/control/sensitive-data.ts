@@ -39,10 +39,15 @@ export function createSensitiveDataPolicy(
     const term = privatePathTerm(path);
     if (term) terms.add(term);
   }
-  const protectedTerms = [...terms].sort((left, right) => right.length - left.length).slice(0, MAX_TERMS);
+  const orderedTerms = [...terms].sort((left, right) => right.length - left.length);
+  const termOverflow = orderedTerms.length > MAX_TERMS;
+  const protectedTerms = orderedTerms.slice(0, MAX_TERMS);
 
   return {
     assertSafe(value: unknown): void {
+      if (termOverflow) {
+        throw new ControlError("SENSITIVE_SCAN_TOO_LARGE", "Protected-term scan exceeded its deterministic boundary");
+      }
       let bytes = 0;
       let nodes = 0;
       const visited = new Set<object>();

@@ -130,7 +130,7 @@ export class GitHubSourceService {
     if (!repoIdPattern.test(input.repo_id) || !slugPattern.test(input.slug)) {
       throw new ControlError("INVALID_REPOSITORY", "Repository registration coordinates are invalid");
     }
-    this.sensitiveData.assertSafe({ repo_id: input.repo_id, slug: input.slug });
+    this.assertCheckoutSafe({ repo_id: input.repo_id, slug: input.slug }, input.repository_path);
     await this.verifyCheckout(input.repository_path, input.slug);
     const resolved = await this.resolveRepository(input.slug);
     return this.options.catalog.registerRepository({
@@ -154,9 +154,10 @@ export class GitHubSourceService {
     expected_issue_revision?: string;
   }): Promise<FormalTaskRegistration> {
     const { repository_path: _repositoryPath, ...content } = input;
-    this.sensitiveData.assertSafe(content);
+    this.assertCheckoutSafe(content, input.repository_path);
     const context = await this.requireContext(input.project_id, input.repo_id, input.repository_path);
     const issue = await this.resolveIssue(context.repository, input.issue_url);
+    this.assertCheckoutSafe(issue, input.repository_path);
     if (input.expected_issue_node_id !== undefined && input.expected_issue_node_id !== issue.issue_node_id) {
       throw new ControlError("ISSUE_IDENTITY_MISMATCH", "Caller Issue node ID disagrees with the verified Issue");
     }
@@ -172,15 +173,16 @@ export class GitHubSourceService {
 
   async registerTemporaryTask(input: RegisterTemporaryTaskInput & { repository_path: string }): Promise<TemporaryTask> {
     const { repository_path: _repositoryPath, ...record } = input;
-    this.sensitiveData.assertSafe(record);
+    this.assertCheckoutSafe(record, input.repository_path);
     await this.requireContext(input.project_id, input.repo_id, input.repository_path);
     return this.options.catalog.registerTemporaryTask(record);
   }
 
   async prepareExistingTask(input: { task_id: string; repository_path: string }): Promise<ExistingTaskContext> {
     if (!taskIdPattern.test(input.task_id)) throw new ControlError("INVALID_TASK_ID", "Task ID is invalid");
-    this.sensitiveData.assertSafe({ task_id: input.task_id });
+    this.assertCheckoutSafe({ task_id: input.task_id }, input.repository_path);
     let task = await this.options.catalog.getTask(input.task_id);
+    this.assertCheckoutSafe(task, input.repository_path);
     const context = await this.requireContext(task.project_id, task.repo_id, input.repository_path);
     if (task.kind === "formal") {
       const issue = await this.resolveIssue(context.repository, task.issue_url);
@@ -215,10 +217,12 @@ export class GitHubSourceService {
     expected_issue_revision?: string;
   }): Promise<FormalTask> {
     const { repository_path: _repositoryPath, ...content } = input;
-    this.sensitiveData.assertSafe(content);
+    this.assertCheckoutSafe(content, input.repository_path);
     const current = await this.options.catalog.getTask(input.task_id);
+    this.assertCheckoutSafe(current, input.repository_path);
     const context = await this.requireContext(current.project_id, current.repo_id, input.repository_path);
     const issue = await this.resolveIssue(context.repository, input.issue_url);
+    this.assertCheckoutSafe(issue, input.repository_path);
     if (input.expected_issue_node_id !== undefined && input.expected_issue_node_id !== issue.issue_node_id) {
       throw new ControlError("ISSUE_IDENTITY_MISMATCH", "Caller Issue node ID disagrees with the verified Issue");
     }
@@ -237,7 +241,7 @@ export class GitHubSourceService {
       throw new ControlError("INVALID_TASK_SCOPE", "Task Project/Repository coordinates are invalid");
     }
     const repository = await this.options.catalog.getRepository(repoId);
-    this.sensitiveData.assertSafe(repository);
+    this.assertCheckoutSafe(repository, repositoryPath);
     await this.options.projects.requireProjectRepository(projectId, repoId);
     await this.verifyCheckout(repositoryPath, repository.slug);
     const actual = await this.resolveRepository(repository.slug);
@@ -262,6 +266,11 @@ export class GitHubSourceService {
     if (!sameSlug(actualSlug, expectedSlug)) {
       throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout origin does not match the canonical Repository");
     }
+  }
+
+  private assertCheckoutSafe(value: unknown, repositoryPath: string): void {
+    this.sensitiveData.assertSafe(value);
+    createSensitiveDataPolicy({}, [repositoryPath]).assertSafe(value);
   }
 
   private async resolveRepository(slug: string): Promise<z.infer<typeof RepositoryResponseSchema>> {
