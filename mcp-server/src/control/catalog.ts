@@ -109,13 +109,13 @@ function taskSourceRelativePath(githubNodeId: string): string {
 function parseInput<T>(schema: ZodType<T>, value: unknown, code: string): T {
   const result = schema.safeParse(value);
   if (result.success) return result.data;
-  throw new ControlError(code, "Invalid Catalog input", { issues: result.error.issues });
+  throw new ControlError(code, "Invalid Catalog input");
 }
 
 function record<T>(schema: ZodType<T>, value: unknown, code: string): T {
   const result = schema.safeParse(value);
   if (result.success) return result.data;
-  throw new ControlError(code, "Invalid Catalog record", { issues: result.error.issues });
+  throw new ControlError(code, "Invalid Catalog record");
 }
 
 function corruption(message: string, details: Record<string, unknown>): ControlError {
@@ -161,8 +161,8 @@ export class Catalog {
   }
 
   async registerRepository(rawInput: RegisterRepositoryInput): Promise<RepositoryRegistration> {
+    this.sensitiveData.assertSafe(rawInput);
     const input = parseInput(RegisterRepositoryInputSchema, rawInput, "INVALID_REPOSITORY");
-    this.sensitiveData.assertSafe(input);
     let registration: RepositoryRegistration | undefined;
     await this.registry.transact(`registry: register repository ${input.repo_id}`, async () => {
       await this.auditRepositorySourceIndexes();
@@ -228,8 +228,8 @@ export class Catalog {
   }
 
   async registerFormalTask(rawInput: RegisterFormalTaskInput): Promise<FormalTaskRegistration> {
+    this.sensitiveData.assertSafe(rawInput);
     const input = parseInput(RegisterFormalTaskInputSchema, rawInput, "INVALID_FORMAL_TASK");
-    this.sensitiveData.assertSafe(input);
     let registration: FormalTaskRegistration | undefined;
     await this.registry.transact(`registry: register formal task ${input.alias}`, async () => {
       await this.auditRepositorySourceIndexes();
@@ -292,8 +292,8 @@ export class Catalog {
   }
 
   async registerTemporaryTask(rawInput: RegisterTemporaryTaskInput): Promise<TemporaryTask> {
+    this.sensitiveData.assertSafe(rawInput);
     const input = parseInput(RegisterTemporaryTaskInputSchema, rawInput, "INVALID_TEMPORARY_TASK");
-    this.sensitiveData.assertSafe(input);
     let task: TemporaryTask | undefined;
     await this.registry.transact(`registry: register temporary task ${input.alias}`, async () => {
       await this.auditRepositorySourceIndexes();
@@ -341,8 +341,8 @@ export class Catalog {
 
   async promoteTemporaryTask(taskId: string, rawInput: RegisterFormalTaskInput): Promise<FormalTask> {
     assertTaskId(taskId);
+    this.sensitiveData.assertSafe(rawInput);
     const input = parseInput(RegisterFormalTaskInputSchema, rawInput, "INVALID_FORMAL_TASK");
-    this.sensitiveData.assertSafe(input);
     let promoted: FormalTask | undefined;
     await this.registry.transact(`registry: promote temporary task ${taskId}`, async () => {
       await this.auditRepositorySourceIndexes();

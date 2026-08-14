@@ -66,6 +66,24 @@ describe("Catalog", () => {
     })).toEqual([]);
   });
 
+  it("scans raw Catalog keys before strict-schema diagnostics", async () => {
+    const secret = "unmistakably-fake-catalog-key-token";
+    const { catalog, fixture } = await catalogFixture(createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
+    await catalog.registerRepository(repositoryInput);
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+    const input = {
+      project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:raw-key",
+      goal: "safe", done_conditions: ["safe"], expected_scope: ["src/control"],
+      [secret]: true,
+    };
+
+    const error = await catalog.registerTemporaryTask(input as never).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+  });
+
   it("registers a Repository and its GitHub source index in one transaction", async () => {
     const { catalog, fixture } = await catalogFixture();
 

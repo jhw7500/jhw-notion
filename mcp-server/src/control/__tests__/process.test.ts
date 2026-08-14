@@ -21,6 +21,17 @@ describe("control process boundary", () => {
     expect(JSON.stringify(error)).toContain("[REDACTED]");
   });
 
+  it("never includes host-absolute command arguments in direct error metadata", async () => {
+    const privatePath = "/srv/private/source-checkout";
+    const runner = new ProcessRunner();
+
+    const error = await runner.run("bash", ["-c", "exit 2", privatePath]).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "COMMAND_FAILED" });
+    expect(JSON.stringify(error)).not.toContain(privatePath);
+    expect((error as Error).message).not.toContain(privatePath);
+  });
+
   it("requires build-server coordinates but not tokens in config files", () => {
     const config = loadControlConfig({
       HOME: "/home/jhw",
