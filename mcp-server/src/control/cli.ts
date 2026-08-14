@@ -22,7 +22,7 @@ import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task
 import { WorktreeManager } from "./worktree.js";
 import { createAuthorityService } from "./authority.js";
 import { getNotionClient } from "../notion-client.js";
-import { DATABASE_SCHEMAS } from "../schema.js";
+import { verifyConfiguredNotionAuthorityRoutes } from "../notion/authority-guard.js";
 import {
   AuthorityRecordSchema,
   BoundedPortfolioPayloadSchema,
@@ -149,27 +149,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
   };
   const notionProbe = {
     async verifyReadOnlyRoutes() {
-      const notion = getNotionClient();
-      const normalize = (value: unknown) => typeof value === "string" ? value.replaceAll("-", "").toLowerCase() : "";
-      for (const schema of Object.values(DATABASE_SCHEMAS)) {
-        let database: unknown;
-        let dataSource: unknown;
-        try {
-          database = await notion.databases.retrieve({ database_id: schema.id });
-          dataSource = await notion.dataSources.retrieve({ data_source_id: schema.dataSourceId });
-        } catch {
-          throw new ControlError("NOTION_GUARD_INDETERMINATE", "Notion authority routing probe is unavailable");
-        }
-        const databaseRecord = database as { id?: unknown };
-        const dataSourceRecord = dataSource as { id?: unknown; parent?: { database_id?: unknown } };
-        if (
-          normalize(databaseRecord.id) !== normalize(schema.id) ||
-          normalize(dataSourceRecord.id) !== normalize(schema.dataSourceId) ||
-          normalize(dataSourceRecord.parent?.database_id) !== normalize(schema.id)
-        ) {
-          throw new ControlError("NOTION_GUARD_INDETERMINATE", "Notion authority routing probe returned conflicting coordinates");
-        }
-      }
+      await verifyConfiguredNotionAuthorityRoutes(getNotionClient());
     },
   };
   const worktrees = new WorktreeManager(config, runner);

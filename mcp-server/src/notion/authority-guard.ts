@@ -21,6 +21,7 @@ for (const [name, schema] of Object.entries(DATABASE_SCHEMAS)) {
 }
 
 const MAX_PARENT_DEPTH = 16;
+type AuthorityNode = { kind: "page" | "database" | "data_source"; id: string; expectedDatabaseId?: string };
 
 function targetResolutionUnavailable(): ControlError {
   const payload = {
@@ -37,12 +38,11 @@ function pageKey(pageId: string): string {
   return normalizeId(trimmed) ?? trimmed.toLowerCase();
 }
 
-export async function resolveTargetDatabase(
-  pageId: string,
+async function resolveAuthorityNode(
+  initial: AuthorityNode,
   notion: Pick<Client, "pages" | "databases" | "dataSources">,
 ): Promise<DatabaseName | "page"> {
-  type Node = { kind: "page" | "database" | "data_source"; id: string; expectedDatabaseId?: string };
-  let current: Node = { kind: "page", id: pageId.trim() };
+  let current = initial;
   const visited = new Set<string>();
   for (let depth = 0; depth < MAX_PARENT_DEPTH; depth += 1) {
     const key = `${current.kind}:${pageKey(current.id)}`;
@@ -124,6 +124,48 @@ export async function resolveTargetDatabase(
     current = { kind: "page", id: parentPageId };
   }
   throw targetResolutionUnavailable();
+}
+
+export async function resolveTargetDatabase(
+  pageId: string,
+  notion: Pick<Client, "pages" | "databases" | "dataSources">,
+): Promise<DatabaseName | "page"> {
+  return resolveAuthorityNode({ kind: "page", id: pageId.trim() }, notion);
+}
+
+function notionGuardIndeterminate(): ControlError {
+  return new ControlError(
+    "NOTION_GUARD_INDETERMINATE",
+    "Notion authority routing proof is unavailable",
+  );
+}
+
+/**
+ * Exercises the same ancestry resolver used by append/delete against every
+ * configured data source. Database coordinates are independently retrieved so
+ * both halves of the configured Notion route are proven read-only.
+ */
+export async function verifyConfiguredNotionAuthorityRoutes(
+  notion: Pick<Client, "pages" | "databases" | "dataSources">,
+): Promise<void> {
+  try {
+    for (const [name, schema] of Object.entries(DATABASE_SCHEMAS)) {
+      const database = await notion.databases.retrieve({ database_id: schema.id });
+      const record = database as { id?: unknown; object?: unknown };
+      if (
+        record.object !== "database" ||
+        normalizeId(record.id) !== normalizeId(schema.id)
+      ) throw notionGuardIndeterminate();
+
+      const resolved = await resolveAuthorityNode(
+        { kind: "data_source", id: schema.dataSourceId },
+        notion,
+      );
+      if (resolved !== name) throw notionGuardIndeterminate();
+    }
+  } catch {
+    throw notionGuardIndeterminate();
+  }
 }
 
 export type NotionAuthorityGuard = Pick<AuthorityService, "assertNotionWriteAllowed">;

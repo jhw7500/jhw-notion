@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import { NOTION_CONFIG } from "../../config.js";
 import { DATABASE_SCHEMAS } from "../../schema.js";
-import { assertTargetWriteAllowed, resolveTargetDatabase } from "../authority-guard.js";
+import {
+  assertTargetWriteAllowed,
+  resolveTargetDatabase,
+  verifyConfiguredNotionAuthorityRoutes,
+} from "../authority-guard.js";
 
 const TARGET = "11111111-1111-4111-8111-111111111111";
 const PARENT = "22222222-2222-4222-8222-222222222222";
@@ -16,6 +20,69 @@ function notionReturning(parent: unknown) {
 }
 
 describe("Notion authority target resolution", () => {
+  it("proves every configured protected and allowed route through the production resolver without writes", async () => {
+    const databases = {
+      retrieve: vi.fn(async ({ database_id }: { database_id: string }) => ({
+        object: "database",
+        id: database_id,
+        parent: { type: "workspace", workspace: true },
+      })),
+    };
+    const dataSources = {
+      retrieve: vi.fn(async ({ data_source_id }: { data_source_id: string }) => {
+        const schema = Object.values(DATABASE_SCHEMAS).find(
+          (candidate) => candidate.dataSourceId.replaceAll("-", "") === data_source_id.replaceAll("-", ""),
+        );
+        if (!schema) throw new Error("unexpected data source");
+        return {
+          object: "data_source",
+          id: data_source_id,
+          parent: { type: "database_id", database_id: schema.id },
+          database_parent: { type: "workspace", workspace: true },
+        };
+      }),
+    };
+
+    await verifyConfiguredNotionAuthorityRoutes({
+      pages: { retrieve: vi.fn() },
+      databases,
+      dataSources,
+    } as any);
+
+    expect(databases.retrieve).toHaveBeenCalledTimes(Object.keys(DATABASE_SCHEMAS).length);
+    expect(dataSources.retrieve).toHaveBeenCalledTimes(Object.keys(DATABASE_SCHEMAS).length);
+  });
+
+  it("fails the preflight route proof when an allowed data source resolves to a protected database", async () => {
+    const notion = {
+      pages: { retrieve: vi.fn() },
+      databases: {
+        retrieve: vi.fn(async ({ database_id }: { database_id: string }) => ({
+          object: "database", id: database_id, parent: { type: "workspace", workspace: true },
+        })),
+      },
+      dataSources: {
+        retrieve: vi.fn(async ({ data_source_id }: { data_source_id: string }) => ({
+          object: "data_source",
+          id: data_source_id,
+          parent: {
+            type: "database_id",
+            database_id: data_source_id.replaceAll("-", "") === DATABASE_SCHEMAS.knowledgeBase.dataSourceId.replaceAll("-", "")
+              ? DATABASE_SCHEMAS.projects.id
+              : Object.values(DATABASE_SCHEMAS).find(
+                (candidate) => candidate.dataSourceId.replaceAll("-", "") === data_source_id.replaceAll("-", ""),
+              )?.id,
+          },
+          database_parent: { type: "workspace", workspace: true },
+        })),
+      },
+    };
+
+    await expect(verifyConfiguredNotionAuthorityRoutes(notion as any)).rejects.toMatchObject({
+      code: "NOTION_GUARD_INDETERMINATE",
+    });
+  });
+
   it("maps normalized database_id parents to configured databases", async () => {
     const compactUpper = NOTION_CONFIG.databases.projects.replaceAll("-", "").toUpperCase();
     const notion = notionReturning({ type: "database_id", database_id: compactUpper });
