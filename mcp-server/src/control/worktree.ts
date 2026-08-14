@@ -300,21 +300,52 @@ export class WorktreeManager {
    * Non-mutating pre-Claim barrier. A pending destructive intent must be
    * reconciled through its archived Claim generation, never by a successor.
    */
-  async assertStartReady(taskId: string, taskAlias: string): Promise<void> {
+  async assertStartReady(
+    taskId: string,
+    taskAlias: string,
+    retained?: Pick<ActiveClaim, "claim_id" | "worktree_ref"> & {
+      disposition: "active" | "handoff" | "force-ended" | "create-failed";
+    },
+  ): Promise<void> {
     const plan = worktreePlan(taskId, taskAlias);
     const state = await this.loadState();
-    const mapping = state.worktrees[plan.worktree_ref];
-    if (mapping?.task_id !== undefined && mapping.task_id !== taskId) {
+    const planned = state.worktrees[plan.worktree_ref];
+    if (planned?.task_id !== undefined && planned.task_id !== taskId) {
       throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Task worktree reference belongs to another Task", {
         task_id: taskId,
         worktree_ref: plan.worktree_ref,
       });
     }
-    if (mapping?.lifecycle === "pending-remove") {
+    const candidates = Object.entries(state.worktrees).filter(([, mapping]) =>
+      mapping.task_id === taskId && mapping.lifecycle !== "removed");
+    if (candidates.length > 1) {
+      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Task has more than one unreconciled worktree generation", {
+        task_id: taskId,
+        worktree_refs: candidates.map(([ref]) => ref).sort(),
+      });
+    }
+    const [entry] = candidates;
+    if (!entry) return;
+    const [worktreeRef, mapping] = entry;
+    const retainedMatches = retained?.claim_id === mapping.claim_id &&
+      retained.worktree_ref === worktreeRef &&
+      plan.worktree_ref === worktreeRef;
+    if (mapping.lifecycle === "pending-create" && !retainedMatches) {
+      throw new ControlError("WORKTREE_CREATE_PENDING", "Worktree creation requires recovery before Task start", {
+        task_id: taskId,
+        worktree_ref: worktreeRef,
+      });
+    }
+    if (
+      mapping.lifecycle === "active" &&
+      retainedMatches
+    ) return;
+    if (mapping.lifecycle === "pending-create" && retainedMatches) return;
+    if (mapping.lifecycle === "active" || mapping.lifecycle === "pending-remove") {
       throw new ControlError(
         "WORKTREE_CLEANUP_REQUIRED",
         "A released worktree generation requires explicit cleanup recovery before Task start",
-        { task_id: taskId, worktree_ref: plan.worktree_ref },
+        { task_id: taskId, worktree_ref: worktreeRef },
       );
     }
   }
@@ -754,6 +785,14 @@ export class WorktreeManager {
     const directRepositoryIdentity = await this.physicalRepositoryIdentity(direct.repository_identity);
     for (const [ref, mapping] of Object.entries(state.worktrees)) {
       if (ref === claim.worktree_ref) continue;
+      if (mapping.lifecycle === "removed") {
+        if (await this.mappedWorktreeExists(mapping.path, root)) {
+          throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Removed worktree tombstone still has a checkout", {
+            worktree_ref: ref,
+          });
+        }
+        continue;
+      }
       const physicalPath = await this.physicalMappingPath(mapping, root);
       const repositoryIdentity = await this.physicalRepositoryIdentity(mapping.repository_identity);
       if (

@@ -30,12 +30,19 @@ export interface ClaimServicePort {
   recoverClaim(taskId: string, claimId: string, action: RecoveryAction): Promise<RecoveryResult>;
   assertOwner(taskId: string, claimId: string): Promise<ActiveClaim>;
   getClaimHistory(taskId: string, claimId: string): Promise<ClaimHistory>;
+  latestClaimHistory(taskId: string): Promise<ClaimHistory>;
   latestHandoffHistory(taskId: string): Promise<ClaimHistory>;
   getActive(taskId: string): Promise<ActiveClaim | undefined>;
 }
 
 export interface WorktreeManagerPort {
-  assertStartReady(taskId: string, taskAlias: string): Promise<void>;
+  assertStartReady(
+    taskId: string,
+    taskAlias: string,
+    retained?: Pick<ActiveClaim, "claim_id" | "worktree_ref"> & {
+      disposition: "active" | "handoff" | "force-ended" | "create-failed";
+    },
+  ): Promise<void>;
   createOrReuse(claim: ActiveClaim, repositoryPath: string): Promise<WorktreeCreateResult>;
   inspect(claim: ActiveClaim): Promise<WorktreeInspection>;
   removeIfSafe(claim: ActiveClaim): Promise<WorktreeRemovalResult>;
@@ -283,11 +290,52 @@ export class TaskService {
     const { repository_path: _repositoryPath, ...content } = input;
     this.sensitiveData.assertSafe(content);
     createSensitiveDataPolicy(process.env, [input.repository_path]).assertSafe(content);
-    const plan = worktreePlan(input.task_id, input.task_alias);
-    await this.worktrees.assertStartReady(input.task_id, input.task_alias);
+    const currentActive = await this.claims.getActive(input.task_id);
+    let latestHistory: ClaimHistory | undefined;
+    if (!currentActive) {
+      try {
+        latestHistory = await this.claims.latestClaimHistory(input.task_id);
+      } catch (cause) {
+        if (!(cause instanceof ControlError && cause.code === "CLAIM_HISTORY_NOT_FOUND")) throw cause;
+      }
+    }
+    const reusableHistory = latestHistory?.task_alias && (
+      latestHistory.status === "handoff" ||
+      latestHistory.status === "force-ended" ||
+      (latestHistory.status === "abandoned" && latestHistory.outcome === "worktree_create_failed")
+    ) ? latestHistory : undefined;
+    const taskAlias = reusableHistory?.task_alias ?? input.task_alias;
+    const plan = worktreePlan(input.task_id, taskAlias);
+    if (reusableHistory && (
+      reusableHistory.task_id !== input.task_id ||
+      reusableHistory.project_id !== input.project_id ||
+      reusableHistory.repo_id !== input.repo_id ||
+      reusableHistory.branch !== plan.branch ||
+      reusableHistory.worktree_ref !== plan.worktree_ref
+    )) {
+      throw new ControlError("REGISTRY_CORRUPT", "Released Claim history has inconsistent Task coordinates");
+    }
+    const retained = currentActive
+      ? { claim_id: currentActive.claim_id, worktree_ref: currentActive.worktree_ref, disposition: "active" as const }
+      : reusableHistory
+        ? {
+            claim_id: reusableHistory.claim_id,
+            worktree_ref: reusableHistory.worktree_ref,
+            disposition: reusableHistory.status === "handoff"
+              ? "handoff" as const
+              : reusableHistory.status === "force-ended"
+                ? "force-ended" as const
+                : "create-failed" as const,
+          }
+        : undefined;
+    await this.worktrees.assertStartReady(
+      input.task_id,
+      taskAlias,
+      retained,
+    );
     const claim = await this.claims.claimTask({
       task_id: input.task_id,
-      task_alias: input.task_alias,
+      task_alias: taskAlias,
       project_id: input.project_id,
       repo_id: input.repo_id,
       session_id: input.session_id,

@@ -30,6 +30,7 @@ const IssueResponseSchema = z.object({
   number: z.number().int().positive(),
   html_url: z.string().url(),
   updated_at: z.string().datetime({ offset: true }),
+  state: z.enum(["open", "closed"]),
   pull_request: z.unknown().optional(),
 }).passthrough();
 
@@ -64,6 +65,12 @@ interface VerifiedIssue {
   issue_revision: string;
   issue_url: string;
   alias: string;
+  state: "open" | "closed";
+}
+
+function issueRecord(issue: VerifiedIssue): Omit<RegisterFormalTaskInput, "project_id" | "repo_id"> {
+  const { state: _state, ...record } = issue;
+  return record;
 }
 
 export interface ExistingTaskContext {
@@ -133,6 +140,7 @@ export class GitHubSourceService {
     this.assertCheckoutSafe({ repo_id: input.repo_id, slug: input.slug }, input.repository_path);
     await this.verifyCheckout(input.repository_path, input.slug);
     const resolved = await this.resolveRepository(input.slug);
+    this.assertCheckoutSafe(resolved, input.repository_path);
     return this.options.catalog.registerRepository({
       repo_id: input.repo_id,
       slug: resolved.full_name,
@@ -158,6 +166,7 @@ export class GitHubSourceService {
     const context = await this.requireContext(input.project_id, input.repo_id, input.repository_path);
     const issue = await this.resolveIssue(context.repository, input.issue_url);
     this.assertCheckoutSafe(issue, input.repository_path);
+    if (issue.state === "closed") throw new ControlError("TASK_COMPLETED", "Closed GitHub Issues cannot create Task ownership");
     if (input.expected_issue_node_id !== undefined && input.expected_issue_node_id !== issue.issue_node_id) {
       throw new ControlError("ISSUE_IDENTITY_MISMATCH", "Caller Issue node ID disagrees with the verified Issue");
     }
@@ -167,7 +176,7 @@ export class GitHubSourceService {
     return this.options.catalog.registerFormalTask({
       project_id: input.project_id,
       repo_id: input.repo_id,
-      ...issue,
+      ...issueRecord(issue),
     });
   }
 
@@ -189,10 +198,12 @@ export class GitHubSourceService {
       if (issue.issue_node_id !== task.issue_node_id) {
         throw new ControlError("ISSUE_IDENTITY_MISMATCH", "Canonical Task and verified Issue node ID disagree");
       }
+      this.assertCheckoutSafe(issue, input.repository_path);
+      if (issue.state === "closed") throw new ControlError("TASK_COMPLETED", "Closed formal Tasks cannot be resumed");
       task = (await this.options.catalog.registerFormalTask({
         project_id: task.project_id,
         repo_id: task.repo_id,
-        ...issue,
+        ...issueRecord(issue),
       })).task;
     }
     if (task.kind === "temporary" && task.lifecycle === "completed") {
@@ -223,6 +234,7 @@ export class GitHubSourceService {
     const context = await this.requireContext(current.project_id, current.repo_id, input.repository_path);
     const issue = await this.resolveIssue(context.repository, input.issue_url);
     this.assertCheckoutSafe(issue, input.repository_path);
+    if (issue.state === "closed") throw new ControlError("TASK_COMPLETED", "Closed GitHub Issues cannot promote Task ownership");
     if (input.expected_issue_node_id !== undefined && input.expected_issue_node_id !== issue.issue_node_id) {
       throw new ControlError("ISSUE_IDENTITY_MISMATCH", "Caller Issue node ID disagrees with the verified Issue");
     }
@@ -232,7 +244,7 @@ export class GitHubSourceService {
     return this.options.catalog.promoteTemporaryTask(current.id, {
       project_id: current.project_id,
       repo_id: current.repo_id,
-      ...issue,
+      ...issueRecord(issue),
     });
   }
 
@@ -245,6 +257,7 @@ export class GitHubSourceService {
     await this.options.projects.requireProjectRepository(projectId, repoId);
     await this.verifyCheckout(repositoryPath, repository.slug);
     const actual = await this.resolveRepository(repository.slug);
+    this.assertCheckoutSafe(actual, repositoryPath);
     if (actual.node_id !== repository.github_node_id) {
       throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "Repository Record and GitHub node identity disagree");
     }
@@ -305,6 +318,7 @@ export class GitHubSourceService {
       issue_revision: issue.updated_at,
       issue_url: requested.canonicalUrl,
       alias: `${repository.slug}#${issue.number}`,
+      state: issue.state,
     };
     this.sensitiveData.assertSafe(verified);
     return verified;

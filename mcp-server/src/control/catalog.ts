@@ -357,16 +357,31 @@ export class Catalog {
 
       const current = await this.taskAt(taskId);
       if (current.kind === "formal") {
-        if (current.issue_node_id !== input.issue_node_id) {
-          throw new ControlError("TASK_ALREADY_FORMAL", "Task is already formalized for another GitHub Issue", {
-            task_id: taskId,
-            issue_node_id: current.issue_node_id,
-          });
+        if (
+          current.project_id !== input.project_id ||
+          current.repo_id !== input.repo_id ||
+          current.issue_node_id !== input.issue_node_id ||
+          current.issue_url !== input.issue_url
+        ) {
+          throw new ControlError("FORMAL_TASK_SOURCE_MISMATCH", "Formal Task immutable source coordinates disagree");
         }
-        promoted = current;
-        if (indexed) return noChanges();
-        await this.records.writeJson(sourcePath, { task_id: current.id });
-        return stage([taskSourceRelativePath(input.issue_node_id)]);
+        const currentRevision = Date.parse(current.issue_revision);
+        const requestedRevision = Date.parse(input.issue_revision);
+        if (requestedRevision < currentRevision) {
+          throw new ControlError("STALE_SOURCE_REVISION", "Verified Issue revision is older than the canonical Task revision");
+        }
+        const aliases = distinctAliases(current.aliases, input.alias);
+        const changedTask = requestedRevision !== currentRevision || aliases.length !== current.aliases.length;
+        promoted = changedTask
+          ? record(FormalTaskSchema, { ...current, aliases, issue_revision: input.issue_revision }, "INVALID_FORMAL_TASK")
+          : current;
+        if (changedTask) await this.records.writeJson(taskRelativePath(current.id), promoted);
+        if (!indexed) await this.records.writeJson(sourcePath, { task_id: current.id });
+        const paths = [
+          ...(changedTask ? [taskRelativePath(current.id)] : []),
+          ...(!indexed ? [taskSourceRelativePath(input.issue_node_id)] : []),
+        ];
+        return paths.length > 0 ? stage(paths) : noChanges();
       }
 
       if (current.project_id !== input.project_id || current.repo_id !== input.repo_id) {

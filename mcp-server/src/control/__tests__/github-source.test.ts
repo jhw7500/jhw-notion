@@ -16,7 +16,7 @@ const formal = {
   issue_url: "https://github.com/jhw7500/wlan/issues/7",
 };
 
-function fixture(overrides: { remote?: string; private?: boolean; fullName?: string } = {}) {
+function fixture(overrides: { remote?: string; private?: boolean; fullName?: string; issueState?: "open" | "closed" } = {}) {
   const catalog = {
     registerRepository: vi.fn(async (input) => ({ repository: { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug }, created: true })),
     getRepository: vi.fn(async () => repository),
@@ -45,6 +45,7 @@ function fixture(overrides: { remote?: string; private?: boolean; fullName?: str
           number: 7,
           html_url: "https://github.com/jhw7500/wlan/issues/7",
           updated_at: "2026-08-14T00:00:00Z",
+          state: overrides.issueState ?? "open",
         })}\n`,
       stderr: "", exitCode: 0,
     })),
@@ -160,5 +161,15 @@ describe("GitHubSourceService", () => {
       source_task_revision: "2026-08-14T00:00:00Z",
     });
     expect(projects.requireProjectRepository).toHaveBeenCalledWith("prj-wlan", "repo-wlan");
+  });
+
+  it("refuses a closed formal Issue before existing Task ownership is created", async () => {
+    const { service, catalog } = fixture({ issueState: "closed" });
+
+    await expect(service.prepareExistingTask({ task_id: formal.id, repository_path: checkout })).rejects.toMatchObject({
+      code: "TASK_COMPLETED",
+    });
+
+    expect(catalog.registerFormalTask).not.toHaveBeenCalled();
   });
 });

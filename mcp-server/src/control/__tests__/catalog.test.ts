@@ -299,6 +299,40 @@ describe("Catalog", () => {
       expected_scope: ["src/new.ts"],
     })).rejects.toMatchObject({ code: "TEMPORARY_ALIAS_CONFLICT" });
   });
+
+  it("applies formal immutable-coordinate and monotonic-revision rules on promotion retry", async () => {
+    const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    await catalog.registerRepository({ repo_id: "repo-other", github_node_id: "R_other", slug: "jhw7500/other" });
+    const temp = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:tmp-20260813-01-fix",
+      goal: "fix roaming regression", done_conditions: ["targeted test passes"], expected_scope: ["src/roaming.ts"],
+    });
+    await catalog.promoteTemporaryTask(temp.id, issueInput);
+
+    for (const drift of [
+      { project_id: "prj-other" },
+      { repo_id: "repo-other" },
+      { issue_url: "https://github.com/jhw7500/wlan/issues/2" },
+    ]) {
+      await expect(catalog.promoteTemporaryTask(temp.id, { ...issueInput, ...drift })).rejects.toMatchObject({
+        code: "FORMAL_TASK_SOURCE_MISMATCH",
+      });
+    }
+    await expect(catalog.promoteTemporaryTask(temp.id, {
+      ...issueInput, issue_revision: "2026-08-12T00:00:00Z",
+    })).rejects.toMatchObject({ code: "STALE_SOURCE_REVISION" });
+
+    await expect(catalog.promoteTemporaryTask(temp.id, {
+      ...issueInput,
+      issue_revision: "2026-08-14T00:00:00Z",
+      alias: "jhw7500/wlan-renamed#1",
+    })).resolves.toMatchObject({
+      id: temp.id,
+      issue_revision: "2026-08-14T00:00:00Z",
+      aliases: ["wlan:tmp-20260813-01-fix", "jhw7500/wlan#1", "jhw7500/wlan-renamed#1"],
+    });
+  });
 });
 
 describe("Catalog Registry integrity and public input boundaries", () => {

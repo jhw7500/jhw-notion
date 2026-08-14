@@ -291,6 +291,21 @@ export class ClaimService {
 
   async latestHandoffHistory(taskId: string): Promise<ClaimHistory> {
     assertTaskId(taskId);
+    const candidates = (await this.taskHistory(taskId)).filter((history) =>
+      history.status === "handoff" && history.handoff_path);
+    if (candidates.length === 0) throw new ControlError("HANDOFF_NOT_FOUND", "Task has no committed Handoff history");
+    return this.latestUniqueHistory(taskId, candidates);
+  }
+
+  /** Returns the exact newest committed release for start/recovery policy. */
+  async latestClaimHistory(taskId: string): Promise<ClaimHistory> {
+    assertTaskId(taskId);
+    const candidates = await this.taskHistory(taskId);
+    if (candidates.length === 0) throw new ControlError("CLAIM_HISTORY_NOT_FOUND", "Task has no committed Claim history");
+    return this.latestUniqueHistory(taskId, candidates);
+  }
+
+  private async taskHistory(taskId: string): Promise<ClaimHistory[]> {
     const years = await this.historyYears();
     const candidates: ClaimHistory[] = [];
     let inspected = 0;
@@ -313,13 +328,16 @@ export class ClaimService {
         if (history.task_id !== taskId || String(this.historyYear(history.released_at)).padStart(4, "0") !== year) {
           throw corruption("Claim history path and canonical coordinates disagree", { task_id: taskId });
         }
-        if (history.status === "handoff" && history.handoff_path) candidates.push(history);
+        candidates.push(history);
       }
     }
-    if (candidates.length === 0) throw new ControlError("HANDOFF_NOT_FOUND", "Task has no committed Handoff history");
+    return candidates;
+  }
+
+  private latestUniqueHistory(taskId: string, candidates: ClaimHistory[]): ClaimHistory {
     candidates.sort((left, right) => right.released_at.localeCompare(left.released_at));
     if (candidates[1]?.released_at === candidates[0]?.released_at) {
-      throw corruption("Latest Task Handoff history is ambiguous", { task_id: taskId });
+      throw corruption("Latest Task Claim history is ambiguous", { task_id: taskId });
     }
     return candidates[0] as ClaimHistory;
   }

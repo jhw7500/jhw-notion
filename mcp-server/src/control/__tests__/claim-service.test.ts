@@ -541,6 +541,7 @@ describe("ClaimService", () => {
         ),
       ),
     ).toEqual(history);
+    await expect(claims.latestClaimHistory(active.task_id)).resolves.toEqual(history);
   });
 
   it("fails closed for a valid existing completed-history path and retains the active Claim", async () => {

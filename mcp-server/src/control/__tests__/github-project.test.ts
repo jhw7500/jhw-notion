@@ -314,6 +314,47 @@ describe("GitHubProjectClient", () => {
     expect(gh.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(5);
   });
 
+  it("rejects a duplicate source attachment that appears during final verification", async () => {
+    const gh = new QueuedGhRunner();
+    const initial = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });
+    const issue = {
+      node_id: "I_new",
+      number: 77,
+      title: "Example",
+      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
+      labels: [{ name: "trial" }, { name: "project-record" }],
+    };
+    const final = projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null });
+    for (const [index, item] of final.data.user.projectV2.items.nodes.entries()) {
+      item.id = index === 0 ? "PVTI_new" : "PVTI_duplicate";
+      item.content = { __typename: "Issue", id: "I_new" };
+      item.status = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" };
+      item.health = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" };
+      item.nextAction = { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select-first-task" };
+    }
+    gh.enqueue(
+      initial,
+      [[{ node_id: "I_preflight", number: 900, title: "Preflight fixture", body: "unchanged", labels: [{ name: "trial" }] }]],
+      issue,
+      issue,
+      { data: { addProjectV2ItemById: { item: { id: "PVTI_new" } } } },
+      { data: { node: { __typename: "ProjectV2Item", id: "PVTI_new", type: "ISSUE", content: { __typename: "Issue", id: "I_new" }, lastReviewed: null } } },
+      ...Array.from({ length: 5 }, () => ({ data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_new" } } } })),
+      final,
+    );
+
+    await expect(client(gh).registerProject({
+      project_id: "prj-example",
+      title: "Example",
+      objective: "Prove the trial flow",
+      repo_ids: ["repo-example"],
+      fields: {
+        status: "proposed", priority: "P2", health: "unknown",
+        next_action: "wait:select-first-task", last_reviewed: "2026-08-13",
+      },
+    })).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_ITEM" });
+  });
+
   it("reuses exactly one already-attached Project item after an interrupted registration", async () => {
     const gh = new QueuedGhRunner();
     const page = projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null });

@@ -801,8 +801,11 @@ export class GitHubProjectClient {
     structure: ProjectStructure,
   ): Promise<void> {
     const finalPage = await this.initialPage();
-    const matches = (await this.items(finalPage)).filter((item) => item.id === itemId);
-    if (matches.length !== 1 || sourceId((matches[0] as ItemNode).content) !== sourceNodeId) {
+    const matches = (await this.items(finalPage)).filter((item) => sourceId(item.content) === sourceNodeId);
+    if (matches.length > 1) {
+      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project Record Issue is attached more than once after registration");
+    }
+    if (matches.length !== 1 || (matches[0] as ItemNode).id !== itemId) {
       throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project item identity failed final verification");
     }
     const actual = operatingFields(matches[0] as ItemNode, structure);

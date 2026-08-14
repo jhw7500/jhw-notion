@@ -59,6 +59,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
     recoverClaim: ReturnType<typeof vi.fn>;
     getActive: ReturnType<typeof vi.fn>;
     getClaimHistory: ReturnType<typeof vi.fn>;
+    latestClaimHistory: ReturnType<typeof vi.fn>;
     latestHandoffHistory: ReturnType<typeof vi.fn>;
   };
   worktrees: {
@@ -95,7 +96,8 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
     recoverClaim: vi.fn(),
     getActive: vi.fn().mockResolvedValue(undefined),
     getClaimHistory: vi.fn(),
-    latestHandoffHistory: vi.fn(),
+    latestClaimHistory: vi.fn().mockRejectedValue(new ControlError("CLAIM_HISTORY_NOT_FOUND", "no history")),
+    latestHandoffHistory: vi.fn().mockRejectedValue(new ControlError("HANDOFF_NOT_FOUND", "no handoff")),
   };
   const worktrees = {
     createOrReuse: vi.fn().mockResolvedValue({
@@ -214,8 +216,60 @@ describe("TaskService", () => {
 
     await tasks.start(startInput);
 
-    expect(worktrees.assertStartReady).toHaveBeenCalledWith(startInput.task_id, startInput.task_alias);
+    expect(claims.getActive).toHaveBeenCalledWith(startInput.task_id);
+    expect(claims.getActive).toHaveBeenCalledBefore(worktrees.assertStartReady);
+    expect(worktrees.assertStartReady).toHaveBeenCalledWith(startInput.task_id, startInput.task_alias, undefined);
     expect(worktrees.assertStartReady).toHaveBeenCalledBefore(claims.claimTask);
+  });
+
+  it("passes the exact current Claim to the cleanup barrier without creating successor ownership", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.getActive.mockResolvedValueOnce(activeClaim);
+    worktrees.assertStartReady.mockRejectedValueOnce(new ControlError("CLAIM_ALREADY_ACTIVE", "still active"));
+
+    await expect(tasks.start(startInput)).rejects.toMatchObject({ code: "CLAIM_ALREADY_ACTIVE" });
+
+    expect(worktrees.assertStartReady).toHaveBeenCalledWith(startInput.task_id, startInput.task_alias, {
+      claim_id: activeClaim.claim_id,
+      worktree_ref: activeClaim.worktree_ref,
+      disposition: "active",
+    });
+    expect(claims.claimTask).not.toHaveBeenCalled();
+  });
+
+  it("does not treat completed Claim history as reusable worktree authority", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.latestClaimHistory.mockResolvedValueOnce({
+      ...activeClaim,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "completed",
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    });
+
+    worktrees.assertStartReady.mockRejectedValueOnce(new ControlError("WORKTREE_CLEANUP_REQUIRED", "cleanup"));
+    await expect(tasks.start(startInput)).rejects.toMatchObject({ code: "WORKTREE_CLEANUP_REQUIRED" });
+
+    expect(worktrees.assertStartReady).toHaveBeenCalledWith(startInput.task_id, startInput.task_alias, undefined);
+    expect(claims.claimTask).not.toHaveBeenCalled();
+  });
+
+  it("reuses only the exact force-ended generation under the resumable lifecycle rule", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.latestClaimHistory.mockResolvedValueOnce({
+      ...activeClaim,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "force-ended",
+    });
+
+    await tasks.start(startInput);
+
+    expect(worktrees.assertStartReady).toHaveBeenCalledWith(startInput.task_id, startInput.task_alias, {
+      claim_id: activeClaim.claim_id,
+      worktree_ref: activeClaim.worktree_ref,
+      disposition: "force-ended",
+    });
   });
 
   it("claims before creating a worktree and abandons the Claim if creation fails", async () => {
@@ -360,6 +414,67 @@ describe("TaskService", () => {
       action: { kind: "cleanup" },
     })).rejects.toMatchObject({ code: "WORKTREE_ACTIVE_SUCCESSOR" });
     expect(worktrees.cleanupReleased).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks a successor after Claim release crashes before local cleanup, then resumes exact cleanup", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const config = configFor(fixture.registryDir);
+    const source = join(fixture.root, "source-release-crash");
+    await git(fixture.root, "init", "--initial-branch=main", source);
+    await git(source, "config", "user.name", "Phase1A Test");
+    await git(source, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(source, "README.md"), "# Source\n", "utf8");
+    await git(source, "add", "README.md");
+    await git(source, "commit", "-m", "Initial source");
+    const registry = new RegistryGit(config, new ProcessRunner());
+    const catalog = new Catalog(config, registry);
+    await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
+    const alias = `${taskAlias}-release-crash`;
+    const task = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan", repo_id: "repo-wlan", alias,
+      goal: "recover a released worktree", done_conditions: ["cleanup"], expected_scope: ["src/control"],
+    });
+    const claims = new ClaimService(config, registry, catalog, {
+      async inspect() { return { process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 }; },
+    });
+    const worktrees = new WorktreeManager(config);
+    let crashAfterRelease = true;
+    const taskWorktrees = {
+      assertStartReady: worktrees.assertStartReady.bind(worktrees),
+      createOrReuse: worktrees.createOrReuse.bind(worktrees),
+      inspect: worktrees.inspect.bind(worktrees),
+      removeIfSafe: async (...args: Parameters<WorktreeManager["removeIfSafe"]>) => {
+        if (crashAfterRelease) {
+          crashAfterRelease = false;
+          throw new Error("injected cleanup crash");
+        }
+        return worktrees.removeIfSafe(...args);
+      },
+      assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
+      rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
+      cleanupReleased: worktrees.cleanupReleased.bind(worktrees),
+    };
+    const tasks = new TaskService(config, claims, taskWorktrees, registry);
+    const input = {
+      task_id: task.id, task_alias: alias, project_id: task.project_id, repo_id: task.repo_id,
+      session_id: "codex-release-crash", repository_path: source,
+    };
+    const started = await tasks.start(input);
+
+    await expect(tasks.finish({
+      task_id: task.id, claim_id: started.claim.claim_id, status: "abandoned", validation: ["stopped safely"],
+    })).resolves.toMatchObject({ worktree_removed: false, cleanup_error: expect.any(String) });
+    await expect(claims.getActive(task.id)).resolves.toBeUndefined();
+    await expect(tasks.start({ ...input, session_id: "codex-successor" })).rejects.toMatchObject({
+      code: "WORKTREE_CLEANUP_REQUIRED",
+    });
+    await expect(claims.getActive(task.id)).resolves.toBeUndefined();
+
+    await expect(tasks.recover({
+      task_id: task.id, claim_id: started.claim.claim_id, action: { kind: "cleanup" },
+    })).resolves.toMatchObject({ kind: "cleanup", worktree: { removed: true, lifecycle: "removed" } });
+    await expect(tasks.start({ ...input, session_id: "codex-after-cleanup" })).resolves.toMatchObject({ reused: false });
   });
 
   it("reports retained Claim coordinates after a worktree creation failure", async () => {
@@ -812,6 +927,7 @@ describe("TaskService", () => {
       recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
       getActive: actualClaims.getActive.bind(actualClaims),
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
+      latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
@@ -833,6 +949,15 @@ describe("TaskService", () => {
       repo_id: task.repo_id,
       session_id: "codex-integration",
       repository_path: source,
+    });
+    const formalAlias = "jhw7500/wlan#77";
+    await catalog.promoteTemporaryTask(task.id, {
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      issue_node_id: "I_promoted_handoff",
+      issue_revision: "2026-08-13T12:36:00Z",
+      issue_url: "https://github.com/jhw7500/wlan/issues/77",
+      alias: formalAlias,
     });
     const input = {
       task_id: task.id,
@@ -871,6 +996,15 @@ describe("TaskService", () => {
     expect(await registry.readHeadRegularFile(pointer)).toBe(committed);
     expect(await actualClaims.getActive(task.id)).toBeUndefined();
     expect(timestamps).toHaveLength(1);
+
+    await expect(tasks.start({
+      task_id: task.id,
+      task_alias: formalAlias,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      session_id: "codex-resume",
+      repository_path: source,
+    })).resolves.toMatchObject({ reused: true, claim: { task_alias: taskAlias } });
   });
 
   it("accepts an ignored .ai Handoff retry when Git exposes no local delta", async () => {
@@ -909,6 +1043,7 @@ describe("TaskService", () => {
       recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
       getActive: actualClaims.getActive.bind(actualClaims),
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
+      latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
@@ -973,24 +1108,29 @@ describe("TaskService", () => {
     });
     const worktrees = new WorktreeManager(config);
     const coordinates = worktreePlan(task.id, alias);
-    const priorClaim = {
+    const priorClaim = await actualClaims.claimTask({
       task_id: task.id,
       task_alias: alias,
       project_id: task.project_id,
       repo_id: task.repo_id,
-      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
       session_id: "codex-prior",
       host: config.buildHost,
       branch: coordinates.branch,
       worktree_ref: coordinates.worktree_ref,
-      started_at: "2026-08-13T12:00:00.000Z",
-    };
+    });
     const seeded = await worktrees.createOrReuse(priorClaim, source);
     await mkdir(join(seeded.path, ".ai"), { recursive: true });
     await writeFile(join(seeded.path, ".ai", "handoff.md"), "pre-existing visible handoff\n", "utf8");
     await expect(worktrees.inspect(priorClaim)).resolves.toMatchObject({
       dirty: true,
       dirty_files: [".ai/handoff.md"],
+    });
+    await actualClaims.finishClaim(task.id, priorClaim.claim_id, {
+      status: "abandoned",
+      outcome: "worktree_create_failed",
+      branch: priorClaim.branch,
+      head_sha: "a".repeat(40),
+      validation: ["worktree_create_failed:COMMAND_FAILED"],
     });
 
     let failFirstRelease = true;
@@ -1000,6 +1140,7 @@ describe("TaskService", () => {
       recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
       getActive: actualClaims.getActive.bind(actualClaims),
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
+      latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
@@ -1079,6 +1220,7 @@ describe("TaskService", () => {
       recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
       getActive: actualClaims.getActive.bind(actualClaims),
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
+      latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       finishClaim: actualClaims.finishClaim.bind(actualClaims),
     };

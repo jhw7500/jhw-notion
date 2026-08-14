@@ -738,6 +738,66 @@ describe("WorktreeManager", () => {
     )).rejects.toMatchObject({ code: "WORKTREE_CLEANUP_REQUIRED" });
   });
 
+  it("blocks a released active generation but permits the exact still-active Claim", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.assertStartReady(active.task_id, active.task_alias, {
+      claim_id: active.claim_id,
+      worktree_ref: active.worktree_ref,
+      disposition: "active",
+    })).resolves.toBeUndefined();
+    await expect(manager.assertStartReady(active.task_id, active.task_alias)).rejects.toMatchObject({
+      code: "WORKTREE_CLEANUP_REQUIRED",
+      details: { task_id: active.task_id, worktree_ref: active.worktree_ref },
+    });
+  });
+
+  it("finds pending cleanup for the same Task after its alias changes", async () => {
+    let saves = 0;
+    const { repoDir, manager } = await worktreeFixtureWithHooks({
+      beforeSave: () => {
+        saves += 1;
+        if (saves === 4) throw new Error("state write failed after git remove");
+      },
+    });
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+    await expect(manager.removeIfSafe(active)).rejects.toThrow("state write failed after git remove");
+
+    await expect(manager.assertStartReady(active.task_id, "owner/repository#77")).rejects.toMatchObject({
+      code: "WORKTREE_CLEANUP_REQUIRED",
+      details: { task_id: active.task_id, worktree_ref: active.worktree_ref },
+    });
+  });
+
+  it("allows only the exact create-failed generation to reconcile pending creation", async () => {
+    let saves = 0;
+    const { repoDir, manager } = await worktreeFixtureWithHooks({
+      beforeSave: () => {
+        saves += 1;
+        if (saves === 2) throw new Error("state write failed after git create");
+      },
+    });
+    const active = claim();
+    await expect(manager.createOrReuse(active, repoDir)).rejects.toThrow("state write failed after git create");
+
+    await expect(manager.assertStartReady(active.task_id, active.task_alias)).rejects.toMatchObject({
+      code: "WORKTREE_CREATE_PENDING",
+    });
+    await expect(manager.assertStartReady(active.task_id, active.task_alias, {
+      claim_id: active.claim_id,
+      worktree_ref: active.worktree_ref,
+      disposition: "create-failed",
+    })).resolves.toBeUndefined();
+    await expect(manager.assertStartReady(active.task_id, active.task_alias, {
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      worktree_ref: active.worktree_ref,
+      disposition: "create-failed",
+    })).rejects.toMatchObject({ code: "WORKTREE_CREATE_PENDING" });
+  });
+
   it("cleans up only the exact released same-host generation and is idempotent", async () => {
     const { repoDir, manager } = await worktreeFixture();
     const active = claim();
@@ -760,6 +820,33 @@ describe("WorktreeManager", () => {
       .rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
     await expect(manager.cleanupReleased({ ...history, host: "another-host" }))
       .rejects.toMatchObject({ code: "HOST_MISMATCH" });
+  });
+
+  it("ignores a verified absent removed tombstone when taking over a later alias generation", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const old = claim();
+    await manager.createOrReuse(old, repoDir);
+    const oldHistory: ClaimHistory = {
+      ...old,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "completed",
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    };
+    await manager.cleanupReleased(oldHistory);
+    const formalAlias = "owner/repository#77";
+    const formalPlan = worktreePlan(old.task_id, formalAlias);
+    const current = claim({
+      task_alias: formalAlias,
+      branch: formalPlan.branch,
+      worktree_ref: formalPlan.worktree_ref,
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      session_id: "codex-formal",
+    });
+    await manager.createOrReuse(current, repoDir);
+
+    await expect(manager.assertTakeoverEligible(current)).resolves.toBeUndefined();
   });
 
   it("reinspects a same-generation pending removal and retries after a second safety check fails", async () => {
