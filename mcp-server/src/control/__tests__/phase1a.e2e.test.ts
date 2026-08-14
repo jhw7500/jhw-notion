@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, readFile, readdir, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,6 +10,8 @@ import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { runCli, type CliDependencies } from "../cli.js";
 import type { ControlConfig } from "../config.js";
 import { ControlError } from "../errors.js";
+import { GitHubProjectClient, type GitHubRunner } from "../github-project.js";
+import { GitHubSourceService, type GitHubSourceRunner } from "../github-source.js";
 import { PilotJournal } from "../journal.js";
 import { MutationLock, ProcessRunner, type ProcessResult, type ProcessRunOptions } from "../process.js";
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
@@ -247,6 +249,79 @@ class PushGateRunner implements ProcessRunnerLike {
     this.calls.push({ command, args: [...args] });
     return this.delegate.runRaw(command, args, options, maximumBytes);
   }
+}
+
+class GateSourceRunner implements GitHubSourceRunner {
+  readonly calls: Array<{ command: string; args: string[]; credential?: "project" | "repo" }> = [];
+  repository = { node_id: "R_phase1a", full_name: "jhw7500/control", private: true };
+  issue = {
+    node_id: "I_phase1a",
+    number: 1,
+    html_url: "https://github.com/jhw7500/control/issues/1",
+    updated_at: "2026-08-13T00:00:00Z",
+    state: "open" as const,
+  };
+
+  constructor(private readonly delegate = new ProcessRunner()) {}
+
+  async run(command: string, args: string[], options?: ProcessRunOptions): Promise<ProcessResult> {
+    this.calls.push({ command, args: [...args] });
+    return this.delegate.run(command, args, options);
+  }
+
+  async runGh(args: string[], credential: "project" | "repo"): Promise<ProcessResult> {
+    this.calls.push({ command: "gh", args: [...args], credential });
+    const target = args[1] ?? "";
+    const value = target === "repos/jhw7500/control" ? this.repository : this.issue;
+    return { command: "gh", args, stdout: `${JSON.stringify(value)}\n`, stderr: "", exitCode: 0 };
+  }
+}
+
+class GateProjectRunner implements GitHubRunner {
+  readonly calls: Array<{ args: string[]; credential: "project" | "repo" }> = [];
+  private readonly responses: Array<unknown | Error> = [];
+
+  enqueue(...responses: Array<unknown | Error>): void {
+    this.responses.push(...responses);
+  }
+
+  async runGh(args: string[], credential: "project" | "repo"): Promise<ProcessResult> {
+    this.calls.push({ args: [...args], credential });
+    const response = this.responses.shift();
+    if (response === undefined) throw new Error("GateProjectRunner exhausted");
+    if (response instanceof Error) throw response;
+    return { command: "gh", args, stdout: `${JSON.stringify(response)}\n`, stderr: "", exitCode: 0 };
+  }
+}
+
+const gateProjectFields = [
+  { __typename: "ProjectV2SingleSelectField", id: "PVTF_status", name: "Status", dataType: "SINGLE_SELECT", options: ["proposed", "active", "paused", "completed", "cancelled"].map((name) => ({ id: `status-${name}`, name })) },
+  { __typename: "ProjectV2SingleSelectField", id: "PVTF_priority", name: "Priority", dataType: "SINGLE_SELECT", options: ["P0", "P1", "P2", "P3"].map((name) => ({ id: `priority-${name}`, name })) },
+  { __typename: "ProjectV2SingleSelectField", id: "PVTF_health", name: "Health", dataType: "SINGLE_SELECT", options: ["on-track", "at-risk", "blocked", "unknown"].map((name) => ({ id: `health-${name}`, name })) },
+  { __typename: "ProjectV2Field", id: "PVTF_next", name: "Next Action", dataType: "TEXT" },
+  { __typename: "ProjectV2Field", id: "PVTF_reviewed", name: "Last Reviewed", dataType: "DATE" },
+];
+
+function gateProjectPage(item: Record<string, unknown> | undefined) {
+  return {
+    data: { user: { projectV2: {
+      id: "PVT_project", public: false, updatedAt: "2026-08-13T00:00:00Z",
+      fields: { totalCount: gateProjectFields.length, nodes: gateProjectFields, pageInfo: { hasNextPage: false, endCursor: null } },
+      items: { totalCount: item ? 1 : 0, nodes: item ? [item] : [], pageInfo: { hasNextPage: false, endCursor: null } },
+    } } },
+  };
+}
+
+function gateProjectItem(complete: boolean) {
+  return {
+    id: "PVTI_existing", isArchived: false, type: "ISSUE",
+    content: { __typename: "Issue", id: "I_existing" },
+    status: complete ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" } : null,
+    priority: complete ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P2", name: "P2" } : null,
+    health: complete ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" } : null,
+    nextAction: complete ? { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select" } : null,
+    lastReviewed: complete ? { __typename: "ProjectV2ItemFieldDateValue", date: "2026-08-13" } : null,
+  };
 }
 
 async function runDeterministicPushRace<T>(left: () => Promise<T>, right: () => Promise<T>, leftRunner: PushGateRunner, rightRunner: PushGateRunner) {
@@ -1168,5 +1243,369 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const artifacts = await textArtifacts(audit);
     expect(artifacts.join("\n")).not.toContain(secret);
     expect(artifacts.join("\n")).not.toContain(fixture.sourceRepo);
+  }, 15_000);
+
+  it("20. descriptor-hostile Registry ancestors, leaves, and hardlinks preserve the outside sentinel and Git authority", async () => {
+    for (const kind of ["ancestor-symlink", "leaf-symlink", "hardlink"] as const) {
+      const fixture = await makeGateFixture();
+      const graph = graphFor(fixture, fixture.cloneA);
+      const outside = join(fixture.root, `${kind}-outside`);
+      const sentinel = kind === "ancestor-symlink" ? join(outside, "sentinel.txt") : outside;
+      if (kind === "ancestor-symlink") {
+        await mkdir(outside);
+        await writeFile(sentinel, "outside-sentinel\n", "utf8");
+        await symlink(outside, join(fixture.cloneA, "repositories"));
+        await git(fixture.cloneA, "add", "--", "repositories");
+        await git(fixture.cloneA, "commit", "-m", "Add hostile repositories ancestor");
+        await git(fixture.cloneA, "push", "origin", "main");
+      } else if (kind === "leaf-symlink") {
+        await writeFile(sentinel, `${JSON.stringify({ id: "repo-hostile", github_node_id: "R_hostile", slug: "jhw7500/hostile" })}\n`, "utf8");
+        await mkdir(join(fixture.cloneA, "repositories"));
+        await symlink(sentinel, join(fixture.cloneA, "repositories", "repo-hostile.yaml"));
+        await git(fixture.cloneA, "add", "--", "repositories");
+        await git(fixture.cloneA, "commit", "-m", "Add hostile Repository leaf");
+        await git(fixture.cloneA, "push", "origin", "main");
+      } else {
+        await graph.catalog.registerRepository(repositoryInput);
+        await link(join(fixture.cloneA, "repositories", "repo-control.yaml"), sentinel);
+      }
+      const beforeSentinel = await readFile(sentinel, "utf8");
+      const beforeStatus = await git(fixture.cloneA, "status", "--porcelain", "--untracked-files=all");
+      const beforeHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+      const beforeRemote = (await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim();
+
+      const operation = kind === "hardlink"
+        ? graph.catalog.getRepository("repo-control")
+        : graph.catalog.registerRepository({ repo_id: "repo-hostile", github_node_id: "R_hostile", slug: "jhw7500/hostile" });
+      await expect(operation, kind).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+      expect(await readFile(sentinel, "utf8"), kind).toBe(beforeSentinel);
+      expect(await git(fixture.cloneA, "status", "--porcelain", "--untracked-files=all"), kind).toBe(beforeStatus);
+      expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim(), kind).toBe(beforeHead);
+      expect((await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim(), kind).toBe(beforeRemote);
+    }
+  }, 30_000);
+
+  it("21. public Repository and formal Task flow verifies membership, checkout, Issue coordinates, and source authority before Claim", async () => {
+    const fixture = await makeGateFixture();
+    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
+    const graph = graphFor(fixture, fixture.cloneA);
+    const runner = new GateSourceRunner();
+    let membershipFailure: string | undefined;
+    const membershipCalls: Array<[string, string]> = [];
+    const source = new GitHubSourceService({
+      runner,
+      catalog: graph.catalog,
+      projects: {
+        async requireProjectRepository(projectId, repoId) {
+          membershipCalls.push([projectId, repoId]);
+          if (membershipFailure) throw new ControlError(membershipFailure, "injected membership refusal");
+        },
+      },
+    });
+    const dependencies = cliDependencies(graph, { source });
+    const registered = await runCli([
+      "repository", "register", "--repo-id", "repo-control", "--slug", "jhw7500/control",
+      "--repo-path", fixture.sourceRepo,
+    ], dependencies);
+    expect(registered.exitCode).toBe(0);
+    expect(JSON.parse(registered.stdout).result).toMatchObject({ repo_id: "repo-control", slug: "jhw7500/control", created: true });
+
+    const formalArgs = (session: string, overrides: {
+      repositoryPath?: string; issueUrl?: string; issueNodeId?: string; issueRevision?: string;
+    } = {}) => [
+      "task", "start", "--project", "prj-control", "--repo-id", "repo-control",
+      "--repo-path", overrides.repositoryPath ?? fixture.sourceRepo,
+      "--issue-url", overrides.issueUrl ?? issueInput.issue_url,
+      "--issue-node-id", overrides.issueNodeId ?? issueInput.issue_node_id,
+      "--issue-revision", overrides.issueRevision ?? issueInput.issue_revision,
+      "--session", session,
+    ];
+    const initialHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+    membershipFailure = "PROJECT_RECORD_NOT_FOUND";
+    const missingMembership = await runCli(formalArgs("source-membership-missing"), dependencies);
+    expect(JSON.parse(missingMembership.stderr)).toEqual({ error: { code: "PROJECT_RECORD_NOT_FOUND" } });
+    membershipFailure = undefined;
+
+    const wrongRepository = await runCli(formalArgs("source-wrong-repository", {
+      issueUrl: "https://github.com/other/repository/issues/1",
+    }), dependencies);
+    expect(JSON.parse(wrongRepository.stderr)).toEqual({ error: { code: "ISSUE_REPOSITORY_MISMATCH" } });
+    const wrongNode = await runCli(formalArgs("source-wrong-node", { issueNodeId: "I_wrong" }), dependencies);
+    expect(JSON.parse(wrongNode.stderr)).toEqual({ error: { code: "ISSUE_IDENTITY_MISMATCH" } });
+    const wrongRevision = await runCli(formalArgs("source-wrong-revision", {
+      issueRevision: "2026-08-13T00:00:01Z",
+    }), dependencies);
+    expect(JSON.parse(wrongRevision.stderr)).toEqual({ error: { code: "ISSUE_REVISION_MISMATCH" } });
+    runner.repository = { ...runner.repository, node_id: "R_other" };
+    const wrongNodeRepository = await runCli(formalArgs("source-wrong-repository-node"), dependencies);
+    expect(JSON.parse(wrongNodeRepository.stderr)).toEqual({ error: { code: "REPOSITORY_IDENTITY_MISMATCH" } });
+    runner.repository = { ...runner.repository, node_id: repositoryInput.github_node_id };
+
+    const wrongCheckout = join(fixture.root, "wrong-checkout");
+    await git(fixture.root, "init", "--initial-branch=main", wrongCheckout);
+    await git(wrongCheckout, "config", "user.name", "Phase1A Test");
+    await git(wrongCheckout, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(wrongCheckout, "README.md"), "wrong\n", "utf8");
+    await git(wrongCheckout, "add", "README.md");
+    await git(wrongCheckout, "commit", "-m", "wrong checkout");
+    await git(wrongCheckout, "remote", "add", "origin", "https://github.com/other/repository.git");
+    const checkoutFailure = await runCli(formalArgs("source-wrong-checkout", { repositoryPath: wrongCheckout }), dependencies);
+    expect(JSON.parse(checkoutFailure.stderr)).toEqual({ error: { code: "CHECKOUT_REMOTE_MISMATCH" } });
+    expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(initialHead);
+    expect(await exists(join(fixture.cloneA, "claims", "active"))).toBe(false);
+
+    const correct = await runCli(formalArgs("source-verified"), dependencies);
+    expect(correct.exitCode).toBe(0);
+    const correctResult = JSON.parse(correct.stdout).result;
+    expect(correctResult).toMatchObject({ task: { kind: "formal" } });
+    expect(await graph.catalog.getTask(correctResult.task.task_id)).toMatchObject({
+      kind: "formal", aliases: ["jhw7500/control#1"],
+    });
+    expect(await graph.claims.getActive(correctResult.task.task_id)).toMatchObject({
+      claim_id: correctResult.claim.claim_id, session_id: "source-verified",
+    });
+    expect(membershipCalls).toContainEqual(["prj-control", "repo-control"]);
+    expect(runner.calls.filter((call) => call.command === "gh").every((call) => call.credential === "repo")).toBe(true);
+  }, 30_000);
+
+  it("22. a duplicate formal source relation fails closed without changing local or remote Registry authority", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const taskIds = [
+      "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab",
+      "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+    ];
+    const duplicateIssue = { ...issueInput, issue_node_id: "I_duplicate", issue_url: "https://github.com/jhw7500/control/issues/2", alias: "jhw7500/control#2" };
+    for (const id of taskIds) {
+      await mkdir(join(fixture.cloneA, "tasks"), { recursive: true });
+      await writeFile(join(fixture.cloneA, "tasks", `${id}.yaml`), `${JSON.stringify({
+        id, kind: "formal", project_id: duplicateIssue.project_id, repo_id: duplicateIssue.repo_id,
+        aliases: [duplicateIssue.alias], issue_node_id: duplicateIssue.issue_node_id,
+        issue_revision: duplicateIssue.issue_revision, issue_url: duplicateIssue.issue_url,
+      })}\n`, "utf8");
+    }
+    const indexDirectory = join(fixture.cloneA, "tasks", "by-source", "github");
+    await mkdir(indexDirectory, { recursive: true });
+    await writeFile(join(indexDirectory, `${sourceIndexKey(duplicateIssue.issue_node_id)}.yaml`), `${JSON.stringify({ task_id: taskIds[0] })}\n`, "utf8");
+    await git(fixture.cloneA, "add", "--", "tasks");
+    await git(fixture.cloneA, "commit", "-m", "Inject duplicate formal source fixture");
+    await git(fixture.cloneA, "push", "origin", "main");
+    const beforeHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+    const beforeRemote = (await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim();
+
+    await expect(graph.catalog.registerFormalTask(duplicateIssue)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim()).toBe(beforeRemote);
+    expect(await git(fixture.cloneA, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  }, 15_000);
+
+  it("23. Project registration retries an attached partial record and re-verifies all five fields without duplicate attachment", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const input = {
+      project_id: "prj-example", title: "Example", objective: "Prove the trial flow", repo_ids: ["repo-control"],
+      fields: { status: "proposed" as const, priority: "P2" as const, health: "unknown" as const, next_action: "wait:select", last_reviewed: "2026-08-13" },
+    };
+    const issue = {
+      node_id: "I_existing", number: 77, title: input.title,
+      body: JSON.stringify({ id: input.project_id, objective: input.objective, repositories: input.repo_ids }),
+      labels: [{ name: "trial" }, { name: "project-record" }],
+    };
+    const mutation = { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_existing" } } } };
+    const interruptedRunner = new GateProjectRunner();
+    interruptedRunner.enqueue(
+      gateProjectPage(gateProjectItem(false)), [[issue]], issue,
+      mutation, mutation, new Error("injected third-field boundary"),
+    );
+    const interrupted = new GitHubProjectClient({
+      githubOwner: "jhw7500", projectNumber: 7, registryRepository: "jhw7500/project-registry",
+      preflightProjectItemId: "PVTI_trial", runner: interruptedRunner, catalog: graph.catalog,
+    });
+    await expect(interrupted.registerProject(input)).rejects.toThrow("injected third-field boundary");
+    expect(interruptedRunner.calls.some((call) => call.args.join(" ").includes("addProjectV2ItemById"))).toBe(false);
+
+    const retryRunner = new GateProjectRunner();
+    retryRunner.enqueue(
+      gateProjectPage(gateProjectItem(false)), [[issue]], issue,
+      mutation, mutation, mutation, mutation, mutation,
+      gateProjectPage(gateProjectItem(true)),
+    );
+    const retry = new GitHubProjectClient({
+      githubOwner: "jhw7500", projectNumber: 7, registryRepository: "jhw7500/project-registry",
+      preflightProjectItemId: "PVTI_trial", runner: retryRunner, catalog: graph.catalog,
+    });
+    const dependencies = cliDependencies(graph, {
+      portfolio: { ...cliDependencies(graph).portfolio, registerProject: retry.registerProject.bind(retry) },
+    });
+    const result = await runCli([
+      "project", "register", "--project", input.project_id, "--title", input.title, "--objective", input.objective,
+      "--repo-id", "repo-control", "--status", "proposed", "--priority", "P2", "--health", "unknown",
+      "--next-action", "wait:select", "--last-reviewed", "2026-08-13",
+    ], dependencies);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).toEqual({
+      project_id: "prj-example", project_item_id: "PVTI_existing", source_node_id: "I_existing", issue_number: 77,
+    });
+    expect(retryRunner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(5);
+    expect(retryRunner.calls.some((call) => call.args.join(" ").includes("addProjectV2ItemById"))).toBe(false);
+  }, 20_000);
+
+  it("24. cleanup recovery resumes failures after release, pending-remove persistence, and physical removal before any successor Claim", async () => {
+    for (const boundary of ["after-release", "after-pending-remove", "after-physical-remove"] as const) {
+      let saves = 0;
+      let injected = false;
+      const fixture = await makeGateFixture();
+      const graph = graphFor(fixture, fixture.cloneA, {
+        worktreeHooks: boundary === "after-release" ? undefined : {
+          beforeSave: () => {
+            saves += 1;
+            const target = boundary === "after-pending-remove" ? 3 : 4;
+            if (!injected && saves === target) {
+              injected = true;
+              throw new Error(`injected ${boundary}`);
+            }
+          },
+        },
+      });
+      let releaseFailure = boundary === "after-release";
+      const worktrees = boundary === "after-release" ? {
+        assertStartReady: graph.worktrees.assertStartReady.bind(graph.worktrees),
+        createOrReuse: graph.worktrees.createOrReuse.bind(graph.worktrees),
+        inspect: graph.worktrees.inspect.bind(graph.worktrees),
+        removeIfSafe: async (...args: Parameters<WorktreeManager["removeIfSafe"]>) => {
+          if (releaseFailure) {
+            releaseFailure = false;
+            throw new Error("injected post-release cleanup failure");
+          }
+          return graph.worktrees.removeIfSafe(...args);
+        },
+        assertForceEndEligible: graph.worktrees.assertForceEndEligible.bind(graph.worktrees),
+        assertTakeoverEligible: graph.worktrees.assertTakeoverEligible.bind(graph.worktrees),
+        rebindTakeover: graph.worktrees.rebindTakeover.bind(graph.worktrees),
+        cleanupReleased: graph.worktrees.cleanupReleased.bind(graph.worktrees),
+      } : graph.worktrees;
+      const tasks = boundary === "after-release"
+        ? new TaskService(graph.config, graph.claims, worktrees, graph.registry)
+        : graph.tasks;
+      const dependencies = cliDependencies(graph, { taskService: tasks });
+      const started = await runCli(temporaryStartArgs(`control:${boundary}`, fixture.sourceRepo, `session-${boundary}`), dependencies);
+      const first = JSON.parse(started.stdout).result;
+      const finished = await runCli([
+        "task", "finish", "--task", first.task.task_id, "--claim", first.claim.claim_id,
+        "--status", "abandoned", "--validation", `boundary ${boundary}`,
+      ], dependencies);
+      expect(finished.exitCode, boundary).toBe(0);
+      expect(JSON.parse(finished.stdout).result.worktree_removed, boundary).toBe(false);
+      expect(await graph.claims.getActive(first.task.task_id), boundary).toBeUndefined();
+      const blocked = await runCli([
+        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `blocked-${boundary}`,
+      ], dependencies);
+      expect(JSON.parse(blocked.stderr), boundary).toEqual({ error: { code: "WORKTREE_CLEANUP_REQUIRED" } });
+      expect(await graph.claims.getActive(first.task.task_id), boundary).toBeUndefined();
+      const recovered = await runCli([
+        "task", "recover", "--task", first.task.task_id, "--expect", first.claim.claim_id, "--action", "cleanup",
+      ], dependencies);
+      expect(recovered.exitCode, boundary).toBe(0);
+      const successor = await runCli([
+        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `recovered-${boundary}`,
+      ], dependencies);
+      expect(successor.exitCode, boundary).toBe(0);
+    }
+  }, 40_000);
+
+  it("25. Project, Handoff, Registry restore, and snapshot injection paths reject before authoritative output", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const secret = "unmistakably-fake-cross-boundary-secret";
+    const projectRunner = new GateProjectRunner();
+    const project = new GitHubProjectClient({
+      githubOwner: "jhw7500", projectNumber: 7, registryRepository: "jhw7500/project-registry",
+      preflightProjectItemId: "PVTI_trial", runner: projectRunner, catalog: graph.catalog,
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+    await expect(project.registerProject({
+      project_id: "prj-injected", title: "Rejected", objective: `contains ${secret}`,
+      repo_ids: ["repo-control"],
+      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:reject", last_reviewed: "2026-08-13" },
+    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(projectRunner.calls).toEqual([]);
+
+    const dependencies = cliDependencies(graph);
+    const started = await runCli(temporaryStartArgs("control:handoff-injection", fixture.sourceRepo, "handoff-injection"), dependencies);
+    const active = JSON.parse(started.stdout).result;
+    const beforeHandoff = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+    const rejectedHandoff = await runCli([
+      "task", "finish", "--task", active.task.task_id, "--claim", active.claim.claim_id, "--status", "handoff",
+      "--validation", "reject injected path", "--progress", `${fixture.sourceRepo}/progress`,
+      "--failures", `${fixture.sourceRepo}/failure`, "--next-step", `${fixture.sourceRepo}/next`,
+    ], dependencies);
+    expect(JSON.parse(rejectedHandoff.stderr)).toEqual({ error: { code: "SENSITIVE_DATA_REJECTED" } });
+    expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(beforeHandoff);
+    expect(await graph.claims.getActive(active.task.task_id)).toMatchObject({ claim_id: active.claim.claim_id });
+    expect(await exists(join(fixture.cloneA, "handoffs", active.task.task_id))).toBe(false);
+
+    const taskPath = join(fixture.cloneA, "tasks", `${active.task.task_id}.yaml`);
+    const restored = JSON.parse(await readFile(taskPath, "utf8"));
+    restored.goal = `${fixture.sourceRepo}/restored-content`;
+    await writeFile(taskPath, `${JSON.stringify(restored)}\n`, "utf8");
+    await git(fixture.cloneA, "add", "--", `tasks/${active.task.task_id}.yaml`);
+    await git(fixture.cloneA, "commit", "-m", "Inject isolated restored record fixture");
+    const remoteBeforeRestoreRead = (await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim();
+    const restorePolicyCatalog = new Catalog(
+      graph.config,
+      graph.registry,
+      createSensitiveDataPolicy({}, [fixture.sourceRepo, fixture.cloneA, fixture.stateDir, fixture.worktreeRoot]),
+    );
+    await expect(restorePolicyCatalog.getTask(active.task.task_id)).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect((await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim()).toBe(remoteBeforeRestoreRead);
+
+    const snapshotSource = projectSource(1);
+    snapshotSource.items[0]!.objective = `${fixture.sourceRepo}/snapshot-source`;
+    const snapshots = new PortfolioService({ projectClient: { readAll: async () => snapshotSource }, stateDir: fixture.stateDir });
+    await expect(snapshots.exportSnapshot()).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(await exists(join(fixture.stateDir, "snapshots"))).toBe(false);
+  }, 25_000);
+
+  it("26. live preflight rejects a noncanonical Registry remote before any Project mutation", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const delegate = new ProcessRunner();
+    const runner = {
+      run: delegate.run.bind(delegate),
+      async runGh(args: string[], credential: "project" | "repo"): Promise<ProcessResult> {
+        return {
+          command: "gh", args, stderr: "", exitCode: 0,
+          stdout: credential === "project" ? "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" : "{}\n",
+        };
+      },
+    };
+    let projectCalls = 0;
+    const project: PreflightProjectPort = {
+      verifyFields: async () => { projectCalls += 1; },
+      addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; },
+      verifyItemContentId: async () => { projectCalls += 1; return "I_trial"; },
+      readLastReviewed: async () => { projectCalls += 1; return undefined; },
+      writeLastReviewed: async () => { projectCalls += 1; },
+      clearLastReviewed: async () => { projectCalls += 1; },
+    };
+    const preflight = new PreflightService({
+      config: graph.config,
+      environment: { GH_PROJECT_TOKEN: "fake-project-token", GH_REPO_TOKEN: "fake-repository-token" },
+      runner,
+      project,
+      authority: { observeCommittedLegacy: async () => undefined },
+      notion: { verifyReadOnlyRoutes: async () => undefined },
+      repository: { verifyPrivateRepository: async () => undefined },
+      registry: { assertReady: async () => undefined },
+    });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_REMOTE_NOT_SSH" });
+    expect(projectCalls).toBe(0);
+    expect(await git(fixture.cloneA, "status", "--porcelain", "--untracked-files=all")).toBe("");
   }, 15_000);
 });
