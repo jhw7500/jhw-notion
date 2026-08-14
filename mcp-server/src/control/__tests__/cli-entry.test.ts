@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { Writable } from "node:stream";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { writeStream } from "../cli.js";
 
 const execFile = promisify(execFileCallback);
 const paths: string[] = [];
@@ -16,6 +18,28 @@ afterEach(async () => {
 });
 
 describe("jhw-control installed entry", () => {
+  it("awaits backpressured near-limit output through the final write callback", async () => {
+    const payload = "x".repeat(12 * 1024 - 1) + "\n";
+    let release: (() => void) | undefined;
+    let received = "";
+    const stream = new Writable({
+      highWaterMark: 1,
+      write(chunk, _encoding, callback) {
+        received += chunk.toString();
+        release = callback;
+      },
+    });
+    let settled = false;
+
+    const pending = writeStream(stream, payload).then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(received).toBe(payload);
+    release?.();
+    await pending;
+    expect(settled).toBe(true);
+  });
+
   it("removes stale deleted control outputs before compiling", async () => {
     const stale = join(mcpRoot, "dist", "control", "locked-cli.js");
     await mkdir(dirname(stale), { recursive: true });
@@ -60,6 +84,8 @@ describe("jhw-control installed entry", () => {
     await mkdir(npmBin, { recursive: true });
     const installedBin = join(npmBin, "jhw-control");
     const stateDir = join(root, "state");
+    await mkdir(join(root, "registry"));
+    await mkdir(join(root, "worktrees"));
     await symlink(join(mcpRoot, "dist", "control", "cli.js"), installedBin);
     const failure = await execFile(installedBin, [
       "project", "register",

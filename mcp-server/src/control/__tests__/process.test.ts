@@ -121,6 +121,54 @@ describe("control process boundary", () => {
     });
   });
 
+  it("forces ordinary child processes into non-interactive Git and SSH mode", async () => {
+    const result = await new ProcessRunner({ GIT_SSH_COMMAND: "ssh -i /fixture/key" }).run(
+      "bash",
+      ["-c", "printf '%s|%s|%s' \"$GIT_TERMINAL_PROMPT\" \"$GCM_INTERACTIVE\" \"$GIT_SSH_COMMAND\""],
+    );
+
+    expect(result.stdout).toBe("0|Never|ssh -i /fixture/key -oBatchMode=yes");
+  });
+
+  it("kills a hanging command at the caller's bounded timeout", async () => {
+    const started = Date.now();
+    const error = await new ProcessRunner({}).run(
+      process.execPath,
+      ["-e", "setInterval(() => undefined, 1000)"],
+      { timeoutMs: 25 },
+    ).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "COMMAND_TIMEOUT" });
+    expect(JSON.stringify(error)).not.toContain("setInterval");
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("kills a hanging raw command without returning partial blob bytes", async () => {
+    const error = await new ProcessRunner({}).runRaw(
+      process.execPath,
+      ["-e", "process.stdout.write('partial'); setInterval(() => undefined, 1000)"],
+      { timeoutMs: 25 },
+      64,
+    ).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "COMMAND_TIMEOUT" });
+    expect(JSON.stringify(error)).not.toContain("partial");
+  });
+
+  it("honors an already-aborted signal without returning child output", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const error = await new ProcessRunner({}).run(
+      process.execPath,
+      ["-e", "process.stdout.write('must-not-return'); setInterval(() => undefined, 1000)"],
+      { signal: controller.signal },
+    ).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "COMMAND_ABORTED" });
+    expect(JSON.stringify(error)).not.toContain("must-not-return");
+  });
+
   it("returns bounded raw bytes without decoding or redacting committed blob content", async () => {
     const secret = "blob-secret";
     const bytes = await new ProcessRunner({ BLOB_TOKEN: secret }).runRaw("bash", ["-c", `printf '${secret}'`], {}, 64);

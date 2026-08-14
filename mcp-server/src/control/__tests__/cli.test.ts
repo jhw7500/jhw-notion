@@ -796,6 +796,7 @@ describe("runCli", () => {
     "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
     "UNSUPPORTED_REGISTRY_OWNER",
     "REGISTRY_REMOTE_NOT_SSH",
+    "COMMAND_TIMEOUT",
   ])("maps preflight policy-unavailable error %s to exit 78", async (code) => {
     const result = await runCli(["preflight"], makeCliDependencies({
       preflight: { run: async () => { throw new ControlError(code, "untrusted policy diagnostic"); } },

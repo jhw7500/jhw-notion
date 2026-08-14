@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { type FileHandle } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
@@ -9,6 +9,8 @@ import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
 
 const MAX_CAPTURE_BYTES = 1024 * 1024;
+const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
+const MAX_PROCESS_TIMEOUT_MS = 600_000;
 const SECRET_ENV_KEY = /_(?:TOKEN|KEY|SECRET)$/;
 
 export interface ProcessResult {
@@ -22,13 +24,79 @@ export interface ProcessResult {
 export interface ProcessRunOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export type GhCredential = "project" | "repo";
 
 /** Removes credentials before spawning ordinary host subprocesses. */
 export function sanitizedChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(env).filter(([key]) => !SECRET_ENV_KEY.test(key)));
+  const sanitized = Object.fromEntries(Object.entries(env).filter(([key]) => !SECRET_ENV_KEY.test(key)));
+  const configuredSsh = sanitized.GIT_SSH_COMMAND?.trim() || "ssh";
+  return {
+    ...sanitized,
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
+    GIT_SSH_COMMAND: /(?:^|\s)-o\s*BatchMode=|(?:^|\s)-oBatchMode=/.test(configuredSsh)
+      ? configuredSsh
+      : `${configuredSsh} -oBatchMode=yes`,
+  };
+}
+
+function timeoutMs(options: ProcessRunOptions): number {
+  const value = options.timeoutMs ?? DEFAULT_PROCESS_TIMEOUT_MS;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_PROCESS_TIMEOUT_MS) {
+    throw new ControlError("INVALID_PROCESS_TIMEOUT", "Process timeout must be a bounded positive integer");
+  }
+  return value;
+}
+
+interface ChildExit {
+  exitCode: number | null;
+  cause?: string;
+  stopped?: "timeout" | "aborted";
+}
+
+/** Waits for close while forcing a deterministic hard stop at either boundary. */
+function waitForChild(child: ChildProcess, options: ProcessRunOptions): Promise<ChildExit> {
+  const deadline = timeoutMs(options);
+  return new Promise((resolve) => {
+    let settled = false;
+    let stopped: ChildExit["stopped"];
+    const settle = (result: ChildExit) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      resolve({ ...result, ...(stopped ? { stopped } : {}) });
+    };
+    const stop = (reason: NonNullable<ChildExit["stopped"]>) => {
+      if (settled || stopped) return;
+      stopped = reason;
+      child.kill("SIGKILL");
+    };
+    const abort = () => stop("aborted");
+    const timer = setTimeout(() => stop("timeout"), deadline);
+    child.once("error", (cause) => settle({
+      exitCode: null,
+      cause: cause instanceof Error ? cause.message : String(cause),
+    }));
+    child.once("close", (exitCode) => settle({ exitCode }));
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function stoppedError(stopped: ChildExit["stopped"], command: string, deadline: number): ControlError | undefined {
+  if (stopped === "timeout") {
+    return new ControlError("COMMAND_TIMEOUT", "Command exceeded its bounded execution time", {
+      command,
+      timeout_ms: deadline,
+    });
+  }
+  if (stopped === "aborted") return new ControlError("COMMAND_ABORTED", "Command was aborted", { command });
+  return undefined;
 }
 
 function secretValues(env: NodeJS.ProcessEnv): string[] {
@@ -180,7 +248,7 @@ export class ProcessRunner {
     return this.runWithEnvironment(
       command,
       args,
-      options.cwd,
+      options,
       sanitizedChildEnvironment(rawEnvironment),
       secretValues(rawEnvironment),
     );
@@ -204,6 +272,7 @@ export class ProcessRunner {
     }
 
     const rawEnvironment = { ...this.environment, ...options.env };
+    const deadline = timeoutMs(options);
     const secrets = secretValues(rawEnvironment);
     const safeCommand = redact(command, secrets);
     const safeArgs = args.map((arg) => redact(arg, secrets));
@@ -252,16 +321,7 @@ export class ProcessRunner {
       child.once("error", () => resolve(snapshot()));
       if (!child.stdout) resolve({ bytes: Buffer.alloc(0), tooLarge: false });
     });
-    const exit = await new Promise<number | null>((resolve) => {
-      let settled = false;
-      const settle = (value: number | null) => {
-        if (settled) return;
-        settled = true;
-        resolve(value);
-      };
-      child.once("error", () => settle(null));
-      child.once("close", (exitCode) => settle(exitCode));
-    });
+    const exit = await waitForChild(child, options);
     let captured: { bytes: Buffer; tooLarge: boolean };
     try {
       captured = await output;
@@ -269,22 +329,24 @@ export class ProcessRunner {
       throw new ControlError("RAW_COMMAND_FAILED", "Unable to read raw command output", {
         command: safeCommand,
         args: safeArgs,
-        exitCode: exit,
+        exitCode: exit.exitCode,
       });
     }
+    const stopError = stoppedError(exit.stopped, safeCommand, deadline);
+    if (stopError) throw stopError;
     if (captured.tooLarge) {
       throw new ControlError("RAW_OUTPUT_TOO_LARGE", "Raw command output exceeds its byte bound", {
         command: safeCommand,
         args: safeArgs,
-        exitCode: exit,
+        exitCode: exit.exitCode,
         maximumBytes,
       });
     }
-    if (exit !== 0) {
+    if (exit.exitCode !== 0) {
       throw new ControlError("RAW_COMMAND_FAILED", "Raw command failed", {
         command: safeCommand,
         args: safeArgs,
-        exitCode: exit,
+        exitCode: exit.exitCode,
       });
     }
     return captured.bytes;
@@ -303,7 +365,7 @@ export class ProcessRunner {
     return this.runWithEnvironment(
       "gh",
       args,
-      options.cwd,
+      options,
       { ...sanitizedChildEnvironment(rawEnvironment), GH_TOKEN: token },
       secretValues(rawEnvironment),
     );
@@ -312,16 +374,17 @@ export class ProcessRunner {
   private async runWithEnvironment(
     command: string,
     args: string[],
-    cwd: string | undefined,
+    options: ProcessRunOptions,
     env: NodeJS.ProcessEnv,
     secrets: readonly string[],
   ): Promise<ProcessResult> {
     const safeCommand = redact(command, secrets);
     const safeArgs = args.map((arg) => redact(arg, secrets));
+    const deadline = timeoutMs(options);
     let child: ReturnType<typeof spawn>;
 
     try {
-      child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(command, args, { cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       throw new ControlError("COMMAND_FAILED", `Unable to start command: ${safeCommand}`, {
@@ -334,20 +397,10 @@ export class ProcessRunner {
 
     const stdout = redactingCapture(child.stdout, secrets);
     const stderr = redactingCapture(child.stderr, secrets);
-    const exit = await new Promise<{ exitCode: number | null; cause?: string }>((resolve) => {
-      let settled = false;
-      const settle = (result: { exitCode: number | null; cause?: string }) => {
-        if (settled) return;
-        settled = true;
-        resolve(result);
-      };
-      child.once("error", (cause) => settle({
-        exitCode: null,
-        cause: cause instanceof Error ? cause.message : String(cause),
-      }));
-      child.once("close", (exitCode) => settle({ exitCode }));
-    });
+    const exit = await waitForChild(child, options);
     const [stdoutBuffer, stderrBuffer] = await Promise.all([stdout, stderr]);
+    const stopError = stoppedError(exit.stopped, safeCommand, deadline);
+    if (stopError) throw stopError;
     const result = {
       command: safeCommand,
       args: safeArgs,

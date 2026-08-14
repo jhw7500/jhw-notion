@@ -2,6 +2,7 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Writable } from "node:stream";
 import type { ZodType } from "zod";
 
 import { Catalog } from "./catalog.js";
@@ -365,6 +366,7 @@ function exitCode(cause: unknown): CliResult["exitCode"] {
     "AMBIGUOUS_REGISTRY_REMOTE",
     "PROJECT_NOT_PRIVATE",
     "REPOSITORY_NOT_PRIVATE",
+    "COMMAND_TIMEOUT",
   ]).has(code)) return 78;
   if (code === "INVALID_CLI_ARGUMENT") return 2;
   return 1;
@@ -834,20 +836,34 @@ async function main(): Promise<void> {
   if (commandFor(argv) === "help") {
     // Help is intentionally configuration-free so an operator can discover the
     // required command contract before host authority has been provisioned.
-    process.stdout.write(resultJson("help", { commands: commandNames }).stdout);
-    process.exit(0);
+    await writeStream(process.stdout, resultJson("help", { commands: commandNames }).stdout);
+    process.exitCode = 0;
     return;
   }
   try {
     const result = await runCli(argv, createCliDependencies(process.env));
-    if (result.stdout) process.stdout.write(result.stdout);
-    if (result.stderr) process.stderr.write(result.stderr);
-    process.exit(result.exitCode);
+    await writeStream(process.stdout, result.stdout);
+    await writeStream(process.stderr, result.stderr);
+    process.exitCode = result.exitCode;
   } catch (cause) {
     const result = controlErrorResult(cause);
-    if (result.stderr) process.stderr.write(result.stderr);
-    process.exit(result.exitCode);
+    await writeStream(process.stderr, result.stderr);
+    process.exitCode = result.exitCode;
   }
+}
+
+/** Resolves only after Node confirms the complete bounded payload was flushed. */
+export async function writeStream(stream: Writable, content: string): Promise<void> {
+  if (!content) return;
+  await new Promise<void>((resolve, reject) => {
+    const onError = (cause: Error) => reject(cause);
+    stream.once("error", onError);
+    stream.write(content, (cause?: Error | null) => {
+      stream.off("error", onError);
+      if (cause) reject(cause);
+      else resolve();
+    });
+  });
 }
 
 /** Safely recognizes direct or npm-bin symlink execution without trusting argv text. */
