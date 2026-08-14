@@ -143,8 +143,6 @@ export class PreflightService {
 
   async run(): Promise<PreflightResult> {
     credentials(this.options.environment);
-    await this.options.authority.observeCommittedLegacy();
-    await this.options.notion.verifyReadOnlyRoutes();
     if (this.options.config.registryRepository.split("/", 1)[0]?.toLowerCase() !== this.options.config.githubOwner.toLowerCase()) {
       throw new ControlError("UNSUPPORTED_REGISTRY_OWNER", "Personal Project fixture must be in a repository owned by the configured user");
     }
@@ -230,6 +228,14 @@ export class PreflightService {
     if (localHead !== remoteHead) {
       throw new ControlError("REMOTE_DIVERGED", "Registry checkout must equal the fetched remote branch head");
     }
+
+    // The authority observation advances a monotonic host cache.  It is a
+    // mutation and therefore must consume only a Registry checkout whose root,
+    // remote identity, visibility, cleanliness, and fetched HEAD equality have
+    // already been proven.  Otherwise a wrong/ahead checkout could poison the
+    // cache and make the legitimate remote epoch look like a rollback.
+    await this.options.authority.observeCommittedLegacy();
+    await this.options.notion.verifyReadOnlyRoutes();
 
     const issuePath = `repos/${this.options.config.registryRepository}/issues/${this.options.config.preflightRegistryIssueNumber}`;
     const issue = parseJson(

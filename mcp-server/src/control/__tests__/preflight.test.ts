@@ -219,7 +219,7 @@ describe("PreflightService", () => {
 
     const result = await preflight.run();
 
-    expect(calls).toEqual(["authority", "notion", "repository:owner/registry"]);
+    expect(calls).toEqual(["repository:owner/registry", "authority", "notion"]);
     expect(result.checks).toMatchObject({ authority: "ok", notion_guard: "ok", registry_repository: "ok" });
   });
 
@@ -381,6 +381,17 @@ describe("PreflightService", () => {
 
     await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_REMOTE_MISMATCH" });
     expect(runner.calls).toEqual([]);
+  });
+
+  it("does not observe or persist authority before Registry identity is proven", async () => {
+    let authorityCalls = 0;
+    const { preflight } = service({
+      remoteUrl: "git@github.com:owner/other.git",
+      authority: { observeCommittedLegacy: async () => { authorityCalls += 1; } },
+    });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_REMOTE_MISMATCH" });
+    expect(authorityCalls).toBe(0);
   });
 
   it("rejects a different effective Registry push URL before trial mutations", async () => {
