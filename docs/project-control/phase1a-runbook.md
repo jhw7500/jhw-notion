@@ -1,55 +1,53 @@
 # Project Control Phase 1A 운영 runbook
 
-Phase 1A는 별도 Registry checkout과 개인 GitHub Project를 이용한 **명시적 dry-run**이다. 기존 Notion은 변경 없이 현재 live authority이며, 이 문서는 authority 전환이나 데이터 migration 절차가 아니다. 아래 10개 절을 순서대로 수행한다.
+Phase 1A는 별도 private Registry와 개인 private GitHub Project를 이용하는 **명시적 trial**이다. 기존 Notion이 변경 없이 live authority다. 이 문서는 authority 전환, migration, cutover 절차가 아니다.
 
-## 1. 사전조건
+## 1. 경계와 사전조건
 
-- 한 대의 build server(Linux)와 `git`, GitHub CLI `gh`, `flock`
-- Node.js 20과 이 저장소에서 빌드된 `jhw-control`
-- 이 저장소와 **분리된** 비공개 `project-registry` GitHub 저장소 및 build server checkout
-- 개인 계정 소유의 비공개 trial GitHub Project, 정확히 다섯 필드: `Status`, `Priority`, `Health`, `Next Action`, `Last Reviewed`
-- Registry의 `trial` 전용 preflight Issue 및 그 Issue를 가리키는 Project item
-- SSH Registry remote와 fast-forward 가능한 깨끗한 Registry checkout
-
-설치 후 확인:
+- 한 대의 Linux build server, Node.js 20, `git`, `gh`, `flock`, 설치된 `jhw-control`
+- 이 저장소와 분리된 private Registry 저장소/checkout
+- 등록할 private source repository의 정확한 checkout
+- 개인 계정 소유 private GitHub Project와 정확히 다섯 필드: `Status`, `Priority`, `Health`, `Next Action`, `Last Reviewed`
+- Registry의 `trial` 전용 preflight Issue와 그 Issue에 연결된 지정 Project item
+- clean, fast-forward 가능한 Registry checkout과 canonical GitHub SSH remote
 
 ```bash
 command -v git gh flock node jhw-control
-node --version                    # v20.x
+node --version
 jhw-control --help
 ```
 
-Phase 1A는 build server에서 수동·on-demand로만 운용한다. GitHub Actions workflow를 만들지 않고 Actions minutes에 의존하지 않으며 schedule도 두지 않는다.
+build server에서 manual/on-demand로만 실행한다. Actions workflow, schedule, heartbeat, cross-host retry를 만들지 않는다.
 
-## 2. 비밀이 아닌 설정과 host credential 주입
+## 2. 하나의 host identity와 credential 계약
 
-비밀이 아닌 좌표를 build server의 operator 전용 설정에서 주입한다. 예시는 경로이며 값은 실제 환경에 맞춘다.
+모든 compliant process가 **같은 checkout inode와 같은 lock**을 사용하도록 아래 값을 operator 설정에 한 번 고정한다. 경로는 모두 immutable absolute path여야 한다. symlink, alternate checkout, 상대 경로, process별 state directory를 섞지 않는다.
 
 ```bash
-export JHW_REGISTRY_DIR=/srv/jhw/project-registry
+export JHW_REGISTRY_DIR=<absolute-registry-checkout>
 export JHW_REGISTRY_REMOTE=origin
 export JHW_REGISTRY_BRANCH=main
-export JHW_WORKTREE_ROOT=/srv/jhw/worktrees
-export JHW_BUILD_HOST=cantopsbuildserver
+export JHW_WORKTREE_ROOT=<absolute-worktree-root>
+export JHW_CONTROL_STATE_DIR=<absolute-control-state-directory>
+export JHW_BUILD_HOST=<fixed-build-host-id>
 export JHW_GITHUB_OWNER=<personal-owner>
 export JHW_PROJECT_NUMBER=<positive-number>
 export JHW_REGISTRY_REPOSITORY=<owner/private-registry>
 export JHW_PREFLIGHT_PROJECT_ITEM_ID=<PVTI_trial-item>
 export JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER=<positive-number>
-export JHW_CONTROL_STATE_DIR="$HOME/.local/state/jhw-control"
 ```
 
-`JHW_REGISTRY_DIR`, `JHW_WORKTREE_ROOT`, `JHW_CONTROL_STATE_DIR`는 absolute local path다. state/snapshot 디렉터리는 `0700`, 파일은 `0600`으로 유지한다.
+`JHW_REGISTRY_DIR`의 realpath/inode, `JHW_REGISTRY_REPOSITORY`, remote의 단 하나뿐인 SSH URL은 같은 Registry를 가리켜야 한다. `JHW_CONTROL_STATE_DIR`는 이 host의 모든 invocation에서 같아야 `registry.lock`이 전역 mutation lock 역할을 한다. private state/snapshot directory는 `0700`, file은 `0600`이다.
 
-비밀 `GH_PROJECT_TOKEN`과 `GH_REPO_TOKEN`은 build server의 credential store/keyring이 **해당 프로세스에만** 주입한다. `.env`, shell history, 명령 인자/출력, snapshot, Git/Handoff, 로그, AI context에 넣지 않는다.
+비밀은 host credential store가 **명령 process에만** 주입한다. `.env`, shell history, argument, Git/Handoff, journal, snapshot, report, AI context에 넣지 않는다.
 
-- Project token: 개인 Project 제한 때문에 짧게 만료되는 별도 classic PAT, 필요한 `project` scope만 사용하고 `repo` scope는 금지한다.
-- Registry token: 가능한 경우 Registry 한 저장소만 선택한 별도 fine-grained PAT.
-- 두 토큰을 재사용하거나 자동으로 scope를 넓히지 않는다. 개인 Project classic PAT는 특정 Project 하나로 제한되지 않아 blast radius가 더 크다.
+- `GH_PROJECT_TOKEN`: 짧게 만료되는 별도 classic PAT. 정규화된 scope가 정확히 `project` 하나여야 한다. `repo`, `workflow`, `gist`, `user`, admin 계열 등 추가 scope는 금지한다.
+- `GH_REPO_TOKEN`: Registry와 등록 대상 source repository만 선택한 별도 repository credential. Registry Issue read/write 및 source repository metadata/Issue read에 필요한 최소 권한만 준다. source Issue 검증과 Repository 등록에도 쓰이므로 “Registry 한 저장소만”으로 잘못 제한하지 않는다.
+- 두 token은 서로 달라야 한다. Registry Git fetch/push는 canonical SSH remote의 host credential을 사용한다.
 
-## 3. Registry authority를 epoch 1 / legacy로 초기화
+## 3. committed authority — epoch 1 / legacy
 
-이 단계는 **별도 Registry checkout**의 operator 예시다. 이 `jhw-notion` 저장소에 `governance/authority.yaml`을 만들지 않는다.
+다음은 **별도 Registry operator 작업 예시**다. 이 `jhw-notion` 저장소에 authority file을 만들지 않는다.
 
 ```bash
 cd "$JHW_REGISTRY_DIR"
@@ -67,106 +65,216 @@ git commit -m "governance: initialize legacy authority"
 git push origin HEAD:main
 ```
 
-다시 읽어 epoch 1 / `legacy`임을 확인한다. Phase 1A 동안 이 값을 `registry`로 바꾸지 않는다. 중앙 파일만 authority를 선택하며 local cache나 `JHW_NOTION_WRITES_DISABLED`는 쓰기를 더 제한할 수 있을 뿐 authority를 전환할 수 없다.
+파일은 regular HEAD blob이어야 한다. installed `jhw-control` version은 `minimum_tool_version` 이상이어야 하며 관찰한 epoch를 되돌릴 수 없다. Phase 1A 동안 `mode`를 `registry`로 바꾸거나 `cutover_at`을 설정하지 않는다. local cache와 `JHW_NOTION_WRITES_DISABLED`는 권한을 더 제한할 수만 있고 authority를 선택하지 않는다.
 
-## 4. live preflight와 stable exit 해석
+## 4. live preflight와 stable outcome
 
-credential store가 두 토큰을 주입한 동일 host shell에서 실행한다.
+credential을 주입한 동일 host shell에서 매 운영 시작 전에 실행한다.
 
 ```bash
 jhw-control preflight
 rc=$?
 ```
 
-성공 결과는 `status: ready`와 credentials/project/registry_issue/registry_git 네 `ok` check다. **live preflight가 매 운영 시작의 go/no-go**다. 실패를 cached 결과로 덮지 않는다.
+성공은 `status: ready`와 아래 **일곱 check**가 모두 `ok`인 경우뿐이다.
 
-| Exit | 의미 | 조치 |
-|---:|---|---|
-| `0` | 성공 | 다음 단계 진행 |
-| `2` | 잘못된 command/flag/ID | 인자만 수정; 실행된 것으로 계산하지 않음 |
-| `4` | Claim conflict/mismatch/not found | owner와 immutable Claim을 다시 확인; 자동 takeover 금지 |
-| `75` | host lock 또는 Registry remote divergence | 중단; rebase/retry/force 금지 |
-| `78` | authority, credential, Project/Registry policy 불가 | **NO-GO**; credential/scope/config/policy를 operator가 수정한 뒤 live preflight 재실행 |
-| `1` | 예기치 않은 오류, corrupt state, journal/snapshot/preflight restore 실패 등 | 변경을 신뢰하지 말고 중단·감사·복구 |
+1. `credentials` — token 분리와 Project token exact scope
+2. `authority` — committed regular HEAD authority, epoch/legacy/no-cutover/minimum version
+3. `notion_guard` — database/data-source ancestry를 포함한 read-only Notion route 검증
+4. `project` — private Project, 정확한 필드, 지정 item attach/field write/restore
+5. `registry_repository` — configured Registry GitHub repository가 private
+6. `registry_issue` — 지정 trial Issue identity/label/unchanged write
+7. `registry_git` — 정확히 하나인 matching SSH remote, fetch, dry-run push
 
-stderr의 안정적 JSON `error.code`를 함께 기록하되 token이나 raw 환경은 복사하지 않는다.
+Authority/Notion/repository prerequisite가 먼저 통과한 뒤에만 지정 preflight fixture를 건드린다. fixture field는 원래 값으로 복구되고 Registry Issue body는 byte-identical해야 한다. 실패를 cached 결과로 덮지 않는다.
 
-## 5. 2–3개 active trial Project와 Repository Record 등록
+| Exit | 의미와 조치 |
+|---:|---|
+| `0` | command가 성공했다. `journal_warning.code=JOURNAL_WRITE_FAILED`가 있어도 authoritative mutation은 이미 성공했으므로 **재시도하지 말고 measurement gap만 기록**한다. |
+| `2` | command/flag/ID가 잘못됐다. 인자만 수정한다. |
+| `4` | Claim conflict/mismatch/not found. immutable Claim 좌표를 다시 확인하고 자동 takeover하지 않는다. |
+| `75` | host lock 또는 Registry dirty/diverged/remote verification 실패. stop; rebase/reset/force/retry로 우회하지 않는다. |
+| `78` | authority/version/Notion guard/credential/scope/privacy/remote/preflight timeout NO-GO. operator가 원인을 수정한 뒤 live preflight부터 다시 실행한다. |
+| `1` | integrity, sensitive-data, worktree/snapshot/Handoff 등 fail-closed 오류. artifact와 stable `error.code`를 감사하고 복구한다. |
 
-실제로 현재 진행 중인 프로젝트 중 **2–3개만** 선정한다. synthetic work나 과거 전체를 등록하지 않는다.
+실패 command에서 journal append도 실패하면 원래 nonzero exit와 원래 `error.code`가 유지되고 `journal_warning`만 추가된다. raw stderr, token, private path를 복사하지 않는다.
 
-1. Registry에서 각 GitHub Repository node ID와 slug에 대해 canonical `repo-...`를 정하고 기존 operator 관리 경로로 `repositories/<repo_id>.yaml` 및 `repositories/by-source/github/<source-key>.yaml`을 검증·등록한다. 현재 public CLI에는 repository-register 명령이 없으므로 AI가 ID를 추측하거나 새 명령을 만들면 안 된다. 정본 파일을 ad-hoc로 손편집하는 절차가 아니며, Repository Record가 준비되지 않았으면 trial Project 등록을 멈춘다.
-2. `/jhw:project --trial`로 각 프로젝트의 `project_id`, title, objective, repository IDs, 다섯 운영 필드를 한 통합 제안으로 확인하고 한 번 승인한다.
-3. skill이 전체 인자를 한 번 전달한다:
+### Registry dirty/ahead fail-stop 진단
+
+exit `75`에서 자동 retry하지 말고 동일 canonical checkout과 remote identity를 먼저 read-only로 진단한다.
+
+```bash
+git -C "$JHW_REGISTRY_DIR" status --short --branch
+git -C "$JHW_REGISTRY_DIR" remote get-url --all "$JHW_REGISTRY_REMOTE"
+git -C "$JHW_REGISTRY_DIR" rev-parse HEAD
+git -C "$JHW_REGISTRY_DIR" ls-remote --heads \
+  "$JHW_REGISTRY_REMOTE" "refs/heads/$JHW_REGISTRY_BRANCH"
+```
+
+unique matching SSH remote가 맞다고 operator가 확인한 뒤에만 remote-tracking ref를 갱신하고 좌우 count/diff를 진단한다. `fetch`는 checkout/remote authority content를 바꾸지 않지만 local Git metadata를 갱신하므로 이 명시적 진단 단계에서만 수행한다.
+
+```bash
+git -C "$JHW_REGISTRY_DIR" fetch "$JHW_REGISTRY_REMOTE" "$JHW_REGISTRY_BRANCH"
+git -C "$JHW_REGISTRY_DIR" rev-list --left-right --count \
+  "HEAD...$JHW_REGISTRY_REMOTE/$JHW_REGISTRY_BRANCH"
+git -C "$JHW_REGISTRY_DIR" diff --name-status \
+  "$JHW_REGISTRY_REMOTE/$JHW_REGISTRY_BRANCH...HEAD"
+```
+
+dirty/ahead/diverged content의 의도와 소유 workflow를 operator가 확인하기 전에는 수정·push·다음 control command를 수행하지 않는다. clean behind-only checkout만 `git -C "$JHW_REGISTRY_DIR" merge --ff-only "$JHW_REGISTRY_REMOTE/$JHW_REGISTRY_BRANCH"`로 전진할 수 있다. ahead commit은 승인된 Registry owner recovery가 content/record 불변식을 감사한 뒤에만 non-forced push로 완결한다. dirty 또는 diverged checkout은 증거를 보존하고 별도 governance review로 복구한다. `reset`, `rebase`, `push --force`, 임의 `stash`, alternate checkout, Registry record 손편집으로 우회하지 않는다.
+
+복구 완료 조건은 `git status --porcelain` 빈 output과 `rev-list`의 `0 0`, unique matching SSH remote다. 이 조건을 만족한 뒤 `jhw-control preflight`를 다시 실행하고 `ready`일 때만 중단된 operator flow를 **새로 명시해** 재개한다.
+
+## 5. Repository와 Project bootstrap
+
+실제 active Project 2–3개만 고른다. synthetic/과거 전체 등록은 하지 않는다. Registry record를 손편집하지 않는다.
+
+각 source checkout마다 operator가 승인한 canonical `repo-...` ID를 사용해 한 번 실행한다.
+
+```bash
+jhw-control repository register \
+  --repo-id <repo-id> --slug <owner/name> --repo-path <absolute-checkout-root>
+```
+
+이 명령은 exact checkout root, 단 하나의 matching GitHub origin, private repository, GitHub node ID를 검증한 뒤 Repository Record를 만든다. 동일 node/slug 재호출만 idempotent다. 다른 node 충돌에서는 멈춘다.
+
+그 다음 `/jhw:project --trial`에서 Project ID, title, objective, repository ID 목록, 다섯 운영 필드를 하나의 제안으로 보고 한 번 승인한다.
 
 ```bash
 jhw-control project register \
   --project <prj-id> --title <title> --objective <objective> \
   --repo-id <repo-id> [--repo-id <repo-id> ...] \
-  --status active --priority <P0-P3> --health <health> \
+  --status <proposed|active|paused|completed|cancelled> \
+  --priority <P0|P1|P2|P3> --health <on-track|at-risk|blocked|unknown> \
   --next-action <task:tsk-id-or-wait:condition> --last-reviewed <YYYY-MM-DD>
 ```
 
-registration JSON 파일을 만들거나 읽지 않는다. 기존 canonical repo/task ID는 반드시 Registry의 값만 쓴다.
+Project Record Issue와 Project item은 source node ID로 idempotently 재사용한다. 부분 실패 시 **같은 승인 payload만** 재시도한다. 중복 item, 다른 Issue body, field mismatch는 corruption으로 중단한다.
 
-## 6. 기존 Notion baseline lookup 5회
+## 6. 기존 Notion baseline 5회
 
-trial Task를 시작하기 **전에** 기존 `/jhw:status`·`/jhw:recall` 방식으로 실제 프로젝트 표본 5회를 측정한다. 매회 같은 네 질문을 답한다.
+첫 trial Task 전에 기존 `/jhw:status`·`/jhw:recall` 방식으로 실제 lookup 5회를 측정한다. 매번 현재 상태, 다음 행동, 차단 원인, 재개 지점의 같은 네 질문을 사용한다. project/query, 시작·종료 시각, elapsed seconds, 답변 가능 여부만 비밀 없는 operator scorecard에 기록한다. Project Control이 Notion이나 과거 session을 자동 로드하게 만들지 않는다.
 
-1. 현재 상태는 무엇인가?
-2. 다음 행동은 무엇인가?
-3. 차단 원인은 무엇인가?
-4. 어디서 재개해야 하는가?
+## 7. 자연 Task cycle
 
-표본별 project/query, 시작·종료 시각, elapsed lookup seconds, 답변 가능 여부를 비밀 없는 operator scorecard에 기록한다. 이 baseline 측정은 Notion 데이터를 이동·수정하지 않는다. Project Control 명령이 이전 세션이나 Notion을 자동 주입하게 만들지 않는다.
+실제 업무가 생길 때만 `/jhw:task`를 명시적으로 사용해 **정확히 세 번의 자연 Task cycle**을 관찰한다. 숫자를 채우는 synthetic Task/Handoff를 만들지 않는다. 세 cycle이 아직 자연스럽게 발생하지 않았으면 evidence는 `insufficient evidence`다.
 
-## 7. 정확히 세 번의 자연 Task cycle
+### 새 formal Issue
 
-도구 설치 완료와 pilot evidence는 다르다. 실제 업무가 발생할 때만 `/jhw:task`로 **정확히 세 cycle**을 수행한다. 숫자를 채우기 위한 Task를 만들지 않는다.
+Issue node ID와 revision은 서버가 current GitHub Issue에서 도출한다. independently verified expectation이 있을 때만 optional expectation flag를 쓴다.
 
-각 cycle:
+```bash
+jhw-control task start \
+  --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
+```
 
-1. 명시적 Issue 또는 temporary work 요청으로 `task start` 한 번; 반환된 immutable `task_id`, `claim_id`, branch/worktree를 기록한다.
-2. 재개 시에는 먼저 `task status`; 충돌을 자동 해제하지 않는다.
-3. 공유 push/PR/merge/deploy 직전에 `task assert-owner`를 각각 실행한다.
-4. 실제 검증과 결과를 포함해 `task finish` 한 번. 종료 때 실제 active-work minutes 근사치를 `--active-work-minutes`로 기록한다.
-5. recovery가 필요하면 먼저 `recover --action status`; `force-end`/`takeover` 직전에 사용자 승인을 받으며 takeover의 새 `claim_id`만 사용한다.
+### 새 temporary Task
 
-세 자연 cycle이 아직 발생하지 않았으면 evidence 상태는 **`insufficient evidence`**다. tooling completion을 pilot 성공으로 보고하지 않는다.
+```bash
+jhw-control task start \
+  --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
+  --temp-alias <alias> --goal <goal> \
+  --done <condition> [--done <condition> ...] \
+  --scope <scope> [--scope <scope> ...] --session <session-id>
+```
 
-## 8. Claim history, bypass, 관리 시간, payload 감사
+### 기존 Task 재개
 
-세 cycle 뒤 다음을 대조한다.
+Project/repository/source registration flag를 다시 주지 않는다. 같은 Task ID를 검증하고 새 Claim generation을 만든다. 성공 output에 latest bounded Handoff가 있으면 그것만 명시적 재개 context로 사용한다.
 
-- Registry `claims/active/`, `claims/history/<YYYY>/<task_id>/`, `tasks/`, `handoffs/`에서 Claim 구간, owner, takeover 관계, 결과와 branch head
-- `${JHW_CONTROL_STATE_DIR}/pilot-journal.jsonl`의 command, task/claim ID, timestamps, `elapsed_ms`, `ok/error_code`, `bypass_reason`, `payload_bytes`, `active_work_minutes`
-- 모든 bypass는 빈 값으로 숨기지 말고 별도 operator 기록에 사유를 명시한다. CLI journal이 자동으로 채우지 못한 수동 bypass도 포함한다.
-- admin time = start + finish + Handoff 작성 stopwatch 합계; active work 대비 비율도 계산한다.
-- portfolio/status/Handoff payload가 12 KiB/20 item 경계를 지켰고 truncated 결과에 `next_page_id`가 있었는지 확인한다.
+```bash
+jhw-control task start \
+  --task <tsk-id> --repo-path <absolute-checkout-root> --session <session-id>
+```
 
-portfolio 전체가 필요할 때만 사용자가 다음 페이지를 명시적으로 요청한다. export는 on-demand 단방향이며 import나 역동기화가 없다.
+재개 전에 cleanup이 남아 있으면 `WORKTREE_CLEANUP_REQUIRED`로 멈춘다. start가 이를 자동 reconcile하거나 새 Claim을 만들지 않는다.
 
-## 9. 즉시 중단 조건
+### status와 on-demand Handoff
 
-다음 중 하나라도 발생하면 추가 cycle, 등록, export, cutover를 중단하고 증거를 보존한다.
+```bash
+jhw-control task status --task <tsk-id> [--claim <active-claim-id>]
+jhw-control task handoff --task <tsk-id> [--claim <released-handoff-claim-id>]
+```
 
-- 동일 Task의 중복/겹치는 성공 Claim
-- 잘못된 owner 또는 `claim_id`가 release/push/PR/merge/deploy에 성공
-- Notion authority guard 우회 또는 legacy/registry 권한 혼동
-- token/credential이 출력, state, snapshot, Git, AI context에 노출
-- 운영 마찰이 수용 불가(관리 시간이 실제 작업보다 커지거나 안전 절차를 반복 우회)
+`task handoff`는 exact Claim 또는 unambiguous latest Handoff history가 가리키는 regular HEAD blob 하나만 읽는다. output은 12 KiB fixed schema다. 다른 history/session을 자동 확장하지 않는다.
 
-stable nonzero exit, remote divergence, preflight restore 실패도 해결 전 NO-GO다. 자동 scope 확대, force push, authority flip으로 우회하지 않는다.
+### temporary → formal promotion
 
-## 10. Phase 1B / cutover 경계
+Task ID를 보존한 채 verified Issue authority로 승격한다.
 
-로컬 14-scenario adversarial gate, 전체 테스트, build가 모두 통과해도 그것은 **tooling completion**일 뿐 Phase 1A pilot 성공 증거가 아니다. merge 뒤 operator가 live preflight를 통과하고 위의 정확히 세 자연 Task cycle을 실제 업무에서 완료해야 한다. 그 cycle이 발생하지 않았으면 evidence 상태는 계속 **`insufficient evidence`**이며, Phase 1B 계획·pilot 성공·cutover 승인을 주장할 수 없다.
+```bash
+jhw-control task promote --task <tsk-id> \
+  --repo-path <absolute-checkout-root> \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number>
+```
 
-세 자연 cycle을 완료한 경우에도 마찰을 보는 최소 증거일 뿐 Phase 1B 승인이나 cutover가 아니다. Phase 1B, daily schedule, cross-host retry, `legacy → registry` authority 변경, Notion reconciliation/migration은 **별도로 승인된 새 계획**이 있어야 한다.
+### finish
 
-그 계획이 승인되기 전에는:
+모든 finish에는 validation이 1개 이상 필요하다. completed에는 outcome도 필요하다. Claim acquisition 때 frozen된 `source_task_revision`이 Handoff에 사용되므로 caller가 새 revision을 만들지 않는다. optional `--source-task-revision`을 주면 frozen 값과 exact match해야 한다.
 
-- 기존 Notion이 변경 없이 live authority다.
-- Registry trial record는 시험 데이터이며 Notion 정본을 대체하지 않는다.
-- `governance/authority.yaml`은 epoch 1 / `legacy`다.
-- build server에서 manual/on-demand operation만 하며 GitHub Actions workflow/minutes와 schedule을 사용하지 않는다.
+```bash
+jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
+  --status completed --outcome <result> \
+  --validation <evidence> [--validation <evidence> ...] \
+  [--active-work-minutes <positive-number>]
+
+jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
+  --status handoff --validation <evidence> \
+  [--progress <text>] [--failures <text>] [--next-step <text>] \
+  [--related-adr-and-evidence <text>] [--active-work-minutes <positive-number>]
+```
+
+`handoff`는 durable Registry copy/history를 만들고 same-host worktree를 유지한다. `completed|abandoned` release 후 local cleanup 실패는 Claim을 되살리지 않는다. exact released Claim cleanup으로 복구한다.
+
+### raw Git 공유 경계
+
+push/PR/merge/deploy 직전에 실행한다.
+
+```bash
+jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
+```
+
+**중요:** 이 확인은 raw Git 명령을 통합 enforcement하지 않는 advisory check라서 확인 직후 승인된 takeover와 race할 수 있다. push/PR 안전을 보장하는 wrapper가 아니다. 실패하거나 owner가 바뀌면 공유 동작을 중단한다.
+
+## 8. recovery와 dirty/ahead fail-stop
+
+활성 Claim 상태를 먼저 읽는다.
+
+```bash
+jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action status
+```
+
+stale을 자동 추정하지 않는다. `force-end` 또는 `takeover`는 결과와 대상 Claim을 보여준 뒤 실행 직전에 별도 승인을 받는다.
+
+```bash
+jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action force-end
+jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action takeover --session <new-session-id>
+```
+
+Takeover 성공 후 반환된 **새 Claim ID**로 status를 다시 확인한다. old ID를 재사용하지 않는다. force-end temporary lifecycle은 `handoff`로 남아 명시적 재개가 가능하다.
+
+이미 release됐지만 worktree cleanup이 남은 exact generation은 다음만 사용한다.
+
+```bash
+jhw-control task recover --task <tsk-id> --expect <released-claim-id> --action cleanup
+```
+
+exact `pending-remove`는 이 cleanup이 재개하는 상태다. active successor, 다른 host/coordinates, dirty/ahead, `pending-create`, 또는 다른 generation의 ambiguous pending state면 stop하고 evidence를 보존한다. 자동 reset/rebase/force push, 경로 삭제, Claim 재생성으로 우회하지 않는다.
+
+## 9. audit와 즉시 중단 조건
+
+자연 cycle 뒤 다음을 대조한다.
+
+- Registry `repositories/`, `projects/`, `tasks/`, `claims/active/`, `claims/history/`, `handoffs/`
+- `${JHW_CONTROL_STATE_DIR}/pilot-journal.jsonl`의 command, task/claim ID, timestamps, elapsed, ok/error, payload bytes, active-work minutes, measurement gap
+- branch/head, Project field, Handoff pointer와 worktree cleanup generation
+- portfolio/status/Handoff 12 KiB 및 status 20-item/page 경계
+
+다음이면 즉시 NO-GO다: 중복 active Claim/Project item, wrong owner release/share, Notion guard 우회, secret/private path 노출, authority rollback/flip, Registry remote mismatch/divergence, fixture restore 실패, 반복되는 manual bypass. 해결 전 추가 cycle/export/registration을 하지 않는다.
+
+## 10. evidence와 Phase 1B 경계
+
+로컬 test/build/e2e/preflight fixture 구현 완료는 pilot evidence가 아니다. 실제 업무에서 정확히 세 자연 cycle이 아직 발생하지 않았으면 상태는 `insufficient evidence`다. 이 문서나 테스트를 근거로 synthetic cycle/Handoff를 만들거나 live preflight 결과를 꾸미지 않는다.
+
+자연 evidence가 생겨도 Phase 1B, daily schedule, cross-host retry, Notion reconciliation/migration, `legacy → registry` cutover는 별도 승인 계획이 필요하다. 그 전에는 Notion이 live authority이고 Registry는 trial control data다.

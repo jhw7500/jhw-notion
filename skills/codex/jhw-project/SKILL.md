@@ -1,6 +1,6 @@
 ---
 name: jhw-project
-description: "Use when the user explicitly requests a JHW project start, close, selection, or Phase 1A trial registration Use when the user invokes `/jhw:project`, `$jhw-project`, or asks to run the JHW project command."
+description: "Use when the user explicitly requests a JHW project start, close, selection, or Phase 1A trial Repository/Project registration Use when the user invokes `/jhw:project`, `$jhw-project`, or asks to run the JHW project command."
 ---
 
 # jhw-project

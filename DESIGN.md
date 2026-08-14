@@ -31,7 +31,7 @@
 
 ### 2.1 Project Control Phase 1A 경계
 
-Phase 1A는 위 Notion workspace를 대체하지 않는 dry-run control plane이다.
+Phase 1A는 위 Notion workspace를 대체하지 않는 trial control plane이다.
 
 ```text
 명시적 /jhw:task, /jhw:portfolio, /jhw:project --trial
@@ -45,17 +45,23 @@ build server의 jhw-control CLI
 ```
 
 - Registry는 `jhw-notion` 워킹 트리 안의 디렉터리가 아니라 독립된 GitHub 저장소/checkout이다.
-- `jhw-control` task lifecycle은 persistent Task, immutable Claim, branch/worktree, durable finish/recovery를 하나의 명시적 CLI surface로 묶는다. portfolio는 12 KiB/20 item 제한과 page metadata를 준다.
-- 새 세션에 이전 세션·Notion·memory·Git history를 자동 주입하지 않는다. 현재 요청과 현재 저장소 사실에서 시작하고 사용자가 지정한 Project/Task/page만 확장한다.
-- 중앙 `governance/authority.yaml`과 server-side Notion guard가 authority epoch를 검증한다. local cache는 이전에 관찰한 강한 정책을 되돌리지 못하게 할 뿐 authority를 선택하지 않는다.
-- Phase 1A Registry의 authority record는 epoch 1 / `legacy`이며 기존 Notion이 변경 없이 live authority다. Registry trial registration은 authority flip, cutover, reconciliation, migration이 아니다.
-- Phase 1B/cutover, daily export, cross-host retry, `legacy → registry` 전환은 자연 Task evidence 후 별도 승인 계획을 요구한다.
+- `repository register`가 exact checkout root/origin/private GitHub node identity를 검증한 뒤에만 Repository Record를 만든다. Project registration과 formal/temporary Task는 이 verified mapping을 요구하며 Registry file 손편집은 public bootstrap 경로가 아니다.
+- public surface는 `repository register`; `task start|promote|handoff|status|finish|recover|assert-owner`; `portfolio status|export`; `project register`; `preflight`다. `task start --task`는 같은 persistent Task의 새 Claim generation을 만들고 explicit resume에서만 bounded latest Handoff를 반환한다.
+- Claim은 source revision을 acquisition 때 고정한다. temporary lifecycle과 Claim create/release/history는 같은 Registry transaction이다. release 뒤 host cleanup은 authority와 분리되며 exact archived generation의 `recover --action cleanup`만 허용한다.
+- Registry Task/Claim/Handoff I/O는 descriptor-relative no-follow record store를 공유하며 symlink, non-directory ancestor, nonregular/multi-link leaf, traversal, path/content ID mismatch를 거부한다. Registry transaction은 host lock, clean/fast-forward check, push/refetch verification 전체를 감싼다.
+- 새 session에 이전 session·Notion·memory·Git history를 자동 주입하지 않는다. 현재 요청과 현재 repository 사실에서 시작하고 사용자가 지정한 Project/Task/page만 확장한다. Handoff는 fixed six-section/12 KiB schema이며 goal/lifecycle/full transcript를 복제하지 않는다.
+- committed regular HEAD `governance/authority.yaml`, monotonic cache, minimum tool version, server-side Notion database/data-source ancestry guard가 fail-closed authority boundary다. local cache는 권한을 더 제한할 수만 있고 authority를 선택하지 않는다.
+- Phase 1A authority는 epoch 1 / `legacy` / null cutover이며 Notion이 live authority다. Phase 1B/cutover, schedule, cross-host retry, reconciliation/migration은 natural evidence 뒤 별도 승인 계획을 요구한다.
 
 ### 2.2 운영·credential 제약
 
-개인 계정 소유 GitHub Project에는 fine-grained PAT를 사용할 수 없어 short-lived classic Project PAT가 필요하다. classic PAT의 Project scope는 특정 personal Project 하나로 격리되지 않으므로 Registry전용 token과 분리하고 Project token에 `repo` scope를 추가하지 않는다. host credential store가 두 token을 process environment에만 주입하며 `jhw-control preflight`가 실제 scope, Project item/write/restore, Registry Issue, SSH Git fetch/dry-run push를 go/no-go로 검사한다.
+개인 account Project에는 fine-grained PAT를 사용할 수 없어 short-lived classic `GH_PROJECT_TOKEN`이 필요하다. normalized scope는 정확히 `project` 하나여야 하고 다른 scope를 허용하지 않는다. 분리된 `GH_REPO_TOKEN`은 Registry와 등록할 private source repository의 Issue/metadata API에 필요한 최소 repository 권한만 가진다. SSH Registry Git credential과도 역할을 섞지 않는다. host credential store가 token을 process environment에만 주입한다.
 
-Phase 1A는 현재 build server의 manual/on-demand 실행이다. 이 control plane을 위한 GitHub-hosted Actions workflow를 만들지 않아 Actions minutes를 사용하지 않으며 schedule도 없다. 운영 순서와 stable exit은 `docs/project-control/phase1a-runbook.md`가 정본이다.
+`jhw-control preflight`는 mutation 전에 committed authority/version, read-only Notion ancestry, exact Project scope, private Project/Registry repository, unique matching SSH remote를 검증한다. 그 뒤 지정 Project/Issue fixture만 write/restore하고 fetch/dry-run push를 확인한다. 성공은 `credentials`, `authority`, `notion_guard`, `project`, `registry_repository`, `registry_issue`, `registry_git` 일곱 check가 모두 `ok`일 때뿐이다.
+
+모든 compliant process는 동일한 Registry realpath/inode/remote identity와 immutable absolute `JHW_CONTROL_STATE_DIR`를 사용한다. 그래야 하나의 `registry.lock`이 host mutation을 직렬화한다. process timeout은 bounded이며 Git/SSH는 noninteractive다. secret과 configured private path는 Registry/GitHub/Handoff/journal/snapshot/output/error에 쓰기 전에 중앙 reject policy가 차단한다.
+
+measurement journal은 derived observation이다. journal append가 실패해도 이미 계산된 command success/failure와 coordinates/exit은 바뀌지 않고 bounded `journal_warning`만 추가된다. Phase 1A는 build server manual/on-demand 실행이며 Actions/schedule이 없다. 운영 순서와 stable exit은 `docs/project-control/phase1a-runbook.md`가 정본이다.
 
 ## 3. 저장소 구조
 
@@ -67,7 +73,8 @@ jhw-notion/
 │   │   ├── server.ts            # MCP 서버 설정
 │   │   ├── notion-client.ts     # Notion REST API 클라이언트
 │   │   ├── config.ts            # DB ID, 페이지 ID 설정
-│   │   └── tools/               # 도구별 핸들러
+│   │   ├── control/             # Project Control CLI/domain/ports
+│   │   └── tools/               # Notion 도구별 핸들러
 │   │       ├── record.ts
 │   │       ├── note.ts
 │   │       ├── delete.ts
@@ -80,22 +87,17 @@ jhw-notion/
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── .env.example
-├── skills/                      # TUI별 스킬 파일
-│   ├── claude/                  # → ~/.claude/commands/jhw/
-│   │   ├── record.md
-│   │   ├── note.md
-│   │   ├── review.md            # 유일하게 로직 포함 (세션 분석)
-│   │   ├── delete.md
-│   │   ├── search.md
-│   │   ├── context.md
-│   │   ├── history.md
-│   │   ├── status.md
-│   │   ├── start.md
-│   │   └── close.md
-│   ├── gemini/                  # → ~/.gemini/commands/jhw/
-│   │   └── (동일 구조, Gemini 형식)
-│   └── codex/                   # → Codex 에이전트 설정
-│       └── (동일 구조, Codex 형식)
+├── skills/
+│   ├── claude/                  # 모든 TUI가 공유하는 Markdown 정본
+│   │   ├── task.md
+│   │   ├── project.md
+│   │   ├── portfolio.md
+│   │   └── (Notion command Markdown)
+│   └── codex/jhw-*/             # 정본에서 생성한 SKILL.md + reference link
+├── scripts/
+│   ├── sync-codex-skills.mjs    # Codex generated skill 동기화
+│   ├── install-config.mjs       # ownership-aware atomic config editor
+│   └── test-install-safety.sh   # isolated-HOME installer gate
 ├── install.sh                   # 원클릭 설치
 ├── .env.example
 └── README.md
@@ -342,105 +344,18 @@ description: 세션 마무리 시 Notion 저장 후보 정리 및 승인 저장
 
 ## 6. 설치 시스템
 
-### 6.1 install.sh 동작
+### 6.1 install.sh 동작과 ownership
 
-```bash
-#!/bin/bash
-set -e
+`install.sh`는 `set -euo pipefail`로 build 실패를 보존하고 다음 순서로 동작한다.
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+1. MCP server와 `jhw-control`을 build한다.
+2. Claude/Gemini/OpenCode/Codex 설치 root를 감지한다.
+3. canonical skill link와 Codex legacy/prompt link를 검사한다. target이 없거나 이 repository를 가리키는 symlink일 때만 설치/갱신한다. foreign file/symlink이면 보존하고 install을 실패시킨다.
+4. `skills/claude/*.md` 정본에서 Codex skill을 생성한 뒤 link한다. generated Codex file을 손편집하지 않는다.
+5. Claude/Gemini/OpenCode JSON과 Codex TOML의 `jhw-notion` entry가 정확히 `node <this-repository>/mcp-server/dist/index.js`를 가리킬 때만 갱신한다. semantic TOML alternate/duplicate와 foreign same-name entry는 보존하고 실패한다.
+6. configuration은 shell string interpolation 없이 argv로 전달하고, 기존 mode를 적용한 private same-directory temp를 fsync한 뒤 atomic publish하고 directory를 fsync한다. Codex backup은 unique project-marked namespace만 exclusive publish/prune한다.
 
-echo "jhw-notion 설치를 시작합니다..."
-
-# [1/4] MCP 서버 빌드
-echo "[1/4] MCP 서버 빌드"
-cd "$SCRIPT_DIR/mcp-server"
-npm install && npm run build
-
-# [2/4] TUI 감지
-echo "[2/4] TUI 감지"
-CLAUDE_DIR="$HOME/.claude"
-GEMINI_DIR="$HOME/.gemini"
-OPENCODE_DIR="$HOME/.config/opencode"
-
-# [3/4] 스킬 심링크
-echo "[3/4] 스킬 심링크"
-if [ -d "$CLAUDE_DIR" ]; then
-  ln -sfn "$SCRIPT_DIR/skills/claude" "$CLAUDE_DIR/commands/jhw"
-  echo "  Claude: $CLAUDE_DIR/commands/jhw → $SCRIPT_DIR/skills/claude ✅"
-fi
-if [ -d "$GEMINI_DIR" ]; then
-  ln -sfn "$SCRIPT_DIR/skills/gemini" "$GEMINI_DIR/commands/jhw"
-  echo "  Gemini: $GEMINI_DIR/commands/jhw → $SCRIPT_DIR/skills/gemini ✅"
-fi
-if [ -d "$OPENCODE_DIR" ]; then
-  mkdir -p "$OPENCODE_DIR/skills"
-  ln -sfn "$SCRIPT_DIR/skills/claude" "$OPENCODE_DIR/skills/jhw"
-  echo "  OpenCode: $OPENCODE_DIR/skills/jhw → $SCRIPT_DIR/skills/claude ✅"
-fi
-
-# [4/4] MCP 서버 등록
-echo "[4/4] MCP 서버 등록"
-MCP_CMD="node"
-MCP_ARGS="$SCRIPT_DIR/mcp-server/dist/index.js"
-
-# Claude settings.json에 추가
-if [ -d "$CLAUDE_DIR" ]; then
-  node -e "
-    const fs = require('fs');
-    const p = '$CLAUDE_DIR/settings.json';
-    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p)) : {};
-    s.mcpServers = s.mcpServers || {};
-    s.mcpServers['jhw-notion'] = {
-      command: '$MCP_CMD',
-      args: ['$MCP_ARGS']
-    };
-    fs.writeFileSync(p, JSON.stringify(s, null, 2));
-  "
-  echo "  Claude: settings.json에 jhw-notion 서버 추가 ✅"
-fi
-
-# Gemini settings.json에 추가
-if [ -d "$GEMINI_DIR" ]; then
-  node -e "
-    const fs = require('fs');
-    const p = '$GEMINI_DIR/settings.json';
-    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p)) : {};
-    s.mcpServers = s.mcpServers || {};
-    s.mcpServers['jhw-notion'] = {
-      command: '$MCP_CMD',
-      args: ['$MCP_ARGS']
-    };
-    fs.writeFileSync(p, JSON.stringify(s, null, 2));
-  "
-  echo "  Gemini: settings.json에 jhw-notion 서버 추가 ✅"
-fi
-
-# OpenCode opencode.json에 추가
-if [ -d "$OPENCODE_DIR" ]; then
-  node -e "
-    const fs = require('fs');
-    const p = '$OPENCODE_DIR/opencode.json';
-    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
-    s['$schema'] = s['$schema'] || 'https://opencode.ai/config.json';
-    s.mcp = s.mcp || {};
-    s.mcp['jhw-notion'] = {
-      type: 'local',
-      command: ['node', '$SCRIPT_DIR/mcp-server/dist/index.js'],
-      enabled: true,
-    };
-    fs.writeFileSync(p, JSON.stringify(s, null, 2));
-  "
-  echo "  OpenCode: opencode.json의 mcp에 jhw-notion 서버 추가 ✅"
-fi
-
-echo ""
-echo "설치 완료!"
-echo ""
-echo "⚠️  .env 설정 필요:"
-echo "  cp $SCRIPT_DIR/mcp-server/.env.example $SCRIPT_DIR/mcp-server/.env"
-echo "  NOTION_API_KEY를 입력하세요"
-```
+Uninstall도 같은 ownership proof를 사용한다. 이 repository가 소유한 link/entry만 제거하고 foreign target/config/backup은 건드리지 않는다. 설치 안전성은 `scripts/test-install-safety.sh`의 isolated HOME에서 네 TUI install → reinstall → uninstall → reinstall과 canonical/legacy/foreign case를 검증한다.
 
 ### 6.2 업데이트
 
@@ -456,18 +371,12 @@ npm run build --prefix mcp-server
 
 ```bash
 ./install.sh --uninstall
-# 심링크 제거 + settings.json에서 jhw-notion 항목 삭제
+# 이 repository 소유가 증명된 link와 MCP entry만 제거
 ```
 
-## 7. 마이그레이션 계획
+## 7. 설치 호환성과 migration 경계
 
-### 현재 → 새 구조
-
-1. MCP 서버 구현 (9개 도구)
-2. Claude 스킬을 얇은 버전으로 교체
-3. 기존 `~/.claude/commands/jhw/` 를 심링크로 전환
-4. Gemini, Codex 스킬 작성
-5. install.sh 작성 및 테스트
+현재 Notion MCP/tool과 shared skill 설치는 기존 Notion database/page를 그대로 사용한다. Project Control Phase 1A는 별도 Registry/private Project에만 trial record를 만들며 Notion record migration을 수행하지 않는다. `legacy → registry` authority 전환과 reconciliation은 별도 승인 계획 전에는 구현·실행하지 않는다.
 
 ### 호환성
 
@@ -479,5 +388,5 @@ npm run build --prefix mcp-server
 
 - **Notion API 키 필요**: Notion Integration 생성 후 토큰 발급
 - **DB 접근 권한**: Integration에 각 DB 공유 필요
-- **프로퍼티명 한글**: Notion DB 프로퍼티가 한글이므로 영문 사용 시 실패
+- **프로퍼티 key 영문**: current live DB key는 `title`, `status`, `rationale`, `project`, `date` 등 실제 code/schema의 영문 key가 기준
 - **review 스킬**: TUI마다 개별 유지보수 필요 (LLM 의존 로직)

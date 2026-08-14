@@ -1,6 +1,6 @@
 ---
 name: jhw-task
-description: "Use when the user explicitly requests a Project Control Task or Issue start, resume, finish, or recovery Use when the user invokes `/jhw:task`, `$jhw-task`, or asks to run the JHW task command."
+description: "Use when the user explicitly requests a Project Control Task start, existing-Task resume, promotion, Handoff, finish, or recovery Use when the user invokes `/jhw:task`, `$jhw-task`, or asks to run the JHW task command."
 ---
 
 # jhw-task

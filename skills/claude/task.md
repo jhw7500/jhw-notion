@@ -1,82 +1,145 @@
 ---
-description: Use when the user explicitly requests a Project Control Task or Issue start, resume, finish, or recovery
-argument-hint: "(start | resume | finish | recover) <task-or-issue>"
+description: Use when the user explicitly requests a Project Control Task start, existing-Task resume, promotion, Handoff, finish, or recovery
+argument-hint: "(start | resume | promote | handoff | finish | recover) <task-or-issue>"
 ---
 
 # /jhw:task — 명시적 Task 제어
 
-이 스킬은 사용자가 Task/Issue/임시 작업의 **시작·재개·종료·복구를 명시적으로 요청한 경우에만** 사용한다. 읽기 전용 조사·리뷰는 Claim이 필요 없다.
+사용자가 Project Control Task 동작을 **명시적으로 요청했을 때만** 사용한다. 읽기 전용 조사·리뷰에는 Claim을 만들지 않는다. 일반 Notion workflow를 이 스킬로 자동 전환하지 않는다.
 
-## 컨텍스트 경계
+## 컨텍스트와 보안 경계
 
-- 현재 사용자 요청과 현재 저장소 사실만 사용한다.
-- 이전 세션, Notion, memory, `/jhw:recall`, `/jhw:cclog`, `/jhw:load`, 광범위한 Git history를 자동으로 읽지 않는다.
-- 기존 canonical `task_id`·`repo_id`를 추측하지 않는다. 안전하게 알 수 없는 값만 짧게 질문한다.
+- 현재 요청, 현재 checkout의 직접 사실, command가 반환한 bounded 결과만 사용한다.
+- 이전 session, Notion, memory, recall/load/cclog, 광범위 Git history를 자동으로 읽지 않는다.
+- canonical `task_id`·`repo_id`·`claim_id`, Issue node/revision을 추측하지 않는다.
+- token, private configured path, secret-like text를 content flag/Handoff/output에 넣지 않는다. `--repo-path`는 command에만 전달하고 응답에 반복하지 않는다.
+- nonzero exit에서 자동 reset/rebase/force/retry/takeover하지 않는다.
 
-## 시작
+## 새 Task 시작
 
-정식 Issue는 다음 전체 인자로 한 번 실행한다.
+### Formal GitHub Issue
+
+Issue URL이 authority coordinate다. 서버가 verified repository token으로 current node ID, canonical URL, revision, `<owner>/<repo>#<number>` alias를 도출한다.
 
 ```bash
-jhw-control task start --project <prj-id> --repo-id <repo-id> \
-  --repo-path <absolute-path> --issue-node-id <node-id> \
-  --issue-url <url> --issue-revision <revision> --session <session-id>
+jhw-control task start \
+  --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
 ```
 
-임시 작업은 Issue 인자 대신 아래를 사용한다. `--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다.
+`--issue-node-id`/`--issue-revision`은 independently verified expectation이 이미 있을 때만 추가한다. caller 값을 source authority처럼 만들지 않는다.
+
+### Temporary Task
+
+`--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다.
 
 ```bash
-jhw-control task start --project <prj-id> --repo-id <repo-id> \
-  --repo-path <absolute-path> --temp-alias <alias> --goal <goal> \
+jhw-control task start \
+  --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
+  --temp-alias <alias> --goal <goal> \
   --done <condition> [--done <condition> ...] \
-  --scope <path-or-scope> [--scope <path-or-scope> ...] --session <session-id>
+  --scope <scope> [--scope <scope> ...] --session <session-id>
 ```
 
-반환된 immutable `task_id`, `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. exit 4 `TASK_ALREADY_CLAIMED`에서 검증된 `error.conflicting_claim`이 있으면 그 안의 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at`만 Claim 충돌 정보로 보여주고 멈춘다. 이 좌표가 없거나 유효하지 않으면 code-only 오류를 보여주고 멈춘다. 어느 경우에도 자동 status 또는 takeover를 하지 않는다.
+성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
 
-## 재개
+## 기존 Task 재개
 
-canonical Task ID가 없으면 질문한다. **재개 전에 항상** 실행한다.
+재개는 `status`가 아니라 같은 persistent Task를 다시 claim하는 명시적 start다. registration field를 섞지 않는다.
 
 ```bash
-jhw-control task status --task <tsk-id>
+jhw-control task start \
+  --task <tsk-id> --repo-path <absolute-checkout-root> --session <session-id>
 ```
 
-반환된 Claim owner(host/branch/worktree), `claim_id`, dirty/ahead/behind를 보여준다. 현재 작업과 소유자가 다르면 충돌로 보고하고 멈춘다. 반환된 현재 `claim_id`를 임의로 바꾸거나 과거 ID를 재사용하지 않는다. 반환이 exit 4 `CLAIM_NOT_FOUND`이면 자동 `task start`하지 않고 미점유 Task인지 사용자에게 알린 뒤 명시적 시작 요청을 받는다.
+성공 결과에 `latest_handoff`가 있을 때만 그것을 재개 context로 보여준다. `TASK_COMPLETED`, `WORKTREE_CLEANUP_REQUIRED`, source/Project/repository mismatch이면 멈춘다. cleanup이 필요하면 아래 exact released-generation 절차를 먼저 승인받는다.
 
-## 복구
-
-명시적 복구 요청에서 먼저 상태만 검사한다.
+활성 Claim 확인만 요청받았으면:
 
 ```bash
-jhw-control task recover --task <tsk-id> --expect <current-claim-id> --action status
+jhw-control task status --task <tsk-id> [--claim <active-claim-id>]
 ```
 
-stale 여부를 자동 판정하지 않는다. `force-end` 또는 `takeover`를 제안할 때 검사 결과와 대상 Claim을 보여주고, **실행 직전에 별도 사용자 승인**을 받는다.
+owner(host/branch/worktree), dirty/ahead/behind와 current Claim을 보여준다. 다른 owner이면 작업하지 않는다.
+
+## Handoff 조회와 promotion
+
+사용자가 Handoff를 명시적으로 요청한 경우에만 exact Claim 또는 unambiguous latest history를 읽는다.
 
 ```bash
-jhw-control task recover --task <tsk-id> --expect <old-claim-id> --action force-end
-jhw-control task recover --task <tsk-id> --expect <old-claim-id> --action takeover --session <session-id>
+jhw-control task handoff --task <tsk-id> [--claim <released-handoff-claim-id>]
 ```
 
-takeover 성공 시 반환된 **새 `claim_id`**만 사용한다. 실패하거나 기대 Claim이 바뀌면 멈추고 새 승인 없이 재시도하지 않는다.
+12 KiB fixed-six-section 결과만 보여주며 다른 history/session을 자동 확장하지 않는다.
 
-takeover 직후 새 ID로 `task status --task <tsk-id> --claim <new-claim-id>`를 실행해 host-local worktree 소유까지 확인한다. 이 검증이 실패하면 작업·finish·공유 동작을 진행하지 않고 오류를 보고한다. 임의 rebind, force-end+restart, 새 명령을 만들어 우회하지 않는다.
+Temporary Task를 verified Issue로 승격하라는 요청에는 Task ID를 보존한다.
 
-## 공유 경계와 종료
+```bash
+jhw-control task promote --task <tsk-id> \
+  --repo-path <absolute-checkout-root> \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number>
+```
 
-공유 push, PR 생성, merge, deploy **각 동작 직전**에 실행한다. 실패하면 해당 공유 동작을 하지 않는다.
+다른 Task에 이미 매핑된 Issue, Project membership/checkout mismatch, source mismatch에서 멈춘다. merge/supersede를 자동 결정하지 않는다.
+
+## 종료
+
+사용자가 종료를 명시적으로 요청한 경우에만 실행한다. 모든 status에는 `--validation`이 1개 이상 필요하고 `completed`에는 `--outcome`도 필요하다.
+
+```bash
+jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
+  --status completed --outcome <result> \
+  --validation <evidence> [--validation <evidence> ...] \
+  [--active-work-minutes <positive-number>]
+
+jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
+  --status handoff --validation <evidence> \
+  [--progress <text>] [--failures <text>] [--next-step <text>] \
+  [--related-adr-and-evidence <text>] [--active-work-minutes <positive-number>]
+```
+
+`--status`는 `completed|handoff|abandoned`다. Handoff source revision은 Claim acquisition 때 frozen된다. `--source-task-revision`을 새로 만들거나 `unknown`을 보내지 않는다; independently retained 값을 보낼 경우 frozen 값과 exact match해야 한다.
+
+Handoff는 Registry copy/history를 durable하게 만든 뒤 release하고 worktree를 유지한다. completed/abandoned의 local cleanup 실패는 이미 성공한 release를 되돌리지 않는다.
+
+## recovery
+
+활성 Claim은 status부터 읽는다.
+
+```bash
+jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action status
+```
+
+stale을 추정하지 않는다. `force-end`/`takeover`는 결과를 보여준 뒤 **실행 직전에 별도 사용자 승인**을 받는다.
+
+```bash
+jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action force-end
+jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action takeover --session <new-session-id>
+```
+
+Takeover 성공 시 반환된 새 `claim_id`로 `task status`를 다시 확인한다. old ID를 재사용하지 않는다.
+
+이미 release된 Claim generation의 pending cleanup은 exact history ID로만 실행한다.
+
+```bash
+jhw-control task recover --task <tsk-id> --expect <released-claim-id> --action cleanup
+```
+
+exact `pending-remove`는 cleanup이 재개하는 상태다. active successor/cross-host/coordinate mismatch, dirty/ahead, `pending-create`, 또는 다른 generation의 ambiguous pending state에서만 멈춘다. 파일 삭제나 새 Claim으로 우회하지 않는다.
+
+## raw Git 공유 경계
+
+push, PR, merge, deploy 각각의 직전에 실행한다.
 
 ```bash
 jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 ```
 
-사용자가 종료를 명시적으로 요청한 경우에만 `task finish`를 실행한다.
+이 확인은 raw Git을 통합 enforcement하지 않는 **advisory check**라서 확인 직후 승인된 takeover와 race할 수 있다. 안전을 보장하는 wrapper로 표현하지 않는다. 실패하면 공유 동작을 하지 않는다.
 
-```bash
-jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
-  --status completed --outcome <result> --validation <evidence> \
-  [--validation <evidence> ...] [--active-work-minutes <minutes>]
-```
+## 결과 해석
 
-`--status`는 `completed|handoff|abandoned`다. handoff에는 `--source-task-revision`과 필요 시 `--progress`, `--failures`, `--next-step`, `--related-adr-and-evidence`를 추가한다. 모든 종료에는 `--validation`이 1개 이상 필요하다.
+- exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
+- exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.
+- exit `75`: Registry dirty/diverged 또는 lock. stop; 자동 retry/rebase/force 금지.
+- 다른 nonzero: stable `error.code`만 보고하고 secret/raw path를 출력하지 않는다.

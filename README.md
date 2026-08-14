@@ -23,8 +23,12 @@ install.sh가 자동으로:
 3. 설치된 TUI 감지
 4. 스킬 심링크 생성
 5. 각 TUI 설정 파일에 MCP 서버 등록
-   - Claude/Gemini: `settings.json`의 `mcpServers`
-   - OpenCode: `opencode.json`의 `mcp`
+   - Claude: `~/.claude.json`의 `mcpServers`
+   - Gemini: `~/.gemini/settings.json`의 `mcpServers`
+   - OpenCode: `~/.config/opencode/opencode.json`의 `mcp`
+   - Codex: `~/.codex/config.toml`의 `mcp_servers`
+
+모든 canonical/legacy skill target과 same-name MCP entry는 이 저장소 소유임이 증명될 때만 교체한다. 다른 file/symlink/registration이 있으면 그대로 보존하고 install은 fail-closed한다. JSON/TOML 설정은 기존 mode를 보존한 private same-directory temp에서 fsync 후 atomic publish한다. Codex backup도 이 설치기의 명시적 namespace만 관리한다.
 
 ### Notion API Key 설정
 
@@ -41,7 +45,7 @@ Notion Integration 생성: https://www.notion.so/my-integrations
 ./install.sh --uninstall
 ```
 
-`jhw-control`은 이 저장소 안의 빌드 결과를 가리키는 심링크일 때만 제거된다. 다른 파일이나 다른 프로젝트의 링크는 덮어쓰거나 삭제하지 않는다.
+`jhw-control`, 네 TUI의 canonical/legacy link, MCP registration은 이 저장소 소유일 때만 제거된다. 다른 파일, link, same-name MCP entry, backup은 덮어쓰거나 삭제하지 않는다.
 
 ## MCP 도구
 
@@ -92,8 +96,22 @@ Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Regi
 - 사용자가 `/jhw:task`, `/jhw:portfolio`, 또는 `/jhw:project --trial`을 명시해야만 trial control을 사용한다.
 - 현재 요청과 현재 저장소 사실만 쓴다. 이전 세션, Notion, memory, recall/load/cclog, 광범위 Git history를 자동 주입하지 않는다.
 - 일반 `/jhw:project`/`--start`/`--close`와 `/jhw:status`는 계속 기존 Notion workflow다. **Phase 1A에서 Notion이 변경 없이 live authority**이며 Registry trial은 authority flip이나 migration이 아니다.
-- 개인 Project는 fine-grained PAT로 제어할 수 없어 별도 short-lived classic Project token이 필요하다. Registry token과 분리하고 scope를 자동 확장하지 않는다. 실제 API를 검사하는 `jhw-control preflight`가 운영 go/no-go다.
+- 개인 Project는 fine-grained PAT로 제어할 수 없어 별도 short-lived classic Project token이 필요하다. `GH_PROJECT_TOKEN`은 정확히 `project` scope 하나만 허용한다. 분리된 `GH_REPO_TOKEN`은 Registry와 등록할 private source repository의 Issue/metadata 검증에 필요한 최소 repository 권한만 가진다. token을 재사용하거나 scope를 자동 확장하지 않는다.
+- `JHW_REGISTRY_DIR`, Registry SSH remote/repository slug, `JHW_CONTROL_STATE_DIR`를 한 host identity로 고정한다. alternate checkout/symlink/state directory를 섞으면 전역 lock과 Registry identity가 깨지므로 허용하지 않는다.
+- `jhw-control preflight`는 committed authority/tool version, read-only Notion ancestry guard, exact credential scope, private Project/Registry repository, designated Project/Issue fixture restore, unique matching SSH remote와 Git dry-run을 확인하는 운영 go/no-go다.
 - build server에서 manual/on-demand로 실행한다. Phase 1A에는 GitHub Actions workflow/minutes 의존과 schedule이 없다.
+
+구현된 public control command는 다음 12개뿐이다.
+
+| 영역 | command |
+|---|---|
+| Repository | `repository register` |
+| Task | `task start`, `task promote`, `task handoff`, `task status`, `task finish`, `task recover`, `task assert-owner` |
+| Portfolio/Project | `portfolio status`, `portfolio export`, `project register`, `preflight` |
+
+`task start --task`는 같은 persistent Task를 명시적으로 재개하고 bounded latest Handoff만 반환한다. Handoff source revision은 Claim 시점에 고정된다. release 뒤 local cleanup은 `task recover --action cleanup`으로 exact Claim generation만 복구한다. `task assert-owner`는 raw Git을 통합 enforce하지 않는 advisory check라서 승인된 takeover와 race할 수 있다.
+
+measurement journal은 authority가 아니다. 성공 output에 `journal_warning.code=JOURNAL_WRITE_FAILED`가 붙어도 command는 이미 성공했으므로 재시도하지 않는다. 실패 command도 원래 exit/error를 유지한다.
 
 설정, 안전한 credential 주입, stable exit code, 세 번의 자연 Task cycle, 중단 기준은 [Phase 1A runbook](docs/project-control/phase1a-runbook.md)을 따른다. Phase 1B/cutover는 별도 승인 계획이 필요하다.
 
@@ -120,7 +138,7 @@ npm run build --prefix mcp-server
 ```
 jhw-notion/
 ├── mcp-server/          # TypeScript MCP 서버 (Notion API 직접 호출)
-│   ├── src/tools/       # 12개 도구 핸들러
+│   ├── src/tools/       # 14개 도구 핸들러
 │   └── dist/            # 빌드 결과
 ├── skills/claude/       # 공유 TUI 스킬 정본 (Project Control 명시적 진입점 포함)
 ├── install.sh           # 원클릭 설치/제거
