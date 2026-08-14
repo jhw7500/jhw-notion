@@ -3,7 +3,7 @@
 **Date:** 2026-08-14
 **Branch:** `feat/project-control-phase1a`
 **Base:** `9fbd7983c80ad19a7fb0a51e201f67ba60ee1133`
-**Validated implementation HEAD:** `c186ff7` (report commit follows)
+**Validated implementation HEAD:** `ca12cd0` (report refresh follows)
 **Status:** implementation and local deterministic gates complete; independent final re-review pending at report authoring.
 
 ## Outcome
@@ -35,7 +35,7 @@ Production behavior was changed only after focused RED evidence. Representative 
 | Installer/durability | foreign links/configs could be replaced, TOML equivalents bypassed ownership, and fsync/hardlink edges were incomplete | isolated-HOME ownership round trip and durability/fault boundaries pass |
 | Final authority-order correction | focused preflight RED: wrong remote still called the monotonic authority observer once (expected zero) | observer moved after exact Registry proof; `preflight` **35/35** GREEN |
 | Strict Notion response fixtures | full-suite RED after strict object validation: **7 failed / 844 passed** because seven test fixtures omitted the official object discriminator | fixture-only correction: append/delete **23/23**, fresh full suite GREEN |
-| Corrected adversarial gate | first expanded run found two test-harness expectation defects; no production defect was hidden | pinned gate expanded **19 → 26** deterministic cases and passed twice as fresh processes |
+| Corrected adversarial gate | first expanded run found two test-harness expectation defects; no production defect was hidden | pinned gate expanded **19 → 27** deterministic cases and passed twice as fresh processes |
 
 Focused evidence retained from the thematic slices includes:
 
@@ -54,10 +54,10 @@ All commands below were run from the repository or `mcp-server` as appropriate a
 
 | Gate | Result |
 |---|---|
-| `npm test` | **51 files, 859/859 tests GREEN** |
+| `npm test` | **51 files, 860/860 tests GREEN** |
 | `npm run build` | GREEN |
-| pinned `phase1a.e2e.test.ts`, fresh process 1 | **26/26 GREEN**, 38.38 s |
-| pinned `phase1a.e2e.test.ts`, fresh process 2 | **26/26 GREEN**, 32.19 s |
+| pinned `phase1a.e2e.test.ts`, fresh process 1 | **27/27 GREEN**, 29.32 s |
+| pinned `phase1a.e2e.test.ts`, fresh process 2 | **27/27 GREEN**, 33.20 s |
 | `npm test -- --run cli-entry` | **5/5 GREEN** |
 | `bash -n install.sh` | GREEN |
 | isolated-HOME `scripts/test-install-safety.sh` | `installer safety: ok` |
@@ -101,6 +101,7 @@ af13985  Preflight fixture pre-verification
 4df06fa  Registry-proof-before-authority observation
 5daf625  Full corrected high-risk adversarial gate
 c186ff7  Explicit fake home fixtures
+ca12cd0  Project/register + Task/finish journal-gap gates
 ```
 
 The complete ordered commit list is available via:
