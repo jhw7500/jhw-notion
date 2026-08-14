@@ -198,10 +198,11 @@ function pullBackFromSplitSurrogate(value: string, limit: number): number {
 interface RedactedCapture {
   bytes: Buffer;
   sensitive: boolean;
+  tooLarge: boolean;
 }
 
 function redactingCapture(stream: Readable | null, secrets: readonly string[]): Promise<RedactedCapture> {
-  if (!stream) return Promise.resolve({ bytes: Buffer.alloc(0), sensitive: false });
+  if (!stream) return Promise.resolve({ bytes: Buffer.alloc(0), sensitive: false, tooLarge: false });
 
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -209,9 +210,14 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
     let captured = 0;
     let pending = "";
     let sensitive = false;
+    let tooLarge = false;
 
     const append = (value: string) => {
-      if (captured >= MAX_CAPTURE_BYTES || !value) return;
+      if (!value) return;
+      if (captured >= MAX_CAPTURE_BYTES) {
+        tooLarge = true;
+        return;
+      }
       const encoded = Buffer.from(value, "utf8");
       const remaining = MAX_CAPTURE_BYTES - captured;
       if (encoded.length <= remaining) {
@@ -223,6 +229,7 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
       const bounded = Buffer.from(completeCharacters, "utf8");
       chunks.push(bounded);
       captured += bounded.length;
+      tooLarge = true;
     };
     const emitAvailable = () => {
       const spans = secretSpans(pending, secrets);
@@ -261,7 +268,7 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
       if (spans.length > 0) sensitive = true;
       append(renderMasked(pending, mergeSecretSpans(spans)));
       pending = "";
-      resolve({ bytes: Buffer.concat(chunks), sensitive });
+      resolve({ bytes: Buffer.concat(chunks), sensitive, tooLarge });
     };
     stream.once("end", finish);
     stream.once("close", finish);
@@ -440,6 +447,19 @@ export class ProcessRunner {
     const [stdoutCapture, stderrCapture] = await Promise.all([stdout, stderr]);
     const stopError = stoppedError(exit.stopped, safeCommand, deadline);
     if (stopError) throw stopError;
+    if (exit.exitCode === 0 && (stdoutCapture.sensitive || stderrCapture.sensitive)) {
+      throw new ControlError(
+        "SENSITIVE_OUTPUT_REJECTED",
+        "Successful command output contained protected host data",
+      );
+    }
+    if (stdoutCapture.tooLarge || stderrCapture.tooLarge) {
+      throw new ControlError(
+        "COMMAND_OUTPUT_TOO_LARGE",
+        "Command output exceeded its bounded capture size",
+        { command: safeCommand, maximum_bytes: MAX_CAPTURE_BYTES },
+      );
+    }
     const result = {
       command: safeCommand,
       args: safeArgs,
@@ -453,13 +473,6 @@ export class ProcessRunner {
         "COMMAND_FAILED",
         `Command failed (${result.exitCode ?? "unknown"}): ${safeCommand}`,
         { ...result, cause: exit.cause ? redact(exit.cause, secrets) : undefined },
-      );
-    }
-
-    if (stdoutCapture.sensitive || stderrCapture.sensitive) {
-      throw new ControlError(
-        "SENSITIVE_OUTPUT_REJECTED",
-        "Successful command output contained protected host data",
       );
     }
 

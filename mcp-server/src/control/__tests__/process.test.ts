@@ -381,15 +381,24 @@ describe("control process boundary", () => {
     expect(JSON.stringify(error)).not.toContain(secret);
   });
 
-  it("caps successful output without splitting final UTF-8", async () => {
+  it("rejects oversized successful stdout instead of returning truncated authority data", async () => {
     const fillerLength = 1024 * 1024 - 3;
-    const result = await new ProcessRunner({ SHORT_TOKEN: "x" }).run("bash", [
+    const failure = await new ProcessRunner({ SHORT_TOKEN: "x" }).run("bash", [
       "-c",
       `head -c ${fillerLength} /dev/zero | tr '\\0' x; printf '😀tail'`,
-    ]);
+    ]).catch((cause: unknown) => cause);
 
-    expect(result.stdout).not.toContain("\uFFFD");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+    expect(failure).toMatchObject({ code: "COMMAND_OUTPUT_TOO_LARGE" });
+    expect(JSON.stringify(failure)).not.toContain("\uFFFD");
+  });
+
+  it("rejects oversized successful stderr instead of returning truncated diagnostics", async () => {
+    const failure = await new ProcessRunner().run("bash", [
+      "-c",
+      `head -c ${1024 * 1024 + 1} /dev/zero | tr '\\0' x >&2`,
+    ]).catch((cause: unknown) => cause);
+
+    expect(failure).toMatchObject({ code: "COMMAND_OUTPUT_TOO_LARGE" });
   });
 
 
