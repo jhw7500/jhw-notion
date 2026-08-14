@@ -59,6 +59,19 @@ export interface WorktreeRecoveryStatus {
   path_exists: boolean;
 }
 
+export type RetainedWorktreeDisposition = "active" | "handoff" | "force-ended" | "create-failed";
+
+export interface RetainedWorktreeGeneration {
+  claim_id: string;
+  worktree_ref: string;
+  disposition: RetainedWorktreeDisposition;
+  successor_claim_id?: string;
+  linked_predecessors?: ReadonlyArray<{
+    claim_id: string;
+    disposition: Exclude<RetainedWorktreeDisposition, "active">;
+  }>;
+}
+
 export interface WorktreeRunner {
   run(command: string, args: string[], options?: ProcessRunOptions): Promise<ProcessResult>;
 }
@@ -311,10 +324,7 @@ export class WorktreeManager {
   async assertStartReady(
     taskId: string,
     taskAlias: string,
-    retained?: Pick<ActiveClaim, "claim_id" | "worktree_ref"> & {
-      disposition: "active" | "handoff" | "force-ended" | "create-failed";
-      successor_claim_id?: string;
-    },
+    retained?: RetainedWorktreeGeneration,
   ): Promise<void> {
     const plan = worktreePlan(taskId, taskAlias);
     const state = await this.loadState();
@@ -344,14 +354,17 @@ export class WorktreeManager {
     const [entry] = candidates;
     if (!entry) return;
     const [worktreeRef, mapping] = entry;
-    const retainedGenerationMatches = retained?.claim_id === mapping.claim_id ||
-      (retained?.successor_claim_id !== undefined && retained.successor_claim_id === mapping.claim_id);
-    const retainedMatches = retainedGenerationMatches &&
+    const matchedDisposition = retained?.claim_id === mapping.claim_id
+      ? retained.disposition
+      : retained?.successor_claim_id === mapping.claim_id
+        ? "active"
+        : retained?.linked_predecessors?.find((generation) => generation.claim_id === mapping.claim_id)?.disposition;
+    const retainedMatches = retained !== undefined && matchedDisposition !== undefined &&
       retained.worktree_ref === worktreeRef &&
       plan.worktree_ref === worktreeRef;
-    const lifecycleAllowed = retained?.disposition === "active" || retained?.disposition === "create-failed"
+    const lifecycleAllowed = matchedDisposition === "active" || matchedDisposition === "create-failed"
       ? mapping.lifecycle === "active" || mapping.lifecycle === "pending-create"
-      : retained?.disposition === "handoff" || retained?.disposition === "force-ended"
+      : matchedDisposition === "handoff" || matchedDisposition === "force-ended"
         ? mapping.lifecycle === "active"
         : false;
     if (mapping.lifecycle === "pending-create" && !(retainedMatches && lifecycleAllowed)) {

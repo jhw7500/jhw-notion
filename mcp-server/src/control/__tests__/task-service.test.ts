@@ -1231,6 +1231,87 @@ describe("TaskService", () => {
     await expect(tasks.finish(input)).resolves.toMatchObject({ worktree_removed: false });
   });
 
+  it("recovers the exact Handoff predecessor after successor rebind persistence fails", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const config = configFor(fixture.registryDir);
+    const source = join(fixture.root, "source-rebind-recovery");
+    await git(fixture.root, "init", "--initial-branch=main", source);
+    await git(source, "config", "user.name", "Phase1A Test");
+    await git(source, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(source, "README.md"), "# Source\n", "utf8");
+    await git(source, "add", "README.md");
+    await git(source, "commit", "-m", "Initial source");
+
+    const registry = isolatedRegistryGit(config, new ProcessRunner());
+    const catalog = new Catalog(config, registry);
+    await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
+    const alias = `${taskAlias}-rebind-recovery`;
+    const task = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias,
+      goal: "recover an exact failed Handoff successor rebind",
+      done_conditions: ["same worktree is reused"],
+      expected_scope: ["src/control"],
+    });
+    const claims = new ClaimService(config, registry, catalog, {
+      async inspect() {
+        return { process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 };
+      },
+    });
+    const initialWorktrees = new WorktreeManager(config);
+    const initialTasks = new TaskService(config, claims, initialWorktrees, registry);
+    const first = await initialTasks.start({
+      task_id: task.id,
+      task_alias: alias,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      session_id: "codex-rebind-first",
+      repository_path: source,
+    });
+    await initialTasks.finish({
+      task_id: task.id,
+      claim_id: first.claim.claim_id,
+      status: "handoff",
+      validation: ["focused test: pass"],
+    });
+
+    const failedRebindWorktrees = new WorktreeManager(config, new ProcessRunner(), {
+      beforeSave: () => {
+        throw new ControlError("STATE_PERSIST_FAILED", "injected successor rebind failure");
+      },
+    });
+    const failedResume = new TaskService(config, claims, failedRebindWorktrees, registry);
+    await expect(failedResume.start({
+      task_id: task.id,
+      task_alias: alias,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      session_id: "codex-rebind-failed",
+      repository_path: source,
+    })).rejects.toMatchObject({ code: "STATE_PERSIST_FAILED" });
+    const failedHistory = await claims.latestClaimHistory(task.id);
+    expect(failedHistory).toMatchObject({
+      status: "abandoned",
+      outcome: "worktree_create_failed",
+      predecessor_claim_id: first.claim.claim_id,
+    });
+
+    const recovered = await new TaskService(config, claims, new WorktreeManager(config), registry).start({
+      task_id: task.id,
+      task_alias: alias,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      session_id: "codex-rebind-recovered",
+      repository_path: source,
+    });
+    expect(recovered).toMatchObject({ reused: true, claim: { predecessor_claim_id: failedHistory.claim_id } });
+    await expect(new WorktreeManager(config).inspect(recovered.claim)).resolves.toMatchObject({
+      worktree_ref: first.worktree_ref,
+    });
+  });
+
   it("retries a reused worktree when the original dirty evidence already included a visible local Handoff", async () => {
     const fixture = await makeRegistryFixture();
     fixtures.push(fixture);

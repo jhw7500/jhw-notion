@@ -22,7 +22,13 @@ import {
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
 import type { ActiveClaim, ClaimHistory } from "./schemas.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
-import { worktreePlan, type WorktreeCreateResult, type WorktreeInspection, type WorktreeRemovalResult } from "./worktree.js";
+import {
+  worktreePlan,
+  type RetainedWorktreeGeneration,
+  type WorktreeCreateResult,
+  type WorktreeInspection,
+  type WorktreeRemovalResult,
+} from "./worktree.js";
 
 export interface ClaimServicePort {
   claimTask(input: ClaimTaskInput): Promise<ActiveClaim>;
@@ -39,9 +45,7 @@ export interface WorktreeManagerPort {
   assertStartReady(
     taskId: string,
     taskAlias: string,
-    retained?: Pick<ActiveClaim, "claim_id" | "worktree_ref"> & {
-      disposition: "active" | "handoff" | "force-ended" | "create-failed";
-    },
+    retained?: RetainedWorktreeGeneration,
   ): Promise<void>;
   createOrReuse(claim: ActiveClaim, repositoryPath: string): Promise<WorktreeCreateResult>;
   inspect(claim: ActiveClaim): Promise<WorktreeInspection>;
@@ -148,6 +152,15 @@ const safeWorktreeCreateCodes = new Set([
 function worktreeCreateValidation(cause: unknown): string {
   const code = cause instanceof ControlError && safeWorktreeCreateCodes.has(cause.code) ? cause.code : "unknown";
   return `worktree_create_failed:${code}`;
+}
+
+const maximumReusableClaimGenerations = 64;
+
+function reusableDisposition(history: ClaimHistory): Exclude<RetainedWorktreeGeneration["disposition"], "active"> | undefined {
+  if (history.status === "handoff") return "handoff";
+  if (history.status === "force-ended") return "force-ended";
+  if (history.status === "abandoned" && history.outcome === "worktree_create_failed") return "create-failed";
+  return undefined;
 }
 
 function assertValidation(validation: string[]): void {
@@ -324,22 +337,12 @@ export class TaskService {
     } catch (cause) {
       if (!(cause instanceof ControlError && cause.code === "CLAIM_HISTORY_NOT_FOUND")) throw cause;
     }
-    const reusableHistory = latestHistory?.task_alias && (
-      latestHistory.status === "handoff" ||
-      latestHistory.status === "force-ended" ||
-      (latestHistory.status === "abandoned" && latestHistory.outcome === "worktree_create_failed")
-    ) ? latestHistory : undefined;
+    const reusableHistory = latestHistory?.task_alias && reusableDisposition(latestHistory) ? latestHistory : undefined;
     const taskAlias = currentActive?.task_alias ?? reusableHistory?.task_alias ?? input.task_alias;
     const plan = worktreePlan(input.task_id, taskAlias);
-    if (reusableHistory && (
-      reusableHistory.task_id !== input.task_id ||
-      reusableHistory.project_id !== input.project_id ||
-      reusableHistory.repo_id !== input.repo_id ||
-      reusableHistory.branch !== plan.branch ||
-      reusableHistory.worktree_ref !== plan.worktree_ref
-    )) {
-      throw new ControlError("REGISTRY_CORRUPT", "Released Claim history has inconsistent Task coordinates");
-    }
+    const reusableChain = reusableHistory
+      ? await this.reusableClaimChain(reusableHistory, input, taskAlias, plan)
+      : [];
     if (currentActive && (
       currentActive.task_id !== input.task_id ||
       currentActive.project_id !== input.project_id ||
@@ -353,16 +356,17 @@ export class TaskService {
     if (currentActive?.predecessor_claim_id && currentActive.predecessor_claim_id !== reusableHistory?.claim_id) {
       throw new ControlError("REGISTRY_CORRUPT", "Active Claim predecessor is not the exact latest reusable release");
     }
-    const retained = currentActive?.predecessor_claim_id && reusableHistory
+    const linkedPredecessors = reusableChain.slice(1).map((history) => ({
+      claim_id: history.claim_id,
+      disposition: reusableDisposition(history) as Exclude<RetainedWorktreeGeneration["disposition"], "active">,
+    }));
+    const retained: RetainedWorktreeGeneration | undefined = currentActive?.predecessor_claim_id && reusableHistory
       ? {
           claim_id: reusableHistory.claim_id,
           successor_claim_id: currentActive.claim_id,
           worktree_ref: reusableHistory.worktree_ref,
-          disposition: reusableHistory.status === "handoff"
-            ? "handoff" as const
-            : reusableHistory.status === "force-ended"
-              ? "force-ended" as const
-              : "create-failed" as const,
+          disposition: reusableDisposition(reusableHistory) as Exclude<RetainedWorktreeGeneration["disposition"], "active">,
+          ...(linkedPredecessors.length > 0 ? { linked_predecessors: linkedPredecessors } : {}),
         }
       : currentActive
         ? { claim_id: currentActive.claim_id, worktree_ref: currentActive.worktree_ref, disposition: "active" as const }
@@ -370,11 +374,8 @@ export class TaskService {
         ? {
             claim_id: reusableHistory.claim_id,
             worktree_ref: reusableHistory.worktree_ref,
-            disposition: reusableHistory.status === "handoff"
-              ? "handoff" as const
-              : reusableHistory.status === "force-ended"
-                ? "force-ended" as const
-                : "create-failed" as const,
+            disposition: reusableDisposition(reusableHistory) as Exclude<RetainedWorktreeGeneration["disposition"], "active">,
+            ...(linkedPredecessors.length > 0 ? { linked_predecessors: linkedPredecessors } : {}),
           }
         : undefined;
     await this.worktrees.assertStartReady(
@@ -683,6 +684,42 @@ export class TaskService {
     ) {
       throw handoffRetryConflict(handoffPath, "dirty_delta_changed");
     }
+  }
+
+  private async reusableClaimChain(
+    latest: ClaimHistory,
+    input: TaskStartInput,
+    taskAlias: string,
+    plan: { branch: string; worktree_ref: string },
+  ): Promise<ClaimHistory[]> {
+    const chain: ClaimHistory[] = [];
+    const seen = new Set<string>();
+    let current: ClaimHistory | undefined = latest;
+    while (current) {
+      if (chain.length >= maximumReusableClaimGenerations || seen.has(current.claim_id)) {
+        throw new ControlError("REGISTRY_CORRUPT", "Reusable Claim predecessor chain is cyclic or exceeds its bound");
+      }
+      const disposition = reusableDisposition(current);
+      if (!disposition || !current.task_alias ||
+        current.task_id !== input.task_id ||
+        current.task_alias !== taskAlias ||
+        current.project_id !== input.project_id ||
+        current.repo_id !== input.repo_id ||
+        current.host !== this.config.buildHost ||
+        current.branch !== plan.branch ||
+        current.worktree_ref !== plan.worktree_ref) {
+        throw new ControlError("REGISTRY_CORRUPT", "Released Claim history has inconsistent Task/worktree coordinates");
+      }
+      seen.add(current.claim_id);
+      chain.push(current);
+      if (disposition !== "create-failed" || !current.predecessor_claim_id) break;
+      const predecessor = await this.claims.getClaimHistory(input.task_id, current.predecessor_claim_id);
+      if (predecessor.claim_id !== current.predecessor_claim_id) {
+        throw new ControlError("REGISTRY_CORRUPT", "Reusable Claim predecessor lookup returned a different generation");
+      }
+      current = predecessor;
+    }
+    return chain;
   }
 
   private buildRequestedHandoff(
