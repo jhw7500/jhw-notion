@@ -111,6 +111,21 @@ describe("Catalog", () => {
     await expect(catalog.getRepository(repositoryInput.repo_id)).resolves.toMatchObject({ slug: "jhw7500/wlan-renamed" });
   });
 
+  it("refuses a Repository slug rename that would strand a dependent formal Task", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    await catalog.registerFormalTask(issueInput);
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerRepository({
+      ...repositoryInput,
+      slug: "jhw7500/wlan-renamed",
+    })).rejects.toMatchObject({ code: "REPOSITORY_RENAME_CONFLICT" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+    await expect(catalog.getRepository(repositoryInput.repo_id)).resolves.toMatchObject({ slug: repositoryInput.slug });
+  });
+
   it("requires a canonical Repository record before creating any Task", async () => {
     const { catalog } = await catalogFixture();
 
@@ -159,6 +174,41 @@ describe("Catalog", () => {
     await expect(catalog.registerTemporaryTask({ ...input, goal: "different work" })).rejects.toMatchObject({
       code: "TEMPORARY_ALIAS_CONFLICT",
     });
+  });
+
+  it("never lets a formal Issue alias identify a different temporary Task", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    await catalog.registerTemporaryTask({
+      project_id: issueInput.project_id,
+      repo_id: issueInput.repo_id,
+      alias: issueInput.alias,
+      goal: "temporary collision",
+      done_conditions: ["collision rejected"],
+      expected_scope: ["src/control"],
+    });
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerFormalTask(issueInput)).rejects.toMatchObject({ code: "TASK_ALIAS_CONFLICT" });
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+  });
+
+  it("derives a new temporary Task lifecycle as active instead of accepting a caller state", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerTemporaryTask({
+      project_id: issueInput.project_id,
+      repo_id: issueInput.repo_id,
+      alias: "wlan:caller-lifecycle",
+      goal: "must begin active",
+      done_conditions: ["caller state rejected"],
+      expected_scope: ["src/control"],
+      lifecycle: "completed",
+    } as any)).rejects.toMatchObject({ code: "INVALID_TEMPORARY_TASK" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
   });
 
   it("exposes a narrowly validated canonical Repository lookup", async () => {
@@ -317,6 +367,33 @@ describe("Catalog", () => {
       done_conditions: ["new test"],
       expected_scope: ["src/new.ts"],
     })).rejects.toMatchObject({ code: "TEMPORARY_ALIAS_CONFLICT" });
+  });
+
+  it("refuses promotion when the verified formal alias belongs to another Task", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    await catalog.registerTemporaryTask({
+      project_id: issueInput.project_id,
+      repo_id: issueInput.repo_id,
+      alias: issueInput.alias,
+      goal: "alias owner",
+      done_conditions: ["stay distinct"],
+      expected_scope: ["src/owner"],
+    });
+    const target = await catalog.registerTemporaryTask({
+      project_id: issueInput.project_id,
+      repo_id: issueInput.repo_id,
+      alias: "wlan:promotion-target",
+      goal: "promotion target",
+      done_conditions: ["promotion checked"],
+      expected_scope: ["src/target"],
+    });
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.promoteTemporaryTask(target.id, issueInput)).rejects.toMatchObject({
+      code: "TASK_ALIAS_CONFLICT",
+    });
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
   });
 
   it("applies formal immutable-coordinate and monotonic-revision rules on promotion retry", async () => {
