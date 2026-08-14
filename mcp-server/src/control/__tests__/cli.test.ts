@@ -389,6 +389,39 @@ describe("runCli", () => {
     expect((await stat(join(stateDir, "pilot-journal.jsonl"))).mode & 0o777).toBe(0o600);
   });
 
+  it("keeps authoritative success coordinates when the derived journal append fails", async () => {
+    const dependencies = makeCliDependencies({
+      journal: { append: vi.fn().mockRejectedValue(new Error("injected journal failure")) },
+    });
+
+    const result = await runCli(formalStartArgs(), dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.taskService.start).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      result: { claim: { task_id: TASK_ID, claim_id: CLAIM_ID } },
+      journal_warning: { code: "JOURNAL_WRITE_FAILED" },
+    });
+    expect(`${result.stdout}${result.stderr}`).not.toContain("injected journal failure");
+  });
+
+  it("keeps the original command error when its derived journal append also fails", async () => {
+    const dependencies = makeCliDependencies({
+      taskService: { status: vi.fn().mockRejectedValue(new ControlError("CLAIM_MISMATCH", "untrusted detail")) },
+      journal: { append: vi.fn().mockRejectedValue(new Error("injected journal failure")) },
+    });
+
+    const result = await runCli(["task", "status", "--task", TASK_ID, "--claim", CLAIM_ID], dependencies);
+
+    expect(result.exitCode).toBe(4);
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "CLAIM_MISMATCH" },
+      journal_warning: { code: "JOURNAL_WRITE_FAILED" },
+    });
+    expect(`${result.stdout}${result.stderr}`).not.toContain("untrusted detail");
+    expect(`${result.stdout}${result.stderr}`).not.toContain("injected journal failure");
+  });
+
   it("rejects unknown flags and mixed formal/temporary task inputs before calling services", async () => {
     const dependencies = makeCliDependencies();
 

@@ -703,7 +703,18 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
       ...metadata,
     });
   } catch {
-    return controlErrorResult(new ControlError("JOURNAL_WRITE_FAILED", "Unable to append the pilot journal"));
+    // The journal is a derived measurement stream, never lifecycle authority.
+    // Preserve the command's already-computed outcome and expose only a stable,
+    // bounded gap marker so retrying cannot duplicate a successful mutation.
+    const stream = result.exitCode === 0 ? result.stdout : result.stderr;
+    const parsed = JSON.parse(stream) as Record<string, unknown>;
+    const warned = `${JSON.stringify({
+      ...parsed,
+      journal_warning: { code: "JOURNAL_WRITE_FAILED" },
+    })}\n`;
+    return result.exitCode === 0
+      ? { ...result, stdout: warned }
+      : { ...result, stderr: warned };
   }
   return result;
 }
