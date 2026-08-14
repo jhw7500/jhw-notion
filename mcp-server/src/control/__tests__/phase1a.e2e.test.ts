@@ -328,6 +328,23 @@ async function textArtifacts(root: string): Promise<string[]> {
   return artifacts;
 }
 
+interface RawErrorAudit {
+  name: string;
+  message: string;
+  code?: unknown;
+  details?: unknown;
+}
+
+function rawErrorAudit(cause: unknown): RawErrorAudit {
+  const record = typeof cause === "object" && cause !== null ? cause as Record<string, unknown> : undefined;
+  return {
+    name: cause instanceof Error ? cause.name : typeof cause,
+    message: cause instanceof Error ? cause.message : String(cause),
+    ...(record && "code" in record ? { code: record.code } : {}),
+    ...(record && "details" in record ? { details: record.details } : {}),
+  };
+}
+
 describe("Phase 1A deterministic adversarial gate", () => {
   it("1. concurrent Repository registration leaves one canonical record and one source mapping", async () => {
     const fixture = await makeGateFixture();
@@ -348,6 +365,14 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(results[0].status).toBe("fulfilled");
     expect(results[1]).toMatchObject({ status: "rejected", reason: { code: "REMOTE_DIVERGED" } });
     const audit = await freshAuditClone(fixture, "audit-repository");
+    const repositoryRecords = (await readdir(join(audit, "repositories"), { withFileTypes: true }))
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name);
+    const sourceMappings = (await readdir(join(audit, "repositories", "by-source", "github"), { withFileTypes: true }))
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name);
+    expect(repositoryRecords).toEqual(["repo-control.yaml"]);
+    expect(sourceMappings).toEqual([`${sourceIndexKey(repositoryInput.github_node_id)}.yaml`]);
     expect(JSON.parse(await readFile(join(audit, "repositories", "repo-control.yaml"), "utf8"))).toEqual({
       id: "repo-control", github_node_id: "R_phase1a", slug: "jhw7500/control",
     });
@@ -376,7 +401,11 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const audit = await freshAuditClone(fixture, "audit-task");
     const source = JSON.parse(await readFile(join(audit, "tasks", "by-source", "github", `${sourceIndexKey(issueInput.issue_node_id)}.yaml`), "utf8"));
     const taskFiles = (await readdir(join(audit, "tasks"), { withFileTypes: true })).filter((entry) => entry.isFile());
+    const sourceFiles = (await readdir(join(audit, "tasks", "by-source", "github"), { withFileTypes: true }))
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name);
     expect(taskFiles.map((entry) => entry.name)).toEqual([`${source.task_id}.yaml`]);
+    expect(sourceFiles).toEqual([`${sourceIndexKey(issueInput.issue_node_id)}.yaml`]);
     expect(JSON.parse(await readFile(join(audit, "tasks", `${source.task_id}.yaml`), "utf8"))).toMatchObject({ id: source.task_id, issue_node_id: issueInput.issue_node_id });
   });
 
@@ -391,11 +420,15 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const head = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
     const temporaryBytes = await readFile(join(fixture.cloneA, "tasks", `${temporary.id}.yaml`), "utf8");
     const formalBytes = await readFile(join(fixture.cloneA, "tasks", `${formal.id}.yaml`), "utf8");
+    const sourcePath = join(fixture.cloneA, "tasks", "by-source", "github", `${sourceIndexKey(issueInput.issue_node_id)}.yaml`);
+    const sourceBytes = await readFile(sourcePath, "utf8");
 
     await expect(graph.catalog.promoteTemporaryTask(temporary.id, issueInput)).rejects.toMatchObject({ code: "SOURCE_ALREADY_MAPPED" });
     expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(head);
     expect(await readFile(join(fixture.cloneA, "tasks", `${temporary.id}.yaml`), "utf8")).toBe(temporaryBytes);
     expect(await readFile(join(fixture.cloneA, "tasks", `${formal.id}.yaml`), "utf8")).toBe(formalBytes);
+    expect(await readFile(sourcePath, "utf8")).toBe(sourceBytes);
+    expect(await git(fixture.cloneA, "status", "--porcelain", "--untracked-files=all")).toBe("");
   });
 
   it("4. two same-host Task starts under one retained lock leave one active Claim", async () => {
@@ -651,8 +684,14 @@ describe("Phase 1A deterministic adversarial gate", () => {
     ]) expect(result.exitCode).toBe(4);
     expect((await graph.claims.getActive(taskId))?.claim_id).toBe(newClaimId);
 
+    const mappingBeforeFinish = JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
+      .worktrees[oldClaim.worktree_ref];
+    const physicalWorktreePath = mappingBeforeFinish.path as string;
+    expect(mappingBeforeFinish).toMatchObject({ claim_id: newClaimId, lifecycle: "active" });
+    expect(await exists(physicalWorktreePath)).toBe(true);
     const finished = await runCli(completedFinishArgs(taskId, newClaimId), dependencies);
     expect(finished.exitCode).toBe(0);
+    expect(JSON.parse(finished.stdout).result.worktree_removed).toBe(true);
     const oldHistory = JSON.parse(await readFile(join(fixture.cloneA, "claims", "history", "2026", taskId, `${oldClaim.claim_id}.yaml`), "utf8"));
     const middleHistory = JSON.parse(await readFile(join(fixture.cloneA, "claims", "history", "2026", taskId, `${firstSuccessorId}.yaml`), "utf8"));
     const newHistory = JSON.parse(await readFile(join(fixture.cloneA, "claims", "history", "2026", taskId, `${newClaimId}.yaml`), "utf8"));
@@ -661,9 +700,12 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(newHistory).toMatchObject({ status: "completed" });
     expect(await graph.claims.getActive(taskId)).toBeUndefined();
     expect(await exists(join(fixture.cloneA, "tasks", `${taskId}.yaml`))).toBe(true);
-    expect(JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8")).worktrees[oldClaim.worktree_ref]).toMatchObject({
+    const removedMapping = JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
+      .worktrees[oldClaim.worktree_ref];
+    expect(removedMapping).toMatchObject({
       claim_id: newClaimId, lifecycle: "removed",
     });
+    expect(await exists(physicalWorktreePath)).toBe(false);
   });
 
   it("9. offline provisional work is unclaimed and cannot assert ownership", async () => {
@@ -696,12 +738,47 @@ describe("Phase 1A deterministic adversarial gate", () => {
     ], dependencies);
 
     expect(result.exitCode).toBe(0);
+    const finished = JSON.parse(result.stdout).result;
     const pointer = `handoffs/${taskId}/${claim.claim_id}.md`;
     const mapping = JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8")).worktrees[claim.worktree_ref];
-    expect(await exists(join(fixture.cloneA, "tasks", `${taskId}.yaml`))).toBe(true);
-    expect(await readFile(join(fixture.cloneA, pointer), "utf8")).toContain(`# Handoff: ${taskId}`);
-    expect(await readFile(join(mapping.path, ".ai", "handoff.md"), "utf8")).toContain(`# Handoff: ${taskId}`);
+    const localHandoff = await readFile(join(mapping.path, ".ai", "handoff.md"), "utf8");
+    const audit = await freshAuditClone(fixture, "handoff-audit");
+    const remoteHead = (await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim().split(/\s+/)[0];
+    expect((await git(audit, "rev-parse", "HEAD")).trim()).toBe(remoteHead);
+    expect(await git(audit, "status", "--porcelain", "--untracked-files=all")).toBe("");
+    expect(JSON.parse(await readFile(join(audit, "tasks", `${taskId}.yaml`), "utf8"))).toMatchObject({ id: taskId });
+    const committedHandoff = await readFile(join(audit, pointer), "utf8");
+    expect(committedHandoff).toBe(localHandoff);
+    expect(committedHandoff).toContain(`# Handoff: ${taskId}`);
+    const history = JSON.parse(await readFile(
+      join(audit, "claims", "history", finished.released_at.slice(0, 4), taskId, `${claim.claim_id}.yaml`),
+      "utf8",
+    ));
+    expect(history).toMatchObject({
+      task_id: taskId,
+      claim_id: claim.claim_id,
+      status: "handoff",
+      handoff_path: pointer,
+    });
+    expect(finished).toMatchObject({
+      task_id: taskId,
+      claim_id: claim.claim_id,
+      status: "handoff",
+      handoff_pointer: pointer,
+      worktree_removed: false,
+    });
+    expect(await exists(join(audit, "claims", "active", `${taskId}.yaml`))).toBe(false);
+    expect(mapping).toMatchObject({
+      task_id: taskId,
+      claim_id: claim.claim_id,
+      session_id: "codex-handoff",
+      host: graph.config.buildHost,
+      branch: claim.branch,
+      lifecycle: "active",
+      path: join(fixture.worktreeRoot, claim.worktree_ref),
+    });
     expect(await exists(mapping.path)).toBe(true);
+    expect(await readFile(join(mapping.path, ".ai", "handoff.md"), "utf8")).toBe(committedHandoff);
     expect(await graph.claims.getActive(taskId)).toBeUndefined();
   });
 
@@ -813,23 +890,38 @@ describe("Phase 1A deterministic adversarial gate", () => {
       clearLastReviewed: async () => undefined,
     };
     const preflight = new PreflightService({ config: graph.config, environment, runner, project });
+    const caughtMetadata: RawErrorAudit[] = [];
+    const auditedPreflight = {
+      async run() {
+        try {
+          return await preflight.run();
+        } catch (cause) {
+          caughtMetadata.push(rawErrorAudit(cause));
+          throw cause;
+        }
+      },
+    };
     const dependencies = cliDependencies(graph, {
       env: environment,
-      preflight,
+      preflight: auditedPreflight,
       mutationLock: { run: async (callback) => callback() },
       journal: new PilotJournal(graph.config.stateDir),
     });
 
-    const caughtMetadata: unknown[] = [];
-    const result = await runCli(["preflight"], dependencies).catch((cause: unknown) => {
-      caughtMetadata.push(cause);
-      throw cause;
-    });
+    const result = await runCli(["preflight"], dependencies);
 
     expect(result).toMatchObject({ exitCode: 78 });
+    expect(caughtMetadata).toHaveLength(1);
+    expect(caughtMetadata[0]).toEqual({
+      name: "ControlError",
+      message: "Project token must not expose repo scope",
+      code: "PROJECT_TOKEN_HAS_REPO_SCOPE",
+      details: {},
+    });
     const errorMetadata = JSON.parse(result.stderr);
     expect(errorMetadata).toEqual({ error: { code: "PROJECT_TOKEN_HAS_REPO_SCOPE" } });
-    expect((await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line))).toEqual([
+    const operationLog = await readFile(logPath, "utf8");
+    expect(operationLog.trim().split("\n").map((line) => JSON.parse(line))).toEqual([
       { operation: "rest:GET:repos/jhw7500/control/issues/1", keys: [] },
       { operation: "rest:GET:/user", keys: [] },
     ]);
@@ -838,11 +930,17 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(queuedArtifacts.filter((name) => /^000[01]\.json\.claimed-\d+$/.test(name))).toHaveLength(2);
     const journal = await readFile(join(fixture.stateDir, "pilot-journal.jsonl"), "utf8");
     expect(JSON.parse(journal)).toMatchObject({ command: "preflight", ok: false, error_code: "PROJECT_TOKEN_HAS_REPO_SCOPE" });
+    const rawErrorArtifact = JSON.stringify(caughtMetadata);
     const artifacts = [
       result.stdout,
       result.stderr,
       JSON.stringify(errorMetadata),
-      JSON.stringify(caughtMetadata),
+      rawErrorArtifact,
+      journal,
+      operationLog,
+      await readFile(join(fixture.binDir, "gh"), "utf8"),
+      ...await textArtifacts(queueDir),
+      ...await textArtifacts(fixture.stateDir),
       ...await textArtifacts(fixture.root),
     ];
     for (const token of [projectToken, repoToken]) expect(artifacts.join("\n")).not.toContain(token);
