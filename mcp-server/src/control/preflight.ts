@@ -33,6 +33,10 @@ export interface PreflightRepositoryPort {
   verifyPrivateRepository(slug: string): Promise<void>;
 }
 
+export interface PreflightRegistryPort {
+  assertReady(): Promise<unknown>;
+}
+
 export interface PreflightServiceOptions {
   config: ControlConfig;
   environment: NodeJS.ProcessEnv;
@@ -41,6 +45,7 @@ export interface PreflightServiceOptions {
   authority: PreflightAuthorityPort;
   notion: PreflightNotionPort;
   repository: PreflightRepositoryPort;
+  registry?: PreflightRegistryPort;
   sensitiveData?: SensitiveDataPolicy;
   remoteUrl?: () => Promise<string>;
   pushRemoteUrl?: () => Promise<string>;
@@ -51,7 +56,9 @@ export interface PreflightServiceOptions {
 // Keep this local schema separate from Project Record parsing: preflight
 // deliberately performs an unchanged-body write, not record adoption.
 const IssueResponseSchema = z.object({
-  node_id: z.string().min(1),
+  node_id: z.string().min(1).max(128),
+  number: z.number().int().safe().positive(),
+  html_url: z.string().max(512).url(),
   title: z.string(),
   body: z.string(),
   labels: z.array(z.object({ name: z.string().min(1) }).passthrough()),
@@ -100,6 +107,23 @@ function distinctProbeDate(original: string | undefined, proposed: string): stri
   return previous.toISOString().slice(0, 10);
 }
 
+function isProvenProjectScopeFailure(cause: unknown): boolean {
+  if (!(cause instanceof ControlError) || cause.code !== "COMMAND_FAILED") return false;
+  const stderr = typeof cause.details.stderr === "string" ? cause.details.stderr : "";
+  return /(?:resource not accessible by personal access token|insufficient (?:oauth )?scope|required scope|requires .*\bproject\b.*scope)/i.test(stderr);
+}
+
+function rethrowProjectProbeFailure(cause: unknown): never {
+  if (isProvenProjectScopeFailure(cause)) {
+    throw new ControlError(
+      "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
+      "Narrow Project credential lacks a capability required by the private fixture",
+    );
+  }
+  if (cause instanceof ControlError) throw cause;
+  throw new ControlError("PREFLIGHT_PROJECT_INTEGRITY", "Project preflight fixture integrity could not be proven");
+}
+
 /** Live fail-closed probe for the intentionally split Project/Registry credentials. */
 export class PreflightService {
   private readonly today: () => string;
@@ -130,6 +154,7 @@ export class PreflightService {
     if (scopes.size !== 1) throw new ControlError("PROJECT_SCOPE_NOT_EXACT", "Project token must expose exactly project scope");
 
     await this.options.repository.verifyPrivateRepository(this.options.config.registryRepository);
+    await this.options.registry?.assertReady();
 
     const observedRoot = this.options.registryRoot
       ? await this.options.registryRoot()
@@ -210,6 +235,11 @@ export class PreflightService {
       "INVALID_PREFLIGHT_ISSUE",
     );
     this.sensitiveData.assertSafe(issue);
+    const expectedIssueUrl = `https://github.com/${this.options.config.registryRepository}/issues/${this.options.config.preflightRegistryIssueNumber}`;
+    if (
+      issue.number !== this.options.config.preflightRegistryIssueNumber ||
+      issue.html_url.toLowerCase() !== expectedIssueUrl.toLowerCase()
+    ) throw new ControlError("INVALID_PREFLIGHT_ISSUE", "Registry preflight Issue identity does not match configuration");
     const fixtureLabels = new Set(issue.labels.map((label) => label.name));
     if (!fixtureLabels.has("trial") || fixtureLabels.has("project-record")) {
       throw new ControlError("INVALID_PREFLIGHT_ISSUE", "The Registry preflight Issue must be trial-only");
@@ -221,39 +251,43 @@ export class PreflightService {
       attachedItemId = await this.options.project.addPreflightItem(issue.node_id);
       const contentId = await this.options.project.verifyItemContentId(this.options.config.preflightProjectItemId);
       if (attachedItemId !== this.options.config.preflightProjectItemId || contentId !== issue.node_id) {
-        throw new Error("fixture attach/source mismatch");
+        throw new ControlError("PREFLIGHT_PROJECT_INTEGRITY", "Project fixture attachment does not match its source Issue");
       }
-    } catch {
-      throw new ControlError(
-        "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
-        "Narrow Project credential could not idempotently attach and identify the private fixture Issue",
-      );
+    } catch (cause) {
+      rethrowProjectProbeFailure(cause);
     }
 
     let original: string | undefined;
     try {
       original = await this.options.project.readLastReviewed(this.options.config.preflightProjectItemId);
-    } catch {
-      throw new ControlError("PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE", "Project date fixture is unavailable to the narrow credential");
+    } catch (cause) {
+      rethrowProjectProbeFailure(cause);
     }
+    const probeDate = distinctProbeDate(original, this.today());
     let probeFailure: unknown;
     try {
       await this.options.project.writeLastReviewed(
         this.options.config.preflightProjectItemId,
-        distinctProbeDate(original, this.today()),
+        probeDate,
       );
+      if (await this.options.project.readLastReviewed(this.options.config.preflightProjectItemId) !== probeDate) {
+        throw new ControlError("PREFLIGHT_PROJECT_INTEGRITY", "Project date probe did not persist the requested value");
+      }
     } catch (cause) {
       probeFailure = cause;
     } finally {
       try {
         if (original === undefined) await this.options.project.clearLastReviewed(this.options.config.preflightProjectItemId);
         else await this.options.project.writeLastReviewed(this.options.config.preflightProjectItemId, original);
+        if (await this.options.project.readLastReviewed(this.options.config.preflightProjectItemId) !== original) {
+          throw new Error("restore readback mismatch");
+        }
       } catch {
         throw new ControlError("PREFLIGHT_RESTORE_FAILED", "Unable to restore the Project preflight fixture");
       }
     }
     if (probeFailure) {
-      throw new ControlError("PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE", "Project write probe failed with the narrow credential");
+      rethrowProjectProbeFailure(probeFailure);
     }
 
     const updated = parseJson(
@@ -264,7 +298,12 @@ export class PreflightService {
       "INVALID_PREFLIGHT_ISSUE",
     );
     this.sensitiveData.assertSafe(updated);
-    if (updated.node_id !== issue.node_id || updated.body !== issue.body) {
+    if (
+      updated.node_id !== issue.node_id ||
+      updated.number !== issue.number ||
+      updated.html_url.toLowerCase() !== issue.html_url.toLowerCase() ||
+      updated.body !== issue.body
+    ) {
       throw new ControlError("INVALID_PREFLIGHT_ISSUE", "Registry Issue unchanged-write verification failed");
     }
 

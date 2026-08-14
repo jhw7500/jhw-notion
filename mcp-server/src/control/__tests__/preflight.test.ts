@@ -5,6 +5,15 @@ import { ControlError } from "../errors.js";
 import { PreflightService, type PreflightProjectPort, type PreflightRunner } from "../preflight.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 
+const PREFLIGHT_ISSUE = {
+  node_id: "I_fixture",
+  number: 9,
+  html_url: "https://github.com/owner/registry/issues/9",
+  title: "trial",
+  body: "unchanged",
+  labels: [{ name: "trial", color: "ededed" }],
+};
+
 function config(): ControlConfig {
   return {
     registryDir: "/srv/registry",
@@ -44,13 +53,14 @@ class QueuedRunner implements PreflightRunner {
 }
 
 function projectPort(overrides: Partial<PreflightProjectPort> = {}): PreflightProjectPort {
+  let lastReviewed: string | undefined = "2026-08-12";
   return {
     verifyFields: async () => undefined,
     addPreflightItem: async () => "PVTI_trial",
     verifyItemContentId: async () => "I_fixture",
-    readLastReviewed: async () => "2026-08-12",
-    writeLastReviewed: async () => undefined,
-    clearLastReviewed: async () => undefined,
+    readLastReviewed: async () => lastReviewed,
+    writeLastReviewed: async (_itemId, date) => { lastReviewed = date; },
+    clearLastReviewed: async () => { lastReviewed = undefined; },
     ...overrides,
   };
 }
@@ -65,13 +75,14 @@ function service(input: {
   authority?: { observeCommittedLegacy(): Promise<void> };
   notion?: { verifyReadOnlyRoutes(): Promise<void> };
   repository?: { verifyPrivateRepository(slug: string): Promise<void> };
+  registry?: { assertReady(): Promise<void> };
   sensitiveData?: SensitiveDataPolicy;
 }) {
   const runner = input.runner ?? new QueuedRunner();
   runner.enqueueGh(
     { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
-    { stdout: `${JSON.stringify({ node_id: "I_fixture", title: "trial", body: "unchanged", labels: [{ name: "trial", color: "ededed" }] })}\n` },
-    { stdout: `${JSON.stringify({ node_id: "I_fixture", title: "trial", body: "unchanged", labels: [{ name: "trial", color: "ededed" }] })}\n` },
+    { stdout: `${JSON.stringify(PREFLIGHT_ISSUE)}\n` },
+    { stdout: `${JSON.stringify(PREFLIGHT_ISSUE)}\n` },
   );
   return {
     runner,
@@ -83,6 +94,7 @@ function service(input: {
       authority: input.authority ?? { observeCommittedLegacy: async () => undefined },
       notion: input.notion ?? { verifyReadOnlyRoutes: async () => undefined },
       repository: input.repository ?? { verifyPrivateRepository: async () => undefined },
+      registry: input.registry ?? { assertReady: async () => undefined },
       sensitiveData: input.sensitiveData,
       remoteUrl: async () => input.remoteUrl ?? "git@github.com:owner/registry.git",
       pushRemoteUrl: async () => input.pushRemoteUrl ?? input.remoteUrl ?? "git@github.com:owner/registry.git",
@@ -98,9 +110,7 @@ describe("PreflightService", () => {
     const runner = new QueuedRunner();
     runner.enqueueGh(
       { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
-      { stdout: `${JSON.stringify({
-        node_id: "I_fixture", title: "trial", body: `contains ${secret}`, labels: [{ name: "trial" }],
-      })}\n` },
+      { stdout: `${JSON.stringify({ ...PREFLIGHT_ISSUE, body: `contains ${secret}` })}\n` },
     );
     let projectCalls = 0;
     const project = projectPort({
@@ -173,6 +183,20 @@ describe("PreflightService", () => {
     await expect(preflight.run()).rejects.toMatchObject({ code });
   });
 
+  it.each([
+    ["an ignored Registry path", "REGISTRY_DIRTY"],
+    ["an assume-unchanged Registry index", "REGISTRY_INDEX_UNSAFE"],
+  ])("rejects %s through the shared readiness proof before trial mutation", async (_label, code) => {
+    let projectCalls = 0;
+    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const registry = { assertReady: async () => { throw new ControlError(code, "safe readiness failure"); } };
+    const { preflight, runner } = service({ project, registry });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code });
+    expect(projectCalls).toBe(0);
+    expect(runner.ghCalls).toHaveLength(1);
+  });
+
   it("requires committed legacy authority, read-only Notion guard routes, and a private Registry repository", async () => {
     const calls: string[] = [];
     const { preflight } = service({
@@ -192,9 +216,7 @@ describe("PreflightService", () => {
     runner.enqueueGh(
       { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
       { stdout: `${JSON.stringify({
-        node_id: "I_fixture",
-        title: "trial",
-        body: "unchanged",
+        ...PREFLIGHT_ISSUE,
         labels: [{ name: "trial" }, { name: "project-record" }],
       })}\n` },
     );
@@ -204,22 +226,32 @@ describe("PreflightService", () => {
     expect(runner.ghCalls).toHaveLength(2);
   });
 
+  it.each([
+    ["wrong issue number", { number: 10 }],
+    ["wrong issue URL", { html_url: "https://github.com/owner/other/issues/9" }],
+  ])("rejects %s before Project or Issue mutation", async (_label, override) => {
+    const runner = new QueuedRunner();
+    runner.enqueueGh(
+      { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
+      { stdout: `${JSON.stringify({ ...PREFLIGHT_ISSUE, ...override })}\n` },
+    );
+    let projectCalls = 0;
+    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+
+    await expect(service({ runner, project }).preflight.run()).rejects.toMatchObject({ code: "INVALID_PREFLIGHT_ISSUE" });
+    expect(projectCalls).toBe(0);
+    expect(runner.ghCalls).toHaveLength(2);
+  });
+
   it("rejects a REST label whose required name is blank", async () => {
     const runner = new QueuedRunner();
     runner.enqueueGh(
       { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
       { stdout: `${JSON.stringify({
-        node_id: "I_fixture",
-        title: "trial",
-        body: "unchanged",
+        ...PREFLIGHT_ISSUE,
         labels: [{ name: "trial", color: "ededed" }, { name: "", color: "ffffff" }],
       })}\n` },
-      { stdout: `${JSON.stringify({
-        node_id: "I_fixture",
-        title: "trial",
-        body: "unchanged",
-        labels: [{ name: "trial", color: "ededed" }],
-      })}\n` },
+      { stdout: `${JSON.stringify(PREFLIGHT_ISSUE)}\n` },
     );
     const { preflight } = service({ runner });
 
@@ -232,7 +264,9 @@ describe("PreflightService", () => {
     const project = projectPort({
       writeLastReviewed: async (_itemId, date) => {
         writes.push(date);
-        if (date === "2026-08-13") throw new ControlError("COMMAND_FAILED", "private content inaccessible");
+        if (date === "2026-08-13") throw new ControlError("COMMAND_FAILED", "command failed", {
+          stderr: "GraphQL: Resource not accessible by personal access token",
+        });
       },
     });
     const { preflight } = service({ project });
@@ -244,7 +278,38 @@ describe("PreflightService", () => {
   it("fails closed when the project-only credential sees no immutable content ID", async () => {
     const { preflight } = service({ project: projectPort({ verifyItemContentId: async () => undefined }) });
 
-    await expect(preflight.run()).rejects.toMatchObject({ code: "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE" });
+    await expect(preflight.run()).rejects.toMatchObject({ code: "PREFLIGHT_PROJECT_INTEGRITY" });
+  });
+
+  it("preserves Project transport failures instead of misclassifying them as scope", async () => {
+    const project = projectPort({
+      addPreflightItem: async () => { throw new ControlError("COMMAND_TIMEOUT", "bounded transport timeout"); },
+    });
+
+    await expect(service({ project }).preflight.run()).rejects.toMatchObject({ code: "COMMAND_TIMEOUT" });
+  });
+
+  it("rejects a no-op Last Reviewed probe after reading the field back", async () => {
+    const writes: string[] = [];
+    const project = projectPort({
+      readLastReviewed: async () => "2026-08-12",
+      writeLastReviewed: async (_itemId, date) => { writes.push(date); },
+    });
+
+    await expect(service({ project }).preflight.run()).rejects.toMatchObject({ code: "PREFLIGHT_PROJECT_INTEGRITY" });
+    expect(writes).toEqual(["2026-08-13", "2026-08-12"]);
+  });
+
+  it("rejects a no-op restore after reading the original field back", async () => {
+    let current = "2026-08-12";
+    const project = projectPort({
+      readLastReviewed: async () => current,
+      writeLastReviewed: async (_itemId, date) => {
+        if (date !== "2026-08-12") current = date;
+      },
+    });
+
+    await expect(service({ project }).preflight.run()).rejects.toMatchObject({ code: "PREFLIGHT_RESTORE_FAILED" });
   });
 
   it("proves issue read/unchanged write and SSH fetch/non-mutating dry-run push", async () => {

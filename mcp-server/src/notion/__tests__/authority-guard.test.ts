@@ -49,7 +49,7 @@ describe("Notion authority target resolution", () => {
       dataSources,
     } as any);
 
-    expect(databases.retrieve).toHaveBeenCalledTimes(Object.keys(DATABASE_SCHEMAS).length);
+    expect(databases.retrieve).toHaveBeenCalledTimes(Object.keys(DATABASE_SCHEMAS).length * 2);
     expect(dataSources.retrieve).toHaveBeenCalledTimes(Object.keys(DATABASE_SCHEMAS).length);
   });
 
@@ -91,7 +91,7 @@ describe("Notion authority target resolution", () => {
     expect(notion.pages.retrieve).toHaveBeenCalledWith({ page_id: "page-id" });
   });
 
-  it("maps current data_source_id parents with or without database_id", async () => {
+  it("maps current data_source_id parents only with the required containing database_id", async () => {
     const withDatabase = notionReturning({
       type: "data_source_id",
       data_source_id: DATABASE_SCHEMAS.decisionLog.dataSourceId,
@@ -113,11 +113,79 @@ describe("Notion authority target resolution", () => {
     });
 
     await expect(resolveTargetDatabase("decision", withDatabase as any)).resolves.toBe("decisionLog");
-    await expect(resolveTargetDatabase("knowledge", dataSourceOnly as any)).resolves.toBe("knowledgeBase");
+    await expect(resolveTargetDatabase("knowledge", dataSourceOnly as any)).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
+    });
     await expect(resolveTargetDatabase("stale-database", staleDatabaseShape as any)).rejects.toMatchObject({
       code: "AUTHORITY_UNAVAILABLE",
     });
     await expect(resolveTargetDatabase("matching-known", matchingKnownIds as any)).resolves.toBe("projects");
+  });
+
+  it("rejects a data source whose database_parent conflicts with the retrieved containing database", async () => {
+    const unknownDataSource = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const notion = {
+      pages: {
+        retrieve: vi.fn(async ({ page_id }: { page_id: string }) => ({
+          object: "page",
+          id: page_id,
+          parent: {
+            type: "data_source_id",
+            data_source_id: unknownDataSource,
+            database_id: NOTION_CONFIG.databases.knowledgeBase,
+          },
+        })),
+      },
+      dataSources: {
+        retrieve: vi.fn(async ({ data_source_id }: { data_source_id: string }) => ({
+          object: "data_source",
+          id: data_source_id,
+          parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase },
+          database_parent: { type: "workspace", workspace: true },
+        })),
+      },
+      databases: {
+        retrieve: vi.fn(async ({ database_id }: { database_id: string }) => ({
+          object: "database",
+          id: database_id,
+          parent: { type: "page_id", page_id: PARENT },
+        })),
+      },
+    };
+
+    await expect(resolveTargetDatabase(TARGET, notion as any)).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
+    });
+  });
+
+  it("fails preflight route proof when database_parent conflicts with the containing database", async () => {
+    const notion = {
+      pages: { retrieve: vi.fn() },
+      databases: {
+        retrieve: vi.fn(async ({ database_id }: { database_id: string }) => ({
+          object: "database",
+          id: database_id,
+          parent: { type: "page_id", page_id: PARENT },
+        })),
+      },
+      dataSources: {
+        retrieve: vi.fn(async ({ data_source_id }: { data_source_id: string }) => ({
+          object: "data_source",
+          id: data_source_id,
+          parent: {
+            type: "database_id",
+            database_id: Object.values(DATABASE_SCHEMAS).find(
+              (candidate) => candidate.dataSourceId.replaceAll("-", "") === data_source_id.replaceAll("-", ""),
+            )?.id,
+          },
+          database_parent: { type: "workspace", workspace: true },
+        })),
+      },
+    };
+
+    await expect(verifyConfiguredNotionAuthorityRoutes(notion as any)).rejects.toMatchObject({
+      code: "NOTION_GUARD_INDETERMINATE",
+    });
   });
 
   it.each([
@@ -180,10 +248,22 @@ describe("Notion authority target resolution", () => {
     const allowed = {
       pages: {
         retrieve: vi.fn(async ({ page_id }: { page_id: string }) => ({
-          object: "page", id: page_id, parent: { type: "data_source_id", data_source_id: unknownDataSource },
+          object: "page",
+          id: page_id,
+          parent: {
+            type: "data_source_id",
+            data_source_id: unknownDataSource,
+            database_id: NOTION_CONFIG.databases.knowledgeBase,
+          },
         })),
       },
-      databases: { retrieve: vi.fn() },
+      databases: {
+        retrieve: vi.fn(async ({ database_id }: { database_id: string }) => ({
+          object: "database",
+          id: database_id,
+          parent: { type: "workspace", workspace: true },
+        })),
+      },
       dataSources: {
         retrieve: vi.fn(async ({ data_source_id }: { data_source_id: string }) => ({
           object: "data_source", id: data_source_id,

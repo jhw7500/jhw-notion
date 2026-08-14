@@ -7,7 +7,12 @@ import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createAuthorityService, createDefaultAuthorityService, loadAuthorityPolicy } from "../authority.js";
+import {
+  assertPhase1ACommittedLegacy,
+  createAuthorityService,
+  createDefaultAuthorityService,
+  loadAuthorityPolicy,
+} from "../authority.js";
 import type { AuthorityRecord } from "../schemas.js";
 import { assertTargetWriteAllowed } from "../../notion/authority-guard.js";
 
@@ -51,6 +56,13 @@ afterEach(async () => {
 });
 
 describe("Notion authority service", () => {
+  it.each([0, 2, 999])("rejects central authority epoch %s for the Phase 1A live policy", (authorityEpoch) => {
+    expect(() => assertPhase1ACommittedLegacy(
+      { ...authority(1, "legacy"), authority_epoch: authorityEpoch } as AuthorityRecord,
+      { authority_epoch: authorityEpoch, mode: "legacy", source: "central" },
+    )).toThrow(expect.objectContaining({ code: "AUTHORITY_POLICY_NOT_LEGACY" }));
+  });
+
   it.each([
     ["legacy cutover", { authority_epoch: 1, mode: "legacy", cutover_at: "2026-08-20T00:00:00Z", minimum_tool_version: "1.0.0" }],
     ["registry without cutover", { authority_epoch: 2, mode: "registry", cutover_at: null, minimum_tool_version: "1.0.0" }],
@@ -650,6 +662,25 @@ describe("Notion authority service", () => {
 
     await expect(service.assertNotionWriteAllowed("projects", "jhw_start")).rejects.toMatchObject({
       code: "AUTHORITY_MOVED",
+    });
+  });
+
+  it("rejects a configured Registry subdirectory even when it contains another committed authority path", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(7, "registry"));
+    const nestedRegistry = join(registryDir, "nested");
+    await mkdir(join(nestedRegistry, "governance"), { recursive: true });
+    await writeFile(join(nestedRegistry, "governance", "authority.yaml"), `${JSON.stringify(authority(8, "legacy"))}\n`);
+    execFileSync("git", ["-C", registryDir, "add", "--all"]);
+    execFileSync("git", ["-C", registryDir, "commit", "-m", "Nested authority decoy"]);
+    const service = createDefaultAuthorityService({
+      HOME: root,
+      JHW_REGISTRY_DIR: nestedRegistry,
+      JHW_CONTROL_STATE_DIR: join(root, "nested-registry-state"),
+    });
+
+    await expect(service.assertNotionWriteAllowed("projects", "jhw_start")).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
     });
   });
 

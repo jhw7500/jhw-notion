@@ -38,6 +38,43 @@ function pageKey(pageId: string): string {
   return normalizeId(trimmed) ?? trimmed.toLowerCase();
 }
 
+function canonicalContainerParent(value: unknown): string | null {
+  if (typeof value !== "object" || value === null) return null;
+  const parent = value as { type?: unknown; database_id?: unknown; page_id?: unknown; workspace?: unknown };
+  if (parent.type === "workspace" && parent.workspace === true) return "workspace";
+  if (parent.type === "page_id") {
+    const id = normalizeId(parent.page_id);
+    return id ? `page:${id}` : null;
+  }
+  if (parent.type === "database_id") {
+    const id = normalizeId(parent.database_id);
+    return id ? `database:${id}` : null;
+  }
+  return null;
+}
+
+async function assertDataSourceDatabaseParent(
+  databaseId: string,
+  databaseParent: unknown,
+  notion: Pick<Client, "databases">,
+): Promise<void> {
+  const expectedParent = canonicalContainerParent(databaseParent);
+  if (!expectedParent) throw targetResolutionUnavailable();
+  let object: unknown;
+  try {
+    object = await notion.databases.retrieve({ database_id: databaseId });
+  } catch {
+    throw targetResolutionUnavailable();
+  }
+  if (typeof object !== "object" || object === null) throw targetResolutionUnavailable();
+  const database = object as { id?: unknown; object?: unknown; parent?: unknown };
+  if (
+    database.object !== "database" ||
+    normalizeId(database.id) !== databaseId ||
+    canonicalContainerParent(database.parent) !== expectedParent
+  ) throw targetResolutionUnavailable();
+}
+
 async function resolveAuthorityNode(
   initial: AuthorityNode,
   notion: Pick<Client, "pages" | "databases" | "dataSources">,
@@ -63,19 +100,6 @@ async function resolveAuthorityNode(
     const record = object as { id?: unknown; object?: unknown; parent?: unknown; database_parent?: unknown };
     if (typeof record.id !== "string" || pageKey(record.id) !== pageKey(current.id)) throw targetResolutionUnavailable();
     if (record.object !== undefined && record.object !== current.kind) throw targetResolutionUnavailable();
-    if (current.kind === "data_source") {
-      const databaseParent = record.database_parent as {
-        type?: unknown;
-        database_id?: unknown;
-        page_id?: unknown;
-        workspace?: unknown;
-      } | undefined;
-      if (!databaseParent || (
-        !(databaseParent.type === "database_id" && normalizeId(databaseParent.database_id)) &&
-        !(databaseParent.type === "page_id" && normalizeId(databaseParent.page_id)) &&
-        !(databaseParent.type === "workspace" && databaseParent.workspace === true)
-      )) throw targetResolutionUnavailable();
-    }
     const parent = record.parent;
     if (typeof parent !== "object" || parent === null) throw targetResolutionUnavailable();
     const typed = parent as {
@@ -90,14 +114,17 @@ async function resolveAuthorityNode(
       const databaseId = normalizeId(typed.database_id);
       const dataSourceId = normalizeId(typed.data_source_id);
       if (typed.type === "database_id" && !databaseId) throw targetResolutionUnavailable();
-      if (typed.type === "data_source_id" && !dataSourceId) throw targetResolutionUnavailable();
+      if (typed.type === "data_source_id" && (!dataSourceId || !databaseId)) throw targetResolutionUnavailable();
+      if (current.kind === "data_source") {
+        if (!databaseId || (current.expectedDatabaseId && current.expectedDatabaseId !== databaseId)) {
+          throw targetResolutionUnavailable();
+        }
+        await assertDataSourceDatabaseParent(databaseId, record.database_parent, notion);
+      }
       const database = databaseId ? databaseIds.get(databaseId) : undefined;
       const dataSourceDatabase = dataSourceId ? dataSourceIds.get(dataSourceId) : undefined;
       if (database && dataSourceDatabase && database !== dataSourceDatabase) throw targetResolutionUnavailable();
 
-      if (current.kind === "data_source" && current.expectedDatabaseId && databaseId && current.expectedDatabaseId !== databaseId) {
-        throw targetResolutionUnavailable();
-      }
       if (typed.type === "database_id") {
         if (dataSourceId && !dataSourceDatabase) {
           current = { kind: "data_source", id: dataSourceId, ...(databaseId ? { expectedDatabaseId: databaseId } : {}) };

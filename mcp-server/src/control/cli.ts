@@ -20,7 +20,7 @@ import { RegistryGit } from "./registry-git.js";
 import { createSensitiveDataPolicy } from "./sensitive-data.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
-import { createAuthorityService } from "./authority.js";
+import { assertPhase1ACommittedLegacy, createAuthorityService } from "./authority.js";
 import { getNotionClient } from "../notion-client.js";
 import { verifyConfiguredNotionAuthorityRoutes } from "../notion/authority-guard.js";
 import {
@@ -144,9 +144,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
         writesDisabled: env.JHW_NOTION_WRITES_DISABLED === "true",
       });
       const decision = await authority.load();
-      if (decision.source !== "central" || central.mode !== "legacy" || central.cutover_at !== null) {
-        throw new ControlError("AUTHORITY_POLICY_NOT_LEGACY", "Phase 1A requires committed legacy authority with no cutover");
-      }
+      assertPhase1ACommittedLegacy(central, decision);
     },
   };
   const notionProbe = {
@@ -197,6 +195,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
       authority: preflightAuthority,
       notion: notionProbe,
       repository: source,
+      registry,
       sensitiveData,
     }),
     mutationLock: new MutationLock(config, env),

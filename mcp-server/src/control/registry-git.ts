@@ -248,23 +248,7 @@ export class RegistryGit {
   }
 
   async transact(message: string, mutate: RegistryMutation): Promise<RegistryTransactionResult> {
-    await this.assertRemoteIdentity();
-    await this.assertVisibleIndex();
-    const initialStatus = await this.registryStatus();
-    if (initialStatus.length > 0) {
-      throw new ControlError("REGISTRY_DIRTY", "Registry checkout has pre-existing or ignored changes");
-    }
-
-    await this.git(["fetch", this.config.registryRemote, this.config.registryBranch]);
-    const initialHead = await this.revision("HEAD");
-    const initialRemoteHead = await this.revision(`${this.config.registryRemote}/${this.config.registryBranch}`);
-    if (initialHead !== initialRemoteHead) {
-      throw new ControlError("REMOTE_DIVERGED", "Registry checkout is not at the remote branch head", {
-        local: initialHead,
-        remote: initialRemoteHead,
-      });
-    }
-
+    const initialHead = await this.assertReady();
     const mutation = await mutate();
     const stagedPaths = [...mutation.paths];
     if (new Set(stagedPaths).size !== stagedPaths.length || stagedPaths.length > MAX_HEAD_DIRECTORY_ENTRIES) {
@@ -339,6 +323,28 @@ export class RegistryGit {
     }
 
     return { commit, changed: true };
+  }
+
+  /** Proves the exact mutation precondition without changing Registry state. */
+  async assertReady(): Promise<string> {
+    await this.assertRemoteIdentity();
+    await this.assertVisibleIndex();
+    const initialStatus = await this.registryStatus();
+    if (initialStatus.length > 0) {
+      throw new ControlError("REGISTRY_DIRTY", "Registry checkout has pre-existing or ignored changes");
+    }
+
+    await this.git(["fetch", this.config.registryRemote, this.config.registryBranch]);
+    const initialHead = await this.revision("HEAD");
+    const initialRemoteHead = await this.revision(`${this.config.registryRemote}/${this.config.registryBranch}`);
+    if (initialHead !== initialRemoteHead) {
+      throw new ControlError("REMOTE_DIVERGED", "Registry checkout is not at the remote branch head", {
+        local: initialHead,
+        remote: initialRemoteHead,
+      });
+    }
+
+    return initialHead;
   }
 
   private async assertRemoteIdentity(): Promise<void> {

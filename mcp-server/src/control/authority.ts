@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, fsync } from "node:fs";
-import { open, rename, unlink, type FileHandle } from "node:fs/promises";
+import { open, rename, stat, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, basename, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
@@ -42,6 +42,26 @@ interface AuthorityCache {
 export interface AuthorityService {
   load(): Promise<AuthorityDecision>;
   assertNotionWriteAllowed(db: DatabaseName, operation: string): Promise<void>;
+}
+
+/** Exact live policy for Phase 1A; later epochs/modes require an approved phase change. */
+export function assertPhase1ACommittedLegacy(
+  central: AuthorityRecord,
+  decision: AuthorityDecision,
+): void {
+  if (
+    central.authority_epoch !== 1 ||
+    central.mode !== "legacy" ||
+    central.cutover_at !== null ||
+    decision.authority_epoch !== 1 ||
+    decision.mode !== "legacy" ||
+    decision.source !== "central"
+  ) {
+    throw new ControlError(
+      "AUTHORITY_POLICY_NOT_LEGACY",
+      "Phase 1A requires committed legacy authority epoch 1 with no cutover",
+    );
+  }
 }
 
 export interface CreateAuthorityServiceOptions {
@@ -420,6 +440,16 @@ async function readCentralFromEnvironment(env: NodeJS.ProcessEnv): Promise<Autho
     }
     const runner = new ProcessRunner({ ...process.env, ...env });
     const cwd = `/proc/self/fd/${registry.fd}`;
+    const rootBytes = await runner.runRaw("git", ["rev-parse", "--show-toplevel"], { cwd }, 4_096);
+    const observedRoot = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(rootBytes).trim();
+    if (!isAbsolute(observedRoot) || /[\u0000-\u001f\u007f]/u.test(observedRoot)) throw authorityUnavailable();
+    const [configuredInfo, rootInfo] = await Promise.all([registry.stat(), stat(observedRoot)]);
+    if (
+      !configuredInfo.isDirectory() ||
+      !rootInfo.isDirectory() ||
+      configuredInfo.dev !== rootInfo.dev ||
+      configuredInfo.ino !== rootInfo.ino
+    ) throw authorityUnavailable();
     const selected = await runner.runRaw(
       "git",
       ["ls-tree", "-z", "HEAD", "--", CENTRAL_AUTHORITY_PATH],
