@@ -12,6 +12,7 @@ import type {
 import { ControlError } from "./errors.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
 import type { FormalTask, RepositoryRecord, TaskRecord, TemporaryTask } from "./schemas.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 const repoIdPattern = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const projectIdPattern = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
@@ -55,6 +56,7 @@ export interface GitHubSourceServiceOptions {
   runner: GitHubSourceRunner;
   catalog: SourceCatalogPort | Catalog;
   projects: ProjectMembershipPort;
+  sensitiveData?: SensitiveDataPolicy;
 }
 
 interface VerifiedIssue {
@@ -118,12 +120,17 @@ function issueCoordinates(issueUrl: string): { slug: string; number: number; can
 }
 
 export class GitHubSourceService {
-  constructor(private readonly options: GitHubSourceServiceOptions) {}
+  private readonly sensitiveData: SensitiveDataPolicy;
+
+  constructor(private readonly options: GitHubSourceServiceOptions) {
+    this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy();
+  }
 
   async registerRepository(input: { repo_id: string; slug: string; repository_path: string }): Promise<RepositoryRegistration> {
     if (!repoIdPattern.test(input.repo_id) || !slugPattern.test(input.slug)) {
       throw new ControlError("INVALID_REPOSITORY", "Repository registration coordinates are invalid");
     }
+    this.sensitiveData.assertSafe({ repo_id: input.repo_id, slug: input.slug });
     await this.verifyCheckout(input.repository_path, input.slug);
     const resolved = await this.resolveRepository(input.slug);
     return this.options.catalog.registerRepository({
@@ -146,6 +153,8 @@ export class GitHubSourceService {
     expected_issue_node_id?: string;
     expected_issue_revision?: string;
   }): Promise<FormalTaskRegistration> {
+    const { repository_path: _repositoryPath, ...content } = input;
+    this.sensitiveData.assertSafe(content);
     const context = await this.requireContext(input.project_id, input.repo_id, input.repository_path);
     const issue = await this.resolveIssue(context.repository, input.issue_url);
     if (input.expected_issue_node_id !== undefined && input.expected_issue_node_id !== issue.issue_node_id) {
@@ -162,13 +171,15 @@ export class GitHubSourceService {
   }
 
   async registerTemporaryTask(input: RegisterTemporaryTaskInput & { repository_path: string }): Promise<TemporaryTask> {
-    await this.requireContext(input.project_id, input.repo_id, input.repository_path);
     const { repository_path: _repositoryPath, ...record } = input;
+    this.sensitiveData.assertSafe(record);
+    await this.requireContext(input.project_id, input.repo_id, input.repository_path);
     return this.options.catalog.registerTemporaryTask(record);
   }
 
   async prepareExistingTask(input: { task_id: string; repository_path: string }): Promise<ExistingTaskContext> {
     if (!taskIdPattern.test(input.task_id)) throw new ControlError("INVALID_TASK_ID", "Task ID is invalid");
+    this.sensitiveData.assertSafe({ task_id: input.task_id });
     let task = await this.options.catalog.getTask(input.task_id);
     const context = await this.requireContext(task.project_id, task.repo_id, input.repository_path);
     if (task.kind === "formal") {
@@ -203,6 +214,8 @@ export class GitHubSourceService {
     expected_issue_node_id?: string;
     expected_issue_revision?: string;
   }): Promise<FormalTask> {
+    const { repository_path: _repositoryPath, ...content } = input;
+    this.sensitiveData.assertSafe(content);
     const current = await this.options.catalog.getTask(input.task_id);
     const context = await this.requireContext(current.project_id, current.repo_id, input.repository_path);
     const issue = await this.resolveIssue(context.repository, input.issue_url);
@@ -224,6 +237,7 @@ export class GitHubSourceService {
       throw new ControlError("INVALID_TASK_SCOPE", "Task Project/Repository coordinates are invalid");
     }
     const repository = await this.options.catalog.getRepository(repoId);
+    this.sensitiveData.assertSafe(repository);
     await this.options.projects.requireProjectRepository(projectId, repoId);
     await this.verifyCheckout(repositoryPath, repository.slug);
     const actual = await this.resolveRepository(repository.slug);
@@ -260,6 +274,7 @@ export class GitHubSourceService {
       throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "GitHub repository slug does not match the request");
     }
     if (!resolved.private) throw new ControlError("REPOSITORY_NOT_PRIVATE", "Phase 1A requires a private GitHub repository");
+    this.sensitiveData.assertSafe(resolved);
     return resolved;
   }
 
@@ -276,11 +291,13 @@ export class GitHubSourceService {
     if (issue.pull_request !== undefined || issue.number !== requested.number || issue.html_url !== requested.canonicalUrl) {
       throw new ControlError("ISSUE_IDENTITY_MISMATCH", "GitHub Issue coordinates disagree with the request");
     }
-    return {
+    const verified = {
       issue_node_id: issue.node_id,
       issue_revision: issue.updated_at,
       issue_url: requested.canonicalUrl,
       alias: `${repository.slug}#${issue.number}`,
     };
+    this.sensitiveData.assertSafe(verified);
+    return verified;
   }
 }

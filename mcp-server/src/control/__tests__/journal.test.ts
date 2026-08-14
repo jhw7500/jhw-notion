@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { PilotJournal } from "../journal.js";
+import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const roots: string[] = [];
 
@@ -24,6 +25,20 @@ function event() {
 }
 
 describe("PilotJournal", () => {
+  it("rejects protected event content before opening the journal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const secret = "unmistakably-fake-journal-token";
+    const journal = new PilotJournal(stateDir, {}, createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
+
+    const error = await journal.append({ ...event(), bypass_reason: `because ${secret}` }).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    await expect(lstat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("refuses a filesystem root rather than chmodding a shared ancestor", async () => {
     await expect(new PilotJournal("/").append(event())).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
   });

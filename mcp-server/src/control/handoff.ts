@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, sep } from "node:path";
 
 import { ControlError } from "./errors.js";
 import type { RegistryRecordStore } from "./codec.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 export const MAX_HANDOFF_BYTES = 12 * 1024;
 
@@ -71,7 +72,13 @@ function headerValue(value: string): string {
  * Builds a self-contained progress note.  Header metadata and exactly the six
  * permitted sections are retained even when caller-provided progress is huge.
  */
-export function buildHandoff(input: HandoffInput): string {
+export function buildHandoff(
+  input: HandoffInput,
+  sensitiveData: SensitiveDataPolicy = createSensitiveDataPolicy(),
+): string {
+  // Each section is independently truncated below. Scan them independently so
+  // six valid bounded inputs do not consume one another's scan allowance.
+  for (const value of Object.values(input)) sensitiveData.assertSafe(value);
   const header = [
     `# Handoff: ${headerValue(input.task_id)}`,
     `source_task_id: ${headerValue(input.task_id)}`,
@@ -249,7 +256,12 @@ async function writeRegularFile(path: string, content: string, code: string): Pr
 }
 
 /** Writes the host-local Handoff without following a `.ai` or file symlink. */
-export async function writeWorktreeHandoff(worktreePath: string, content: string): Promise<string> {
+export async function writeWorktreeHandoff(
+  worktreePath: string,
+  content: string,
+  sensitiveData: SensitiveDataPolicy = createSensitiveDataPolicy(process.env, [worktreePath]),
+): Promise<string> {
+  sensitiveData.assertSafe(content);
   const worktreeRoot = await rootDirectory(worktreePath, "UNSAFE_WORKTREE_PATH");
   const aiDirectory = await containedDirectory(worktreeRoot, ".ai", "UNSAFE_HANDOFF_PATH");
   const handoffPath = join(aiDirectory, "handoff.md");
@@ -267,7 +279,9 @@ export async function writeRegistryHandoff(
   claimId: string,
   content: string,
   committed?: string,
+  sensitiveData: SensitiveDataPolicy = createSensitiveDataPolicy(),
 ): Promise<{ path: string; changed: boolean }> {
+  sensitiveData.assertSafe(content);
   const relativePath = canonicalHandoffPath(taskId, claimId);
   if (committed !== undefined) {
     if (committed === content) return { path: relativePath, changed: false };

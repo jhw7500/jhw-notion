@@ -4,6 +4,7 @@ import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { MAX_HANDOFF_BYTES } from "./handoff.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 export interface RegistryMutationResult {
   /** Exact registry-relative paths that this mutation changed and must stage. */
@@ -52,6 +53,11 @@ export class RegistryGit {
   constructor(
     private readonly config: ControlConfig,
     private readonly runner: ProcessRunnerLike,
+    private readonly sensitiveData: SensitiveDataPolicy = createSensitiveDataPolicy(process.env, [
+      config.registryDir,
+      config.stateDir,
+      config.worktreeRoot,
+    ]),
   ) {}
 
   /**
@@ -160,9 +166,11 @@ export class RegistryGit {
   /** Reads a bounded, valid UTF-8 Handoff from a proven regular HEAD blob. */
   async readHeadRegularFile(relativePath: string): Promise<string> {
     try {
-      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await this.readHeadRegularBlob(relativePath));
+      const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await this.readHeadRegularBlob(relativePath));
+      this.sensitiveData.assertSafe(content);
+      return content;
     } catch (cause) {
-      if (cause instanceof ControlError && cause.code === "HANDOFF_MISSING") throw cause;
+      if (cause instanceof ControlError && (cause.code === "HANDOFF_MISSING" || cause.code.startsWith("SENSITIVE_"))) throw cause;
       throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD blob is not valid UTF-8", { relativePath });
     }
   }

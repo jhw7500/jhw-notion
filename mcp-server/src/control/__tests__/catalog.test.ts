@@ -7,6 +7,7 @@ import { Catalog } from "../catalog.js";
 import { sourceIndexKey } from "../ids.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
@@ -15,13 +16,13 @@ afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
 });
 
-async function catalogFixture(): Promise<{ fixture: RegistryFixture; catalog: Catalog }> {
+async function catalogFixture(sensitiveData?: SensitiveDataPolicy): Promise<{ fixture: RegistryFixture; catalog: Catalog }> {
   const fixture = await makeRegistryFixture();
   fixtures.push(fixture);
   const config = configFor(fixture.registryDir);
   return {
     fixture,
-    catalog: new Catalog(config, new RegistryGit(config, new ProcessRunner())),
+    catalog: new Catalog(config, new RegistryGit(config, new ProcessRunner()), sensitiveData),
   };
 }
 
@@ -41,6 +42,30 @@ const issueInput = {
 };
 
 describe("Catalog", () => {
+  it("rejects protected content before a Task record or commit is created", async () => {
+    const secret = "unmistakably-fake-catalog-token";
+    const { catalog, fixture } = await catalogFixture(createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
+    await catalog.registerRepository(repositoryInput);
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    const error = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: "wlan:tmp-20260813-01-fix",
+      goal: `do not persist ${secret}`,
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/roaming.ts"],
+    }).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+    expect(await readdir(join(fixture.registryDir, "tasks")).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT") return [];
+      throw cause;
+    })).toEqual([]);
+  });
+
   it("registers a Repository and its GitHub source index in one transaction", async () => {
     const { catalog, fixture } = await catalogFixture();
 

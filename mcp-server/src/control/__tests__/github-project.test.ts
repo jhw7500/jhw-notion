@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { GitHubProjectClient, type GitHubRunner } from "../github-project.js";
+import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000001";
 
@@ -105,6 +106,34 @@ function client(gh: QueuedGhRunner, catalog = catalogFixture()) {
 }
 
 describe("GitHubProjectClient", () => {
+  it("rejects protected registration content before any GitHub call", async () => {
+    const gh = new QueuedGhRunner();
+    const secret = "unmistakably-fake-project-token";
+    const github = new GitHubProjectClient({
+      githubOwner: "owner",
+      projectNumber: 7,
+      registryRepository: "owner/registry",
+      preflightProjectItemId: "PVTI_preflight",
+      runner: gh,
+      catalog: catalogFixture(),
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+
+    const error = await github.registerProject({
+      project_id: "prj-project-1",
+      title: "Project 1",
+      objective: `contains ${secret}`,
+      repo_ids: ["repo-control"],
+      fields: {
+        status: "active", priority: "P2", health: "blocked",
+        next_action: "wait:fixture", last_reviewed: "2026-08-13",
+      },
+    }).catch((cause) => cause);
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(gh.calls).toEqual([]);
+  });
+
   it("rejects a public Project before treating it as trial authority", async () => {
     const gh = new QueuedGhRunner();
     const page = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });

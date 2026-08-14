@@ -21,6 +21,7 @@ import {
 } from "./handoff.js";
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
 import type { ActiveClaim, ClaimHistory } from "./schemas.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import { worktreePlan, type WorktreeCreateResult, type WorktreeInspection, type WorktreeRemovalResult } from "./worktree.js";
 
 export interface ClaimServicePort {
@@ -260,6 +261,7 @@ function parseHandoffGitState(value: string, handoffPath: string): HandoffGitSta
  */
 export class TaskService {
   private readonly records: RegistryRecordStore;
+  private readonly sensitiveData: SensitiveDataPolicy;
 
   constructor(
     private readonly config: ControlConfig,
@@ -267,11 +269,20 @@ export class TaskService {
     private readonly worktrees: WorktreeManagerPort,
     private readonly registry: RegistryGitPort,
     private readonly now: () => Date = () => new Date(),
+    sensitiveData?: SensitiveDataPolicy,
   ) {
     this.records = new RegistryRecordStore(config.registryDir, registry);
+    this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [
+      config.registryDir,
+      config.stateDir,
+      config.worktreeRoot,
+    ]);
   }
 
   async start(input: TaskStartInput): Promise<TaskStartResult> {
+    const { repository_path: _repositoryPath, ...content } = input;
+    this.sensitiveData.assertSafe(content);
+    createSensitiveDataPolicy(process.env, [input.repository_path]).assertSafe(content);
     const plan = worktreePlan(input.task_id, input.task_alias);
     await this.worktrees.assertStartReady(input.task_id, input.task_alias);
     const claim = await this.claims.claimTask({
@@ -333,7 +344,9 @@ export class TaskService {
     const active = await this.assertOwner(taskId, claimId);
     const inspection = await this.worktrees.inspect(active);
     const { path: _path, ...worktree } = inspection;
-    return { active, worktree };
+    const result = { active, worktree };
+    this.sensitiveData.assertSafe(result);
+    return result;
   }
 
   async handoff(taskId: string, claimId?: string): Promise<TaskHandoffResult> {
@@ -360,7 +373,7 @@ export class TaskService {
     ) {
       throw new ControlError("REGISTRY_CORRUPT", "Committed Handoff metadata disagrees with Claim history");
     }
-    return {
+    const result = {
       handoff_pointer: expectedPath,
       task_id: metadata.task_id,
       claim_id: metadata.claim_id,
@@ -368,9 +381,12 @@ export class TaskService {
       generated_at: metadata.generated_at,
       sections: parseHandoffSections(content),
     };
+    this.sensitiveData.assertSafe(result);
+    return result;
   }
 
   async finish(input: TaskFinishInput): Promise<TaskFinishResult> {
+    this.sensitiveData.assertSafe(input);
     assertValidation(input.validation);
     const active = await this.assertOwner(input.task_id, input.claim_id);
     const inspection = await this.worktrees.inspect(active);
@@ -423,11 +439,13 @@ export class TaskService {
         handoff = this.buildRequestedHandoff(active, inspection, input, this.timestamp());
       }
 
-      await writeWorktreeHandoff(inspection.path, handoff);
+      await writeWorktreeHandoff(inspection.path, handoff, this.sensitiveData);
       // This transaction must complete (including push verification) before the
       // Claim release transaction; a failed release intentionally leaves this copy.
       await this.registry.transact(`registry: handoff ${active.claim_id}`, async () => {
-        const result = await writeRegistryHandoff(this.records, active.task_id, active.claim_id, handoff, committed);
+        const result = await writeRegistryHandoff(
+          this.records, active.task_id, active.claim_id, handoff, committed, this.sensitiveData,
+        );
         return { paths: result.changed ? [result.path] : [] };
       });
     }
@@ -462,6 +480,7 @@ export class TaskService {
   }
 
   async recover(input: TaskRecoverInput): Promise<TaskRecoveryResult> {
+    this.sensitiveData.assertSafe(input);
     if (input.action.kind === "cleanup") {
       const history = await this.claims.getClaimHistory(input.task_id, input.claim_id);
       const active = await this.claims.getActive(input.task_id);
@@ -571,7 +590,7 @@ export class TaskService {
       failures: input.failures,
       next_step: input.next_step,
       related_adr_and_evidence: input.related_adr_and_evidence,
-    });
+    }, this.sensitiveData);
   }
 
   private async committedHandoff(relativePath: string): Promise<string | undefined> {

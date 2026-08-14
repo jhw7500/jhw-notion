@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ZodType } from "zod";
 
@@ -16,6 +16,7 @@ import { MutationLock, ProcessRunner, type MutationLockPort } from "./process.js
 import { PortfolioService } from "./portfolio.js";
 import { PreflightService } from "./preflight.js";
 import { RegistryGit } from "./registry-git.js";
+import { createSensitiveDataPolicy } from "./sensitive-data.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
 import { createAuthorityService } from "./authority.js";
@@ -107,8 +108,9 @@ class ParsedCommandFailure extends Error {
 export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): CliDependencies {
   const config = loadControlConfig(env);
   const runner = new ProcessRunner(env);
-  const registry = new RegistryGit(config, runner);
-  const catalog = new Catalog(config, registry);
+  const sensitiveData = createSensitiveDataPolicy(env, [config.registryDir, config.stateDir, config.worktreeRoot]);
+  const registry = new RegistryGit(config, runner, sensitiveData);
+  const catalog = new Catalog(config, registry, sensitiveData);
   const githubProject = new GitHubProjectClient({
     githubOwner: config.githubOwner,
     projectNumber: config.projectNumber,
@@ -116,8 +118,9 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     preflightProjectItemId: config.preflightProjectItemId,
     runner,
     catalog,
+    sensitiveData,
   });
-  const source = new GitHubSourceService({ runner, catalog, projects: githubProject });
+  const source = new GitHubSourceService({ runner, catalog, projects: githubProject, sensitiveData });
   const records = new RegistryRecordStore(config.registryDir, registry);
   const readCommittedAuthority = async () => {
     try {
@@ -194,15 +197,15 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
         throw cause;
       }
     },
-  });
+  }, () => new Date(), sensitiveData);
   return {
     stateDir: config.stateDir,
     env,
-    taskService: new TaskService(config, claims, worktrees, registry),
+    taskService: new TaskService(config, claims, worktrees, registry, () => new Date(), sensitiveData),
     claimService: claims,
     catalog,
     source,
-    portfolio: new PortfolioService({ projectClient: githubProject, stateDir: config.stateDir }),
+    portfolio: new PortfolioService({ projectClient: githubProject, stateDir: config.stateDir, sensitiveData }),
     preflight: new PreflightService({
       config,
       environment: env,
@@ -211,6 +214,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
       authority: preflightAuthority,
       notion: notionProbe,
       repository: source,
+      sensitiveData,
     }),
     mutationLock: new MutationLock(config, env),
   };
@@ -265,6 +269,16 @@ function value(flags: ParsedFlags, flag: string): string | undefined {
 function values(flags: ParsedFlags, flag: string): string[] {
   const result = flags.get(flag);
   return result === undefined ? [] : Array.isArray(result) ? result : [result];
+}
+
+/** Rejects content flags while treating the checkout path only as a protected term. */
+function assertSafeFlags(flags: ParsedFlags, dependencies: CliDependencies): void {
+  const checkout = value(flags, "--repo-path");
+  const policy = createSensitiveDataPolicy(dependencies.env, [
+    dependencies.stateDir,
+    ...(checkout && isAbsolute(checkout) ? [checkout] : []),
+  ]);
+  policy.assertSafe(Object.fromEntries([...flags].filter(([name]) => name !== "--repo-path")));
 }
 
 function required(flags: ParsedFlags, flag: string): string {
@@ -407,6 +421,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
 
   if (command === "repository register") {
     const flags = parseFlags(argv.slice(2), new Set(["--repo-id", "--slug", "--repo-path"]));
+    assertSafeFlags(flags, dependencies);
     const repo_id = assertPattern(required(flags, "--repo-id"), REPO_ID);
     const slug = required(flags, "--slug");
     const repository_path = required(flags, "--repo-path");
@@ -428,6 +443,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       "--project", "--repo-id", "--repo-path", "--issue-node-id", "--issue-url", "--issue-revision",
       "--temp-alias", "--goal", "--done", "--scope", "--session",
     ]), new Set(["--done", "--scope"]));
+    assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
     const session_id = required(flags, "--session");
@@ -530,6 +546,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const flags = parseFlags(argv.slice(2), new Set([
       "--task", "--repo-path", "--issue-url", "--issue-node-id", "--issue-revision",
     ]));
+    assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
     const promoted = await dependencies.source.promoteTemporaryTask({
@@ -544,6 +561,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
 
   if (command === "task status") {
     const flags = parseFlags(argv.slice(2), new Set(["--task", "--claim"]));
+    assertSafeFlags(flags, dependencies);
     const task_id = requireTaskId(flags);
     const requestedClaim = value(flags, "--claim");
     const claim_id = requestedClaim ? assertPattern(requestedClaim, CLAIM_ID) : (await dependencies.claimService.getActive(task_id))?.claim_id;
@@ -567,6 +585,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
 
   if (command === "task handoff") {
     const flags = parseFlags(argv.slice(2), new Set(["--task", "--claim"]));
+    assertSafeFlags(flags, dependencies);
     const taskId = requireTaskId(flags);
     const claim = value(flags, "--claim");
     const handoff = await dependencies.taskService.handoff(
@@ -581,6 +600,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       "--task", "--claim", "--status", "--validation", "--outcome", "--source-task-revision",
       "--progress", "--failures", "--next-step", "--related-adr-and-evidence", "--active-work-minutes",
     ]), new Set(["--validation"]));
+    assertSafeFlags(flags, dependencies);
     const task_id = requireTaskId(flags);
     const claim_id = requireClaimId(flags);
     const status = required(flags, "--status");
@@ -626,6 +646,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
 
   if (command === "task recover") {
     const flags = parseFlags(argv.slice(2), new Set(["--task", "--expect", "--action", "--session"]));
+    assertSafeFlags(flags, dependencies);
     const task_id = requireTaskId(flags);
     const claim_id = requireClaimId(flags, "--expect");
     const actionName = required(flags, "--action");
@@ -663,12 +684,14 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
 
   if (command === "task assert-owner") {
     const flags = parseFlags(argv.slice(2), new Set(["--task", "--claim"]));
+    assertSafeFlags(flags, dependencies);
     const active = await dependencies.taskService.assertOwner(requireTaskId(flags), requireClaimId(flags));
     return { flags, result: resultJson(command, { owned: true, claim: activeSummary(active) }) };
   }
 
   if (command === "portfolio status") {
     const flags = parseFlags(argv.slice(2), new Set(["--project", "--page"]));
+    assertSafeFlags(flags, dependencies);
     const project = value(flags, "--project");
     if (project) assertPattern(project, PROJECT_ID);
     const page = value(flags, "--page");
@@ -687,6 +710,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
 
   if (command === "portfolio export") {
     const flags = parseFlags(argv.slice(2), new Set());
+    assertSafeFlags(flags, dependencies);
     const exported = validatedPortResult(
       SnapshotExportResultSchema,
       await dependencies.portfolio.exportSnapshot(),
@@ -700,6 +724,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       "--project", "--title", "--objective", "--repo-id", "--status", "--priority", "--health",
       "--next-action", "--last-reviewed",
     ]), new Set(["--repo-id"]));
+    assertSafeFlags(flags, dependencies);
     const parsedInput = RegisterProjectInputSchema.safeParse({
       project_id: required(flags, "--project"),
       title: required(flags, "--title"),
@@ -727,6 +752,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
 
   if (command === "preflight") {
     const flags = parseFlags(argv.slice(1), new Set());
+    assertSafeFlags(flags, dependencies);
     const preflight = validatedPortResult(PreflightResultSchema, await dependencies.preflight.run(), "INVALID_PREFLIGHT_RESULT");
     return { flags, result: resultJson(command, preflight) };
   }

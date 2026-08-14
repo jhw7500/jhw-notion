@@ -4,6 +4,7 @@ import type { ProcessResult, ProcessRunOptions } from "./process.js";
 import type { PreflightResult } from "./schemas.js";
 import { z } from "zod";
 import { githubSlugFromRemote } from "./github-source.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 export interface PreflightRunner {
   runGh(args: string[], credential: "project" | "repo", options?: ProcessRunOptions): Promise<ProcessResult>;
@@ -39,6 +40,7 @@ export interface PreflightServiceOptions {
   authority: PreflightAuthorityPort;
   notion: PreflightNotionPort;
   repository: PreflightRepositoryPort;
+  sensitiveData?: SensitiveDataPolicy;
   remoteUrl?: () => Promise<string>;
   today?: () => string;
 }
@@ -98,9 +100,15 @@ function distinctProbeDate(original: string | undefined, proposed: string): stri
 /** Live fail-closed probe for the intentionally split Project/Registry credentials. */
 export class PreflightService {
   private readonly today: () => string;
+  private readonly sensitiveData: SensitiveDataPolicy;
 
   constructor(private readonly options: PreflightServiceOptions) {
     this.today = options.today ?? (() => new Date().toISOString().slice(0, 10));
+    this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy(options.environment, [
+      options.config.registryDir,
+      options.config.stateDir,
+      options.config.worktreeRoot,
+    ]);
   }
 
   async run(): Promise<PreflightResult> {
@@ -138,6 +146,7 @@ export class PreflightService {
       IssueResponseSchema,
       "INVALID_PREFLIGHT_ISSUE",
     );
+    this.sensitiveData.assertSafe(issue);
     const fixtureLabels = new Set(issue.labels.map((label) => label.name));
     if (!fixtureLabels.has("trial") || fixtureLabels.has("project-record")) {
       throw new ControlError("INVALID_PREFLIGHT_ISSUE", "The Registry preflight Issue must be trial-only");
@@ -191,6 +200,7 @@ export class PreflightService {
       IssueResponseSchema,
       "INVALID_PREFLIGHT_ISSUE",
     );
+    this.sensitiveData.assertSafe(updated);
     if (updated.node_id !== issue.node_id || updated.body !== issue.body) {
       throw new ControlError("INVALID_PREFLIGHT_ISSUE", "Registry Issue unchanged-write verification failed");
     }

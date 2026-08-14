@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { ControlError } from "./errors.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   ProjectOperationalFieldsSchema,
   ProjectRecordBodySchema,
@@ -254,6 +255,7 @@ export interface GitHubProjectClientOptions {
   runner: GitHubRunner;
   catalog: GitHubCatalogPort;
   now?: () => Date;
+  sensitiveData?: SensitiveDataPolicy;
 }
 
 interface ProjectStructure {
@@ -450,10 +452,12 @@ function operatingFields(node: ItemNode, structure: ProjectStructure): ProjectOp
 /** Strict personal-Project adapter with a repository-token join at immutable Issue node IDs. */
 export class GitHubProjectClient {
   private readonly now: () => Date;
+  private readonly sensitiveData: SensitiveDataPolicy;
   private preflightStructure?: ProjectStructure;
 
   constructor(private readonly options: GitHubProjectClientOptions) {
     this.now = options.now ?? (() => new Date());
+    this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy();
   }
 
   private assertSupportedOwner(): void {
@@ -550,6 +554,7 @@ export class GitHubProjectClient {
       "INVALID_ISSUE_RESPONSE",
     );
     const allIssues = pages.flat().filter((issue) => issue.pull_request === undefined);
+    this.sensitiveData.assertSafe(allIssues);
     if (
       new Set(allIssues.map((issue) => issue.node_id)).size !== allIssues.length ||
       new Set(allIssues.map((issue) => issue.number)).size !== allIssues.length
@@ -584,17 +589,20 @@ export class GitHubProjectClient {
   }
 
   private async readIssue(number: number): Promise<Issue> {
-    return jsonFrom(
+    const issue = jsonFrom(
       (await this.options.runner.runGh([
         "api", `repos/${this.options.registryRepository}/issues/${number}`, ...this.issueHeaders(),
       ], "repo")).stdout,
       IssueSchema,
       "INVALID_ISSUE_RESPONSE",
     );
+    this.sensitiveData.assertSafe(issue);
+    return issue;
   }
 
   private async createIssue(input: RegisterProjectInput): Promise<Issue> {
-    return jsonFrom(
+    this.sensitiveData.assertSafe(input);
+    const issue = jsonFrom(
       (await this.options.runner.runGh([
         "api", "--method", "POST", `repos/${this.options.registryRepository}/issues`,
         ...this.issueHeaders(),
@@ -606,6 +614,8 @@ export class GitHubProjectClient {
       IssueSchema,
       "INVALID_ISSUE_RESPONSE",
     );
+    this.sensitiveData.assertSafe(issue);
+    return issue;
   }
 
   private verifyIssue(issue: Issue, expected: RegisterProjectInput, expectedNodeId?: string): void {
@@ -701,6 +711,7 @@ export class GitHubProjectClient {
       total_count: output.length,
     });
     if (!source.success) throw new ControlError("INVALID_PROJECT_SOURCE", "Project snapshot source failed validation");
+    this.sensitiveData.assertSafe(source.data);
     return source.data;
   }
 
@@ -731,6 +742,7 @@ export class GitHubProjectClient {
   async registerProject(rawInput: RegisterProjectInput): Promise<ProjectRecordLink> {
     const input = RegisterProjectInputSchema.safeParse(rawInput);
     if (!input.success) throw new ControlError("INVALID_PROJECT_REGISTRATION", "Project registration input is invalid");
+    this.sensitiveData.assertSafe(input.data);
     validateActiveNextAction(input.data.fields);
     await Promise.all(input.data.repo_ids.map((repoId) => this.options.catalog.getRepository(repoId)));
     const nextTask = taskId(input.data.fields);

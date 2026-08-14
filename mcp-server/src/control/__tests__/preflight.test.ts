@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { ControlConfig } from "../config.js";
 import { ControlError } from "../errors.js";
 import { PreflightService, type PreflightProjectPort, type PreflightRunner } from "../preflight.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 
 function config(): ControlConfig {
   return {
@@ -62,6 +63,7 @@ function service(input: {
   authority?: { observeCommittedLegacy(): Promise<void> };
   notion?: { verifyReadOnlyRoutes(): Promise<void> };
   repository?: { verifyPrivateRepository(slug: string): Promise<void> };
+  sensitiveData?: SensitiveDataPolicy;
 }) {
   const runner = input.runner ?? new QueuedRunner();
   runner.enqueueGh(
@@ -79,6 +81,7 @@ function service(input: {
       authority: input.authority ?? { observeCommittedLegacy: async () => undefined },
       notion: input.notion ?? { verifyReadOnlyRoutes: async () => undefined },
       repository: input.repository ?? { verifyPrivateRepository: async () => undefined },
+      sensitiveData: input.sensitiveData,
       remoteUrl: async () => input.remoteUrl ?? "git@github.com:owner/registry.git",
       today: () => "2026-08-13",
     }),
@@ -86,6 +89,33 @@ function service(input: {
 }
 
 describe("PreflightService", () => {
+  it("rejects protected Registry Issue content before an unchanged write or Project mutation", async () => {
+    const secret = "unmistakably-fake-preflight-token";
+    const runner = new QueuedRunner();
+    runner.enqueueGh(
+      { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
+      { stdout: `${JSON.stringify({
+        node_id: "I_fixture", title: "trial", body: `contains ${secret}`, labels: [{ name: "trial" }],
+      })}\n` },
+    );
+    let projectCalls = 0;
+    const project = projectPort({
+      verifyFields: async () => { projectCalls += 1; },
+      addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; },
+    });
+    const { preflight } = service({
+      runner,
+      project,
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+
+    const error = await preflight.run().catch((cause) => cause);
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(projectCalls).toBe(0);
+    expect(runner.ghCalls).toHaveLength(2);
+  });
+
   it.each([
     [{ GH_PROJECT_TOKEN: "same", GH_REPO_TOKEN: "same" }, "CREDENTIALS_NOT_SEPARATE"],
     [{ GH_PROJECT_TOKEN: "only" }, "MISSING_CREDENTIAL"],

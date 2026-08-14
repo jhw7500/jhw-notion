@@ -8,6 +8,7 @@ import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { newClaimId } from "./ids.js";
 import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   ActiveClaimSchema,
   ClaimHistorySchema,
@@ -152,16 +153,26 @@ function stage(paths: string[]): RegistryMutationResult {
 
 /** Ownership-safe active Claim lifecycle backed by the canonical Registry. */
 export class ClaimService {
+  private readonly sensitiveData: SensitiveDataPolicy;
+
   constructor(
     private readonly config: ControlConfig,
     private readonly registry: RegistryGit,
     private readonly catalog: Catalog,
     private readonly inspection: ClaimInspection,
     private readonly now: () => Date = () => new Date(),
-  ) {}
+    sensitiveData?: SensitiveDataPolicy,
+  ) {
+    this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [
+      config.registryDir,
+      config.stateDir,
+      config.worktreeRoot,
+    ]);
+  }
 
   async claimTask(rawInput: ClaimTaskInput): Promise<ActiveClaim> {
     const input = parse(ClaimTaskInputSchema, rawInput, "INVALID_CLAIM", "Invalid Claim input");
+    this.sensitiveData.assertSafe(input);
     await this.assertActivePathComponents(input.task_id);
     const sourceTaskRevision = await this.catalog.getTaskSourceRevision(input.task_id);
     let claimed: ActiveClaim | undefined;
@@ -211,6 +222,7 @@ export class ClaimService {
     assertTaskId(taskId);
     assertClaimId(expectedClaimId);
     const outcome = parse(FinishOutcomeSchema, rawOutcome, "INVALID_FINISH_OUTCOME", "Invalid Claim finish outcome");
+    this.sensitiveData.assertSafe(outcome);
     this.assertHandoffPath(outcome.handoff_path, taskId, expectedClaimId);
     await this.assertActivePathComponents(taskId);
     const releasedAt = this.timestamp();
@@ -244,6 +256,7 @@ export class ClaimService {
     assertTaskId(taskId);
     assertClaimId(expectedClaimId);
     const action = parse(RecoveryActionSchema, rawAction, "INVALID_RECOVERY_ACTION", "Invalid Claim recovery action");
+    this.sensitiveData.assertSafe(action);
 
     if (action.kind === "status") return this.recoveryStatus(taskId, expectedClaimId);
     if (action.kind === "force-end") return this.forceEnd(taskId, expectedClaimId);
@@ -506,8 +519,10 @@ export class ClaimService {
             released_year: releasedYear,
           });
         }
+        this.sensitiveData.assertSafe(candidate);
         candidates.push(candidate);
       } catch (cause) {
+        if (cause instanceof ControlError && cause.code.startsWith("SENSITIVE_")) throw cause;
         if (cause instanceof ControlError && cause.code === "REGISTRY_CORRUPT") throw cause;
         throw corruption("Claim takeover history is invalid", {
           task_id: taskId,
@@ -550,6 +565,7 @@ export class ClaimService {
     }
     if (!active) return undefined;
     this.assertActiveMatchesTask(active, task, recordPath);
+    this.sensitiveData.assertSafe(active);
     return active;
   }
 

@@ -4,6 +4,7 @@ import { mkdir, open, readdir, rename, unlink, type FileHandle } from "node:fs/p
 
 import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   type ProjectRecordLink,
   type RegisterProjectInput,
@@ -44,6 +45,7 @@ export interface PortfolioServiceOptions {
   projectClient: ProjectSnapshotReader;
   stateDir: string;
   now?: () => Date;
+  sensitiveData?: SensitiveDataPolicy;
   /** Test-only synchronization point after writes and before disk validation. */
   beforeSnapshotValidation?(snapshotDirectory: string): Promise<void> | void;
 }
@@ -324,13 +326,16 @@ async function updateCurrentPointer(snapshotsFd: number, directoryName: string):
 /** Bounded live portfolio reader and one-way private snapshot exporter. */
 export class PortfolioService {
   private readonly now: () => Date;
+  private readonly sensitiveData: SensitiveDataPolicy;
 
   constructor(private readonly options: PortfolioServiceOptions) {
     this.now = options.now ?? (() => new Date());
+    this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy(process.env, [options.stateDir]);
   }
 
   async status(projectId?: string, pageId?: string): Promise<BoundedPayload> {
     const source = parseSource(await this.options.projectClient.readAll());
+    this.sensitiveData.assertSafe(source);
     const items = projectId ? source.items.filter((item) => item.project_id === projectId) : source.items;
     const pages = boundedPages(items);
     const requested = pageId ?? "page-1";
@@ -343,6 +348,7 @@ export class PortfolioService {
   }
 
   async registerProject(input: RegisterProjectInput): Promise<ProjectRecordLink> {
+    this.sensitiveData.assertSafe(input);
     if (!this.options.projectClient.registerProject) {
       throw new ControlError("PROJECT_REGISTRATION_UNAVAILABLE", "Project snapshot reader does not support registration");
     }
@@ -351,6 +357,7 @@ export class PortfolioService {
 
   async exportSnapshot(): Promise<SnapshotExportResult> {
     const source = parseSource(await this.options.projectClient.readAll());
+    this.sensitiveData.assertSafe(source);
     const { generatedAt, directoryName } = safeGeneratedDirectory(this.now());
     const payloadWithoutChecksum = {
       schema_version: 1,
@@ -364,6 +371,7 @@ export class PortfolioService {
     const checksum = createHash("sha256").update(JSON.stringify(payloadWithoutChecksum)).digest("hex");
     const json = `${JSON.stringify({ ...payloadWithoutChecksum, checksum })}\n`;
     const pages = markdownPages(source.items);
+    this.sensitiveData.assertSafe([json, pages]);
 
     let state: SecureStateDirectory | undefined;
     let snapshots: DirectoryAnchor | undefined;

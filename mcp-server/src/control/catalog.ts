@@ -7,6 +7,7 @@ import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { newTaskId, sourceIndexKey } from "./ids.js";
 import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   FormalTaskSchema,
   RepositoryRecordSchema,
@@ -146,16 +147,24 @@ function assertRepositoryId(repoId: string): void {
 /** Canonical Registry catalog with source-index collision protection. */
 export class Catalog {
   readonly records: RegistryRecordStore;
+  private readonly sensitiveData: SensitiveDataPolicy;
 
   constructor(
     private readonly config: ControlConfig,
     private readonly registry: RegistryGit,
+    sensitiveData?: SensitiveDataPolicy,
   ) {
     this.records = new RegistryRecordStore(config.registryDir, registry);
+    this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [
+      config.registryDir,
+      config.stateDir,
+      config.worktreeRoot,
+    ]);
   }
 
   async registerRepository(rawInput: RegisterRepositoryInput): Promise<RepositoryRegistration> {
     const input = parseInput(RegisterRepositoryInputSchema, rawInput, "INVALID_REPOSITORY");
+    this.sensitiveData.assertSafe(input);
     let registration: RepositoryRegistration | undefined;
     await this.registry.transact(`registry: register repository ${input.repo_id}`, async () => {
       const sourcePath = repositorySourceRelativePath(input.github_node_id);
@@ -221,6 +230,7 @@ export class Catalog {
 
   async registerFormalTask(rawInput: RegisterFormalTaskInput): Promise<FormalTaskRegistration> {
     const input = parseInput(RegisterFormalTaskInputSchema, rawInput, "INVALID_FORMAL_TASK");
+    this.sensitiveData.assertSafe(input);
     let registration: FormalTaskRegistration | undefined;
     await this.registry.transact(`registry: register formal task ${input.alias}`, async () => {
       await this.requireRepository(input.repo_id);
@@ -282,6 +292,7 @@ export class Catalog {
 
   async registerTemporaryTask(rawInput: RegisterTemporaryTaskInput): Promise<TemporaryTask> {
     const input = parseInput(RegisterTemporaryTaskInputSchema, rawInput, "INVALID_TEMPORARY_TASK");
+    this.sensitiveData.assertSafe(input);
     let task: TemporaryTask | undefined;
     await this.registry.transact(`registry: register temporary task ${input.alias}`, async () => {
       await this.requireRepository(input.repo_id);
@@ -329,6 +340,7 @@ export class Catalog {
   async promoteTemporaryTask(taskId: string, rawInput: RegisterFormalTaskInput): Promise<FormalTask> {
     assertTaskId(taskId);
     const input = parseInput(RegisterFormalTaskInputSchema, rawInput, "INVALID_FORMAL_TASK");
+    this.sensitiveData.assertSafe(input);
     let promoted: FormalTask | undefined;
     await this.registry.transact(`registry: promote temporary task ${taskId}`, async () => {
       await this.requireRepository(input.repo_id);
@@ -423,6 +435,7 @@ export class Catalog {
     assertRepositoryId(repoId);
     const repository = await this.repositoryAt(repoId);
     if (!repository) throw new ControlError("REPOSITORY_NOT_FOUND", "Canonical Repository record does not exist", { repo_id: repoId });
+    if (repository) this.sensitiveData.assertSafe(repository);
     return repository;
   }
 
@@ -587,6 +600,7 @@ export class Catalog {
         actualRecordId: task.id,
       });
     }
+    this.sensitiveData.assertSafe(task);
     return task;
   }
 }

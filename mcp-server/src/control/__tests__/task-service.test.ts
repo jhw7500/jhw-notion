@@ -10,6 +10,7 @@ import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { ControlError } from "../errors.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { TaskService } from "../task-service.js";
 import { WorktreeManager, worktreePlan } from "../worktree.js";
 import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
@@ -49,7 +50,7 @@ afterEach(async () => {
   await Promise.all(localPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-async function taskFixture(): Promise<{
+async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
   tasks: TaskService;
   claims: {
     claimTask: ReturnType<typeof vi.fn>;
@@ -146,7 +147,10 @@ async function taskFixture(): Promise<{
     }),
   };
   return {
-    tasks: new TaskService(configFor(fixture.registryDir), claims, worktrees, registry, () => new Date("2026-08-13T12:36:56.789Z")),
+    tasks: new TaskService(
+      configFor(fixture.registryDir), claims, worktrees, registry,
+      () => new Date("2026-08-13T12:36:56.789Z"), sensitiveData,
+    ),
     claims,
     worktrees,
     registry,
@@ -156,6 +160,36 @@ async function taskFixture(): Promise<{
 }
 
 describe("TaskService", () => {
+  it("rejects protected finish content before reading or mutating Claim/worktree state", async () => {
+    const secret = "unmistakably-fake-task-token";
+    const { tasks, claims, worktrees } = await taskFixture(createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
+
+    const error = await tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      progress: `contains ${secret}`,
+      validation: ["targeted tests pass"],
+    }).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(claims.assertOwner).not.toHaveBeenCalled();
+    expect(worktrees.inspect).not.toHaveBeenCalled();
+  });
+
+  it("rejects protected content at the standalone Handoff builder boundary", () => {
+    const secret = "unmistakably-fake-handoff-token";
+    const policy = createSensitiveDataPolicy({ FAKE_API_TOKEN: secret });
+    expect(() => buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: "revision-1",
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:34:56.789Z",
+      progress: secret,
+    }, policy)).toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
+  });
+
   it("checks local cleanup readiness before creating Registry ownership", async () => {
     const { tasks, claims, worktrees } = await taskFixture();
 

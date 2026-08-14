@@ -7,6 +7,7 @@ import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
@@ -22,7 +23,7 @@ afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
 });
 
-async function claimsFixture(now: () => Date = () => fixedNow): Promise<{
+async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: SensitiveDataPolicy): Promise<{
   fixture: RegistryFixture;
   claims: ClaimService;
   task: Awaited<ReturnType<Catalog["registerTemporaryTask"]>>;
@@ -43,7 +44,7 @@ async function claimsFixture(now: () => Date = () => fixedNow): Promise<{
   });
   return {
     fixture,
-    claims: new ClaimService(config, registry, catalog, inspection, now),
+    claims: new ClaimService(config, registry, catalog, inspection, now, sensitiveData),
     task,
   };
 }
@@ -121,6 +122,21 @@ async function replaceActiveWithExternalSymlink(
 }
 
 describe("ClaimService", () => {
+  it("rejects protected Claim content before creating active ownership", async () => {
+    const secret = "unmistakably-fake-claim-token";
+    const { claims, fixture, task } = await claimsFixture(
+      () => fixedNow,
+      createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    );
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    const error = await claims.claimTask(claimInput(task.id, { session_id: secret })).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+  });
+
   it("creates the normal absent active-Claim directory inside the Registry", async () => {
     const { claims, fixture, task } = await claimsFixture();
     const path = join(fixture.registryDir, "claims", "active", `${task.id}.yaml`);

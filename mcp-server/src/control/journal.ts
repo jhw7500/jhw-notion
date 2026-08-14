@@ -3,6 +3,7 @@ import { lstat, mkdir, open, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 import { ControlError } from "./errors.js";
+import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 const MAX_JOURNAL_LINE_BYTES = 4096;
 const JOURNAL_FILE = "pilot-journal.jsonl";
@@ -141,12 +142,18 @@ export async function openSecureStateDirectory(
  * command metadata, never argument values or host-local paths.
  */
 export class PilotJournal implements JournalPort {
+  private readonly sensitiveData: SensitiveDataPolicy;
+
   constructor(
     private readonly stateDir: string,
     private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
-  ) {}
+    sensitiveData?: SensitiveDataPolicy,
+  ) {
+    this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [stateDir]);
+  }
 
   async append(event: JournalEvent): Promise<void> {
+    this.sensitiveData.assertSafe(event);
     const line = `${JSON.stringify(event)}\n`;
     if (Buffer.byteLength(line, "utf8") > MAX_JOURNAL_LINE_BYTES) {
       throw new ControlError("JOURNAL_EVENT_TOO_LARGE", "Pilot journal event exceeds the atomic append boundary");

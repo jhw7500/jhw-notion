@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
+import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const roots: string[] = [];
 
@@ -49,6 +50,26 @@ function source(count = 23): ProjectSnapshotSource {
 }
 
 describe("PortfolioService", () => {
+  it("rejects protected source fields before output or snapshot persistence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const secret = "unmistakably-fake-portfolio-token";
+    const protectedSource = source(1);
+    protectedSource.items[0] = { ...protectedSource.items[0]!, objective: `contains ${secret}` };
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => protectedSource },
+      stateDir,
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+
+    const statusError = await portfolio.status().catch((cause) => cause);
+    expect(statusError).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(statusError)).not.toContain(secret);
+    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    await expect(lstat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("caps portfolio markdown and CLI-safe payload at 12 KiB or 20 items and emits page IDs", async () => {
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source() },

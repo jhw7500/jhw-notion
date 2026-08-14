@@ -7,6 +7,7 @@ import { ControlError } from "../errors.js";
 import { MAX_HANDOFF_BYTES } from "../handoff.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit, type ProcessRunnerLike, type RegistryMutationResult } from "../registry-git.js";
+import { createSensitiveDataPolicy } from "../sensitive-data.js";
 import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
@@ -194,14 +195,20 @@ describe("RegistryGit", () => {
     await expect(registry.readHeadRegularFile("handoffs/regular.md")).resolves.toBe("# Durable handoff\nfirst\n");
   });
 
-  it("preserves a committed secret-valued substring because blob bytes bypass text redaction", async () => {
+  it("rejects a committed secret-valued substring before restoring blob text", async () => {
     const { registryDir } = await fixture();
     const secret = "registry-secret-value";
     await commitFile(registryDir, "handoffs/secret.md", `# Handoff\n${secret}\n`);
     await git(registryDir, "push", "origin", "main");
-    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner({ HIDDEN_TOKEN: secret }));
+    const registry = new RegistryGit(
+      configFor(registryDir),
+      new ProcessRunner({ HIDDEN_TOKEN: secret }),
+      createSensitiveDataPolicy({ HIDDEN_TOKEN: secret }),
+    );
 
-    await expect(registry.readHeadRegularFile("handoffs/secret.md")).resolves.toContain(secret);
+    const error = await registry.readHeadRegularFile("handoffs/secret.md").catch((cause) => cause);
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
   });
 
   it("rejects invalid UTF-8 committed blob bytes without exposing them", async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { GitHubSourceService } from "../github-source.js";
+import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const checkout = "/srv/jhw/source/wlan";
 const repository = { id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" };
@@ -52,6 +53,28 @@ function fixture(overrides: { remote?: string; private?: boolean; fullName?: str
 }
 
 describe("GitHubSourceService", () => {
+  it("rejects protected GitHub responses before Catalog mutation", async () => {
+    const secret = "unmistakably-fake-source-token";
+    const { catalog, projects, runner } = fixture();
+    runner.runGh.mockResolvedValueOnce({
+      command: "gh", args: [], stderr: "", exitCode: 0,
+      stdout: `${JSON.stringify({ node_id: secret, full_name: "jhw7500/wlan", private: true })}\n`,
+    });
+    const service = new GitHubSourceService({
+      runner,
+      catalog,
+      projects,
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+
+    const error = await service.registerRepository({
+      repo_id: "repo-wlan", slug: "jhw7500/wlan", repository_path: checkout,
+    }).catch((cause) => cause);
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(catalog.registerRepository).not.toHaveBeenCalled();
+  });
+
   it("derives the private Repository node ID after binding the exact checkout origin", async () => {
     const { service, catalog } = fixture();
 
