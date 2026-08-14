@@ -45,6 +45,15 @@ describe("SensitiveDataPolicy", () => {
       .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
   });
 
+  it.each([
+    "contains,file:///srv/private/source-checkout/file.ts",
+    "[file:///srv/private/source-checkout/file.ts]",
+    "x;file://localhost/srv/private/source-checkout/file.ts",
+  ])("rejects punctuation-framed file URI host path %s", (value) => {
+    expect(() => assertNoAbsoluteHostPaths(value))
+      .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
+  });
+
   it("redacts file URIs from direct ControlError metadata", () => {
     const error = new ControlError("SAFE_FAILURE", "failed file:///srv/private/source", {
       evidence: "file://localhost/srv/private/source/file.ts",

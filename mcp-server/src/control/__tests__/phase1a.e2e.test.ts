@@ -1528,7 +1528,11 @@ describe("Phase 1A deterministic adversarial gate", () => {
       preflightProjectItemId: "PVTI_trial", runner: projectRunner, catalog: graph.catalog,
       sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
     });
-    for (const objective of [`contains ${secret}`, `contains,${fixture.sourceRepo}/project-objective`]) {
+    for (const objective of [
+      `contains ${secret}`,
+      `contains,${fixture.sourceRepo}/project-objective`,
+      `contains,file://localhost${fixture.sourceRepo}/project-objective`,
+    ]) {
       await expect(project.registerProject({
         project_id: "prj-injected", title: "Rejected", objective,
         repo_ids: ["repo-control"],
