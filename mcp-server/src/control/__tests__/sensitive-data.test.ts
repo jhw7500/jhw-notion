@@ -52,4 +52,33 @@ describe("SensitiveDataPolicy", () => {
     expect(JSON.stringify(error)).not.toContain("file://");
     expect(error.message).not.toContain("file://");
   });
+
+  it.each([
+    "contains,/srv/private/source-checkout/file.ts",
+    "[/srv/private/source-checkout/file.ts]",
+    "x;/srv/private/source-checkout/file.ts",
+    "contains,C:\\private\\source-checkout\\file.ts",
+  ])("rejects punctuation-framed absolute host path %s", (value) => {
+    expect(() => assertNoAbsoluteHostPaths(value))
+      .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
+  });
+
+  it("preserves URL and repository-slug text that is not a host path", () => {
+    expect(() => assertNoAbsoluteHostPaths([
+      "https://github.com/owner/repository/issues/1",
+      "owner/repository#1",
+      "docs/project-control/runbook.md",
+    ])).not.toThrow();
+  });
+
+  it("redacts punctuation-framed host paths from direct ControlError metadata", () => {
+    const privatePath = "/srv/private/source-checkout/file.ts";
+    const error = new ControlError("SAFE_FAILURE", `failed,${privatePath}`, {
+      evidence: `[${privatePath}]`,
+      windows: "x;C:\\private\\source-checkout\\file.ts",
+    });
+    expect(error.message).not.toContain(privatePath);
+    expect(JSON.stringify(error)).not.toContain(privatePath);
+    expect(JSON.stringify(error)).not.toContain("C:\\private\\source-checkout");
+  });
 });

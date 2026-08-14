@@ -1528,11 +1528,13 @@ describe("Phase 1A deterministic adversarial gate", () => {
       preflightProjectItemId: "PVTI_trial", runner: projectRunner, catalog: graph.catalog,
       sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
     });
-    await expect(project.registerProject({
-      project_id: "prj-injected", title: "Rejected", objective: `contains ${secret}`,
-      repo_ids: ["repo-control"],
-      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:reject", last_reviewed: "2026-08-13" },
-    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    for (const objective of [`contains ${secret}`, `contains,${fixture.sourceRepo}/project-objective`]) {
+      await expect(project.registerProject({
+        project_id: "prj-injected", title: "Rejected", objective,
+        repo_ids: ["repo-control"],
+        fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:reject", last_reviewed: "2026-08-13" },
+      })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    }
     expect(projectRunner.calls).toEqual([]);
 
     const dependencies = cliDependencies(graph);

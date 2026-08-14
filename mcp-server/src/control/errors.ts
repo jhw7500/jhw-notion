@@ -1,6 +1,6 @@
 const sensitiveEnvironmentKey = /(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL)/i;
-const unixHostPath = /(^|[\s"'`(=:])(\/(?!\/)[^\s"'`<>|]+)/gu;
-const windowsHostPath = /(^|[\s"'`(=])([A-Za-z]:[\\/][^\s"'`<>|]+)/gu;
+const unixHostPath = /(^|[^A-Za-z0-9_./-])(\/(?!\/)[^\s"'`<>|]+)/gu;
+const windowsHostPath = /(^|[^A-Za-z0-9_./\\-])([A-Za-z]:[\\/][^\s"'`<>|]+)/gu;
 const fileUri = /file:\/\/[^\s"'`<>|]*/giu;
 const maximumErrorNodes = 2_000;
 

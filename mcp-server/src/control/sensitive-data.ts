@@ -58,8 +58,12 @@ function scanBounded(value: unknown, inspect: (candidate: string) => void): void
   scan(value);
 }
 
-const embeddedUnixPath = /(?:^|[\s"'`(=:])\/(?!\/)[^\s"'`<>|]+/u;
-const embeddedWindowsPath = /(?:^|[\s"'`(=])[A-Za-z]:[\\/][^\s"'`<>|]+/u;
+// A host path token may be framed by prose punctuation (`,/srv`, `[/srv]`,
+// `;C:\\private`) as well as whitespace.  Exclude only characters that can
+// legitimately continue a URL, repository slug, or relative path, and retain
+// the double-slash guard so `https://...` is not classified as a Unix path.
+const embeddedUnixPath = /(?:^|[^A-Za-z0-9_./-])\/(?!\/)[^\s"'`<>|]+/u;
+const embeddedWindowsPath = /(?:^|[^A-Za-z0-9_./\\-])[A-Za-z]:[\\/][^\s"'`<>|]+/u;
 const embeddedFileUri = /(?:^|[\s"'`(=])file:\/\//iu;
 
 /** Rejects host-absolute paths only at content boundaries, never operational path arguments. */
