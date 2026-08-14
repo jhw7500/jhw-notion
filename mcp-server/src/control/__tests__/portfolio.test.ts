@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile as execFileCallback } from "node:child_process";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -9,6 +11,7 @@ import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const roots: string[] = [];
+const execFile = promisify(execFileCallback);
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -250,6 +253,38 @@ describe("PortfolioService", () => {
     await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SNAPSHOT_VALIDATION_FAILED" });
     await expect(lstat(join(stateDir, "snapshots", "current"))).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("rejects a FIFO snapshot component without blocking its type check", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    let fifoPath = "";
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      beforeSnapshotValidation: async (snapshotDirectory) => {
+        fifoPath = join(await realpath(snapshotDirectory), "portfolio.json");
+        await unlink(fifoPath);
+        await execFile("mkfifo", [fifoPath]);
+      },
+    });
+    const pending = portfolio.exportSnapshot().catch((cause: unknown) => cause);
+    const hung = Symbol("hung");
+    const outcome = await Promise.race([
+      pending,
+      new Promise<typeof hung>((resolve) => setTimeout(() => resolve(hung), 100)),
+    ]);
+    if (outcome === hung) {
+      await Promise.all([
+        execFile("sh", ["-c", "printf x > \"$1\"", "sh", fifoPath]),
+        pending,
+      ]);
+    }
+
+    expect(outcome).not.toBe(hung);
+    expect(outcome).toMatchObject({ code: "SNAPSHOT_VALIDATION_FAILED" });
+  }, 1_000);
 
   it("recomputes the checksum from the actual on-disk portfolio JSON", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));

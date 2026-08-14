@@ -46,7 +46,7 @@ const CLAIM_ID = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0
 const PROJECT_ID = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const REPO_ID = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const MAX_CLI_OUTPUT_BYTES = 12 * 1024;
-const HANDOFF_RESULT_BUDGET = MAX_CLI_OUTPUT_BYTES - 256;
+const CLI_RESULT_BUDGET = MAX_CLI_OUTPUT_BYTES - 256;
 
 const commandNames = [
   "repository register",
@@ -339,7 +339,7 @@ function boundedHandoffResult(
   }));
   const fullSections = Object.fromEntries(entries);
   const full = render(fullSections, false);
-  if (Buffer.byteLength(full.stdout, "utf8") <= HANDOFF_RESULT_BUDGET) return full;
+  if (Buffer.byteLength(full.stdout, "utf8") <= CLI_RESULT_BUDGET) return full;
 
   let low = 0;
   let high = MAX_CLI_OUTPUT_BYTES;
@@ -348,7 +348,7 @@ function boundedHandoffResult(
     const scale = Math.floor((low + high) / 2);
     const sections = Object.fromEntries(entries.map(([name, value]) => [name, scaledSection(value, scale)]));
     const candidate = render(sections, true);
-    if (Buffer.byteLength(candidate.stdout, "utf8") <= HANDOFF_RESULT_BUDGET) {
+    if (Buffer.byteLength(candidate.stdout, "utf8") <= CLI_RESULT_BUDGET) {
       best = candidate;
       low = scale + 1;
     } else {
@@ -817,6 +817,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
     const execution = requiresMutationLock(argv)
       ? await dependencies.mutationLock.run(() => execute(command, argv, dependencies))
       : await execute(command, argv, dependencies);
+    if (Buffer.byteLength(execution.result.stdout || execution.result.stderr, "utf8") > CLI_RESULT_BUDGET) {
+      throw new ControlError("CLI_OUTPUT_TOO_LARGE", "A control command exceeded the bounded output envelope");
+    }
     result = execution.result;
     flags = execution.flags;
   } catch (cause) {
@@ -868,6 +871,7 @@ export function requiresMutationLock(argv: readonly string[]): boolean {
   if (argv[0] === "repository" && argv[1] === "register") return true;
   if (argv[0] === "task" && (argv[1] === "start" || argv[1] === "finish" || argv[1] === "promote")) return true;
   if (argv[0] === "project" && argv[1] === "register") return true;
+  if (argv[0] === "portfolio" && argv[1] === "export") return true;
   if (argv[0] !== "task" || argv[1] !== "recover") return false;
   const index = argv.indexOf("--action");
   return argv[index + 1] === "force-end" || argv[index + 1] === "takeover" || argv[index + 1] === "cleanup";

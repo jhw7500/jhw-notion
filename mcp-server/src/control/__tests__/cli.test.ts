@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { requiresMutationLock, runCli, type CliDependencies } from "../cli.js";
 import { ControlError } from "../errors.js";
+import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { MutationLock, type MutationLockRuntime } from "../process.js";
 import type { ControlConfig } from "../config.js";
 
@@ -230,6 +231,38 @@ function registerArgs(): string[] {
     "--next-action", "wait:select-first-task",
     "--last-reviewed", "2026-08-13",
   ];
+}
+
+function nearCliLimitPortfolioSource(): ProjectSnapshotSource {
+  const items = Array.from({ length: 23 }, (_, index) => ({
+    project_item_id: `PVTI_${index + 1}`,
+    source_node_id: `I_${index + 1}`,
+    project_id: `prj-project-${index + 1}`,
+    title: `Project ${index + 1}`,
+    objective: "x".repeat(487),
+    repo_ids: [REPO_ID],
+    fields: {
+      status: "active" as const,
+      priority: "P2" as const,
+      health: "on-track" as const,
+      next_action: "wait:fixture",
+      last_reviewed: "2026-08-13",
+    },
+    stale: false,
+  }));
+  return {
+    project_node_id: "PVT_project",
+    source_revision: "2026-08-13T00:00:00Z",
+    field_definitions: [
+      { id: "PVTF_status", name: "Status", data_type: "SINGLE_SELECT", options: [{ id: "status-active", name: "active" }] },
+      { id: "PVTF_priority", name: "Priority", data_type: "SINGLE_SELECT", options: [{ id: "priority-P2", name: "P2" }] },
+      { id: "PVTF_health", name: "Health", data_type: "SINGLE_SELECT", options: [{ id: "health-on-track", name: "on-track" }] },
+      { id: "PVTF_next", name: "Next Action", data_type: "TEXT" },
+      { id: "PVTF_reviewed", name: "Last Reviewed", data_type: "DATE" },
+    ],
+    items,
+    total_count: items.length,
+  };
 }
 
 describe("runCli", () => {
@@ -460,6 +493,23 @@ describe("runCli", () => {
     expect(`${result.stdout}${result.stderr}`).not.toContain("injected journal failure");
   });
 
+  it("reserves enough portfolio output for a journal-gap warning without crossing 12 KiB", async () => {
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => nearCliLimitPortfolioSource() },
+      stateDir: "/unused",
+    });
+    const dependencies = makeCliDependencies({
+      portfolio: { status: portfolio.status.bind(portfolio) },
+      journal: { append: vi.fn().mockRejectedValue(new Error("injected journal failure")) },
+    });
+
+    const result = await runCli(["portfolio", "status"], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ journal_warning: { code: "JOURNAL_WRITE_FAILED" } });
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+  });
+
   it("keeps the original command error when its derived journal append also fails", async () => {
     const dependencies = makeCliDependencies({
       taskService: { status: vi.fn().mockRejectedValue(new ControlError("CLAIM_MISMATCH", "untrusted detail")) },
@@ -540,10 +590,10 @@ describe("runCli", () => {
     expect(requiresMutationLock(["task", "status"])).toBe(false);
     expect(requiresMutationLock(["task", "recover", "--action", "status"])).toBe(false);
     expect(requiresMutationLock(["portfolio", "status"])).toBe(false);
-    expect(requiresMutationLock(["portfolio", "export"])).toBe(false);
+    expect(requiresMutationLock(["portfolio", "export"])).toBe(true);
   });
 
-  it("locks preflight exactly once while portfolio status/export remain lock-free", async () => {
+  it("locks preflight and portfolio export while portfolio status remains read-only", async () => {
     const mutationLock = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
     const dependencies = makeCliDependencies({ mutationLock });
 
@@ -554,7 +604,7 @@ describe("runCli", () => {
     expect(preflight.exitCode).toBe(0);
     expect(status.exitCode).toBe(0);
     expect(exported.exitCode).toBe(0);
-    expect(mutationLock.run).toHaveBeenCalledTimes(1);
+    expect(mutationLock.run).toHaveBeenCalledTimes(2);
   });
 
   it.each([
@@ -732,6 +782,25 @@ describe("runCli", () => {
       },
     });
     expect(result.stdout).not.toContain("Prove the trial flow");
+  });
+
+  it("rejects an oversized success envelope from a control port", async () => {
+    const dependencies = makeCliDependencies({
+      portfolio: {
+        registerProject: vi.fn().mockResolvedValue({
+          project_id: PROJECT_ID,
+          project_item_id: `PVTI_${"a".repeat(20_000)}`,
+          source_node_id: `I_${"b".repeat(20_000)}`,
+          issue_number: 1,
+        }),
+      },
+    });
+
+    const result = await runCli(registerArgs(), dependencies);
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "CLI_OUTPUT_TOO_LARGE" } });
+    expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
   });
 
   it.each([

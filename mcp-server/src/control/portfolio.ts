@@ -15,11 +15,13 @@ import {
 
 export type ProjectSnapshotSource = ValidProjectSnapshotSource;
 
-const MAX_PAYLOAD_BYTES = 12 * 1024;
+// Reserve a fixed envelope for the CLI's stable journal-gap marker. This keeps
+// an authoritative success successful even when its derived journal is down.
+const MAX_PAYLOAD_BYTES = 12 * 1024 - 256;
 const MAX_PAGE_ITEMS = 20;
 const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const createFileFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW;
-const readFileFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
+const readFileFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 export interface ProjectSnapshotReader {
   readAll(): Promise<ProjectSnapshotSource>;

@@ -1042,7 +1042,7 @@ export class WorktreeManager {
     let published: Awaited<ReturnType<typeof open>> | undefined;
     let directory: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      published = await open(statePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      published = await open(statePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const info = await published.stat();
       if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600) throw new Error("unsafe published state");
       const actual = await published.readFile("utf8");

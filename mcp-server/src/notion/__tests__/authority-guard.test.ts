@@ -293,11 +293,26 @@ describe("Notion authority target resolution", () => {
     await expect(resolveTargetDatabase(TARGET, base as any)).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
   });
 
+  it("rejects a retrieved response that omits its full-object discriminator", async () => {
+    const notion = {
+      pages: {
+        retrieve: vi.fn(async ({ page_id }: { page_id: string }) => ({
+          id: page_id,
+          parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects },
+        })),
+      },
+    };
+
+    await expect(resolveTargetDatabase(TARGET, notion as any)).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
+    });
+  });
+
   it("walks page ancestors to the owning configured database", async () => {
     const retrieve = vi.fn(async ({ page_id }: { page_id: string }) => {
-      if (page_id === TARGET) return { id: TARGET, parent: { type: "page_id", page_id: PARENT } };
+      if (page_id === TARGET) return { object: "page", id: TARGET, parent: { type: "page_id", page_id: PARENT } };
       if (page_id === PARENT) {
-        return { id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects } };
+        return { object: "page", id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects } };
       }
       throw new Error("unexpected page");
     });
@@ -308,8 +323,8 @@ describe("Notion authority target resolution", () => {
 
   it("allows a descendant of an allowed Knowledge Base record", async () => {
     const retrieve = vi.fn(async ({ page_id }: { page_id: string }) => page_id === TARGET
-      ? { id: TARGET, parent: { type: "page_id", page_id: PARENT } }
-      : { id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase } });
+      ? { object: "page", id: TARGET, parent: { type: "page_id", page_id: PARENT } }
+      : { object: "page", id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase } });
 
     await expect(resolveTargetDatabase(TARGET, { pages: { retrieve } } as any)).resolves.toBe("knowledgeBase");
   });

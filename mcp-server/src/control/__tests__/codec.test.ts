@@ -1,17 +1,10 @@
 import { expect, it } from "vitest";
-import { mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { ClaimHistorySchema, RepositoryRecordSchema } from "../schemas.js";
-import { readRecord, writeRecord } from "../codec.js";
+import * as codec from "../codec.js";
 
-it("round-trips deterministic JSON-subset YAML with a trailing newline", async () => {
-  const root = await mkdtemp(join(tmpdir(), "jhw-codec-"));
-  const file = join(root, "repositories", "repo-ab.yaml");
-  const value = { id: "repo-ab", github_node_id: "R_1", slug: "jhw/a" };
-  await writeRecord(file, value);
-  expect(await readFile(file, "utf8")).toBe(`${JSON.stringify(value, null, 2)}\n`);
-  expect(await readRecord(file, RepositoryRecordSchema)).toEqual(value);
+it("does not expose legacy path-based Registry persistence helpers", () => {
+  expect(codec).not.toHaveProperty("readRecord");
+  expect(codec).not.toHaveProperty("writeRecord");
 });
 
 it("rejects repository records without a canonical repo ID", () => {

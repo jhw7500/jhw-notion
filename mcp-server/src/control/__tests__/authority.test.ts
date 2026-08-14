@@ -69,6 +69,7 @@ describe("Notion authority service", () => {
     ["malformed cutover", { authority_epoch: 2, mode: "registry", cutover_at: "tomorrow", minimum_tool_version: "1.0.0" }],
     ["non-semver minimum", { authority_epoch: 1, mode: "legacy", cutover_at: null, minimum_tool_version: "latest" }],
     ["reserved epoch zero", { authority_epoch: 0, mode: "legacy", cutover_at: null, minimum_tool_version: "1.0.0" }],
+    ["unsafe numeric epoch", { authority_epoch: 1e100, mode: "legacy", cutover_at: null, minimum_tool_version: "1.0.0" }],
   ])("fails closed on inconsistent central authority: %s", async (_label, record) => {
     const { cachePath } = await temporaryCache();
     const service = createAuthorityService({
@@ -81,6 +82,18 @@ describe("Notion authority service", () => {
       code: "AUTHORITY_UNAVAILABLE",
     });
     await expect(readFile(cachePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fails closed on an unsafe numeric epoch restored from the authority cache", async () => {
+    const { cachePath } = await temporaryCache();
+    await writeFile(cachePath, `${JSON.stringify({ authority_epoch: 1e100, mode: "legacy" })}\n`, "utf8");
+    const service = createAuthorityService({
+      readCentral: async () => authority(1, "legacy"),
+      cachePath,
+      writesDisabled: false,
+    });
+
+    await expect(service.load()).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
   });
 
   it("rejects central authority requiring a newer control tool version", async () => {

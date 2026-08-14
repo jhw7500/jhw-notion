@@ -99,7 +99,7 @@ async function resolveAuthorityNode(
     if (typeof object !== "object" || object === null) throw targetResolutionUnavailable();
     const record = object as { id?: unknown; object?: unknown; parent?: unknown; database_parent?: unknown };
     if (typeof record.id !== "string" || pageKey(record.id) !== pageKey(current.id)) throw targetResolutionUnavailable();
-    if (record.object !== undefined && record.object !== current.kind) throw targetResolutionUnavailable();
+    if (record.object !== current.kind) throw targetResolutionUnavailable();
     const parent = record.parent;
     if (typeof parent !== "object" || parent === null) throw targetResolutionUnavailable();
     const typed = parent as {

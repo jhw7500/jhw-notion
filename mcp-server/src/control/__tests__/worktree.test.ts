@@ -1,5 +1,7 @@
-import { chmod, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { execFile as execFileCallback } from "node:child_process";
+import { chmod, mkdir, readFile, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -12,6 +14,7 @@ import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./hel
 const fixtures: RegistryFixture[] = [];
 const TASK_ID = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab";
+const execFile = promisify(execFileCallback);
 
 function claim(overrides: Record<string, string> = {}) {
   const plan = worktreePlan(TASK_ID, "wlan:tmp-20260813-01-fix");
@@ -117,6 +120,32 @@ describe("WorktreeManager", () => {
     await expect(manager.createOrReuse(claim(), repoDir)).rejects.toMatchObject({ code: "WORKTREE_STATE_WRITE_FAILED" });
     await expect(readFile(join(fixture.root, "state", "worktrees.json"), "utf8")).resolves.toBe("{}\n");
   });
+
+  it("rejects a FIFO published state without blocking its type check", async () => {
+    let fifoPath = "";
+    const { repoDir, manager } = await worktreeFixtureWithHooks({
+      afterPublish: async (statePath) => {
+        fifoPath = await realpath(statePath);
+        await unlink(fifoPath);
+        await execFile("mkfifo", [fifoPath]);
+      },
+    });
+    const pending = manager.createOrReuse(claim(), repoDir).catch((cause: unknown) => cause);
+    const hung = Symbol("hung");
+    const outcome = await Promise.race([
+      pending,
+      new Promise<typeof hung>((resolve) => setTimeout(() => resolve(hung), 100)),
+    ]);
+    if (outcome === hung) {
+      await Promise.all([
+        execFile("sh", ["-c", "printf x > \"$1\"", "sh", fifoPath]),
+        pending,
+      ]);
+    }
+
+    expect(outcome).not.toBe(hung);
+    expect(outcome).toMatchObject({ code: "WORKTREE_STATE_WRITE_FAILED" });
+  }, 1_000);
 
   it("rejects a published state when its post-rename directory sync fails", async () => {
     let reportedSaved = false;

@@ -14,7 +14,7 @@ import { CONTROL_TOOL_VERSION } from "./version.js";
 import { ProcessRunner } from "./process.js";
 
 const CACHE_SCHEMA = z.object({
-  authority_epoch: z.number().int().positive(),
+  authority_epoch: z.number().int().positive().safe(),
   mode: z.enum(["legacy", "registry"]),
 }).strict();
 const CACHE_FILE = "authority-cache.json";

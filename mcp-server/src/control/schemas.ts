@@ -22,7 +22,7 @@ const nextAction = z.string().max(165).refine(
 );
 
 const authorityBase = {
-  authority_epoch: z.number().int().positive(),
+  authority_epoch: z.number().int().positive().safe(),
   minimum_tool_version: z.string().max(64).regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/),
 };
 export const AuthorityRecordSchema = z.discriminatedUnion("mode", [
