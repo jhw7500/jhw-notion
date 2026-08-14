@@ -34,7 +34,7 @@ describe("control process boundary", () => {
 
   it("requires build-server coordinates but not tokens in config files", () => {
     const config = loadControlConfig({
-      HOME: "/home/jhw",
+      HOME: "/fixture/home",
       JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
       JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
       JHW_BUILD_HOST: "cantopsbuildserver",
@@ -102,7 +102,7 @@ describe("control process boundary", () => {
     ["JHW_WORKTREE_ROOT", "/"],
   ])("fails closed for invalid non-secret preflight coordinate %s", (key, value) => {
     const env = {
-      HOME: "/home/jhw",
+      HOME: "/fixture/home",
       JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
       JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
       JHW_BUILD_HOST: "cantopsbuildserver",
@@ -120,7 +120,7 @@ describe("control process boundary", () => {
   it("rejects incomplete build-server coordinates", () => {
     let error: unknown;
     try {
-      loadControlConfig({ HOME: "/home/jhw" });
+      loadControlConfig({ HOME: "/fixture/home" });
     } catch (cause) {
       error = cause;
     }
