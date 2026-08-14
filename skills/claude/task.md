@@ -102,6 +102,8 @@ jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
 
 Handoff는 Registry copy/history를 durable하게 만든 뒤 release하고 worktree를 유지한다. completed/abandoned의 local cleanup 실패는 이미 성공한 release를 되돌리지 않는다.
 
+Formal Task의 `--status completed`는 해당 Claim generation만 archive/release하며 GitHub Issue를 닫지 않는다. Formal lifecycle authority는 Issue의 open/closed 상태다. Issue가 open 또는 reopened이면 같은 Task ID를 검증해 새 Claim으로 재개할 수 있고, terminal 종료는 Issue authority에서 별도로 close한다.
+
 ## recovery
 
 활성 Claim은 status부터 읽는다.
@@ -141,5 +143,5 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
 - exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.
-- exit `75`: Registry dirty/diverged 또는 lock. stop; 자동 retry/rebase/force 금지.
+- exit `75`: Registry dirty/diverged 또는 lock contention/acquisition timeout. stop; 자동 retry/rebase/force 금지. Lock helper spawn/setup/acquire 실패는 일반 command `1`, preflight NO-GO `78`이다.
 - 다른 nonzero: stable `error.code`만 보고하고 secret/raw path를 출력하지 않는다.

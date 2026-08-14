@@ -93,7 +93,7 @@ Authority/Notion/repository prerequisite가 먼저 통과한 뒤에만 지정 pr
 | `0` | command가 성공했다. `journal_warning.code=JOURNAL_WRITE_FAILED`가 있어도 authoritative mutation은 이미 성공했으므로 **재시도하지 말고 measurement gap만 기록**한다. |
 | `2` | command/flag/ID가 잘못됐다. 인자만 수정한다. |
 | `4` | Claim conflict/mismatch/not found. immutable Claim 좌표를 다시 확인하고 자동 takeover하지 않는다. |
-| `75` | host lock 또는 Registry dirty/diverged/remote verification 실패. stop; rebase/reset/force/retry로 우회하지 않는다. |
+| `75` | host lock contention/acquisition timeout 또는 Registry dirty/diverged/remote verification 실패. stop; rebase/reset/force/retry로 우회하지 않는다. Lock helper spawn/setup/acquire 실패는 일반 command에서 `1`이고 preflight NO-GO에서는 `78`이다. |
 | `78` | authority/version/Notion guard/credential/scope/privacy/remote/preflight timeout NO-GO. operator가 원인을 수정한 뒤 live preflight부터 다시 실행한다. |
 | `1` | integrity, sensitive-data, worktree/snapshot/Handoff 등 fail-closed 오류. artifact와 stable `error.code`를 감사하고 복구한다. |
 
@@ -226,6 +226,8 @@ jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
 ```
 
 `handoff`는 durable Registry copy/history를 만들고 same-host worktree를 유지한다. `completed|abandoned` release 후 local cleanup 실패는 Claim을 되살리지 않는다. exact released Claim cleanup으로 복구한다.
+
+Formal Task에서 `--status completed`는 **그 Claim generation의 결과를 archive하고 release할 뿐** GitHub Issue를 닫거나 Task lifecycle을 완료하지 않는다. Formal lifecycle authority는 GitHub Issue의 open/closed 상태다. Issue가 open이거나 다시 열렸다면 같은 Task ID를 검증해 새 Claim으로 재개할 수 있고, terminal 종료가 필요하면 Issue authority에서 별도로 close한다.
 
 ### raw Git 공유 경계
 
