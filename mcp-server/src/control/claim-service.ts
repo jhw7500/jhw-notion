@@ -1,4 +1,4 @@
-import { lstat, realpath, stat, unlink } from "node:fs/promises";
+import { lstat, readdir, realpath, stat, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 
 import { z, type ZodType } from "zod";
@@ -22,6 +22,8 @@ const taskIdPattern = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{
 const claimIdPattern = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const projectIdPattern = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const repositoryIdPattern = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
+const historyYearDirectoryPattern = /^\d{4}$/;
+const maximumHistoryYearDirectories = 10_000;
 
 const ClaimTaskInputSchema = z.object({
   task_id: z.string().regex(taskIdPattern),
@@ -106,7 +108,7 @@ function activeRelativePath(taskId: string): string {
   return `claims/active/${taskId}.yaml`;
 }
 
-function historyRelativePath(year: number, taskId: string, claimId: string): string {
+function historyRelativePath(year: number | string, taskId: string, claimId: string): string {
   return `claims/history/${year}/${taskId}/${claimId}.yaml`;
 }
 
@@ -323,8 +325,21 @@ export class ClaimService {
     let replacement: ActiveClaim | undefined;
     await this.registry.transact(`registry: take over claim ${expectedClaimId}`, async () => {
       const task = await this.catalog.getTask(taskId);
-      const active = await this.requireOwner(task, expectedClaimId);
-      history = this.recoveryHistory(active, "taken-over", releasedAt);
+      const active = await this.readActive(task);
+      if (!active) {
+        throw new ControlError("CLAIM_NOT_FOUND", "Task does not have an active Claim", { task_id: task.id });
+      }
+      if (active.claim_id !== expectedClaimId) {
+        history = await this.requireLinkedTakeoverRetry(task, expectedClaimId, active, sessionId);
+        replacement = active;
+        return stage([]);
+      }
+      if (active.host !== this.config.buildHost) {
+        throw new ControlError("HOST_MISMATCH", "Claim takeover is allowed only on the recorded host", {
+          claim_host: active.host,
+          build_host: this.config.buildHost,
+        });
+      }
       const started = this.timestamp();
       replacement = parse(
         ActiveClaimSchema,
@@ -338,6 +353,13 @@ export class ClaimService {
         "INVALID_CLAIM",
         "Replacement Claim record failed validation",
       );
+      if (replacement.claim_id === expectedClaimId) {
+        throw corruption("Replacement Claim did not rotate its immutable generation", {
+          task_id: taskId,
+          claim_id: expectedClaimId,
+        });
+      }
+      history = this.takeoverHistory(active, releasedAt, replacement.claim_id);
       const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await writeRecord(destination, history);
       await this.assertActivePathComponents(taskId);
@@ -350,6 +372,157 @@ export class ClaimService {
     if (!history || !replacement) throw new Error("Claim takeover transaction did not produce both records");
     const verified = await this.assertOwner(taskId, replacement.claim_id);
     return { kind: "takeover", active: verified, history };
+  }
+
+  private async requireLinkedTakeoverRetry(
+    task: TaskRecord,
+    expectedClaimId: string,
+    active: ActiveClaim,
+    requestedSessionId: string,
+  ): Promise<ClaimHistory> {
+    if (active.host !== this.config.buildHost) {
+      throw new ControlError("HOST_MISMATCH", "Claim takeover retry is allowed only on the active Claim host", {
+        claim_host: active.host,
+        build_host: this.config.buildHost,
+      });
+    }
+    try {
+      await this.registry.assertHeadRegularFile(activeRelativePath(task.id));
+    } catch (cause) {
+      throw corruption("Active takeover successor is not a committed regular Registry record", {
+        task_id: task.id,
+        claim_id: active.claim_id,
+        cause: errorMessage(cause),
+      });
+    }
+    const candidates = await this.takeoverHistoryCandidates(task.id, expectedClaimId);
+    if (candidates.length === 0) {
+      throw new ControlError("CLAIM_MISMATCH", "Claim generation is not the directly linked takeover predecessor", {
+        task_id: task.id,
+        expected_claim_id: expectedClaimId,
+        actual_claim_id: active.claim_id,
+      });
+    }
+    if (candidates.length !== 1) {
+      throw corruption("Claim takeover history is ambiguous", {
+        task_id: task.id,
+        claim_id: expectedClaimId,
+        candidate_count: candidates.length,
+      });
+    }
+
+    const history = candidates[0];
+    if (
+      history.status !== "taken-over" ||
+      history.claim_id !== expectedClaimId ||
+      history.successor_claim_id !== active.claim_id ||
+      active.claim_id === expectedClaimId ||
+      active.session_id !== requestedSessionId
+    ) {
+      throw new ControlError("CLAIM_MISMATCH", "Claim generation is not the requested direct takeover predecessor", {
+        task_id: task.id,
+        expected_claim_id: expectedClaimId,
+        actual_claim_id: active.claim_id,
+      });
+    }
+    if (history.host !== this.config.buildHost) {
+      throw new ControlError("HOST_MISMATCH", "Claim takeover history belongs to another host", {
+        claim_host: history.host,
+        build_host: this.config.buildHost,
+      });
+    }
+    if (
+      history.task_id !== active.task_id ||
+      history.task_alias !== active.task_alias ||
+      history.project_id !== active.project_id ||
+      history.repo_id !== active.repo_id ||
+      history.branch !== active.branch ||
+      history.worktree_ref !== active.worktree_ref
+    ) {
+      throw corruption("Linked takeover Claim records disagree on canonical coordinates", {
+        task_id: task.id,
+        predecessor_claim_id: expectedClaimId,
+        successor_claim_id: active.claim_id,
+      });
+    }
+    return history;
+  }
+
+  private async takeoverHistoryCandidates(taskId: string, claimId: string): Promise<ClaimHistory[]> {
+    const historyRootRelative = "claims/history";
+    await this.assertRegistryPathComponents(historyRootRelative);
+    const historyRoot = join(this.config.registryDir, historyRootRelative);
+    let entries: Array<{ name: string; isDirectory(): boolean }>;
+    try {
+      entries = await readdir(historyRoot, { withFileTypes: true });
+    } catch (cause) {
+      if (isNotFound(cause)) return [];
+      throw corruption("Claim history years could not be inspected", { cause: errorMessage(cause) });
+    }
+    const years = entries
+      .filter((entry) => historyYearDirectoryPattern.test(entry.name))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    if (years.length > maximumHistoryYearDirectories) {
+      throw corruption("Claim history year lookup exceeded its deterministic bound", { year_count: years.length });
+    }
+
+    const candidates: ClaimHistory[] = [];
+    for (const year of years) {
+      if (!year.isDirectory()) {
+        throw corruption("Claim history year is not a regular directory", { year: year.name });
+      }
+      const relativePath = historyRelativePath(year.name, taskId, claimId);
+      await this.assertRegistryPathComponents(relativePath);
+      const path = join(this.config.registryDir, relativePath);
+      let entry: Awaited<ReturnType<typeof lstat>>;
+      try {
+        entry = await lstat(path);
+      } catch (cause) {
+        if (isNotFound(cause)) continue;
+        throw corruption("Claim takeover history could not be inspected", {
+          task_id: taskId,
+          claim_id: claimId,
+          cause: errorMessage(cause),
+        });
+      }
+      if (entry.isSymbolicLink() || !entry.isFile()) {
+        throw corruption("Claim takeover history is not a regular file", {
+          task_id: taskId,
+          claim_id: claimId,
+          year: year.name,
+        });
+      }
+      try {
+        await this.registry.assertHeadRegularFile(relativePath);
+        const candidate = await readRecord(path, ClaimHistorySchema);
+        if (candidate.task_id !== taskId || candidate.claim_id !== claimId) {
+          throw corruption("Claim takeover history path and record identity disagree", {
+            task_id: taskId,
+            claim_id: claimId,
+            year: year.name,
+          });
+        }
+        const releasedYear = String(this.historyYear(candidate.released_at)).padStart(4, "0");
+        if (year.name !== releasedYear) {
+          throw corruption("Claim takeover history is outside its released_at UTC year", {
+            task_id: taskId,
+            claim_id: claimId,
+            year: year.name,
+            released_year: releasedYear,
+          });
+        }
+        candidates.push(candidate);
+      } catch (cause) {
+        if (cause instanceof ControlError && cause.code === "REGISTRY_CORRUPT") throw cause;
+        throw corruption("Claim takeover history is invalid", {
+          task_id: taskId,
+          claim_id: claimId,
+          year: year.name,
+          cause: errorMessage(cause),
+        });
+      }
+    }
+    return candidates;
   }
 
   private async readActive(task: TaskRecord): Promise<ActiveClaim | undefined> {
@@ -563,7 +736,7 @@ export class ClaimService {
 
   private recoveryHistory(
     active: ActiveClaim,
-    status: "force-ended" | "taken-over",
+    status: "force-ended",
     releasedAt: string,
   ): ClaimHistory {
     return parse(
@@ -572,6 +745,20 @@ export class ClaimService {
         ...active,
         released_at: releasedAt,
         status,
+      },
+      "INVALID_CLAIM_HISTORY",
+      "Claim history record failed validation",
+    );
+  }
+
+  private takeoverHistory(active: ActiveClaim, releasedAt: string, successorClaimId: string): ClaimHistory {
+    return parse(
+      ClaimHistorySchema,
+      {
+        ...active,
+        released_at: releasedAt,
+        status: "taken-over",
+        successor_claim_id: successorClaimId,
       },
       "INVALID_CLAIM_HISTORY",
       "Claim history record failed validation",

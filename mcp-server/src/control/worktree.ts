@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import type { ActiveClaim } from "./schemas.js";
+import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory } from "./schemas.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
@@ -10,6 +10,7 @@ import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./pro
 const STATE_VERSION = 2;
 const canonicalTaskId = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const canonicalClaimId = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const canonicalGitObjectId = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const logicalRef = /^wt-[a-z0-9][a-z0-9-]{1,120}$/;
 
 export type WorktreeLifecycle = "pending-create" | "active" | "pending-remove" | "removed";
@@ -67,6 +68,10 @@ type WorktreeClaim = Pick<
   ActiveClaim,
   "task_id" | "task_alias" | "claim_id" | "session_id" | "host" | "branch" | "worktree_ref"
 >;
+
+export interface WorktreeTakeoverRebindResult {
+  changed: boolean;
+}
 
 interface WorktreeMapping {
   task_id: string;
@@ -164,12 +169,32 @@ function asMapping(value: unknown, ref: string): WorktreeMapping {
     "repository_identity",
     "path",
     "base_sha",
+    "lifecycle",
   ];
-  if (required.some((key) => typeof record[key] !== "string") || !isLifecycle(record.lifecycle)) {
+  if (
+    Object.keys(record).length !== required.length ||
+    required.some((key) => !(key in record)) ||
+    required.slice(0, -1).some((key) => typeof record[key] !== "string") ||
+    !isLifecycle(record.lifecycle)
+  ) {
     throw new ControlError("INVALID_WORKTREE_STATE", "Worktree mapping has invalid fields", { worktree_ref: ref });
   }
-  if (!isAbsolute(record.repository_path as string) || !isAbsolute(record.path as string)) {
+  if (
+    !canonicalTaskId.test(record.task_id as string) ||
+    !canonicalClaimId.test(record.claim_id as string) ||
+    !(record.session_id as string).trim() ||
+    !(record.host as string).trim() ||
+    !(record.branch as string).trim() ||
+    !isAbsolute(record.repository_path as string) ||
+    !isAbsolute(record.repository_identity as string) ||
+    !isAbsolute(record.path as string)
+  ) {
     throw new ControlError("INVALID_WORKTREE_STATE", "Worktree mapping must contain absolute host-local paths", {
+      worktree_ref: ref,
+    });
+  }
+  if (!canonicalGitObjectId.test(record.base_sha as string)) {
+    throw new ControlError("INVALID_WORKTREE_STATE", "Worktree mapping contains an invalid base Git object ID", {
       worktree_ref: ref,
     });
   }
@@ -287,6 +312,73 @@ export class WorktreeManager {
     const repository = await this.repositoryInfo(mapping.repository_path);
     this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
     return this.inspectMapped(mapping, claim, root);
+  }
+
+  async assertTakeoverEligible(previous: ActiveClaim): Promise<void> {
+    const parsed = ActiveClaimSchema.safeParse(previous);
+    if (!parsed.success) {
+      throw new ControlError("INVALID_CLAIM", "Takeover predecessor is not a canonical active Claim");
+    }
+    validateClaim(parsed.data);
+    this.assertLocalHost(parsed.data);
+    const state = await this.loadState();
+    const root = await this.worktreeRoot();
+    const mapping = await this.uniqueTakeoverMapping(state, parsed.data, root);
+    const repository = await this.repositoryInfo(mapping.repository_path);
+    this.assertTakeoverMapping(mapping, parsed.data, repository, root, "active");
+    await this.verifyWorktree(mapping.path, parsed.data.branch, repository.identity, root);
+  }
+
+  async rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<WorktreeTakeoverRebindResult> {
+    const predecessorResult = ClaimHistorySchema.safeParse(previous);
+    if (!predecessorResult.success || predecessorResult.data.status !== "taken-over") {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Takeover rebind requires canonical taken-over history");
+    }
+    const successorResult = ActiveClaimSchema.safeParse(successor);
+    if (!successorResult.success) {
+      throw new ControlError("INVALID_CLAIM", "Takeover successor is not a canonical active Claim");
+    }
+    if (!predecessorResult.data.task_alias) {
+      throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Takeover predecessor lacks its canonical Task alias");
+    }
+    const predecessor = {
+      ...predecessorResult.data,
+      task_alias: predecessorResult.data.task_alias,
+    };
+    const next = successorResult.data;
+    validateClaim(predecessor);
+    validateClaim(next);
+    this.assertLocalHost(predecessor);
+    this.assertLocalHost(next);
+    if (predecessor.claim_id === next.claim_id || predecessor.successor_claim_id !== next.claim_id) {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Takeover history does not directly identify the successor", {
+        worktree_ref: predecessor.worktree_ref,
+      });
+    }
+    this.assertTakeoverCoordinatesMatch(predecessor, next);
+
+    const state = await this.loadState();
+    const root = await this.worktreeRoot();
+    const mapping = await this.uniqueTakeoverMapping(state, predecessor, root);
+    const repository = await this.repositoryInfo(mapping.repository_path);
+    const alreadyBound = mapping.claim_id === next.claim_id && mapping.session_id === next.session_id;
+    if (alreadyBound) {
+      this.assertTakeoverMapping(mapping, next, repository, root, "active");
+      await this.verifyWorktree(mapping.path, next.branch, repository.identity, root);
+      return { changed: false };
+    }
+    this.assertTakeoverMapping(mapping, predecessor, repository, root, "active");
+    await this.verifyWorktree(mapping.path, predecessor.branch, repository.identity, root);
+    mapping.claim_id = next.claim_id;
+    mapping.session_id = next.session_id;
+    await this.saveState(state);
+
+    const verifiedState = await this.loadState();
+    const verified = await this.uniqueTakeoverMapping(verifiedState, next, root);
+    const verifiedRepository = await this.repositoryInfo(verified.repository_path);
+    this.assertTakeoverMapping(verified, next, verifiedRepository, root, "active");
+    await this.verifyWorktree(verified.path, next.branch, verifiedRepository.identity, root);
+    return { changed: true };
   }
 
   async removeIfSafe(claim: WorktreeClaim): Promise<WorktreeRemovalResult> {
@@ -565,6 +657,112 @@ export class WorktreeManager {
         task_id: claim.task_id,
         claim_id: claim.claim_id,
         worktree_ref: claim.worktree_ref,
+      });
+    }
+  }
+
+  private assertTakeoverCoordinatesMatch(previous: ClaimHistory, successor: ActiveClaim): void {
+    if (
+      previous.task_id !== successor.task_id ||
+      previous.task_alias !== successor.task_alias ||
+      previous.project_id !== successor.project_id ||
+      previous.repo_id !== successor.repo_id ||
+      previous.host !== successor.host ||
+      previous.branch !== successor.branch ||
+      previous.worktree_ref !== successor.worktree_ref
+    ) {
+      throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Takeover Claim records disagree on worktree coordinates", {
+        worktree_ref: previous.worktree_ref,
+      });
+    }
+  }
+
+  private async uniqueTakeoverMapping(state: WorktreeState, claim: WorktreeClaim, root: string): Promise<WorktreeMapping> {
+    this.worktreePath(root, claim.worktree_ref);
+    const direct = state.worktrees[claim.worktree_ref];
+    if (!direct) {
+      throw new ControlError("WORKTREE_NOT_MAPPED", "Takeover Claim has no host-local worktree mapping", {
+        worktree_ref: claim.worktree_ref,
+      });
+    }
+    const directPhysicalPath = await this.physicalMappingPath(direct, root);
+    const directRepositoryIdentity = await this.physicalRepositoryIdentity(direct.repository_identity);
+    for (const [ref, mapping] of Object.entries(state.worktrees)) {
+      if (ref === claim.worktree_ref) continue;
+      const physicalPath = await this.physicalMappingPath(mapping, root);
+      const repositoryIdentity = await this.physicalRepositoryIdentity(mapping.repository_identity);
+      if (
+        mapping.task_id === claim.task_id ||
+        resolve(mapping.path) === resolve(direct.path) ||
+        physicalPath === directPhysicalPath ||
+        (repositoryIdentity === directRepositoryIdentity && mapping.branch === direct.branch)
+      ) {
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover worktree mapping is duplicated or aliased", {
+          worktree_ref: claim.worktree_ref,
+        });
+      }
+    }
+    return direct;
+  }
+
+  private async physicalRepositoryIdentity(identity: string): Promise<string> {
+    try {
+      const entry = await lstat(identity);
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover repository identity is not a regular directory");
+      }
+      return await realpath(identity);
+    } catch (cause) {
+      if (cause instanceof ControlError) throw cause;
+      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover repository identity could not be resolved");
+    }
+  }
+
+  private async physicalMappingPath(mapping: WorktreeMapping, root: string): Promise<string> {
+    const { path } = mapping;
+    if (!isAbsolute(path) || !isWithin(root, path)) {
+      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping contains an unsafe aliased path");
+    }
+    try {
+      const entry = await lstat(path);
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping path is not a regular directory");
+      }
+      const physical = await realpath(path);
+      if (!isWithin(root, physical)) {
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping resolves outside the configured root");
+      }
+      return physical;
+    } catch (cause) {
+      if (cause instanceof ControlError) throw cause;
+      if (isNotFound(cause) && mapping.lifecycle !== "active") return resolve(path);
+      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping physical path could not be resolved");
+    }
+  }
+
+  private assertTakeoverMapping(
+    mapping: WorktreeMapping,
+    claim: WorktreeClaim,
+    repository: RepositoryInfo,
+    root: string,
+    lifecycle: WorktreeLifecycle,
+  ): void {
+    if (mapping.claim_id !== claim.claim_id || mapping.session_id !== claim.session_id) {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Takeover worktree mapping belongs to another Claim generation", {
+        worktree_ref: claim.worktree_ref,
+      });
+    }
+    if (mapping.repository_path !== repository.root) {
+      throw new ControlError("WORKTREE_REPOSITORY_MISMATCH", "Stored repository root does not match its resolved identity", {
+        worktree_ref: claim.worktree_ref,
+      });
+    }
+    this.assertCoordinates(mapping, claim, repository.identity, root);
+    if (mapping.lifecycle !== lifecycle) {
+      throw new ControlError("WORKTREE_LIFECYCLE_MISMATCH", "Takeover requires an active worktree lifecycle", {
+        worktree_ref: claim.worktree_ref,
+        expected_lifecycle: lifecycle,
+        actual_lifecycle: mapping.lifecycle,
       });
     }
   }

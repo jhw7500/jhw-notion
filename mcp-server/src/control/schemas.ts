@@ -120,8 +120,18 @@ export const ClaimHistorySchema = z
     head_sha: z.string().optional(),
     validation_summary: z.string().optional(),
     handoff_path: z.string().optional(),
+    successor_claim_id: canonicalId("clm").optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((history, context) => {
+    if (history.successor_claim_id !== undefined && history.status !== "taken-over") {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["successor_claim_id"],
+        message: "Only taken-over Claim history may identify a successor",
+      });
+    }
+  });
 export type ClaimHistory = z.infer<typeof ClaimHistorySchema>;
 
 export const ProjectOperationalFieldsSchema = z

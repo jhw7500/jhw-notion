@@ -32,6 +32,8 @@ export interface WorktreeManagerPort {
   createOrReuse(claim: ActiveClaim, repositoryPath: string): Promise<WorktreeCreateResult>;
   inspect(claim: ActiveClaim): Promise<WorktreeInspection>;
   removeIfSafe(claim: ActiveClaim): Promise<WorktreeRemovalResult>;
+  assertTakeoverEligible(previous: ActiveClaim): Promise<void>;
+  rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<{ changed: boolean }>;
 }
 
 export interface RegistryGitPort {
@@ -393,7 +395,26 @@ export class TaskService {
   }
 
   async recover(input: TaskRecoverInput): Promise<RecoveryResult> {
-    return this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
+    if (input.action.kind !== "takeover") {
+      return this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
+    }
+
+    let previous: ActiveClaim | undefined;
+    try {
+      previous = await this.claims.assertOwner(input.task_id, input.claim_id);
+    } catch (cause) {
+      if (!(cause instanceof ControlError && cause.code === "CLAIM_MISMATCH")) throw cause;
+      // The only permitted reconciliation path is ClaimService's exact,
+      // remotely authoritative old->direct-successor retry below.
+    }
+    if (previous) await this.worktrees.assertTakeoverEligible(previous);
+
+    const recovered = await this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
+    if (recovered.kind !== "takeover") {
+      throw new ControlError("INVALID_RECOVERY_RESULT", "Takeover recovery did not return a successor Claim");
+    }
+    await this.worktrees.rebindTakeover(recovered.history, recovered.active);
+    return recovered;
   }
 
   private timestamp(): string {

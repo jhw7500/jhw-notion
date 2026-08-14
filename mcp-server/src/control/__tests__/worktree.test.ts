@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ProcessRunner } from "../process.js";
 import { ControlError } from "../errors.js";
 import { WorktreeManager, worktreePlan } from "../worktree.js";
+import type { ClaimHistory } from "../schemas.js";
 import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
@@ -27,6 +28,21 @@ function claim(overrides: Record<string, string> = {}) {
     started_at: "2026-08-13T12:34:56.789Z",
     ...overrides,
   };
+}
+
+function takeover(previous = claim(), overrides: Record<string, string> = {}) {
+  const successor = claim({
+    claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+    session_id: "codex-successor",
+    ...overrides,
+  });
+  const history: ClaimHistory = {
+    ...previous,
+    released_at: "2026-08-13T12:35:56.789Z",
+    status: "taken-over",
+    successor_claim_id: successor.claim_id,
+  };
+  return { history, successor };
 }
 
 async function worktreeFixture(): Promise<{
@@ -139,6 +155,471 @@ describe("WorktreeManager", () => {
 
     await expect(manager.removeIfSafe(original)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
     await expect(stat(created.path)).resolves.toBeDefined();
+  });
+
+  it("prevalidates and CAS-rebinds an exact active same-host takeover without changing physical identity", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    const created = await manager.createOrReuse(previous, repoDir);
+    const { history, successor } = takeover(previous);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const before = JSON.parse(await readFile(statePath, "utf8"));
+
+    await expect(manager.assertTakeoverEligible(previous)).resolves.toBeUndefined();
+    await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: true });
+
+    const after = JSON.parse(await readFile(statePath, "utf8"));
+    const ref = previous.worktree_ref;
+    expect(after.worktrees[ref]).toEqual({
+      ...before.worktrees[ref],
+      claim_id: successor.claim_id,
+      session_id: successor.session_id,
+    });
+    await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: false });
+    expect(await readFile(statePath, "utf8")).toBe(`${JSON.stringify(after, null, 2)}\n`);
+    await expect(manager.inspect(previous)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    await expect(manager.removeIfSafe(previous)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    await expect(manager.inspect(successor)).resolves.toMatchObject({ path: created.path });
+  });
+
+  it("refuses takeover when the exact local mapping is missing", async () => {
+    const { manager } = await worktreeFixture();
+    const previous = claim();
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_NOT_MAPPED" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_NOT_MAPPED" });
+  });
+
+  it.each([
+    ["wrong stored Claim generation", "claim_id", "clm-0198aabb-ccdd-7eef-8abc-0123456789ad", "WORKTREE_CLAIM_MISMATCH"],
+    ["wrong stored session", "session_id", "codex-other", "WORKTREE_CLAIM_MISMATCH"],
+    ["wrong stored host", "host", "other-host", "WORKTREE_MAPPING_MISMATCH"],
+    ["wrong stored Task", "task_id", "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac", "WORKTREE_MAPPING_MISMATCH"],
+  ])("refuses takeover for %s", async (_name, field, value, code) => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees[previous.worktree_ref][field] = value;
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it.each(["path", "repository_path"] as const)("refuses takeover for a wrong stored %s", async (field) => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    if (field === "path") {
+      const wrongPath = join(fixture.root, "worktrees", "wt-wrong-direct-path");
+      await mkdir(wrongPath);
+      state.worktrees[previous.worktree_ref].path = wrongPath;
+    } else {
+      state.worktrees[previous.worktree_ref].repository_path = `${repoDir}/../source-repository`;
+    }
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+    const code = field === "path" ? "WORKTREE_MAPPING_MISMATCH" : "WORKTREE_REPOSITORY_MISMATCH";
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("refuses takeover when the actual checkout branch disagrees with the Claim", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    const created = await manager.createOrReuse(previous, repoDir);
+    await git(created.path, "switch", "-c", "task/unrelated-actual-branch");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_BRANCH_MISMATCH" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_BRANCH_MISMATCH" });
+  });
+
+  it("refuses takeover when the physical checkout belongs to another repository", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    const created = await manager.createOrReuse(previous, repoDir);
+    await git(repoDir, "worktree", "remove", created.path);
+    await git(fixture.root, "init", `--initial-branch=${previous.branch}`, created.path);
+    await git(created.path, "config", "user.name", "Phase1A Test");
+    await git(created.path, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(created.path, "README.md"), "# Impostor\n", "utf8");
+    await git(created.path, "add", "README.md");
+    await git(created.path, "commit", "-m", "Impostor checkout");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_REPOSITORY_MISMATCH" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_REPOSITORY_MISMATCH" });
+  });
+
+  it("refuses takeover when the mapping is already bound to a different successor", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees[previous.worktree_ref].claim_id = "clm-0198aabb-ccdd-7eef-8abc-0123456789ad";
+    state.worktrees[previous.worktree_ref].session_id = "codex-different-successor";
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it.each([
+    ["cross-host predecessor", { old: { host: "other-host" } }, "HOST_MISMATCH"],
+    ["cross-host successor", { next: { host: "other-host" } }, "HOST_MISMATCH"],
+    ["different predecessor session", { old: { session_id: "codex-wrong" } }, "WORKTREE_CLAIM_MISMATCH"],
+    ["different successor task", { next: { task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac" } }, "WORKTREE_PLAN_MISMATCH"],
+    ["different successor alias", { next: { task_alias: "control:other" } }, "WORKTREE_PLAN_MISMATCH"],
+    ["different successor project", { next: { project_id: "prj-other" } }, "WORKTREE_MAPPING_MISMATCH"],
+    ["different successor repository", { next: { repo_id: "repo-other" } }, "WORKTREE_MAPPING_MISMATCH"],
+    ["different successor branch", { next: { branch: "task/other" } }, "WORKTREE_PLAN_MISMATCH"],
+    ["different successor ref", { next: { worktree_ref: "wt-other" } }, "WORKTREE_PLAN_MISMATCH"],
+    ["same successor generation", { next: { claim_id: CLAIM_ID } }, "WORKTREE_CLAIM_MISMATCH"],
+    ["wrong direct successor link", { link: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad" }, "WORKTREE_CLAIM_MISMATCH"],
+  ])("refuses takeover rebind for %s", async (_name, mutation, code) => {
+    const { repoDir, manager } = await worktreeFixture();
+    const stored = claim();
+    await manager.createOrReuse(stored, repoDir);
+    const previous = claim((mutation as { old?: Record<string, string> }).old);
+    const { history, successor } = takeover(previous, (mutation as { next?: Record<string, string> }).next);
+    if ((mutation as { link?: string }).link) history.successor_claim_id = (mutation as { link: string }).link;
+
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code });
+    await expect(manager.inspect(stored)).resolves.toBeDefined();
+  });
+
+  it.each(["pending-create", "pending-remove", "removed"] as const)(
+    "refuses takeover rebind while the worktree lifecycle is %s",
+    async (lifecycle) => {
+      const { fixture, repoDir, manager } = await worktreeFixture();
+      const previous = claim();
+      await manager.createOrReuse(previous, repoDir);
+      const statePath = join(fixture.root, "state", "worktrees.json");
+      const state = JSON.parse(await readFile(statePath, "utf8"));
+      state.worktrees[previous.worktree_ref].lifecycle = lifecycle;
+      await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+      await chmod(statePath, 0o600);
+      const { history, successor } = takeover(previous);
+
+      await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({
+        code: "WORKTREE_LIFECYCLE_MISMATCH",
+      });
+    },
+  );
+
+  it("refuses a duplicate Task/path/branch mapping without changing the exact owner", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-duplicate-takeover"] = {
+      ...state.worktrees[previous.worktree_ref],
+      path: join(fixture.root, "worktrees", "wt-duplicate-takeover"),
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_AMBIGUOUS",
+    });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("refuses a lexically aliased duplicate path even when its other coordinates differ", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-aliased-takeover"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      branch: "task/unrelated",
+      repository_identity: join(fixture.root, "unrelated-git-common"),
+      path: `${join(fixture.root, "worktrees")}/alias/../${previous.worktree_ref}`,
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_AMBIGUOUS",
+    });
+  });
+
+  it("refuses a physically aliased duplicate checkout even when its metadata lies", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    const created = await manager.createOrReuse(previous, repoDir);
+    const aliasPath = join(fixture.root, "worktrees", "wt-physical-alias");
+    await symlink(created.path, aliasPath);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-physical-alias"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      branch: "task/unrelated",
+      repository_identity: join(fixture.root, "unrelated-git-common"),
+      path: aliasPath,
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+  });
+
+  it("refuses an unrelated active mapping whose physical path escapes through an outward symlink", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const external = join(fixture.root, "external-worktree-alias");
+    const aliasPath = join(fixture.root, "worktrees", "wt-outward-alias");
+    await mkdir(external);
+    await symlink(external, aliasPath);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-outward-alias"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      branch: "task/unrelated",
+      repository_identity: join(fixture.root, "unrelated-git-common"),
+      path: aliasPath,
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("refuses an unrelated active mapping whose path is not a directory", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const filePath = join(fixture.root, "worktrees", "wt-file-alias");
+    await writeFile(filePath, "not a checkout\n", "utf8");
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-file-alias"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      branch: "task/unrelated",
+      repository_identity: join(fixture.root, "unrelated-git-common"),
+      path: filePath,
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("refuses an unrelated active mapping whose checkout path is missing", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const missingPath = join(fixture.root, "worktrees", "wt-missing-active");
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-missing-active"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      branch: "task/unrelated",
+      repository_identity: join(fixture.root, "unrelated-git-common"),
+      path: missingPath,
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("canonicalizes unrelated repository identities before branch uniqueness comparison", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    const direct = state.worktrees[previous.worktree_ref];
+    const aliasPath = join(fixture.root, "worktrees", "wt-repository-alias");
+    await mkdir(aliasPath);
+    const identityName = direct.repository_identity.split("/").at(-1);
+    state.worktrees["wt-repository-alias"] = {
+      ...direct,
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      repository_identity: `${direct.repository_identity}/../${identityName}`,
+      path: aliasPath,
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it.each([
+    ["noncanonical Task ID", { task_id: "tsk-not-canonical" }],
+    ["empty session", { session_id: "" }],
+    ["empty host", { host: "" }],
+    ["empty branch", { branch: "" }],
+    ["relative repository identity", { repository_identity: ".git" }],
+    ["unexpected field", { unexpected: true }],
+  ])("rejects an unrelated mapping with %s as invalid state", async (_name, mutation) => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-malformed-unrelated"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      branch: "task/unrelated",
+      path: join(fixture.root, "worktrees", "wt-malformed-unrelated"),
+      ...mutation,
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "INVALID_WORKTREE_STATE" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "INVALID_WORKTREE_STATE" });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("permits an absent unrelated removed tombstone that aliases no takeover coordinate", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const unrelatedRepo = join(fixture.root, "unrelated-repository");
+    await git(fixture.root, "init", "--initial-branch=main", unrelatedRepo);
+    await git(unrelatedRepo, "config", "user.name", "Phase1A Test");
+    await git(unrelatedRepo, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(unrelatedRepo, "README.md"), "# Unrelated\n", "utf8");
+    await git(unrelatedRepo, "add", "README.md");
+    await git(unrelatedRepo, "commit", "-m", "Initial unrelated source");
+    const identity = (await git(unrelatedRepo, "rev-parse", "--git-common-dir")).trim();
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-removed-unrelated"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      session_id: "codex-unrelated",
+      branch: "task/unrelated",
+      repository_path: unrelatedRepo,
+      repository_identity: identity.startsWith("/") ? identity : join(unrelatedRepo, identity),
+      path: join(fixture.root, "worktrees", "wt-removed-unrelated"),
+      lifecycle: "removed",
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).resolves.toBeUndefined();
+    await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: true });
+  });
+
+  it("refuses malformed base identity before laundering it through takeover", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees[previous.worktree_ref].base_sha = "";
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "INVALID_WORKTREE_STATE" });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "INVALID_WORKTREE_STATE" });
+  });
+
+  it("retains old mapping bytes when takeover state persistence fails and converges on retry", async () => {
+    let failNextSave = false;
+    const { fixture, repoDir, manager } = await worktreeFixtureWithHooks({
+      beforeSave: () => {
+        if (!failNextSave) return;
+        failNextSave = false;
+        throw new Error("injected takeover state save failure");
+      },
+    });
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+    failNextSave = true;
+
+    await expect(manager.rebindTakeover(history, successor)).rejects.toThrow("injected takeover state save failure");
+    expect(await readFile(statePath, "utf8")).toBe(before);
+    await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: true });
+    await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: false });
+  });
+
+  it("recognizes a successor mapping after post-save failure and does not rewrite it", async () => {
+    let failNextSave = false;
+    const { fixture, repoDir, manager } = await worktreeFixtureWithHooks({
+      afterSave: () => {
+        if (!failNextSave) return;
+        failNextSave = false;
+        throw new Error("injected takeover post-save failure");
+      },
+    });
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const { history, successor } = takeover(previous);
+    failNextSave = true;
+
+    await expect(manager.rebindTakeover(history, successor)).rejects.toThrow("injected takeover post-save failure");
+    const successorBytes = await readFile(statePath, "utf8");
+    await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: false });
+    expect(await readFile(statePath, "utf8")).toBe(successorBytes);
   });
 
   it("rejects actual ahead commits as unpushed before removal", async () => {

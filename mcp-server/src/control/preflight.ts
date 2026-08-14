@@ -33,7 +33,7 @@ const IssueResponseSchema = z.object({
   node_id: z.string().min(1),
   title: z.string(),
   body: z.string(),
-  labels: z.array(z.object({ name: z.string() }).strict()),
+  labels: z.array(z.object({ name: z.string().min(1) }).passthrough()),
 }).passthrough();
 
 function credentials(environment: NodeJS.ProcessEnv): void {

@@ -60,6 +60,8 @@ async function taskFixture(): Promise<{
     createOrReuse: ReturnType<typeof vi.fn>;
     inspect: ReturnType<typeof vi.fn>;
     removeIfSafe: ReturnType<typeof vi.fn>;
+    assertTakeoverEligible: ReturnType<typeof vi.fn>;
+    rebindTakeover: ReturnType<typeof vi.fn>;
   };
   registry: { transact: ReturnType<typeof vi.fn>; readHeadRegularFile: ReturnType<typeof vi.fn> };
   worktreePath: string;
@@ -99,6 +101,8 @@ async function taskFixture(): Promise<{
       behind: 0,
     }),
     removeIfSafe: vi.fn().mockResolvedValue({ removed: true }),
+    assertTakeoverEligible: vi.fn().mockResolvedValue(undefined),
+    rebindTakeover: vi.fn().mockResolvedValue({ changed: true }),
   };
   const registry = {
     transact: vi.fn(async (_message: string, mutate: () => Promise<{ paths: readonly string[] }>) => {
@@ -145,6 +149,97 @@ describe("TaskService", () => {
       CLAIM_ID,
       expect.objectContaining({ validation: ["worktree_create_failed:unknown"] }),
     );
+  });
+
+  it("prevalidates a fresh takeover before Registry rotation and then rebinds its direct successor", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    const successor = { ...activeClaim, claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac", session_id: "codex-new" };
+    const history = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "taken-over" as const,
+      successor_claim_id: successor.claim_id,
+    };
+    claims.recoverClaim.mockResolvedValue({ kind: "takeover", active: successor, history });
+
+    await expect(tasks.recover({
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      action: { kind: "takeover", session_id: successor.session_id },
+    })).resolves.toEqual({ kind: "takeover", active: successor, history });
+
+    expect(claims.assertOwner).toHaveBeenCalledBefore(worktrees.assertTakeoverEligible);
+    expect(worktrees.assertTakeoverEligible).toHaveBeenCalledBefore(claims.recoverClaim);
+    expect(claims.recoverClaim).toHaveBeenCalledBefore(worktrees.rebindTakeover);
+    expect(worktrees.assertTakeoverEligible).toHaveBeenCalledWith(activeClaim);
+    expect(worktrees.rebindTakeover).toHaveBeenCalledWith(history, successor);
+  });
+
+  it("reconciles only an exact ownership mismatch through the linked takeover retry", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    const successor = { ...activeClaim, claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac", session_id: "codex-new" };
+    const history = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "taken-over" as const,
+      successor_claim_id: successor.claim_id,
+    };
+    claims.assertOwner.mockRejectedValueOnce(new ControlError("CLAIM_MISMATCH", "already rotated"));
+    claims.recoverClaim.mockResolvedValue({ kind: "takeover", active: successor, history });
+
+    await expect(tasks.recover({
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      action: { kind: "takeover", session_id: successor.session_id },
+    })).resolves.toMatchObject({ kind: "takeover", active: successor });
+
+    expect(worktrees.assertTakeoverEligible).not.toHaveBeenCalled();
+    expect(claims.recoverClaim).toHaveBeenCalledTimes(1);
+    expect(worktrees.rebindTakeover).toHaveBeenCalledWith(history, successor);
+  });
+
+  it.each(["CLAIM_NOT_FOUND", "REGISTRY_CORRUPT", "HOST_MISMATCH"])(
+    "does not reconcile a takeover after %s ownership failure",
+    async (code) => {
+      const { tasks, claims, worktrees } = await taskFixture();
+      claims.assertOwner.mockRejectedValueOnce(new ControlError(code, "stop"));
+
+      await expect(tasks.recover({
+        task_id: activeClaim.task_id,
+        claim_id: activeClaim.claim_id,
+        action: { kind: "takeover", session_id: "codex-new" },
+      })).rejects.toMatchObject({ code });
+
+      expect(claims.recoverClaim).not.toHaveBeenCalled();
+      expect(worktrees.rebindTakeover).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not rotate Registry ownership when takeover worktree eligibility fails", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    worktrees.assertTakeoverEligible.mockRejectedValueOnce(new ControlError("WORKTREE_LIFECYCLE_MISMATCH", "pending"));
+
+    await expect(tasks.recover({
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      action: { kind: "takeover", session_id: "codex-new" },
+    })).rejects.toMatchObject({ code: "WORKTREE_LIFECYCLE_MISMATCH" });
+
+    expect(claims.recoverClaim).not.toHaveBeenCalled();
+  });
+
+  it.each(["status", "force-end"] as const)("preserves direct %s recovery without takeover worktree mutation", async (kind) => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.recoverClaim.mockResolvedValue({ kind });
+
+    await tasks.recover({
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      action: { kind },
+    });
+
+    expect(worktrees.assertTakeoverEligible).not.toHaveBeenCalled();
+    expect(worktrees.rebindTakeover).not.toHaveBeenCalled();
   });
 
   it("reports retained Claim coordinates after a worktree creation failure", async () => {
@@ -481,6 +576,8 @@ describe("TaskService", () => {
         return reorderInspection ? { ...current, dirty_files: [...current.dirty_files].reverse() } : current;
       },
       removeIfSafe: worktrees.removeIfSafe.bind(worktrees),
+      assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
+      rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
     };
     let failFirstRelease = true;
     const claims = {
@@ -754,6 +851,8 @@ describe("TaskService", () => {
       },
       inspect: vi.fn(),
       removeIfSafe: vi.fn(),
+      assertTakeoverEligible: vi.fn(),
+      rebindTakeover: vi.fn(),
     };
     const tasks = new TaskService(config, claims, failedWorktrees, registry);
 

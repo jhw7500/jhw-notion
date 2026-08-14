@@ -1,4 +1,4 @@
-import { mkdir, readFile, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -215,14 +215,14 @@ describe("ClaimService", () => {
     ).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
   });
 
-  it("takeover archives the old Claim and installs a fresh configured-host Claim atomically", async () => {
+  it("takeover archives the old Claim with a typed direct link to its fresh successor", async () => {
     const times = [
       new Date("2026-08-13T12:34:56.789Z"),
       new Date("2026-08-13T12:34:57.789Z"),
       new Date("2026-08-13T12:34:58.789Z"),
     ];
     const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
-    const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-a", host: "old-build-host" }));
+    const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-a" }));
 
     const recovered = await claims.recoverClaim(first.task_id, first.claim_id, {
       kind: "takeover",
@@ -237,11 +237,173 @@ describe("ClaimService", () => {
       claim_id: first.claim_id,
       status: "taken-over",
       session_id: "codex-a",
-      host: "old-build-host",
+      host: "cantopsbuildserver",
+      successor_claim_id: recovered.active.claim_id,
     });
     await expect(claims.assertOwner(first.task_id, first.claim_id)).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
     expect(await claims.assertOwner(first.task_id, recovered.active.claim_id)).toEqual(recovered.active);
     expect(await exists(join(fixture.registryDir, "claims", "history", "2026", first.task_id, `${first.claim_id}.yaml`))).toBe(true);
+  });
+
+  it("reconciles only the exact remotely linked takeover retry without another commit", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id));
+    const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+    const recovered = await claims.recoverClaim(first.task_id, first.claim_id, takeover);
+    const head = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(claims.recoverClaim(first.task_id, first.claim_id, takeover)).resolves.toEqual(recovered);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(head);
+    expect(await git(fixture.registryDir, "status", "--porcelain")).toBe("");
+  });
+
+  it("rejects takeover retry for a different successor session", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id));
+    await claims.recoverClaim(first.task_id, first.claim_id, { kind: "takeover", session_id: "codex-new" });
+
+    await expect(claims.recoverClaim(first.task_id, first.claim_id, {
+      kind: "takeover",
+      session_id: "codex-other",
+    })).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
+  });
+
+  it.each(["legacy-unlinked", "wrong-link"])(
+    "rejects a %s takeover history as idempotent authority",
+    async (variant) => {
+      const times = [
+        new Date("2026-08-13T12:34:56.789Z"),
+        new Date("2026-08-13T12:34:57.789Z"),
+        new Date("2026-08-13T12:34:58.789Z"),
+      ];
+      const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+      const first = await claims.claimTask(claimInput(task.id));
+      const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+      await claims.recoverClaim(first.task_id, first.claim_id, takeover);
+      const relative = historyRelativePath(first);
+      const path = join(fixture.registryDir, relative);
+      const history = JSON.parse(await readFile(path, "utf8"));
+      if (variant === "legacy-unlinked") delete history.successor_claim_id;
+      else history.successor_claim_id = "clm-0198aabb-ccdd-7eef-8abc-0123456789ad";
+      await commitRegistryFile(fixture, relative, `${JSON.stringify(history)}\n`);
+      const head = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+      await expect(claims.recoverClaim(first.task_id, first.claim_id, takeover)).rejects.toMatchObject({
+        code: "CLAIM_MISMATCH",
+      });
+      expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(head);
+    },
+  );
+
+  it("rejects an older linked predecessor after its direct successor was itself taken over", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+      new Date("2026-08-13T12:34:59.789Z"),
+      new Date("2026-08-13T12:35:00.789Z"),
+    ];
+    const { claims, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id));
+    const second = await claims.recoverClaim(first.task_id, first.claim_id, {
+      kind: "takeover",
+      session_id: "codex-second",
+    });
+    await claims.recoverClaim(second.active.task_id, second.active.claim_id, {
+      kind: "takeover",
+      session_id: "codex-third",
+    });
+
+    await expect(claims.recoverClaim(first.task_id, first.claim_id, {
+      kind: "takeover",
+      session_id: "codex-second",
+    })).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
+  });
+
+  it("finds a remotely linked predecessor across a retry clock year boundary", async () => {
+    const times = [
+      new Date("2026-12-31T23:59:57.000Z"),
+      new Date("2026-12-31T23:59:58.000Z"),
+      new Date("2026-12-31T23:59:59.000Z"),
+      new Date("2027-01-01T00:00:01.000Z"),
+    ];
+    const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? new Date("2027-01-01T00:00:02.000Z"));
+    const first = await claims.claimTask(claimInput(task.id));
+    const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+    const recovered = await claims.recoverClaim(first.task_id, first.claim_id, takeover);
+    const head = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(claims.recoverClaim(first.task_id, first.claim_id, takeover)).resolves.toEqual(recovered);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(head);
+    await expect(readFile(join(fixture.registryDir, "claims", "history", "2026", first.task_id, `${first.claim_id}.yaml`), "utf8"))
+      .resolves.toContain(recovered.active.claim_id);
+  });
+
+  it("rejects a remotely linked predecessor stored outside its released_at UTC year", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id));
+    const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+    await claims.recoverClaim(first.task_id, first.claim_id, takeover);
+    const canonical = join(fixture.registryDir, historyRelativePath(first));
+    const misplacedRelative = `claims/history/2025/${first.task_id}/${first.claim_id}.yaml`;
+    const misplaced = join(fixture.registryDir, misplacedRelative);
+    await mkdir(dirname(misplaced), { recursive: true });
+    await rename(canonical, misplaced);
+    await git(fixture.registryDir, "add", "-A", "--", "claims/history");
+    await git(fixture.registryDir, "commit", "-m", "Mispartition takeover history");
+    await git(fixture.registryDir, "push", "origin", "main");
+    const head = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(claims.recoverClaim(first.task_id, first.claim_id, takeover)).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+    });
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(head);
+  });
+
+  it("rejects duplicate exact predecessor history across canonical year directories", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id));
+    const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+    await claims.recoverClaim(first.task_id, first.claim_id, takeover);
+    const duplicate = `claims/history/2025/${first.task_id}/${first.claim_id}.yaml`;
+    await commitRegistryFile(fixture, duplicate, await readFile(join(fixture.registryDir, historyRelativePath(first)), "utf8"));
+
+    await expect(claims.recoverClaim(first.task_id, first.claim_id, takeover)).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+    });
+  });
+
+  it("rejects cross-host takeover before rotating Registry ownership", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const first = await claims.claimTask(claimInput(task.id, { host: "other-build-host" }));
+    const head = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(claims.recoverClaim(first.task_id, first.claim_id, {
+      kind: "takeover",
+      session_id: "codex-new",
+    })).rejects.toMatchObject({ code: "HOST_MISMATCH" });
+    await expect(claims.assertOwner(first.task_id, first.claim_id)).resolves.toEqual(first);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(head);
   });
 
   it("rejects finish when the active Claim is redirected outside the Registry", async () => {

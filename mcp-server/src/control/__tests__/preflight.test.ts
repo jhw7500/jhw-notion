@@ -63,8 +63,8 @@ function service(input: {
   const runner = input.runner ?? new QueuedRunner();
   runner.enqueueGh(
     { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
-    { stdout: `${JSON.stringify({ node_id: "I_fixture", title: "trial", body: "unchanged", labels: [{ name: "trial" }] })}\n` },
-    { stdout: `${JSON.stringify({ node_id: "I_fixture", title: "trial", body: "unchanged", labels: [{ name: "trial" }] })}\n` },
+    { stdout: `${JSON.stringify({ node_id: "I_fixture", title: "trial", body: "unchanged", labels: [{ name: "trial", color: "ededed" }] })}\n` },
+    { stdout: `${JSON.stringify({ node_id: "I_fixture", title: "trial", body: "unchanged", labels: [{ name: "trial", color: "ededed" }] })}\n` },
   );
   return {
     runner,
@@ -110,6 +110,29 @@ describe("PreflightService", () => {
         title: "trial",
         body: "unchanged",
         labels: [{ name: "trial" }, { name: "project-record" }],
+      })}\n` },
+    );
+    const { preflight } = service({ runner });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "INVALID_PREFLIGHT_ISSUE" });
+    expect(runner.ghCalls).toHaveLength(2);
+  });
+
+  it("rejects a REST label whose required name is blank", async () => {
+    const runner = new QueuedRunner();
+    runner.enqueueGh(
+      { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
+      { stdout: `${JSON.stringify({
+        node_id: "I_fixture",
+        title: "trial",
+        body: "unchanged",
+        labels: [{ name: "trial", color: "ededed" }, { name: "", color: "ffffff" }],
+      })}\n` },
+      { stdout: `${JSON.stringify({
+        node_id: "I_fixture",
+        title: "trial",
+        body: "unchanged",
+        labels: [{ name: "trial", color: "ededed" }],
       })}\n` },
     );
     const { preflight } = service({ runner });
