@@ -48,6 +48,10 @@ export interface PortfolioServiceOptions {
   sensitiveData?: SensitiveDataPolicy;
   /** Test-only synchronization point after writes and before disk validation. */
   beforeSnapshotValidation?(snapshotDirectory: string): Promise<void> | void;
+  /** Test-only observation after the snapshots-directory parent sync. */
+  afterSnapshotsParentSync?(): Promise<void> | void;
+  /** Test-only replacement for deterministic parent-sync fault injection. */
+  syncSnapshotsParent?(state: SecureStateDirectory): Promise<void> | void;
 }
 
 interface DirectoryAnchor {
@@ -379,6 +383,15 @@ export class PortfolioService {
     try {
       state = await openSecureStateDirectory(this.options.stateDir);
       snapshots = await openDirectoryAt(state.fd, "snapshots", true);
+      // Repeat the parent sync on reuse: if a prior first-creation sync failed,
+      // the empty namespace remains and EEXIST cannot prove it was durable.
+      try {
+        if (this.options.syncSnapshotsParent) await this.options.syncSnapshotsParent(state);
+        else await state.sync();
+      } catch {
+        throw new ControlError("SNAPSHOT_SYNC_FAILED", "Unable to durably sync the snapshots parent namespace");
+      }
+      await this.options.afterSnapshotsParentSync?.();
       snapshot = await openDirectoryAt(snapshots.fd, directoryName, true);
       await writeNewFile(snapshot.fd, "portfolio.json", json);
       for (const [index, markdown] of pages.entries()) {

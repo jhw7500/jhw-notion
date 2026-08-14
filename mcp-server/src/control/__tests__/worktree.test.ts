@@ -64,7 +64,13 @@ async function worktreeFixture(): Promise<{
   return { fixture, repoDir, manager: new WorktreeManager(config) };
 }
 
-async function worktreeFixtureWithHooks(hooks: { beforeSave?: () => void; afterSave?: () => void }): Promise<{
+async function worktreeFixtureWithHooks(hooks: {
+  beforeSave?: () => void;
+  afterPublish?: (statePath: string) => void | Promise<void>;
+  syncPublishedFile?: () => void | Promise<void>;
+  syncStateDirectory?: () => void | Promise<void>;
+  afterSave?: () => void;
+}): Promise<{
   fixture: RegistryFixture;
   repoDir: string;
   manager: WorktreeManager;
@@ -82,7 +88,13 @@ async function worktreeFixtureWithHooks(hooks: { beforeSave?: () => void; afterS
   const Constructor = WorktreeManager as unknown as new (
     config: ReturnType<typeof configFor>,
     runner: undefined,
-    hooks: { beforeSave?: () => void; afterSave?: () => void },
+    hooks: {
+      beforeSave?: () => void;
+      afterPublish?: (statePath: string) => void | Promise<void>;
+      syncPublishedFile?: () => void | Promise<void>;
+      syncStateDirectory?: () => void | Promise<void>;
+      afterSave?: () => void;
+    },
   ) => WorktreeManager;
   return { fixture, repoDir, manager: new Constructor(config, undefined, hooks) };
 }
@@ -92,6 +104,32 @@ afterEach(async () => {
 });
 
 describe("WorktreeManager", () => {
+  it("reopens and rejects a published state file changed before durability sync", async () => {
+    let corruptNextPublish = true;
+    const { fixture, repoDir, manager } = await worktreeFixtureWithHooks({
+      afterPublish: async (statePath) => {
+        if (!corruptNextPublish) return;
+        corruptNextPublish = false;
+        await writeFile(statePath, "{}\n", "utf8");
+      },
+    });
+
+    await expect(manager.createOrReuse(claim(), repoDir)).rejects.toMatchObject({ code: "WORKTREE_STATE_WRITE_FAILED" });
+    await expect(readFile(join(fixture.root, "state", "worktrees.json"), "utf8")).resolves.toBe("{}\n");
+  });
+
+  it("rejects a published state when its post-rename directory sync fails", async () => {
+    let reportedSaved = false;
+    const { repoDir, manager } = await worktreeFixtureWithHooks({
+      syncStateDirectory: async () => { throw new Error("injected directory sync failure"); },
+      afterSave: () => { reportedSaved = true; },
+    });
+
+    await expect(manager.createOrReuse(claim(), repoDir)).rejects.toMatchObject({ code: "WORKTREE_STATE_WRITE_FAILED" });
+
+    expect(reportedSaved).toBe(false);
+  });
+
   it("creates a deterministic logical worktree ref without placing an absolute path in the Claim", () => {
     const plan = worktreePlan(TASK_ID, "WLAN: Roaming/Fix");
 

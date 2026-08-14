@@ -12,7 +12,7 @@ import { ControlError } from "./errors.js";
 import {
   buildHandoff,
   canonicalHandoffPath,
-  parseHandoffMetadata,
+  assertValidHandoff,
   parseHandoffSections,
   MAX_HANDOFF_BYTES,
   writeRegistryHandoff,
@@ -365,7 +365,7 @@ export class TaskService {
     if (Buffer.byteLength(content, "utf8") > MAX_HANDOFF_BYTES) {
       throw new ControlError("REGISTRY_CORRUPT", "Committed Handoff exceeds its byte boundary");
     }
-    const metadata = parseHandoffMetadata(content);
+    const metadata = assertValidHandoff(content);
     if (
       metadata.task_id !== history.task_id ||
       metadata.claim_id !== history.claim_id ||
@@ -406,7 +406,7 @@ export class TaskService {
       const committed = await this.committedHandoff(handoffPath);
       let handoff: string;
       if (committed) {
-        const metadata = parseHandoffMetadata(committed);
+        const metadata = assertValidHandoff(committed);
         if (
           metadata.task_id !== active.task_id ||
           metadata.claim_id !== active.claim_id ||

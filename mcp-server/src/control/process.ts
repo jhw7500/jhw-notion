@@ -487,7 +487,9 @@ export class MutationLock implements MutationLockPort {
         directory = await openSecureStateDirectory(this.config.stateDir, this.secureDirectoryHooks);
         lockFile = await directory.openFile("registry.lock", lockOpenFlags, 0o600);
         const info = await lockFile.stat();
-        if (!info.isFile()) throw new ControlError("UNSAFE_STATE_PATH", "Host lock is not a regular file");
+        if (!info.isFile() || info.nlink !== 1) {
+          throw new ControlError("UNSAFE_STATE_PATH", "Host lock is not a private single-link regular file");
+        }
         await lockFile.chmod(0o600);
       } catch (cause) {
         if (cause instanceof ControlError && cause.code === "UNSAFE_STATE_PATH") throw cause;

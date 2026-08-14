@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory } from "./schemas.js";
@@ -61,6 +62,9 @@ export interface WorktreeRunner {
 /** Test-only fault boundaries for durable state failure-window coverage. */
 export interface WorktreeStateHooks {
   beforeSave?: () => void | Promise<void>;
+  afterPublish?: (statePath: string) => void | Promise<void>;
+  syncPublishedFile?: (file: FileHandle) => void | Promise<void>;
+  syncStateDirectory?: (directory: FileHandle) => void | Promise<void>;
   afterSave?: () => void | Promise<void>;
 }
 
@@ -922,6 +926,7 @@ export class WorktreeManager {
   private async saveState(state: WorktreeState): Promise<void> {
     await this.stateHooks.beforeSave?.();
     const statePath = await this.statePath();
+    const serialized = `${JSON.stringify(state, null, 2)}\n`;
     try {
       const existing = await lstat(statePath);
       if (existing.isSymbolicLink() || !existing.isFile()) {
@@ -935,18 +940,46 @@ export class WorktreeManager {
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
       handle = await open(temporary, "wx", 0o600);
-      await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+      await handle.chmod(0o600);
+      await handle.writeFile(serialized, "utf8");
       await handle.sync();
       await handle.close();
       handle = undefined;
       await rename(temporary, statePath);
-      await chmod(statePath, 0o600);
+      await this.stateHooks.afterPublish?.(statePath);
+      await this.verifyPublishedState(statePath, serialized);
     } catch (cause) {
       if (handle) await handle.close().catch(() => undefined);
       await unlink(temporary).catch(() => undefined);
       throw cause;
     }
     await this.stateHooks.afterSave?.();
+  }
+
+  private async verifyPublishedState(statePath: string, expected: string): Promise<void> {
+    let published: Awaited<ReturnType<typeof open>> | undefined;
+    let directory: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      published = await open(statePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const info = await published.stat();
+      if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600) throw new Error("unsafe published state");
+      const actual = await published.readFile("utf8");
+      if (actual !== expected) throw new Error("published state differs");
+      parseState(JSON.parse(actual));
+      if (this.stateHooks.syncPublishedFile) await this.stateHooks.syncPublishedFile(published);
+      else await published.sync();
+
+      directory = await open(this.config.stateDir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      const directoryInfo = await directory.stat();
+      if (!directoryInfo.isDirectory()) throw new Error("unsafe state directory");
+      if (this.stateHooks.syncStateDirectory) await this.stateHooks.syncStateDirectory(directory);
+      else await directory.sync();
+    } catch {
+      throw new ControlError("WORKTREE_STATE_WRITE_FAILED", "Published worktree state failed durability verification");
+    } finally {
+      await directory?.close().catch(() => undefined);
+      await published?.close().catch(() => undefined);
+    }
   }
 
   private async statePath(): Promise<string> {

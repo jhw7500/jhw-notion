@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, sep } from "node:path";
 
 import { ControlError } from "./errors.js";
 import type { RegistryRecordStore } from "./codec.js";
+import { OffsetDateTimeSchema, SourceTaskRevisionSchema } from "./schemas.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 export const MAX_HANDOFF_BYTES = 12 * 1024;
@@ -48,6 +49,18 @@ function literalText(value: string | readonly string[] | undefined): string {
   // Four leading spaces make every payload line literal Markdown code. This
   // neutralizes ATX/setext headings, fences, HTML, and CR-derived newlines.
   return normalized.split("\n").map((line) => `    ${line}`).join("\n");
+}
+
+/** Keeps the literal-code indentation intact and never leaves a terminal newline. */
+function boundedLiteralText(value: string | readonly string[] | undefined, maximumBytes: number): string {
+  let bounded = truncateUtf8(literalText(value), maximumBytes);
+  while (bounded.endsWith("\n")) bounded = bounded.slice(0, -1);
+  const finalLine = bounded.slice(bounded.lastIndexOf("\n") + 1);
+  if (finalLine.length < 4 || !finalLine.startsWith("    ")) {
+    bounded = bounded.slice(0, Math.max(0, bounded.lastIndexOf("\n")));
+    while (bounded.endsWith("\n")) bounded = bounded.slice(0, -1);
+  }
+  return bounded || "    None recorded.";
 }
 
 /** Truncates at a JavaScript code point boundary, never in the middle of UTF-8. */
@@ -104,10 +117,20 @@ export function buildHandoff(
   );
   const perSection = Math.max(0, Math.floor((MAX_HANDOFF_BYTES - reserved) / sections.length));
   const body = sections.map((section) => {
-    const bounded = truncateUtf8(literalText(section.value), perSection);
-    return `## ${section.title}\n${bounded}\n`;
+    const bounded = boundedLiteralText(section.value, perSection);
+    return `## ${section.title}\n${bounded}`;
   }).join("\n");
-  return `${header}\n${body}`;
+  const content = `${header}\n${body}`;
+  const metadata = assertValidHandoff(content);
+  if (
+    metadata.task_id !== input.task_id ||
+    metadata.source_task_revision !== input.source_task_revision ||
+    metadata.claim_id !== input.claim_id ||
+    metadata.generated_at !== input.generated_at
+  ) {
+    throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Generated Handoff metadata was normalized or truncated");
+  }
+  return content;
 }
 
 export interface HandoffMetadata {
@@ -174,6 +197,37 @@ export function parseHandoffSections(content: string): Record<HandoffSectionTitl
     cursor = next;
   }
   return sections;
+}
+
+/** Validates the complete fixed Handoff contract before any filesystem write. */
+export function assertValidHandoff(content: string): HandoffMetadata {
+  if (
+    Buffer.byteLength(content, "utf8") > MAX_HANDOFF_BYTES ||
+    content.endsWith("\n") ||
+    /[\u0000-\u0009\u000b-\u001f\u007f]/u.test(content)
+  ) {
+    throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Handoff violates its byte or terminal-newline boundary");
+  }
+  const metadata = parseHandoffMetadata(content);
+  const expectedHeader = [
+    `# Handoff: ${metadata.task_id}`,
+    `source_task_id: ${metadata.task_id}`,
+    `source_task_revision: ${metadata.source_task_revision}`,
+    `claim_id: ${metadata.claim_id}`,
+    `generated_at: ${metadata.generated_at}`,
+    "",
+  ].join("\n");
+  if (
+    !canonicalTaskId.test(metadata.task_id) ||
+    !canonicalClaimId.test(metadata.claim_id) ||
+    !SourceTaskRevisionSchema.safeParse(metadata.source_task_revision).success ||
+    !OffsetDateTimeSchema.safeParse(metadata.generated_at).success ||
+    !content.startsWith(`${expectedHeader}\n## ${handoffSectionTitles[0]}\n`)
+  ) {
+    throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Handoff metadata coordinates are invalid");
+  }
+  parseHandoffSections(content);
+  return metadata;
 }
 
 export function canonicalHandoffPath(taskId: string, claimId: string): string {
@@ -262,6 +316,7 @@ export async function writeWorktreeHandoff(
   sensitiveData: SensitiveDataPolicy = createSensitiveDataPolicy(process.env, [worktreePath]),
 ): Promise<string> {
   sensitiveData.assertSafe(content);
+  assertValidHandoff(content);
   const worktreeRoot = await rootDirectory(worktreePath, "UNSAFE_WORKTREE_PATH");
   const aiDirectory = await containedDirectory(worktreeRoot, ".ai", "UNSAFE_HANDOFF_PATH");
   const handoffPath = join(aiDirectory, "handoff.md");
@@ -282,6 +337,10 @@ export async function writeRegistryHandoff(
   sensitiveData: SensitiveDataPolicy = createSensitiveDataPolicy(),
 ): Promise<{ path: string; changed: boolean }> {
   sensitiveData.assertSafe(content);
+  const metadata = assertValidHandoff(content);
+  if (metadata.task_id !== taskId || metadata.claim_id !== claimId) {
+    throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Handoff metadata does not match its Registry destination");
+  }
   const relativePath = canonicalHandoffPath(taskId, claimId);
   if (committed !== undefined) {
     if (committed === content) return { path: relativePath, changed: false };

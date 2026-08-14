@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -86,6 +86,55 @@ describe("PilotJournal", () => {
 
     expect(await readFile(external, "utf8")).toBe("outside");
     expect((await lstat(external)).mode & 0o777).toBe(0o644);
+  });
+
+  it("rejects a hard-linked journal before chmod, append, or sync", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const external = join(root, "external-journal.jsonl");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(external, "outside\n", "utf8");
+    await chmod(external, 0o644);
+    await link(external, join(stateDir, "pilot-journal.jsonl"));
+    let synced = false;
+
+    await expect(new PilotJournal(stateDir, {
+      afterJournalSync: () => { synced = true; },
+    }).append(event())).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+
+    expect(await readFile(external, "utf8")).toBe("outside\n");
+    expect((await lstat(external)).mode & 0o777).toBe(0o644);
+    expect(synced).toBe(false);
+  });
+
+  it("reports the journal durable only after data and directory sync complete", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    let synced = false;
+
+    await new PilotJournal(stateDir, {
+      afterJournalSync: () => { synced = true; },
+    }).append(event());
+
+    expect(synced).toBe(true);
+    expect(JSON.parse(await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8"))).toMatchObject(event());
+  });
+
+  it("rejects the append when the journal file sync fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    let reportedDurable = false;
+
+    await expect(new PilotJournal(stateDir, {
+      syncJournalFile: async () => { throw new Error("injected file sync failure"); },
+      afterJournalSync: () => { reportedDurable = true; },
+    }).append(event())).rejects.toMatchObject({ code: "JOURNAL_WRITE_FAILED" });
+
+    expect(reportedDurable).toBe(false);
+    expect(JSON.parse(await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8"))).toMatchObject(event());
   });
 
   it("keeps the journal on the opened state-directory inode after an ancestor swap", async () => {

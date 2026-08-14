@@ -50,6 +50,74 @@ function source(count = 23): ProjectSnapshotSource {
 }
 
 describe("PortfolioService", () => {
+  it("syncs the state parent before each snapshot namespace publication", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    let parentSyncs = 0;
+    const first = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      afterSnapshotsParentSync: () => { parentSyncs += 1; },
+    });
+    const second = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:35:56.000Z"),
+      afterSnapshotsParentSync: () => { parentSyncs += 1; },
+    });
+
+    await first.exportSnapshot();
+    await second.exportSnapshot();
+
+    expect(parentSyncs).toBe(2);
+  });
+
+  it("fails before snapshot publication when the first namespace parent sync fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    let reportedSynced = false;
+    const service = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      syncSnapshotsParent: async () => { throw new Error("injected parent sync failure"); },
+      afterSnapshotsParentSync: () => { reportedSynced = true; },
+    });
+
+    await expect(service.exportSnapshot()).rejects.toMatchObject({ code: "SNAPSHOT_SYNC_FAILED" });
+
+    expect(reportedSynced).toBe(false);
+    await expect(readFile(join(stateDir, "snapshots", "current"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retries the parent sync after an earlier first-creation sync failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    let syncAttempts = 0;
+    const service = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      syncSnapshotsParent: async () => {
+        syncAttempts += 1;
+        if (syncAttempts === 1) throw new Error("injected first parent sync failure");
+      },
+    });
+
+    await expect(service.exportSnapshot()).rejects.toMatchObject({ code: "SNAPSHOT_SYNC_FAILED" });
+    await expect(service.exportSnapshot()).resolves.toMatchObject({
+      jsonPath: "2026-08-13T12-34-56.000Z/portfolio.json",
+    });
+
+    expect(syncAttempts).toBe(2);
+    await expect(readFile(join(stateDir, "snapshots", "current"), "utf8"))
+      .resolves.toBe("2026-08-13T12-34-56.000Z\n");
+  });
+
   it("rejects protected source fields before output or snapshot persistence", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
     roots.push(root);

@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, spawn as spawnChild } from "node:child_process";
-import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -202,6 +202,24 @@ describe("callback mutation lock", () => {
     await writeFile(external, "outside", "utf8");
     await chmod(external, 0o644);
     await symlink(external, join(stateDir, "registry.lock"));
+    const spawn = vi.fn();
+
+    await expect(new MutationLock(configFor(stateDir), {}, { spawn }).run(async () => undefined)).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+
+    expect(await readFile(external, "utf8")).toBe("outside");
+    expect((await lstat(external)).mode & 0o777).toBe(0o644);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a hard-linked registry lock before chmod or flock acquisition", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const external = join(root, "external-lock");
+    await mkdir(stateDir);
+    await writeFile(external, "outside", "utf8");
+    await chmod(external, 0o644);
+    await link(external, join(stateDir, "registry.lock"));
     const spawn = vi.fn();
 
     await expect(new MutationLock(configFor(stateDir), {}, { spawn }).run(async () => undefined)).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });

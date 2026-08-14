@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { buildHandoff } from "../handoff.js";
+import { assertValidHandoff, buildHandoff, parseHandoffMetadata, parseHandoffSections, writeWorktreeHandoff } from "../handoff.js";
 import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { ControlError } from "../errors.js";
@@ -434,6 +434,31 @@ describe("TaskService", () => {
     });
     expect(claims.getClaimHistory).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
     expect(claims.latestHandoffHistory).not.toHaveBeenCalled();
+  });
+
+  it("rejects a committed Handoff with bytes outside the fixed schema", async () => {
+    const { tasks, claims, fixture } = await taskFixture();
+    const relativePath = `handoffs/${TASK_ID}/${CLAIM_ID}.md`;
+    const valid = buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: activeClaim.source_task_revision,
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+    });
+    const invalid = valid.replace(
+      "    None recorded.\n## Git State",
+      "    safe\r## ATTACKER-CONTROLLED-HEADING\n## Git State",
+    );
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(join(fixture.registryDir, relativePath), invalid, "utf8");
+    claims.getClaimHistory.mockResolvedValue({
+      ...activeClaim,
+      released_at: "2026-08-13T12:36:56.789Z",
+      status: "handoff",
+      handoff_path: relativePath,
+    });
+
+    await expect(tasks.handoff(TASK_ID, CLAIM_ID)).rejects.toMatchObject({ code: "INVALID_HANDOFF_EVIDENCE" });
   });
 
   it("leaves a durable Registry Handoff in place if Claim release fails", async () => {
@@ -1134,6 +1159,74 @@ describe("TaskService", () => {
     });
 
     expect(Buffer.byteLength(handoff, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(() => parseHandoffMetadata(handoff)).not.toThrow();
+    expect(() => parseHandoffSections(handoff)).not.toThrow();
+    expect(handoff.endsWith("\n")).toBe(false);
+  });
+
+  it("keeps an exact newline truncation boundary parseable without a blank payload line", () => {
+    const multiline = "x\n".repeat(100_000);
+    const handoff = buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: "issue-revision-7",
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+      progress: multiline,
+      git_state: multiline,
+      validation: multiline,
+      failures: multiline,
+      next_step: multiline,
+      related_adr_and_evidence: multiline,
+    });
+    const firstPayloadStart = handoff.indexOf("\n## Progress Since Last Checkpoint\n") +
+      "\n## Progress Since Last Checkpoint\n".length;
+    const firstPayloadEnd = handoff.indexOf("\n## Git State\n", firstPayloadStart);
+
+    expect(firstPayloadEnd).toBeGreaterThan(firstPayloadStart);
+    expect(handoff.slice(firstPayloadStart, firstPayloadEnd).endsWith("\n")).toBe(false);
+    expect(() => parseHandoffSections(handoff)).not.toThrow();
+  });
+
+  it("rejects Handoff preamble bytes, loose timestamps, and oversized revisions", () => {
+    const valid = buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: "issue-revision-7",
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+    });
+    const preamble = valid.replace(
+      "generated_at: 2026-08-13T12:36:56.789Z\n\n##",
+      "generated_at: 2026-08-13T12:36:56.789Z\nATTACKER-CONTROLLED-PREAMBLE\n\n##",
+    );
+
+    expect(() => assertValidHandoff(preamble)).toThrowError(expect.objectContaining({ code: "INVALID_HANDOFF_EVIDENCE" }));
+    const carriageReturnHeading = valid.replace(
+      "    None recorded.\n## Git State",
+      "    safe\r## ATTACKER-CONTROLLED-HEADING\n## Git State",
+    );
+    expect(() => assertValidHandoff(carriageReturnHeading)).toThrowError(expect.objectContaining({ code: "INVALID_HANDOFF_EVIDENCE" }));
+    for (const generated_at of ["0", "2026", "Aug 13 2026", "2026-08-13"]) {
+      expect(() => buildHandoff({
+        task_id: TASK_ID,
+        source_task_revision: "issue-revision-7",
+        claim_id: CLAIM_ID,
+        generated_at,
+      })).toThrowError(expect.objectContaining({ code: "INVALID_HANDOFF_EVIDENCE" }));
+    }
+    expect(() => buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: "x".repeat(257),
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+    })).toThrowError(expect.objectContaining({ code: "INVALID_HANDOFF_EVIDENCE" }));
+  });
+
+  it("self-validates malformed Handoff content before creating a worktree artifact", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-invalid-handoff-"));
+    localPaths.push(root);
+
+    await expect(writeWorktreeHandoff(root, "# malformed\n")).rejects.toMatchObject({ code: "INVALID_HANDOFF_EVIDENCE" });
+    await expect(readFile(join(root, ".ai", "handoff.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("renders hostile section payloads as literal text under exactly six approved headings", () => {

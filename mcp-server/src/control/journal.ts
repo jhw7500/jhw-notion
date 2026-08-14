@@ -31,12 +31,16 @@ export interface JournalPort {
 /** Test-only synchronization point after the state directory has an FD anchor. */
 export interface SecureStateDirectoryHooks {
   afterDirectoryOpen?(directory: SecureStateDirectory): Promise<void> | void;
+  syncJournalFile?(file: FileHandle): Promise<void> | void;
+  syncJournalDirectory?(directory: SecureStateDirectory): Promise<void> | void;
+  afterJournalSync?(): Promise<void> | void;
 }
 
 export interface SecureStateDirectory {
   readonly path: string;
   readonly fd: number;
   openFile(name: string, flags: number, mode?: number): Promise<FileHandle>;
+  sync(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -87,6 +91,10 @@ class AnchoredStateDirectory implements SecureStateDirectory {
     // The descriptor-backed path retains the directory inode even if a hostile
     // concurrent actor renames a validated ancestor after the open below.
     return open(`/proc/self/fd/${this.handle.fd}/${name}`, flags | constants.O_NOFOLLOW, mode);
+  }
+
+  async sync(): Promise<void> {
+    await this.handle.sync();
   }
 
   async close(): Promise<void> {
@@ -165,11 +173,29 @@ export class PilotJournal implements JournalPort {
       const file = await directory.openFile(JOURNAL_FILE, journalOpenFlags, 0o600);
       try {
         const info = await file.stat();
-        if (!info.isFile()) throw unsafeStatePath();
+        if (!info.isFile() || info.nlink !== 1) throw unsafeStatePath();
         await file.chmod(0o600);
         // One bounded write on an O_APPEND descriptor preserves a complete
         // event line across concurrently finishing read-only invocations.
-        await file.write(Buffer.from(line, "utf8"));
+        const bytes = Buffer.from(line, "utf8");
+        const written = await file.write(bytes);
+        if (written.bytesWritten !== bytes.length) {
+          throw new ControlError("JOURNAL_WRITE_FAILED", "Pilot journal append was incomplete");
+        }
+        // The journal remains derived data, but once append resolves its line
+        // and a newly-created namespace entry have crossed the durability gate.
+        if (this.secureDirectoryHooks.syncJournalFile) {
+          await this.secureDirectoryHooks.syncJournalFile(file);
+        } else {
+          // Full sync, rather than datasync, also covers the enforced 0600 mode.
+          await file.sync();
+        }
+        if (this.secureDirectoryHooks.syncJournalDirectory) {
+          await this.secureDirectoryHooks.syncJournalDirectory(directory);
+        } else {
+          await directory.sync();
+        }
+        await this.secureDirectoryHooks.afterJournalSync?.();
       } finally {
         await file.close();
       }

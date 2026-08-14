@@ -6,6 +6,8 @@ const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm") =>
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
 const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
 const timestamp = z.string().min(1);
+export const SourceTaskRevisionSchema = z.string().min(1).max(256);
+export const OffsetDateTimeSchema = z.string().min(1).max(64).datetime({ offset: true });
 export const TemporaryLifecycleSchema = z.enum(["active", "handoff", "completed", "abandoned"]);
 export type TemporaryLifecycle = z.infer<typeof TemporaryLifecycleSchema>;
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
@@ -81,7 +83,7 @@ export const ActiveClaimSchema = z
     host: z.string().min(1),
     branch: z.string().min(1),
     worktree_ref: z.string().min(1),
-    source_task_revision: z.string().min(1).max(256),
+    source_task_revision: SourceTaskRevisionSchema,
     started_at: timestamp,
   })
   .strict();
@@ -101,7 +103,7 @@ export const ConflictingClaimSummarySchema = ActiveClaimSchema.pick({
   host: safeClaimConflictText,
   branch: safeClaimConflictText,
   worktree_ref: safeClaimConflictText,
-  started_at: ActiveClaimSchema.shape.started_at.max(64).datetime({ offset: true }),
+  started_at: OffsetDateTimeSchema,
 }).strict();
 export type ConflictingClaimSummary = z.infer<typeof ConflictingClaimSummarySchema>;
 
@@ -116,7 +118,7 @@ export const ClaimHistorySchema = z
     host: z.string().min(1),
     branch: z.string().min(1),
     worktree_ref: z.string().min(1),
-    source_task_revision: z.string().min(1).max(256).optional(),
+    source_task_revision: SourceTaskRevisionSchema.optional(),
     started_at: timestamp,
     released_at: timestamp,
     status: z.enum(["completed", "handoff", "abandoned", "force-ended", "taken-over"]),
