@@ -57,6 +57,7 @@ const activeClaim = {
   host: "build-host",
   branch: "task/000000000001-control-task",
   worktree_ref: "wt-000000000001-control-task",
+  source_task_revision: "2026-08-13T00:00:00Z",
   started_at: "2026-08-13T00:00:00.000Z",
 };
 
@@ -124,6 +125,14 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     finish: vi.fn().mockResolvedValue({
       history: { ...activeClaim, status: "completed", released_at: "2026-08-13T00:01:00.000Z" },
       worktree_removed: true,
+    }),
+    handoff: vi.fn().mockResolvedValue({
+      handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md`,
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      source_task_revision: "2026-08-13T00:00:00Z",
+      generated_at: "2026-08-13T00:01:00Z",
+      sections: { "Progress Since Last Checkpoint": "bounded" },
     }),
     recover: vi.fn().mockResolvedValue({ kind: "status", active: activeClaim, process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 }),
     assertOwner: vi.fn().mockResolvedValue(activeClaim),
@@ -266,6 +275,18 @@ describe("runCli", () => {
       issue_url: "https://github.com/example/control/issues/1",
     });
     expect(dependencies.mutationLock.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("retrieves bounded Handoff evidence explicitly without acquiring the mutation lock", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli(["task", "handoff", "--task", TASK_ID, "--claim", CLAIM_ID], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.taskService.handoff).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
+    expect(dependencies.mutationLock.run).not.toHaveBeenCalled();
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      result: { task_id: TASK_ID, claim_id: CLAIM_ID, handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md` },
+    });
   });
 
   it("returns stable JSON and exit code 4 for a Claim conflict", async () => {
@@ -425,6 +446,7 @@ describe("runCli", () => {
     expect(requiresMutationLock(["task", "start"])).toBe(true);
     expect(requiresMutationLock(["task", "finish"])).toBe(true);
     expect(requiresMutationLock(["task", "recover", "--action", "takeover"])).toBe(true);
+    expect(requiresMutationLock(["task", "recover", "--action", "cleanup"])).toBe(true);
     expect(requiresMutationLock(["project", "register"])).toBe(true);
     expect(requiresMutationLock(["preflight"])).toBe(true);
     expect(requiresMutationLock(["task", "status"])).toBe(false);
@@ -671,6 +693,32 @@ describe("runCli", () => {
     expect(newClaim).toBe(replacement.claim_id);
     expect(owner.exitCode).toBe(0);
     expect(dependencies.taskService.assertOwner).toHaveBeenLastCalledWith(TASK_ID, replacement.claim_id);
+  });
+
+  it("routes exact released-generation cleanup through locked Task recovery", async () => {
+    const cleanup = {
+      kind: "cleanup" as const,
+      history: { ...activeClaim, status: "completed", released_at: "2026-08-13T00:01:00.000Z" },
+      worktree: { removed: true, recovered: true, lifecycle: "removed" as const },
+    };
+    const mutationLock = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
+    const dependencies = makeCliDependencies({
+      mutationLock,
+      taskService: { recover: vi.fn().mockResolvedValue(cleanup) },
+    });
+
+    const result = await runCli([
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "cleanup",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.taskService.recover).toHaveBeenCalledWith({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      action: { kind: "cleanup" },
+    });
+    expect(JSON.parse(result.stdout)).toMatchObject({ result: { kind: "cleanup", task_id: TASK_ID } });
+    expect(mutationLock.run).toHaveBeenCalledTimes(1);
   });
 
   it.each(['"', "error", "a"])("keeps JSON valid for hostile ambient secret value %j", async (secret) => {

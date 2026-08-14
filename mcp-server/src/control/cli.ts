@@ -42,6 +42,7 @@ const commandNames = [
   "repository register",
   "task start",
   "task promote",
+  "task handoff",
   "task status",
   "task finish",
   "task recover",
@@ -76,7 +77,7 @@ export interface CliDependencies {
   stateDir: string;
   env: NodeJS.ProcessEnv;
   now?: () => Date;
-  taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner">;
+  taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff">;
   claimService: Pick<ClaimService, "getActive">;
   catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask">;
   source: Pick<GitHubSourceService,
@@ -422,6 +423,16 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       session_id,
       repository_path,
     });
+    let latestHandoff: Awaited<ReturnType<CliDependencies["taskService"]["handoff"]>> | undefined;
+    if (hasExisting) {
+      try {
+        latestHandoff = await dependencies.taskService.handoff(task.id);
+      } catch (cause) {
+        if (!(cause instanceof ControlError && new Set(["HANDOFF_NOT_FOUND", "CLAIM_HISTORY_NOT_FOUND"]).has(cause.code))) {
+          throw cause;
+        }
+      }
+    }
     return {
       flags,
       result: resultJson(command, {
@@ -430,6 +441,14 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         branch: started.branch,
         worktree_ref: started.worktree_ref,
         reused: started.reused,
+        ...(latestHandoff ? {
+          latest_handoff: {
+            handoff_pointer: latestHandoff.handoff_pointer,
+            claim_id: latestHandoff.claim_id,
+            generated_at: latestHandoff.generated_at,
+            sections: latestHandoff.sections,
+          },
+        } : {}),
       }),
     };
   }
@@ -473,6 +492,17 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     };
   }
 
+  if (command === "task handoff") {
+    const flags = parseFlags(argv.slice(2), new Set(["--task", "--claim"]));
+    const taskId = requireTaskId(flags);
+    const claim = value(flags, "--claim");
+    const handoff = await dependencies.taskService.handoff(
+      taskId,
+      claim === undefined ? undefined : assertPattern(claim, CLAIM_ID),
+    );
+    return { flags, result: resultJson(command, handoff) };
+  }
+
   if (command === "task finish") {
     const flags = parseFlags(argv.slice(2), new Set([
       "--task", "--claim", "--status", "--validation", "--outcome", "--source-task-revision",
@@ -489,9 +519,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     // Validate friction input before the lifecycle service or journal can mutate.
     assertPositiveNumber(value(flags, "--active-work-minutes"));
     if (status === "completed" && !outcome) usage("Completed Task finish requires outcome");
-    if (status === "handoff" && (!source_task_revision || source_task_revision === "unknown")) {
-      usage("Handoff Task finish requires source-task-revision");
-    }
+    if (source_task_revision === "unknown") usage("Unknown source-task-revision is not valid evidence");
     const input: TaskFinishInput = {
       task_id,
       claim_id,
@@ -529,7 +557,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const claim_id = requireClaimId(flags, "--expect");
     const actionName = required(flags, "--action");
     let action: TaskRecoverInput["action"];
-    if (actionName === "status" || actionName === "force-end") {
+    if (actionName === "status" || actionName === "force-end" || actionName === "cleanup") {
       // The documented session is advisory for non-takeover recovery.
       action = { kind: actionName };
     } else if (actionName === "takeover") {
@@ -688,7 +716,7 @@ export function requiresMutationLock(argv: readonly string[]): boolean {
   if (argv[0] === "project" && argv[1] === "register") return true;
   if (argv[0] !== "task" || argv[1] !== "recover") return false;
   const index = argv.indexOf("--action");
-  return argv[index + 1] === "force-end" || argv[index + 1] === "takeover";
+  return argv[index + 1] === "force-end" || argv[index + 1] === "takeover" || argv[index + 1] === "cleanup";
 }
 
 async function main(): Promise<void> {

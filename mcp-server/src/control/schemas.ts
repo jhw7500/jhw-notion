@@ -6,6 +6,8 @@ const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm") =>
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
 const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
 const timestamp = z.string().min(1);
+export const TemporaryLifecycleSchema = z.enum(["active", "handoff", "completed", "abandoned"]);
+export type TemporaryLifecycle = z.infer<typeof TemporaryLifecycleSchema>;
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
   const parsed = new Date(`${value}T00:00:00.000Z`);
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
@@ -60,7 +62,7 @@ export const TemporaryTaskSchema = z
     goal: z.string().min(1),
     done_conditions: z.array(z.string().min(1)).min(1),
     expected_scope: z.array(z.string().min(1)).min(1),
-    lifecycle: z.string().min(1),
+    lifecycle: TemporaryLifecycleSchema,
   })
   .strict();
 export type TemporaryTask = z.infer<typeof TemporaryTaskSchema>;
@@ -79,6 +81,7 @@ export const ActiveClaimSchema = z
     host: z.string().min(1),
     branch: z.string().min(1),
     worktree_ref: z.string().min(1),
+    source_task_revision: z.string().min(1).max(256),
     started_at: timestamp,
   })
   .strict();
@@ -113,6 +116,7 @@ export const ClaimHistorySchema = z
     host: z.string().min(1),
     branch: z.string().min(1),
     worktree_ref: z.string().min(1),
+    source_task_revision: z.string().min(1).max(256).optional(),
     started_at: timestamp,
     released_at: timestamp,
     status: z.enum(["completed", "handoff", "abandoned", "force-ended", "taken-over"]),

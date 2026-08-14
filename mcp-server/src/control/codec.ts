@@ -19,6 +19,11 @@ export interface RecordIdentity {
   value: string;
 }
 
+export interface RegistryDirectoryEntry {
+  name: string;
+  kind: "file" | "directory";
+}
+
 function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
 }
@@ -123,6 +128,12 @@ export class RegistryRecordStore {
 
   /** Lists only direct regular-file names under a descriptor-retained directory. */
   async listRegularFileNames(relativeDirectory: string, maximumEntries: number): Promise<string[]> {
+    return (await this.listDirectoryEntries(relativeDirectory, maximumEntries))
+      .filter((entry) => entry.kind === "file")
+      .map((entry) => entry.name);
+  }
+
+  async listDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]> {
     const components = safeRelativePath(relativeDirectory);
     if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 1) {
       throw new ControlError("INVALID_REGISTRY_BOUND", "Registry listing requires a positive deterministic bound");
@@ -135,13 +146,14 @@ export class RegistryRecordStore {
       if (!directory) return [];
       const entries = await readdir(descriptorPath(directory, "."), { withFileTypes: true });
       if (entries.length > maximumEntries) throw corrupt("Registry directory exceeds its deterministic bound", relativeDirectory);
-      const names: string[] = [];
+      const output: RegistryDirectoryEntry[] = [];
       for (const entry of entries) {
-        if (entry.isDirectory()) continue;
-        if (!entry.isFile()) throw corrupt("Registry directory contains a non-regular entry", relativeDirectory);
-        names.push(entry.name);
+        if (!entry.isDirectory() && !entry.isFile()) {
+          throw corrupt("Registry directory contains a non-regular entry", relativeDirectory);
+        }
+        output.push({ name: entry.name, kind: entry.isDirectory() ? "directory" : "file" });
       }
-      return names.sort((left, right) => left.localeCompare(right));
+      return output.sort((left, right) => left.name.localeCompare(right.name));
     } catch (cause) {
       if (cause instanceof ControlError) throw cause;
       throw corrupt("Registry directory could not be listed safely", relativeDirectory);

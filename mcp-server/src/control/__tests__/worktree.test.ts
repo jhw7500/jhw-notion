@@ -25,6 +25,7 @@ function claim(overrides: Record<string, string> = {}) {
     host: "cantopsbuildserver",
     branch: plan.branch,
     worktree_ref: plan.worktree_ref,
+    source_task_revision: "a".repeat(40),
     started_at: "2026-08-13T12:34:56.789Z",
     ...overrides,
   };
@@ -675,6 +676,52 @@ describe("WorktreeManager", () => {
     await expect(manager.removeIfSafe(successor)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
     await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true, recovered: true, lifecycle: "removed" });
     await expect(manager.createOrReuse(successor, repoDir)).resolves.toMatchObject({ reused: false });
+  });
+
+  it("blocks a new Claim before a pending released generation is explicitly cleaned up", async () => {
+    let saves = 0;
+    const { repoDir, manager } = await worktreeFixtureWithHooks({
+      beforeSave: () => {
+        saves += 1;
+        if (saves === 4) throw new Error("state write failed after git remove");
+      },
+    });
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+    await expect(manager.removeIfSafe(active)).rejects.toThrow("state write failed after git remove");
+
+    await expect(manager.assertStartReady(active.task_id, active.task_alias)).rejects.toMatchObject({
+      code: "WORKTREE_CLEANUP_REQUIRED",
+      details: { task_id: active.task_id, worktree_ref: active.worktree_ref },
+    });
+    await expect(manager.createOrReuse(
+      claim({ claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac", session_id: "codex-successor" }),
+      repoDir,
+    )).rejects.toMatchObject({ code: "WORKTREE_CLEANUP_REQUIRED" });
+  });
+
+  it("cleans up only the exact released same-host generation and is idempotent", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const history: ClaimHistory = {
+      ...active,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "completed",
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    };
+
+    await expect(manager.cleanupReleased(history)).resolves.toMatchObject({ removed: true, lifecycle: "removed" });
+    await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(manager.cleanupReleased(history)).resolves.toEqual({ removed: true, recovered: true, lifecycle: "removed" });
+    await expect(manager.assertStartReady(active.task_id, active.task_alias)).resolves.toBeUndefined();
+
+    await expect(manager.cleanupReleased({ ...history, claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac" }))
+      .rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    await expect(manager.cleanupReleased({ ...history, host: "another-host" }))
+      .rejects.toMatchObject({ code: "HOST_MISMATCH" });
   });
 
   it("reinspects a same-generation pending removal and retries after a second safety check fails", async () => {

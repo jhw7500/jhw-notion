@@ -254,8 +254,11 @@ export class WorktreeManager {
     if (mapping) {
       this.assertCoordinates(mapping, claim, repository.identity, root);
       if (mapping.lifecycle === "pending-remove") {
-        await this.resolvePendingRemove(state, claim, mapping, root);
-        mapping = state.worktrees[claim.worktree_ref];
+        throw new ControlError(
+          "WORKTREE_CLEANUP_REQUIRED",
+          "A released worktree generation requires explicit cleanup recovery before Task start",
+          { task_id: claim.task_id, worktree_ref: claim.worktree_ref },
+        );
       }
       if (mapping.lifecycle === "active") {
         await this.verifyWorktree(mapping.path, claim.branch, repository.identity, root);
@@ -285,6 +288,75 @@ export class WorktreeManager {
     // A failure here leaves the durable pending-create record for recovery.
     await this.saveState(state);
     return this.created(mapping, false);
+  }
+
+  /**
+   * Non-mutating pre-Claim barrier. A pending destructive intent must be
+   * reconciled through its archived Claim generation, never by a successor.
+   */
+  async assertStartReady(taskId: string, taskAlias: string): Promise<void> {
+    const plan = worktreePlan(taskId, taskAlias);
+    const state = await this.loadState();
+    const mapping = state.worktrees[plan.worktree_ref];
+    if (mapping?.task_id !== undefined && mapping.task_id !== taskId) {
+      throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Task worktree reference belongs to another Task", {
+        task_id: taskId,
+        worktree_ref: plan.worktree_ref,
+      });
+    }
+    if (mapping?.lifecycle === "pending-remove") {
+      throw new ControlError(
+        "WORKTREE_CLEANUP_REQUIRED",
+        "A released worktree generation requires explicit cleanup recovery before Task start",
+        { task_id: taskId, worktree_ref: plan.worktree_ref },
+      );
+    }
+  }
+
+  /** Clean up exactly one committed, released Claim generation. */
+  async cleanupReleased(rawHistory: ClaimHistory): Promise<WorktreeRemovalResult> {
+    const result = ClaimHistorySchema.safeParse(rawHistory);
+    if (!result.success || !result.data.task_alias) {
+      throw new ControlError("INVALID_CLAIM_HISTORY", "Cleanup requires canonical released Claim history");
+    }
+    const history = result.data as ClaimHistory & { task_alias: string };
+    if (!new Set(["completed", "abandoned", "force-ended"]).has(history.status)) {
+      throw new ControlError("WORKTREE_CLEANUP_NOT_ALLOWED", "This released Claim status does not permit worktree cleanup", {
+        task_id: history.task_id,
+        claim_id: history.claim_id,
+        status: history.status,
+      });
+    }
+    validateClaim(history);
+    this.assertLocalHost(history);
+    const state = await this.loadState();
+    const root = await this.worktreeRoot();
+    const mapping = state.worktrees[history.worktree_ref];
+    if (!mapping) {
+      throw new ControlError("WORKTREE_NOT_MAPPED", "Released Claim has no host-local worktree mapping", {
+        worktree_ref: history.worktree_ref,
+      });
+    }
+    if (mapping.claim_id !== history.claim_id) {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Worktree cleanup belongs to a different Claim generation", {
+        worktree_ref: history.worktree_ref,
+      });
+    }
+    this.assertCoordinates(mapping, history, mapping.repository_identity, root);
+    if (mapping.lifecycle === "removed") {
+      if (await this.mappedWorktreeExists(mapping.path, root)) {
+        throw new ControlError("WORKTREE_LIFECYCLE_MISMATCH", "Removed worktree tombstone still has a checkout", {
+          worktree_ref: history.worktree_ref,
+        });
+      }
+      return { removed: true, recovered: true, lifecycle: "removed" };
+    }
+    if (mapping.lifecycle === "pending-create") {
+      throw new ControlError("WORKTREE_CREATE_PENDING", "Worktree creation requires recovery before cleanup", {
+        worktree_ref: history.worktree_ref,
+      });
+    }
+    return this.removeIfSafe(history);
   }
 
   async inspect(claim: WorktreeClaim): Promise<WorktreeInspection> {
@@ -477,20 +549,6 @@ export class WorktreeManager {
     mapping.session_id = claim.session_id;
     mapping.repository_path = repository.root;
     mapping.base_sha = mapping.base_sha || repository.head;
-  }
-
-  private async resolvePendingRemove(
-    state: WorktreeState,
-    claim: WorktreeClaim,
-    mapping: WorktreeMapping,
-    root: string,
-  ): Promise<void> {
-    this.assertCoordinates(mapping, claim, mapping.repository_identity, root);
-    if (await this.mappedWorktreeExists(mapping.path, root)) {
-      throw new ControlError("WORKTREE_REMOVE_PENDING", "A prior worktree removal is still pending", { worktree_ref: claim.worktree_ref });
-    }
-    mapping.lifecycle = "removed";
-    await this.saveState(state);
   }
 
   /**

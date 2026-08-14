@@ -12,10 +12,12 @@ import {
   RepositoryRecordSchema,
   TaskRecordSchema,
   TemporaryTaskSchema,
+  TemporaryLifecycleSchema,
   type FormalTask,
   type RepositoryRecord,
   type TaskRecord,
   type TemporaryTask,
+  type TemporaryLifecycle,
 } from "./schemas.js";
 
 const projectIdPattern = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
@@ -51,7 +53,7 @@ const RegisterTemporaryTaskInputSchema = z.object({
   goal: z.string().min(1),
   done_conditions: z.array(z.string().min(1)).min(1),
   expected_scope: z.array(z.string().min(1)).min(1),
-  lifecycle: z.string().min(1).optional(),
+  lifecycle: TemporaryLifecycleSchema.optional(),
 }).strict();
 
 export interface RegisterRepositoryInput {
@@ -76,7 +78,7 @@ export interface RegisterTemporaryTaskInput {
   goal: string;
   done_conditions: string[];
   expected_scope: string[];
-  lifecycle?: string;
+  lifecycle?: TemporaryLifecycle;
 }
 
 export interface RepositoryRegistration {
@@ -402,6 +404,19 @@ export class Catalog {
     return task.kind === "formal"
       ? task.issue_revision
       : this.registry.headRegularBlobObjectId(taskRelativePath(task.id));
+  }
+
+  /** Mutates a temporary lifecycle only inside the caller's Registry transaction. */
+  async transitionTemporaryLifecycle(taskId: string, lifecycle: TemporaryLifecycle): Promise<string[]> {
+    const current = await this.taskAt(taskId);
+    if (current.kind === "formal") return [];
+    if (current.lifecycle === "completed" && lifecycle !== "completed") {
+      throw new ControlError("TASK_COMPLETED", "Completed temporary Tasks cannot transition or be reclaimed");
+    }
+    if (current.lifecycle === lifecycle) return [];
+    const updated = record(TemporaryTaskSchema, { ...current, lifecycle }, "INVALID_TEMPORARY_TASK");
+    await this.records.writeJson(taskRelativePath(updated.id), updated);
+    return [taskRelativePath(updated.id)];
   }
 
   async getRepository(repoId: string): Promise<RepositoryRecord> {

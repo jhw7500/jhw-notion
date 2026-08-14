@@ -1,4 +1,4 @@
-import { lstat, readdir, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 
 import { z, type ZodType } from "zod";
@@ -163,6 +163,7 @@ export class ClaimService {
   async claimTask(rawInput: ClaimTaskInput): Promise<ActiveClaim> {
     const input = parse(ClaimTaskInputSchema, rawInput, "INVALID_CLAIM", "Invalid Claim input");
     await this.assertActivePathComponents(input.task_id);
+    const sourceTaskRevision = await this.catalog.getTaskSourceRevision(input.task_id);
     let claimed: ActiveClaim | undefined;
 
     await this.registry.transact(`registry: claim task ${input.task_id}`, async () => {
@@ -184,12 +185,14 @@ export class ClaimService {
           summary.success ? { conflicting_claim: summary.data } : {},
         );
       }
+      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(task.id, "active");
 
       const started = this.timestamp();
       claimed = parse(
         ActiveClaimSchema,
         {
           ...input,
+          source_task_revision: sourceTaskRevision,
           claim_id: newClaimId(Date.parse(started)),
           started_at: started,
         },
@@ -197,7 +200,7 @@ export class ClaimService {
         "Claim record failed validation",
       );
       await this.catalog.records.writeJson(activeRelativePath(input.task_id), claimed);
-      return stage([activeRelativePath(input.task_id)]);
+      return stage([...lifecyclePaths, activeRelativePath(input.task_id)]);
     });
 
     if (!claimed) throw new Error("Claim transaction did not produce an active Claim");
@@ -225,7 +228,8 @@ export class ClaimService {
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
       await this.catalog.records.remove(activeRelativePath(taskId));
-      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
+      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(taskId, outcome.status);
+      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId), ...lifecyclePaths]);
     });
 
     if (!history) throw new Error("Claim finish transaction did not produce history");
@@ -261,6 +265,52 @@ export class ClaimService {
     return this.requireOwner(task, expectedClaimId);
   }
 
+  async getClaimHistory(taskId: string, claimId: string): Promise<ClaimHistory> {
+    assertTaskId(taskId);
+    assertClaimId(claimId);
+    const candidates = await this.claimHistoryCandidates(taskId, claimId);
+    if (candidates.length === 0) {
+      throw new ControlError("CLAIM_HISTORY_NOT_FOUND", "Exact released Claim history does not exist");
+    }
+    if (candidates.length !== 1) throw corruption("Exact released Claim history is ambiguous", { task_id: taskId });
+    return candidates[0] as ClaimHistory;
+  }
+
+  async latestHandoffHistory(taskId: string): Promise<ClaimHistory> {
+    assertTaskId(taskId);
+    const years = await this.historyYears();
+    const candidates: ClaimHistory[] = [];
+    let inspected = 0;
+    for (const year of years) {
+      const directory = `claims/history/${year}/${taskId}`;
+      const entries = await this.catalog.records.listDirectoryEntries(directory, maximumHistoryYearDirectories);
+      for (const entry of entries) {
+        if (++inspected > maximumHistoryYearDirectories) {
+          throw corruption("Claim Handoff lookup exceeded its deterministic bound", { task_id: taskId });
+        }
+        const match = entry.kind === "file" ? entry.name.match(/^(clm-[0-9a-f-]+)\.yaml$/) : undefined;
+        if (!match || !claimIdPattern.test(match[1] as string)) {
+          throw corruption("Claim history directory contains a malformed entry", { task_id: taskId });
+        }
+        const history = await this.catalog.records.readJson(
+          `${directory}/${entry.name}`,
+          ClaimHistorySchema,
+          { field: "claim_id", value: match[1] as string },
+        );
+        if (history.task_id !== taskId || String(this.historyYear(history.released_at)).padStart(4, "0") !== year) {
+          throw corruption("Claim history path and canonical coordinates disagree", { task_id: taskId });
+        }
+        if (history.status === "handoff" && history.handoff_path) candidates.push(history);
+      }
+    }
+    if (candidates.length === 0) throw new ControlError("HANDOFF_NOT_FOUND", "Task has no committed Handoff history");
+    candidates.sort((left, right) => right.released_at.localeCompare(left.released_at));
+    if (candidates[1]?.released_at === candidates[0]?.released_at) {
+      throw corruption("Latest Task Handoff history is ambiguous", { task_id: taskId });
+    }
+    return candidates[0] as ClaimHistory;
+  }
+
   private async recoveryStatus(taskId: string, expectedClaimId: string): Promise<RecoveryStatus> {
     const active = await this.assertOwner(taskId, expectedClaimId);
     const observed = parse(
@@ -291,7 +341,8 @@ export class ClaimService {
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
       await this.catalog.records.remove(activeRelativePath(taskId));
-      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
+      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(taskId, "handoff");
+      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId), ...lifecyclePaths]);
     });
     if (!history) throw new Error("Claim force-end transaction did not produce history");
     return { kind: "force-end", history };
@@ -375,7 +426,7 @@ export class ClaimService {
         cause: errorMessage(cause),
       });
     }
-    const candidates = await this.takeoverHistoryCandidates(task.id, expectedClaimId);
+    const candidates = await this.claimHistoryCandidates(task.id, expectedClaimId);
     if (candidates.length === 0) {
       throw new ControlError("CLAIM_MISMATCH", "Claim generation is not the directly linked takeover predecessor", {
         task_id: task.id,
@@ -428,69 +479,30 @@ export class ClaimService {
     return history;
   }
 
-  private async takeoverHistoryCandidates(taskId: string, claimId: string): Promise<ClaimHistory[]> {
-    const historyRootRelative = "claims/history";
-    await this.assertRegistryPathComponents(historyRootRelative);
-    const historyRoot = join(this.config.registryDir, historyRootRelative);
-    let entries: Array<{ name: string; isDirectory(): boolean }>;
-    try {
-      entries = await readdir(historyRoot, { withFileTypes: true });
-    } catch (cause) {
-      if (isNotFound(cause)) return [];
-      throw corruption("Claim history years could not be inspected", { cause: errorMessage(cause) });
-    }
-    const years = entries
-      .filter((entry) => historyYearDirectoryPattern.test(entry.name))
-      .sort((left, right) => left.name.localeCompare(right.name));
-    if (years.length > maximumHistoryYearDirectories) {
-      throw corruption("Claim history year lookup exceeded its deterministic bound", { year_count: years.length });
-    }
-
+  private async claimHistoryCandidates(taskId: string, claimId: string): Promise<ClaimHistory[]> {
+    const years = await this.historyYears();
     const candidates: ClaimHistory[] = [];
     for (const year of years) {
-      if (!year.isDirectory()) {
-        throw corruption("Claim history year is not a regular directory", { year: year.name });
-      }
-      const relativePath = historyRelativePath(year.name, taskId, claimId);
-      await this.assertRegistryPathComponents(relativePath);
-      const path = join(this.config.registryDir, relativePath);
-      let entry: Awaited<ReturnType<typeof lstat>>;
+      const relativePath = historyRelativePath(year, taskId, claimId);
       try {
-        entry = await lstat(path);
-      } catch (cause) {
-        if (isNotFound(cause)) continue;
-        throw corruption("Claim takeover history could not be inspected", {
-          task_id: taskId,
-          claim_id: claimId,
-          cause: errorMessage(cause),
-        });
-      }
-      if (entry.isSymbolicLink() || !entry.isFile()) {
-        throw corruption("Claim takeover history is not a regular file", {
-          task_id: taskId,
-          claim_id: claimId,
-          year: year.name,
-        });
-      }
-      try {
-        await this.registry.assertHeadRegularFile(relativePath);
-        const candidate = await this.catalog.records.readJson(relativePath, ClaimHistorySchema, {
+        const candidate = await this.catalog.records.readOptionalJson(relativePath, ClaimHistorySchema, {
           field: "claim_id",
           value: claimId,
         });
+        if (!candidate) continue;
         if (candidate.task_id !== taskId || candidate.claim_id !== claimId) {
           throw corruption("Claim takeover history path and record identity disagree", {
             task_id: taskId,
             claim_id: claimId,
-            year: year.name,
+            year,
           });
         }
         const releasedYear = String(this.historyYear(candidate.released_at)).padStart(4, "0");
-        if (year.name !== releasedYear) {
+        if (year !== releasedYear) {
           throw corruption("Claim takeover history is outside its released_at UTC year", {
             task_id: taskId,
             claim_id: claimId,
-            year: year.name,
+            year,
             released_year: releasedYear,
           });
         }
@@ -500,12 +512,24 @@ export class ClaimService {
         throw corruption("Claim takeover history is invalid", {
           task_id: taskId,
           claim_id: claimId,
-          year: year.name,
+          year,
           cause: errorMessage(cause),
         });
       }
     }
     return candidates;
+  }
+
+  private async historyYears(): Promise<string[]> {
+    const entries = await this.catalog.records.listDirectoryEntries("claims/history", maximumHistoryYearDirectories);
+    const years: string[] = [];
+    for (const entry of entries) {
+      if (entry.kind !== "directory" || !historyYearDirectoryPattern.test(entry.name)) {
+        throw corruption("Claim history root contains a malformed year entry", {});
+      }
+      years.push(entry.name);
+    }
+    return years;
   }
 
   private async readActive(task: TaskRecord): Promise<ActiveClaim | undefined> {

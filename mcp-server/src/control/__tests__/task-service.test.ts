@@ -31,6 +31,7 @@ const activeClaim = {
   host: "cantopsbuildserver",
   branch: plan.branch,
   worktree_ref: plan.worktree_ref,
+  source_task_revision: "issue-revision-7",
   started_at: "2026-08-13T12:34:56.789Z",
 };
 
@@ -55,9 +56,14 @@ async function taskFixture(): Promise<{
     assertOwner: ReturnType<typeof vi.fn>;
     finishClaim: ReturnType<typeof vi.fn>;
     recoverClaim: ReturnType<typeof vi.fn>;
+    getActive: ReturnType<typeof vi.fn>;
+    getClaimHistory: ReturnType<typeof vi.fn>;
+    latestHandoffHistory: ReturnType<typeof vi.fn>;
   };
   worktrees: {
     createOrReuse: ReturnType<typeof vi.fn>;
+    assertStartReady: ReturnType<typeof vi.fn>;
+    cleanupReleased: ReturnType<typeof vi.fn>;
     inspect: ReturnType<typeof vi.fn>;
     removeIfSafe: ReturnType<typeof vi.fn>;
     assertTakeoverEligible: ReturnType<typeof vi.fn>;
@@ -86,6 +92,9 @@ async function taskFixture(): Promise<{
       validation_summary: "npm test: pass",
     }),
     recoverClaim: vi.fn(),
+    getActive: vi.fn().mockResolvedValue(undefined),
+    getClaimHistory: vi.fn(),
+    latestHandoffHistory: vi.fn(),
   };
   const worktrees = {
     createOrReuse: vi.fn().mockResolvedValue({
@@ -94,6 +103,8 @@ async function taskFixture(): Promise<{
       branch: plan.branch,
       reused: false,
     }),
+    assertStartReady: vi.fn().mockResolvedValue(undefined),
+    cleanupReleased: vi.fn().mockResolvedValue({ removed: true, recovered: true, lifecycle: "removed" }),
     inspect: vi.fn().mockResolvedValue({
       path: worktreePath,
       worktree_ref: plan.worktree_ref,
@@ -145,6 +156,15 @@ async function taskFixture(): Promise<{
 }
 
 describe("TaskService", () => {
+  it("checks local cleanup readiness before creating Registry ownership", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+
+    await tasks.start(startInput);
+
+    expect(worktrees.assertStartReady).toHaveBeenCalledWith(startInput.task_id, startInput.task_alias);
+    expect(worktrees.assertStartReady).toHaveBeenCalledBefore(claims.claimTask);
+  });
+
   it("claims before creating a worktree and abandons the Claim if creation fails", async () => {
     const { tasks, claims, worktrees } = await taskFixture();
     worktrees.createOrReuse.mockRejectedValue(new Error("worktree failed"));
@@ -256,6 +276,39 @@ describe("TaskService", () => {
     expect(worktrees.rebindTakeover).not.toHaveBeenCalled();
   });
 
+  it("recovers cleanup from exact released history only when no active successor exists", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    const history = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "completed" as const,
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    };
+    claims.getClaimHistory.mockResolvedValue(history);
+
+    await expect(tasks.recover({
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      action: { kind: "cleanup" },
+    })).resolves.toEqual({
+      kind: "cleanup",
+      history,
+      worktree: { removed: true, recovered: true, lifecycle: "removed" },
+    });
+    expect(claims.getActive).toHaveBeenCalledBefore(worktrees.cleanupReleased);
+    expect(worktrees.cleanupReleased).toHaveBeenCalledWith(history);
+
+    claims.getActive.mockResolvedValueOnce({ ...activeClaim, claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac" });
+    await expect(tasks.recover({
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      action: { kind: "cleanup" },
+    })).rejects.toMatchObject({ code: "WORKTREE_ACTIVE_SUCCESSOR" });
+    expect(worktrees.cleanupReleased).toHaveBeenCalledTimes(1);
+  });
+
   it("reports retained Claim coordinates after a worktree creation failure", async () => {
     const { tasks, claims, worktrees } = await taskFixture();
     const privatePath = "/private/worktree";
@@ -295,6 +348,58 @@ describe("TaskService", () => {
       CLAIM_ID,
       expect.objectContaining({ status: "handoff", handoff_path: pointer }),
     );
+  });
+
+  it("derives Handoff source revision from the active Claim and rejects caller drift", async () => {
+    const { tasks, claims, fixture } = await taskFixture();
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["npm test: pass"],
+    })).resolves.toMatchObject({ history: { handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md` } });
+    expect(await readFile(join(fixture.registryDir, "handoffs", TASK_ID, `${CLAIM_ID}.md`), "utf8"))
+      .toContain("source_task_revision: issue-revision-7");
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["npm test: pass"],
+      source_task_revision: "caller-forged-revision",
+    })).rejects.toMatchObject({ code: "SOURCE_REVISION_MISMATCH" });
+    expect(claims.finishClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("retrieves only an exact committed Handoff bound to Claim history", async () => {
+    const { tasks, claims, fixture } = await taskFixture();
+    const relativePath = `handoffs/${TASK_ID}/${CLAIM_ID}.md`;
+    const content = buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: activeClaim.source_task_revision,
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+      progress: "bounded progress",
+    });
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(join(fixture.registryDir, relativePath), content, "utf8");
+    claims.getClaimHistory.mockResolvedValue({
+      ...activeClaim,
+      released_at: "2026-08-13T12:36:56.789Z",
+      status: "handoff",
+      handoff_path: relativePath,
+    });
+
+    await expect(tasks.handoff(TASK_ID, CLAIM_ID)).resolves.toMatchObject({
+      handoff_pointer: relativePath,
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      source_task_revision: activeClaim.source_task_revision,
+      sections: { "Progress Since Last Checkpoint": "bounded progress" },
+    });
+    expect(claims.getClaimHistory).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
+    expect(claims.latestHandoffHistory).not.toHaveBeenCalled();
   });
 
   it("leaves a durable Registry Handoff in place if Claim release fails", async () => {
@@ -587,6 +692,7 @@ describe("TaskService", () => {
     await git(source, "commit", "-m", "Initial source");
     const registry = new RegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
+    await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const task = await catalog.registerTemporaryTask({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",
@@ -604,6 +710,7 @@ describe("TaskService", () => {
     const worktrees = new WorktreeManager(config);
     let reorderInspection = false;
     const taskWorktrees = {
+      assertStartReady: worktrees.assertStartReady.bind(worktrees),
       createOrReuse: worktrees.createOrReuse.bind(worktrees),
       inspect: async (...args: Parameters<WorktreeManager["inspect"]>) => {
         const current = await worktrees.inspect(...args);
@@ -612,12 +719,16 @@ describe("TaskService", () => {
       removeIfSafe: worktrees.removeIfSafe.bind(worktrees),
       assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
       rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
+      cleanupReleased: worktrees.cleanupReleased.bind(worktrees),
     };
     let failFirstRelease = true;
     const claims = {
       claimTask: actualClaims.claimTask.bind(actualClaims),
       assertOwner: actualClaims.assertOwner.bind(actualClaims),
       recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
+      getActive: actualClaims.getActive.bind(actualClaims),
+      getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
+      latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -644,7 +755,6 @@ describe("TaskService", () => {
       claim_id: started.claim.claim_id,
       status: "handoff" as const,
       validation: ["npm test: pass"],
-      source_task_revision: "temporary-v1",
       progress: "Durable Registry copy is the retry source.",
     };
     const pointer = `handoffs/${task.id}/${started.claim.claim_id}.md`;
@@ -693,6 +803,7 @@ describe("TaskService", () => {
     await git(source, "commit", "-m", "Ignore local AI handoffs");
     const registry = new RegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
+    await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const task = await catalog.registerTemporaryTask({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",
@@ -712,6 +823,9 @@ describe("TaskService", () => {
       claimTask: actualClaims.claimTask.bind(actualClaims),
       assertOwner: actualClaims.assertOwner.bind(actualClaims),
       recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
+      getActive: actualClaims.getActive.bind(actualClaims),
+      getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
+      latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -734,7 +848,6 @@ describe("TaskService", () => {
       claim_id: started.claim.claim_id,
       status: "handoff" as const,
       validation: ["npm test: pass"],
-      source_task_revision: "temporary-v1",
     };
 
     await expect(tasks.finish(input)).rejects.toThrow("injected release failure");
@@ -759,6 +872,7 @@ describe("TaskService", () => {
 
     const registry = new RegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
+    await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const alias = `${taskAlias}-reused-handoff`;
     const task = await catalog.registerTemporaryTask({
       project_id: "prj-wlan",
@@ -800,6 +914,9 @@ describe("TaskService", () => {
       claimTask: actualClaims.claimTask.bind(actualClaims),
       assertOwner: actualClaims.assertOwner.bind(actualClaims),
       recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
+      getActive: actualClaims.getActive.bind(actualClaims),
+      getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
+      latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -823,7 +940,6 @@ describe("TaskService", () => {
       claim_id: started.claim.claim_id,
       status: "handoff" as const,
       validation: ["npm test: pass"],
-      source_task_revision: "temporary-v1",
     };
     const pointer = `handoffs/${task.id}/${started.claim.claim_id}.md`;
 
@@ -853,6 +969,7 @@ describe("TaskService", () => {
     const config = configFor(fixture.registryDir);
     const registry = new RegistryGit(config, new ProcessRunner());
     const catalog = new Catalog(config, registry);
+    await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
     const task = await catalog.registerTemporaryTask({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",
@@ -876,10 +993,14 @@ describe("TaskService", () => {
       },
       assertOwner: actualClaims.assertOwner.bind(actualClaims),
       recoverClaim: actualClaims.recoverClaim.bind(actualClaims),
+      getActive: actualClaims.getActive.bind(actualClaims),
+      getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
+      latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       finishClaim: actualClaims.finishClaim.bind(actualClaims),
     };
     const secretPath = "/srv/jhw/private/project-secret";
     const failedWorktrees = {
+      assertStartReady: vi.fn(),
       createOrReuse: async () => {
         throw new ControlError("COMMAND_FAILED", `git failed at ${secretPath}`, { path: secretPath });
       },
@@ -887,6 +1008,7 @@ describe("TaskService", () => {
       removeIfSafe: vi.fn(),
       assertTakeoverEligible: vi.fn(),
       rebindTakeover: vi.fn(),
+      cleanupReleased: vi.fn(),
     };
     const tasks = new TaskService(config, claims, failedWorktrees, registry);
 

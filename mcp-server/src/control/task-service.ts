@@ -14,6 +14,7 @@ import {
   canonicalHandoffPath,
   parseHandoffMetadata,
   parseHandoffSections,
+  MAX_HANDOFF_BYTES,
   writeRegistryHandoff,
   writeWorktreeHandoff,
   type HandoffInput,
@@ -27,14 +28,19 @@ export interface ClaimServicePort {
   finishClaim(taskId: string, claimId: string, outcome: FinishOutcome): Promise<ClaimHistory>;
   recoverClaim(taskId: string, claimId: string, action: RecoveryAction): Promise<RecoveryResult>;
   assertOwner(taskId: string, claimId: string): Promise<ActiveClaim>;
+  getClaimHistory(taskId: string, claimId: string): Promise<ClaimHistory>;
+  latestHandoffHistory(taskId: string): Promise<ClaimHistory>;
+  getActive(taskId: string): Promise<ActiveClaim | undefined>;
 }
 
 export interface WorktreeManagerPort {
+  assertStartReady(taskId: string, taskAlias: string): Promise<void>;
   createOrReuse(claim: ActiveClaim, repositoryPath: string): Promise<WorktreeCreateResult>;
   inspect(claim: ActiveClaim): Promise<WorktreeInspection>;
   removeIfSafe(claim: ActiveClaim): Promise<WorktreeRemovalResult>;
   assertTakeoverEligible(previous: ActiveClaim): Promise<void>;
   rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<{ changed: boolean }>;
+  cleanupReleased(history: ClaimHistory): Promise<WorktreeRemovalResult>;
 }
 
 export interface RegistryGitPort {
@@ -87,11 +93,28 @@ export interface TaskFinishResult {
   cleanup_error?: string;
 }
 
+export interface TaskHandoffResult {
+  handoff_pointer: string;
+  task_id: string;
+  claim_id: string;
+  source_task_revision: string;
+  generated_at: string;
+  sections: ReturnType<typeof parseHandoffSections>;
+}
+
 export interface TaskRecoverInput {
   task_id: string;
   claim_id: string;
-  action: RecoveryAction;
+  action: RecoveryAction | { kind: "cleanup" };
 }
+
+export interface TaskCleanupRecoveryResult {
+  kind: "cleanup";
+  history: ClaimHistory;
+  worktree: WorktreeRemovalResult;
+}
+
+export type TaskRecoveryResult = RecoveryResult | TaskCleanupRecoveryResult;
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -250,6 +273,7 @@ export class TaskService {
 
   async start(input: TaskStartInput): Promise<TaskStartResult> {
     const plan = worktreePlan(input.task_id, input.task_alias);
+    await this.worktrees.assertStartReady(input.task_id, input.task_alias);
     const claim = await this.claims.claimTask({
       task_id: input.task_id,
       task_alias: input.task_alias,
@@ -312,6 +336,40 @@ export class TaskService {
     return { active, worktree };
   }
 
+  async handoff(taskId: string, claimId?: string): Promise<TaskHandoffResult> {
+    const history = claimId === undefined
+      ? await this.claims.latestHandoffHistory(taskId)
+      : await this.claims.getClaimHistory(taskId, claimId);
+    if (history.status !== "handoff" || !history.handoff_path || !history.source_task_revision) {
+      throw new ControlError("HANDOFF_NOT_FOUND", "Released Claim does not contain canonical Handoff evidence");
+    }
+    const expectedPath = canonicalHandoffPath(history.task_id, history.claim_id);
+    if (history.task_id !== taskId || (claimId !== undefined && history.claim_id !== claimId) || history.handoff_path !== expectedPath) {
+      throw new ControlError("REGISTRY_CORRUPT", "Claim history and Handoff coordinates disagree");
+    }
+    await this.records.assertCommittedRegularFile(expectedPath);
+    const content = await this.registry.readHeadRegularFile(expectedPath);
+    if (Buffer.byteLength(content, "utf8") > MAX_HANDOFF_BYTES) {
+      throw new ControlError("REGISTRY_CORRUPT", "Committed Handoff exceeds its byte boundary");
+    }
+    const metadata = parseHandoffMetadata(content);
+    if (
+      metadata.task_id !== history.task_id ||
+      metadata.claim_id !== history.claim_id ||
+      metadata.source_task_revision !== history.source_task_revision
+    ) {
+      throw new ControlError("REGISTRY_CORRUPT", "Committed Handoff metadata disagrees with Claim history");
+    }
+    return {
+      handoff_pointer: expectedPath,
+      task_id: metadata.task_id,
+      claim_id: metadata.claim_id,
+      source_task_revision: metadata.source_task_revision,
+      generated_at: metadata.generated_at,
+      sections: parseHandoffSections(content),
+    };
+  }
+
   async finish(input: TaskFinishInput): Promise<TaskFinishResult> {
     assertValidation(input.validation);
     const active = await this.assertOwner(input.task_id, input.claim_id);
@@ -325,7 +383,10 @@ export class TaskService {
 
     if (input.status === "handoff") {
       handoffPath = canonicalHandoffPath(active.task_id, active.claim_id);
-      const revision = input.source_task_revision ?? "unknown";
+      if (input.source_task_revision !== undefined && input.source_task_revision !== active.source_task_revision) {
+        throw new ControlError("SOURCE_REVISION_MISMATCH", "Caller source revision disagrees with the active Claim");
+      }
+      const revision = active.source_task_revision;
       const committed = await this.committedHandoff(handoffPath);
       let handoff: string;
       if (committed) {
@@ -400,7 +461,19 @@ export class TaskService {
     }
   }
 
-  async recover(input: TaskRecoverInput): Promise<RecoveryResult> {
+  async recover(input: TaskRecoverInput): Promise<TaskRecoveryResult> {
+    if (input.action.kind === "cleanup") {
+      const history = await this.claims.getClaimHistory(input.task_id, input.claim_id);
+      const active = await this.claims.getActive(input.task_id);
+      if (active) {
+        throw new ControlError(
+          "WORKTREE_ACTIVE_SUCCESSOR",
+          "Refusing archived cleanup while the Task has an active Claim generation",
+          { task_id: input.task_id, active_claim_id: active.claim_id },
+        );
+      }
+      return { kind: "cleanup", history, worktree: await this.worktrees.cleanupReleased(history) };
+    }
     if (input.action.kind !== "takeover") {
       return this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
     }
@@ -489,7 +562,7 @@ export class TaskService {
   ): string {
     return buildHandoff({
       task_id: active.task_id,
-      source_task_revision: input.source_task_revision ?? "unknown",
+      source_task_revision: active.source_task_revision,
       claim_id: active.claim_id,
       generated_at: generatedAt,
       progress: input.progress,

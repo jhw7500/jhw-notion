@@ -32,6 +32,7 @@ async function claimsFixture(now: () => Date = () => fixedNow): Promise<{
   const config = configFor(fixture.registryDir);
   const registry = new RegistryGit(config, new ProcessRunner());
   const catalog = new Catalog(config, registry);
+  await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
   const task = await catalog.registerTemporaryTask({
     project_id: "prj-wlan",
     repo_id: "repo-wlan",
@@ -128,6 +129,43 @@ describe("ClaimService", () => {
     const active = await claims.claimTask(claimInput(task.id));
 
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(active);
+    expect(active.source_task_revision).toBe(
+      (await git(fixture.registryDir, "rev-parse", `HEAD:tasks/${task.id}.yaml`)).trim(),
+    );
+  });
+
+  it("updates temporary lifecycle atomically with release and refuses completed reclaim", async () => {
+    const { claims, task, fixture } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    await claims.finishClaim(task.id, active.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    });
+
+    const record = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
+    expect(record.lifecycle).toBe("completed");
+    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-resume" }))).rejects.toMatchObject({
+      code: "TASK_COMPLETED",
+    });
+  });
+
+  it("marks force-ended temporary work resumable as handoff", async () => {
+    const { claims, task, fixture } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+
+    await claims.recoverClaim(task.id, active.claim_id, { kind: "force-end" });
+
+    const record = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
+    expect(record.lifecycle).toBe("handoff");
+    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-resume" }))).resolves.toMatchObject({
+      task_id: task.id,
+      session_id: "codex-resume",
+    });
+    const resumed = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
+    expect(resumed.lifecycle).toBe("active");
   });
 
   it("rejects a second active Claim for the same canonical Task", async () => {
