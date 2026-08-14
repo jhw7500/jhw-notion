@@ -3,7 +3,7 @@
 **Date:** 2026-08-14
 **Branch:** `feat/project-control-phase1a`
 **Base:** `9fbd7983c80ad19a7fb0a51e201f67ba60ee1133`
-**Validated implementation HEAD:** `ca12cd0` (report refresh follows)
+**Validated implementation HEAD:** `79c4053` (report refresh follows)
 **Status:** implementation and local deterministic gates complete; independent final re-review pending at report authoring.
 
 ## Outcome
@@ -36,6 +36,8 @@ Production behavior was changed only after focused RED evidence. Representative 
 | Final authority-order correction | focused preflight RED: wrong remote still called the monotonic authority observer once (expected zero) | observer moved after exact Registry proof; `preflight` **35/35** GREEN |
 | Strict Notion response fixtures | full-suite RED after strict object validation: **7 failed / 844 passed** because seven test fixtures omitted the official object discriminator | fixture-only correction: append/delete **23/23**, fresh full suite GREEN |
 | Corrected adversarial gate | first expanded run found two test-harness expectation defects; no production defect was hidden | pinned gate expanded **19 → 27** deterministic cases and passed twice as fresh processes |
+| Framed private-path rejection | punctuation- and `file://`-framed absolute paths bypassed the content boundary | delimiter-aware rejection passes focused policy/E2E regressions; URLs and repository slugs remain accepted |
+| Takeover gate runtime bound | the real-Git takeover scenario passed alone but exceeded Vitest's generic 5-second per-test limit in the full gate | the single multi-window scenario has an explicit 15-second ceiling and passed in two fresh complete E2E processes |
 
 Focused evidence retained from the thematic slices includes:
 
@@ -54,10 +56,10 @@ All commands below were run from the repository or `mcp-server` as appropriate a
 
 | Gate | Result |
 |---|---|
-| `npm test` | **51 files, 860/860 tests GREEN** |
+| `npm test` | **51 files, 869/869 tests GREEN** |
 | `npm run build` | GREEN |
-| pinned `phase1a.e2e.test.ts`, fresh process 1 | **27/27 GREEN**, 29.32 s |
-| pinned `phase1a.e2e.test.ts`, fresh process 2 | **27/27 GREEN**, 33.20 s |
+| pinned `phase1a.e2e.test.ts`, fresh process 1 | **27/27 GREEN**, 40.21 s |
+| pinned `phase1a.e2e.test.ts`, fresh process 2 | **27/27 GREEN**, 45.31 s |
 | `npm test -- --run cli-entry` | **5/5 GREEN** |
 | `bash -n install.sh` | GREEN |
 | isolated-HOME `scripts/test-install-safety.sh` | `installer safety: ok` |
@@ -102,6 +104,9 @@ af13985  Preflight fixture pre-verification
 5daf625  Full corrected high-risk adversarial gate
 c186ff7  Explicit fake home fixtures
 ca12cd0  Project/register + Task/finish journal-gap gates
+c5257a6  Punctuation-framed host-path rejection
+6b28720  Framed file-URI path rejection
+79c4053  Explicit takeover E2E runtime bound
 ```
 
 The complete ordered commit list is available via:
