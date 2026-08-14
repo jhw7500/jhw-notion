@@ -287,10 +287,18 @@ describe("PreflightService", () => {
     expect(writes).toEqual(["2026-08-13", "2026-08-12"]);
   });
 
-  it("fails closed when the project-only credential sees no immutable content ID", async () => {
-    const { preflight } = service({ project: projectPort({ verifyItemContentId: async () => undefined }) });
+  it.each([
+    ["missing", undefined],
+    ["wrong", "I_other"],
+  ])("fails closed before add when the configured Project item has %s source identity", async (_label, contentId) => {
+    let addCalls = 0;
+    const { preflight } = service({ project: projectPort({
+      verifyItemContentId: async () => contentId,
+      addPreflightItem: async () => { addCalls += 1; return "PVTI_new"; },
+    }) });
 
     await expect(preflight.run()).rejects.toMatchObject({ code: "PREFLIGHT_PROJECT_INTEGRITY" });
+    expect(addCalls).toBe(0);
   });
 
   it("preserves Project transport failures instead of misclassifying them as scope", async () => {

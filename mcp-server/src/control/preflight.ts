@@ -251,9 +251,12 @@ export class PreflightService {
     await this.options.project.verifyFields();
     let attachedItemId: string;
     try {
-      attachedItemId = await this.options.project.addPreflightItem(issue.node_id);
       const contentId = await this.options.project.verifyItemContentId(this.options.config.preflightProjectItemId);
-      if (attachedItemId !== this.options.config.preflightProjectItemId || contentId !== issue.node_id) {
+      if (contentId !== issue.node_id) {
+        throw new ControlError("PREFLIGHT_PROJECT_INTEGRITY", "Configured Project fixture does not match its source Issue");
+      }
+      attachedItemId = await this.options.project.addPreflightItem(issue.node_id);
+      if (attachedItemId !== this.options.config.preflightProjectItemId) {
         throw new ControlError("PREFLIGHT_PROJECT_INTEGRITY", "Project fixture attachment does not match its source Issue");
       }
     } catch (cause) {
