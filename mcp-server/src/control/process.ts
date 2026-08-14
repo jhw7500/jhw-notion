@@ -58,6 +58,22 @@ interface ChildExit {
   stopped?: "timeout" | "aborted";
 }
 
+function killChildTree(child: ChildProcess): void {
+  let groupKilled = false;
+  if (process.platform !== "win32" && typeof child.pid === "number" && child.pid > 0) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      groupKilled = true;
+    } catch {
+      // Fall back to the direct child below. Capture streams are closed in
+      // either case so an escaped descendant cannot retain our completion.
+    }
+  }
+  if (!groupKilled) child.kill("SIGKILL");
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+}
+
 /** Waits for close while forcing a deterministic hard stop at either boundary. */
 function waitForChild(child: ChildProcess, options: ProcessRunOptions): Promise<ChildExit> {
   const deadline = timeoutMs(options);
@@ -74,7 +90,7 @@ function waitForChild(child: ChildProcess, options: ProcessRunOptions): Promise<
     const stop = (reason: NonNullable<ChildExit["stopped"]>) => {
       if (settled || stopped) return;
       stopped = reason;
-      child.kill("SIGKILL");
+      killChildTree(child);
     };
     const abort = () => stop("aborted");
     const timer = setTimeout(() => stop("timeout"), deadline);
@@ -227,7 +243,10 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
       pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       emitAvailable();
     });
-    stream.once("end", () => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       pending += decoder.end();
       const spans = secretSpans(pending, secrets);
       const prefixLength = partialSecretPrefixLength(pending, secrets);
@@ -235,7 +254,9 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
       append(renderMasked(pending, mergeSecretSpans(spans)));
       pending = "";
       resolve(Buffer.concat(chunks));
-    });
+    };
+    stream.once("end", finish);
+    stream.once("close", finish);
     stream.once("error", reject);
   });
 }
@@ -281,6 +302,7 @@ export class ProcessRunner {
       child = spawn(command, args, {
         cwd: options.cwd,
         env: sanitizedChildEnvironment(rawEnvironment),
+        detached: process.platform !== "win32",
         // stderr is intentionally not captured: an arbitrary blob error must
         // never become an unredacted diagnostic payload.
         stdio: ["ignore", "pipe", "ignore"],
@@ -315,6 +337,7 @@ export class ProcessRunner {
         captured += bytes.length;
       });
       child.stdout?.once("end", () => resolve(snapshot()));
+      child.stdout?.once("close", () => resolve(snapshot()));
       child.stdout?.once("error", reject);
       // A failed spawn is not guaranteed to emit stdout's `end`; settle this
       // capture as well so the stable command error below can be returned.
@@ -384,7 +407,12 @@ export class ProcessRunner {
     let child: ReturnType<typeof spawn>;
 
     try {
-      child = spawn(command, args, { cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env,
+        detached: process.platform !== "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       throw new ControlError("COMMAND_FAILED", `Unable to start command: ${safeCommand}`, {

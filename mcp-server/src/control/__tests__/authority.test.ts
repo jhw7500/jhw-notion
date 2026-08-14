@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -149,7 +151,7 @@ describe("Notion authority service", () => {
     expect(JSON.parse(await readFile(cachePath, "utf8"))).toEqual({ authority_epoch: 4, mode: "registry" });
   });
 
-  it("serializes observations so a delayed stale caller cannot overwrite a newer epoch", async () => {
+  it("fails closed for a concurrent observation and accepts an explicit later observation", async () => {
     const { cachePath } = await temporaryCache();
     let staleReadStarted!: () => void;
     let releaseStale!: () => void;
@@ -172,10 +174,11 @@ describe("Notion authority service", () => {
 
     const staleLoad = stale.load();
     await started;
-    const freshLoad = fresh.load();
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    const concurrent = await fresh.load().catch((cause: unknown) => cause);
+    expect(concurrent).toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
     releaseStale();
-    await Promise.all([staleLoad, freshLoad]);
+    await expect(staleLoad).resolves.toMatchObject({ authority_epoch: 1, mode: "legacy" });
+    await expect(fresh.load()).resolves.toMatchObject({ authority_epoch: 2, mode: "registry" });
 
     expect(JSON.parse(await readFile(cachePath, "utf8"))).toEqual({ authority_epoch: 2, mode: "registry" });
   });
@@ -404,6 +407,39 @@ describe("Notion authority service", () => {
     await expect(service.load()).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
     expect((await lstat(external)).mode & 0o777).toBe(0o644);
     expect(await readFile(external, "utf8")).toBe("outside");
+  });
+
+  it("fails closed without waiting when another process holds the authority cache lock", async () => {
+    const { root, cachePath } = await temporaryCache();
+    const lockPath = join(root, "authority-cache.lock");
+    await writeFile(lockPath, "");
+    const holder = spawn("flock", ["-x", lockPath, "sh", "-c", "printf ready; cat"], {
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    await once(holder.stdout!, "data");
+    const service = createAuthorityService({
+      readCentral: async () => authority(9, "legacy"),
+      cachePath,
+      writesDisabled: false,
+    });
+    let settled = false;
+    const pending = service.load().catch((cause: unknown) => cause);
+    pending.finally(() => { settled = true; }).catch(() => undefined);
+
+    try {
+      for (let turn = 0; turn < 10_000 && !settled; turn += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      const settledBeforeRelease = settled;
+      holder.stdin!.end();
+      const result = await pending;
+
+      expect(settledBeforeRelease).toBe(true);
+      expect(result).toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
+    } finally {
+      holder.stdin!.end();
+      if (holder.exitCode === null) await once(holder, "close");
+    }
   });
 
   it("emits stable structured routing text and lets local configuration only disable more writes", async () => {

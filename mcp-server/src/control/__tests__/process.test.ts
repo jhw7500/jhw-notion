@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -141,6 +141,56 @@ describe("control process boundary", () => {
     expect(error).toMatchObject({ code: "COMMAND_TIMEOUT" });
     expect(JSON.stringify(error)).not.toContain("setInterval");
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it.each(["captured", "raw"] as const)("aborts a %s process tree whose descendant retains the capture pipes", async (kind) => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-control-process-tree-"));
+    const marker = join(root, "descendant.pid");
+    const controller = new AbortController();
+    let descendantPid: number | undefined;
+    let settled = false;
+    const script = [
+      "const {spawn}=require('node:child_process');",
+      "const {writeFileSync}=require('node:fs');",
+      "const child=spawn(process.execPath,['-e','setInterval(()=>undefined,1000)'],{stdio:['ignore',process.stdout,process.stderr]});",
+      "writeFileSync(process.argv[1],String(child.pid));",
+      "setInterval(()=>undefined,1000);",
+    ].join("");
+    const runner = new ProcessRunner({});
+    const pending = (kind === "captured"
+      ? runner.run(process.execPath, ["-e", script, marker], { signal: controller.signal })
+      : runner.runRaw(process.execPath, ["-e", script, marker], { signal: controller.signal }, 64)
+    ).catch((cause: unknown) => cause);
+    pending.finally(() => { settled = true; }).catch(() => undefined);
+
+    try {
+      for (let turn = 0; turn < 10_000 && descendantPid === undefined; turn += 1) {
+        try {
+          descendantPid = Number.parseInt(await readFile(marker, "utf8"), 10);
+        } catch (cause) {
+          if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+      }
+      expect(Number.isSafeInteger(descendantPid)).toBe(true);
+      controller.abort();
+      for (let turn = 0; turn < 10_000 && !settled; turn += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      const settledBeforeCleanup = settled;
+      if (!settled && descendantPid) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* already stopped */ }
+      }
+      const error = await pending;
+
+      expect(settledBeforeCleanup).toBe(true);
+      expect(error).toMatchObject({ code: "COMMAND_ABORTED" });
+    } finally {
+      if (descendantPid) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* already stopped */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("kills a hanging raw command without returning partial blob bytes", async () => {

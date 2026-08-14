@@ -229,7 +229,7 @@ function acquireLock(file: FileHandle): Promise<void> {
   return new Promise((resolve, reject) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("flock", ["-x", "3"], {
+      child = spawn("flock", ["-x", "-n", "3"], {
         env: { PATH: process.env.PATH },
         stdio: ["ignore", "ignore", "ignore", file.fd],
       });
