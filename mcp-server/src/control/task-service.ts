@@ -492,6 +492,7 @@ export class TaskService {
 
   async finish(input: TaskFinishInput): Promise<TaskFinishResult> {
     this.sensitiveData.assertSafe(input);
+    assertNoAbsoluteHostPaths(input);
     assertFinishInput(input);
     const active = await this.assertOwner(input.task_id, input.claim_id);
     const inspection = await this.worktrees.inspect(active);

@@ -5,7 +5,11 @@ import { isAbsolute, join, relative, sep } from "node:path";
 import { ControlError } from "./errors.js";
 import type { RegistryRecordStore } from "./codec.js";
 import { OffsetDateTimeSchema, SourceTaskRevisionSchema } from "./schemas.js";
-import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import {
+  assertNoAbsoluteHostPaths,
+  createSensitiveDataPolicy,
+  type SensitiveDataPolicy,
+} from "./sensitive-data.js";
 
 export const MAX_HANDOFF_BYTES = 12 * 1024;
 
@@ -91,7 +95,10 @@ export function buildHandoff(
 ): string {
   // Each section is independently truncated below. Scan them independently so
   // six valid bounded inputs do not consume one another's scan allowance.
-  for (const value of Object.values(input)) sensitiveData.assertSafe(value);
+  for (const value of Object.values(input)) {
+    sensitiveData.assertSafe(value);
+    assertNoAbsoluteHostPaths(value);
+  }
   const header = [
     `# Handoff: ${headerValue(input.task_id)}`,
     `source_task_id: ${headerValue(input.task_id)}`,
@@ -316,6 +323,7 @@ export async function writeWorktreeHandoff(
   sensitiveData: SensitiveDataPolicy = createSensitiveDataPolicy(process.env, [worktreePath]),
 ): Promise<string> {
   sensitiveData.assertSafe(content);
+  assertNoAbsoluteHostPaths(content);
   assertValidHandoff(content);
   const worktreeRoot = await rootDirectory(worktreePath, "UNSAFE_WORKTREE_PATH");
   const aiDirectory = await containedDirectory(worktreeRoot, ".ai", "UNSAFE_HANDOFF_PATH");
@@ -337,6 +345,7 @@ export async function writeRegistryHandoff(
   sensitiveData: SensitiveDataPolicy = createSensitiveDataPolicy(),
 ): Promise<{ path: string; changed: boolean }> {
   sensitiveData.assertSafe(content);
+  assertNoAbsoluteHostPaths(content);
   const metadata = assertValidHandoff(content);
   if (metadata.task_id !== taskId || metadata.claim_id !== claimId) {
     throw new ControlError("INVALID_HANDOFF_EVIDENCE", "Handoff metadata does not match its Registry destination");

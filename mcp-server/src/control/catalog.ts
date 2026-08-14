@@ -195,7 +195,7 @@ export class Catalog {
           registration = { repository: indexed.repository, created: false };
           return noChanges();
         }
-        await this.assertRepositoryRenameAllowed(indexed.repository.id);
+        const migratedTaskPaths = await this.migrateRepositorySlugDependencies(indexed.repository, input.slug);
         const renamed = record(
           RepositoryRecordSchema,
           { ...indexed.repository, slug: input.slug },
@@ -203,7 +203,7 @@ export class Catalog {
         );
         await this.records.writeJson(repositoryRelativePath(renamed.id), renamed);
         registration = { repository: renamed, created: false };
-        return stage([repositoryRelativePath(renamed.id)]);
+        return stage([repositoryRelativePath(renamed.id), ...migratedTaskPaths]);
       }
 
       const existing = await this.repositoryAt(input.repo_id);
@@ -215,7 +215,9 @@ export class Catalog {
             requested_github_node_id: input.github_node_id,
           });
         }
-        if (existing.slug !== input.slug) await this.assertRepositoryRenameAllowed(existing.id);
+        const migratedTaskPaths = existing.slug === input.slug
+          ? []
+          : await this.migrateRepositorySlugDependencies(existing, input.slug);
         const renamed = existing.slug === input.slug
           ? existing
           : record(RepositoryRecordSchema, { ...existing, slug: input.slug }, "INVALID_REPOSITORY");
@@ -225,6 +227,7 @@ export class Catalog {
         return stage([
           ...(renamed === existing ? [] : [repositoryRelativePath(renamed.id)]),
           repositorySourceRelativePath(input.github_node_id),
+          ...migratedTaskPaths,
         ]);
       }
 
@@ -610,9 +613,13 @@ export class Catalog {
     }
   }
 
-  private async assertRepositoryRenameAllowed(repoId: string): Promise<void> {
+  private async migrateRepositorySlugDependencies(
+    repository: RepositoryRecord,
+    nextSlug: string,
+  ): Promise<string[]> {
     await this.auditTaskSourceIndexes();
     const names = await this.records.listRegularFileNames("tasks", maximumCatalogEntries);
+    const updates: FormalTask[] = [];
     for (const name of names) {
       if (!/^tsk-[0-9a-f-]+\.yaml$/.test(name)) {
         throw corruption("Task directory contains a non-canonical record name", { entry: name });
@@ -620,13 +627,26 @@ export class Catalog {
       const taskId = name.slice(0, -".yaml".length);
       if (!taskIdPattern.test(taskId)) throw corruption("Task directory contains a malformed Task ID", { entry: name });
       const task = await this.taskAt(taskId);
-      if (task.kind === "formal" && task.repo_id === repoId) {
-        throw new ControlError(
-          "REPOSITORY_RENAME_CONFLICT",
-          "Repository slug cannot change while canonical formal Tasks depend on it",
-        );
+      if (task.kind !== "formal" || task.repo_id !== repository.id) continue;
+      const coordinates = task.issue_url.match(canonicalIssueUrlPattern);
+      const issueNumber = coordinates?.[3];
+      const previousIssueSlug = coordinates ? `${coordinates[1]}/${coordinates[2]}` : undefined;
+      if (!coordinates || !issueNumber || !previousIssueSlug || !sameGithubSlug(previousIssueSlug, repository.slug)) {
+        throw corruption("Formal Task locator disagrees with the Repository being renamed", { task_id: task.id });
       }
+      const previousAlias = `${coordinates[1]}/${coordinates[2]}#${issueNumber}`;
+      const nextAlias = `${nextSlug}#${issueNumber}`;
+      await this.assertAliasAvailable(nextAlias, task.id);
+      const aliases = task.aliases.map((alias) => alias === previousAlias ? nextAlias : alias);
+      const updated = record(FormalTaskSchema, {
+        ...task,
+        aliases,
+        issue_url: `https://github.com/${nextSlug}/issues/${issueNumber}`,
+      }, "INVALID_FORMAL_TASK");
+      updates.push(updated);
     }
+    for (const task of updates) await this.records.writeJson(taskRelativePath(task.id), task);
+    return updates.map((task) => taskRelativePath(task.id));
   }
 
   private async auditTaskSourceIndexes(): Promise<void> {

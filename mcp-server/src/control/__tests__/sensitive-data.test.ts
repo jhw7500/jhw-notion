@@ -77,6 +77,7 @@ describe("SensitiveDataPolicy", () => {
       "https://github.com/owner/repository/issues/1",
       "owner/repository#1",
       "docs/project-control/runbook.md",
+      "<div>safe HTML</div>",
     ])).not.toThrow();
   });
 

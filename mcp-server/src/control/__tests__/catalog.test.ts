@@ -221,19 +221,33 @@ describe("Catalog", () => {
     await expect(catalog.getRepository(repositoryInput.repo_id)).resolves.toMatchObject({ slug: "jhw7500/wlan-renamed" });
   });
 
-  it("refuses a Repository slug rename that would strand a dependent formal Task", async () => {
-    const { catalog, fixture } = await catalogFixture();
+  it("atomically migrates dependent formal Task locators on a verified same-node Repository rename", async () => {
+    const { catalog } = await catalogFixture();
     await catalog.registerRepository(repositoryInput);
-    await catalog.registerFormalTask(issueInput);
-    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const formal = await catalog.registerFormalTask(issueInput);
+    const renamedSlug = "jhw7500/wlan-renamed";
+    const renamedIssue = {
+      ...issueInput,
+      issue_url: `https://github.com/${renamedSlug}/issues/1`,
+      alias: `${renamedSlug}#1`,
+    };
 
     await expect(catalog.registerRepository({
       ...repositoryInput,
-      slug: "jhw7500/wlan-renamed",
-    })).rejects.toMatchObject({ code: "REPOSITORY_RENAME_CONFLICT" });
+      slug: renamedSlug,
+    })).resolves.toMatchObject({ repository: { slug: renamedSlug }, created: false });
 
-    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
-    await expect(catalog.getRepository(repositoryInput.repo_id)).resolves.toMatchObject({ slug: repositoryInput.slug });
+    await expect(catalog.getTask(formal.task.id)).resolves.toMatchObject({
+      id: formal.task.id,
+      repo_id: repositoryInput.repo_id,
+      issue_node_id: issueInput.issue_node_id,
+      issue_url: renamedIssue.issue_url,
+      aliases: [renamedIssue.alias],
+    });
+    await expect(catalog.registerFormalTask(renamedIssue)).resolves.toMatchObject({
+      task: { id: formal.task.id, issue_url: renamedIssue.issue_url, aliases: [renamedIssue.alias] },
+      created: false,
+    });
   });
 
   it("requires a canonical Repository record before creating any Task", async () => {

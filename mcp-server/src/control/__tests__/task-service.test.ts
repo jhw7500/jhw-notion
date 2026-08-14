@@ -228,6 +228,28 @@ describe("TaskService", () => {
     await expect(readFile(join(worktreePath, ".ai", "handoff.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it.each([
+    "continue from /tmp/private-note",
+    "continue from C:\\private\\note.txt",
+    "continue from file:///tmp/private-note",
+  ])("rejects absolute-path Handoff content before any mutation: %s", async (progress) => {
+    const { tasks, claims, worktrees, registry, worktreePath } = await taskFixture();
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      progress,
+      validation: ["targeted tests pass"],
+    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+
+    expect(claims.assertOwner).not.toHaveBeenCalled();
+    expect(worktrees.inspect).not.toHaveBeenCalled();
+    expect(registry.transact).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+    await expect(readFile(join(worktreePath, ".ai", "handoff.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("rejects protected finish content before reading or mutating Claim/worktree state", async () => {
     const secret = "unmistakably-fake-task-token";
     const { tasks, claims, worktrees } = await taskFixture(createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
@@ -708,8 +730,8 @@ describe("TaskService", () => {
       source_task_revision: activeClaim.source_task_revision,
       claim_id: CLAIM_ID,
       generated_at: "2026-08-13T12:36:56.789Z",
-      progress: "Continue from /srv/private/source-checkout/src/control/task-service.ts",
-    });
+      progress: "safe placeholder",
+    }).replace("safe placeholder", "Continue from /srv/private/source-checkout/src/control/task-service.ts");
     await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
     await writeFile(join(fixture.registryDir, relativePath), content, "utf8");
     claims.getClaimHistory.mockResolvedValue({

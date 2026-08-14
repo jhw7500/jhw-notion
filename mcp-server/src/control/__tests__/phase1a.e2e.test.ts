@@ -1667,4 +1667,73 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const historyDirectory = join(fixture.cloneA, "claims", "history", "2026", active.task.task_id);
     expect((await readdir(historyDirectory)).filter((name) => name === `${active.claim.claim_id}.yaml`)).toHaveLength(1);
   }, 20_000);
+
+  it("28. verified same-node Repository rename migrates a formal Task and keeps explicit resume usable", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const renamedSlug = "jhw7500/control-renamed";
+    await git(fixture.sourceRepo, "remote", "add", "origin", `git@github.com:${renamedSlug}.git`);
+
+    const sourceRunner: GitHubSourceRunner = {
+      run: graph.runner.run.bind(graph.runner),
+      async runGh(args: string[], credential: "project" | "repo"): Promise<ProcessResult> {
+        expect(credential).toBe("repo");
+        const route = args[1];
+        if (route === `repos/${renamedSlug}`) {
+          return {
+            command: "gh", args, stderr: "", exitCode: 0,
+            stdout: `${JSON.stringify({ node_id: repositoryInput.github_node_id, full_name: renamedSlug, private: true })}\n`,
+          };
+        }
+        if (route === `repos/${renamedSlug}/issues/1`) {
+          return {
+            command: "gh", args, stderr: "", exitCode: 0,
+            stdout: `${JSON.stringify({
+              node_id: issueInput.issue_node_id,
+              number: 1,
+              html_url: `https://github.com/${renamedSlug}/issues/1`,
+              updated_at: issueInput.issue_revision,
+              state: "open",
+            })}\n`,
+          };
+        }
+        throw new Error(`Unexpected fake GitHub route: ${route ?? "missing"}`);
+      },
+    };
+    const source = new GitHubSourceService({
+      runner: sourceRunner,
+      catalog: graph.catalog,
+      projects: { requireProjectRepository: async () => undefined },
+    });
+
+    await expect(source.registerRepository({
+      repo_id: repositoryInput.repo_id,
+      slug: renamedSlug,
+      repository_path: fixture.sourceRepo,
+    })).resolves.toMatchObject({
+      repository: { id: repositoryInput.repo_id, github_node_id: repositoryInput.github_node_id, slug: renamedSlug },
+      created: false,
+    });
+    await expect(graph.catalog.getTask(formal.id)).resolves.toMatchObject({
+      id: formal.id,
+      issue_node_id: issueInput.issue_node_id,
+      issue_url: `https://github.com/${renamedSlug}/issues/1`,
+      aliases: [`${renamedSlug}#1`],
+    });
+
+    const resumed = await runCli([
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-after-repository-rename",
+    ], cliDependencies(graph, { source }));
+    expect(resumed.exitCode).toBe(0);
+    expect(JSON.parse(resumed.stdout).result).toMatchObject({
+      task: { task_id: formal.id },
+      claim: { task_id: formal.id },
+    });
+    await expect(graph.claims.getActive(formal.id)).resolves.toMatchObject({
+      task_id: formal.id,
+      task_alias: `${renamedSlug}#1`,
+    });
+  }, 20_000);
 });
