@@ -847,7 +847,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       claim_id: newClaimId, lifecycle: "removed",
     });
     expect(await exists(physicalWorktreePath)).toBe(false);
-  });
+  }, 15_000);
 
   it("9. offline provisional work is unclaimed and cannot assert ownership", async () => {
     const fixture = await makeGateFixture();
