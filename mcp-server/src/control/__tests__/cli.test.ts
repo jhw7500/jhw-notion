@@ -784,7 +784,7 @@ describe("runCli", () => {
     expect(result.stdout).not.toContain("Prove the trial flow");
   });
 
-  it("rejects an oversized success envelope from a control port", async () => {
+  it("rejects oversized Project coordinates at the result schema boundary", async () => {
     const dependencies = makeCliDependencies({
       portfolio: {
         registerProject: vi.fn().mockResolvedValue({
@@ -797,6 +797,31 @@ describe("runCli", () => {
     });
 
     const result = await runCli(registerArgs(), dependencies);
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "INVALID_PROJECT_REGISTRATION_RESULT" } });
+    expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
+  });
+
+  it("rejects any remaining oversized read-only command envelope", async () => {
+    const dependencies = makeCliDependencies({
+      taskService: {
+        status: vi.fn().mockResolvedValue({
+          active: { ...activeClaim, host: "h".repeat(20_000) },
+          worktree: {
+            branch: activeClaim.branch,
+            worktree_ref: activeClaim.worktree_ref,
+            head_sha: "0123456789abcdef",
+            dirty: false,
+            dirty_files: [],
+            ahead: 0,
+            behind: 0,
+          },
+        }),
+      },
+    });
+
+    const result = await runCli(["task", "status", "--task", TASK_ID, "--claim", CLAIM_ID], dependencies);
 
     expect(result.exitCode).toBe(1);
     expect(JSON.parse(result.stderr)).toEqual({ error: { code: "CLI_OUTPUT_TOO_LARGE" } });

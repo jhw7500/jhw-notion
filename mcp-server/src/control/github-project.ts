@@ -34,6 +34,8 @@ const REQUIRED_FIELD_TYPES = {
   "Next Action": "TEXT",
   "Last Reviewed": "DATE",
 } as const;
+const apiId = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
+const apiName = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
 
 const PROJECT_QUERY = `query ProjectPage($owner: String!, $number: Int!, $fieldCursor: String, $itemCursor: String) {
   user(login: $owner) {
@@ -155,13 +157,13 @@ const PREFLIGHT_ITEM_QUERY = `query PreflightItem($itemId: ID!) {
   }
 }`;
 
-const PageInfoSchema = z.object({ hasNextPage: z.boolean(), endCursor: z.string().min(1).nullable() }).strict();
+const PageInfoSchema = z.object({ hasNextPage: z.boolean(), endCursor: apiId.nullable() }).strict();
 const FieldNodeSchema = z.object({
-  __typename: z.string().min(1),
-  id: z.string().min(1),
-  name: z.string().min(1),
-  dataType: z.string().min(1),
-  options: z.array(z.object({ id: z.string().min(1), name: z.string().min(1) }).strict()).optional(),
+  __typename: apiName,
+  id: apiId,
+  name: apiName,
+  dataType: apiName,
+  options: z.array(z.object({ id: apiId, name: apiName }).strict()).max(100).optional(),
 }).passthrough();
 const FieldConnectionSchema = z.object({
   totalCount: z.number().int().nonnegative(),
@@ -170,15 +172,15 @@ const FieldConnectionSchema = z.object({
 }).strict();
 const SelectValueSchema = z.object({
   __typename: z.literal("ProjectV2ItemFieldSingleSelectValue"),
-  optionId: z.string().min(1),
-  name: z.string().min(1),
+  optionId: apiId,
+  name: apiName,
 }).strict();
-const TextValueSchema = z.object({ __typename: z.literal("ProjectV2ItemFieldTextValue"), text: z.string() }).strict();
-const DateValueSchema = z.object({ __typename: z.literal("ProjectV2ItemFieldDateValue"), date: z.string() }).strict();
+const TextValueSchema = z.object({ __typename: z.literal("ProjectV2ItemFieldTextValue"), text: z.string().max(4096) }).strict();
+const DateValueSchema = z.object({ __typename: z.literal("ProjectV2ItemFieldDateValue"), date: z.string().max(64) }).strict();
 const ItemNodeSchema = z.object({
-  id: z.string().min(1),
+  id: apiId,
   isArchived: z.boolean(),
-  type: z.string().min(1),
+  type: apiName,
   content: z.unknown().nullable(),
   status: z.unknown().nullable(),
   priority: z.unknown().nullable(),
@@ -195,9 +197,9 @@ const ProjectEnvelopeSchema = z.object({
   data: z.object({
     user: z.object({
       projectV2: z.object({
-        id: z.string().min(1),
+        id: apiId,
         public: z.boolean(),
-        updatedAt: z.string().min(1),
+        updatedAt: z.string().max(64).datetime({ offset: true }),
         fields: FieldConnectionSchema.optional(),
         items: ItemConnectionSchema.optional(),
       }).passthrough().nullable(),
@@ -205,29 +207,29 @@ const ProjectEnvelopeSchema = z.object({
   }).strict(),
 }).passthrough();
 const IssueSchema = z.object({
-  node_id: z.string().min(1),
-  number: z.number().int().positive(),
-  title: z.string().min(1),
-  body: z.string().nullable(),
-  labels: z.array(z.object({ name: z.string().min(1) }).passthrough()),
+  node_id: apiId,
+  number: z.number().int().positive().safe(),
+  title: z.string().min(1).max(256),
+  body: z.string().max(64 * 1024).nullable(),
+  labels: z.array(z.object({ name: apiName }).passthrough()).max(100),
   pull_request: z.unknown().optional(),
 }).passthrough();
 const IssuePagesSchema = z.array(z.array(IssueSchema).max(100)).max(MAX_ISSUE_PAGES);
 const MutationItemSchema = z.object({
-  data: z.object({ addProjectV2ItemById: z.object({ item: z.object({ id: z.string().min(1) }).strict() }).strict() }).strict(),
+  data: z.object({ addProjectV2ItemById: z.object({ item: z.object({ id: apiId }).strict() }).strict() }).strict(),
 }).passthrough();
 const MutationUpdateSchema = z.object({
-  data: z.object({ updateProjectV2ItemFieldValue: z.object({ projectV2Item: z.object({ id: z.string().min(1) }).strict() }).strict() }).strict(),
+  data: z.object({ updateProjectV2ItemFieldValue: z.object({ projectV2Item: z.object({ id: apiId }).strict() }).strict() }).strict(),
 }).passthrough();
 const MutationClearSchema = z.object({
-  data: z.object({ clearProjectV2ItemFieldValue: z.object({ projectV2Item: z.object({ id: z.string().min(1) }).strict() }).strict() }).strict(),
+  data: z.object({ clearProjectV2ItemFieldValue: z.object({ projectV2Item: z.object({ id: apiId }).strict() }).strict() }).strict(),
 }).passthrough();
 const PreflightItemSchema = z.object({
   data: z.object({
     node: z.object({
       __typename: z.literal("ProjectV2Item"),
-      id: z.string().min(1),
-      type: z.string().min(1),
+      id: apiId,
+      type: apiName,
       content: z.unknown().nullable(),
       lastReviewed: z.unknown().nullable(),
     }).strict().nullable(),
@@ -283,7 +285,7 @@ function jsonFrom<T>(stdout: string, schema: z.ZodType<T>, code: string): T {
     throw new ControlError(code, "GitHub GraphQL returned errors");
   }
   const parsed = schema.safeParse(raw);
-  if (!parsed.success) throw new ControlError(code, "GitHub response failed strict validation", { issues: parsed.error.issues });
+  if (!parsed.success) throw new ControlError(code, "GitHub response failed strict validation");
   return parsed.data;
 }
 
@@ -374,7 +376,7 @@ function issueEqual(issue: Issue, input: RegisterProjectInput): boolean {
 }
 
 function sourceId(raw: unknown): string | undefined {
-  const parsed = z.object({ __typename: z.literal("Issue"), id: z.string().min(1) }).strict().safeParse(raw);
+  const parsed = z.object({ __typename: z.literal("Issue"), id: apiId }).strict().safeParse(raw);
   return parsed.success ? parsed.data.id : undefined;
 }
 
@@ -471,9 +473,20 @@ export class GitHubProjectClient {
     return [["raw", `owner=${this.options.githubOwner}`], ["typed", `number=${this.options.projectNumber}`]];
   }
 
+  private projectResponse(stdout: string): ReturnType<typeof projectFrom> {
+    const project = projectFrom(stdout);
+    this.sensitiveData.assertSafe(project);
+    return project;
+  }
+
+  private safeApiResult<T>(value: T): T {
+    this.sensitiveData.assertSafe(value);
+    return value;
+  }
+
   private async initialPage(): Promise<InitialProjectPage> {
     this.assertSupportedOwner();
-    const project = projectFrom((await this.options.runner.runGh(graphqlArgs(PROJECT_QUERY, this.coordinates()), "project")).stdout);
+    const project = this.projectResponse((await this.options.runner.runGh(graphqlArgs(PROJECT_QUERY, this.coordinates()), "project")).stdout);
     if (!project.fields || !project.items) throw new ControlError("INVALID_PROJECT_RESPONSE", "Initial Project response is incomplete");
     return { projectId: project.id, revision: project.updatedAt, fields: project.fields, items: project.items };
   }
@@ -492,7 +505,7 @@ export class GitHubProjectClient {
     let pages = 1;
     while (next !== undefined) {
       if (pages++ >= MAX_PROJECT_PAGES) throw new ControlError("INCOMPLETE_PROJECT_FIELD_READ", "Project field pagination exceeded its safety bound");
-      const project = projectFrom((await this.options.runner.runGh(graphqlArgs(FIELDS_QUERY, [
+      const project = this.projectResponse((await this.options.runner.runGh(graphqlArgs(FIELDS_QUERY, [
         ...this.coordinates(), ["raw", `fieldCursor=${next}`],
       ]), "project")).stdout);
       this.assertStable(project, initial);
@@ -517,7 +530,7 @@ export class GitHubProjectClient {
     let pages = 1;
     while (next !== undefined) {
       if (pages++ >= MAX_PROJECT_PAGES) throw new ControlError("INCOMPLETE_PROJECT_READ", "Project item pagination exceeded its safety bound");
-      const project = projectFrom((await this.options.runner.runGh(graphqlArgs(ITEMS_QUERY, [
+      const project = this.projectResponse((await this.options.runner.runGh(graphqlArgs(ITEMS_QUERY, [
         ...this.coordinates(), ["raw", `itemCursor=${next}`],
       ]), "project")).stdout);
       this.assertStable(project, initial);
@@ -636,13 +649,13 @@ export class GitHubProjectClient {
   }
 
   private async addItem(projectId: string, contentId: string): Promise<string> {
-    const result = jsonFrom(
+    const result = this.safeApiResult(jsonFrom(
       (await this.options.runner.runGh(graphqlArgs(ADD_ITEM_MUTATION, [
         ["raw", `projectId=${projectId}`], ["raw", `contentId=${contentId}`],
       ]), "project")).stdout,
       MutationItemSchema,
       "INVALID_PROJECT_MUTATION",
-    );
+    ));
     return result.data.addProjectV2ItemById.item.id;
   }
 
@@ -658,7 +671,7 @@ export class GitHubProjectClient {
     const query = kind === "single" ? SET_SINGLE_MUTATION : kind === "text" ? SET_TEXT_MUTATION : SET_DATE_MUTATION;
     const variableName = kind === "single" ? "optionId" : kind === "text" ? "text" : "date";
     const variableValue = kind === "single" ? optionId(field, value) : value;
-    const result = jsonFrom(
+    const result = this.safeApiResult(jsonFrom(
       (await this.options.runner.runGh(graphqlArgs(query, [
         ["raw", `projectId=${structure.projectId}`],
         ["raw", `itemId=${itemId}`],
@@ -667,7 +680,7 @@ export class GitHubProjectClient {
       ]), "project")).stdout,
       MutationUpdateSchema,
       "INVALID_PROJECT_MUTATION",
-    );
+    ));
     if (result.data.updateProjectV2ItemFieldValue.projectV2Item.id !== itemId) {
       throw new ControlError("INVALID_PROJECT_MUTATION", "Project field mutation returned another item ID");
     }
@@ -682,13 +695,21 @@ export class GitHubProjectClient {
       if (!source) throw new ControlError("PROJECT_SOURCE_REDACTED", "Project item source identity is unavailable", { project_item_id: node.id });
       return { node, source, fields: operatingFields(node, structure) };
     });
+    if (new Set(parsedItems.map(({ source }) => source)).size !== parsedItems.length) {
+      throw new ControlError("DUPLICATE_PROJECT_ITEM", "One Project Record source is attached more than once");
+    }
     const issues = await this.listProjectRecordIssues();
     const byNode = new Map(issues.map((issue) => [issue.node_id, issue]));
     const output: ProjectSnapshotItem[] = [];
+    const seenProjectIds = new Set<string>();
     for (const { node, source, fields } of parsedItems) {
       const issue = byNode.get(source);
       if (!issue) throw new ControlError("PROJECT_RECORD_NOT_FOUND", "Project item is not backed by a trial Registry Issue", { project_item_id: node.id });
       const body = projectBody(issue.body);
+      if (seenProjectIds.has(body.id)) {
+        throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple Project Record Issues claim one canonical Project ID");
+      }
+      seenProjectIds.add(body.id);
       await Promise.all(body.repositories.map((repoId) => this.options.catalog.getRepository(repoId)));
       const nextTask = taskId(fields);
       if (nextTask) await this.options.catalog.getTask(nextTask);
@@ -719,14 +740,13 @@ export class GitHubProjectClient {
   async requireProjectRepository(projectId: string, repoId: string): Promise<void> {
     const initial = await this.initialPage();
     const itemNodes = await this.items(initial);
-    const matches: Array<{ issue: Issue; body: ProjectRecordBody }> = [];
-    for (const issue of await this.listProjectRecordIssues()) {
-      const body = projectBody(issue.body);
-      if (body.id === projectId) matches.push({ issue, body });
-    }
+    const matches = (await this.canonicalProjectRecords(projectId)).map((issue) => ({ issue, body: projectBody(issue.body) }));
     if (matches.length === 0) throw new ControlError("PROJECT_RECORD_NOT_FOUND", "Canonical Project Record does not exist");
     if (matches.length !== 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Canonical Project Record is ambiguous");
     const match = matches[0] as { issue: Issue; body: ProjectRecordBody };
+    if (!hasLabels(match.issue, PROJECT_RECORD_LABELS)) {
+      throw new ControlError("PROJECT_RECORD_LABEL_RECOVERY_REQUIRED", "Canonical Project Record is missing required classification labels");
+    }
     if (!match.body.repositories.includes(repoId)) {
       throw new ControlError("PROJECT_REPOSITORY_MISMATCH", "Project Record does not contain the canonical Repository");
     }
@@ -826,11 +846,11 @@ export class GitHubProjectClient {
   }
 
   private async preflightItem(itemId: string): Promise<z.infer<typeof PreflightItemSchema>["data"]["node"]> {
-    return jsonFrom(
+    return this.safeApiResult(jsonFrom(
       (await this.options.runner.runGh(graphqlArgs(PREFLIGHT_ITEM_QUERY, [["raw", `itemId=${itemId}`]]), "project")).stdout,
       PreflightItemSchema,
       "INVALID_PREFLIGHT_ITEM",
-    ).data.node;
+    )).data.node;
   }
 
   async verifyItemContentId(itemId: string): Promise<string | undefined> {
@@ -860,13 +880,13 @@ export class GitHubProjectClient {
     const structure = this.preflightStructure;
     const field = structure?.byName.get("Last Reviewed");
     if (!structure || !field) throw new ControlError("PREFLIGHT_SEQUENCE_INVALID", "Project fields must be verified before the date probe");
-    const result = jsonFrom(
+    const result = this.safeApiResult(jsonFrom(
       (await this.options.runner.runGh(graphqlArgs(CLEAR_FIELD_MUTATION, [
         ["raw", `projectId=${structure.projectId}`], ["raw", `itemId=${itemId}`], ["raw", `fieldId=${field.id}`],
       ]), "project")).stdout,
       MutationClearSchema,
       "INVALID_PROJECT_MUTATION",
-    );
+    ));
     if (result.data.clearProjectV2ItemFieldValue.projectV2Item.id !== itemId) {
       throw new ControlError("INVALID_PROJECT_MUTATION", "Project clear mutation returned another item ID");
     }

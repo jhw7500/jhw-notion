@@ -153,6 +153,20 @@ describe("GitHubProjectClient", () => {
     await expect(client(gh).requireProjectRepository("prj-project-1", "repo-control")).resolves.toBeUndefined();
   });
 
+  it("rejects an unlabeled canonical duplicate during Project membership proof", async () => {
+    const gh = new QueuedGhRunner();
+    const complete = issueFixture(1);
+    const unlabeled = { ...complete, node_id: "I_duplicate", number: 2, labels: [] };
+    gh.enqueue(
+      projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null }),
+      [[complete, unlabeled]],
+    );
+
+    await expect(client(gh).requireProjectRepository("prj-project-1", "repo-control")).rejects.toMatchObject({
+      code: "DUPLICATE_PROJECT_RECORD",
+    });
+  });
+
   it("rejects missing Repository membership or an unattached Project Record", async () => {
     const wrongRepo = new QueuedGhRunner();
     wrongRepo.enqueue(
@@ -239,6 +253,97 @@ describe("GitHubProjectClient", () => {
     optionPage.data.user.projectV2.items.nodes[0]!.priority.name = "P9";
     badOption.enqueue(optionPage);
     await expect(client(badOption).readAll()).rejects.toMatchObject({ code: "INVALID_PROJECT_ITEM" });
+  });
+
+  it("rejects duplicate source attachments before portfolio rows are emitted", async () => {
+    const gh = new QueuedGhRunner();
+    const page = projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null });
+    page.data.user.projectV2.items.nodes[1]!.content = { __typename: "Issue", id: "I_1" };
+    gh.enqueue(page, [[issueFixture(1)]]);
+
+    await expect(client(gh).readAll()).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_ITEM" });
+  });
+
+  it("rejects two Project Record Issues that claim one canonical Project ID", async () => {
+    const gh = new QueuedGhRunner();
+    const duplicate = issueFixture(2);
+    duplicate.body = JSON.stringify({ id: "prj-project-1", objective: "Other", repositories: ["repo-control"] });
+    gh.enqueue(
+      projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null }),
+      [[issueFixture(1), duplicate]],
+    );
+
+    await expect(client(gh).readAll()).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_RECORD" });
+  });
+
+  it("rejects protected or oversized API coordinates before they can be reused outbound", async () => {
+    const secret = "unmistakably-fake-project-api-token";
+    for (const [kind, mutate, expectedCode] of [
+      ["protected", (page: ReturnType<typeof projectPageFixture>) => { page.data.user.projectV2.fields.nodes[0]!.id = secret; }, "SENSITIVE_DATA_REJECTED"],
+      ["oversized", (page: ReturnType<typeof projectPageFixture>) => { page.data.user.projectV2.id = `PVT_${"x".repeat(300)}`; }, "INVALID_PROJECT_RESPONSE"],
+    ] as const) {
+      const gh = new QueuedGhRunner();
+      const page = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });
+      mutate(page);
+      gh.enqueue(page);
+      const github = new GitHubProjectClient({
+        githubOwner: "owner",
+        projectNumber: 7,
+        registryRepository: "owner/registry",
+        preflightProjectItemId: "PVTI_preflight",
+        runner: gh,
+        catalog: catalogFixture(),
+        sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+      });
+
+      const error = await github.readAll().catch((cause: unknown) => cause);
+      expect(error, kind).toMatchObject({ code: expectedCode });
+      expect(gh.calls, kind).toHaveLength(1);
+      expect(JSON.stringify(error), kind).not.toContain(secret);
+    }
+  });
+
+  it("rejects a protected mutation result before any follow-up Project call", async () => {
+    const gh = new QueuedGhRunner();
+    const secret = "unmistakably-fake-project-mutation-token";
+    const issue = {
+      node_id: "I_new",
+      number: 77,
+      title: "Example",
+      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
+      labels: [{ name: "trial" }, { name: "project-record" }],
+    };
+    gh.enqueue(
+      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
+      [[]],
+      issue,
+      issue,
+      { data: { addProjectV2ItemById: { item: { id: secret } } } },
+    );
+    const github = new GitHubProjectClient({
+      githubOwner: "owner",
+      projectNumber: 7,
+      registryRepository: "owner/registry",
+      preflightProjectItemId: "PVTI_preflight",
+      runner: gh,
+      catalog: catalogFixture(),
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+
+    const error = await github.registerProject({
+      project_id: "prj-example",
+      title: "Example",
+      objective: "Prove the trial flow",
+      repo_ids: ["repo-example"],
+      fields: {
+        status: "proposed", priority: "P2", health: "unknown",
+        next_action: "wait:select-first-task", last_reviewed: "2026-08-13",
+      },
+    }).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(gh.calls).toHaveLength(5);
+    expect(JSON.stringify(error)).not.toContain(secret);
   });
 
   it("creates a verified trial Issue, attaches it, and writes all five fields", async () => {

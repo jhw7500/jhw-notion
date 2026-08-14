@@ -7,6 +7,7 @@ const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
 const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
 const timestamp = z.string().min(1);
 const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
+const githubApiId = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
 export const SourceTaskRevisionSchema = z.string().min(1).max(256);
 export const OffsetDateTimeSchema = z.string().min(1).max(64).datetime({ offset: true });
 export const TemporaryLifecycleSchema = z.enum(["active", "handoff", "completed", "abandoned"]);
@@ -174,12 +175,12 @@ export const ProjectRecordBodySchema = z
   .strict();
 export type ProjectRecordBody = z.infer<typeof ProjectRecordBodySchema>;
 
-export const ProjectFieldOptionSchema = z.object({ id: z.string().min(1), name: z.string().min(1) }).strict();
+export const ProjectFieldOptionSchema = z.object({ id: githubApiId, name: z.string().min(1).max(256) }).strict();
 export type ProjectFieldOption = z.infer<typeof ProjectFieldOptionSchema>;
 
 export const ProjectFieldDefinitionSchema = z
   .object({
-    id: z.string().min(1),
+    id: githubApiId,
     name: z.enum(["Status", "Priority", "Health", "Next Action", "Last Reviewed"]),
     data_type: z.enum(["SINGLE_SELECT", "TEXT", "DATE"]),
     options: z.array(ProjectFieldOptionSchema).optional(),
@@ -189,8 +190,8 @@ export type ProjectFieldDefinition = z.infer<typeof ProjectFieldDefinitionSchema
 
 export const ProjectSnapshotItemSchema = z
   .object({
-    project_item_id: z.string().min(1),
-    source_node_id: z.string().min(1),
+    project_item_id: githubApiId,
+    source_node_id: githubNodeId,
     project_id: projectId,
     title: z.string().min(1).max(256),
     objective: z.string().min(1).max(4096),
@@ -203,8 +204,8 @@ export type ProjectSnapshotItem = z.infer<typeof ProjectSnapshotItemSchema>;
 
 export const ProjectSnapshotSourceSchema = z
   .object({
-    project_node_id: z.string().min(1),
-    source_revision: z.string().min(1),
+    project_node_id: githubApiId,
+    source_revision: OffsetDateTimeSchema,
     field_definitions: z.array(ProjectFieldDefinitionSchema).length(5),
     items: z.array(ProjectSnapshotItemSchema),
     total_count: z.number().int().nonnegative(),
@@ -216,9 +217,9 @@ export type ProjectSnapshotSource = z.infer<typeof ProjectSnapshotSourceSchema>;
 export const ProjectRecordLinkSchema = z
   .object({
     project_id: projectId,
-    project_item_id: z.string().min(1),
-    source_node_id: z.string().min(1),
-    issue_number: z.number().int().positive(),
+    project_item_id: githubApiId,
+    source_node_id: githubNodeId,
+    issue_number: z.number().int().positive().safe(),
   })
   .strict();
 export type ProjectRecordLink = z.infer<typeof ProjectRecordLinkSchema>;
