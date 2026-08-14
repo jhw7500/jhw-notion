@@ -4,7 +4,7 @@ import { mkdir, open, readdir, rename, unlink, type FileHandle } from "node:fs/p
 
 import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
-import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   type ProjectRecordLink,
   type RegisterProjectInput,
@@ -64,9 +64,7 @@ interface DirectoryAnchor {
 function parseSource(raw: unknown): ProjectSnapshotSource {
   const parsed = ProjectSnapshotSourceSchema.safeParse(raw);
   if (!parsed.success) {
-    throw new ControlError("INVALID_PROJECT_SOURCE", "GitHub Project source failed strict validation", {
-      issues: parsed.error.issues,
-    });
+    throw new ControlError("INVALID_PROJECT_SOURCE", "GitHub Project source failed strict validation");
   }
   return parsed.data;
 }
@@ -340,8 +338,10 @@ export class PortfolioService {
   }
 
   async status(projectId?: string, pageId?: string): Promise<BoundedPayload> {
-    const source = parseSource(await this.options.projectClient.readAll());
-    this.sensitiveData.assertSafe(source);
+    const rawSource = await this.options.projectClient.readAll();
+    this.sensitiveData.assertSafe(rawSource);
+    assertNoAbsoluteHostPaths(rawSource);
+    const source = parseSource(rawSource);
     const items = projectId ? source.items.filter((item) => item.project_id === projectId) : source.items;
     const pages = boundedPages(items);
     const requested = pageId ?? "page-1";
@@ -355,6 +355,7 @@ export class PortfolioService {
 
   async registerProject(input: RegisterProjectInput): Promise<ProjectRecordLink> {
     this.sensitiveData.assertSafe(input);
+    assertNoAbsoluteHostPaths(input);
     if (!this.options.projectClient.registerProject) {
       throw new ControlError("PROJECT_REGISTRATION_UNAVAILABLE", "Project snapshot reader does not support registration");
     }
@@ -362,8 +363,10 @@ export class PortfolioService {
   }
 
   async exportSnapshot(): Promise<SnapshotExportResult> {
-    const source = parseSource(await this.options.projectClient.readAll());
-    this.sensitiveData.assertSafe(source);
+    const rawSource = await this.options.projectClient.readAll();
+    this.sensitiveData.assertSafe(rawSource);
+    assertNoAbsoluteHostPaths(rawSource);
+    const source = parseSource(rawSource);
     const { generatedAt, directoryName } = safeGeneratedDirectory(this.now());
     const payloadWithoutChecksum = {
       schema_version: 1,

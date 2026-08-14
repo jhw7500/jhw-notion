@@ -134,6 +134,22 @@ describe("GitHubProjectClient", () => {
     expect(gh.calls).toEqual([]);
   });
 
+  it("rejects an absolute source-checkout path before any GitHub Project call", async () => {
+    const gh = new QueuedGhRunner();
+
+    await expect(client(gh).registerProject({
+      project_id: "prj-project-1",
+      title: "Project 1",
+      objective: "contains /srv/private/source-checkout",
+      repo_ids: ["repo-control"],
+      fields: {
+        status: "active", priority: "P2", health: "blocked",
+        next_action: "wait:fixture", last_reviewed: "2026-08-13",
+      },
+    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(gh.calls).toEqual([]);
+  });
+
   it("rejects a public Project before treating it as trial authority", async () => {
     const gh = new QueuedGhRunner();
     const page = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });

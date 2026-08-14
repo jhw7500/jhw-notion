@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
@@ -139,6 +139,49 @@ describe("PortfolioService", () => {
     expect(JSON.stringify(statusError)).not.toContain(secret);
     await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
     await expect(lstat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("scans an invalid source port value before schema diagnostics can reflect it", async () => {
+    const secret = "unmistakably-fake-invalid-source-token";
+    const invalid = source(1) as unknown as Record<string, unknown>;
+    invalid[secret] = true;
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => invalid as never },
+      stateDir: "/unused",
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+
+    const error = await portfolio.status().catch((cause) => cause);
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+  });
+
+  it("rejects absolute source-checkout paths in restored snapshot text and Project outbound text", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const sourceCheckout = join(root, "source-checkout");
+    const protectedSource = source(1);
+    protectedSource.items[0] = { ...protectedSource.items[0]!, objective: `do not export ${sourceCheckout}` };
+    const registerProject = vi.fn();
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => protectedSource, registerProject },
+      stateDir: join(root, "state"),
+    });
+
+    await expect(portfolio.status()).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    await expect(portfolio.registerProject({
+      project_id: "prj-control",
+      title: "Control Trial",
+      objective: `do not send ${sourceCheckout}`,
+      repo_ids: ["repo-control"],
+      fields: {
+        status: "proposed", priority: "P2", health: "unknown",
+        next_action: "wait:fixture", last_reviewed: "2026-08-13",
+      },
+    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(registerProject).not.toHaveBeenCalled();
+    await expect(lstat(join(root, "state"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("caps portfolio markdown and CLI-safe payload at 12 KiB or 20 items and emits page IDs", async () => {

@@ -30,6 +30,44 @@ function rejected(): ControlError {
   return new ControlError("SENSITIVE_DATA_REJECTED", "Content contains protected host data");
 }
 
+function scanBounded(value: unknown, inspect: (candidate: string) => void): void {
+  let bytes = 0;
+  let nodes = 0;
+  const visited = new Set<object>();
+  const scan = (candidate: unknown): void => {
+    nodes += 1;
+    if (nodes > MAX_SCAN_NODES) throw new ControlError("SENSITIVE_SCAN_TOO_LARGE", "Content scan exceeded its deterministic boundary");
+    if (typeof candidate === "string") {
+      bytes += Buffer.byteLength(candidate, "utf8");
+      if (bytes > MAX_SCAN_BYTES) throw new ControlError("SENSITIVE_SCAN_TOO_LARGE", "Content scan exceeded its deterministic boundary");
+      inspect(candidate);
+      return;
+    }
+    if (candidate === null || typeof candidate !== "object") return;
+    if (visited.has(candidate)) throw new ControlError("SENSITIVE_SCAN_TOO_LARGE", "Content scan contains a cycle");
+    visited.add(candidate);
+    if (Array.isArray(candidate)) {
+      for (const entry of candidate) scan(entry);
+    } else {
+      for (const [key, entry] of Object.entries(candidate as Record<string, unknown>)) {
+        scan(key);
+        scan(entry);
+      }
+    }
+  };
+  scan(value);
+}
+
+const embeddedUnixPath = /(?:^|[\s"'`(=:])\/(?!\/)[^\s"'`<>|]+/u;
+const embeddedWindowsPath = /(?:^|[\s"'`(=])[A-Za-z]:[\\/][^\s"'`<>|]+/u;
+
+/** Rejects host-absolute paths only at content boundaries, never operational path arguments. */
+export function assertNoAbsoluteHostPaths(value: unknown): void {
+  scanBounded(value, (candidate) => {
+    if (embeddedUnixPath.test(candidate) || embeddedWindowsPath.test(candidate)) throw rejected();
+  });
+}
+
 /** Bounded reject-before-persist/outbound policy; it never returns a match. */
 export function createSensitiveDataPolicy(
   environment: NodeJS.ProcessEnv = process.env,
@@ -52,28 +90,9 @@ export function createSensitiveDataPolicy(
       if (termOverflow) {
         throw new ControlError("SENSITIVE_SCAN_TOO_LARGE", "Protected-term scan exceeded its deterministic boundary");
       }
-      let bytes = 0;
-      let nodes = 0;
-      const visited = new Set<object>();
-      const scan = (candidate: unknown): void => {
-        nodes += 1;
-        if (nodes > MAX_SCAN_NODES) throw new ControlError("SENSITIVE_SCAN_TOO_LARGE", "Content scan exceeded its deterministic boundary");
-        if (typeof candidate === "string") {
-          bytes += Buffer.byteLength(candidate, "utf8");
-          if (bytes > MAX_SCAN_BYTES) throw new ControlError("SENSITIVE_SCAN_TOO_LARGE", "Content scan exceeded its deterministic boundary");
-          if (protectedTerms.some((term) => candidate.includes(term))) throw rejected();
-          return;
-        }
-        if (candidate === null || typeof candidate !== "object") return;
-        if (visited.has(candidate)) throw new ControlError("SENSITIVE_SCAN_TOO_LARGE", "Content scan contains a cycle");
-        visited.add(candidate);
-        if (Array.isArray(candidate)) {
-          for (const entry of candidate) scan(entry);
-        } else {
-          for (const entry of Object.values(candidate as Record<string, unknown>)) scan(entry);
-        }
-      };
-      scan(value);
+      scanBounded(value, (candidate) => {
+        if (protectedTerms.some((term) => candidate.includes(term))) throw rejected();
+      });
     },
   };
 }

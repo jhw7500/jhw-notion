@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { ControlError } from "./errors.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
-import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   ProjectOperationalFieldsSchema,
   ProjectRecordBodySchema,
@@ -475,13 +475,18 @@ export class GitHubProjectClient {
 
   private projectResponse(stdout: string): ReturnType<typeof projectFrom> {
     const project = projectFrom(stdout);
-    this.sensitiveData.assertSafe(project);
+    this.assertContentSafe(project);
     return project;
   }
 
   private safeApiResult<T>(value: T): T {
-    this.sensitiveData.assertSafe(value);
+    this.assertContentSafe(value);
     return value;
+  }
+
+  private assertContentSafe(value: unknown): void {
+    this.sensitiveData.assertSafe(value);
+    assertNoAbsoluteHostPaths(value);
   }
 
   private async initialPage(): Promise<InitialProjectPage> {
@@ -567,7 +572,7 @@ export class GitHubProjectClient {
       "INVALID_ISSUE_RESPONSE",
     );
     const allIssues = pages.flat().filter((issue) => issue.pull_request === undefined);
-    this.sensitiveData.assertSafe(allIssues);
+    this.assertContentSafe(allIssues);
     if (
       new Set(allIssues.map((issue) => issue.node_id)).size !== allIssues.length ||
       new Set(allIssues.map((issue) => issue.number)).size !== allIssues.length
@@ -609,12 +614,12 @@ export class GitHubProjectClient {
       IssueSchema,
       "INVALID_ISSUE_RESPONSE",
     );
-    this.sensitiveData.assertSafe(issue);
+    this.assertContentSafe(issue);
     return issue;
   }
 
   private async createIssue(input: RegisterProjectInput): Promise<Issue> {
-    this.sensitiveData.assertSafe(input);
+    this.assertContentSafe(input);
     const issue = jsonFrom(
       (await this.options.runner.runGh([
         "api", "--method", "POST", `repos/${this.options.registryRepository}/issues`,
@@ -627,7 +632,7 @@ export class GitHubProjectClient {
       IssueSchema,
       "INVALID_ISSUE_RESPONSE",
     );
-    this.sensitiveData.assertSafe(issue);
+    this.assertContentSafe(issue);
     return issue;
   }
 
@@ -732,7 +737,7 @@ export class GitHubProjectClient {
       total_count: output.length,
     });
     if (!source.success) throw new ControlError("INVALID_PROJECT_SOURCE", "Project snapshot source failed validation");
-    this.sensitiveData.assertSafe(source.data);
+    this.assertContentSafe(source.data);
     return source.data;
   }
 
@@ -760,9 +765,9 @@ export class GitHubProjectClient {
   }
 
   async registerProject(rawInput: RegisterProjectInput): Promise<ProjectRecordLink> {
+    this.assertContentSafe(rawInput);
     const input = RegisterProjectInputSchema.safeParse(rawInput);
     if (!input.success) throw new ControlError("INVALID_PROJECT_REGISTRATION", "Project registration input is invalid");
-    this.sensitiveData.assertSafe(input.data);
     validateActiveNextAction(input.data.fields);
     await Promise.all(input.data.repo_ids.map((repoId) => this.options.catalog.getRepository(repoId)));
     const nextTask = taskId(input.data.fields);
