@@ -4,7 +4,7 @@
 **Branch:** `feat/project-control-phase1a`
 **Base:** `9fbd7983c80ad19a7fb0a51e201f67ba60ee1133`
 **Validated implementation HEAD:** `0e7b566` (report refresh follows)
-**Status:** implementation and local deterministic gates complete; independent final re-review pending at report authoring.
+**Status:** implementation and local deterministic gates complete; independent final scoped re-review CLEAN.
 
 ## Outcome
 
@@ -131,8 +131,8 @@ git log --reverse --oneline 9fbd7983c80ad19a7fb0a51e201f67ba60ee1133..HEAD
 
 ## Concerns / Accepted Limits
 
-The first exact-HEAD independent scoped re-review returned **Critical 0 / Important 2**. Both findings were reproduced before correction: absolute-path Handoff content completed release but failed later read/resume, and a verified same-node Repository rename was blocked when a formal Task existed. Commit `08cbff0` closed those direct paths. Its fix-round re-review then found **Critical 0 / Important 1**: replacing the old canonical alias stranded immutable active/history Claims. Commit `0e7b566` preserves globally unique prior same-Issue aliases and proves both active-Claim operations and a pre-rename Handoff resume. The corrected HEAD is undergoing the required bounded re-review; it is not declared CLEAN until that verdict is recorded here.
+The first exact-HEAD independent scoped re-review returned **Critical 0 / Important 2**. Both findings were reproduced before correction: absolute-path Handoff content completed release but failed later read/resume, and a verified same-node Repository rename was blocked when a formal Task existed. Commit `08cbff0` closed those direct paths. Its fix-round re-review then found **Critical 0 / Important 1**: replacing the old canonical alias stranded immutable active/history Claims. Commit `0e7b566` preserves globally unique prior same-Issue aliases and proves both active-Claim operations and a pre-rename Handoff resume. The final exact-HEAD scoped re-review returned **CLEAN — Critical 0 / Important 0**.
 
 **Live evidence remains insufficient.** This implementation intentionally did not run live preflight, mutate live GitHub/Notion, flip authority, or create synthetic natural-cycle evidence. Deployment readiness still requires the separately governed live trial and natural-cycle evidence described by the approved design. Phase 1B, distributed locks/retries, scheduler/Actions, TTL/heartbeat, automatic context loading, and cutover remain out of scope.
 
-Independent final whole-diff re-review is mandatory. At report authoring it was still running; this report must be updated with its final CLEAN verdict before returning `DONE`.
+The only nonblocking WATCH is that historical formal aliases are constrained by Issue number rather than by a separately persisted repository-slug lineage. Immutable Issue node/source indexes, canonical `task_id`, and global alias uniqueness retain Phase 1A authority and collision safety; no Phase 1B mechanism was added.
