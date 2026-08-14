@@ -3,7 +3,7 @@
 **Date:** 2026-08-14
 **Branch:** `feat/project-control-phase1a`
 **Base:** `9fbd7983c80ad19a7fb0a51e201f67ba60ee1133`
-**Validated implementation HEAD:** `08cbff0` (report refresh follows)
+**Validated implementation HEAD:** `d951d35` (report refresh follows)
 **Status:** implementation and local deterministic gates complete; independent final re-review pending at report authoring.
 
 ## Outcome
@@ -39,6 +39,7 @@ Production behavior was changed only after focused RED evidence. Representative 
 | Framed private-path rejection | punctuation- and `file://`-framed absolute paths bypassed the content boundary | delimiter-aware rejection passes focused policy/E2E regressions; URLs and repository slugs remain accepted |
 | Takeover gate runtime bound | the real-Git takeover scenario passed alone but exceeded Vitest's generic 5-second per-test limit in the full gate | the single multi-window scenario has an explicit 15-second ceiling and passed in two fresh complete E2E processes |
 | Final re-review round-trip corrections | Handoff absolute paths could be written but not read, and a verified same-node Repository rename stranded formal Tasks | all Handoff creation/write ports reject Unix/Windows/file-URI host paths before mutation; a same-node rename atomically migrates derived Issue URL/alias and the existing formal Task resumes in E2E |
+| Angle-framed path self-review | a temporary HTML false-positive exception also permitted `</absolute/path>` framing | the exception was removed; angle-framed paths fail focused policy tests while non-closing literal HTML remains renderable |
 
 Focused evidence retained from the thematic slices includes:
 
@@ -57,10 +58,10 @@ All commands below were run from the repository or `mcp-server` as appropriate a
 
 | Gate | Result |
 |---|---|
-| `npm test` | **51 files, 873/873 tests GREEN** |
+| `npm test` | **51 files, 874/874 tests GREEN** |
 | `npm run build` | GREEN |
-| pinned `phase1a.e2e.test.ts`, fresh process 1 | **28/28 GREEN**, 19.14 s |
-| pinned `phase1a.e2e.test.ts`, fresh process 2 | **28/28 GREEN**, 19.34 s |
+| pinned `phase1a.e2e.test.ts`, fresh process 1 | **28/28 GREEN**, 59.96 s |
+| pinned `phase1a.e2e.test.ts`, fresh process 2 | **28/28 GREEN**, 52.53 s |
 | `npm test -- --run cli-entry` | **5/5 GREEN** |
 | `bash -n install.sh` | GREEN |
 | isolated-HOME `scripts/test-install-safety.sh` | `installer safety: ok` |
@@ -109,6 +110,7 @@ c5257a6  Punctuation-framed host-path rejection
 6b28720  Framed file-URI path rejection
 79c4053  Explicit takeover E2E runtime bound
 08cbff0  Handoff and verified Repository-rename round trips
+d951d35  Angle-framed host-path rejection regression
 ```
 
 The complete ordered commit list is available via:
