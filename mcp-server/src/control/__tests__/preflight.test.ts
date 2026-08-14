@@ -59,6 +59,9 @@ function service(input: {
   runner?: QueuedRunner;
   project?: PreflightProjectPort;
   remoteUrl?: string;
+  authority?: { observeCommittedLegacy(): Promise<void> };
+  notion?: { verifyReadOnlyRoutes(): Promise<void> };
+  repository?: { verifyPrivateRepository(slug: string): Promise<void> };
 }) {
   const runner = input.runner ?? new QueuedRunner();
   runner.enqueueGh(
@@ -73,6 +76,9 @@ function service(input: {
       environment: input.environment ?? { GH_PROJECT_TOKEN: "project-secret", GH_REPO_TOKEN: "repo-secret" },
       runner,
       project: input.project ?? projectPort(),
+      authority: input.authority ?? { observeCommittedLegacy: async () => undefined },
+      notion: input.notion ?? { verifyReadOnlyRoutes: async () => undefined },
+      repository: input.repository ?? { verifyPrivateRepository: async () => undefined },
       remoteUrl: async () => input.remoteUrl ?? "git@github.com:owner/registry.git",
       today: () => "2026-08-13",
     }),
@@ -99,6 +105,52 @@ describe("PreflightService", () => {
     const { preflight } = service({ runner });
 
     await expect(preflight.run()).rejects.toMatchObject({ code: "PROJECT_TOKEN_HAS_REPO_SCOPE" });
+  });
+
+  it.each(["read:user", "admin:org", "workflow", "delete_repo", "gist", "user"])(
+    "rejects unexpected classic Project PAT scope %s",
+    async (extraScope) => {
+    const runner = new QueuedRunner();
+    runner.enqueueGh({ stdout: `HTTP/2.0 200 OK\r\nx-oauth-scopes: project, ${extraScope}\r\n\r\n{}\n` });
+    const { preflight } = service({ runner });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "PROJECT_SCOPE_NOT_EXACT" });
+    },
+  );
+
+  it.each([
+    ["authority", "AUTHORITY_UNAVAILABLE"],
+    ["notion", "NOTION_GUARD_INDETERMINATE"],
+    ["repository", "REPOSITORY_NOT_PRIVATE"],
+  ] as const)("fails before every Project/Issue mutation when %s prerequisite is unavailable", async (failed, code) => {
+    const project = projectPort({
+      addPreflightItem: async () => { throw new Error("must not mutate"); },
+      writeLastReviewed: async () => { throw new Error("must not mutate"); },
+      clearLastReviewed: async () => { throw new Error("must not mutate"); },
+    });
+    const reject = async () => { throw new ControlError(code, "safe prerequisite failure"); };
+    const { preflight } = service({
+      project,
+      ...(failed === "authority" ? { authority: { observeCommittedLegacy: reject } } : {}),
+      ...(failed === "notion" ? { notion: { verifyReadOnlyRoutes: reject } } : {}),
+      ...(failed === "repository" ? { repository: { verifyPrivateRepository: reject } } : {}),
+    });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code });
+  });
+
+  it("requires committed legacy authority, read-only Notion guard routes, and a private Registry repository", async () => {
+    const calls: string[] = [];
+    const { preflight } = service({
+      authority: { observeCommittedLegacy: async () => { calls.push("authority"); } },
+      notion: { verifyReadOnlyRoutes: async () => { calls.push("notion"); } },
+      repository: { verifyPrivateRepository: async (slug) => { calls.push(`repository:${slug}`); } },
+    });
+
+    const result = await preflight.run();
+
+    expect(calls).toEqual(["authority", "notion", "repository:owner/registry"]);
+    expect(result.checks).toMatchObject({ authority: "ok", notion_guard: "ok", registry_repository: "ok" });
   });
 
   it("rejects a preflight fixture that is also labeled as a Project Record", async () => {
@@ -168,7 +220,10 @@ describe("PreflightService", () => {
 
     expect(result).toEqual({
       status: "ready",
-      checks: { credentials: "ok", project: "ok", registry_issue: "ok", registry_git: "ok" },
+      checks: {
+        credentials: "ok", authority: "ok", notion_guard: "ok", project: "ok",
+        registry_repository: "ok", registry_issue: "ok", registry_git: "ok",
+      },
     });
     expect(runner.ghCalls.map((call) => call.credential)).toEqual(["project", "repo", "repo"]);
     expect(runner.ghCalls[1]?.args).toEqual([
@@ -192,6 +247,17 @@ describe("PreflightService", () => {
     const { preflight, runner } = service({ remoteUrl: "https://github.com/owner/registry.git" });
 
     await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_REMOTE_NOT_SSH" });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("rejects an SSH Registry remote for a different canonical repository", async () => {
+    const project = projectPort({
+      addPreflightItem: async () => { throw new Error("must not mutate"); },
+      writeLastReviewed: async () => { throw new Error("must not mutate"); },
+    });
+    const { preflight, runner } = service({ remoteUrl: "git@github.com:owner/other.git", project });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_REMOTE_MISMATCH" });
     expect(runner.calls).toEqual([]);
   });
 });

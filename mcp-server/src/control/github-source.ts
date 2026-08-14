@@ -133,6 +133,11 @@ export class GitHubSourceService {
     });
   }
 
+  async verifyPrivateRepository(slug: string): Promise<void> {
+    if (!slugPattern.test(slug)) throw new ControlError("INVALID_REPOSITORY", "Repository slug is invalid");
+    await this.resolveRepository(slug);
+  }
+
   async registerFormalTask(input: {
     project_id: string;
     repo_id: string;

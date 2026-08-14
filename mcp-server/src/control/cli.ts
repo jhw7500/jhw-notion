@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ZodType } from "zod";
 
 import { Catalog } from "./catalog.js";
+import { RegistryRecordStore } from "./codec.js";
 import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
@@ -16,7 +18,11 @@ import { PreflightService } from "./preflight.js";
 import { RegistryGit } from "./registry-git.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
+import { createAuthorityService } from "./authority.js";
+import { getNotionClient } from "../notion-client.js";
+import { DATABASE_SCHEMAS } from "../schema.js";
 import {
+  AuthorityRecordSchema,
   BoundedPortfolioPayloadSchema,
   ConflictingClaimSummarySchema,
   PreflightResultSchema,
@@ -112,6 +118,56 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     catalog,
   });
   const source = new GitHubSourceService({ runner, catalog, projects: githubProject });
+  const records = new RegistryRecordStore(config.registryDir, registry);
+  const readCommittedAuthority = async () => {
+    try {
+      await records.assertCommittedRegularFile("governance/authority.yaml");
+      const parsed = AuthorityRecordSchema.safeParse(JSON.parse(await registry.readHeadRegularFile("governance/authority.yaml")));
+      if (!parsed.success) throw new Error("invalid authority");
+      return parsed.data;
+    } catch {
+      throw new ControlError("AUTHORITY_UNAVAILABLE", "Committed Registry authority policy is unavailable");
+    }
+  };
+  const preflightAuthority = {
+    async observeCommittedLegacy() {
+      const central = await readCommittedAuthority();
+      const authority = createAuthorityService({
+        readCentral: async () => central,
+        cachePath: join(config.stateDir, "authority-cache.json"),
+        writesDisabled: env.JHW_NOTION_WRITES_DISABLED === "true",
+      });
+      const decision = await authority.load();
+      if (decision.source !== "central" || central.mode !== "legacy" || central.cutover_at !== null) {
+        throw new ControlError("AUTHORITY_POLICY_NOT_LEGACY", "Phase 1A requires committed legacy authority with no cutover");
+      }
+    },
+  };
+  const notionProbe = {
+    async verifyReadOnlyRoutes() {
+      const notion = getNotionClient();
+      const normalize = (value: unknown) => typeof value === "string" ? value.replaceAll("-", "").toLowerCase() : "";
+      for (const schema of Object.values(DATABASE_SCHEMAS)) {
+        let database: unknown;
+        let dataSource: unknown;
+        try {
+          database = await notion.databases.retrieve({ database_id: schema.id });
+          dataSource = await notion.dataSources.retrieve({ data_source_id: schema.dataSourceId });
+        } catch {
+          throw new ControlError("NOTION_GUARD_INDETERMINATE", "Notion authority routing probe is unavailable");
+        }
+        const databaseRecord = database as { id?: unknown };
+        const dataSourceRecord = dataSource as { id?: unknown; parent?: { database_id?: unknown } };
+        if (
+          normalize(databaseRecord.id) !== normalize(schema.id) ||
+          normalize(dataSourceRecord.id) !== normalize(schema.dataSourceId) ||
+          normalize(dataSourceRecord.parent?.database_id) !== normalize(schema.id)
+        ) {
+          throw new ControlError("NOTION_GUARD_INDETERMINATE", "Notion authority routing probe returned conflicting coordinates");
+        }
+      }
+    },
+  };
   const worktrees = new WorktreeManager(config, runner);
   const claims = new ClaimService(config, registry, catalog, {
     async inspect(claim) {
@@ -147,7 +203,15 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     catalog,
     source,
     portfolio: new PortfolioService({ projectClient: githubProject, stateDir: config.stateDir }),
-    preflight: new PreflightService({ config, environment: env, runner, project: githubProject }),
+    preflight: new PreflightService({
+      config,
+      environment: env,
+      runner,
+      project: githubProject,
+      authority: preflightAuthority,
+      notion: notionProbe,
+      repository: source,
+    }),
     mutationLock: new MutationLock(config, env),
   };
 }
@@ -267,6 +331,10 @@ function exitCode(cause: unknown): CliResult["exitCode"] {
   if (new Set(["REMOTE_DIVERGED", "REMOTE_VERIFY_FAILED", "REGISTRY_DIRTY", "LOCK_BUSY", "LOCK_CONTENDED"]).has(code)) return 75;
   if (new Set([
     "AUTHORITY_UNAVAILABLE",
+    "AUTHORITY_EPOCH_ROLLBACK",
+    "AUTHORITY_POLICY_NOT_LEGACY",
+    "TOOL_VERSION_TOO_OLD",
+    "NOTION_GUARD_INDETERMINATE",
     "MISSING_CREDENTIAL",
     "PORTFOLIO_UNAVAILABLE",
     "PREFLIGHT_UNAVAILABLE",
@@ -275,9 +343,14 @@ function exitCode(cause: unknown): CliResult["exitCode"] {
     "PROJECT_SCOPE_UNVERIFIABLE",
     "PROJECT_TOKEN_HAS_REPO_SCOPE",
     "PROJECT_SCOPE_MISSING",
+    "PROJECT_SCOPE_NOT_EXACT",
     "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
     "UNSUPPORTED_REGISTRY_OWNER",
     "REGISTRY_REMOTE_NOT_SSH",
+    "REGISTRY_REMOTE_MISMATCH",
+    "AMBIGUOUS_REGISTRY_REMOTE",
+    "PROJECT_NOT_PRIVATE",
+    "REPOSITORY_NOT_PRIVATE",
   ]).has(code)) return 78;
   if (code === "INVALID_CLI_ARGUMENT") return 2;
   return 1;

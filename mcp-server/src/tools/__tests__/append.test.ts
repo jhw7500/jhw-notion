@@ -33,7 +33,9 @@ describe("jhw_append", () => {
   beforeEach(() => {
     defaultPageCache.clear();
     mockClient = createMockNotionClient();
-    mockClient.pages.retrieve.mockResolvedValue({ parent: { type: "workspace", workspace: true } });
+    mockClient.pages.retrieve.mockImplementation(async ({ page_id }: { page_id: string }) => ({
+      id: page_id, object: "page", parent: { type: "workspace", workspace: true },
+    }));
     mockClient.blocks.children.append.mockResolvedValue({});
     const { server, capturedTools } = createMockServer();
     legacyAuthority.assertNotionWriteAllowed.mockClear();
@@ -135,6 +137,7 @@ describe("jhw_append", () => {
     const pageId = "33a8a230-a04e-8154-8fa5-d96ebdd63500";
     defaultPageCache.set({ id: pageId, db: "projects", title: "kept", text: "kept" });
     mockClient.pages.retrieve.mockResolvedValue({
+      id: pageId,
       parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects },
     });
     const { server, capturedTools } = createMockServer();
@@ -152,6 +155,7 @@ describe("jhw_append", () => {
   it("registry authority에서도 Knowledge Base append는 기존 경로로 처리한다", async () => {
     const pageId = "33a8a230-a04e-8154-8fa5-d96ebdd63500";
     mockClient.pages.retrieve.mockResolvedValue({
+      id: pageId,
       parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase },
     });
     const selectiveAuthority = {

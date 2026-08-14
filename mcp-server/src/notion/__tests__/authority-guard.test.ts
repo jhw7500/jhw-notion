@@ -10,7 +10,7 @@ const PARENT = "22222222-2222-4222-8222-222222222222";
 function notionReturning(parent: unknown) {
   return {
     pages: {
-      retrieve: vi.fn().mockResolvedValue({ id: "page", object: "page", parent }),
+      retrieve: vi.fn(async ({ page_id }: { page_id: string }) => ({ id: page_id, object: "page", parent })),
     },
   };
 }
@@ -27,7 +27,7 @@ describe("Notion authority target resolution", () => {
   it("maps current data_source_id parents with or without database_id", async () => {
     const withDatabase = notionReturning({
       type: "data_source_id",
-      data_source_id: "unrelated",
+      data_source_id: DATABASE_SCHEMAS.decisionLog.dataSourceId,
       database_id: NOTION_CONFIG.databases.decisionLog,
     });
     const dataSourceOnly = notionReturning({
@@ -47,7 +47,9 @@ describe("Notion authority target resolution", () => {
 
     await expect(resolveTargetDatabase("decision", withDatabase as any)).resolves.toBe("decisionLog");
     await expect(resolveTargetDatabase("knowledge", dataSourceOnly as any)).resolves.toBe("knowledgeBase");
-    await expect(resolveTargetDatabase("stale-database", staleDatabaseShape as any)).resolves.toBe("knowledgeBase");
+    await expect(resolveTargetDatabase("stale-database", staleDatabaseShape as any)).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
+    });
     await expect(resolveTargetDatabase("matching-known", matchingKnownIds as any)).resolves.toBe("projects");
   });
 
@@ -74,10 +76,10 @@ describe("Notion authority target resolution", () => {
     });
   });
 
-  it("returns page for an unknown or non-database parent", async () => {
+  it("fails closed for unresolved database/data-source parents and allows only a real workspace root", async () => {
     await expect(
       resolveTargetDatabase("unknown", notionReturning({ type: "database_id", database_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }) as any),
-    ).resolves.toBe("page");
+    ).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
     await expect(
       resolveTargetDatabase("root", notionReturning({ type: "workspace", workspace: true }) as any),
     ).resolves.toBe("page");
@@ -85,7 +87,63 @@ describe("Notion authority target resolution", () => {
       type: "data_source_id",
       database_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       data_source_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    }) as any)).resolves.toBe("page");
+    }) as any)).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
+  });
+
+  it("retrieves unknown database and data-source ancestry to protected and allowed configured roots", async () => {
+    const unknownDatabase = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const unknownDataSource = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const notion = {
+      pages: {
+        retrieve: vi.fn(async ({ page_id }: { page_id: string }) => ({
+          object: "page", id: page_id, parent: { type: "database_id", database_id: unknownDatabase },
+        })),
+      },
+      databases: {
+        retrieve: vi.fn(async ({ database_id }: { database_id: string }) => ({
+          object: "database", id: database_id,
+          parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects },
+        })),
+      },
+      dataSources: { retrieve: vi.fn() },
+    };
+    await expect(resolveTargetDatabase(TARGET, notion as any)).resolves.toBe("projects");
+    expect(notion.databases.retrieve).toHaveBeenCalledWith({ database_id: unknownDatabase.replaceAll("-", "") });
+
+    const allowed = {
+      pages: {
+        retrieve: vi.fn(async ({ page_id }: { page_id: string }) => ({
+          object: "page", id: page_id, parent: { type: "data_source_id", data_source_id: unknownDataSource },
+        })),
+      },
+      databases: { retrieve: vi.fn() },
+      dataSources: {
+        retrieve: vi.fn(async ({ data_source_id }: { data_source_id: string }) => ({
+          object: "data_source", id: data_source_id,
+          parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase },
+          database_parent: { type: "workspace", workspace: true },
+        })),
+      },
+    };
+    await expect(resolveTargetDatabase(TARGET, allowed as any)).resolves.toBe("knowledgeBase");
+    expect(allowed.dataSources.retrieve).toHaveBeenCalledWith({ data_source_id: unknownDataSource.replaceAll("-", "") });
+  });
+
+  it("fails closed on database/data-source cycles, malformed full objects, and unavailable APIs", async () => {
+    const unknownDatabase = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const base = {
+      pages: { retrieve: vi.fn(async () => ({ object: "page", id: TARGET, parent: { type: "database_id", database_id: unknownDatabase } })) },
+      dataSources: { retrieve: vi.fn() },
+    };
+    await expect(resolveTargetDatabase(TARGET, {
+      ...base,
+      databases: { retrieve: vi.fn(async () => ({ object: "database", id: unknownDatabase, parent: { type: "database_id", database_id: unknownDatabase } })) },
+    } as any)).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
+    await expect(resolveTargetDatabase(TARGET, {
+      ...base,
+      databases: { retrieve: vi.fn(async () => ({ object: "database", id: "wrong", parent: { type: "workspace", workspace: true } })) },
+    } as any)).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
+    await expect(resolveTargetDatabase(TARGET, base as any)).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
   });
 
   it("walks page ancestors to the owning configured database", async () => {

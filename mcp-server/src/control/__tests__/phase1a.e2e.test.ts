@@ -146,12 +146,48 @@ function noopJournal() {
 }
 
 function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {}): CliDependencies {
+  const ensureRepository = async () => {
+    try {
+      return await graph.catalog.getRepository("repo-control");
+    } catch (cause) {
+      if (!(cause instanceof ControlError && cause.code === "REPOSITORY_NOT_FOUND")) throw cause;
+      return (await graph.catalog.registerRepository(repositoryInput)).repository;
+    }
+  };
   return {
     stateDir: graph.config.stateDir,
     env: {},
     taskService: graph.tasks,
     claimService: graph.claims,
     catalog: graph.catalog,
+    source: {
+      registerRepository: async (input) => graph.catalog.registerRepository({
+        repo_id: input.repo_id,
+        slug: input.slug,
+        github_node_id: repositoryInput.github_node_id,
+      }),
+      registerFormalTask: async (input) => {
+        await ensureRepository();
+        return graph.catalog.registerFormalTask({
+          project_id: input.project_id,
+          repo_id: input.repo_id,
+          issue_node_id: input.expected_issue_node_id ?? issueInput.issue_node_id,
+          issue_revision: input.expected_issue_revision ?? issueInput.issue_revision,
+          issue_url: input.issue_url,
+          alias: issueInput.alias,
+        });
+      },
+      registerTemporaryTask: async (input) => {
+        await ensureRepository();
+        const { repository_path: _repositoryPath, ...record } = input;
+        return graph.catalog.registerTemporaryTask(record);
+      },
+      prepareExistingTask: async (input) => {
+        const task = await graph.catalog.getTask(input.task_id);
+        return { task, alias: task.aliases[0]!, source_task_revision: await graph.catalog.getTaskSourceRevision(task.id) };
+      },
+      promoteTemporaryTask: async (input) => graph.catalog.promoteTemporaryTask(input.task_id, issueInput),
+    },
     portfolio: {
       status: async () => ({ page_id: "page-1", markdown: "# Portfolio\n", items: [], truncated: false, total_items: 0 }),
       exportSnapshot: async () => ({
@@ -161,7 +197,13 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
       }),
       registerProject: async (input) => ({ project_id: input.project_id, project_item_id: "PVTI_control", source_node_id: "I_control", issue_number: 1 }),
     },
-    preflight: { run: async () => ({ status: "ready", checks: { credentials: "ok", project: "ok", registry_issue: "ok", registry_git: "ok" } }) },
+    preflight: { run: async () => ({
+      status: "ready",
+      checks: {
+        credentials: "ok", authority: "ok", notion_guard: "ok", project: "ok",
+        registry_repository: "ok", registry_issue: "ok", registry_git: "ok",
+      },
+    }) },
     mutationLock: new MutationLock(graph.config, {}),
     journal: noopJournal(),
     ...overrides,
@@ -382,6 +424,9 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
   it("2. concurrent Issue registration leaves one generated Task and one source mapping", async () => {
     const fixture = await makeGateFixture();
+    const seed = graphFor(fixture, fixture.cloneA);
+    await seed.catalog.registerRepository(repositoryInput);
+    await git(fixture.cloneB, "pull", "--ff-only", "origin", "main");
     const leftRunner = new PushGateRunner(new ProcessRunner(), "2026-08-13T00:00:01Z");
     const rightRunner = new PushGateRunner(new ProcessRunner(), "2026-08-13T00:00:02Z");
     const leftConfig = fixtureConfig(fixture, fixture.cloneA);
@@ -412,6 +457,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
   it("3. promotion collision changes neither Task nor Registry HEAD", async () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
     const temporary = await graph.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:temporary", goal: "temporary",
       done_conditions: ["test"], expected_scope: ["src/control"],
@@ -434,6 +480,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
   it("4. two same-host Task starts under one retained lock leave one active Claim", async () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
     const canonical = (await graph.catalog.registerFormalTask(issueInput)).task;
     const enteredStart = deferred();
     const release = deferred();
@@ -558,6 +605,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
   it("7. client death after successful Claim push recovers from remote authority", async () => {
     const fixture = await makeGateFixture();
     const graphA = graphFor(fixture, fixture.cloneA);
+    await graphA.catalog.registerRepository(repositoryInput);
     const task = await graphA.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:death", goal: "recover",
       done_conditions: ["status"], expected_scope: ["src/control"],
@@ -711,6 +759,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
   it("9. offline provisional work is unclaimed and cannot assert ownership", async () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
     const task = await graph.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:offline", goal: "offline",
       done_conditions: ["later"], expected_scope: ["src/control"],
@@ -733,7 +782,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const taskId = task.task_id as string;
     const result = await runCli([
       "task", "finish", "--task", taskId, "--claim", claim.claim_id, "--status", "handoff",
-      "--source-task-revision", "temporary-v1", "--validation", "checkpoint: pass", "--progress", "gate progress",
+      "--validation", "checkpoint: pass", "--progress", "gate progress",
       "--active-work-minutes", "1",
     ], dependencies);
 
@@ -889,7 +938,15 @@ describe("Phase 1A deterministic adversarial gate", () => {
       writeLastReviewed: async () => undefined,
       clearLastReviewed: async () => undefined,
     };
-    const preflight = new PreflightService({ config: graph.config, environment, runner, project });
+    const preflight = new PreflightService({
+      config: graph.config,
+      environment,
+      runner,
+      project,
+      authority: { observeCommittedLegacy: async () => undefined },
+      notion: { verifyReadOnlyRoutes: async () => undefined },
+      repository: { verifyPrivateRepository: async () => undefined },
+    });
     const caughtMetadata: RawErrorAudit[] = [];
     const auditedPreflight = {
       async run() {

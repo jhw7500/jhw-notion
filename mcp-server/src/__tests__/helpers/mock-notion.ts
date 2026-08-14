@@ -7,6 +7,7 @@ export interface MockNotionClient {
   search: ReturnType<typeof vi.fn>;
   databases: {
     query: ReturnType<typeof vi.fn>;
+    retrieve: ReturnType<typeof vi.fn>;
   };
   dataSources: {
     query: ReturnType<typeof vi.fn>;
@@ -31,6 +32,7 @@ export function createMockNotionClient(): MockNotionClient {
     search: vi.fn(),
     databases: {
       query: vi.fn(),
+      retrieve: vi.fn(),
     },
     dataSources: {
       query: vi.fn(),

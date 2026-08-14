@@ -9,6 +9,7 @@ import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
 import { AuthorityRecordSchema, type AuthorityRecord } from "./schemas.js";
 import type { DatabaseName } from "../config.js";
+import { CONTROL_TOOL_VERSION } from "./version.js";
 
 const CACHE_SCHEMA = AuthorityRecordSchema.pick({ authority_epoch: true, mode: true });
 const CACHE_FILE = "authority-cache.json";
@@ -39,6 +40,7 @@ export interface CreateAuthorityServiceOptions {
   readCentral(): Promise<AuthorityRecord | null>;
   cachePath: string;
   writesDisabled: boolean;
+  toolVersion?: string;
   /** Deterministic durability/failure hooks for tests; omitted in production. */
   cacheHooks?: AuthorityCacheHooks;
 }
@@ -262,7 +264,7 @@ async function withCacheLock<T>(
     await acquireLock(lock);
     return await callback(directory, fileName);
   } catch (cause) {
-    if (cause instanceof ControlError && cause.code.startsWith("AUTHORITY_")) throw cause;
+    if (cause instanceof ControlError && (cause.code.startsWith("AUTHORITY_") || cause.code === "TOOL_VERSION_TOO_OLD")) throw cause;
     throw authorityUnavailable();
   } finally {
     await lock?.close();
@@ -275,6 +277,25 @@ function validateCentral(value: AuthorityRecord | null): AuthorityRecord | null 
   const result = AuthorityRecordSchema.safeParse(value);
   if (!result.success) throw authorityUnavailable();
   return result.data;
+}
+
+function semver(value: string): [number, number, number] | undefined {
+  const match = value.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+  if (!match) return undefined;
+  const parts = match.slice(1).map(Number);
+  return parts.every(Number.isSafeInteger) ? parts as [number, number, number] : undefined;
+}
+
+function enforceMinimumToolVersion(central: AuthorityRecord, actualVersion: string): void {
+  const minimum = semver(central.minimum_tool_version);
+  const actual = semver(actualVersion);
+  if (!minimum || !actual) throw authorityUnavailable();
+  for (let index = 0; index < minimum.length; index += 1) {
+    if ((actual[index] as number) > (minimum[index] as number)) return;
+    if ((actual[index] as number) < (minimum[index] as number)) {
+      throw new ControlError("TOOL_VERSION_TOO_OLD", "Control tool does not satisfy central authority minimum version");
+    }
+  }
 }
 
 export function createAuthorityService(options: CreateAuthorityServiceOptions): AuthorityService {
@@ -294,6 +315,7 @@ export function createAuthorityService(options: CreateAuthorityServiceOptions): 
           if (cache) throw authorityUnavailable();
           return { authority_epoch: 0, mode: "legacy", source: "compatibility" };
         }
+        enforceMinimumToolVersion(central, options.toolVersion ?? CONTROL_TOOL_VERSION);
         if (cache && central.authority_epoch < cache.authority_epoch) throw epochRollback();
         if (cache?.mode === "registry" && central.mode !== "registry") throw epochRollback();
 

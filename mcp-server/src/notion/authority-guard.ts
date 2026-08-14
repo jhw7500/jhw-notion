@@ -39,22 +39,44 @@ function pageKey(pageId: string): string {
 
 export async function resolveTargetDatabase(
   pageId: string,
-  notion: Pick<Client, "pages">,
+  notion: Pick<Client, "pages" | "databases" | "dataSources">,
 ): Promise<DatabaseName | "page"> {
-  let currentPageId = pageId.trim();
+  type Node = { kind: "page" | "database" | "data_source"; id: string; expectedDatabaseId?: string };
+  let current: Node = { kind: "page", id: pageId.trim() };
   const visited = new Set<string>();
   for (let depth = 0; depth < MAX_PARENT_DEPTH; depth += 1) {
-    const key = pageKey(currentPageId);
+    const key = `${current.kind}:${pageKey(current.id)}`;
     if (!key || visited.has(key)) throw targetResolutionUnavailable();
     visited.add(key);
 
-    let page: unknown;
+    let object: unknown;
     try {
-      page = await notion.pages.retrieve({ page_id: currentPageId });
+      object = current.kind === "page"
+        ? await notion.pages.retrieve({ page_id: current.id })
+        : current.kind === "database"
+          ? await notion.databases.retrieve({ database_id: current.id })
+          : await notion.dataSources.retrieve({ data_source_id: current.id });
     } catch {
       throw targetResolutionUnavailable();
     }
-    const parent = (page as { parent?: unknown } | null)?.parent;
+    if (typeof object !== "object" || object === null) throw targetResolutionUnavailable();
+    const record = object as { id?: unknown; object?: unknown; parent?: unknown; database_parent?: unknown };
+    if (typeof record.id !== "string" || pageKey(record.id) !== pageKey(current.id)) throw targetResolutionUnavailable();
+    if (record.object !== undefined && record.object !== current.kind) throw targetResolutionUnavailable();
+    if (current.kind === "data_source") {
+      const databaseParent = record.database_parent as {
+        type?: unknown;
+        database_id?: unknown;
+        page_id?: unknown;
+        workspace?: unknown;
+      } | undefined;
+      if (!databaseParent || (
+        !(databaseParent.type === "database_id" && normalizeId(databaseParent.database_id)) &&
+        !(databaseParent.type === "page_id" && normalizeId(databaseParent.page_id)) &&
+        !(databaseParent.type === "workspace" && databaseParent.workspace === true)
+      )) throw targetResolutionUnavailable();
+    }
+    const parent = record.parent;
     if (typeof parent !== "object" || parent === null) throw targetResolutionUnavailable();
     const typed = parent as {
       type?: unknown;
@@ -67,20 +89,39 @@ export async function resolveTargetDatabase(
     if (typed.type === "database_id" || typed.type === "data_source_id") {
       const databaseId = normalizeId(typed.database_id);
       const dataSourceId = normalizeId(typed.data_source_id);
+      if (typed.type === "database_id" && !databaseId) throw targetResolutionUnavailable();
+      if (typed.type === "data_source_id" && !dataSourceId) throw targetResolutionUnavailable();
       const database = databaseId ? databaseIds.get(databaseId) : undefined;
       const dataSourceDatabase = dataSourceId ? dataSourceIds.get(dataSourceId) : undefined;
       if (database && dataSourceDatabase && database !== dataSourceDatabase) throw targetResolutionUnavailable();
-      if (database) return database;
-      if (dataSourceDatabase) return dataSourceDatabase;
-      if (databaseId || dataSourceId) return "page";
-      throw targetResolutionUnavailable();
+
+      if (current.kind === "data_source" && current.expectedDatabaseId && databaseId && current.expectedDatabaseId !== databaseId) {
+        throw targetResolutionUnavailable();
+      }
+      if (typed.type === "database_id") {
+        if (dataSourceId && !dataSourceDatabase) {
+          current = { kind: "data_source", id: dataSourceId, ...(databaseId ? { expectedDatabaseId: databaseId } : {}) };
+          continue;
+        }
+        if (database) return database;
+        if (dataSourceDatabase) throw targetResolutionUnavailable();
+        current = { kind: "database", id: databaseId as string };
+        continue;
+      }
+
+      if (dataSourceDatabase) {
+        if (databaseId && !database) throw targetResolutionUnavailable();
+        return dataSourceDatabase;
+      }
+      current = { kind: "data_source", id: dataSourceId as string, ...(databaseId ? { expectedDatabaseId: databaseId } : {}) };
+      continue;
     }
 
     if (typed.type === "workspace" && typed.workspace === true) return "page";
     if (typed.type !== "page_id") throw targetResolutionUnavailable();
     const parentPageId = typeof typed.page_id === "string" ? typed.page_id.trim() : "";
     if (!normalizeId(parentPageId)) throw targetResolutionUnavailable();
-    currentPageId = parentPageId;
+    current = { kind: "page", id: parentPageId };
   }
   throw targetResolutionUnavailable();
 }

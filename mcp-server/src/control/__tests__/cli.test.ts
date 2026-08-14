@@ -178,7 +178,10 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
   const preflight = {
     run: vi.fn().mockResolvedValue({
       status: "ready",
-      checks: { credentials: "ok", project: "ok", registry_issue: "ok", registry_git: "ok" },
+      checks: {
+        credentials: "ok", authority: "ok", notion_guard: "ok", project: "ok",
+        registry_repository: "ok", registry_issue: "ok", registry_git: "ok",
+      },
     }),
     ...overrides.preflight,
   };

@@ -3,6 +3,7 @@ import { ControlError } from "./errors.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
 import type { PreflightResult } from "./schemas.js";
 import { z } from "zod";
+import { githubSlugFromRemote } from "./github-source.js";
 
 export interface PreflightRunner {
   runGh(args: string[], credential: "project" | "repo", options?: ProcessRunOptions): Promise<ProcessResult>;
@@ -18,11 +19,26 @@ export interface PreflightProjectPort {
   clearLastReviewed(itemId: string): Promise<void>;
 }
 
+export interface PreflightAuthorityPort {
+  observeCommittedLegacy(): Promise<void>;
+}
+
+export interface PreflightNotionPort {
+  verifyReadOnlyRoutes(): Promise<void>;
+}
+
+export interface PreflightRepositoryPort {
+  verifyPrivateRepository(slug: string): Promise<void>;
+}
+
 export interface PreflightServiceOptions {
   config: ControlConfig;
   environment: NodeJS.ProcessEnv;
   runner: PreflightRunner;
   project: PreflightProjectPort;
+  authority: PreflightAuthorityPort;
+  notion: PreflightNotionPort;
+  repository: PreflightRepositoryPort;
   remoteUrl?: () => Promise<string>;
   today?: () => string;
 }
@@ -68,10 +84,6 @@ function parseJson<T>(stdout: string, schema: { safeParse(value: unknown): { suc
   return parsed.data;
 }
 
-function sshRemote(remote: string): boolean {
-  return /^git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+(?:\.git)?$/.test(remote) || /^ssh:\/\/[A-Za-z0-9@._-]+\/[A-Za-z0-9._/-]+(?:\.git)?$/.test(remote);
-}
-
 function restHeaders(): string[] {
   return ["-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2026-03-10"];
 }
@@ -93,6 +105,8 @@ export class PreflightService {
 
   async run(): Promise<PreflightResult> {
     credentials(this.options.environment);
+    await this.options.authority.observeCommittedLegacy();
+    await this.options.notion.verifyReadOnlyRoutes();
     if (this.options.config.registryRepository.split("/", 1)[0]?.toLowerCase() !== this.options.config.githubOwner.toLowerCase()) {
       throw new ControlError("UNSUPPORTED_REGISTRY_OWNER", "Personal Project fixture must be in a repository owned by the configured user");
     }
@@ -102,6 +116,21 @@ export class PreflightService {
     const scopes = parseHeaderResponse(scopeResult.stdout);
     if (scopes.has("repo")) throw new ControlError("PROJECT_TOKEN_HAS_REPO_SCOPE", "Project token must not expose repo scope");
     if (!scopes.has("project")) throw new ControlError("PROJECT_SCOPE_MISSING", "Project token must expose project scope");
+    if (scopes.size !== 1) throw new ControlError("PROJECT_SCOPE_NOT_EXACT", "Project token must expose exactly project scope");
+
+    await this.options.repository.verifyPrivateRepository(this.options.config.registryRepository);
+
+    const remote = this.options.remoteUrl
+      ? await this.options.remoteUrl()
+      : (await this.options.runner.run("git", ["remote", "get-url", "--all", this.options.config.registryRemote], {
+        cwd: this.options.config.registryDir,
+      })).stdout.trim();
+    const remoteLines = remote.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (remoteLines.length !== 1) throw new ControlError("AMBIGUOUS_REGISTRY_REMOTE", "Registry remote must have exactly one URL");
+    const remoteSlug = githubSlugFromRemote(remoteLines[0] as string, true);
+    if (remoteSlug.toLowerCase() !== this.options.config.registryRepository.toLowerCase()) {
+      throw new ControlError("REGISTRY_REMOTE_MISMATCH", "Registry remote does not match configured repository identity");
+    }
 
     const issuePath = `repos/${this.options.config.registryRepository}/issues/${this.options.config.preflightRegistryIssueNumber}`;
     const issue = parseJson(
@@ -166,12 +195,6 @@ export class PreflightService {
       throw new ControlError("INVALID_PREFLIGHT_ISSUE", "Registry Issue unchanged-write verification failed");
     }
 
-    const remote = this.options.remoteUrl
-      ? await this.options.remoteUrl()
-      : (await this.options.runner.run("git", ["remote", "get-url", this.options.config.registryRemote], {
-        cwd: this.options.config.registryDir,
-      })).stdout.trim();
-    if (!sshRemote(remote)) throw new ControlError("REGISTRY_REMOTE_NOT_SSH", "Registry preflight requires an SSH remote");
     await this.options.runner.run("git", ["fetch", this.options.config.registryRemote, this.options.config.registryBranch], { cwd: this.options.config.registryDir });
     await this.options.runner.run("git", ["push", "--dry-run", this.options.config.registryRemote, `HEAD:${this.options.config.registryBranch}`], {
       cwd: this.options.config.registryDir,
@@ -179,7 +202,15 @@ export class PreflightService {
 
     return {
       status: "ready",
-      checks: { credentials: "ok", project: "ok", registry_issue: "ok", registry_git: "ok" },
+      checks: {
+        credentials: "ok",
+        authority: "ok",
+        notion_guard: "ok",
+        project: "ok",
+        registry_repository: "ok",
+        registry_issue: "ok",
+        registry_git: "ok",
+      },
     };
   }
 }

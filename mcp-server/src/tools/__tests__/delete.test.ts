@@ -27,7 +27,9 @@ describe("jhw_delete", () => {
 
   beforeEach(() => {
     mockClient = createMockNotionClient();
-    mockClient.pages.retrieve.mockResolvedValue({ parent: { type: "workspace", workspace: true } });
+    mockClient.pages.retrieve.mockImplementation(async ({ page_id }: { page_id: string }) => ({
+      id: page_id, object: "page", parent: { type: "workspace", workspace: true },
+    }));
     const { server, capturedTools } = createMockServer();
     legacyAuthority.assertNotionWriteAllowed.mockClear();
     registryAuthority.assertNotionWriteAllowed.mockClear();
@@ -74,7 +76,12 @@ describe("jhw_delete", () => {
     defaultPageCache.clear();
     defaultPageCache.set({ id: "page-1", db: "decisionLog", title: "kept", text: "kept" });
     mockClient.pages.retrieve.mockResolvedValue({
-      parent: { type: "data_source_id", data_source_id: "ds", database_id: NOTION_CONFIG.databases.decisionLog },
+      id: "page-1",
+      parent: {
+        type: "data_source_id",
+        data_source_id: "c1d8d3c3-538e-40a9-a306-2b694a4d8ff9",
+        database_id: NOTION_CONFIG.databases.decisionLog,
+      },
     });
     const { server, capturedTools } = createMockServer();
     registerDelete(server as any, registryAuthority);
@@ -90,6 +97,7 @@ describe("jhw_delete", () => {
 
   it("registry authority에서도 Knowledge Base 삭제는 기존 경로로 처리한다", async () => {
     mockClient.pages.retrieve.mockResolvedValue({
+      id: "kb-page",
       parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase },
     });
     mockClient.pages.update.mockResolvedValue({});

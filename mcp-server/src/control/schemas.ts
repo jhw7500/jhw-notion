@@ -249,7 +249,10 @@ export const PreflightResultSchema = z
     checks: z
       .object({
         credentials: z.literal("ok"),
+        authority: z.literal("ok"),
+        notion_guard: z.literal("ok"),
         project: z.literal("ok"),
+        registry_repository: z.literal("ok"),
         registry_issue: z.literal("ok"),
         registry_git: z.literal("ok"),
       })

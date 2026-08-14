@@ -21,7 +21,7 @@ function authority(authority_epoch: number, mode: "legacy" | "registry"): Author
     authority_epoch,
     mode,
     cutover_at: mode === "registry" ? "2026-08-20T00:00:00Z" : null,
-    minimum_tool_version: mode === "registry" ? "1.1.0" : "1.0.0",
+    minimum_tool_version: "1.0.0",
   };
 }
 
@@ -36,6 +36,18 @@ afterEach(async () => {
 });
 
 describe("Notion authority service", () => {
+  it("rejects central authority requiring a newer control tool version", async () => {
+    const { cachePath } = await temporaryCache();
+    const service = createAuthorityService({
+      readCentral: async () => ({ ...authority(1, "legacy"), minimum_tool_version: "1.1.0" }),
+      cachePath,
+      writesDisabled: false,
+      toolVersion: "1.0.0",
+    });
+
+    await expect(service.load()).rejects.toMatchObject({ code: "TOOL_VERSION_TOO_OLD" });
+    await expect(readFile(cachePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
   it("allows legacy mode but rejects Projects and Decision writes in registry mode", async () => {
     const { cachePath } = await temporaryCache();
     let central = authority(1, "legacy");
