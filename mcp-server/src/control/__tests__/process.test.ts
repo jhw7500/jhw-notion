@@ -43,13 +43,13 @@ describe("control process boundary", () => {
 
   it("requires absolute Registry and worktree roots", () => {
     const base = {
-      HOME: "/home/jhw",
-      JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
-      JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
-      JHW_BUILD_HOST: "cantopsbuildserver",
-      JHW_GITHUB_OWNER: "jhw7500",
+      HOME: "/fixture/home",
+      JHW_REGISTRY_DIR: "/fixture/registry",
+      JHW_WORKTREE_ROOT: "/fixture/worktrees",
+      JHW_BUILD_HOST: "fixture-build-host",
+      JHW_GITHUB_OWNER: "fixture-owner",
       JHW_PROJECT_NUMBER: "7",
-      JHW_REGISTRY_REPOSITORY: "jhw7500/project-registry",
+      JHW_REGISTRY_REPOSITORY: "fixture-owner/registry",
       JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
       JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
     };
