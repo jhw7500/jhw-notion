@@ -22,6 +22,9 @@ interface RawProcessRunnerLike extends ProcessRunnerLike {
   runRaw(command: string, args: string[], options: ProcessRunOptions | undefined, maximumBytes: number): Promise<Buffer>;
 }
 
+const MAX_HEAD_DIRECTORY_ENTRIES = 10_000;
+const MAX_HEAD_TREE_ROW_BYTES = 384;
+
 export interface RegistryTransactionResult {
   commit: string;
   changed: boolean;
@@ -36,9 +39,10 @@ function changedPaths(status: string): string[] {
 }
 
 function isSafeRegistryRelativePath(path: string): boolean {
-  if (!path || path.includes("\0") || isAbsolute(path) || /^[A-Za-z]:[\\/]/.test(path)) return false;
+  if (!path || path.includes("\0") || path.includes("\\") || isAbsolute(path) || /^[A-Za-z]:[\\/]/.test(path)) return false;
   const normalized = normalize(path);
-  return normalized !== "." && normalized !== ".." && !normalized.startsWith(`..${sep}`);
+  return normalized === path && normalized !== "." && normalized !== ".." && !normalized.startsWith(`..${sep}`) &&
+    path.split("/").every((component) => component.length > 0 && component !== "." && component !== "..");
 }
 
 function isNonFastForwardPushFailure(error: ControlError): boolean {
@@ -140,16 +144,20 @@ export class RegistryGit {
 
   /** Lists the exact direct children selected by a proven regular HEAD tree. */
   async listHeadDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]> {
-    if (!isSafeRegistryRelativePath(relativeDirectory) || !Number.isSafeInteger(maximumEntries) || maximumEntries < 1) {
+    if (!isSafeRegistryRelativePath(relativeDirectory) || !Number.isSafeInteger(maximumEntries) ||
+      maximumEntries < 1 || maximumEntries > MAX_HEAD_DIRECTORY_ENTRIES) {
       throw new ControlError("INVALID_REGISTRY_PATH", "Registry directory path or bound is invalid");
     }
-    let selected: string;
+    let roots: string[];
     try {
-      selected = (await this.git(["ls-tree", "-z", "HEAD", "--", relativeDirectory])).stdout;
+      const selected = await this.rawGit(
+        ["ls-tree", "-z", "HEAD", "--", relativeDirectory],
+        Buffer.byteLength(relativeDirectory, "utf8") + 128,
+      );
+      roots = this.decodeNulRows(selected);
     } catch {
       throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD directory");
     }
-    const roots = selected.split("\0").filter(Boolean);
     if (roots.length === 0) return [];
     if (roots.length !== 1) throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD directory is ambiguous");
     const rootTab = (roots[0] as string).indexOf("\t");
@@ -158,13 +166,16 @@ export class RegistryGit {
     if (rootMode !== "040000" || rootType !== "tree" || rootPath !== relativeDirectory || !/^[0-9a-f]{40,64}$/.test(treeId ?? "")) {
       throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD path is not a directory tree");
     }
-    let output: string;
+    let rows: string[];
     try {
-      output = (await this.git(["ls-tree", "-z", treeId as string])).stdout;
+      const output = await this.rawGit(
+        ["ls-tree", "-z", treeId as string],
+        (maximumEntries + 1) * MAX_HEAD_TREE_ROW_BYTES,
+      );
+      rows = this.decodeNulRows(output);
     } catch {
       throw new ControlError("REGISTRY_CORRUPT", "Unable to enumerate Registry HEAD directory");
     }
-    const rows = output.split("\0").filter(Boolean);
     if (rows.length > maximumEntries) throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD directory exceeds its bound");
     const entries = rows.map((row): RegistryDirectoryEntry => {
       const tab = row.indexOf("\t");
@@ -178,6 +189,26 @@ export class RegistryGit {
       throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD directory contains a non-regular entry");
     });
     return entries.sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  private async rawGit(args: string[], maximumBytes: number): Promise<Buffer> {
+    const rawRunner = this.runner as Partial<RawProcessRunnerLike>;
+    if (typeof rawRunner.runRaw !== "function") {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry runner cannot capture exact HEAD tree bytes");
+    }
+    return rawRunner.runRaw("git", args, { cwd: this.config.registryDir }, maximumBytes);
+  }
+
+  private decodeNulRows(bytes: Buffer): string[] {
+    if (bytes.length === 0) return [];
+    if (bytes.at(-1) !== 0) throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD tree output is truncated");
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    const rows = text.slice(0, -1).split("\0");
+    if (rows.some((row) => row.length === 0)) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD tree output contains an empty row");
+    }
+    this.sensitiveData.assertSafe(rows);
+    return rows;
   }
 
   /** Proves a HEAD-selected blob is bounded before requesting its content. */

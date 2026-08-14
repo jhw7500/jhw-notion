@@ -344,7 +344,9 @@ export class WorktreeManager {
     const [entry] = candidates;
     if (!entry) return;
     const [worktreeRef, mapping] = entry;
-    const retainedMatches = retained?.claim_id === mapping.claim_id &&
+    const retainedGenerationMatches = retained?.claim_id === mapping.claim_id ||
+      (retained?.successor_claim_id !== undefined && retained.successor_claim_id === mapping.claim_id);
+    const retainedMatches = retainedGenerationMatches &&
       retained.worktree_ref === worktreeRef &&
       plan.worktree_ref === worktreeRef;
     const lifecycleAllowed = retained?.disposition === "active" || retained?.disposition === "create-failed"
@@ -458,6 +460,18 @@ export class WorktreeManager {
     const repository = await this.repositoryInfo(mapping.repository_path);
     this.assertTakeoverMapping(mapping, parsed.data, repository, root, "active");
     await this.verifyWorktree(mapping.path, parsed.data.branch, repository.identity, root);
+  }
+
+  async assertForceEndEligible(previous: ActiveClaim): Promise<void> {
+    const status = await this.recoveryStatus(previous);
+    if (status.lifecycle === "active") return;
+    if (status.lifecycle === "pending-create") {
+      throw new ControlError("WORKTREE_CREATE_PENDING", "Worktree creation must be reconciled before force-end");
+    }
+    if (status.lifecycle === "pending-remove") {
+      throw new ControlError("WORKTREE_REMOVE_PENDING", "Worktree removal must be reconciled before force-end");
+    }
+    throw new ControlError("WORKTREE_REMOVED", "Removed worktree generation cannot be force-ended");
   }
 
   async rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<WorktreeTakeoverRebindResult> {

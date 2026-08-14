@@ -10,15 +10,19 @@ import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.j
 import { AuthorityRecordSchema, type AuthorityRecord } from "./schemas.js";
 import type { DatabaseName } from "../config.js";
 import { CONTROL_TOOL_VERSION } from "./version.js";
+import { ProcessRunner } from "./process.js";
 
 const CACHE_SCHEMA = AuthorityRecordSchema.pick({ authority_epoch: true, mode: true });
 const CACHE_FILE = "authority-cache.json";
 const LOCK_FILE = "authority-cache.lock";
 const temporaryCacheOpenFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW;
 const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW;
-const centralOpenFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
+const cacheReadOpenFlags = constants.O_RDONLY | constants.O_NONBLOCK;
 const centralDirectoryOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const MAX_NAMESPACE_DEPTH = 4096;
+const AUTHORITY_LOCK_TIMEOUT_MS = 5_000;
+const CENTRAL_AUTHORITY_PATH = "governance/authority.yaml";
+const MAX_CENTRAL_AUTHORITY_BYTES = 4_096;
 
 export interface AuthorityDecision {
   authority_epoch: number;
@@ -51,7 +55,27 @@ export interface AuthorityCacheHooks {
   afterRename?(): Promise<void> | void;
   syncDirectory?(directoryFd: number): Promise<void>;
   afterDirectorySync?(directoryFd: number): Promise<void> | void;
+  /** Deterministic helper-process boundary injection for tests. */
+  lockRuntime?: AuthorityLockRuntime;
+  lockTimeoutMs?: number;
 }
+
+export interface AuthorityLockChild {
+  once(event: string, listener: (...args: unknown[]) => void): unknown;
+  kill?(signal?: NodeJS.Signals | number): unknown;
+}
+
+export interface AuthorityLockRuntime {
+  spawn(
+    command: string,
+    args: string[],
+    options: { env: NodeJS.ProcessEnv; stdio: ["ignore", "ignore", "ignore", number] },
+  ): AuthorityLockChild;
+}
+
+const productionAuthorityLockRuntime: AuthorityLockRuntime = {
+  spawn: (command, args, options) => spawn(command, args, options),
+};
 
 function structuredError(
   code: string,
@@ -104,7 +128,7 @@ function readJson<T>(text: string, parse: (value: unknown) => T): T {
 async function readCache(directory: SecureStateDirectory, fileName: string): Promise<AuthorityCache | null> {
   let file: FileHandle | undefined;
   try {
-    file = await directory.openFile(fileName, constants.O_RDONLY);
+    file = await directory.openFile(fileName, cacheReadOpenFlags);
     const info = await file.stat();
     if (!info.isFile() || info.nlink !== 1) throw authorityUnavailable();
     return readJson(await file.readFile("utf8"), (value) => {
@@ -157,7 +181,7 @@ async function writeCache(
     await (hooks.rename ?? rename)(descriptorPath(directory, temporaryName), descriptorPath(directory, fileName));
     await hooks.afterRename?.();
 
-    published = await directory.openFile(fileName, constants.O_RDONLY);
+    published = await directory.openFile(fileName, cacheReadOpenFlags);
     const publishedInfo = await published.stat();
     if (!publishedInfo.isFile() || publishedInfo.nlink !== 1 || (publishedInfo.mode & 0o777) !== 0o600) {
       throw authorityUnavailable();
@@ -225,11 +249,15 @@ async function syncCacheNamespace(
   }
 }
 
-function acquireLock(file: FileHandle): Promise<void> {
+function acquireLock(file: FileHandle, hooks: AuthorityCacheHooks = {}): Promise<void> {
+  const deadline = hooks.lockTimeoutMs ?? AUTHORITY_LOCK_TIMEOUT_MS;
+  if (!Number.isSafeInteger(deadline) || deadline <= 0 || deadline > 60_000) {
+    return Promise.reject(authorityUnavailable());
+  }
   return new Promise((resolve, reject) => {
-    let child: ReturnType<typeof spawn>;
+    let child: AuthorityLockChild;
     try {
-      child = spawn("flock", ["-x", "-n", "3"], {
+      child = (hooks.lockRuntime ?? productionAuthorityLockRuntime).spawn("flock", ["-x", "-n", "3"], {
         env: { PATH: process.env.PATH },
         stdio: ["ignore", "ignore", "ignore", file.fd],
       });
@@ -241,8 +269,13 @@ function acquireLock(file: FileHandle): Promise<void> {
     const settle = (callback: () => void) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       callback();
     };
+    const timer = setTimeout(() => settle(() => {
+      try { child.kill?.("SIGKILL"); } catch { /* stable failure below */ }
+      reject(authorityUnavailable());
+    }), deadline);
     child.once("error", () => settle(() => reject(authorityUnavailable())));
     child.once("close", (status) => settle(() => status === 0 ? resolve() : reject(authorityUnavailable())));
   });
@@ -250,6 +283,7 @@ function acquireLock(file: FileHandle): Promise<void> {
 
 async function withCacheLock<T>(
   cachePath: string,
+  hooks: AuthorityCacheHooks | undefined,
   callback: (directory: SecureStateDirectory, fileName: string) => Promise<T>,
 ): Promise<T> {
   const { stateDir, fileName } = safeCacheLocation(cachePath);
@@ -261,7 +295,7 @@ async function withCacheLock<T>(
     const lockInfo = await lock.stat();
     if (!lockInfo.isFile() || lockInfo.nlink !== 1) throw authorityUnavailable();
     await lock.chmod(0o600);
-    await acquireLock(lock);
+    await acquireLock(lock, hooks);
     return await callback(directory, fileName);
   } catch (cause) {
     if (cause instanceof ControlError && (cause.code.startsWith("AUTHORITY_") || cause.code === "TOOL_VERSION_TOO_OLD")) throw cause;
@@ -301,7 +335,7 @@ function enforceMinimumToolVersion(central: AuthorityRecord, actualVersion: stri
 export function createAuthorityService(options: CreateAuthorityServiceOptions): AuthorityService {
   return {
     async load(): Promise<AuthorityDecision> {
-      return withCacheLock(options.cachePath, async (directory, fileName) => {
+      return withCacheLock(options.cachePath, options.cacheHooks, async (directory, fileName) => {
         const cache = await readCache(directory, fileName);
         let central: AuthorityRecord | null;
         try {
@@ -360,8 +394,6 @@ async function readCentralFromEnvironment(env: NodeJS.ProcessEnv): Promise<Autho
   if (!registryDir) return null;
   if (!isAbsolute(registryDir)) throw authorityUnavailable();
   let registry: FileHandle | undefined;
-  let governance: FileHandle | undefined;
-  let file: FileHandle | undefined;
   try {
     const target = resolve(registryDir);
     const root = parse(target).root;
@@ -382,22 +414,40 @@ async function readCentralFromEnvironment(env: NodeJS.ProcessEnv): Promise<Autho
       await current?.close().catch(() => undefined);
       throw authorityUnavailable();
     }
-    try {
-      governance = await open(`/proc/self/fd/${registry.fd}/governance`, centralDirectoryOpenFlags);
-      if (!(await governance.stat()).isDirectory()) throw authorityUnavailable();
-    } catch (cause) {
-      if (cause instanceof ControlError) throw cause;
-      throw authorityUnavailable();
-    }
-    try {
-      file = await open(`/proc/self/fd/${governance.fd}/authority.yaml`, centralOpenFlags);
-    } catch (cause) {
-      if (isNotFound(cause)) return null;
-      throw authorityUnavailable();
-    }
-    const fileInfo = await file.stat();
-    if (!fileInfo.isFile() || fileInfo.nlink !== 1) throw authorityUnavailable();
-    const parsed: unknown = JSON.parse(await file.readFile("utf8"));
+    const runner = new ProcessRunner({ ...process.env, ...env });
+    const cwd = `/proc/self/fd/${registry.fd}`;
+    const selected = await runner.runRaw(
+      "git",
+      ["ls-tree", "-z", "HEAD", "--", CENTRAL_AUTHORITY_PATH],
+      { cwd },
+      256,
+    );
+    if (selected.length === 0 || selected.at(-1) !== 0) throw authorityUnavailable();
+    const selection = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(selected);
+    const rows = selection.slice(0, -1).split("\0");
+    if (rows.length !== 1 || !rows[0]) throw authorityUnavailable();
+    const tab = rows[0].indexOf("\t");
+    const [mode, type, objectId] = tab >= 0 ? rows[0].slice(0, tab).split(" ") : [];
+    const path = tab >= 0 ? rows[0].slice(tab + 1) : "";
+    if (
+      (mode !== "100644" && mode !== "100755") ||
+      type !== "blob" ||
+      !/^[0-9a-f]{40,64}$/.test(objectId ?? "") ||
+      path !== CENTRAL_AUTHORITY_PATH
+    ) throw authorityUnavailable();
+    const sizeBytes = await runner.runRaw("git", ["cat-file", "-s", objectId as string], { cwd }, 32);
+    const sizeText = new TextDecoder("utf-8", { fatal: true }).decode(sizeBytes);
+    if (!/^(?:0|[1-9][0-9]*)\n?$/.test(sizeText)) throw authorityUnavailable();
+    const size = Number.parseInt(sizeText, 10);
+    if (!Number.isSafeInteger(size) || size > MAX_CENTRAL_AUTHORITY_BYTES) throw authorityUnavailable();
+    const bytes = await runner.runRaw(
+      "git",
+      ["cat-file", "blob", objectId as string],
+      { cwd },
+      MAX_CENTRAL_AUTHORITY_BYTES,
+    );
+    if (bytes.length !== size) throw authorityUnavailable();
+    const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
     const result = AuthorityRecordSchema.safeParse(parsed);
     if (!result.success) throw authorityUnavailable();
     return result.data;
@@ -405,8 +455,6 @@ async function readCentralFromEnvironment(env: NodeJS.ProcessEnv): Promise<Autho
     if (cause instanceof ControlError && cause.code === "AUTHORITY_UNAVAILABLE") throw cause;
     throw authorityUnavailable();
   } finally {
-    await file?.close();
-    await governance?.close();
     await registry?.close();
   }
 }

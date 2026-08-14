@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { chmod, link, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -106,6 +107,16 @@ describe("PilotJournal", () => {
     expect(await readFile(external, "utf8")).toBe("outside\n");
     expect((await lstat(external)).mode & 0o777).toBe(0o644);
     expect(synced).toBe(false);
+  });
+
+  it("rejects a FIFO journal without blocking before its type check", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    await mkdir(stateDir, { mode: 0o700 });
+    execFileSync("mkfifo", [join(stateDir, "pilot-journal.jsonl")]);
+
+    await expect(new PilotJournal(stateDir).append(event())).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
   });
 
   it("reports the journal durable only after data and directory sync complete", async () => {

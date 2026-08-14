@@ -754,6 +754,24 @@ describe("WorktreeManager", () => {
     });
   });
 
+  it("accepts the exact successor after a resumed worktree rebind lost its response", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const predecessor = claim();
+    await manager.createOrReuse(predecessor, repoDir);
+    const successor = claim({
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      session_id: "codex-successor",
+    });
+    await manager.createOrReuse(successor, repoDir);
+
+    await expect(manager.assertStartReady(predecessor.task_id, predecessor.task_alias, {
+      claim_id: predecessor.claim_id,
+      successor_claim_id: successor.claim_id,
+      worktree_ref: predecessor.worktree_ref,
+      disposition: "handoff",
+    })).resolves.toBeUndefined();
+  });
+
   it("finds pending cleanup for the same Task after its alias changes", async () => {
     let saves = 0;
     const { repoDir, manager } = await worktreeFixtureWithHooks({
@@ -796,6 +814,20 @@ describe("WorktreeManager", () => {
       worktree_ref: active.worktree_ref,
       disposition: "create-failed",
     })).rejects.toMatchObject({ code: "WORKTREE_CREATE_PENDING" });
+  });
+
+  it("refuses force-end while the exact Claim still has pending creation", async () => {
+    let saves = 0;
+    const { repoDir, manager } = await worktreeFixtureWithHooks({
+      beforeSave: () => {
+        saves += 1;
+        if (saves === 2) throw new Error("state write failed after git create");
+      },
+    });
+    const active = claim();
+    await expect(manager.createOrReuse(active, repoDir)).rejects.toThrow("state write failed after git create");
+
+    await expect(manager.assertForceEndEligible(active)).rejects.toMatchObject({ code: "WORKTREE_CREATE_PENDING" });
   });
 
   it("rejects a pending-create mapping that contradicts Handoff lifecycle evidence", async () => {

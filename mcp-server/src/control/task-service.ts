@@ -46,6 +46,7 @@ export interface WorktreeManagerPort {
   createOrReuse(claim: ActiveClaim, repositoryPath: string): Promise<WorktreeCreateResult>;
   inspect(claim: ActiveClaim): Promise<WorktreeInspection>;
   removeIfSafe(claim: ActiveClaim): Promise<WorktreeRemovalResult>;
+  assertForceEndEligible(previous: ActiveClaim): Promise<void>;
   assertTakeoverEligible(previous: ActiveClaim): Promise<void>;
   rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<{ changed: boolean }>;
   cleanupReleased(history: ClaimHistory): Promise<WorktreeRemovalResult>;
@@ -362,7 +363,8 @@ export class TaskService {
       taskAlias,
       retained,
     );
-    const claim = currentActive?.session_id === input.session_id
+    const reusingCurrentClaim = currentActive?.session_id === input.session_id;
+    const claim = reusingCurrentClaim
       ? currentActive
       : await this.claims.claimTask({
           task_id: input.task_id,
@@ -384,23 +386,25 @@ export class TaskService {
       // best-effort release fails, the caller must receive its retained Claim
       // coordinates without leaking the host-local allocation failure details.
       let claimState: "active" | "released" = "active";
-      await this.claims.finishClaim(claim.task_id, claim.claim_id, {
-        status: "abandoned",
-        outcome: "worktree_create_failed",
-        branch: claim.branch,
-        head_sha: "unavailable",
-        validation: [worktreeCreateValidation(cause)],
-      }).then(() => {
-        claimState = "released";
-      }).catch(() => undefined);
+      if (!reusingCurrentClaim) {
+        await this.claims.finishClaim(claim.task_id, claim.claim_id, {
+          status: "abandoned",
+          outcome: "worktree_create_failed",
+          branch: claim.branch,
+          head_sha: "unavailable",
+          validation: [worktreeCreateValidation(cause)],
+        }).then(() => {
+          claimState = "released";
+        }).catch(() => undefined);
+      }
       if (cause instanceof ControlError) {
-        throw new ControlError(cause.code, cause.message, {
+        throw new ControlError(cause.code, "Worktree allocation failed", {
           task_id: claim.task_id,
           claim_id: claim.claim_id,
           claim_state: claimState,
         });
       }
-      throw new ControlError("TASK_START_FAILED", errorMessage(cause), {
+      throw new ControlError("TASK_START_FAILED", "Worktree allocation failed", {
         task_id: claim.task_id,
         claim_id: claim.claim_id,
         claim_state: claimState,
@@ -576,6 +580,11 @@ export class TaskService {
         );
       }
       return { kind: "cleanup", history, worktree: await this.worktrees.cleanupReleased(history) };
+    }
+    if (input.action.kind === "force-end") {
+      const previous = await this.claims.assertOwner(input.task_id, input.claim_id);
+      await this.worktrees.assertForceEndEligible(previous);
+      return this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
     }
     if (input.action.kind !== "takeover") {
       return this.claims.recoverClaim(input.task_id, input.claim_id, input.action);

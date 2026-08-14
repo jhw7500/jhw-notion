@@ -8,7 +8,8 @@ import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive
 const MAX_JOURNAL_LINE_BYTES = 4096;
 const JOURNAL_FILE = "pilot-journal.jsonl";
 const directoryOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-const journalOpenFlags = constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW;
+const journalOpenFlags = constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY |
+  constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 export interface JournalEvent {
   command: string;
@@ -201,7 +202,8 @@ export class PilotJournal implements JournalPort {
       }
     } catch (cause) {
       if (cause instanceof ControlError) throw cause;
-      if (typeof cause === "object" && cause !== null && "code" in cause && (cause.code === "ELOOP" || cause.code === "ENOTDIR")) {
+      if (typeof cause === "object" && cause !== null && "code" in cause &&
+        (cause.code === "ELOOP" || cause.code === "ENOTDIR" || cause.code === "ENXIO")) {
         throw unsafeStatePath();
       }
       throw new ControlError("JOURNAL_WRITE_FAILED", "Unable to append the pilot journal");

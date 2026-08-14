@@ -122,6 +122,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
       behind: 0,
     }),
     removeIfSafe: vi.fn().mockResolvedValue({ removed: true }),
+    assertForceEndEligible: vi.fn().mockResolvedValue(undefined),
     assertTakeoverEligible: vi.fn().mockResolvedValue(undefined),
     rebindTakeover: vi.fn().mockResolvedValue({ changed: true }),
   };
@@ -337,7 +338,9 @@ describe("TaskService", () => {
     const { tasks, claims, worktrees } = await taskFixture();
     worktrees.createOrReuse.mockRejectedValue(new Error("worktree failed"));
 
-    await expect(tasks.start(startInput)).rejects.toThrow("worktree failed");
+    const error = await tasks.start(startInput).catch((cause: unknown) => cause);
+    expect(error).toMatchObject({ code: "TASK_START_FAILED", message: "Worktree allocation failed" });
+    expect(JSON.stringify(error)).not.toContain("worktree failed");
 
     expect(claims.claimTask).toHaveBeenCalledBefore(worktrees.createOrReuse);
     expect(claims.finishClaim).toHaveBeenCalledWith(
@@ -351,6 +354,22 @@ describe("TaskService", () => {
       CLAIM_ID,
       expect.objectContaining({ validation: ["worktree_create_failed:unknown"] }),
     );
+  });
+
+  it("does not abandon a pre-existing same-session Claim when retry allocation fails", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.getActive.mockResolvedValueOnce(activeClaim);
+    worktrees.createOrReuse.mockRejectedValueOnce(
+      new ControlError("WORKTREE_MAPPING_MISMATCH", "injected existing mapping failure"),
+    );
+
+    await expect(tasks.start(startInput)).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_MISMATCH",
+      details: { task_id: activeClaim.task_id, claim_id: activeClaim.claim_id, claim_state: "active" },
+    });
+
+    expect(claims.claimTask).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
   });
 
   it("prevalidates a fresh takeover before Registry rotation and then rebinds its direct successor", async () => {
@@ -426,6 +445,21 @@ describe("TaskService", () => {
       claim_id: activeClaim.claim_id,
       action: { kind: "takeover", session_id: "codex-new" },
     })).rejects.toMatchObject({ code: "WORKTREE_LIFECYCLE_MISMATCH" });
+
+    expect(claims.recoverClaim).not.toHaveBeenCalled();
+  });
+
+  it("does not force-end Registry ownership while local creation still needs recovery", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    worktrees.assertForceEndEligible.mockRejectedValueOnce(
+      new ControlError("WORKTREE_CREATE_PENDING", "creation recovery required"),
+    );
+
+    await expect(tasks.recover({
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      action: { kind: "force-end" },
+    })).rejects.toMatchObject({ code: "WORKTREE_CREATE_PENDING" });
 
     expect(claims.recoverClaim).not.toHaveBeenCalled();
   });

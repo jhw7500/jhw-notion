@@ -12,6 +12,7 @@ import { isSensitiveEnvironmentKey } from "./sensitive-data.js";
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
 const MAX_PROCESS_TIMEOUT_MS = 600_000;
+const LOCK_HELPER_TIMEOUT_MS = 5_000;
 
 export interface ProcessResult {
   command: string;
@@ -118,22 +119,13 @@ function stoppedError(stopped: ChildExit["stopped"], command: string, deadline: 
 function secretValues(env: NodeJS.ProcessEnv): string[] {
   return [...new Set(
     Object.entries(env)
-      .filter(([key, value]) => isSensitiveEnvironmentKey(key) && value)
+      .filter(([key, value]) => isSensitiveEnvironmentKey(key) && value && Buffer.byteLength(value, "utf8") >= 8)
       .map(([, value]) => value as string),
   )].sort((left, right) => right.length - left.length);
 }
 
 function redact(value: string, secrets: readonly string[]): string {
   return secrets.reduce((result, secret) => result.replaceAll(secret, "[REDACTED]"), value);
-}
-
-function partialSecretPrefixLength(value: string, secrets: readonly string[]): number {
-  const longest = Math.max(0, ...secrets.map((secret) => secret.length - 1));
-  for (let length = Math.min(longest, value.length); length > 0; length -= 1) {
-    const suffix = value.slice(-length);
-    if (secrets.some((secret) => secret.startsWith(suffix))) return length;
-  }
-  return 0;
 }
 
 interface SecretSpan {
@@ -193,14 +185,20 @@ function pullBackFromSplitSurrogate(value: string, limit: number): number {
  * Redacts each stream incrementally, masking the union of all complete secret
  * spans before retaining a suffix that might complete in a later chunk.
  */
-function redactingCapture(stream: Readable | null, secrets: readonly string[]): Promise<Buffer> {
-  if (!stream) return Promise.resolve(Buffer.alloc(0));
+interface RedactedCapture {
+  bytes: Buffer;
+  sensitive: boolean;
+}
+
+function redactingCapture(stream: Readable | null, secrets: readonly string[]): Promise<RedactedCapture> {
+  if (!stream) return Promise.resolve({ bytes: Buffer.alloc(0), sensitive: false });
 
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     const decoder = new StringDecoder("utf8");
     let captured = 0;
     let pending = "";
+    let sensitive = false;
 
     const append = (value: string) => {
       if (captured >= MAX_CAPTURE_BYTES || !value) return;
@@ -218,6 +216,7 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
     };
     const emitAvailable = () => {
       const spans = secretSpans(pending, secrets);
+      if (spans.length > 0) sensitive = true;
       const longest = Math.max(0, ...secrets.map((secret) => secret.length));
       let limit = Math.max(0, pending.length - Math.max(0, longest - 1));
       let changed = true;
@@ -249,11 +248,10 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
       settled = true;
       pending += decoder.end();
       const spans = secretSpans(pending, secrets);
-      const prefixLength = partialSecretPrefixLength(pending, secrets);
-      if (prefixLength) spans.push({ start: pending.length - prefixLength, end: pending.length });
+      if (spans.length > 0) sensitive = true;
       append(renderMasked(pending, mergeSecretSpans(spans)));
       pending = "";
-      resolve(Buffer.concat(chunks));
+      resolve({ bytes: Buffer.concat(chunks), sensitive });
     };
     stream.once("end", finish);
     stream.once("close", finish);
@@ -426,14 +424,14 @@ export class ProcessRunner {
     const stdout = redactingCapture(child.stdout, secrets);
     const stderr = redactingCapture(child.stderr, secrets);
     const exit = await waitForChild(child, options);
-    const [stdoutBuffer, stderrBuffer] = await Promise.all([stdout, stderr]);
+    const [stdoutCapture, stderrCapture] = await Promise.all([stdout, stderr]);
     const stopError = stoppedError(exit.stopped, safeCommand, deadline);
     if (stopError) throw stopError;
     const result = {
       command: safeCommand,
       args: safeArgs,
-      stdout: stdoutBuffer.toString("utf8"),
-      stderr: stderrBuffer.toString("utf8"),
+      stdout: stdoutCapture.bytes.toString("utf8"),
+      stderr: stderrCapture.bytes.toString("utf8"),
       exitCode: exit.exitCode,
     };
 
@@ -442,6 +440,13 @@ export class ProcessRunner {
         "COMMAND_FAILED",
         `Command failed (${result.exitCode ?? "unknown"}): ${safeCommand}`,
         { ...result, cause: exit.cause ? redact(exit.cause, secrets) : undefined },
+      );
+    }
+
+    if (stdoutCapture.sensitive || stderrCapture.sensitive) {
+      throw new ControlError(
+        "SENSITIVE_OUTPUT_REJECTED",
+        "Successful command output contained protected host data",
       );
     }
 
@@ -457,6 +462,7 @@ export interface MutationLockPort {
 
 export interface MutationLockChild {
   once(event: string, listener: (...args: unknown[]) => void): unknown;
+  kill?(signal?: NodeJS.Signals | number): unknown;
 }
 
 export interface MutationLockRuntime {
@@ -483,8 +489,13 @@ function acquireLock(child: MutationLockChild): Promise<void> {
     const settle = (result: () => void) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       result();
     };
+    const timer = setTimeout(() => settle(() => {
+      try { child.kill?.("SIGKILL"); } catch { /* stable timeout below */ }
+      reject(new ControlError("LOCK_ACQUIRE_TIMEOUT", "Host lock acquisition exceeded its bounded execution time"));
+    }), LOCK_HELPER_TIMEOUT_MS);
     child.once("error", () => settle(() => reject(new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock acquisition"))));
     child.once("close", (status) => settle(() => {
       const code = typeof status === "number" ? status : null;

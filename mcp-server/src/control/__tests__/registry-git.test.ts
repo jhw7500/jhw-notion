@@ -185,6 +185,20 @@ describe("RegistryGit", () => {
     await expect(registry.headRegularBlobObjectId("tasks/revision.yaml")).resolves.toBe(expected);
   });
 
+  it.each([
+    "tasks/../governance/authority.yaml",
+    "tasks//record.yaml",
+    "tasks\\record.yaml",
+    "./tasks/record.yaml",
+  ])("rejects noncanonical Registry authority path %s before Git", async (path) => {
+    const { registryDir } = await fixture();
+    const run = vi.fn();
+    const registry = new RegistryGit(configFor(registryDir), { run });
+
+    await expect(registry.headRegularBlobObjectId(path)).rejects.toMatchObject({ code: "INVALID_REGISTRY_PATH" });
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("lists only direct regular HEAD tree entries with exact kinds", async () => {
     const { registryDir } = await fixture();
     await commitFile(registryDir, "claims/history/2026/task.yaml", "{}\n");
@@ -197,6 +211,20 @@ describe("RegistryGit", () => {
       { name: "history", kind: "directory" },
     ]);
     await expect(registry.listHeadDirectoryEntries("missing", 10)).resolves.toEqual([]);
+  });
+
+  it("uses bounded raw capture and rejects an unterminated HEAD tree enumeration", async () => {
+    const { registryDir } = await fixture();
+    const treeId = "a".repeat(40);
+    const run = vi.fn();
+    const runRaw = vi.fn()
+      .mockResolvedValueOnce(Buffer.from(`040000 tree ${treeId}\tclaims\0`, "utf8"))
+      .mockResolvedValueOnce(Buffer.from(`100644 blob ${"b".repeat(40)}\tactive.yaml`, "utf8"));
+    const registry = new RegistryGit(configFor(registryDir), { run, runRaw });
+
+    await expect(registry.listHeadDirectoryEntries("claims", 10)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(run).not.toHaveBeenCalled();
+    expect(runRaw).toHaveBeenCalledTimes(2);
   });
 
   it("reads exact committed Handoff bytes from HEAD rather than the mutable checkout", async () => {

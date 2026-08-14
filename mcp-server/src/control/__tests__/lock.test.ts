@@ -30,7 +30,7 @@ function configFor(stateDir: string): ControlConfig {
 }
 
 function completedAcquisition(status: number, error = false) {
-  const child = new EventEmitter() as EventEmitter;
+  const child = Object.assign(new EventEmitter(), { kill: vi.fn(() => true) });
   queueMicrotask(() => {
     if (error) child.emit("error", new Error("flock unavailable"));
     else child.emit("close", status);
@@ -97,6 +97,30 @@ describe("callback mutation lock", () => {
     await expect(spawnFailure.run(callback)).rejects.toMatchObject({ code: "LOCK_SPAWN_FAILED" });
     await expect(childError.run(callback)).rejects.toMatchObject({ code: "LOCK_SPAWN_FAILED" });
     expect(callback).not.toHaveBeenCalled();
+  });
+
+  it("bounds a lock helper that never emits error or close", async () => {
+    vi.useFakeTimers();
+    try {
+      const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+      roots.push(root);
+      const child = Object.assign(new EventEmitter(), { kill: vi.fn(() => true) });
+      const callback = vi.fn(async () => "must-not-run");
+      const spawned = deferred();
+      const pending = new MutationLock(
+        configFor(join(root, "state")),
+        {},
+        { spawn: () => { spawned.resolve(); return child; } },
+      ).run(callback);
+
+      await spawned.promise;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(pending).rejects.toMatchObject({ code: "LOCK_ACQUIRE_TIMEOUT" });
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(callback).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps a real flock after its acquisition process exits until the pending callback returns", async () => {

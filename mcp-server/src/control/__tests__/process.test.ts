@@ -121,6 +121,28 @@ describe("control process boundary", () => {
     });
   });
 
+  it("rejects protected data in successful output instead of returning redacted corruption", async () => {
+    const secret = "unmistakably-fake-success-token";
+    const error = await new ProcessRunner({ API_TOKEN: secret }).run(
+      "bash",
+      ["-c", `printf '${secret}'`],
+    ).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_OUTPUT_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(JSON.stringify(error)).not.toContain("[REDACTED]");
+  });
+
+  it("does not corrupt successful output for unusably short secret-like values", async () => {
+    const result = await new ProcessRunner({ API_TOKEN: "x" }).run("bash", ["-c", "printf x"]);
+    expect(result.stdout).toBe("x");
+  });
+
+  it("does not reject an ordinary output prefix that is not the protected value", async () => {
+    const result = await new ProcessRunner({ API_TOKEN: "abcdefgh" }).run("bash", ["-c", "printf a"]);
+    expect(result.stdout).toBe("a");
+  });
+
   it("forces ordinary child processes into non-interactive Git and SSH mode", async () => {
     const result = await new ProcessRunner({ GIT_SSH_COMMAND: "ssh -i /fixture/key" }).run(
       "bash",
@@ -283,141 +305,52 @@ describe("control process boundary", () => {
     await writeFile(join(bin, "gh"), "#!/bin/sh\nprintf '%s|%s|%s|%s|%s' \"$GH_TOKEN\" \"${GH_PROJECT_TOKEN:-missing}\" \"${GH_REPO_TOKEN:-missing}\" \"${DB_PASSWORD:-missing}\" \"${lowercase_token:-missing}\"\n");
     await chmod(join(bin, "gh"), 0o755);
     try {
-      const result = await new ProcessRunner({
+      const error = await new ProcessRunner({
         GH_PROJECT_TOKEN: "project-token",
         GH_REPO_TOKEN: "repo-token",
         DB_PASSWORD: "unmistakably-fake-db-password",
         lowercase_token: "unmistakably-fake-lower-token",
-      }).runGh([], "project", { env: { PATH: bin } });
+      }).runGh([], "project", { env: { PATH: bin } }).catch((cause: unknown) => cause);
 
-      expect(result.stdout).toBe("[REDACTED]|missing|missing|missing|missing");
+      expect(error).toMatchObject({ code: "SENSITIVE_OUTPUT_REJECTED" });
+      expect(JSON.stringify(error)).not.toContain("project-token");
     } finally {
       await rm(bin, { recursive: true, force: true });
     }
   });
 
-  it("redacts a self-overlapping secret emitted in one chunk", async () => {
-    const result = await new ProcessRunner({ AAA_TOKEN: "aaa" }).run("bash", ["-c", "printf aaa"]);
-
-    expect(result.stdout).toBe("[REDACTED]");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
-  });
-
-  it("redacts a self-overlapping secret split across child output chunks", async () => {
-    const result = await new ProcessRunner({ AAA_TOKEN: "aaa" }).run(process.execPath, [
+  it("redacts overlapping protected terms in failed diagnostic streams", async () => {
+    const first = "abcdefgh";
+    const second = "defghijk";
+    const error = await new ProcessRunner({ FIRST_TOKEN: first, SECOND_TOKEN: second }).run(process.execPath, [
       "-e",
-      "process.stdout.write('a'); setTimeout(() => process.stdout.write('aa'), 20)",
-    ]);
+      "process.stderr.write('abc');setTimeout(()=>{process.stderr.write('defghijk');process.exit(2)},10)",
+    ]).catch((cause: unknown) => cause);
 
-    expect(result.stdout).toBe("[REDACTED]");
-    expect(result.stdout).not.toContain("a");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+    expect(error).toMatchObject({ code: "COMMAND_FAILED" });
+    expect(JSON.stringify(error)).not.toContain(first);
+    expect(JSON.stringify(error)).not.toContain(second);
+    expect(JSON.stringify(error)).toContain("[REDACTED]");
   });
 
-  it("redacts an overlapping secret across arbitrary output splits", async () => {
-    const result = await new ProcessRunner({ ABAB_TOKEN: "abab" }).run(process.execPath, [
-      "-e",
-      "process.stdout.write('ab'); setTimeout(() => process.stdout.write('ab'), 20)",
-    ]);
-
-    expect(result.stdout).toBe("[REDACTED]");
-    expect(result.stdout).not.toContain("ab");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
-  });
-
-  it("masks the union of distinct overlapping secrets in one chunk", async () => {
-    const result = await new ProcessRunner({ FIRST_TOKEN: "abc", SECOND_TOKEN: "bcd" }).run(
-      "bash",
-      ["-c", "printf abcd"],
-    );
-
-    expect(result.stdout).toBe("[REDACTED]");
-    expect(result.stdout).not.toContain("abc");
-    expect(result.stdout).not.toContain("bcd");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
-  });
-
-  it("masks the union of distinct overlapping secrets split across chunks", async () => {
-    const result = await new ProcessRunner({ FIRST_TOKEN: "abc", SECOND_TOKEN: "bcd" }).run(process.execPath, [
-      "-e",
-      "process.stdout.write('ab'); setTimeout(() => process.stdout.write('cd'), 20)",
-    ]);
-
-    expect(result.stdout).toBe("[REDACTED]");
-    expect(result.stdout).not.toContain("d");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
-  });
-
-  it("masks containment relationships without exposing a suffix", async () => {
-    const result = await new ProcessRunner({ SHORT_TOKEN: "abc", LONG_TOKEN: "abcde" }).run(
-      "bash",
-      ["-c", "printf abcde"],
-    );
-
-    expect(result.stdout).toBe("[REDACTED]");
-    expect(result.stdout).not.toContain("abc");
-    expect(result.stdout).not.toContain("de");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
-  });
-
-  it("masks every span in a three-secret overlap chain", async () => {
-    const result = await new ProcessRunner({ FIRST_TOKEN: "abc", SECOND_TOKEN: "bcd", THIRD_TOKEN: "cde" }).run(
-      "bash",
-      ["-c", "printf abcde"],
-    );
-
-    expect(result.stdout).toBe("[REDACTED]");
-    expect(result.stdout).not.toContain("abc");
-    expect(result.stdout).not.toContain("bcd");
-    expect(result.stdout).not.toContain("cde");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
-  });
-
-  it("preserves an emoji when the streaming retention boundary bisects its surrogate pair", async () => {
-    const result = await new ProcessRunner({ CROSSING_TOKEN: "secret" }).run(process.execPath, [
-      "-e",
-      "process.stdout.write('A😀xxxx'); setTimeout(() => process.stdout.write('secretZ'), 20)",
-    ]);
-
-    expect(result.stdout).toBe("A😀xxxx[REDACTED]Z");
-    expect(result.stdout).not.toContain("\uFFFD");
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
-  });
-
-  it("does not leak a secret prefix that crosses the safe output boundary", async () => {
+  it("rejects protected successful output even when the match crosses the capture boundary", async () => {
     const secret = "crossing-secret";
-    const result = await new ProcessRunner({ CROSSING_TOKEN: secret }).run("bash", [
+    const error = await new ProcessRunner({ CROSSING_TOKEN: secret }).run("bash", [
       "-c",
       `head -c ${1024 * 1024 - 4} /dev/zero | tr '\\0' x; printf '${secret}'`,
-    ]);
+    ]).catch((cause: unknown) => cause);
 
-    expect(result.stdout).not.toContain(secret);
-    expect(result.stdout).not.toContain(secret.slice(0, 4));
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
+    expect(error).toMatchObject({ code: "SENSITIVE_OUTPUT_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
   });
 
-  it("caps redacted output after short-secret replacement expansion", async () => {
-    const result = await new ProcessRunner({ SHORT_TOKEN: "a" }).run("bash", [
+  it("caps successful output without splitting final UTF-8", async () => {
+    const fillerLength = 1024 * 1024 - 3;
+    const result = await new ProcessRunner({ SHORT_TOKEN: "x" }).run("bash", [
       "-c",
-      `head -c ${1024 * 1024} /dev/zero | tr '\\0' a`,
+      `head -c ${fillerLength} /dev/zero | tr '\\0' x; printf '😀tail'`,
     ]);
 
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
-    expect(result.stdout).not.toContain("a");
-  });
-
-  it("preserves complete UTF-8 when the final capture cap bisects an emoji", async () => {
-    const marker = "[REDACTED]";
-    const safeBytesBeforeEmoji = 1024 * 1024 - 3;
-    const fillerLength = safeBytesBeforeEmoji - Buffer.byteLength(marker);
-    const result = await new ProcessRunner({ ONE_TOKEN: "a" }).run("bash", [
-      "-c",
-      `printf a; head -c ${fillerLength} /dev/zero | tr '\\0' x; printf '😀tail'`,
-    ]);
-
-    expect(result.stdout.startsWith(marker)).toBe(true);
-    expect(result.stdout).toHaveLength(marker.length + fillerLength);
-    expect(result.stdout.slice(marker.length).replaceAll("x", "")).toBe("");
     expect(result.stdout).not.toContain("\uFFFD");
     expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024 * 1024);
   });

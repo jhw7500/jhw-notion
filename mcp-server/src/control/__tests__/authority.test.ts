@@ -1,10 +1,11 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
+import { EventEmitter } from "node:events";
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createAuthorityService, createDefaultAuthorityService, loadAuthorityPolicy } from "../authority.js";
 import type { AuthorityRecord } from "../schemas.js";
@@ -31,6 +32,18 @@ function namespaceChain(stateDir: string): string[] {
   const paths = [stateDir];
   while (dirname(paths.at(-1)!) !== paths.at(-1)) paths.push(dirname(paths.at(-1)!));
   return paths;
+}
+
+async function committedRegistry(root: string, record?: AuthorityRecord): Promise<string> {
+  const registryDir = join(root, "committed-registry");
+  await mkdir(join(registryDir, "governance"), { recursive: true });
+  execFileSync("git", ["init", "--initial-branch=main", registryDir]);
+  execFileSync("git", ["-C", registryDir, "config", "user.name", "Phase1A Test"]);
+  execFileSync("git", ["-C", registryDir, "config", "user.email", "phase1a@example.invalid"]);
+  if (record) await writeFile(join(registryDir, "governance", "authority.yaml"), `${JSON.stringify(record)}\n`);
+  execFileSync("git", ["-C", registryDir, "add", "--all"]);
+  execFileSync("git", ["-C", registryDir, "commit", "--allow-empty", "-m", "Authority fixture"]);
+  return registryDir;
 }
 
 afterEach(async () => {
@@ -409,6 +422,18 @@ describe("Notion authority service", () => {
     expect(await readFile(external, "utf8")).toBe("outside");
   });
 
+  it("rejects a FIFO authority cache without blocking before its type check", async () => {
+    const { root, cachePath } = await temporaryCache();
+    execFileSync("mkfifo", [cachePath]);
+    const service = createAuthorityService({
+      readCentral: async () => authority(9, "legacy"),
+      cachePath,
+      writesDisabled: false,
+    });
+
+    await expect(service.load()).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
+  });
+
   it("fails closed without waiting when another process holds the authority cache lock", async () => {
     const { root, cachePath } = await temporaryCache();
     const lockPath = join(root, "authority-cache.lock");
@@ -439,6 +464,33 @@ describe("Notion authority service", () => {
     } finally {
       holder.stdin!.end();
       if (holder.exitCode === null) await once(holder, "close");
+    }
+  });
+
+  it("bounds an authority lock helper that never emits error or close", async () => {
+    vi.useFakeTimers();
+    try {
+      const { cachePath } = await temporaryCache();
+      const child = Object.assign(new EventEmitter(), { kill: vi.fn(() => true) });
+      let markSpawned: () => void = () => undefined;
+      const spawned = new Promise<void>((resolve) => { markSpawned = resolve; });
+      const service = createAuthorityService({
+        readCentral: async () => authority(9, "legacy"),
+        cachePath,
+        writesDisabled: false,
+        cacheHooks: {
+          lockTimeoutMs: 25,
+          lockRuntime: { spawn: () => { markSpawned(); return child; } },
+        },
+      });
+      const pending = service.load();
+
+      await spawned;
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(pending).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -548,12 +600,10 @@ describe("Notion authority service", () => {
 
   it("reads JSON-subset authority.yaml without creating or chmodding Registry content", async () => {
     const { root } = await temporaryCache();
-    const registryDir = join(root, "registry");
+    const registryDir = await committedRegistry(root, authority(7, "registry"));
     const governanceDir = join(registryDir, "governance");
     const stateDir = join(root, "state");
-    await mkdir(governanceDir, { recursive: true });
     await chmod(governanceDir, 0o755);
-    await writeFile(join(governanceDir, "authority.yaml"), `${JSON.stringify(authority(7, "registry"), null, 2)}\n`);
 
     await expect(loadAuthorityPolicy({
       HOME: root,
@@ -565,6 +615,36 @@ describe("Notion authority service", () => {
     expect(JSON.parse(await readFile(join(stateDir, "authority-cache.json"), "utf8"))).toEqual({
       authority_epoch: 7,
       mode: "registry",
+    });
+  });
+
+  it("uses the committed authority blob instead of a dirty checkout replacement", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(7, "registry"));
+    await writeFile(join(registryDir, "governance", "authority.yaml"), `${JSON.stringify(authority(8, "legacy"))}\n`);
+    const service = createDefaultAuthorityService({
+      HOME: root,
+      JHW_REGISTRY_DIR: registryDir,
+      JHW_CONTROL_STATE_DIR: join(root, "dirty-central-state"),
+    });
+
+    await expect(service.assertNotionWriteAllowed("projects", "jhw_start")).rejects.toMatchObject({
+      code: "AUTHORITY_MOVED",
+    });
+  });
+
+  it("rejects a dirty authority file that does not exist in HEAD", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root);
+    await writeFile(join(registryDir, "governance", "authority.yaml"), `${JSON.stringify(authority(1, "legacy"))}\n`);
+    const service = createDefaultAuthorityService({
+      HOME: root,
+      JHW_REGISTRY_DIR: registryDir,
+      JHW_CONTROL_STATE_DIR: join(root, "missing-head-state"),
+    });
+
+    await expect(service.assertNotionWriteAllowed("projects", "jhw_start")).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
     });
   });
 
@@ -588,7 +668,7 @@ describe("Notion authority service", () => {
     await expect(lstat(join(root, "missing-registry"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("requires configured Registry and governance directories but permits a missing final record", async () => {
+  it("requires configured Registry, governance tree, and committed final record", async () => {
     const { root } = await temporaryCache();
     const missingGovernanceRegistry = join(root, "missing-governance-registry");
     await mkdir(missingGovernanceRegistry);
@@ -604,12 +684,11 @@ describe("Notion authority service", () => {
     expect((await lstat(missingGovernanceRegistry)).mode & 0o777).toBe(0o755);
     await expect(lstat(join(missingGovernanceRegistry, "governance"))).rejects.toMatchObject({ code: "ENOENT" });
 
-    const recordAbsentRegistry = join(root, "record-absent-registry");
+    const recordAbsentRegistry = await committedRegistry(root);
     const governanceDir = join(recordAbsentRegistry, "governance");
-    await mkdir(governanceDir, { recursive: true });
     await chmod(governanceDir, 0o755);
     await expect(serviceFor(recordAbsentRegistry, "record-absent-state")
-      .assertNotionWriteAllowed("projects", "jhw_start")).resolves.toBeUndefined();
+      .assertNotionWriteAllowed("projects", "jhw_start")).rejects.toMatchObject({ code: "AUTHORITY_UNAVAILABLE" });
     expect((await lstat(governanceDir)).mode & 0o777).toBe(0o755);
     await expect(lstat(join(governanceDir, "authority.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
   });
