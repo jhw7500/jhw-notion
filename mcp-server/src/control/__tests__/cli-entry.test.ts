@@ -8,6 +8,7 @@ import { Writable } from "node:stream";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { writeStream } from "../cli.js";
+import { buildHandoff } from "../handoff.js";
 
 const execFile = promisify(execFileCallback);
 const paths: string[] = [];
@@ -74,6 +75,89 @@ describe("jhw-control installed entry", () => {
       result: { commands: expect.arrayContaining(["task start", "portfolio export", "preflight"]) },
     });
     expect(stdout).not.toContain("entry-token");
+  });
+
+  it("flushes bounded near-cap Handoff output through an installed-bin symlink", async () => {
+    await execFile("npm", ["run", "build"], { cwd: mcpRoot, encoding: "utf8" });
+    const root = await mkdtemp(join(tmpdir(), "jhw-control-bin-"));
+    paths.push(root);
+    const registry = join(root, "registry");
+    const stateDir = join(root, "state");
+    const worktrees = join(root, "worktrees");
+    const npmBin = join(root, "node_modules", ".bin");
+    await Promise.all([mkdir(registry), mkdir(stateDir), mkdir(worktrees), mkdir(npmBin, { recursive: true })]);
+    await execFile("git", ["init", "--initial-branch=main"], { cwd: registry });
+    await execFile("git", ["config", "user.name", "Phase1A Test"], { cwd: registry });
+    await execFile("git", ["config", "user.email", "phase1a@example.invalid"], { cwd: registry });
+    const taskId = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab";
+    const claimId = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab";
+    const alias = "control:entry-near-cap";
+    const revision = "revision-1";
+    const handoffPath = `handoffs/${taskId}/${claimId}.md`;
+    const escapeHeavy = "\\".repeat(32 * 1024);
+    const handoff = buildHandoff({
+      task_id: taskId,
+      claim_id: claimId,
+      source_task_revision: revision,
+      generated_at: "2026-08-13T00:01:00.000Z",
+      progress: escapeHeavy,
+      git_state: escapeHeavy,
+      validation: escapeHeavy,
+      failures: escapeHeavy,
+      next_step: escapeHeavy,
+      related_adr_and_evidence: escapeHeavy,
+    });
+    const files: Record<string, unknown> = {
+      [`tasks/${taskId}.yaml`]: {
+        id: taskId, kind: "temporary", project_id: "prj-control", repo_id: "repo-control",
+        aliases: [alias], goal: "installed output gate", done_conditions: ["bounded"],
+        expected_scope: ["src/control"], lifecycle: "handoff",
+      },
+      [`claims/history/2026/${taskId}/${claimId}.yaml`]: {
+        task_id: taskId, task_alias: alias, project_id: "prj-control", repo_id: "repo-control",
+        claim_id: claimId, session_id: "entry-session", host: "build-host",
+        branch: "task/entry-near-cap", worktree_ref: "wt-entry-near-cap",
+        source_task_revision: revision, started_at: "2026-08-13T00:00:00.000Z",
+        released_at: "2026-08-13T00:01:00.000Z", status: "handoff", handoff_path: handoffPath,
+      },
+    };
+    for (const [relative, value] of Object.entries(files)) {
+      const target = join(registry, relative);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    }
+    await mkdir(dirname(join(registry, handoffPath)), { recursive: true });
+    await writeFile(join(registry, handoffPath), handoff, "utf8");
+    await execFile("git", ["add", "--", "."], { cwd: registry });
+    await execFile("git", ["commit", "-m", "Seed bounded Handoff fixture"], { cwd: registry });
+
+    const installedBin = join(npmBin, "jhw-control");
+    await symlink(join(mcpRoot, "dist", "control", "cli.js"), installedBin);
+    const { stdout, stderr } = await execFile(installedBin, ["task", "handoff", "--task", taskId, "--claim", claimId], {
+      cwd: mcpRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: root,
+        JHW_REGISTRY_DIR: registry,
+        JHW_WORKTREE_ROOT: worktrees,
+        JHW_BUILD_HOST: "build-host",
+        JHW_GITHUB_OWNER: "owner",
+        JHW_PROJECT_NUMBER: "1",
+        JHW_REGISTRY_REPOSITORY: "owner/registry",
+        JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+        JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+        JHW_CONTROL_STATE_DIR: stateDir,
+      },
+    });
+
+    expect(stderr).toBe("");
+    expect(Buffer.byteLength(stdout, "utf8")).toBeGreaterThan(10 * 1024);
+    expect(Buffer.byteLength(stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(JSON.parse(stdout)).toMatchObject({
+      command: "task handoff",
+      result: { task_id: taskId, claim_id: claimId, truncated: true },
+    });
   });
 
   it("does not let a marker-bearing installed bin bypass the callback lock", async () => {

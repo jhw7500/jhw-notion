@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import { MutationLock, ProcessRunner, type ProcessResult, type ProcessRunOptions
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { PreflightService, type PreflightProjectPort } from "../preflight.js";
 import { RegistryGit, type ProcessRunnerLike } from "../registry-git.js";
+import { createSensitiveDataPolicy } from "../sensitive-data.js";
 import { sourceIndexKey } from "../ids.js";
 import { TaskService } from "../task-service.js";
 import { WorktreeManager, type WorktreeStateHooks } from "../worktree.js";
@@ -351,7 +352,11 @@ const claimed = source + ".claimed-" + process.pid;
 fs.renameSync(source, claimed);
 const response = JSON.parse(fs.readFileSync(claimed, "utf8"));
 if (JSON.stringify(capture) !== JSON.stringify(response.expect)) process.exit(94);
-const serialized = JSON.stringify(capture);
+const selectedTokenSha256 = crypto.createHash("sha256").update(String(process.env.GH_TOKEN || "")).digest("hex");
+const sourceCredentialsAbsent = !process.env.GH_PROJECT_TOKEN && !process.env.GH_REPO_TOKEN;
+if (!sourceCredentialsAbsent || selectedTokenSha256 !== response.expectTokenSha256) process.exit(92);
+const audit = { ...capture, selected_token_sha256: selectedTokenSha256, source_credentials_absent: sourceCredentialsAbsent };
+const serialized = JSON.stringify(audit);
 if (containsSecret(serialized) || containsSecret(JSON.stringify(response)) || containsSecret(String(response.stdout || "")) || containsSecret(String(response.stderr || ""))) process.exit(93);
 fs.appendFileSync(path.join(root, "operations.jsonl"), serialized + "\\n", { mode: 0o600 });
 process.stdout.write(String(response.stdout || ""));
@@ -907,8 +912,13 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
     const { queueDir, logPath } = await writeFakeGh(fixture);
+    const projectToken = "phase1a-project-token-value";
+    const repoToken = "phase1a-repo-token-value";
+    const projectTokenSha256 = createHash("sha256").update(projectToken).digest("hex");
+    const repoTokenSha256 = createHash("sha256").update(repoToken).digest("hex");
     await writeFile(join(queueDir, "0000.json"), `${JSON.stringify({
       expect: { operation: "rest:GET:repos/jhw7500/control/issues/1", keys: [] },
+      expectTokenSha256: repoTokenSha256,
       stdout: `${JSON.stringify({
         node_id: "I_fixture",
         title: "trial",
@@ -920,12 +930,11 @@ describe("Phase 1A deterministic adversarial gate", () => {
     })}\n`, { mode: 0o600 });
     await writeFile(join(queueDir, "0001.json"), `${JSON.stringify({
       expect: { operation: "rest:GET:/user", keys: [] },
+      expectTokenSha256: projectTokenSha256,
       stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project, repo\r\n\r\n{}\n",
       stderr: "",
       exitCode: 0,
     })}\n`, { mode: 0o600 });
-    const projectToken = "phase1a-project-token-value";
-    const repoToken = "phase1a-repo-token-value";
     const fingerprints = [projectToken, repoToken].map((token) => ({
       length: token.length,
       sha256: createHash("sha256").update(token).digest("hex"),
@@ -993,8 +1002,14 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(errorMetadata).toEqual({ error: { code: "PROJECT_TOKEN_HAS_REPO_SCOPE" } });
     const operationLog = await readFile(logPath, "utf8");
     expect(operationLog.trim().split("\n").map((line) => JSON.parse(line))).toEqual([
-      { operation: "rest:GET:repos/jhw7500/control/issues/1", keys: [] },
-      { operation: "rest:GET:/user", keys: [] },
+      {
+        operation: "rest:GET:repos/jhw7500/control/issues/1", keys: [],
+        selected_token_sha256: repoTokenSha256, source_credentials_absent: true,
+      },
+      {
+        operation: "rest:GET:/user", keys: [],
+        selected_token_sha256: projectTokenSha256, source_credentials_absent: true,
+      },
     ]);
     const queuedArtifacts = await readdir(queueDir);
     expect(queuedArtifacts.filter((name) => /^\d{4}\.json$/.test(name))).toEqual([]);
@@ -1016,4 +1031,142 @@ describe("Phase 1A deterministic adversarial gate", () => {
     ];
     for (const token of [projectToken, repoToken]) expect(artifacts.join("\n")).not.toContain(token);
   });
+
+  it("15. journal failure preserves successful Task coordinates and idempotent retry", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const dependencies = cliDependencies(graph, {
+      journal: { append: async () => { throw new Error("injected journal outage"); } },
+    });
+    const args = temporaryStartArgs("control:journal-gap", fixture.sourceRepo, "codex-journal-gap");
+
+    const first = await runCli(args, dependencies);
+    const retry = await runCli(args, dependencies);
+
+    expect(first.exitCode).toBe(0);
+    expect(retry.exitCode).toBe(0);
+    const firstPayload = JSON.parse(first.stdout);
+    const retryPayload = JSON.parse(retry.stdout);
+    expect(firstPayload.journal_warning).toEqual({ code: "JOURNAL_WRITE_FAILED" });
+    expect(retryPayload.journal_warning).toEqual({ code: "JOURNAL_WRITE_FAILED" });
+    expect(retryPayload.result.task.task_id).toBe(firstPayload.result.task.task_id);
+    expect(retryPayload.result.claim.claim_id).toBe(firstPayload.result.claim.claim_id);
+    const taskFiles = (await readdir(join(fixture.cloneA, "tasks"), { withFileTypes: true }))
+      .filter((entry) => entry.isFile());
+    expect(taskFiles).toHaveLength(1);
+  }, 15_000);
+
+  it("16. explicit existing-Task resume returns only the bounded latest Handoff and reuses the worktree", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const dependencies = cliDependencies(graph);
+    const started = await runCli(temporaryStartArgs("control:explicit-resume", fixture.sourceRepo, "codex-before-handoff"), dependencies);
+    const first = JSON.parse(started.stdout).result;
+    const released = await runCli([
+      "task", "finish", "--task", first.task.task_id, "--claim", first.claim.claim_id,
+      "--status", "handoff", "--validation", "focused e2e: pass", "--progress", "bounded resume context",
+    ], dependencies);
+    expect(released.exitCode).toBe(0);
+
+    const resumed = await runCli([
+      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo,
+      "--session", "codex-after-handoff",
+    ], dependencies);
+
+    expect(resumed.exitCode).toBe(0);
+    expect(Buffer.byteLength(resumed.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(JSON.parse(resumed.stdout).result).toMatchObject({
+      task: { task_id: first.task.task_id },
+      reused: true,
+      latest_handoff: {
+        claim_id: first.claim.claim_id,
+        sections: { "Progress Since Last Checkpoint": "bounded resume context" },
+      },
+    });
+  }, 15_000);
+
+  it("17. completed formal Claim history does not replace an open Issue as lifecycle authority", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const dependencies = cliDependencies(graph);
+    const first = await runCli([
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-first",
+    ], dependencies);
+    const firstClaim = JSON.parse(first.stdout).result.claim.claim_id;
+    expect((await runCli(completedFinishArgs(formal.id, firstClaim), dependencies)).exitCode).toBe(0);
+
+    const reopened = await runCli([
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-open",
+    ], dependencies);
+
+    expect(reopened.exitCode).toBe(0);
+    expect(JSON.parse(reopened.stdout).result).toMatchObject({ task: { task_id: formal.id } });
+    expect(JSON.parse(reopened.stdout).result.claim.claim_id).not.toBe(firstClaim);
+  }, 15_000);
+
+  it("18. abandoned cleanup blocks a successor until exact released-generation recovery completes", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const dependencies = cliDependencies(graph);
+    const started = await runCli(temporaryStartArgs("control:cleanup-recovery", fixture.sourceRepo, "codex-cleanup-first"), dependencies);
+    const first = JSON.parse(started.stdout).result;
+    const mapping = JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
+      .worktrees[first.claim.worktree_ref];
+    const dirtyPath = join(mapping.path, "dirty-after-release.txt");
+    await writeFile(dirtyPath, "dirty\n", "utf8");
+    const abandoned = await runCli([
+      "task", "finish", "--task", first.task.task_id, "--claim", first.claim.claim_id,
+      "--status", "abandoned", "--validation", "cleanup recovery e2e",
+    ], dependencies);
+    expect(abandoned.exitCode).toBe(0);
+    expect(JSON.parse(abandoned.stdout).result.worktree_removed).toBe(false);
+
+    const blocked = await runCli([
+      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-blocked",
+    ], dependencies);
+    expect(blocked.exitCode).toBe(1);
+    expect(JSON.parse(blocked.stderr)).toEqual({ error: { code: "WORKTREE_CLEANUP_REQUIRED" } });
+    expect(await graph.claims.getActive(first.task.task_id)).toBeUndefined();
+
+    await unlink(dirtyPath);
+    const cleanup = await runCli([
+      "task", "recover", "--task", first.task.task_id, "--expect", first.claim.claim_id, "--action", "cleanup",
+    ], dependencies);
+    expect(cleanup.exitCode).toBe(0);
+    expect(JSON.parse(cleanup.stdout).result).toMatchObject({ kind: "cleanup", task_id: first.task.task_id });
+    expect(JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
+      .worktrees[first.claim.worktree_ref]).toMatchObject({ lifecycle: "removed" });
+    const resumed = await runCli([
+      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-recovered",
+    ], dependencies);
+    expect(resumed.exitCode).toBe(0);
+  }, 15_000);
+
+  it("19. centralized persistence policy rejects injected credential and private source path with clean authority", async () => {
+    const fixture = await makeGateFixture();
+    const config = fixtureConfig(fixture, fixture.cloneA);
+    const registry = isolatedRegistryGit(config, new ProcessRunner());
+    const secret = "unmistakably-fake-e2e-persistence-token";
+    const catalog = new Catalog(config, registry, createSensitiveDataPolicy(
+      { FAKE_API_TOKEN: secret },
+      [fixture.sourceRepo, fixture.cloneA, fixture.stateDir, fixture.worktreeRoot],
+    ));
+    await catalog.registerRepository(repositoryInput);
+    const before = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+
+    for (const goal of [`do not persist ${secret}`, `do not persist ${fixture.sourceRepo}/private.ts`]) {
+      await expect(catalog.registerTemporaryTask({
+        project_id: "prj-control", repo_id: "repo-control", alias: `control:rejected-${goal === secret ? "secret" : createHash("sha256").update(goal).digest("hex").slice(0, 8)}`,
+        goal, done_conditions: ["reject"], expected_scope: ["src/control"],
+      })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    }
+    expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(before);
+    expect(await git(fixture.cloneA, "status", "--porcelain", "--untracked-files=all")).toBe("");
+    const audit = await freshAuditClone(fixture, "persistence-policy-audit");
+    const artifacts = await textArtifacts(audit);
+    expect(artifacts.join("\n")).not.toContain(secret);
+    expect(artifacts.join("\n")).not.toContain(fixture.sourceRepo);
+  }, 15_000);
 });
