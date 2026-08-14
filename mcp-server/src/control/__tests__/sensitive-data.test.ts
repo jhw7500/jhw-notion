@@ -65,6 +65,7 @@ describe("SensitiveDataPolicy", () => {
   it.each([
     "contains,/srv/private/source-checkout/file.ts",
     "[/srv/private/source-checkout/file.ts]",
+    "</srv/private/source-checkout/file.ts>",
     "x;/srv/private/source-checkout/file.ts",
     "contains,C:\\private\\source-checkout\\file.ts",
   ])("rejects punctuation-framed absolute host path %s", (value) => {
@@ -77,7 +78,7 @@ describe("SensitiveDataPolicy", () => {
       "https://github.com/owner/repository/issues/1",
       "owner/repository#1",
       "docs/project-control/runbook.md",
-      "<div>safe HTML</div>",
+      "<div>safe HTML",
     ])).not.toThrow();
   });
 

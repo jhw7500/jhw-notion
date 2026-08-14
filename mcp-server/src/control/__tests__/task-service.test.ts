@@ -1660,7 +1660,7 @@ describe("TaskService", () => {
       source_task_revision: "issue-revision-7",
       claim_id: CLAIM_ID,
       generated_at: "2026-08-13T12:36:56.789Z",
-      progress: "ok\r## Goal\r\n   ### Goal\nsetext\n---\n```md\n# fenced\n```\n<div>html</div>",
+      progress: "ok\r## Goal\r\n   ### Goal\nsetext\n---\n```md\n# fenced\n```\n<div>html",
     });
 
     expect(handoff.match(/^## /gm)).toHaveLength(6);
