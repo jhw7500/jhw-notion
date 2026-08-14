@@ -1,10 +1,11 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_ENTRY="$SCRIPT_DIR/mcp-server/dist/index.js"
 CONTROL_ENTRY="$SCRIPT_DIR/mcp-server/dist/control/cli.js"
 CONTROL_LINK="$HOME/.local/bin/jhw-control"
+CONFIG_EDITOR="$SCRIPT_DIR/scripts/install-config.mjs"
 
 # Colors
 RED='\033[0;31m'
@@ -65,56 +66,85 @@ uninstall_control_cli() {
   fi
 }
 
+install_owned_symlink() {
+  local target="$1"
+  local source="$2"
+  local label="$3"
+  mkdir -p "$(dirname "$target")"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if is_repo_owned_symlink "$target"; then
+      rm -- "$target"
+    else
+      fail "$label 대상이 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
+      exit 1
+    fi
+  fi
+  ln -s -- "$source" "$target"
+  ok "$label 심링크 설치"
+}
+
+uninstall_owned_symlink() {
+  local target="$1"
+  local label="$2"
+  if is_repo_owned_symlink "$target"; then
+    rm -- "$target"
+    ok "$label 심링크 제거"
+  elif [ -e "$target" ] || [ -L "$target" ]; then
+    skip "$label 는 이 저장소 소유가 아니므로 보존"
+  fi
+}
+
+run_config_editor() {
+  local operation="$1"
+  local settings_file="$2"
+  local changed_message="$3"
+  local unchanged_message="$4"
+  local stamp="${5:-unused}"
+  local rc
+  case "$operation" in
+    register-*) mkdir -p "$(dirname "$settings_file")" ;;
+  esac
+  if node "$CONFIG_EDITOR" "$operation" "$settings_file" "$MCP_ENTRY" "$SCRIPT_DIR" "$stamp"; then
+    CONFIG_EDITOR_CHANGED=1
+    ok "$changed_message"
+    return
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 3 ]; then
+    CONFIG_EDITOR_CHANGED=0
+    skip "$unchanged_message"
+    return
+  fi
+  if [ "$rc" -eq 4 ]; then
+    fail "동일 이름의 외부 MCP 등록을 보존하기 위해 설치를 중단합니다."
+    exit 1
+  fi
+  fail "MCP 설정을 안전하게 갱신하지 못했습니다."
+  exit 1
+}
+
 register_mcp() {
   local settings_file="$1"
   local tui_name="$2"
 
-  node -e "
-    const fs = require('fs');
-    const p = '$settings_file';
-    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
-    s.mcpServers = s.mcpServers || {};
-    s.mcpServers['jhw-notion'] = {
-      type: 'stdio',
-      command: 'node',
-      args: ['$MCP_ENTRY'],
-      env: { NOTION_API_KEY: '\${NOTION_API_KEY}' }
-    };
-    fs.writeFileSync(p, JSON.stringify(s, null, 2));
-  "
-  ok "$tui_name: $(basename "$settings_file")에 jhw-notion 서버 추가"
+  run_config_editor \
+    "register-stdio" "$settings_file" \
+    "$tui_name: jhw-notion 서버 추가" \
+    "$tui_name: jhw-notion 서버 이미 최신"
 }
 
 register_opencode_mcp() {
   local settings_file="$1"
 
-  node -e "
-    const fs = require('fs');
-    const p = '$settings_file';
-    const s = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
-
-    s['$schema'] = s['$schema'] || 'https://opencode.ai/config.json';
-    s.mcp = s.mcp || {};
-    s.mcp['jhw-notion'] = {
-      type: 'local',
-      command: ['node', '$MCP_ENTRY'],
-      enabled: true
-    };
-
-    if (s.mcpServers && s.mcpServers['jhw-notion']) {
-      delete s.mcpServers['jhw-notion'];
-      if (Object.keys(s.mcpServers).length === 0) {
-        delete s.mcpServers;
-      }
-    }
-
-    fs.writeFileSync(p, JSON.stringify(s, null, 2));
-  "
-  ok "OpenCode: opencode.json에 jhw-notion 서버 추가"
+  run_config_editor \
+    "register-opencode" "$settings_file" \
+    "OpenCode: jhw-notion 서버 추가" \
+    "OpenCode: jhw-notion 서버 이미 최신"
 }
 
 # config.toml에는 다른 MCP 서버의 시크릿도 들어있다. 백업 사본이 무한히 쌓이지 않도록
-# 우리가 만든 것(.bak.YYYYMMDDHHMMSS)만 최근 BACKUP_KEEP개까지 남긴다.
+# 우리가 만든 것(.bak.jhw-notion.YYYYMMDDHHMMSS.UUID)만 최근 BACKUP_KEEP개까지 남긴다.
 # 다른 도구가 만든 .bak(다른 이름 규칙)은 건드리지 않는다.
 BACKUP_KEEP=3
 
@@ -125,13 +155,14 @@ prune_codex_backups() {
   base="$(basename "$config_file")"
 
   # xargs는 공백이 든 경로를 쪼개 조용히 실패한다. 한 줄씩 그대로 넘긴다.
-  find "$dir" -maxdepth 1 -type f -name "$base.bak.*" 2>/dev/null |
-    grep -E "\.bak\.[0-9]{14}$" |
-    sort -r |
-    tail -n +$((BACKUP_KEEP + 1)) |
-    while IFS= read -r old; do
-      rm -f "$old"
-    done
+  while IFS= read -r old; do
+    [ -n "$old" ] && rm -f -- "$old"
+  done < <(
+    find "$dir" -maxdepth 1 -type f -name "$base.bak.jhw-notion.*" 2>/dev/null |
+      grep -E "\.bak\.jhw-notion\.[0-9]{14}\.[0-9a-f-]{36}$" |
+      sort -r |
+      tail -n +$((BACKUP_KEEP + 1))
+  )
 }
 
 # Codex는 JSON이 아니라 ~/.codex/config.toml의 [mcp_servers.<id>] 섹션을 읽는다.
@@ -139,142 +170,46 @@ prune_codex_backups() {
 register_codex_mcp() {
   local config_file="$1"
 
-  # 경로를 스크립트에 보간하면 따옴표·역슬래시가 든 경로에서 JS 구문이 깨진다.
-  # 환경변수로 넘겨 보간 자체를 없앤다.
-  # 내용이 그대로면 백업도 쓰기도 하지 않는다(exit 3) — 재설치마다 사본이 쌓이던 문제.
-  if CODEX_CONFIG="$config_file" \
-     CODEX_MCP_ENTRY="$MCP_ENTRY" \
-     CODEX_BACKUP_STAMP="$(date +%Y%m%d%H%M%S)" \
-     node -e "
-    const fs = require('fs');
-    const p = process.env.CODEX_CONFIG;
-    const entry = [
-      '[mcp_servers.jhw-notion]',
-      'command = \"node\"',
-      'args = [' + JSON.stringify(process.env.CODEX_MCP_ENTRY) + ']',
-      'startup_timeout_sec = 60.0',
-    ];
-
-    const src = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
-    const lines = src.length ? src.split('\n') : [];
-    const start = lines.findIndex((l) => l.trim() === '[mcp_servers.jhw-notion]');
-
-    let out;
-    if (start >= 0) {
-      let end = start + 1;
-      while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
-      while (end > start + 1 && lines[end - 1].trim() === '') end--;   // 섹션 뒤 빈 줄 보존
-      out = [...lines.slice(0, start), ...entry, ...lines.slice(end)];
-    } else {
-      const body = src.replace(/\n+$/, '');
-      out = body.length ? [...body.split('\n'), '', ...entry, ''] : [...entry, ''];
-    }
-
-    const next = out.join('\n');
-    if (next === src) process.exit(3);
-
-    if (src.length) fs.copyFileSync(p, p + '.bak.' + process.env.CODEX_BACKUP_STAMP);
-    fs.writeFileSync(p, next);
-  "; then
-    ok "Codex: config.toml에 jhw-notion 서버 추가"
-  else
-    local rc=$?
-    if [ "$rc" -eq 3 ]; then
-      skip "Codex: config.toml 이미 최신 (백업 생성 안 함)"
-    else
-      fail "Codex: config.toml 갱신 실패"
-      exit 1
-    fi
+  run_config_editor \
+    "register-codex" "$config_file" \
+    "Codex: jhw-notion 서버 추가" \
+    "Codex: config.toml 이미 최신 (백업 생성 안 함)" \
+    "$(date +%Y%m%d%H%M%S)"
+  if [ "$CONFIG_EDITOR_CHANGED" -eq 1 ]; then
+    prune_codex_backups "$config_file"
   fi
-
-  prune_codex_backups "$config_file"
 }
 
 unregister_mcp() {
   local settings_file="$1"
   local tui_name="$2"
 
-  if [ ! -f "$settings_file" ]; then return; fi
-
-  node -e "
-    const fs = require('fs');
-    const p = '$settings_file';
-    const s = JSON.parse(fs.readFileSync(p, 'utf8'));
-    if (s.mcpServers && s.mcpServers['jhw-notion']) {
-      delete s.mcpServers['jhw-notion'];
-      fs.writeFileSync(p, JSON.stringify(s, null, 2));
-    }
-  "
-  ok "$tui_name: jhw-notion 서버 제거"
+  run_config_editor \
+    "unregister-stdio" "$settings_file" \
+    "$tui_name: jhw-notion 서버 제거" \
+    "$tui_name: 소유한 jhw-notion 등록 없음"
 }
 
 unregister_codex_mcp() {
   local config_file="$1"
 
-  if [ ! -f "$config_file" ]; then return; fi
-  if ! grep -q '^\[mcp_servers\.jhw-notion\]' "$config_file"; then return; fi
-
-  # 실제로 섹션이 있을 때만 여기 도달하므로 이 백업은 항상 의미가 있다.
-  cp "$config_file" "$config_file.bak.$(date +%Y%m%d%H%M%S)"
-
-  CODEX_CONFIG="$config_file" node -e "
-    const fs = require('fs');
-    const p = process.env.CODEX_CONFIG;
-    const lines = fs.readFileSync(p, 'utf8').split('\n');
-    const start = lines.findIndex((l) => l.trim() === '[mcp_servers.jhw-notion]');
-    if (start < 0) process.exit(0);
-
-    // [mcp_servers.jhw-notion.env] 같은 자식 테이블도 함께 지운다.
-    // 남겨두면 command 없는 jhw-notion 서버가 되살아난다.
-    const ours = (l) => {
-      const t = l.trim();
-      return t === '[mcp_servers.jhw-notion]' || t.startsWith('[mcp_servers.jhw-notion.');
-    };
-
-    let end = start + 1;
-    while (end < lines.length) {
-      if (/^\s*\[/.test(lines[end]) && !ours(lines[end])) break;
-      end++;
-    }
-    fs.writeFileSync(p, [...lines.slice(0, start), ...lines.slice(end)].join('\n'));
-  "
-  ok "Codex: jhw-notion 서버 제거"
-
-  prune_codex_backups "$config_file"
+  run_config_editor \
+    "unregister-codex" "$config_file" \
+    "Codex: jhw-notion 서버 제거" \
+    "Codex: 소유한 jhw-notion 등록 없음" \
+    "$(date +%Y%m%d%H%M%S)"
+  if [ "$CONFIG_EDITOR_CHANGED" -eq 1 ]; then
+    prune_codex_backups "$config_file"
+  fi
 }
 
 unregister_opencode_mcp() {
   local settings_file="$1"
 
-  if [ ! -f "$settings_file" ]; then return; fi
-
-  node -e "
-    const fs = require('fs');
-    const p = '$settings_file';
-    const s = JSON.parse(fs.readFileSync(p, 'utf8'));
-    let changed = false;
-
-    if (s.mcp && s.mcp['jhw-notion']) {
-      delete s.mcp['jhw-notion'];
-      if (Object.keys(s.mcp).length === 0) {
-        delete s.mcp;
-      }
-      changed = true;
-    }
-
-    if (s.mcpServers && s.mcpServers['jhw-notion']) {
-      delete s.mcpServers['jhw-notion'];
-      if (Object.keys(s.mcpServers).length === 0) {
-        delete s.mcpServers;
-      }
-      changed = true;
-    }
-
-    if (changed) {
-      fs.writeFileSync(p, JSON.stringify(s, null, 2));
-    }
-  "
-  ok "OpenCode: jhw-notion 서버 제거"
+  run_config_editor \
+    "unregister-opencode" "$settings_file" \
+    "OpenCode: jhw-notion 서버 제거" \
+    "OpenCode: 소유한 jhw-notion 등록 없음"
 }
 
 # --- Uninstall ---
@@ -286,12 +221,10 @@ if [ "${1:-}" = "--uninstall" ]; then
   uninstall_control_cli
 
   echo "[2/3] 스킬 심링크 제거"
-  for link in "$HOME/.claude/commands/jhw" "$HOME/.gemini/commands/jhw" "$HOME/.config/opencode/skills/jhw" "$HOME/.codex/commands/jhw"; do
-    if [ -L "$link" ]; then
-      rm "$link"
-      ok "$(dirname "$link") 심링크 제거"
-    fi
-  done
+  uninstall_owned_symlink "$HOME/.claude/commands/jhw" "Claude jhw"
+  uninstall_owned_symlink "$HOME/.gemini/commands/jhw" "Gemini jhw"
+  uninstall_owned_symlink "$HOME/.config/opencode/skills/jhw" "OpenCode jhw"
+  uninstall_owned_symlink "$HOME/.codex/commands/jhw" "Codex legacy jhw"
 
   # Codex prompts는 평평한 디렉토리라 파일별 심링크로 깔려 있다.
   # 이 저장소를 가리키는 것만 제거하고 남의 프롬프트는 건드리지 않는다.
@@ -300,18 +233,20 @@ if [ "${1:-}" = "--uninstall" ]; then
   removed=0
   for link in "$HOME/.codex/prompts"/*.md; do
     [ -L "$link" ] || continue
-    case "$(readlink "$link")" in
-      "$SCRIPT_DIR"/skills/claude/*) rm "$link"; removed=$((removed + 1)) ;;
-    esac
+    if is_repo_owned_symlink "$link"; then
+      rm -- "$link"
+      removed=$((removed + 1))
+    fi
   done
   [ "$removed" -gt 0 ] && ok "$HOME/.codex/prompts 심링크 ${removed}개 제거"
 
   removed=0
   for link in "$HOME/.codex/skills"/jhw-*; do
     [ -L "$link" ] || continue
-    case "$(readlink "$link")" in
-      "$SCRIPT_DIR"/skills/codex/*) rm "$link"; removed=$((removed + 1)) ;;
-    esac
+    if is_repo_owned_symlink "$link"; then
+      rm -- "$link"
+      removed=$((removed + 1))
+    fi
   done
   [ "$removed" -gt 0 ] && ok "$HOME/.codex/skills 심링크 ${removed}개 제거"
 
@@ -373,93 +308,67 @@ else
 fi
 
 if [ -d "$CLAUDE_DIR" ]; then
-  mkdir -p "$CLAUDE_DIR/commands"
-  TARGET="$CLAUDE_DIR/commands/jhw"
-  if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then
-    mv "$TARGET" "$TARGET.bak.$(date +%Y%m%d%H%M%S)"
-    ok "Claude: 기존 jhw 디렉토리 백업"
-  fi
-  [ -L "$TARGET" ] && rm "$TARGET"
-  ln -sfn "$SCRIPT_DIR/skills/claude" "$TARGET"
-  ok "Claude: $TARGET → $SCRIPT_DIR/skills/claude"
+  install_owned_symlink "$CLAUDE_DIR/commands/jhw" "$SCRIPT_DIR/skills/claude" "Claude jhw"
 fi
 if [ -d "$GEMINI_DIR" ]; then
-  mkdir -p "$GEMINI_DIR/commands"
-  TARGET="$GEMINI_DIR/commands/jhw"
-  if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then
-    mv "$TARGET" "$TARGET.bak.$(date +%Y%m%d%H%M%S)"
-    ok "Gemini: 기존 jhw 디렉토리 백업"
-  fi
-  [ -L "$TARGET" ] && rm "$TARGET"
-  ln -sfn "$SCRIPT_DIR/skills/claude" "$TARGET"
-  ok "Gemini: $TARGET → $SCRIPT_DIR/skills/claude"
+  install_owned_symlink "$GEMINI_DIR/commands/jhw" "$SCRIPT_DIR/skills/claude" "Gemini jhw"
 fi
 if [ -d "$OPENCODE_DIR" ]; then
-  mkdir -p "$OPENCODE_DIR/skills"
-  TARGET="$OPENCODE_DIR/skills/jhw"
-  if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then
-    mv "$TARGET" "$TARGET.bak.$(date +%Y%m%d%H%M%S)"
-    ok "OpenCode: 기존 jhw 디렉토리 백업"
-  fi
-  [ -L "$TARGET" ] && rm "$TARGET"
-  ln -sfn "$SCRIPT_DIR/skills/claude" "$TARGET"
-  ok "OpenCode: $TARGET → $SCRIPT_DIR/skills/claude"
+  install_owned_symlink "$OPENCODE_DIR/skills/jhw" "$SCRIPT_DIR/skills/claude" "OpenCode jhw"
 fi
 if [ -d "$CODEX_DIR" ]; then
   # Codex는 $CODEX_HOME/skills 의 스킬 디렉토리를 자동 발견한다.
   # (~/.codex/commands/*.toml은 스캔하지 않으므로 예전 TOML 배선은 제거한다.)
   LEGACY="$CODEX_DIR/commands/jhw"
-  if [ -L "$LEGACY" ]; then
-    rm "$LEGACY"
-    ok "Codex: 스캔되지 않는 commands/jhw 배선 제거"
+  if [ -e "$LEGACY" ] || [ -L "$LEGACY" ]; then
+    if is_repo_owned_symlink "$LEGACY"; then
+      rm -- "$LEGACY"
+      ok "Codex: 소유한 legacy commands/jhw 배선 제거"
+    else
+      fail "Codex legacy commands/jhw가 외부 파일/링크이므로 보존하고 설치를 중단합니다."
+      exit 1
+    fi
   fi
 
   mkdir -p "$CODEX_DIR/skills"
-  SKILL_BAK=""
   LINKED=0
   for SRC in "$SCRIPT_DIR"/skills/codex/jhw-*; do
     [ -d "$SRC" ] || continue
     NAME="$(basename "$SRC")"
     TARGET="$CODEX_DIR/skills/$NAME"
-    # 우리 링크가 아닌 기존 스킬(수동 복사본 등)은 지우지 말고 백업한다.
     if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
-      case "$(readlink "$TARGET" 2>/dev/null)" in
-        "$SCRIPT_DIR"/skills/codex/*) : ;;   # 이미 우리 링크 → 그대로 갱신
-        *)
-          if [ -z "$SKILL_BAK" ]; then
-            SKILL_BAK="$CODEX_DIR/skills.bak.$(date +%Y%m%d%H%M%S)"
-            mkdir -p "$SKILL_BAK"
-          fi
-          mv "$TARGET" "$SKILL_BAK/"
-          ;;
-      esac
+      if is_repo_owned_symlink "$TARGET"; then
+        rm -- "$TARGET"
+      else
+        fail "Codex 스킬 이름 충돌을 보존하기 위해 설치를 중단합니다."
+        exit 1
+      fi
     fi
-    ln -sfn "$SRC" "$TARGET"
+    ln -s -- "$SRC" "$TARGET"
     LINKED=$((LINKED + 1))
   done
-  [ -n "$SKILL_BAK" ] && ok "Codex: 기존 jhw 스킬 백업 → $SKILL_BAK"
   ok "Codex: $CODEX_DIR/skills/jhw-* → skills/codex/jhw-* (심링크 ${LINKED}개)"
 
   # prompts(/prompts:<name>)는 평평한 디렉토리라 파일별 심링크로 깐다.
   # review.md/status.md 같은 흔한 이름이 이미 있으면 남의 프롬프트를 밀어내지 않고 건너뛴다.
   mkdir -p "$CODEX_DIR/prompts"
   PLINKED=0
-  PSKIPPED=0
   for SRC in "$SCRIPT_DIR"/skills/claude/*.md; do
     NAME="$(basename "$SRC")"
     [ "$NAME" = "AGENTS.md" ] && continue
     TARGET="$CODEX_DIR/prompts/$NAME"
     if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
-      case "$(readlink "$TARGET" 2>/dev/null)" in
-        "$SCRIPT_DIR"/skills/claude/*) : ;;   # 우리 링크 → 갱신
-        *) PSKIPPED=$((PSKIPPED + 1)); continue ;;   # 남의 프롬프트 → 보존
-      esac
+      if is_repo_owned_symlink "$TARGET"; then
+        rm -- "$TARGET"
+      else
+        fail "Codex 프롬프트 이름 충돌을 보존하기 위해 설치를 중단합니다."
+        exit 1
+      fi
     fi
-    ln -sfn "$SRC" "$TARGET"
+    ln -s -- "$SRC" "$TARGET"
     PLINKED=$((PLINKED + 1))
   done
   ok "Codex: $CODEX_DIR/prompts/*.md → skills/claude/*.md (심링크 ${PLINKED}개)"
-  [ "$PSKIPPED" -gt 0 ] && skip "Codex: 이름이 겹치는 기존 프롬프트 ${PSKIPPED}개는 보존 (스킬 \$jhw-* 로 사용 가능)"
 fi
 
 # [5/5] MCP 서버 등록
