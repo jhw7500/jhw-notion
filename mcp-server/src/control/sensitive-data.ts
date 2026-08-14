@@ -60,11 +60,12 @@ function scanBounded(value: unknown, inspect: (candidate: string) => void): void
 
 const embeddedUnixPath = /(?:^|[\s"'`(=:])\/(?!\/)[^\s"'`<>|]+/u;
 const embeddedWindowsPath = /(?:^|[\s"'`(=])[A-Za-z]:[\\/][^\s"'`<>|]+/u;
+const embeddedFileUri = /(?:^|[\s"'`(=])file:\/\//iu;
 
 /** Rejects host-absolute paths only at content boundaries, never operational path arguments. */
 export function assertNoAbsoluteHostPaths(value: unknown): void {
   scanBounded(value, (candidate) => {
-    if (embeddedUnixPath.test(candidate) || embeddedWindowsPath.test(candidate)) throw rejected();
+    if (embeddedUnixPath.test(candidate) || embeddedWindowsPath.test(candidate) || embeddedFileUri.test(candidate)) throw rejected();
   });
 }
 

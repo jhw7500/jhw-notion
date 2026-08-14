@@ -111,6 +111,27 @@ describe("Catalog", () => {
     expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
   });
 
+  it("rejects protected raw bytes hidden behind a duplicate JSON key", async () => {
+    const secret = "unmistakably-fake-overwritten-node-token";
+    const { catalog, fixture } = await catalogFixture(createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }));
+    await catalog.registerRepository(repositoryInput);
+    const path = `repositories/${repositoryInput.repo_id}.yaml`;
+    await commitFile(fixture.registryDir, path, [
+      "{",
+      `  \"id\": \"${repositoryInput.repo_id}\",`,
+      `  \"github_node_id\": \"${secret}\",`,
+      `  \"github_node_id\": \"${repositoryInput.github_node_id}\",`,
+      `  \"slug\": \"${repositoryInput.slug}\"`,
+      "}",
+      "",
+    ].join("\n"));
+    await git(fixture.registryDir, "push", "origin", "main");
+
+    await expect(catalog.getRepository(repositoryInput.repo_id)).rejects.toMatchObject({
+      code: "SENSITIVE_DATA_REJECTED",
+    });
+  });
+
   it("rejects restored noncanonical Repository slugs and foreign formal-looking aliases", async () => {
     const { catalog, fixture } = await catalogFixture();
     const repository = (await catalog.registerRepository(repositoryInput)).repository;
@@ -125,6 +146,31 @@ describe("Catalog", () => {
     await commitFile(fixture.registryDir, `repositories/${repository.id}.yaml`, `${JSON.stringify(repository)}\n`);
     await commitFile(fixture.registryDir, `tasks/${formal.id}.yaml`, `${JSON.stringify({
       ...formal, aliases: ["evil/repository#1", ...formal.aliases],
+    })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    await expect(catalog.getTask(formal.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("binds formal Issue URL and alias coordinates to the referenced Repository slug", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const foreignSource = {
+      ...issueInput,
+      issue_url: "https://github.com/other-owner/other-repository/issues/1",
+      alias: "other-owner/other-repository#1",
+    };
+
+    await expect(catalog.registerFormalTask(foreignSource)).rejects.toMatchObject({
+      code: "ISSUE_REPOSITORY_MISMATCH",
+    });
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    await commitFile(fixture.registryDir, `tasks/${formal.id}.yaml`, `${JSON.stringify({
+      ...formal,
+      issue_url: foreignSource.issue_url,
+      aliases: [foreignSource.alias],
     })}\n`);
     await git(fixture.registryDir, "push", "origin", "main");
     await expect(catalog.getTask(formal.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });

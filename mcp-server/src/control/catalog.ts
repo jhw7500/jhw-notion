@@ -26,6 +26,7 @@ const taskIdPattern = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{
 const githubSlugPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 const safeAliasPattern = /^[^\u0000-\u001f\u007f]{1,160}$/;
 const formalAliasPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}#[1-9][0-9]*$/;
+const canonicalIssueUrlPattern = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})\/issues\/([1-9][0-9]*)$/;
 const maximumCatalogEntries = 10_000;
 const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 
@@ -146,6 +147,16 @@ function assertRepositoryId(repoId: string): void {
   }
 }
 
+function issueRepositorySlug(issueUrl: string): string | undefined {
+  const match = issueUrl.match(canonicalIssueUrlPattern);
+  if (!match || !Number.isSafeInteger(Number(match[3]))) return undefined;
+  return `${match[1]}/${match[2]}`;
+}
+
+function sameGithubSlug(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
 /** Canonical Registry catalog with source-index collision protection. */
 export class Catalog {
   readonly records: RegistryRecordStore;
@@ -237,7 +248,7 @@ export class Catalog {
     let registration: FormalTaskRegistration | undefined;
     await this.registry.transact(`registry: register formal task ${input.alias}`, async () => {
       await this.auditRepositorySourceIndexes();
-      await this.requireRepository(input.repo_id);
+      const repository = await this.requireRepository(input.repo_id);
       await this.auditTaskSourceIndexes();
       const sourcePath = taskSourceRelativePath(input.issue_node_id);
       const indexed = await this.formalTaskForSource(sourcePath, input.issue_node_id);
@@ -252,6 +263,7 @@ export class Catalog {
         ) {
           throw new ControlError("FORMAL_TASK_SOURCE_MISMATCH", "Formal Task immutable source coordinates disagree");
         }
+        this.assertInputRepository(repository, input.issue_url);
         const currentRevision = Date.parse(current.issue_revision);
         const requestedRevision = Date.parse(input.issue_revision);
         if (requestedRevision < currentRevision) {
@@ -272,6 +284,7 @@ export class Catalog {
         return stage([taskRelativePath(updated.id)]);
       }
 
+      this.assertInputRepository(repository, input.issue_url);
       const task = record(
         FormalTaskSchema,
         {
@@ -350,7 +363,7 @@ export class Catalog {
     let promoted: FormalTask | undefined;
     await this.registry.transact(`registry: promote temporary task ${taskId}`, async () => {
       await this.auditRepositorySourceIndexes();
-      await this.requireRepository(input.repo_id);
+      const repository = await this.requireRepository(input.repo_id);
       await this.auditTaskSourceIndexes();
       const sourcePath = taskSourceRelativePath(input.issue_node_id);
       const indexed = await this.formalTaskForSource(sourcePath, input.issue_node_id);
@@ -373,6 +386,7 @@ export class Catalog {
         ) {
           throw new ControlError("FORMAL_TASK_SOURCE_MISMATCH", "Formal Task immutable source coordinates disagree");
         }
+        this.assertInputRepository(repository, input.issue_url);
         const currentRevision = Date.parse(current.issue_revision);
         const requestedRevision = Date.parse(input.issue_revision);
         if (requestedRevision < currentRevision) {
@@ -395,6 +409,8 @@ export class Catalog {
       if (current.lifecycle === "completed") {
         throw new ControlError("TASK_COMPLETED", "Completed temporary Tasks cannot be promoted");
       }
+
+      this.assertInputRepository(repository, input.issue_url);
 
       if (current.project_id !== input.project_id || current.repo_id !== input.repo_id) {
         throw new ControlError("TASK_SCOPE_MISMATCH", "Temporary Task project/repository does not match the GitHub Issue", {
@@ -657,6 +673,7 @@ export class Catalog {
       if (task.kind === "formal" && !seenTasks.has(task.id)) {
         throw corruption("Formal Task record has no exact source index", { task_id: task.id });
       }
+      if (task.kind === "formal") await this.assertTaskRepository(task);
       if (task.kind === "temporary" && seenTasks.has(task.id)) {
         throw corruption("Temporary Task is referenced by a formal source index", { task_id: task.id });
       }
@@ -734,6 +751,21 @@ export class Catalog {
     }
     this.sensitiveData.assertSafe(task);
     return task;
+  }
+
+  private assertInputRepository(repository: RepositoryRecord, issueUrl: string): void {
+    const slug = issueRepositorySlug(issueUrl);
+    if (!slug || !sameGithubSlug(slug, repository.slug)) {
+      throw new ControlError("ISSUE_REPOSITORY_MISMATCH", "Verified Issue does not belong to the canonical Repository");
+    }
+  }
+
+  private async assertTaskRepository(task: FormalTask): Promise<void> {
+    const repository = await this.repositoryAt(task.repo_id);
+    const slug = issueRepositorySlug(task.issue_url);
+    if (!repository || !slug || !sameGithubSlug(slug, repository.slug)) {
+      throw corruption("Formal Task source does not belong to its referenced Repository", { task_id: task.id });
+    }
   }
 }
 

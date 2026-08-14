@@ -106,9 +106,16 @@ export class RegistryRecordStore {
       const bytes = await this.boundedFileBytes(file, info, relativePath);
       if (!committed) throw corrupt("Existing Registry record is not present in HEAD", relativePath);
       if (!bytes.equals(committed)) throw corrupt("Registry checkout bytes disagree with HEAD", relativePath);
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        throw corrupt("Registry record is not valid JSON-subset YAML", relativePath);
+      }
+      this.sensitiveData.assertSafe(text);
       let raw: unknown;
       try {
-        raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+        raw = JSON.parse(text);
       } catch {
         throw corrupt("Registry record is not valid JSON-subset YAML", relativePath);
       }

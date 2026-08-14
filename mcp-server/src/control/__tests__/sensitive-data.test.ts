@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { createSensitiveDataPolicy } from "../sensitive-data.js";
+import { ControlError } from "../errors.js";
+import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy } from "../sensitive-data.js";
 
 describe("SensitiveDataPolicy", () => {
   it("rejects recognized exact secrets and private absolute paths without echoing either", () => {
@@ -33,5 +34,22 @@ describe("SensitiveDataPolicy", () => {
     expect(() => policy.assertSafe(`contains ${credential}`)).toThrowError(expect.objectContaining({
       code: "SENSITIVE_SCAN_TOO_LARGE",
     }));
+  });
+
+  it.each([
+    "file:///srv/private/source-checkout/file.ts",
+    "file://localhost/srv/private/source-checkout/file.ts",
+    "file:///%73rv/private/source-checkout/file.ts",
+  ])("rejects file URI host-path form %s", (uri) => {
+    expect(() => assertNoAbsoluteHostPaths(`inspect ${uri}`))
+      .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
+  });
+
+  it("redacts file URIs from direct ControlError metadata", () => {
+    const error = new ControlError("SAFE_FAILURE", "failed file:///srv/private/source", {
+      evidence: "file://localhost/srv/private/source/file.ts",
+    });
+    expect(JSON.stringify(error)).not.toContain("file://");
+    expect(error.message).not.toContain("file://");
   });
 });

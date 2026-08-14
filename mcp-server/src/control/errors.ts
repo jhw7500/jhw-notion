@@ -1,6 +1,7 @@
 const sensitiveEnvironmentKey = /(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL)/i;
 const unixHostPath = /(^|[\s"'`(=:])(\/(?!\/)[^\s"'`<>|]+)/gu;
 const windowsHostPath = /(^|[\s"'`(=])([A-Za-z]:[\\/][^\s"'`<>|]+)/gu;
+const fileUri = /file:\/\/[^\s"'`<>|]*/giu;
 const maximumErrorNodes = 2_000;
 
 function protectedTerms(): string[] {
@@ -14,6 +15,7 @@ function sanitizeString(value: string, terms: readonly string[]): string {
   let safe = value;
   for (const term of terms) safe = safe.split(term).join("[REDACTED]");
   return safe
+    .replace(fileUri, "[REDACTED]")
     .replace(unixHostPath, (_match, prefix: string) => `${prefix}[REDACTED]`)
     .replace(windowsHostPath, (_match, prefix: string) => `${prefix}[REDACTED]`);
 }
