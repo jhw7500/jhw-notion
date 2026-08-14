@@ -8,6 +8,10 @@ const MAX_TERMS = 128;
 const MIN_TERM_BYTES = 8;
 const secretKey = /(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL)/i;
 
+export function isSensitiveEnvironmentKey(key: string): boolean {
+  return secretKey.test(key);
+}
+
 export interface SensitiveDataPolicy {
   assertSafe(value: unknown): void;
 }
@@ -33,7 +37,7 @@ export function createSensitiveDataPolicy(
 ): SensitiveDataPolicy {
   const terms = new Set<string>();
   for (const [key, value] of Object.entries(environment)) {
-    if (secretKey.test(key) && usableTerm(value)) terms.add(value);
+    if (isSensitiveEnvironmentKey(key) && usableTerm(value)) terms.add(value);
   }
   for (const path of privatePaths) {
     const term = privatePathTerm(path);

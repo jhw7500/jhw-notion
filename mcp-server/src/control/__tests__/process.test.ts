@@ -244,6 +244,33 @@ describe("control process boundary", () => {
     expect(result.stdout).toBe("missing|missing");
   });
 
+  it("aligns password, credential, API-key, private-key, passwd, and lowercase token handling", async () => {
+    const environment = {
+      DB_PASSWORD: "unmistakably-fake-db-password",
+      SERVICE_CREDENTIAL: "unmistakably-fake-service-credential",
+      NOTION_API_KEY: "unmistakably-fake-notion-api-key",
+      SSH_PRIVATE_KEY: "unmistakably-fake-private-key",
+      CACHE_PASSWD: "unmistakably-fake-cache-passwd",
+      lowercase_token: "unmistakably-fake-lower-token",
+    };
+    const keys = Object.keys(environment);
+    const runner = new ProcessRunner(environment);
+    const inherited = await runner.run(process.execPath, [
+      "-e",
+      `process.stdout.write(${JSON.stringify(keys)}.map(k=>process.env[k]??'missing').join('|'))`,
+    ]);
+
+    expect(inherited.stdout).toBe(keys.map(() => "missing").join("|"));
+    const secret = environment.DB_PASSWORD;
+    const error = await runner.run(process.execPath, [
+      "-e",
+      `process.stderr.write(${JSON.stringify(secret)});process.exit(2)`,
+    ]).catch((cause: unknown) => cause);
+    expect(error).toMatchObject({ code: "COMMAND_FAILED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(JSON.stringify(error)).toContain("[REDACTED]");
+  });
+
   it("requires an explicit selected credential for gh execution", async () => {
     const runner = new ProcessRunner({});
     await expect(runner.runGh(["--version"], "project")).rejects.toMatchObject({
@@ -253,15 +280,17 @@ describe("control process boundary", () => {
 
   it("injects only the selected credential into the gh child", async () => {
     const bin = await mkdtemp(join(tmpdir(), "jhw-control-gh-"));
-    await writeFile(join(bin, "gh"), "#!/bin/sh\nprintf '%s|%s|%s' \"$GH_TOKEN\" \"${GH_PROJECT_TOKEN:-missing}\" \"${GH_REPO_TOKEN:-missing}\"\n");
+    await writeFile(join(bin, "gh"), "#!/bin/sh\nprintf '%s|%s|%s|%s|%s' \"$GH_TOKEN\" \"${GH_PROJECT_TOKEN:-missing}\" \"${GH_REPO_TOKEN:-missing}\" \"${DB_PASSWORD:-missing}\" \"${lowercase_token:-missing}\"\n");
     await chmod(join(bin, "gh"), 0o755);
     try {
       const result = await new ProcessRunner({
         GH_PROJECT_TOKEN: "project-token",
         GH_REPO_TOKEN: "repo-token",
+        DB_PASSWORD: "unmistakably-fake-db-password",
+        lowercase_token: "unmistakably-fake-lower-token",
       }).runGh([], "project", { env: { PATH: bin } });
 
-      expect(result.stdout).toBe("[REDACTED]|missing|missing");
+      expect(result.stdout).toBe("[REDACTED]|missing|missing|missing|missing");
     } finally {
       await rm(bin, { recursive: true, force: true });
     }

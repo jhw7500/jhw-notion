@@ -7,11 +7,11 @@ import type { Readable } from "node:stream";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
+import { isSensitiveEnvironmentKey } from "./sensitive-data.js";
 
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
 const MAX_PROCESS_TIMEOUT_MS = 600_000;
-const SECRET_ENV_KEY = /_(?:TOKEN|KEY|SECRET)$/;
 
 export interface ProcessResult {
   command: string;
@@ -32,7 +32,7 @@ export type GhCredential = "project" | "repo";
 
 /** Removes credentials before spawning ordinary host subprocesses. */
 export function sanitizedChildEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const sanitized = Object.fromEntries(Object.entries(env).filter(([key]) => !SECRET_ENV_KEY.test(key)));
+  const sanitized = Object.fromEntries(Object.entries(env).filter(([key]) => !isSensitiveEnvironmentKey(key)));
   const configuredSsh = sanitized.GIT_SSH_COMMAND?.trim() || "ssh";
   return {
     ...sanitized,
@@ -118,7 +118,7 @@ function stoppedError(stopped: ChildExit["stopped"], command: string, deadline: 
 function secretValues(env: NodeJS.ProcessEnv): string[] {
   return [...new Set(
     Object.entries(env)
-      .filter(([key, value]) => SECRET_ENV_KEY.test(key) && value)
+      .filter(([key, value]) => isSensitiveEnvironmentKey(key) && value)
       .map(([, value]) => value as string),
   )].sort((left, right) => right.length - left.length);
 }
