@@ -7,6 +7,7 @@ import type {
   RecoveryResult,
 } from "./claim-service.js";
 import type { ControlConfig } from "./config.js";
+import { RegistryRecordStore } from "./codec.js";
 import { ControlError } from "./errors.js";
 import {
   buildHandoff,
@@ -38,6 +39,7 @@ export interface WorktreeManagerPort {
 
 export interface RegistryGitPort {
   transact(message: string, mutate: () => Promise<RegistryMutationResult>): Promise<RegistryTransactionResult>;
+  assertHeadRegularFile(relativePath: string): Promise<void>;
   readHeadRegularFile(relativePath: string): Promise<string>;
 }
 
@@ -234,13 +236,17 @@ function parseHandoffGitState(value: string, handoffPath: string): HandoffGitSta
  * source of release; host-local worktree removal is strictly post-release cleanup.
  */
 export class TaskService {
+  private readonly records: RegistryRecordStore;
+
   constructor(
     private readonly config: ControlConfig,
     private readonly claims: ClaimServicePort,
     private readonly worktrees: WorktreeManagerPort,
     private readonly registry: RegistryGitPort,
     private readonly now: () => Date = () => new Date(),
-  ) {}
+  ) {
+    this.records = new RegistryRecordStore(config.registryDir, registry);
+  }
 
   async start(input: TaskStartInput): Promise<TaskStartResult> {
     const plan = worktreePlan(input.task_id, input.task_alias);
@@ -360,7 +366,7 @@ export class TaskService {
       // This transaction must complete (including push verification) before the
       // Claim release transaction; a failed release intentionally leaves this copy.
       await this.registry.transact(`registry: handoff ${active.claim_id}`, async () => {
-        const result = await writeRegistryHandoff(this.config.registryDir, active.task_id, active.claim_id, handoff);
+        const result = await writeRegistryHandoff(this.records, active.task_id, active.claim_id, handoff, committed);
         return { paths: result.changed ? [result.path] : [] };
       });
     }
@@ -497,6 +503,7 @@ export class TaskService {
 
   private async committedHandoff(relativePath: string): Promise<string | undefined> {
     try {
+      await this.records.assertCommittedRegularFile(relativePath);
       return await this.registry.readHeadRegularFile(relativePath);
     } catch (cause) {
       if (cause instanceof ControlError && cause.code === "HANDOFF_MISSING") return undefined;

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -63,7 +63,11 @@ async function taskFixture(): Promise<{
     assertTakeoverEligible: ReturnType<typeof vi.fn>;
     rebindTakeover: ReturnType<typeof vi.fn>;
   };
-  registry: { transact: ReturnType<typeof vi.fn>; readHeadRegularFile: ReturnType<typeof vi.fn> };
+  registry: {
+    transact: ReturnType<typeof vi.fn>;
+    assertHeadRegularFile: ReturnType<typeof vi.fn>;
+    readHeadRegularFile: ReturnType<typeof vi.fn>;
+  };
   worktreePath: string;
   fixture: RegistryFixture;
 }> {
@@ -108,6 +112,16 @@ async function taskFixture(): Promise<{
     transact: vi.fn(async (_message: string, mutate: () => Promise<{ paths: readonly string[] }>) => {
       await mutate();
       return { commit: "registry-commit", changed: true };
+    }),
+    assertHeadRegularFile: vi.fn(async (relativePath: string) => {
+      try {
+        await readFile(join(fixture.registryDir, relativePath));
+      } catch (cause) {
+        if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT") {
+          throw new ControlError("HANDOFF_MISSING", "missing");
+        }
+        throw cause;
+      }
     }),
     readHeadRegularFile: vi.fn(async (relativePath: string) => {
       try {
@@ -300,6 +314,26 @@ describe("TaskService", () => {
 
     await expect(readFile(join(worktreePath, ".ai", "handoff.md"), "utf8")).resolves.toContain("# Handoff");
     await expect(readFile(join(fixture.registryDir, pointer), "utf8")).resolves.toContain("claim_id:");
+  });
+
+  it("rejects a multi-link Registry Handoff destination before release", async () => {
+    const { tasks, claims, fixture } = await taskFixture();
+    const pointer = join(fixture.registryDir, "handoffs", TASK_ID, `${CLAIM_ID}.md`);
+    const outside = join(fixture.root, "outside-handoff.md");
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(outside, "outside sentinel\n", "utf8");
+    await link(outside, pointer);
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    expect(await readFile(outside, "utf8")).toBe("outside sentinel\n");
+    expect(claims.finishClaim).not.toHaveBeenCalled();
   });
 
   it("rejects duplicate pre-existing local Handoff entries before generating evidence", async () => {

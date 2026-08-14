@@ -1,9 +1,8 @@
-import { stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import { z, type ZodType } from "zod";
 
-import { readRecord, writeRecord } from "./codec.js";
+import { RegistryRecordStore } from "./codec.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { newTaskId, sourceIndexKey } from "./ids.js";
@@ -86,22 +85,6 @@ export interface FormalTaskRegistration {
   created: boolean;
 }
 
-function repositoryPath(registryDir: string, repoId: string): string {
-  return join(registryDir, "repositories", `${repoId}.yaml`);
-}
-
-function repositorySourcePath(registryDir: string, githubNodeId: string): string {
-  return join(registryDir, "repositories", "by-source", "github", `${sourceIndexKey(githubNodeId)}.yaml`);
-}
-
-function taskPath(registryDir: string, taskId: string): string {
-  return join(registryDir, "tasks", `${taskId}.yaml`);
-}
-
-function taskSourcePath(registryDir: string, githubNodeId: string): string {
-  return join(registryDir, "tasks", "by-source", "github", `${sourceIndexKey(githubNodeId)}.yaml`);
-}
-
 function repositoryRelativePath(repoId: string): string {
   return `repositories/${repoId}.yaml`;
 }
@@ -116,20 +99,6 @@ function taskRelativePath(taskId: string): string {
 
 function taskSourceRelativePath(githubNodeId: string): string {
   return `tasks/by-source/github/${sourceIndexKey(githubNodeId)}.yaml`;
-}
-
-async function readOptionalRecord<T>(path: string, schema: ZodType<T>): Promise<T | undefined> {
-  try {
-    await stat(path);
-  } catch (cause) {
-    if (isNotFound(cause)) return undefined;
-    throw cause;
-  }
-  return readRecord(path, schema);
-}
-
-function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
-  return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
 }
 
 function parseInput<T>(schema: ZodType<T>, value: unknown, code: string): T {
@@ -170,16 +139,20 @@ function assertRepositoryId(repoId: string): void {
 
 /** Canonical Registry catalog with source-index collision protection. */
 export class Catalog {
+  readonly records: RegistryRecordStore;
+
   constructor(
     private readonly config: ControlConfig,
     private readonly registry: RegistryGit,
-  ) {}
+  ) {
+    this.records = new RegistryRecordStore(config.registryDir, registry);
+  }
 
   async registerRepository(rawInput: RegisterRepositoryInput): Promise<RepositoryRegistration> {
     const input = parseInput(RegisterRepositoryInputSchema, rawInput, "INVALID_REPOSITORY");
     let registration: RepositoryRegistration | undefined;
     await this.registry.transact(`registry: register repository ${input.repo_id}`, async () => {
-      const sourcePath = repositorySourcePath(this.config.registryDir, input.github_node_id);
+      const sourcePath = repositorySourceRelativePath(input.github_node_id);
       const indexed = await this.repositoryForSource(sourcePath, input.github_node_id);
       if (indexed) {
         if (indexed.repoId !== input.repo_id) {
@@ -202,7 +175,7 @@ export class Catalog {
             requested_github_node_id: input.github_node_id,
           });
         }
-        await writeRecord(sourcePath, { repo_id: existing.id });
+        await this.records.writeJson(sourcePath, { repo_id: existing.id });
         registration = { repository: existing, created: false };
         return stage([repositorySourceRelativePath(input.github_node_id)]);
       }
@@ -212,8 +185,8 @@ export class Catalog {
         { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug },
         "INVALID_REPOSITORY",
       );
-      await writeRecord(repositoryPath(this.config.registryDir, repository.id), repository);
-      await writeRecord(sourcePath, { repo_id: repository.id });
+      await this.records.writeJson(repositoryRelativePath(repository.id), repository);
+      await this.records.writeJson(sourcePath, { repo_id: repository.id });
       registration = { repository, created: true };
       return stage([repositoryRelativePath(repository.id), repositorySourceRelativePath(repository.github_node_id)]);
     });
@@ -225,7 +198,7 @@ export class Catalog {
     const input = parseInput(RegisterFormalTaskInputSchema, rawInput, "INVALID_FORMAL_TASK");
     let registration: FormalTaskRegistration | undefined;
     await this.registry.transact(`registry: register formal task ${input.alias}`, async () => {
-      const sourcePath = taskSourcePath(this.config.registryDir, input.issue_node_id);
+      const sourcePath = taskSourceRelativePath(input.issue_node_id);
       const indexed = await this.formalTaskForSource(sourcePath, input.issue_node_id);
       if (indexed) {
         registration = { task: indexed.task, created: false };
@@ -246,8 +219,8 @@ export class Catalog {
         },
         "INVALID_FORMAL_TASK",
       );
-      await writeRecord(taskPath(this.config.registryDir, task.id), task);
-      await writeRecord(sourcePath, { task_id: task.id });
+      await this.records.writeJson(taskRelativePath(task.id), task);
+      await this.records.writeJson(sourcePath, { task_id: task.id });
       registration = { task, created: true };
       return stage([taskRelativePath(task.id), taskSourceRelativePath(input.issue_node_id)]);
     });
@@ -274,7 +247,7 @@ export class Catalog {
         },
         "INVALID_TEMPORARY_TASK",
       );
-      await writeRecord(taskPath(this.config.registryDir, task.id), task);
+      await this.records.writeJson(taskRelativePath(task.id), task);
       return stage([taskRelativePath(task.id)]);
     });
 
@@ -287,7 +260,7 @@ export class Catalog {
     const input = parseInput(RegisterFormalTaskInputSchema, rawInput, "INVALID_FORMAL_TASK");
     let promoted: FormalTask | undefined;
     await this.registry.transact(`registry: promote temporary task ${taskId}`, async () => {
-      const sourcePath = taskSourcePath(this.config.registryDir, input.issue_node_id);
+      const sourcePath = taskSourceRelativePath(input.issue_node_id);
       const indexed = await this.formalTaskForSource(sourcePath, input.issue_node_id);
       if (indexed && indexed.taskId !== taskId) {
         throw new ControlError("SOURCE_ALREADY_MAPPED", "GitHub Issue source is already mapped to another Task", {
@@ -307,7 +280,7 @@ export class Catalog {
         }
         promoted = current;
         if (indexed) return noChanges();
-        await writeRecord(sourcePath, { task_id: current.id });
+        await this.records.writeJson(sourcePath, { task_id: current.id });
         return stage([taskSourceRelativePath(input.issue_node_id)]);
       }
 
@@ -335,8 +308,8 @@ export class Catalog {
         },
         "INVALID_FORMAL_TASK",
       );
-      await writeRecord(taskPath(this.config.registryDir, current.id), formal);
-      if (!indexed) await writeRecord(sourcePath, { task_id: current.id });
+      await this.records.writeJson(taskRelativePath(current.id), formal);
+      if (!indexed) await this.records.writeJson(sourcePath, { task_id: current.id });
       promoted = formal;
       return stage([
         taskRelativePath(current.id),
@@ -370,14 +343,14 @@ export class Catalog {
     if (!repository) {
       throw corruption("Repository source index points to a missing record", {
         sourceIndexPath,
-        recordPath: repositoryPath(this.config.registryDir, source.repo_id),
+        recordPath: join(this.config.registryDir, repositoryRelativePath(source.repo_id)),
         expectedRecordId: source.repo_id,
       });
     }
     if (repository.github_node_id !== expectedGithubNodeId) {
       throw corruption("Repository source index and canonical record disagree on GitHub node ID", {
         sourceIndexPath,
-        recordPath: repositoryPath(this.config.registryDir, source.repo_id),
+        recordPath: join(this.config.registryDir, repositoryRelativePath(source.repo_id)),
         expectedRecordId: source.repo_id,
         actualRecordId: repository.id,
         expectedGithubNodeId,
@@ -397,7 +370,7 @@ export class Catalog {
     if (task.kind !== "formal") {
       throw corruption("Task source index points to a non-formal Task", {
         sourceIndexPath,
-        recordPath: taskPath(this.config.registryDir, source.task_id),
+        recordPath: join(this.config.registryDir, taskRelativePath(source.task_id)),
         expectedRecordId: source.task_id,
         actualRecordId: task.id,
         actualKind: task.kind,
@@ -406,7 +379,7 @@ export class Catalog {
     if (task.issue_node_id !== expectedIssueNodeId) {
       throw corruption("Task source index and canonical record disagree on Issue node ID", {
         sourceIndexPath,
-        recordPath: taskPath(this.config.registryDir, source.task_id),
+        recordPath: join(this.config.registryDir, taskRelativePath(source.task_id)),
         expectedRecordId: source.task_id,
         actualRecordId: task.id,
         expectedIssueNodeId,
@@ -418,17 +391,21 @@ export class Catalog {
 
   private async sourceIndex<T>(path: string, schema: ZodType<T>): Promise<T | undefined> {
     try {
-      return await readOptionalRecord(path, schema);
+      return await this.records.readOptionalJson(path, schema);
     } catch (cause) {
-      throw corruption("Registry source index is invalid", { sourceIndexPath: path, cause: errorMessage(cause) });
+      throw corruption("Registry source index is invalid", {
+        sourceIndexPath: join(this.config.registryDir, path),
+        cause: errorMessage(cause),
+      });
     }
   }
 
   private async repositoryAt(repoId: string, sourceIndexPath?: string): Promise<RepositoryRecord | undefined> {
-    const recordPath = repositoryPath(this.config.registryDir, repoId);
+    const relativePath = repositoryRelativePath(repoId);
+    const recordPath = join(this.config.registryDir, relativePath);
     let repository: RepositoryRecord | undefined;
     try {
-      repository = await readOptionalRecord(recordPath, RepositoryRecordSchema);
+      repository = await this.records.readOptionalJson(relativePath, RepositoryRecordSchema, { field: "id", value: repoId });
     } catch (cause) {
       throw corruption("Repository record referenced by Registry is invalid", {
         sourceIndexPath,
@@ -449,10 +426,11 @@ export class Catalog {
   }
 
   private async taskAt(taskId: string, sourceIndexPath?: string): Promise<TaskRecord> {
-    const recordPath = taskPath(this.config.registryDir, taskId);
+    const relativePath = taskRelativePath(taskId);
+    const recordPath = join(this.config.registryDir, relativePath);
     let task: TaskRecord;
     try {
-      task = await readRecord(recordPath, TaskRecordSchema);
+      task = await this.records.readJson(relativePath, TaskRecordSchema, { field: "id", value: taskId });
     } catch (cause) {
       throw corruption("Task record referenced by Registry is invalid or missing", {
         sourceIndexPath,

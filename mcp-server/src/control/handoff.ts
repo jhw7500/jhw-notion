@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 
 import { ControlError } from "./errors.js";
+import type { RegistryRecordStore } from "./codec.js";
 
 export const MAX_HANDOFF_BYTES = 12 * 1024;
 
@@ -261,35 +262,20 @@ export async function writeWorktreeHandoff(worktreePath: string, content: string
  * may reuse byte-identical evidence but cannot overwrite operator-recovery data.
  */
 export async function writeRegistryHandoff(
-  registryDir: string,
+  records: RegistryRecordStore,
   taskId: string,
   claimId: string,
   content: string,
+  committed?: string,
 ): Promise<{ path: string; changed: boolean }> {
   const relativePath = canonicalHandoffPath(taskId, claimId);
-  const root = await rootDirectory(registryDir, "UNSAFE_REGISTRY_PATH");
-  let directory = root;
-  for (const component of relativePath.split("/").slice(0, -1)) {
-    directory = await containedDirectory(directory, component, "UNSAFE_REGISTRY_PATH");
-  }
-  const destination = join(directory, `${claimId}.md`);
-  try {
-    const existing = await lstat(destination);
-    if (existing.isSymbolicLink() || !existing.isFile()) {
-      throw new ControlError("UNSAFE_REGISTRY_PATH", "Registry Handoff destination is not a regular file", {
-        path: relativePath,
-      });
-    }
-    const previous = await readFile(destination, "utf8");
-    if (previous === content) return { path: relativePath, changed: false };
+  if (committed !== undefined) {
+    if (committed === content) return { path: relativePath, changed: false };
     throw new ControlError("HANDOFF_EXISTS", "Registry Handoff already exists with different durable evidence", {
       path: relativePath,
     });
-  } catch (cause) {
-    if (cause instanceof ControlError) throw cause;
-    if (!isNotFound(cause)) throw cause;
   }
-
-  await writeRegularFile(destination, content, "UNSAFE_REGISTRY_PATH");
+  await records.assertAbsent(relativePath);
+  await records.writeText(relativePath, content);
   return { path: relativePath, changed: true };
 }

@@ -59,11 +59,11 @@ export class RegistryGit {
    * This deliberately consults Git metadata rather than trusting the worktree.
    */
   async assertHeadRegularFile(relativePath: string): Promise<void> {
-    await this.headRegularBlobObject(relativePath);
+    await this.headRegularBlobObjectId(relativePath);
   }
 
   /** Reads the exact regular blob object ID selected by HEAD tree metadata. */
-  private async headRegularBlobObject(relativePath: string): Promise<string> {
+  async headRegularBlobObjectId(relativePath: string): Promise<string> {
     if (!isSafeRegistryRelativePath(relativePath)) {
       throw new ControlError("INVALID_REGISTRY_PATH", "Registry file path must be a safe relative path", { relativePath });
     }
@@ -104,7 +104,7 @@ export class RegistryGit {
    * byte-for-byte (including content that happens to equal a host secret).
    */
   async readHeadRegularBlob(relativePath: string): Promise<Buffer> {
-    const objectId = await this.headRegularBlobObject(relativePath);
+    const objectId = await this.headRegularBlobObjectId(relativePath);
     const rawRunner = this.runner as Partial<RawProcessRunnerLike>;
     if (typeof rawRunner.runRaw !== "function") {
       throw new ControlError("REGISTRY_CORRUPT", "Registry runner cannot read committed blob bytes", { relativePath });

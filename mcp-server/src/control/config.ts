@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import { ControlError } from "./errors.js";
 
@@ -54,12 +54,23 @@ function coordinate(env: NodeJS.ProcessEnv, key: string, pattern: RegExp, descri
   return value;
 }
 
+function absolutePath(env: NodeJS.ProcessEnv, key: string, fallback?: string): string {
+  const value = fallback === undefined ? required(env, key) : optional(env, key, fallback);
+  if (!isAbsolute(value)) {
+    throw new ControlError("INVALID_CONFIG", `${key} must be an absolute path`, { key });
+  }
+  return value;
+}
+
 /**
  * Loads only non-secret host-control configuration. Credential tokens deliberately
  * remain in the process environment until a `gh` child environment is constructed.
  */
 export function loadControlConfig(env: NodeJS.ProcessEnv = process.env): ControlConfig {
-  const home = required(env, "HOME");
+  const explicitStateDir = env.JHW_CONTROL_STATE_DIR?.trim();
+  const stateDir = explicitStateDir
+    ? absolutePath(env, "JHW_CONTROL_STATE_DIR")
+    : absolutePath(env, "JHW_CONTROL_STATE_DIR", join(required(env, "HOME"), ".local/state/jhw-control"));
   const githubOwner = required(env, "JHW_GITHUB_OWNER");
   const registryRepository = coordinate(
     env,
@@ -73,10 +84,10 @@ export function loadControlConfig(env: NodeJS.ProcessEnv = process.env): Control
     });
   }
   return {
-    registryDir: required(env, "JHW_REGISTRY_DIR"),
+    registryDir: absolutePath(env, "JHW_REGISTRY_DIR"),
     registryRemote: optional(env, "JHW_REGISTRY_REMOTE", "origin"),
     registryBranch: optional(env, "JHW_REGISTRY_BRANCH", "main"),
-    worktreeRoot: required(env, "JHW_WORKTREE_ROOT"),
+    worktreeRoot: absolutePath(env, "JHW_WORKTREE_ROOT"),
     buildHost: required(env, "JHW_BUILD_HOST"),
     githubOwner,
     projectNumber: projectNumber(env),
@@ -88,6 +99,6 @@ export function loadControlConfig(env: NodeJS.ProcessEnv = process.env): Control
       "must be a ProjectV2 item node ID",
     ),
     preflightRegistryIssueNumber: positiveInteger(env, "JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER"),
-    stateDir: optional(env, "JHW_CONTROL_STATE_DIR", join(home, ".local/state/jhw-control")),
+    stateDir,
   };
 }

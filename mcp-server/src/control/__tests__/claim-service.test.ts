@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -199,6 +199,17 @@ describe("ClaimService", () => {
     await expect(claims.getActive(task.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     await expect(claims.assertOwner(task.id, externalClaim.claim_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     expect(await readFile(externalPath, "utf8")).toBe(content);
+  });
+
+  it("rejects a multi-link active Claim before trusting ownership", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const activePath = join(fixture.registryDir, "claims", "active", `${active.task_id}.yaml`);
+    await link(activePath, join(fixture.root, "active-claim-hardlink.yaml"));
+
+    await expect(claims.getActive(active.task_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    await expect(claims.assertOwner(active.task_id, active.claim_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await git(fixture.registryDir, "status", "--porcelain", "--untracked-files=all")).toBe("");
   });
 
   it("cannot release a Claim owned by another generation", async () => {
@@ -611,6 +622,25 @@ describe("ClaimService", () => {
         head_sha: "0123456789abcdef",
         validation: ["npm test: pass"],
         handoff_path: handoffRelativePath(active),
+      }),
+    ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await claims.getActive(active.task_id)).toEqual(active);
+  });
+
+  it("rejects a multi-link committed Handoff and retains the active Claim", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const relative = handoffRelativePath(active);
+    await commitRegistryFile(fixture, relative, "# Handoff\n\nDurable content.\n");
+    await link(join(fixture.registryDir, relative), join(fixture.root, "handoff-hardlink.md"));
+
+    await expect(
+      claims.finishClaim(active.task_id, active.claim_id, {
+        status: "handoff",
+        branch: "task/wlan-roaming-fix",
+        head_sha: "0123456789abcdef",
+        validation: ["npm test: pass"],
+        handoff_path: relative,
       }),
     ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     expect(await claims.getActive(active.task_id)).toEqual(active);

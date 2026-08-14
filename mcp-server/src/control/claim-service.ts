@@ -1,10 +1,9 @@
-import { lstat, readdir, realpath, stat, unlink } from "node:fs/promises";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 
 import { z, type ZodType } from "zod";
 
 import { Catalog } from "./catalog.js";
-import { readRecord, writeRecord } from "./codec.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { newClaimId } from "./ids.js";
@@ -100,10 +99,6 @@ export interface RecoveryTakeover {
 
 export type RecoveryResult = RecoveryStatus | RecoveryForceEnd | RecoveryTakeover;
 
-function activePath(registryDir: string, taskId: string): string {
-  return join(registryDir, "claims", "active", `${taskId}.yaml`);
-}
-
 function activeRelativePath(taskId: string): string {
   return `claims/active/${taskId}.yaml`;
 }
@@ -118,16 +113,6 @@ function expectedHandoffPath(taskId: string, claimId: string): string {
 
 function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
-}
-
-async function readOptionalRecord<T>(path: string, schema: ZodType<T>): Promise<T | undefined> {
-  try {
-    await stat(path);
-  } catch (cause) {
-    if (isNotFound(cause)) return undefined;
-    throw cause;
-  }
-  return readRecord(path, schema);
 }
 
 function parse<T>(schema: ZodType<T>, value: unknown, code: string, message: string): T {
@@ -211,8 +196,7 @@ export class ClaimService {
         "INVALID_CLAIM",
         "Claim record failed validation",
       );
-      await this.assertActivePathComponents(input.task_id);
-      await writeRecord(activePath(this.config.registryDir, input.task_id), claimed);
+      await this.catalog.records.writeJson(activeRelativePath(input.task_id), claimed);
       return stage([activeRelativePath(input.task_id)]);
     });
 
@@ -238,10 +222,9 @@ export class ClaimService {
       const active = await this.requireOwner(task, expectedClaimId);
       await this.assertHandoffAvailable(outcome.handoff_path);
       history = this.finishHistory(active, outcome, releasedAt);
-      const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
-      await writeRecord(destination, history);
-      await this.assertActivePathComponents(taskId);
-      await unlink(activePath(this.config.registryDir, taskId));
+      await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
+      await this.catalog.records.writeJson(historyRelative, history);
+      await this.catalog.records.remove(activeRelativePath(taskId));
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
     });
 
@@ -305,10 +288,9 @@ export class ClaimService {
       const task = await this.catalog.getTask(taskId);
       const active = await this.requireOwner(task, expectedClaimId);
       history = this.recoveryHistory(active, "force-ended", releasedAt);
-      const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
-      await writeRecord(destination, history);
-      await this.assertActivePathComponents(taskId);
-      await unlink(activePath(this.config.registryDir, taskId));
+      await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
+      await this.catalog.records.writeJson(historyRelative, history);
+      await this.catalog.records.remove(activeRelativePath(taskId));
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId)]);
     });
     if (!history) throw new Error("Claim force-end transaction did not produce history");
@@ -360,12 +342,10 @@ export class ClaimService {
         });
       }
       history = this.takeoverHistory(active, releasedAt, replacement.claim_id);
-      const destination = await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
-      await writeRecord(destination, history);
-      await this.assertActivePathComponents(taskId);
-      await unlink(activePath(this.config.registryDir, taskId));
-      await this.assertActivePathComponents(taskId);
-      await writeRecord(activePath(this.config.registryDir, taskId), replacement);
+      await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
+      await this.catalog.records.writeJson(historyRelative, history);
+      await this.catalog.records.remove(activeRelativePath(taskId));
+      await this.catalog.records.writeJson(activeRelativePath(taskId), replacement);
       return stage([historyRelative, activeRelativePath(taskId)]);
     });
 
@@ -494,7 +474,10 @@ export class ClaimService {
       }
       try {
         await this.registry.assertHeadRegularFile(relativePath);
-        const candidate = await readRecord(path, ClaimHistorySchema);
+        const candidate = await this.catalog.records.readJson(relativePath, ClaimHistorySchema, {
+          field: "claim_id",
+          value: claimId,
+        });
         if (candidate.task_id !== taskId || candidate.claim_id !== claimId) {
           throw corruption("Claim takeover history path and record identity disagree", {
             task_id: taskId,
@@ -527,10 +510,13 @@ export class ClaimService {
 
   private async readActive(task: TaskRecord): Promise<ActiveClaim | undefined> {
     await this.assertActivePathComponents(task.id);
-    const recordPath = activePath(this.config.registryDir, task.id);
+    const recordPath = activeRelativePath(task.id);
     let active: ActiveClaim | undefined;
     try {
-      active = await readOptionalRecord(recordPath, ActiveClaimSchema);
+      active = await this.catalog.records.readOptionalJson(recordPath, ActiveClaimSchema, {
+        field: "task_id",
+        value: task.id,
+      });
     } catch (cause) {
       throw corruption("Active Claim record is invalid", {
         recordPath,
@@ -611,23 +597,13 @@ export class ClaimService {
 
   private async assertHandoffAvailable(handoffPath: string | undefined): Promise<void> {
     if (!handoffPath) return;
-    await this.assertRegistryPathComponents(handoffPath);
-    await this.registry.assertHeadRegularFile(handoffPath);
-    const path = join(this.config.registryDir, handoffPath);
-    let entry: Awaited<ReturnType<typeof lstat>>;
     try {
-      entry = await lstat(path);
+      await this.catalog.records.assertCommittedRegularFile(handoffPath);
     } catch (cause) {
-      throw corruption("Committed Handoff is missing from the Registry checkout", {
+      if (cause instanceof ControlError && cause.code === "HANDOFF_MISSING") throw cause;
+      throw corruption("Committed Handoff is unavailable or unsafe", {
         handoff_path: handoffPath,
-        recordPath: path,
         cause: errorMessage(cause),
-      });
-    }
-    if (!entry.isFile()) {
-      throw corruption("Handoff pointer does not reference a regular Registry file", {
-        handoff_path: handoffPath,
-        recordPath: path,
       });
     }
   }
@@ -636,25 +612,16 @@ export class ClaimService {
     historyRelative: string,
     taskId: string,
     claimId: string,
-  ): Promise<string> {
-    await this.assertRegistryPathComponents(historyRelative);
-    const destination = join(this.config.registryDir, historyRelative);
+  ): Promise<void> {
     try {
-      await lstat(destination);
+      await this.catalog.records.assertAbsent(historyRelative);
     } catch (cause) {
-      if (isNotFound(cause)) return destination;
-      throw corruption("Claim history destination could not be inspected", {
-        recordPath: destination,
+      throw corruption("Claim history destination is unavailable", {
         task_id: taskId,
         claim_id: claimId,
         cause: errorMessage(cause),
       });
     }
-    throw corruption("Claim history destination already exists", {
-      recordPath: destination,
-      task_id: taskId,
-      claim_id: claimId,
-    });
   }
 
   private async assertRegistryPathComponents(relativePath: string | undefined): Promise<void> {

@@ -41,6 +41,42 @@ describe("control process boundary", () => {
     expect(JSON.stringify(config)).not.toContain("TOKEN");
   });
 
+  it("requires absolute Registry and worktree roots", () => {
+    const base = {
+      HOME: "/home/jhw",
+      JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
+      JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
+      JHW_BUILD_HOST: "cantopsbuildserver",
+      JHW_GITHUB_OWNER: "jhw7500",
+      JHW_PROJECT_NUMBER: "7",
+      JHW_REGISTRY_REPOSITORY: "jhw7500/project-registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+      JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+    };
+    expect(() => loadControlConfig({ ...base, JHW_REGISTRY_DIR: "relative-registry" })).toThrow(
+      expect.objectContaining({ code: "INVALID_CONFIG" }),
+    );
+    expect(() => loadControlConfig({ ...base, JHW_WORKTREE_ROOT: "relative-worktrees" })).toThrow(
+      expect.objectContaining({ code: "INVALID_CONFIG" }),
+    );
+  });
+
+  it("does not require HOME when an immutable absolute state directory is explicit", () => {
+    const config = loadControlConfig({
+      JHW_REGISTRY_DIR: "/srv/jhw/project-registry",
+      JHW_WORKTREE_ROOT: "/srv/jhw/worktrees",
+      JHW_CONTROL_STATE_DIR: "/srv/jhw/control-state",
+      JHW_BUILD_HOST: "cantopsbuildserver",
+      JHW_GITHUB_OWNER: "jhw7500",
+      JHW_PROJECT_NUMBER: "7",
+      JHW_REGISTRY_REPOSITORY: "jhw7500/project-registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+      JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+    });
+
+    expect(config.stateDir).toBe("/srv/jhw/control-state");
+  });
+
   it.each([
     ["JHW_REGISTRY_REPOSITORY", "invalid"],
     ["JHW_REGISTRY_REPOSITORY", "another-owner/project-registry"],

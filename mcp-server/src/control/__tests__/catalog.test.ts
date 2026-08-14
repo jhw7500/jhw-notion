@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -198,6 +198,64 @@ describe("Catalog", () => {
 });
 
 describe("Catalog Registry integrity and public input boundaries", () => {
+  it("refuses a committed repositories ancestor symlink before touching its outside target", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const outside = join(fixture.root, "outside-repositories");
+    const sentinel = join(outside, "sentinel.txt");
+    await mkdir(outside);
+    await writeFile(sentinel, "outside-sentinel\n", "utf8");
+    await symlink(outside, join(fixture.registryDir, "repositories"));
+    await git(fixture.registryDir, "add", "--", "repositories");
+    await git(fixture.registryDir, "commit", "-m", "Add hostile repositories symlink");
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeRemote = (await git(fixture.registryDir, "rev-parse", "origin/main")).trim();
+
+    await expect(catalog.registerRepository(repositoryInput)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    expect(await readFile(sentinel, "utf8")).toBe("outside-sentinel\n");
+    expect(await readdir(outside)).toEqual(["sentinel.txt"]);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.registryDir, "rev-parse", "origin/main")).trim()).toBe(beforeRemote);
+    expect(await git(fixture.registryDir, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  });
+
+  it("refuses a committed Repository leaf symlink even when its outside bytes parse", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const outside = join(fixture.root, "outside-repository.yaml");
+    await writeFile(outside, `${JSON.stringify({
+      id: repositoryInput.repo_id,
+      github_node_id: repositoryInput.github_node_id,
+      slug: repositoryInput.slug,
+    }, null, 2)}\n`, "utf8");
+    await mkdir(join(fixture.registryDir, "repositories"));
+    await symlink(outside, join(fixture.registryDir, "repositories", `${repositoryInput.repo_id}.yaml`));
+    await git(fixture.registryDir, "add", "--", "repositories");
+    await git(fixture.registryDir, "commit", "-m", "Add hostile Repository leaf symlink");
+    await git(fixture.registryDir, "push", "origin", "main");
+    const before = await readFile(outside, "utf8");
+
+    await expect(catalog.registerRepository(repositoryInput)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    expect(await readFile(outside, "utf8")).toBe(before);
+    expect(await git(fixture.registryDir, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  });
+
+  it("refuses a multi-link Repository record before trusting canonical identity", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const record = join(fixture.registryDir, "repositories", `${repositoryInput.repo_id}.yaml`);
+    const outside = join(fixture.root, "repository-hardlink.yaml");
+    await unlink(outside).catch(() => undefined);
+    await link(record, outside);
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.getRepository(repositoryInput.repo_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect(await git(fixture.registryDir, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  });
+
   it("fails closed when a Repository source index points to a record for another GitHub node", async () => {
     const { catalog, fixture } = await catalogFixture();
     const sourcePath = `repositories/by-source/github/${sourceIndexKey(repositoryInput.github_node_id)}.yaml`;
@@ -211,7 +269,7 @@ describe("Catalog Registry integrity and public input boundaries", () => {
 
     await expect(catalog.registerRepository(repositoryInput)).rejects.toMatchObject({
       code: "REGISTRY_CORRUPT",
-      details: expect.objectContaining({ sourceIndexPath: join(fixture.registryDir, sourcePath) }),
+      details: expect.objectContaining({ sourceIndexPath: sourcePath }),
     });
   });
 
@@ -240,7 +298,7 @@ describe("Catalog Registry integrity and public input boundaries", () => {
 
     await expect(catalog.registerRepository(repositoryInput)).rejects.toMatchObject({
       code: "REGISTRY_CORRUPT",
-      details: expect.objectContaining({ expectedRecordId: "repo-wlan", actualRecordId: "repo-other" }),
+      details: expect.objectContaining({ expectedRecordId: "repo-wlan" }),
     });
   });
 
@@ -330,7 +388,7 @@ describe("Catalog Registry integrity and public input boundaries", () => {
 
     await expect(catalog.promoteTemporaryTask(temp.id, issueInput)).rejects.toMatchObject({
       code: "REGISTRY_CORRUPT",
-      details: expect.objectContaining({ expectedRecordId: temp.id, actualRecordId: otherTaskId }),
+      details: expect.objectContaining({ expectedRecordId: temp.id }),
     });
   });
 });
