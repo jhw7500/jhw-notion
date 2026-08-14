@@ -5,10 +5,16 @@ const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm") =>
 
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
 const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
-const timestamp = z.string().min(1);
+const boundedUtf8 = (maximumBytes: number) => z.string().min(1).max(maximumBytes)
+  .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
+const boundedCoordinate = (maximumBytes: number) => z.string().min(1).max(maximumBytes)
+  .regex(/^[^\u0000-\u001f\u007f]+$/u)
+  .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
+const taskAlias = boundedCoordinate(160);
+const claimCoordinate = boundedCoordinate(255);
 const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 const githubApiId = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
-export const SourceTaskRevisionSchema = z.string().min(1).max(256);
+export const SourceTaskRevisionSchema = boundedCoordinate(256);
 export const OffsetDateTimeSchema = z.string().min(1).max(64).datetime({ offset: true });
 export const TemporaryLifecycleSchema = z.enum(["active", "handoff", "completed", "abandoned"]);
 export type TemporaryLifecycle = z.infer<typeof TemporaryLifecycleSchema>;
@@ -45,7 +51,8 @@ const taskBase = {
   id: canonicalId("tsk"),
   project_id: projectId,
   repo_id: repositoryId,
-  aliases: z.array(z.string().min(1)),
+  aliases: z.array(taskAlias).min(1).max(64)
+    .refine((aliases) => new Set(aliases).size === aliases.length, "Duplicate Task alias"),
 };
 
 export const FormalTaskSchema = z
@@ -53,8 +60,8 @@ export const FormalTaskSchema = z
     ...taskBase,
     kind: z.literal("formal"),
     issue_node_id: githubNodeId,
-    issue_revision: z.string().min(1),
-    issue_url: z.string().url(),
+    issue_revision: OffsetDateTimeSchema,
+    issue_url: z.string().max(512).url(),
   })
   .strict();
 export type FormalTask = z.infer<typeof FormalTaskSchema>;
@@ -63,9 +70,9 @@ export const TemporaryTaskSchema = z
   .object({
     ...taskBase,
     kind: z.literal("temporary"),
-    goal: z.string().min(1),
-    done_conditions: z.array(z.string().min(1)).min(1),
-    expected_scope: z.array(z.string().min(1)).min(1),
+    goal: boundedUtf8(32 * 1024),
+    done_conditions: z.array(boundedUtf8(256)).min(1).max(32),
+    expected_scope: z.array(boundedUtf8(256)).min(1).max(32),
     lifecycle: TemporaryLifecycleSchema,
   })
   .strict();
@@ -77,17 +84,17 @@ export type TaskRecord = z.infer<typeof TaskRecordSchema>;
 export const ActiveClaimSchema = z
   .object({
     task_id: canonicalId("tsk"),
-    task_alias: z.string().min(1),
+    task_alias: taskAlias,
     project_id: projectId,
     repo_id: repositoryId,
     claim_id: canonicalId("clm"),
     predecessor_claim_id: canonicalId("clm").optional(),
-    session_id: z.string().min(1),
-    host: z.string().min(1),
-    branch: z.string().min(1),
-    worktree_ref: z.string().min(1),
+    session_id: claimCoordinate,
+    host: claimCoordinate,
+    branch: claimCoordinate,
+    worktree_ref: claimCoordinate,
     source_task_revision: SourceTaskRevisionSchema,
-    started_at: timestamp,
+    started_at: OffsetDateTimeSchema,
   })
   .strict();
 export type ActiveClaim = z.infer<typeof ActiveClaimSchema>;
@@ -113,23 +120,23 @@ export type ConflictingClaimSummary = z.infer<typeof ConflictingClaimSummarySche
 export const ClaimHistorySchema = z
   .object({
     task_id: canonicalId("tsk"),
-    task_alias: z.string().min(1).optional(),
+    task_alias: taskAlias.optional(),
     project_id: projectId,
     repo_id: repositoryId,
     claim_id: canonicalId("clm"),
     predecessor_claim_id: canonicalId("clm").optional(),
-    session_id: z.string().min(1),
-    host: z.string().min(1),
-    branch: z.string().min(1),
-    worktree_ref: z.string().min(1),
-    source_task_revision: SourceTaskRevisionSchema.optional(),
-    started_at: timestamp,
-    released_at: timestamp,
+    session_id: claimCoordinate,
+    host: claimCoordinate,
+    branch: claimCoordinate,
+    worktree_ref: claimCoordinate,
+    source_task_revision: SourceTaskRevisionSchema,
+    started_at: OffsetDateTimeSchema,
+    released_at: OffsetDateTimeSchema,
     status: z.enum(["completed", "handoff", "abandoned", "force-ended", "taken-over"]),
-    outcome: z.string().optional(),
-    head_sha: z.string().optional(),
-    validation_summary: z.string().optional(),
-    handoff_path: z.string().optional(),
+    outcome: boundedUtf8(4096).optional(),
+    head_sha: boundedCoordinate(128).optional(),
+    validation_summary: boundedUtf8(33 * 1024).optional(),
+    handoff_path: z.string().max(160).regex(/^handoffs\/tsk-[0-9a-f-]+\/clm-[0-9a-f-]+\.md$/).optional(),
     successor_claim_id: canonicalId("clm").optional(),
   })
   .strict()
@@ -140,6 +147,12 @@ export const ClaimHistorySchema = z
         path: ["successor_claim_id"],
         message: "Only taken-over Claim history may identify a successor",
       });
+    }
+    if (history.status === "completed" && history.outcome === undefined) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "Completed Claim history requires an outcome" });
+    }
+    if ((history.handoff_path !== undefined) !== (history.status === "handoff")) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["handoff_path"], message: "Only Handoff history carries a Handoff pointer" });
     }
   });
 export type ClaimHistory = z.infer<typeof ClaimHistorySchema>;

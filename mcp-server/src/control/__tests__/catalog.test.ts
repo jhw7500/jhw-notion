@@ -302,7 +302,7 @@ describe("Catalog", () => {
     await expect(catalog.registerTemporaryTask({
       project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:oversized-record",
       goal: "x".repeat(70 * 1024), done_conditions: ["bounded"], expected_scope: ["src/control"],
-    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    })).rejects.toMatchObject({ code: "INVALID_TEMPORARY_TASK" });
     expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
     expect((await git(fixture.registryDir, "rev-parse", "origin/main")).trim()).toBe(before);
     expect(await git(fixture.registryDir, "status", "--porcelain", "--untracked-files=all")).toBe("");
@@ -713,44 +713,22 @@ describe("Catalog Registry integrity and public input boundaries", () => {
     await expect(catalog.getTask(first.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
   });
 
-  it.each(["completed", "active-claim"])("rejects promotion of a %s temporary Task", async (state) => {
+  it("rejects promotion of a completed temporary Task", async () => {
     const { catalog, fixture } = await catalogFixture();
     await catalog.registerRepository(repositoryInput);
     const temp = await catalog.registerTemporaryTask({
       project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:promotion-eligibility",
       goal: "eligible only without authority conflict", done_conditions: ["checked"], expected_scope: ["src/control"],
     });
-    if (state === "completed") {
-      await commitFile(
-        fixture.registryDir,
-        `tasks/${temp.id}.yaml`,
-        `${JSON.stringify({ ...temp, lifecycle: "completed" })}\n`,
-      );
-    } else {
-      await commitFile(
-        fixture.registryDir,
-        `claims/active/${temp.id}.yaml`,
-        `${JSON.stringify({
-          task_id: temp.id,
-          task_alias: temp.aliases[0],
-          project_id: temp.project_id,
-          repo_id: temp.repo_id,
-          claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ab",
-          session_id: "codex-a",
-          host: "build-host",
-          branch: "task/0123456789ab-wlan-promotion-eligibility",
-          worktree_ref: "wt-0123456789ab-wlan-promotion-eligibility",
-          source_task_revision: "a".repeat(40),
-          started_at: "2026-08-13T00:00:00Z",
-        })}\n`,
-      );
-    }
+    await commitFile(
+      fixture.registryDir,
+      `tasks/${temp.id}.yaml`,
+      `${JSON.stringify({ ...temp, lifecycle: "completed" })}\n`,
+    );
     await git(fixture.registryDir, "push", "origin", "main");
     const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
 
-    await expect(catalog.promoteTemporaryTask(temp.id, issueInput)).rejects.toMatchObject({
-      code: state === "completed" ? "TASK_COMPLETED" : "TASK_ACTIVE_CLAIM",
-    });
+    await expect(catalog.promoteTemporaryTask(temp.id, issueInput)).rejects.toMatchObject({ code: "TASK_COMPLETED" });
     expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
   });
 });

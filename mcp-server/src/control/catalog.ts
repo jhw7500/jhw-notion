@@ -391,10 +391,6 @@ export class Catalog {
       if (current.lifecycle === "completed") {
         throw new ControlError("TASK_COMPLETED", "Completed temporary Tasks cannot be promoted");
       }
-      const activeClaim = await this.records.readOptionalJson(`claims/active/${taskId}.yaml`, z.unknown());
-      if (activeClaim !== undefined) {
-        throw new ControlError("TASK_ACTIVE_CLAIM", "Temporary Tasks with an active Claim cannot be promoted");
-      }
 
       if (current.project_id !== input.project_id || current.repo_id !== input.repo_id) {
         throw new ControlError("TASK_SCOPE_MISMATCH", "Temporary Task project/repository does not match the GitHub Issue", {

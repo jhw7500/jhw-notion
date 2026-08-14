@@ -24,32 +24,44 @@ const projectIdPattern = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const repositoryIdPattern = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const historyYearDirectoryPattern = /^\d{4}$/;
 const maximumHistoryYearDirectories = 10_000;
+const boundedCoordinate = (maximumBytes: number) => z.string().min(1).max(maximumBytes)
+  .regex(/^[^\u0000-\u001f\u007f]+$/u)
+  .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
+const boundedText = (maximumBytes: number) => z.string().min(1).max(maximumBytes)
+  .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
 
 const ClaimTaskInputSchema = z.object({
   task_id: z.string().regex(taskIdPattern),
-  task_alias: z.string().min(1),
+  task_alias: boundedCoordinate(160),
   project_id: z.string().regex(projectIdPattern),
   repo_id: z.string().regex(repositoryIdPattern),
-  session_id: z.string().min(1),
-  host: z.string().min(1),
-  branch: z.string().min(1),
-  worktree_ref: z.string().min(1),
+  session_id: boundedCoordinate(255),
+  host: boundedCoordinate(255),
+  branch: boundedCoordinate(255),
+  worktree_ref: boundedCoordinate(255),
 }).strict();
 
 const FinishOutcomeSchema = z.object({
   status: z.enum(["completed", "handoff", "abandoned"]),
-  outcome: z.string().min(1).optional(),
-  branch: z.string().min(1),
-  head_sha: z.string().min(1),
-  validation: z.array(z.string().min(1)).min(1),
-  handoff_path: z.string().min(1).optional(),
-}).strict();
+  outcome: boundedText(4096).optional(),
+  branch: boundedCoordinate(255),
+  head_sha: boundedCoordinate(128),
+  validation: z.array(boundedText(512).refine((value) => value.trim().length > 0)).min(1).max(64),
+  handoff_path: z.string().max(160).regex(/^handoffs\/tsk-[0-9a-f-]+\/clm-[0-9a-f-]+\.md$/).optional(),
+}).strict().superRefine((outcome, context) => {
+  if (outcome.status === "completed" && outcome.outcome === undefined) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["outcome"], message: "Completed releases require an outcome" });
+  }
+  if ((outcome.handoff_path !== undefined) !== (outcome.status === "handoff")) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["handoff_path"], message: "Only Handoff releases carry a Handoff pointer" });
+  }
+});
 
 const RecoveryStatusActionSchema = z.object({ kind: z.literal("status") }).strict();
 const RecoveryForceEndActionSchema = z.object({ kind: z.literal("force-end") }).strict();
 const RecoveryTakeoverActionSchema = z.object({
   kind: z.literal("takeover"),
-  session_id: z.string().min(1),
+  session_id: boundedCoordinate(255),
 }).strict();
 const RecoveryActionSchema = z.discriminatedUnion("kind", [
   RecoveryStatusActionSchema,
@@ -119,7 +131,7 @@ function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
 function parse<T>(schema: ZodType<T>, value: unknown, code: string, message: string): T {
   const result = schema.safeParse(value);
   if (result.success) return result.data;
-  throw new ControlError(code, message, { issues: result.error.issues });
+  throw new ControlError(code, message);
 }
 
 function assertTaskId(taskId: string): void {
@@ -171,8 +183,8 @@ export class ClaimService {
   }
 
   async claimTask(rawInput: ClaimTaskInput): Promise<ActiveClaim> {
+    this.sensitiveData.assertSafe(rawInput);
     const input = parse(ClaimTaskInputSchema, rawInput, "INVALID_CLAIM", "Invalid Claim input");
-    this.sensitiveData.assertSafe(input);
     await this.assertActivePathComponents(input.task_id);
     const sourceTaskRevision = await this.catalog.getTaskSourceRevision(input.task_id);
     let claimed: ActiveClaim | undefined;
@@ -223,8 +235,8 @@ export class ClaimService {
   async finishClaim(taskId: string, expectedClaimId: string, rawOutcome: FinishOutcome): Promise<ClaimHistory> {
     assertTaskId(taskId);
     assertClaimId(expectedClaimId);
+    this.sensitiveData.assertSafe(rawOutcome);
     const outcome = parse(FinishOutcomeSchema, rawOutcome, "INVALID_FINISH_OUTCOME", "Invalid Claim finish outcome");
-    this.sensitiveData.assertSafe(outcome);
     this.assertHandoffPath(outcome.handoff_path, taskId, expectedClaimId);
     await this.assertActivePathComponents(taskId);
     const releasedAt = this.timestamp();
@@ -257,8 +269,8 @@ export class ClaimService {
   async recoverClaim(taskId: string, expectedClaimId: string, rawAction: RecoveryAction): Promise<RecoveryResult> {
     assertTaskId(taskId);
     assertClaimId(expectedClaimId);
+    this.sensitiveData.assertSafe(rawAction);
     const action = parse(RecoveryActionSchema, rawAction, "INVALID_RECOVERY_ACTION", "Invalid Claim recovery action");
-    this.sensitiveData.assertSafe(action);
 
     if (action.kind === "status") return this.recoveryStatus(taskId, expectedClaimId);
     if (action.kind === "force-end") return this.forceEnd(taskId, expectedClaimId);
@@ -335,6 +347,7 @@ export class ClaimService {
           throw corruption("Claim history path and canonical coordinates disagree", { task_id: taskId });
         }
         this.assertHistoryMatchesTask(history, task);
+        this.sensitiveData.assertSafe(history);
         candidates.push(history);
       }
     }

@@ -28,6 +28,7 @@ it("accepts legacy takeover history but reserves a typed successor link for take
     host: "build-host",
     branch: "task/example",
     worktree_ref: "wt-example",
+    source_task_revision: "revision-1",
     started_at: "2026-08-13T00:00:00.000Z",
     released_at: "2026-08-13T01:00:00.000Z",
   };

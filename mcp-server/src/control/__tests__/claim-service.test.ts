@@ -122,6 +122,47 @@ async function replaceActiveWithExternalSymlink(
 }
 
 describe("ClaimService", () => {
+  it.each([
+    [{ status: "completed" }, "completed release without an outcome"],
+    [{ status: "handoff" }, "Handoff release without a pointer"],
+    [{ status: "abandoned", handoff_path: `handoffs/tsk-0198aabb-ccdd-7eef-8abc-0123456789ab/clm-0198aabb-ccdd-7eef-8abc-0123456789ab.md` }, "non-Handoff release with a pointer"],
+  ])("rejects an incoherent %s before mutating Registry authority", async (fields) => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.finishClaim(active.task_id, active.claim_id, {
+      ...fields,
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    } as never)).rejects.toMatchObject({ code: "INVALID_FINISH_OUTCOME" });
+
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+    await expect(claims.assertOwner(active.task_id, active.claim_id)).resolves.toEqual(active);
+  });
+
+  it("rejects protected invalid-enum input without reflecting its received value", async () => {
+    const secret = "unmistakably-fake-finish-token";
+    const { claims, fixture, task } = await claimsFixture(
+      () => fixedNow,
+      createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    );
+    const active = await claims.claimTask(claimInput(task.id));
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    const error = await claims.finishClaim(active.task_id, active.claim_id, {
+      status: secret,
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    } as never).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+  });
+
   it("rejects protected Claim content before creating active ownership", async () => {
     const secret = "unmistakably-fake-claim-token";
     const { claims, fixture, task } = await claimsFixture(
@@ -285,6 +326,7 @@ describe("ClaimService", () => {
     await expect(
       claims.finishClaim(first.task_id, "clm-00000000-0000-7000-8000-000000000000", {
         status: "completed",
+        outcome: "done",
         branch: "task/example",
         head_sha: "0123456789abcdef",
         validation: ["npm test: pass"],
@@ -515,6 +557,7 @@ describe("ClaimService", () => {
     await expect(
       claims.finishClaim(active.task_id, active.claim_id, {
         status: "completed",
+        outcome: "done",
         branch: "task/wlan-roaming-fix",
         head_sha: "0123456789abcdef",
         validation: ["npm test: pass"],
@@ -579,11 +622,50 @@ describe("ClaimService", () => {
     await expect(claims.latestClaimHistory(active.task_id)).resolves.toEqual(history);
   });
 
+  it("rejects protected content restored through latest Claim-history enumeration", async () => {
+    const secret = "unmistakably-fake-restored-history-token";
+    const { claims, fixture, task } = await claimsFixture(
+      () => fixedNow,
+      createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    );
+    const active = await claims.claimTask(claimInput(task.id));
+    const history = await claims.finishClaim(active.task_id, active.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    });
+    await commitRegistryFile(fixture, historyRelativePath(active), `${JSON.stringify({ ...history, outcome: secret })}\n`);
+
+    const error = await claims.latestClaimHistory(active.task_id).catch((cause) => cause);
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+  });
+
+  it("rejects restored Claim history without its frozen source revision", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const history = await claims.finishClaim(active.task_id, active.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    });
+    const malformed = { ...history } as Partial<typeof history>;
+    delete malformed.source_task_revision;
+    await commitRegistryFile(fixture, historyRelativePath(active), `${JSON.stringify(malformed)}\n`);
+
+    await expect(claims.latestClaimHistory(active.task_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
   it("rejects a dirty deletion that would hide committed Claim history", async () => {
     const { claims, fixture, task } = await claimsFixture();
     const active = await claims.claimTask(claimInput(task.id));
     await claims.finishClaim(active.task_id, active.claim_id, {
       status: "completed",
+      outcome: "done",
       branch: active.branch,
       head_sha: "0123456789abcdef",
       validation: ["targeted test passes"],
@@ -624,6 +706,7 @@ describe("ClaimService", () => {
     await expect(
       claims.finishClaim(active.task_id, active.claim_id, {
         status: "completed",
+        outcome: "done",
         branch: "task/wlan-roaming-fix",
         head_sha: "0123456789abcdef",
         validation: ["npm test: pass"],
@@ -664,6 +747,7 @@ describe("ClaimService", () => {
     await expect(
       claims.finishClaim(active.task_id, active.claim_id, {
         status: "completed",
+        outcome: "done",
         branch: "task/wlan-roaming-fix",
         head_sha: "0123456789abcdef",
         validation: ["npm test: pass"],

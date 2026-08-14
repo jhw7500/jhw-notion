@@ -120,13 +120,13 @@ describe("jhw-control installed entry", () => {
     }).catch((cause: unknown) => cause as { code: number; stdout: string; stderr: string });
 
     expect(failure).toMatchObject({ code: 1, stdout: "" });
-    expect(JSON.parse(failure.stderr)).toEqual({ error: { code: "REPOSITORY_NOT_FOUND" } });
+    expect(JSON.parse(failure.stderr)).toEqual({ error: { code: "REGISTRY_CORRUPT" } });
     expect(failure.stderr).not.toContain("entry-project-token");
     expect(failure.stderr).not.toContain("entry-repo-token");
     expect((await lstat(join(stateDir, "registry.lock"))).isFile()).toBe(true);
     const journal = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
     expect(journal).not.toContain("entry-project-token");
     expect(journal).not.toContain("entry-repo-token");
-    expect(JSON.parse(journal)).toMatchObject({ command: "project register", error_code: "REPOSITORY_NOT_FOUND" });
+    expect(JSON.parse(journal)).toMatchObject({ command: "project register", error_code: "REGISTRY_CORRUPT" });
   });
 });

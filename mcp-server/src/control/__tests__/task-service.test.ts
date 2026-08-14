@@ -177,6 +177,39 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
 }
 
 describe("TaskService", () => {
+  it("rejects an incoherent completed release before reading or mutating authority", async () => {
+    const { tasks, claims, worktrees, registry } = await taskFixture();
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "completed",
+      validation: ["targeted tests pass"],
+    })).rejects.toMatchObject({ code: "INVALID_FINISH_OUTCOME" });
+
+    expect(claims.assertOwner).not.toHaveBeenCalled();
+    expect(worktrees.inspect).not.toHaveBeenCalled();
+    expect(registry.transact).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+  });
+
+  it("rejects oversized validation before publishing either Handoff copy", async () => {
+    const { tasks, claims, worktrees, registry, worktreePath } = await taskFixture();
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["v".repeat(65 * 1024)],
+    })).rejects.toMatchObject({ code: "INVALID_FINISH_OUTCOME" });
+
+    expect(claims.assertOwner).not.toHaveBeenCalled();
+    expect(worktrees.inspect).not.toHaveBeenCalled();
+    expect(registry.transact).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+    await expect(readFile(join(worktreePath, ".ai", "handoff.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("rejects the trusted source-checkout path in Handoff fields before persistence or release", async () => {
     const { tasks, claims, registry, worktreePath } = await taskFixture();
 
@@ -557,9 +590,11 @@ describe("TaskService", () => {
     };
     const started = await tasks.start(input);
 
-    await expect(tasks.finish({
+    const released = await tasks.finish({
       task_id: task.id, claim_id: started.claim.claim_id, status: "abandoned", validation: ["stopped safely"],
-    })).resolves.toMatchObject({ worktree_removed: false, cleanup_error: expect.any(String) });
+    });
+    expect(released).toMatchObject({ worktree_removed: false, cleanup_error: "WORKTREE_CLEANUP_FAILED" });
+    expect(JSON.stringify(released)).not.toContain("injected cleanup crash");
     await expect(claims.getActive(task.id)).resolves.toBeUndefined();
     await expect(tasks.start({ ...input, session_id: "codex-successor" })).rejects.toMatchObject({
       code: "WORKTREE_CLEANUP_REQUIRED",
@@ -1355,6 +1390,7 @@ describe("TaskService", () => {
       task_id: TASK_ID,
       claim_id: CLAIM_ID,
       status,
+      ...(status === "completed" ? { outcome: "done" } : {}),
       validation: ["npm test: pass"],
     });
 

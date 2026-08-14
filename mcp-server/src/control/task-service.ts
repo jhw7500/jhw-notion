@@ -131,10 +131,6 @@ export interface TaskServiceHooks {
   afterClaim?: (claim: ActiveClaim) => void | Promise<void>;
 }
 
-function errorMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
-}
-
 const safeWorktreeCreateCodes = new Set([
   "COMMAND_FAILED",
   "HOST_MISMATCH",
@@ -155,8 +151,31 @@ function worktreeCreateValidation(cause: unknown): string {
 }
 
 function assertValidation(validation: string[]): void {
-  if (!Array.isArray(validation) || validation.length === 0 || validation.some((line) => !line.trim())) {
-    throw new ControlError("INVALID_FINISH_OUTCOME", "Task finish requires at least one non-empty validation result");
+  if (
+    !Array.isArray(validation) ||
+    validation.length === 0 ||
+    validation.length > 64 ||
+    validation.some((line) =>
+      typeof line !== "string" || !line.trim() || Buffer.byteLength(line, "utf8") > 512)
+  ) {
+    throw new ControlError("INVALID_FINISH_OUTCOME", "Task finish validation is missing or exceeds its bounded schema");
+  }
+}
+
+function assertFinishInput(input: TaskFinishInput): void {
+  assertValidation(input.validation);
+  if (input.outcome !== undefined && (!input.outcome.trim() || Buffer.byteLength(input.outcome, "utf8") > 4096)) {
+    throw new ControlError("INVALID_FINISH_OUTCOME", "Task finish outcome is empty or exceeds its bounded schema");
+  }
+  if (input.status === "completed" && input.outcome === undefined) {
+    throw new ControlError("INVALID_FINISH_OUTCOME", "Completed Task finish requires an outcome");
+  }
+  if (
+    input.status !== "handoff" &&
+    [input.source_task_revision, input.progress, input.failures, input.next_step, input.related_adr_and_evidence]
+      .some((value) => value !== undefined)
+  ) {
+    throw new ControlError("INVALID_FINISH_OUTCOME", "Only Handoff finish accepts Handoff content fields");
   }
 }
 
@@ -471,7 +490,7 @@ export class TaskService {
 
   async finish(input: TaskFinishInput): Promise<TaskFinishResult> {
     this.sensitiveData.assertSafe(input);
-    assertValidation(input.validation);
+    assertFinishInput(input);
     const active = await this.assertOwner(input.task_id, input.claim_id);
     const inspection = await this.worktrees.inspect(active);
     if (typeof inspection.repository_path !== "string") {
@@ -563,7 +582,7 @@ export class TaskService {
     } catch (cause) {
       // The Claim was already durably released.  Retain an unsafe worktree for
       // recovery rather than falsely treating host cleanup as a Claim operation.
-      return { history, worktree_removed: false, cleanup_error: errorMessage(cause) };
+      return { history, worktree_removed: false, cleanup_error: "WORKTREE_CLEANUP_FAILED" };
     }
   }
 
