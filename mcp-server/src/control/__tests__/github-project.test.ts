@@ -557,6 +557,24 @@ describe("GitHubProjectClient", () => {
     expect(invalid.calls).toHaveLength(0);
   });
 
+  it("does not create a duplicate when a labeled Project Record body is malformed", async () => {
+    const gh = new QueuedGhRunner();
+    const malformed = {
+      ...issueFixture(77),
+      body: JSON.stringify({ id: "prj-example", objective: "Malformed", repositories: "repo-example" }),
+    };
+    gh.enqueue(
+      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
+      [[malformed]],
+    );
+
+    await expect(client(gh).registerProject({
+      project_id: "prj-example", title: "Example", objective: "Prove the trial flow", repo_ids: ["repo-example"],
+      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
+    })).rejects.toMatchObject({ code: "INVALID_PROJECT_RECORD" });
+    expect(gh.calls.some((call) => call.args.includes("POST"))).toBe(false);
+  });
+
   it("uses the shortest active cadence but never marks completed projects stale", async () => {
     const gh = new QueuedGhRunner();
     const page = projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null });

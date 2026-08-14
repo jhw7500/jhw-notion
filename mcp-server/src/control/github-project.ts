@@ -598,7 +598,11 @@ export class GitHubProjectClient {
         body = projectBody(issue.body);
       } catch {
         // Recovery scans every Issue independent of labels. Only canonical
-        // Project Record bodies participate in idempotency decisions.
+        // Project Record bodies participate in idempotency decisions, while a
+        // labeled malformed record is authority corruption rather than absence.
+        if (hasLabels(issue, PROJECT_RECORD_LABELS)) {
+          throw new ControlError("INVALID_PROJECT_RECORD", "Labeled Project Record Issue body is malformed");
+        }
         continue;
       }
       if (body.id === projectId) candidates.push(issue);
