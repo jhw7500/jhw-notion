@@ -1,8 +1,10 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { PassThrough } from "node:stream";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { loadControlConfig } from "../config.js";
 import { ProcessRunner } from "../process.js";
@@ -231,6 +233,25 @@ describe("control process boundary", () => {
     expect(error).toMatchObject({ code: "COMMAND_TIMEOUT" });
     expect(JSON.stringify(error)).not.toContain("partial");
   });
+
+  it("settles after the kill grace even when a child never emits close", async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true),
+    });
+    const RuntimeProcessRunner = ProcessRunner as unknown as new (
+      environment: NodeJS.ProcessEnv,
+      runtime: { spawn(): typeof child },
+    ) => ProcessRunner;
+    const runner = new RuntimeProcessRunner({}, { spawn: () => child });
+
+    const error = await runner.run("never-closes", [], { timeoutMs: 10 }).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "COMMAND_TIMEOUT" });
+    expect(child.kill).toHaveBeenCalled();
+  }, 500);
 
   it("honors an already-aborted signal without returning child output", async () => {
     const controller = new AbortController();

@@ -4,6 +4,7 @@ import { constants, fsync } from "node:fs";
 import { open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, basename, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
+import { z } from "zod";
 
 import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
@@ -12,7 +13,10 @@ import type { DatabaseName } from "../config.js";
 import { CONTROL_TOOL_VERSION } from "./version.js";
 import { ProcessRunner } from "./process.js";
 
-const CACHE_SCHEMA = AuthorityRecordSchema.pick({ authority_epoch: true, mode: true });
+const CACHE_SCHEMA = z.object({
+  authority_epoch: z.number().int().positive(),
+  mode: z.enum(["legacy", "registry"]),
+}).strict();
 const CACHE_FILE = "authority-cache.json";
 const LOCK_FILE = "authority-cache.lock";
 const temporaryCacheOpenFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW;

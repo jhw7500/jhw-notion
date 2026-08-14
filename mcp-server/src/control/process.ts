@@ -12,6 +12,7 @@ import { isSensitiveEnvironmentKey } from "./sensitive-data.js";
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
 const MAX_PROCESS_TIMEOUT_MS = 600_000;
+const PROCESS_STOP_GRACE_MS = 100;
 const LOCK_HELPER_TIMEOUT_MS = 5_000;
 
 export interface ProcessResult {
@@ -81,10 +82,12 @@ function waitForChild(child: ChildProcess, options: ProcessRunOptions): Promise<
   return new Promise((resolve) => {
     let settled = false;
     let stopped: ChildExit["stopped"];
+    let stopTimer: ReturnType<typeof setTimeout> | undefined;
     const settle = (result: ChildExit) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (stopTimer) clearTimeout(stopTimer);
       options.signal?.removeEventListener("abort", abort);
       resolve({ ...result, ...(stopped ? { stopped } : {}) });
     };
@@ -92,6 +95,7 @@ function waitForChild(child: ChildProcess, options: ProcessRunOptions): Promise<
       if (settled || stopped) return;
       stopped = reason;
       killChildTree(child);
+      stopTimer = setTimeout(() => settle({ exitCode: null }), PROCESS_STOP_GRACE_MS);
     };
     const abort = () => stop("aborted");
     const timer = setTimeout(() => stop("timeout"), deadline);
@@ -104,6 +108,12 @@ function waitForChild(child: ChildProcess, options: ProcessRunOptions): Promise<
     else options.signal?.addEventListener("abort", abort, { once: true });
   });
 }
+
+export interface ProcessRunnerRuntime {
+  spawn: typeof spawn;
+}
+
+const productionProcessRunnerRuntime: ProcessRunnerRuntime = { spawn };
 
 function stoppedError(stopped: ChildExit["stopped"], command: string, deadline: number): ControlError | undefined {
   if (stopped === "timeout") {
@@ -260,7 +270,10 @@ function redactingCapture(stream: Readable | null, secrets: readonly string[]): 
 }
 
 export class ProcessRunner {
-  constructor(private readonly environment: NodeJS.ProcessEnv = process.env) {}
+  constructor(
+    private readonly environment: NodeJS.ProcessEnv = process.env,
+    private readonly runtime: ProcessRunnerRuntime = productionProcessRunnerRuntime,
+  ) {}
 
   async run(command: string, args: string[], options: ProcessRunOptions = {}): Promise<ProcessResult> {
     const rawEnvironment = { ...this.environment, ...options.env };
@@ -297,7 +310,7 @@ export class ProcessRunner {
     const safeArgs = args.map((arg) => redact(arg, secrets));
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(command, args, {
+      child = this.runtime.spawn(command, args, {
         cwd: options.cwd,
         env: sanitizedChildEnvironment(rawEnvironment),
         detached: process.platform !== "win32",
@@ -405,7 +418,7 @@ export class ProcessRunner {
     let child: ReturnType<typeof spawn>;
 
     try {
-      child = spawn(command, args, {
+      child = this.runtime.spawn(command, args, {
         cwd: options.cwd,
         env,
         detached: process.platform !== "win32",

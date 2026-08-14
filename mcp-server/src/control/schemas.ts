@@ -21,14 +21,14 @@ const nextAction = z.string().max(165).refine(
   "Invalid Next Action",
 );
 
-export const AuthorityRecordSchema = z
-  .object({
-    authority_epoch: z.number().int().nonnegative(),
-    mode: z.enum(["legacy", "registry"]),
-    cutover_at: timestamp.nullable(),
-    minimum_tool_version: z.string().min(1),
-  })
-  .strict();
+const authorityBase = {
+  authority_epoch: z.number().int().positive(),
+  minimum_tool_version: z.string().max(64).regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/),
+};
+export const AuthorityRecordSchema = z.discriminatedUnion("mode", [
+  z.object({ ...authorityBase, mode: z.literal("legacy"), cutover_at: z.null() }).strict(),
+  z.object({ ...authorityBase, mode: z.literal("registry"), cutover_at: OffsetDateTimeSchema }).strict(),
+]);
 export type AuthorityRecord = z.infer<typeof AuthorityRecordSchema>;
 
 export const RepositoryRecordSchema = z
