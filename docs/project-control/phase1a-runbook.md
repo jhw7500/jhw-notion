@@ -160,7 +160,9 @@ stable nonzero exit, remote divergence, preflight restore 실패도 해결 전 N
 
 ## 10. Phase 1B / cutover 경계
 
-Phase 1A의 세 자연 cycle은 마찰을 보는 최소 증거일 뿐 Phase 1B 승인이나 cutover가 아니다. Phase 1B, daily schedule, cross-host retry, `legacy → registry` authority 변경, Notion reconciliation/migration은 **별도로 승인된 새 계획**이 있어야 한다.
+로컬 14-scenario adversarial gate, 전체 테스트, build가 모두 통과해도 그것은 **tooling completion**일 뿐 Phase 1A pilot 성공 증거가 아니다. merge 뒤 operator가 live preflight를 통과하고 위의 정확히 세 자연 Task cycle을 실제 업무에서 완료해야 한다. 그 cycle이 발생하지 않았으면 evidence 상태는 계속 **`insufficient evidence`**이며, Phase 1B 계획·pilot 성공·cutover 승인을 주장할 수 없다.
+
+세 자연 cycle을 완료한 경우에도 마찰을 보는 최소 증거일 뿐 Phase 1B 승인이나 cutover가 아니다. Phase 1B, daily schedule, cross-host retry, `legacy → registry` authority 변경, Notion reconciliation/migration은 **별도로 승인된 새 계획**이 있어야 한다.
 
 그 계획이 승인되기 전에는:
 
