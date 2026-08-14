@@ -48,8 +48,8 @@ describe("jhw_append", () => {
 
   it("registry authority에서 Projects descendant append를 거부한다", async () => {
     mockClient.pages.retrieve.mockImplementation(async ({ page_id }: { page_id: string }) => page_id === TARGET
-      ? { id: TARGET, parent: { type: "page_id", page_id: PARENT } }
-      : { id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects } });
+      ? { id: TARGET, object: "page", parent: { type: "page_id", page_id: PARENT } }
+      : { id: PARENT, object: "page", parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects } });
     const selectiveAuthority = {
       assertNotionWriteAllowed: vi.fn(async (db: string) => {
         if (db === "projects") throw new ControlError("AUTHORITY_MOVED", "moved");
@@ -67,8 +67,8 @@ describe("jhw_append", () => {
 
   it("registry authority에서 Knowledge Base descendant append는 허용한다", async () => {
     mockClient.pages.retrieve.mockImplementation(async ({ page_id }: { page_id: string }) => page_id === TARGET
-      ? { id: TARGET, parent: { type: "page_id", page_id: PARENT } }
-      : { id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase } });
+      ? { id: TARGET, object: "page", parent: { type: "page_id", page_id: PARENT } }
+      : { id: PARENT, object: "page", parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase } });
     const selectiveAuthority = {
       assertNotionWriteAllowed: vi.fn(async (db: string) => {
         if (db === "projects" || db === "decisionLog") throw new ControlError("AUTHORITY_MOVED", "moved");
@@ -138,6 +138,7 @@ describe("jhw_append", () => {
     defaultPageCache.set({ id: pageId, db: "projects", title: "kept", text: "kept" });
     mockClient.pages.retrieve.mockResolvedValue({
       id: pageId,
+      object: "page",
       parent: { type: "database_id", database_id: NOTION_CONFIG.databases.projects },
     });
     const { server, capturedTools } = createMockServer();
@@ -156,6 +157,7 @@ describe("jhw_append", () => {
     const pageId = "33a8a230-a04e-8154-8fa5-d96ebdd63500";
     mockClient.pages.retrieve.mockResolvedValue({
       id: pageId,
+      object: "page",
       parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase },
     });
     const selectiveAuthority = {

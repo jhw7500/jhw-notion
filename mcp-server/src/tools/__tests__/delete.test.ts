@@ -39,8 +39,8 @@ describe("jhw_delete", () => {
 
   it("registry authority에서 Decision Log descendant delete를 거부한다", async () => {
     mockClient.pages.retrieve.mockImplementation(async ({ page_id }: { page_id: string }) => page_id === TARGET
-      ? { id: TARGET, parent: { type: "page_id", page_id: PARENT } }
-      : { id: PARENT, parent: { type: "database_id", database_id: NOTION_CONFIG.databases.decisionLog } });
+      ? { id: TARGET, object: "page", parent: { type: "page_id", page_id: PARENT } }
+      : { id: PARENT, object: "page", parent: { type: "database_id", database_id: NOTION_CONFIG.databases.decisionLog } });
     const selectiveAuthority = {
       assertNotionWriteAllowed: vi.fn(async (db: string) => {
         if (db === "decisionLog") throw new ControlError("AUTHORITY_MOVED", "moved");
@@ -77,6 +77,7 @@ describe("jhw_delete", () => {
     defaultPageCache.set({ id: "page-1", db: "decisionLog", title: "kept", text: "kept" });
     mockClient.pages.retrieve.mockResolvedValue({
       id: "page-1",
+      object: "page",
       parent: {
         type: "data_source_id",
         data_source_id: "c1d8d3c3-538e-40a9-a306-2b694a4d8ff9",
@@ -98,6 +99,7 @@ describe("jhw_delete", () => {
   it("registry authority에서도 Knowledge Base 삭제는 기존 경로로 처리한다", async () => {
     mockClient.pages.retrieve.mockResolvedValue({
       id: "kb-page",
+      object: "page",
       parent: { type: "database_id", database_id: NOTION_CONFIG.databases.knowledgeBase },
     });
     mockClient.pages.update.mockResolvedValue({});
