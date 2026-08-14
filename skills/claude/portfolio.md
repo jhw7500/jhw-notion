@@ -21,7 +21,8 @@ jhw-control portfolio status [--project <prj-id>] --page <page-id>
 
 - `page_id`, 반환 item 수, `total_items`
 - `truncated`, `next_page_id`(없으면 `none`)
-- 직렬화된 `payload_bytes`와 한도(12 KiB/20 items)
+- CLI가 반환한 정확한 stdout JSON envelope와 마지막 줄바꿈까지의 UTF-8 byte 길이를 로컬에서 측정한 값. TUI가 정확한 raw stdout bytes에 접근해 측정할 수 없으면 `not measured`로 표시하며 `payload_bytes` 필드를 가정하거나 결과 객체에서 수치를 만들어내지 않는다.
+- CLI가 강제하는 한도(12 KiB/20 items)
 
 기본 조회에서 `truncated: true`여도 `next_page_id`를 자동으로 따라가지 않는다. 사용자가 `다음/계속/전체` 또는 특정 page ID를 **명시적으로 요청한 경우에만** 반환된 ID로 다음 호출을 실행한다. 임의 page ID, `--all`, page-size 옵션을 만들지 않는다.
 

@@ -9,7 +9,14 @@ import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { newClaimId } from "./ids.js";
 import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
-import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory, type TaskRecord } from "./schemas.js";
+import {
+  ActiveClaimSchema,
+  ClaimHistorySchema,
+  ConflictingClaimSummarySchema,
+  type ActiveClaim,
+  type ClaimHistory,
+  type TaskRecord,
+} from "./schemas.js";
 
 const taskIdPattern = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const claimIdPattern = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -176,10 +183,19 @@ export class ClaimService {
       this.assertClaimInputMatchesTask(input, task);
       const existing = await this.readActive(task);
       if (existing) {
-        throw new ControlError("TASK_ALREADY_CLAIMED", "Task already has an active Claim", {
-          task_id: input.task_id,
+        const summary = ConflictingClaimSummarySchema.safeParse({
+          task_id: existing.task_id,
           claim_id: existing.claim_id,
+          host: existing.host,
+          branch: existing.branch,
+          worktree_ref: existing.worktree_ref,
+          started_at: existing.started_at,
         });
+        throw new ControlError(
+          "TASK_ALREADY_CLAIMED",
+          "Task already has an active Claim",
+          summary.success ? { conflicting_claim: summary.data } : {},
+        );
       }
 
       const started = this.timestamp();

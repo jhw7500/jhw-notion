@@ -132,11 +132,43 @@ describe("ClaimService", () => {
 
   it("rejects a second active Claim for the same canonical Task", async () => {
     const { claims, task } = await claimsFixture();
-    const ownerA = claimInput(task.id, { session_id: "codex-a" });
+    const ownerA = claimInput(task.id, {
+      session_id: "codex-a-secret-session",
+      host: "safe-build-host",
+      branch: "task/safe-conflict",
+      worktree_ref: "wt-safe-conflict",
+    });
     const ownerB = claimInput(task.id, { session_id: "codex-b" });
     const first = await claims.claimTask(ownerA);
 
-    await expect(claims.claimTask(ownerB)).rejects.toMatchObject({ code: "TASK_ALREADY_CLAIMED" });
+    const conflict = await claims.claimTask(ownerB).catch((cause: unknown) => cause);
+
+    expect(conflict).toMatchObject({
+      code: "TASK_ALREADY_CLAIMED",
+      details: {
+        conflicting_claim: {
+          task_id: first.task_id,
+          claim_id: first.claim_id,
+          host: "safe-build-host",
+          branch: "task/safe-conflict",
+          worktree_ref: "wt-safe-conflict",
+          started_at: first.started_at,
+        },
+      },
+    });
+    expect((conflict as ControlError).details).toEqual({
+      conflicting_claim: {
+        task_id: first.task_id,
+        claim_id: first.claim_id,
+        host: "safe-build-host",
+        branch: "task/safe-conflict",
+        worktree_ref: "wt-safe-conflict",
+        started_at: first.started_at,
+      },
+    });
+    expect(JSON.stringify(conflict)).not.toContain("codex-a-secret-session");
+    expect(JSON.stringify(conflict)).not.toContain(task.project_id);
+    expect(JSON.stringify(conflict)).not.toContain(task.repo_id);
     expect((await claims.getActive(first.task_id))?.claim_id).toBe(first.claim_id);
   });
 

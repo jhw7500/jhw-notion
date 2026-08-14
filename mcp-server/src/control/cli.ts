@@ -17,12 +17,14 @@ import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task
 import { WorktreeManager } from "./worktree.js";
 import {
   BoundedPortfolioPayloadSchema,
+  ConflictingClaimSummarySchema,
   PreflightResultSchema,
   ProjectRecordLinkSchema,
   RegisterProjectInputSchema,
   SnapshotExportResultSchema,
   type ActiveClaim,
   type BoundedPortfolioPayload,
+  type ConflictingClaimSummary,
   type PreflightResult,
   type ProjectRecordLink,
   type RegisterProjectInput,
@@ -283,9 +285,21 @@ function retainedClaim(cause: unknown): Record<string, string> | undefined {
   return { task_id, claim_id, state: claim_state };
 }
 
+function conflictingClaim(cause: unknown): ConflictingClaimSummary | undefined {
+  if (!(cause instanceof ControlError) || cause.code !== "TASK_ALREADY_CLAIMED") return undefined;
+  const parsed = ConflictingClaimSummarySchema.safeParse(cause.details.conflicting_claim);
+  return parsed.success ? parsed.data : undefined;
+}
+
 export function controlErrorResult(cause: unknown): CliResult {
-  const retained = retainedClaim(cause);
-  const error = { code: errorCode(cause), ...(retained ? { retained_claim: retained } : {}) };
+  const code = errorCode(cause);
+  const conflict = conflictingClaim(cause);
+  const retained = code === "TASK_ALREADY_CLAIMED" ? undefined : retainedClaim(cause);
+  const error = {
+    code,
+    ...(conflict ? { conflicting_claim: conflict } : {}),
+    ...(retained ? { retained_claim: retained } : {}),
+  };
   return { exitCode: exitCode(cause), stdout: "", stderr: `${JSON.stringify({ error })}\n` };
 }
 

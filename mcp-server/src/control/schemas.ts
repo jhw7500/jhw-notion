@@ -84,6 +84,24 @@ export const ActiveClaimSchema = z
   .strict();
 export type ActiveClaim = z.infer<typeof ActiveClaimSchema>;
 
+const safeClaimConflictText = z.string().min(1).max(255).regex(/^[^\u0000-\u001f\u007f]+$/u);
+
+/** Deliberately bounded public coordinates for an already-owned Task. */
+export const ConflictingClaimSummarySchema = ActiveClaimSchema.pick({
+  task_id: true,
+  claim_id: true,
+  host: true,
+  branch: true,
+  worktree_ref: true,
+  started_at: true,
+}).extend({
+  host: safeClaimConflictText,
+  branch: safeClaimConflictText,
+  worktree_ref: safeClaimConflictText,
+  started_at: ActiveClaimSchema.shape.started_at.max(64).datetime({ offset: true }),
+}).strict();
+export type ConflictingClaimSummary = z.infer<typeof ConflictingClaimSummarySchema>;
+
 export const ClaimHistorySchema = z
   .object({
     task_id: canonicalId("tsk"),

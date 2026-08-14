@@ -212,16 +212,91 @@ function registerArgs(): string[] {
 
 describe("runCli", () => {
   it("returns stable JSON and exit code 4 for a Claim conflict", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-conflict-"));
+    const conflictingClaim = {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      host: "build-host",
+      branch: "task/000000000001-control-task",
+      worktree_ref: "wt-000000000001-control-task",
+      started_at: "2026-08-13T00:00:00.000Z",
+    };
     const dependencies = makeCliDependencies({
+      stateDir,
       taskService: {
-        start: async () => { throw new ControlError("TASK_ALREADY_CLAIMED", "occupied"); },
+        start: async () => {
+          throw new ControlError("TASK_ALREADY_CLAIMED", "occupied with raw-secret-message", {
+            conflicting_claim: conflictingClaim,
+            session_id: "codex-secret-session",
+            repository_path: "/private/source/control",
+            token: "secret-token",
+          });
+        },
       },
     });
 
     const result = await runCli(formalStartArgs(), dependencies);
+    const journal = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
 
     expect(result.exitCode).toBe(4);
-    expect(JSON.parse(result.stderr)).toMatchObject({ error: { code: "TASK_ALREADY_CLAIMED" } });
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "TASK_ALREADY_CLAIMED", conflicting_claim: conflictingClaim },
+    });
+    expect(`${result.stderr}${journal}`).not.toContain("codex-secret-session");
+    expect(`${result.stderr}${journal}`).not.toContain("secret-token");
+    expect(`${result.stderr}${journal}`).not.toContain("raw-secret-message");
+    expect(`${result.stderr}${journal}`).not.toContain("/private/source/control");
+    expect(JSON.parse(journal)).toMatchObject({ ok: false, error_code: "TASK_ALREADY_CLAIMED" });
+  });
+
+  it.each([
+    undefined,
+    {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      host: "build-host",
+      branch: "task/control",
+      worktree_ref: "wt-control",
+      started_at: "2026-08-13T00:00:00.000Z",
+      session_id: "must-reject-extra-field",
+    },
+  ])("fails closed when Claim-conflict coordinates are missing or malformed", async (conflicting_claim) => {
+    const result = await runCli(formalStartArgs(), makeCliDependencies({
+      taskService: {
+        start: async () => {
+          throw new ControlError("TASK_ALREADY_CLAIMED", "occupied", {
+            ...(conflicting_claim ? { conflicting_claim } : {}),
+          });
+        },
+      },
+    }));
+
+    expect(result.exitCode).toBe(4);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "TASK_ALREADY_CLAIMED" } });
+    expect(result.stderr).not.toContain("must-reject-extra-field");
+  });
+
+  it("never emits conflicting_claim for unrelated errors", async () => {
+    const result = await runCli(formalStartArgs(), makeCliDependencies({
+      taskService: {
+        start: async () => {
+          throw new ControlError("COMMAND_FAILED", "raw-secret-message", {
+            conflicting_claim: {
+              task_id: TASK_ID,
+              claim_id: CLAIM_ID,
+              host: "build-host",
+              branch: "task/control",
+              worktree_ref: "wt-control",
+              started_at: "2026-08-13T00:00:00.000Z",
+            },
+          });
+        },
+      },
+    }));
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "COMMAND_FAILED" } });
+    expect(result.stderr).not.toContain("conflicting_claim");
   });
 
   it("never writes tokens to output or the measurement journal", async () => {

@@ -32,7 +32,7 @@ jhw-control task start --project <prj-id> --repo-id <repo-id> \
   --scope <path-or-scope> [--scope <path-or-scope> ...] --session <session-id>
 ```
 
-반환된 immutable `task_id`, `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. Claim 충돌은 owner/Claim 정보를 그대로 보여주고 멈춘다. 자동 takeover하지 않는다.
+반환된 immutable `task_id`, `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. exit 4 `TASK_ALREADY_CLAIMED`에서 검증된 `error.conflicting_claim`이 있으면 그 안의 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at`만 Claim 충돌 정보로 보여주고 멈춘다. 이 좌표가 없거나 유효하지 않으면 code-only 오류를 보여주고 멈춘다. 어느 경우에도 자동 status 또는 takeover를 하지 않는다.
 
 ## 재개
 
