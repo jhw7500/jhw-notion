@@ -1608,4 +1608,57 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(projectCalls).toBe(0);
     expect(await git(fixture.cloneA, "status", "--porcelain", "--untracked-files=all")).toBe("");
   }, 15_000);
+
+  it("27. journal gaps preserve Project registration and Task finish success coordinates without duplicate pressure", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const projectLinks = new Map<string, { project_id: string; project_item_id: string; source_node_id: string; issue_number: number }>();
+    let projectCreates = 0;
+    const failingJournal = { append: async () => { throw new Error("injected measurement outage"); } };
+    const projectPort = {
+      ...cliDependencies(graph).portfolio,
+      async registerProject(input: { project_id: string }) {
+        let link = projectLinks.get(input.project_id);
+        if (!link) {
+          projectCreates += 1;
+          link = { project_id: input.project_id, project_item_id: "PVTI_journal", source_node_id: "I_journal", issue_number: 91 };
+          projectLinks.set(input.project_id, link);
+        }
+        return link;
+      },
+    };
+    const journalDependencies = cliDependencies(graph, { journal: failingJournal, portfolio: projectPort });
+    const projectArgs = [
+      "project", "register", "--project", "prj-journal", "--title", "Journal Project",
+      "--objective", "prove authoritative success", "--repo-id", "repo-control", "--status", "proposed",
+      "--priority", "P2", "--health", "unknown", "--next-action", "wait:approval", "--last-reviewed", "2026-08-13",
+    ];
+
+    const firstProject = await runCli(projectArgs, journalDependencies);
+    const retryProject = await runCli(projectArgs, journalDependencies);
+    expect(firstProject.exitCode).toBe(0);
+    expect(retryProject.exitCode).toBe(0);
+    expect(JSON.parse(firstProject.stdout)).toEqual(JSON.parse(retryProject.stdout));
+    expect(JSON.parse(firstProject.stdout)).toMatchObject({
+      result: { project_id: "prj-journal", project_item_id: "PVTI_journal", source_node_id: "I_journal", issue_number: 91 },
+      journal_warning: { code: "JOURNAL_WRITE_FAILED" },
+    });
+    expect(projectCreates).toBe(1);
+
+    const started = await runCli(
+      temporaryStartArgs("control:finish-journal-gap", fixture.sourceRepo, "finish-journal-session"),
+      cliDependencies(graph),
+    );
+    const active = JSON.parse(started.stdout).result;
+    const finishArgs = completedFinishArgs(active.task.task_id, active.claim.claim_id);
+    const firstFinish = await runCli(finishArgs, journalDependencies);
+    expect(firstFinish.exitCode).toBe(0);
+    expect(JSON.parse(firstFinish.stdout)).toMatchObject({
+      result: { task_id: active.task.task_id, claim_id: active.claim.claim_id, status: "completed" },
+      journal_warning: { code: "JOURNAL_WRITE_FAILED" },
+    });
+    expect(await graph.claims.getActive(active.task.task_id)).toBeUndefined();
+    const historyDirectory = join(fixture.cloneA, "claims", "history", "2026", active.task.task_id);
+    expect((await readdir(historyDirectory)).filter((name) => name === `${active.claim.claim_id}.yaml`)).toHaveLength(1);
+  }, 20_000);
 });
