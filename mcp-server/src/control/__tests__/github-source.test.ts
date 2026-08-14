@@ -96,6 +96,28 @@ describe("GitHubSourceService", () => {
     expect(catalog.registerRepository).not.toHaveBeenCalled();
   });
 
+  it("rejects checkout-path API data and overlong node IDs before Catalog mutation", async () => {
+    const pathResponse = fixture();
+    pathResponse.runner.runGh.mockResolvedValueOnce({
+      command: "gh", args: [], stderr: "", exitCode: 0,
+      stdout: `${JSON.stringify({ node_id: checkout, full_name: "jhw7500/wlan", private: true })}\n`,
+    });
+    await expect(pathResponse.service.registerRepository({
+      repo_id: "repo-wlan", slug: "jhw7500/wlan", repository_path: checkout,
+    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(pathResponse.catalog.registerRepository).not.toHaveBeenCalled();
+
+    const overlong = fixture();
+    overlong.runner.runGh.mockResolvedValueOnce({
+      command: "gh", args: [], stderr: "", exitCode: 0,
+      stdout: `${JSON.stringify({ node_id: `R_${"x".repeat(200)}`, full_name: "jhw7500/wlan", private: true })}\n`,
+    });
+    await expect(overlong.service.registerRepository({
+      repo_id: "repo-wlan", slug: "jhw7500/wlan", repository_path: checkout,
+    })).rejects.toMatchObject({ code: "INVALID_REPOSITORY_RESPONSE" });
+    expect(overlong.catalog.registerRepository).not.toHaveBeenCalled();
+  });
+
   it("derives the private Repository node ID after binding the exact checkout origin", async () => {
     const { service, catalog } = fixture();
 

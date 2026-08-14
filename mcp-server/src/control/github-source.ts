@@ -18,15 +18,16 @@ const repoIdPattern = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const projectIdPattern = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const taskIdPattern = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const slugPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 
 const RepositoryResponseSchema = z.object({
-  node_id: z.string().min(1),
+  node_id: githubNodeId,
   full_name: z.string().regex(slugPattern),
   private: z.boolean(),
 }).passthrough();
 
 const IssueResponseSchema = z.object({
-  node_id: z.string().min(1),
+  node_id: githubNodeId,
   number: z.number().int().positive(),
   html_url: z.string().url(),
   updated_at: z.string().datetime({ offset: true }),

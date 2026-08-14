@@ -281,12 +281,15 @@ export class ClaimService {
   async getClaimHistory(taskId: string, claimId: string): Promise<ClaimHistory> {
     assertTaskId(taskId);
     assertClaimId(claimId);
+    const task = await this.catalog.getTask(taskId);
     const candidates = await this.claimHistoryCandidates(taskId, claimId);
     if (candidates.length === 0) {
       throw new ControlError("CLAIM_HISTORY_NOT_FOUND", "Exact released Claim history does not exist");
     }
     if (candidates.length !== 1) throw corruption("Exact released Claim history is ambiguous", { task_id: taskId });
-    return candidates[0] as ClaimHistory;
+    const history = candidates[0] as ClaimHistory;
+    this.assertHistoryMatchesTask(history, task);
+    return history;
   }
 
   async latestHandoffHistory(taskId: string): Promise<ClaimHistory> {
@@ -306,6 +309,7 @@ export class ClaimService {
   }
 
   private async taskHistory(taskId: string): Promise<ClaimHistory[]> {
+    const task = await this.catalog.getTask(taskId);
     const years = await this.historyYears();
     const candidates: ClaimHistory[] = [];
     let inspected = 0;
@@ -328,6 +332,7 @@ export class ClaimService {
         if (history.task_id !== taskId || String(this.historyYear(history.released_at)).padStart(4, "0") !== year) {
           throw corruption("Claim history path and canonical coordinates disagree", { task_id: taskId });
         }
+        this.assertHistoryMatchesTask(history, task);
         candidates.push(history);
       }
     }
@@ -636,6 +641,20 @@ export class ClaimService {
         expectedRepoId: task.repo_id,
         activeRepoId: active.repo_id,
         activeTaskAlias: active.task_alias,
+      });
+    }
+  }
+
+  private assertHistoryMatchesTask(history: ClaimHistory, task: TaskRecord): void {
+    if (
+      history.task_id !== task.id ||
+      history.project_id !== task.project_id ||
+      history.repo_id !== task.repo_id ||
+      (history.task_alias !== undefined && !task.aliases.includes(history.task_alias))
+    ) {
+      throw corruption("Archived Claim and canonical Task disagree", {
+        task_id: task.id,
+        claim_id: history.claim_id,
       });
     }
   }

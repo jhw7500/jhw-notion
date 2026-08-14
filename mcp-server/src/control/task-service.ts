@@ -7,7 +7,7 @@ import type {
   RecoveryResult,
 } from "./claim-service.js";
 import type { ControlConfig } from "./config.js";
-import { RegistryRecordStore } from "./codec.js";
+import { RegistryRecordStore, type RegistryDirectoryEntry } from "./codec.js";
 import { ControlError } from "./errors.js";
 import {
   buildHandoff,
@@ -54,6 +54,8 @@ export interface WorktreeManagerPort {
 export interface RegistryGitPort {
   transact(message: string, mutate: () => Promise<RegistryMutationResult>): Promise<RegistryTransactionResult>;
   assertHeadRegularFile(relativePath: string): Promise<void>;
+  readHeadRegularBlob(relativePath: string): Promise<Buffer>;
+  listHeadDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]>;
   readHeadRegularFile(relativePath: string): Promise<string>;
 }
 

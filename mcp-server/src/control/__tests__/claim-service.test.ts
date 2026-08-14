@@ -544,6 +544,34 @@ describe("ClaimService", () => {
     await expect(claims.latestClaimHistory(active.task_id)).resolves.toEqual(history);
   });
 
+  it("rejects a dirty deletion that would hide committed Claim history", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    await claims.finishClaim(active.task_id, active.claim_id, {
+      status: "completed",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    });
+    await unlink(join(fixture.registryDir, historyRelativePath(active)));
+
+    await expect(claims.latestClaimHistory(active.task_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("rejects archived Claim scope that disagrees with the canonical Task", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const history = await claims.finishClaim(active.task_id, active.claim_id, {
+      status: "abandoned", branch: active.branch, head_sha: "0123456789abcdef", validation: ["stopped"],
+    });
+    await commitRegistryFile(fixture, historyRelativePath(active), `${JSON.stringify({
+      ...history,
+      repo_id: "repo-other",
+    })}\n`);
+
+    await expect(claims.getClaimHistory(active.task_id, active.claim_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
   it("fails closed for a valid existing completed-history path and retains the active Claim", async () => {
     const { claims, fixture, task } = await claimsFixture();
     const active = await claims.claimTask(claimInput(task.id));

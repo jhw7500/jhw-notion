@@ -74,6 +74,8 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
   registry: {
     transact: ReturnType<typeof vi.fn>;
     assertHeadRegularFile: ReturnType<typeof vi.fn>;
+    readHeadRegularBlob: ReturnType<typeof vi.fn>;
+    listHeadDirectoryEntries: ReturnType<typeof vi.fn>;
     readHeadRegularFile: ReturnType<typeof vi.fn>;
   };
   worktreePath: string;
@@ -138,6 +140,17 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
         throw cause;
       }
     }),
+    readHeadRegularBlob: vi.fn(async (relativePath: string) => {
+      try {
+        return await readFile(join(fixture.registryDir, relativePath));
+      } catch (cause) {
+        if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT") {
+          throw new ControlError("HANDOFF_MISSING", "missing");
+        }
+        throw cause;
+      }
+    }),
+    listHeadDirectoryEntries: vi.fn(async () => []),
     readHeadRegularFile: vi.fn(async (relativePath: string) => {
       try {
         return await readFile(join(fixture.registryDir, relativePath), "utf8");

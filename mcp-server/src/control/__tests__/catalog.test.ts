@@ -239,6 +239,25 @@ describe("Catalog", () => {
     });
   });
 
+  it("round-trips records above the Handoff cap and rejects over-bound records before mutation", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const task = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:large-record",
+      goal: "x".repeat(13 * 1024), done_conditions: ["bounded"], expected_scope: ["src/control"],
+    });
+    await expect(catalog.getTask(task.id)).resolves.toEqual(task);
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerTemporaryTask({
+      project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:oversized-record",
+      goal: "x".repeat(70 * 1024), done_conditions: ["bounded"], expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+    expect((await git(fixture.registryDir, "rev-parse", "origin/main")).trim()).toBe(before);
+    expect(await git(fixture.registryDir, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  });
+
   it("refuses promotion when the Issue maps to another Task", async () => {
     const { catalog } = await catalogFixture();
     await catalog.registerRepository(repositoryInput);
@@ -336,6 +355,28 @@ describe("Catalog", () => {
 });
 
 describe("Catalog Registry integrity and public input boundaries", () => {
+  it("rejects valid-looking dirty working bytes instead of trusting them over HEAD", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const path = join(fixture.registryDir, "repositories", `${repositoryInput.repo_id}.yaml`);
+    await writeFile(path, `${JSON.stringify({
+      id: repositoryInput.repo_id,
+      github_node_id: repositoryInput.github_node_id,
+      slug: "jhw7500/forged",
+    })}\n`, "utf8");
+
+    await expect(catalog.getRepository(repositoryInput.repo_id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(await git(fixture.registryDir, "show", `HEAD:repositories/${repositoryInput.repo_id}.yaml`)).toContain(repositoryInput.slug);
+  });
+
+  it("rejects a FIFO record leaf without blocking in descriptor open", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await mkdir(join(fixture.registryDir, "tasks"), { recursive: true });
+    await new ProcessRunner().run("mkfifo", [join(fixture.registryDir, "tasks", "fifo.yaml")]);
+
+    await expect(catalog.records.assertAbsent("tasks/fifo.yaml")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
   it("refuses a committed repositories ancestor symlink before touching its outside target", async () => {
     const { catalog, fixture } = await catalogFixture();
     const outside = join(fixture.root, "outside-repositories");
@@ -505,6 +546,48 @@ describe("Catalog Registry integrity and public input boundaries", () => {
       done_conditions: [],
       expected_scope: [],
     })).rejects.toMatchObject({ code: "INVALID_TEMPORARY_TASK" });
+  });
+
+  it("rejects an overlong source node ID before any primary record or index mutation", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerRepository({
+      ...repositoryInput,
+      github_node_id: `R_${"x".repeat(200)}`,
+    })).rejects.toMatchObject({ code: "INVALID_REPOSITORY" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+    expect((await git(fixture.registryDir, "rev-parse", "origin/main")).trim()).toBe(before);
+    expect(await git(fixture.registryDir, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  });
+
+  it("rejects canonical Repository and formal Task records whose reverse source index is missing", async () => {
+    const repositoryCase = await catalogFixture();
+    await repositoryCase.catalog.registerRepository(repositoryInput);
+    const repositoryIndex = `repositories/by-source/github/${sourceIndexKey(repositoryInput.github_node_id)}.yaml`;
+    await git(repositoryCase.fixture.registryDir, "rm", "--", repositoryIndex);
+    await git(repositoryCase.fixture.registryDir, "commit", "-m", "Remove Repository source index");
+    await git(repositoryCase.fixture.registryDir, "push", "origin", "main");
+    const repositoryHead = (await git(repositoryCase.fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(repositoryCase.catalog.registerRepository({
+      ...repositoryInput,
+      repo_id: "repo-other",
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect((await git(repositoryCase.fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(repositoryHead);
+
+    const taskCase = await catalogFixture();
+    await taskCase.catalog.registerRepository(repositoryInput);
+    await taskCase.catalog.registerFormalTask(issueInput);
+    const taskIndex = `tasks/by-source/github/${sourceIndexKey(issueInput.issue_node_id)}.yaml`;
+    await git(taskCase.fixture.registryDir, "rm", "--", taskIndex);
+    await git(taskCase.fixture.registryDir, "commit", "-m", "Remove Task source index");
+    await git(taskCase.fixture.registryDir, "push", "origin", "main");
+    const taskHead = (await git(taskCase.fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(taskCase.catalog.registerFormalTask(issueInput)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect((await git(taskCase.fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(taskHead);
   });
 
   it("fails closed when promotion reads a Task record whose path and embedded ID differ", async () => {

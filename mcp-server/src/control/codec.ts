@@ -7,11 +7,14 @@ import type { ZodType } from "zod";
 import { ControlError } from "./errors.js";
 
 const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
+const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const temporaryFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW;
+export const MAX_REGISTRY_RECORD_BYTES = 64 * 1024;
 
 export interface RegistryHeadPort {
   assertHeadRegularFile(relativePath: string): Promise<void>;
+  readHeadRegularBlob(relativePath: string): Promise<Buffer>;
+  listHeadDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]>;
 }
 
 export interface RecordIdentity {
@@ -74,32 +77,36 @@ export class RegistryRecordStore {
 
   async readOptionalJson<T>(relativePath: string, schema: ZodType<T>, identity?: RecordIdentity): Promise<T | undefined> {
     const components = safeRelativePath(relativePath);
+    const committed = await this.committedBytesOptional(relativePath);
     let root: FileHandle | undefined;
     let parent: FileHandle | undefined;
     let file: FileHandle | undefined;
     try {
       root = await this.openRoot();
       parent = await this.openParent(root, components.slice(0, -1), false);
-      if (!parent) return undefined;
+      if (!parent) {
+        if (committed) throw corrupt("Committed Registry record is missing from the checkout", relativePath);
+        return undefined;
+      }
       try {
         file = await open(descriptorPath(parent, components.at(-1) as string), readFlags);
       } catch (cause) {
-        if (isNotFound(cause)) return undefined;
+        if (isNotFound(cause)) {
+          if (committed) throw corrupt("Committed Registry record is missing from the checkout", relativePath);
+          return undefined;
+        }
         throw corrupt("Registry record leaf is symbolic or not a regular file", relativePath);
       }
       const info = await file.stat();
       if (!info.isFile() || info.nlink !== 1) {
         throw corrupt("Registry record leaf must be a single-link regular file", relativePath);
       }
-      await this.head.assertHeadRegularFile(relativePath).catch((cause) => {
-        if (cause instanceof ControlError && cause.code === "HANDOFF_MISSING") {
-          throw corrupt("Existing Registry record is not a regular HEAD blob", relativePath);
-        }
-        throw cause;
-      });
+      const bytes = await this.boundedFileBytes(file, info, relativePath);
+      if (!committed) throw corrupt("Existing Registry record is not present in HEAD", relativePath);
+      if (!bytes.equals(committed)) throw corrupt("Registry checkout bytes disagree with HEAD", relativePath);
       let raw: unknown;
       try {
-        raw = JSON.parse(await file.readFile("utf8"));
+        raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
       } catch {
         throw corrupt("Registry record is not valid JSON-subset YAML", relativePath);
       }
@@ -138,12 +145,16 @@ export class RegistryRecordStore {
     if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 1) {
       throw new ControlError("INVALID_REGISTRY_BOUND", "Registry listing requires a positive deterministic bound");
     }
+    const committed = await this.head.listHeadDirectoryEntries(relativeDirectory, maximumEntries);
     let root: FileHandle | undefined;
     let directory: FileHandle | undefined;
     try {
       root = await this.openRoot();
       directory = await this.openParent(root, components, false);
-      if (!directory) return [];
+      if (!directory) {
+        if (committed.length > 0) throw corrupt("Committed Registry directory is missing from the checkout", relativeDirectory);
+        return [];
+      }
       const entries = await readdir(descriptorPath(directory, "."), { withFileTypes: true });
       if (entries.length > maximumEntries) throw corrupt("Registry directory exceeds its deterministic bound", relativeDirectory);
       const output: RegistryDirectoryEntry[] = [];
@@ -153,7 +164,11 @@ export class RegistryRecordStore {
         }
         output.push({ name: entry.name, kind: entry.isDirectory() ? "directory" : "file" });
       }
-      return output.sort((left, right) => left.name.localeCompare(right.name));
+      const sorted = output.sort((left, right) => left.name.localeCompare(right.name));
+      if (JSON.stringify(sorted) !== JSON.stringify(committed)) {
+        throw corrupt("Registry checkout directory disagrees with HEAD", relativeDirectory);
+      }
+      return committed;
     } catch (cause) {
       if (cause instanceof ControlError) throw cause;
       throw corrupt("Registry directory could not be listed safely", relativeDirectory);
@@ -166,6 +181,7 @@ export class RegistryRecordStore {
   /** Proves that both the checkout leaf and the exact HEAD entry are regular files. */
   async assertCommittedRegularFile(relativePath: string): Promise<void> {
     const components = safeRelativePath(relativePath);
+    const committed = await this.head.readHeadRegularBlob(relativePath);
     let root: FileHandle | undefined;
     let parent: FileHandle | undefined;
     let file: FileHandle | undefined;
@@ -184,6 +200,9 @@ export class RegistryRecordStore {
       const info = await file.stat();
       if (!info.isFile() || info.nlink !== 1) {
         throw corrupt("Committed Registry file must be a single-link regular file", relativePath);
+      }
+      if (!(await this.boundedFileBytes(file, info, relativePath)).equals(committed)) {
+        throw corrupt("Committed Registry checkout bytes disagree with HEAD", relativePath);
       }
     } catch (cause) {
       if (cause instanceof ControlError) throw cause;
@@ -240,9 +259,12 @@ export class RegistryRecordStore {
       if (!before.isFile() || before.nlink !== 1) {
         throw corrupt("Registry record to remove must be a single-link regular file", relativePath);
       }
-      await this.head.assertHeadRegularFile(relativePath).catch(() => {
+      const committed = await this.head.readHeadRegularBlob(relativePath).catch(() => {
         throw corrupt("Registry record to remove is not a regular HEAD blob", relativePath);
       });
+      if (!(await this.boundedFileBytes(file, before, relativePath)).equals(committed)) {
+        throw corrupt("Registry record to remove disagrees with HEAD", relativePath);
+      }
       await unlink(descriptorPath(parent, leaf));
       await parent.sync();
     } catch (cause) {
@@ -256,6 +278,9 @@ export class RegistryRecordStore {
   }
 
   async writeText(relativePath: string, contents: string): Promise<void> {
+    if (Buffer.byteLength(contents, "utf8") > MAX_REGISTRY_RECORD_BYTES) {
+      throw corrupt("Registry record exceeds its byte boundary", relativePath);
+    }
     const components = safeRelativePath(relativePath);
     const leaf = components.at(-1) as string;
     const temporaryName = `.${leaf}.${randomUUID()}.tmp`;
@@ -275,7 +300,12 @@ export class RegistryRecordStore {
         if (!info.isFile() || info.nlink !== 1) {
           throw corrupt("Registry record leaf must be a single-link regular file", relativePath);
         }
-        await this.head.assertHeadRegularFile(relativePath);
+        const committed = await this.head.readHeadRegularBlob(relativePath).catch(() => {
+          throw corrupt("Existing Registry record is not a regular HEAD blob", relativePath);
+        });
+        if (!(await this.boundedFileBytes(existing, info, relativePath)).equals(committed)) {
+          throw corrupt("Existing Registry record disagrees with HEAD", relativePath);
+        }
       } catch (cause) {
         if (!isNotFound(cause)) throw cause;
       } finally {
@@ -340,6 +370,25 @@ export class RegistryRecordStore {
       if (cause instanceof ControlError) throw cause;
       throw corrupt("Registry root contains a symbolic or unavailable component");
     }
+  }
+
+  private async committedBytesOptional(relativePath: string): Promise<Buffer | undefined> {
+    try {
+      return await this.head.readHeadRegularBlob(relativePath);
+    } catch (cause) {
+      if (cause instanceof ControlError && cause.code === "HANDOFF_MISSING") return undefined;
+      if (cause instanceof ControlError) throw cause;
+      throw corrupt("Registry HEAD record could not be read", relativePath);
+    }
+  }
+
+  private async boundedFileBytes(file: FileHandle, info: Awaited<ReturnType<FileHandle["stat"]>>, relativePath: string): Promise<Buffer> {
+    if (info.size > MAX_REGISTRY_RECORD_BYTES) throw corrupt("Registry record exceeds its byte boundary", relativePath);
+    const bytes = await file.readFile();
+    if (bytes.length !== info.size || bytes.length > MAX_REGISTRY_RECORD_BYTES) {
+      throw corrupt("Registry record changed during its bounded read", relativePath);
+    }
+    return bytes;
   }
 
   private async openParent(root: FileHandle, components: readonly string[], create: boolean): Promise<FileHandle | undefined> {

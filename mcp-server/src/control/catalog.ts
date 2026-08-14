@@ -28,20 +28,21 @@ const githubSlugPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,
 const safeAliasPattern = /^[^\u0000-\u001f\u007f]{1,160}$/;
 const formalAliasPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}#[1-9][0-9]*$/;
 const maximumCatalogEntries = 10_000;
+const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 
 const RepositorySourceIndexSchema = z.object({ repo_id: z.string().regex(repositoryIdPattern) }).strict();
 const TaskSourceIndexSchema = z.object({ task_id: z.string().regex(taskIdPattern) }).strict();
 
 const RegisterRepositoryInputSchema = z.object({
   repo_id: z.string().regex(repositoryIdPattern),
-  github_node_id: z.string().min(1),
+  github_node_id: githubNodeId,
   slug: z.string().regex(githubSlugPattern),
 }).strict();
 
 const RegisterFormalTaskInputSchema = z.object({
   project_id: z.string().regex(projectIdPattern),
   repo_id: z.string().regex(repositoryIdPattern),
-  issue_node_id: z.string().min(1),
+  issue_node_id: githubNodeId,
   issue_revision: z.string().datetime({ offset: true }),
   issue_url: z.string().url(),
   alias: z.string().regex(formalAliasPattern),
@@ -167,6 +168,7 @@ export class Catalog {
     this.sensitiveData.assertSafe(input);
     let registration: RepositoryRegistration | undefined;
     await this.registry.transact(`registry: register repository ${input.repo_id}`, async () => {
+      await this.auditRepositorySourceIndexes();
       const sourcePath = repositorySourceRelativePath(input.github_node_id);
       const indexed = await this.repositoryForSource(sourcePath, input.github_node_id);
       if (indexed) {
@@ -233,6 +235,7 @@ export class Catalog {
     this.sensitiveData.assertSafe(input);
     let registration: FormalTaskRegistration | undefined;
     await this.registry.transact(`registry: register formal task ${input.alias}`, async () => {
+      await this.auditRepositorySourceIndexes();
       await this.requireRepository(input.repo_id);
       await this.auditTaskSourceIndexes();
       const sourcePath = taskSourceRelativePath(input.issue_node_id);
@@ -295,6 +298,7 @@ export class Catalog {
     this.sensitiveData.assertSafe(input);
     let task: TemporaryTask | undefined;
     await this.registry.transact(`registry: register temporary task ${input.alias}`, async () => {
+      await this.auditRepositorySourceIndexes();
       await this.requireRepository(input.repo_id);
       const aliases = await this.tasksForAlias(input.alias);
       if (aliases.length > 1) throw corruption("Temporary Task alias is mapped more than once", { alias: input.alias });
@@ -343,6 +347,7 @@ export class Catalog {
     this.sensitiveData.assertSafe(input);
     let promoted: FormalTask | undefined;
     await this.registry.transact(`registry: promote temporary task ${taskId}`, async () => {
+      await this.auditRepositorySourceIndexes();
       await this.requireRepository(input.repo_id);
       await this.auditTaskSourceIndexes();
       const sourcePath = taskSourceRelativePath(input.issue_node_id);
@@ -423,6 +428,7 @@ export class Catalog {
 
   async getTask(taskId: string): Promise<TaskRecord> {
     assertTaskId(taskId);
+    await this.auditTaskSourceIndexes();
     return this.taskAt(taskId);
   }
 
@@ -448,6 +454,7 @@ export class Catalog {
 
   async getRepository(repoId: string): Promise<RepositoryRecord> {
     assertRepositoryId(repoId);
+    await this.auditRepositorySourceIndexes();
     const repository = await this.repositoryAt(repoId);
     if (!repository) throw new ControlError("REPOSITORY_NOT_FOUND", "Canonical Repository record does not exist", { repo_id: repoId });
     if (repository) this.sensitiveData.assertSafe(repository);
@@ -571,10 +578,12 @@ export class Catalog {
 
   private async auditTaskSourceIndexes(): Promise<void> {
     const directory = "tasks/by-source/github";
-    const names = await this.records.listRegularFileNames(directory, maximumCatalogEntries);
+    const indexEntries = await this.records.listDirectoryEntries(directory, maximumCatalogEntries);
     const seenSources = new Set<string>();
     const seenTasks = new Set<string>();
-    for (const name of names) {
+    for (const entry of indexEntries) {
+      if (entry.kind !== "file") throw corruption("Task source index contains a non-file entry", { entry: entry.name });
+      const name = entry.name;
       if (!/^[A-Za-z0-9_-]+\.yaml$/.test(name)) {
         throw corruption("Task source index has a malformed filename", { entry: name });
       }
@@ -590,6 +599,71 @@ export class Catalog {
       }
       seenSources.add(task.issue_node_id);
       seenTasks.add(task.id);
+    }
+    const taskEntries = await this.records.listDirectoryEntries("tasks", maximumCatalogEntries);
+    for (const entry of taskEntries) {
+      if (entry.kind === "directory") {
+        if (entry.name !== "by-source") throw corruption("Task directory contains an unexpected subdirectory", { entry: entry.name });
+        continue;
+      }
+      if (!/^tsk-[0-9a-f-]+\.yaml$/.test(entry.name)) {
+        throw corruption("Task directory contains a non-canonical record name", { entry: entry.name });
+      }
+      const id = entry.name.slice(0, -".yaml".length);
+      if (!taskIdPattern.test(id)) throw corruption("Task directory contains a malformed Task ID", { entry: entry.name });
+      const task = await this.taskAt(id);
+      if (task.kind === "formal" && !seenTasks.has(task.id)) {
+        throw corruption("Formal Task record has no exact source index", { task_id: task.id });
+      }
+      if (task.kind === "temporary" && seenTasks.has(task.id)) {
+        throw corruption("Temporary Task is referenced by a formal source index", { task_id: task.id });
+      }
+    }
+  }
+
+  private async auditRepositorySourceIndexes(): Promise<void> {
+    const directory = "repositories/by-source/github";
+    const indexEntries = await this.records.listDirectoryEntries(directory, maximumCatalogEntries);
+    const seenRepositories = new Set<string>();
+    for (const entry of indexEntries) {
+      if (entry.kind !== "file" || !/^[A-Za-z0-9_-]+\.yaml$/.test(entry.name)) {
+        throw corruption("Repository source index contains a malformed entry", { entry: entry.name });
+      }
+      const path = `${directory}/${entry.name}`;
+      const source = await this.sourceIndex(path, RepositorySourceIndexSchema);
+      if (!source) throw corruption("Repository source index disappeared during audit", { sourceIndexPath: path });
+      const repository = await this.repositoryAt(source.repo_id, path);
+      if (!repository) {
+        throw corruption("Repository source index points to a missing record", {
+          sourceIndexPath: path,
+          expectedRecordId: source.repo_id,
+        });
+      }
+      if (`${sourceIndexKey(repository.github_node_id)}.yaml` !== entry.name) {
+        throw corruption("Repository source index and canonical source disagree", {
+          sourceIndexPath: path,
+          expectedRecordId: repository.id,
+        });
+      }
+      if (seenRepositories.has(repository.id)) {
+        throw corruption("Repository source index is duplicated", { sourceIndexPath: path });
+      }
+      seenRepositories.add(repository.id);
+    }
+    const repositoryEntries = await this.records.listDirectoryEntries("repositories", maximumCatalogEntries);
+    for (const entry of repositoryEntries) {
+      if (entry.kind === "directory") {
+        if (entry.name !== "by-source") {
+          throw corruption("Repository directory contains an unexpected subdirectory", { entry: entry.name });
+        }
+        continue;
+      }
+      const match = entry.name.match(/^(repo-[a-z0-9][a-z0-9-]{1,62})\.yaml$/);
+      if (!match) throw corruption("Repository directory contains a malformed record", { entry: entry.name });
+      const repository = await this.repositoryAt(match[1] as string);
+      if (!repository || !seenRepositories.has(repository.id)) {
+        throw corruption("Repository record has no exact source index", { repo_id: match[1] });
+      }
     }
   }
 

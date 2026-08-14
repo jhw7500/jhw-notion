@@ -6,6 +6,7 @@ const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm") =>
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
 const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
 const timestamp = z.string().min(1);
+const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 export const SourceTaskRevisionSchema = z.string().min(1).max(256);
 export const OffsetDateTimeSchema = z.string().min(1).max(64).datetime({ offset: true });
 export const TemporaryLifecycleSchema = z.enum(["active", "handoff", "completed", "abandoned"]);
@@ -33,7 +34,7 @@ export type AuthorityRecord = z.infer<typeof AuthorityRecordSchema>;
 export const RepositoryRecordSchema = z
   .object({
     id: repositoryId,
-    github_node_id: z.string().min(1),
+    github_node_id: githubNodeId,
     slug: z.string().min(1),
   })
   .strict();
@@ -50,7 +51,7 @@ export const FormalTaskSchema = z
   .object({
     ...taskBase,
     kind: z.literal("formal"),
-    issue_node_id: z.string().min(1),
+    issue_node_id: githubNodeId,
     issue_revision: z.string().min(1),
     issue_url: z.string().url(),
   })

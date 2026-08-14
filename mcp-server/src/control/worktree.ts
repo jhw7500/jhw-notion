@@ -11,6 +11,8 @@ import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./pro
 const STATE_VERSION = 2;
 const canonicalTaskId = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const canonicalClaimId = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const canonicalProjectId = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
+const canonicalRepositoryId = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const canonicalGitObjectId = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const logicalRef = /^wt-[a-z0-9][a-z0-9-]{1,120}$/;
 
@@ -72,7 +74,7 @@ export interface WorktreeStateHooks {
 
 type WorktreeClaim = Pick<
   ActiveClaim,
-  "task_id" | "task_alias" | "claim_id" | "session_id" | "host" | "branch" | "worktree_ref"
+  "task_id" | "task_alias" | "project_id" | "repo_id" | "claim_id" | "session_id" | "host" | "branch" | "worktree_ref"
 >;
 
 export interface WorktreeTakeoverRebindResult {
@@ -81,6 +83,8 @@ export interface WorktreeTakeoverRebindResult {
 
 interface WorktreeMapping {
   task_id: string;
+  project_id: string;
+  repo_id: string;
   claim_id: string;
   session_id: string;
   host: string;
@@ -167,6 +171,8 @@ function asMapping(value: unknown, ref: string): WorktreeMapping {
   const record = value as Record<string, unknown>;
   const required = [
     "task_id",
+    "project_id",
+    "repo_id",
     "claim_id",
     "session_id",
     "host",
@@ -187,6 +193,8 @@ function asMapping(value: unknown, ref: string): WorktreeMapping {
   }
   if (
     !canonicalTaskId.test(record.task_id as string) ||
+    !canonicalProjectId.test(record.project_id as string) ||
+    !canonicalRepositoryId.test(record.repo_id as string) ||
     !canonicalClaimId.test(record.claim_id as string) ||
     !(record.session_id as string).trim() ||
     !(record.host as string).trim() ||
@@ -569,6 +577,8 @@ export class WorktreeManager {
   private pendingCreateMapping(claim: WorktreeClaim, repository: RepositoryInfo, root: string): WorktreeMapping {
     return {
       task_id: claim.task_id,
+      project_id: claim.project_id,
+      repo_id: claim.repo_id,
       claim_id: claim.claim_id,
       session_id: claim.session_id,
       host: claim.host,
@@ -744,6 +754,8 @@ export class WorktreeManager {
     const expectedPath = this.worktreePath(root, claim.worktree_ref);
     if (
       mapping.task_id !== claim.task_id ||
+      mapping.project_id !== claim.project_id ||
+      mapping.repo_id !== claim.repo_id ||
       mapping.host !== claim.host ||
       mapping.branch !== claim.branch ||
       mapping.repository_identity !== repositoryIdentity ||

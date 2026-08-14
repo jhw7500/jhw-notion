@@ -822,6 +822,24 @@ describe("WorktreeManager", () => {
       .rejects.toMatchObject({ code: "HOST_MISMATCH" });
   });
 
+  it("does not remove a worktree for archived Project/Repository scope drift", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const history: ClaimHistory = {
+      ...active,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "abandoned",
+      head_sha: "a".repeat(40),
+      validation_summary: "stopped",
+    };
+
+    await expect(manager.cleanupReleased({ ...history, repo_id: "repo-other" })).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_MISMATCH",
+    });
+    await expect(stat(created.path)).resolves.toBeDefined();
+  });
+
   it("ignores a verified absent removed tombstone when taking over a later alias generation", async () => {
     const { repoDir, manager } = await worktreeFixture();
     const old = claim();

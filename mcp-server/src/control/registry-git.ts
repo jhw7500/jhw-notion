@@ -1,6 +1,7 @@
 import { isAbsolute, normalize, sep } from "node:path";
 
 import type { ControlConfig } from "./config.js";
+import { MAX_REGISTRY_RECORD_BYTES, type RegistryDirectoryEntry } from "./codec.js";
 import { ControlError } from "./errors.js";
 import { MAX_HANDOFF_BYTES } from "./handoff.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
@@ -109,21 +110,21 @@ export class RegistryGit {
    * path because a Handoff is immutable evidence and must survive restoration
    * byte-for-byte (including content that happens to equal a host secret).
    */
-  async readHeadRegularBlob(relativePath: string): Promise<Buffer> {
+  async readHeadRegularBlob(relativePath: string, maximumBytes = MAX_REGISTRY_RECORD_BYTES): Promise<Buffer> {
     const objectId = await this.headRegularBlobObjectId(relativePath);
     const rawRunner = this.runner as Partial<RawProcessRunnerLike>;
     if (typeof rawRunner.runRaw !== "function") {
       throw new ControlError("REGISTRY_CORRUPT", "Registry runner cannot read committed blob bytes", { relativePath });
     }
-    await this.assertHeadBlobSize(relativePath, objectId);
+    await this.assertHeadBlobSize(relativePath, objectId, maximumBytes);
     try {
       const bytes = await rawRunner.runRaw(
         "git",
         ["cat-file", "blob", objectId],
         { cwd: this.config.registryDir },
-        MAX_HANDOFF_BYTES,
+        maximumBytes,
       );
-      if (bytes.length > MAX_HANDOFF_BYTES) {
+      if (bytes.length > maximumBytes) {
         // Defend the contract even for alternate ProcessRunner implementations.
         throw new ControlError("RAW_OUTPUT_TOO_LARGE", "Raw blob exceeds the Handoff byte limit");
       }
@@ -137,8 +138,50 @@ export class RegistryGit {
     }
   }
 
+  /** Lists the exact direct children selected by a proven regular HEAD tree. */
+  async listHeadDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]> {
+    if (!isSafeRegistryRelativePath(relativeDirectory) || !Number.isSafeInteger(maximumEntries) || maximumEntries < 1) {
+      throw new ControlError("INVALID_REGISTRY_PATH", "Registry directory path or bound is invalid");
+    }
+    let selected: string;
+    try {
+      selected = (await this.git(["ls-tree", "-z", "HEAD", "--", relativeDirectory])).stdout;
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD directory");
+    }
+    const roots = selected.split("\0").filter(Boolean);
+    if (roots.length === 0) return [];
+    if (roots.length !== 1) throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD directory is ambiguous");
+    const rootTab = (roots[0] as string).indexOf("\t");
+    const [rootMode, rootType, treeId] = rootTab >= 0 ? (roots[0] as string).slice(0, rootTab).split(" ") : [];
+    const rootPath = rootTab >= 0 ? (roots[0] as string).slice(rootTab + 1) : "";
+    if (rootMode !== "040000" || rootType !== "tree" || rootPath !== relativeDirectory || !/^[0-9a-f]{40,64}$/.test(treeId ?? "")) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD path is not a directory tree");
+    }
+    let output: string;
+    try {
+      output = (await this.git(["ls-tree", "-z", treeId as string])).stdout;
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to enumerate Registry HEAD directory");
+    }
+    const rows = output.split("\0").filter(Boolean);
+    if (rows.length > maximumEntries) throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD directory exceeds its bound");
+    const entries = rows.map((row): RegistryDirectoryEntry => {
+      const tab = row.indexOf("\t");
+      const [mode, type] = tab >= 0 ? row.slice(0, tab).split(" ") : [];
+      const name = tab >= 0 ? row.slice(tab + 1) : "";
+      if (!name || name.includes("/") || name === "." || name === "..") {
+        throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD directory contains an unsafe name");
+      }
+      if (mode === "040000" && type === "tree") return { name, kind: "directory" };
+      if ((mode === "100644" || mode === "100755") && type === "blob") return { name, kind: "file" };
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD directory contains a non-regular entry");
+    });
+    return entries.sort((left, right) => left.name.localeCompare(right.name));
+  }
+
   /** Proves a HEAD-selected blob is bounded before requesting its content. */
-  private async assertHeadBlobSize(relativePath: string, objectId: string): Promise<void> {
+  private async assertHeadBlobSize(relativePath: string, objectId: string, maximumBytes: number): Promise<void> {
     let output: string;
     try {
       output = (await this.git(["cat-file", "-s", objectId])).stdout;
@@ -155,7 +198,7 @@ export class RegistryGit {
       });
     }
     const size = BigInt(output.endsWith("\n") ? output.slice(0, -1) : output);
-    if (size > BigInt(MAX_HANDOFF_BYTES)) {
+    if (size > BigInt(maximumBytes)) {
       throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD blob exceeds the Handoff byte limit", {
         relativePath,
         object_id: objectId,
@@ -166,7 +209,9 @@ export class RegistryGit {
   /** Reads a bounded, valid UTF-8 Handoff from a proven regular HEAD blob. */
   async readHeadRegularFile(relativePath: string): Promise<string> {
     try {
-      const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await this.readHeadRegularBlob(relativePath));
+      const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+        await this.readHeadRegularBlob(relativePath, MAX_HANDOFF_BYTES),
+      );
       this.sensitiveData.assertSafe(content);
       return content;
     } catch (cause) {

@@ -185,6 +185,20 @@ describe("RegistryGit", () => {
     await expect(registry.headRegularBlobObjectId("tasks/revision.yaml")).resolves.toBe(expected);
   });
 
+  it("lists only direct regular HEAD tree entries with exact kinds", async () => {
+    const { registryDir } = await fixture();
+    await commitFile(registryDir, "claims/history/2026/task.yaml", "{}\n");
+    await commitFile(registryDir, "claims/active.yaml", "{}\n");
+    await git(registryDir, "push", "origin", "main");
+    const registry = new RegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.listHeadDirectoryEntries("claims", 10)).resolves.toEqual([
+      { name: "active.yaml", kind: "file" },
+      { name: "history", kind: "directory" },
+    ]);
+    await expect(registry.listHeadDirectoryEntries("missing", 10)).resolves.toEqual([]);
+  });
+
   it("reads exact committed Handoff bytes from HEAD rather than the mutable checkout", async () => {
     const { registryDir } = await fixture();
     await commitFile(registryDir, "handoffs/regular.md", "# Durable handoff\nfirst\n");
