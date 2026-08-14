@@ -45,6 +45,8 @@ const TASK_ID = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const CLAIM_ID = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PROJECT_ID = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const REPO_ID = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
+const MAX_CLI_OUTPUT_BYTES = 12 * 1024;
+const HANDOFF_RESULT_BUDGET = MAX_CLI_OUTPUT_BYTES - 256;
 
 const commandNames = [
   "repository register",
@@ -309,6 +311,55 @@ function resultJson(command: CommandName, result: unknown): CliResult {
   return { exitCode: 0, stdout: `${JSON.stringify({ command, result })}\n`, stderr: "" };
 }
 
+type CliHandoff = Awaited<ReturnType<CliDependencies["taskService"]["handoff"]>>;
+type BoundedCliHandoff = Omit<CliHandoff, "sections"> & {
+  sections: Record<string, string>;
+  truncated: boolean;
+};
+
+function scaledSection(value: string, scale: number): string {
+  const characters = Array.from(value);
+  const retained = Math.floor(characters.length * scale / MAX_CLI_OUTPUT_BYTES);
+  if (retained >= characters.length) return value;
+  return `${characters.slice(0, retained).join("")}\u2026`;
+}
+
+function boundedHandoffResult(
+  command: CommandName,
+  handoff: CliHandoff,
+  payload: (summary: BoundedCliHandoff) => unknown,
+): CliResult {
+  const entries = Object.entries(handoff.sections);
+  if (entries.some(([, value]) => typeof value !== "string")) {
+    throw new ControlError("INVALID_HANDOFF_RESULT", "Handoff service returned invalid section content");
+  }
+  const render = (sections: Record<string, string>, truncated: boolean) => resultJson(command, payload({
+    ...handoff,
+    sections,
+    truncated,
+  }));
+  const fullSections = Object.fromEntries(entries);
+  const full = render(fullSections, false);
+  if (Buffer.byteLength(full.stdout, "utf8") <= HANDOFF_RESULT_BUDGET) return full;
+
+  let low = 0;
+  let high = MAX_CLI_OUTPUT_BYTES;
+  let best: CliResult | undefined;
+  while (low <= high) {
+    const scale = Math.floor((low + high) / 2);
+    const sections = Object.fromEntries(entries.map(([name, value]) => [name, scaledSection(value, scale)]));
+    const candidate = render(sections, true);
+    if (Buffer.byteLength(candidate.stdout, "utf8") <= HANDOFF_RESULT_BUDGET) {
+      best = candidate;
+      low = scale + 1;
+    } else {
+      high = scale - 1;
+    }
+  }
+  if (!best) throw new ControlError("HANDOFF_PAYLOAD_TOO_LARGE", "Handoff metadata exceeds the CLI output boundary");
+  return best;
+}
+
 function validatedPortResult<T>(schema: ZodType<T>, raw: unknown, code: string): T {
   const parsed = schema.safeParse(raw);
   if (!parsed.success) throw new ControlError(code, "A control port returned an invalid result");
@@ -486,14 +537,6 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         project_id, repo_id, repository_path, alias, goal, done_conditions, expected_scope,
       });
     }
-    const started = await dependencies.taskService.start({
-      task_id: task.id,
-      task_alias: alias,
-      project_id,
-      repo_id,
-      session_id,
-      repository_path,
-    });
     let latestHandoff: Awaited<ReturnType<CliDependencies["taskService"]["handoff"]>> | undefined;
     if (hasExisting) {
       try {
@@ -504,23 +547,43 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         }
       }
     }
+    const started = await dependencies.taskService.start({
+      task_id: task.id,
+      task_alias: alias,
+      project_id,
+      repo_id,
+      session_id,
+      repository_path,
+    });
+    const startPayload = (latest?: {
+      handoff_pointer: string;
+      claim_id: string;
+      generated_at: string;
+      sections: Record<string, string>;
+      truncated: boolean;
+    }) => ({
+      task: taskSummary(task),
+      claim: activeSummary(started.claim),
+      branch: started.branch,
+      worktree_ref: started.worktree_ref,
+      reused: started.reused,
+      ...(latest ? { latest_handoff: latest } : {}),
+    });
+    if (latestHandoff) {
+      return {
+        flags,
+        result: boundedHandoffResult(command, latestHandoff, (summary) => startPayload({
+          handoff_pointer: summary.handoff_pointer,
+          claim_id: summary.claim_id,
+          generated_at: summary.generated_at,
+          sections: summary.sections,
+          truncated: summary.truncated,
+        })),
+      };
+    }
     return {
       flags,
-      result: resultJson(command, {
-        task: taskSummary(task),
-        claim: activeSummary(started.claim),
-        branch: started.branch,
-        worktree_ref: started.worktree_ref,
-        reused: started.reused,
-        ...(latestHandoff ? {
-          latest_handoff: {
-            handoff_pointer: latestHandoff.handoff_pointer,
-            claim_id: latestHandoff.claim_id,
-            generated_at: latestHandoff.generated_at,
-            sections: latestHandoff.sections,
-          },
-        } : {}),
-      }),
+      result: resultJson(command, startPayload()),
     };
   }
 
@@ -574,7 +637,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       taskId,
       claim === undefined ? undefined : assertPattern(claim, CLAIM_ID),
     );
-    return { flags, result: resultJson(command, handoff) };
+    return { flags, result: boundedHandoffResult(command, handoff, (summary) => summary) };
   }
 
   if (command === "task finish") {

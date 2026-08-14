@@ -264,6 +264,22 @@ describe("runCli", () => {
     expect(dependencies.source.registerTemporaryTask).not.toHaveBeenCalled();
   });
 
+  it("validates the latest Handoff before an existing Task can acquire a Claim", async () => {
+    const dependencies = makeCliDependencies({
+      taskService: {
+        handoff: vi.fn().mockRejectedValue(new ControlError("REGISTRY_CORRUPT", "invalid committed Handoff")),
+      },
+    });
+
+    const result = await runCli([
+      "task", "start", "--task", TASK_ID, "--repo-path", "/fixture/private-source/control", "--session", "codex-resume",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "REGISTRY_CORRUPT" } });
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
   it("promotes a temporary Task only through verified Issue authority", async () => {
     const dependencies = makeCliDependencies();
     const result = await runCli([
@@ -290,6 +306,42 @@ describe("runCli", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({
       result: { task_id: TASK_ID, claim_id: CLAIM_ID, handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md` },
     });
+  });
+
+  it.each(["handoff", "resume"] as const)("keeps escaped %s Handoff JSON within the 12 KiB CLI envelope", async (kind) => {
+    const sections = Object.fromEntries([
+      "Progress Since Last Checkpoint",
+      "Git State",
+      "Validation",
+      "Failures and Dead Ends",
+      "Exact Next Step",
+      "Related ADR and Evidence",
+    ].map((name) => [name, "\\".repeat(2_000)]));
+    const journal = { append: vi.fn().mockRejectedValue(new Error("injected journal gap")) };
+    const dependencies = makeCliDependencies({
+      journal,
+      taskService: { handoff: vi.fn().mockResolvedValue({
+        handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md`,
+        task_id: TASK_ID,
+        claim_id: CLAIM_ID,
+        source_task_revision: "2026-08-13T00:00:00Z",
+        generated_at: "2026-08-13T00:01:00Z",
+        sections,
+      }) },
+    });
+    const argv = kind === "handoff"
+      ? ["task", "handoff", "--task", TASK_ID, "--claim", CLAIM_ID]
+      : ["task", "start", "--task", TASK_ID, "--repo-path", "/fixture/private-source/control", "--session", "codex-resume"];
+
+    const result = await runCli(argv, dependencies);
+    const payload = JSON.parse(result.stdout);
+    const summary = kind === "handoff" ? payload.result : payload.result.latest_handoff;
+
+    expect(result.exitCode).toBe(0);
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(summary.truncated).toBe(true);
+    expect(Object.keys(summary.sections)).toEqual(Object.keys(sections));
+    expect(payload.journal_warning).toEqual({ code: "JOURNAL_WRITE_FAILED" });
   });
 
   it("returns stable JSON and exit code 4 for a Claim conflict", async () => {
