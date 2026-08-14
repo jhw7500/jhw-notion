@@ -98,6 +98,7 @@ type Overrides = {
   stateDir?: string;
   env?: NodeJS.ProcessEnv;
   taskService?: Record<string, unknown>;
+  source?: Record<string, unknown>;
   catalog?: Record<string, unknown>;
   portfolio?: Record<string, unknown>;
   preflight?: Record<string, unknown>;
@@ -135,6 +136,14 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     registerFormalTask: vi.fn().mockResolvedValue({ task: formalTask(), created: true }),
     registerTemporaryTask: vi.fn().mockResolvedValue(temporaryTask()),
     ...overrides.catalog,
+  };
+  const source = {
+    registerRepository: vi.fn().mockResolvedValue({ repository: { id: REPO_ID, github_node_id: "R_control", slug: "example/control" }, created: true }),
+    registerFormalTask: vi.fn().mockResolvedValue({ task: formalTask(), created: true }),
+    registerTemporaryTask: vi.fn().mockResolvedValue(temporaryTask()),
+    prepareExistingTask: vi.fn().mockResolvedValue({ task: formalTask(), alias: "example/control#1", source_task_revision: "2026-08-13T00:00:00Z" }),
+    promoteTemporaryTask: vi.fn().mockResolvedValue(formalTask()),
+    ...overrides.source,
   };
   const portfolio = {
     status: vi.fn().mockResolvedValue({
@@ -175,6 +184,7 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     taskService,
     claimService,
     catalog,
+    source,
     portfolio,
     preflight,
     mutationLock,
@@ -211,6 +221,53 @@ function registerArgs(): string[] {
 }
 
 describe("runCli", () => {
+  it("registers a Repository through verified source authority under the mutation lock", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "repository", "register", "--repo-id", REPO_ID, "--slug", "example/control", "--repo-path", "/srv/source/control",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.source.registerRepository).toHaveBeenCalledWith({
+      repo_id: REPO_ID, slug: "example/control", repository_path: "/srv/source/control",
+    });
+    expect(dependencies.mutationLock.run).toHaveBeenCalledTimes(1);
+    expect(result.stdout).not.toContain("/srv/source/control");
+  });
+
+  it("resumes an existing immutable Task only after source context validation", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "task", "start", "--task", TASK_ID, "--repo-path", "/srv/source/control", "--session", "codex-resume",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.source.prepareExistingTask).toHaveBeenCalledWith({
+      task_id: TASK_ID, repository_path: "/srv/source/control",
+    });
+    expect(dependencies.taskService.start).toHaveBeenCalledWith(expect.objectContaining({
+      task_id: TASK_ID, task_alias: "example/control#1", session_id: "codex-resume",
+    }));
+    expect(dependencies.source.registerFormalTask).not.toHaveBeenCalled();
+    expect(dependencies.source.registerTemporaryTask).not.toHaveBeenCalled();
+  });
+
+  it("promotes a temporary Task only through verified Issue authority", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "task", "promote", "--task", TASK_ID, "--repo-path", "/srv/source/control",
+      "--issue-url", "https://github.com/example/control/issues/1",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.source.promoteTemporaryTask).toHaveBeenCalledWith({
+      task_id: TASK_ID,
+      repository_path: "/srv/source/control",
+      issue_url: "https://github.com/example/control/issues/1",
+    });
+    expect(dependencies.mutationLock.run).toHaveBeenCalledTimes(1);
+  });
+
   it("returns stable JSON and exit code 4 for a Claim conflict", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-conflict-"));
     const conflictingClaim = {
@@ -340,10 +397,10 @@ describe("runCli", () => {
     const journal = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
 
     expect(result.exitCode).toBe(0);
-    expect(dependencies.catalog.registerFormalTask).toHaveBeenCalledWith(expect.objectContaining({
+    expect(dependencies.source.registerFormalTask).toHaveBeenCalledWith(expect.objectContaining({
       project_id: PROJECT_ID,
       repo_id: REPO_ID,
-      issue_node_id: "I_control",
+      expected_issue_node_id: "I_control",
     }));
     expect(dependencies.taskService.start).toHaveBeenCalledWith(expect.objectContaining({
       task_id: TASK_ID,

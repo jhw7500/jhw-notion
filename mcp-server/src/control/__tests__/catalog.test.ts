@@ -71,6 +71,71 @@ describe("Catalog", () => {
     });
   });
 
+  it("updates only a verified same-node Repository slug rename", async () => {
+    const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+
+    await expect(catalog.registerRepository({ ...repositoryInput, slug: "jhw7500/wlan-renamed" })).resolves.toEqual({
+      created: false,
+      repository: {
+        id: repositoryInput.repo_id,
+        github_node_id: repositoryInput.github_node_id,
+        slug: "jhw7500/wlan-renamed",
+      },
+    });
+    await expect(catalog.getRepository(repositoryInput.repo_id)).resolves.toMatchObject({ slug: "jhw7500/wlan-renamed" });
+  });
+
+  it("requires a canonical Repository record before creating any Task", async () => {
+    const { catalog } = await catalogFixture();
+
+    await expect(catalog.registerFormalTask(issueInput)).rejects.toMatchObject({ code: "REPOSITORY_NOT_FOUND" });
+    await expect(catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: "wlan:tmp-20260813-01-fix",
+      goal: "fix roaming regression",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/roaming.ts"],
+    })).rejects.toMatchObject({ code: "REPOSITORY_NOT_FOUND" });
+  });
+
+  it("rejects immutable formal adoption drift and explicitly advances only its verified revision", async () => {
+    const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const first = await catalog.registerFormalTask(issueInput);
+
+    await expect(catalog.registerFormalTask({ ...issueInput, project_id: "prj-other" })).rejects.toMatchObject({
+      code: "FORMAL_TASK_SOURCE_MISMATCH",
+    });
+    await expect(catalog.registerFormalTask({ ...issueInput, issue_url: "https://github.com/jhw7500/wlan/issues/2" })).rejects.toMatchObject({
+      code: "FORMAL_TASK_SOURCE_MISMATCH",
+    });
+    await expect(catalog.registerFormalTask({ ...issueInput, issue_revision: "2026-08-14T00:00:00Z" })).resolves.toMatchObject({
+      created: false,
+      task: { id: first.task.id, issue_revision: "2026-08-14T00:00:00Z" },
+    });
+  });
+
+  it("makes a bounded temporary alias idempotent and rejects conflicting reuse", async () => {
+    const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const input = {
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: "wlan:tmp-20260813-01-fix",
+      goal: "fix roaming regression",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/roaming.ts"],
+    };
+    const first = await catalog.registerTemporaryTask(input);
+
+    await expect(catalog.registerTemporaryTask(input)).resolves.toEqual(first);
+    await expect(catalog.registerTemporaryTask({ ...input, goal: "different work" })).rejects.toMatchObject({
+      code: "TEMPORARY_ALIAS_CONFLICT",
+    });
+  });
+
   it("exposes a narrowly validated canonical Repository lookup", async () => {
     const { catalog } = await catalogFixture();
     await catalog.registerRepository(repositoryInput);
@@ -101,6 +166,7 @@ describe("Catalog", () => {
 
   it("adopts the existing Task ID for an already indexed Issue", async () => {
     const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
     const a = await catalog.registerFormalTask(issueInput);
     const b = await catalog.registerFormalTask(issueInput);
 
@@ -110,6 +176,7 @@ describe("Catalog", () => {
 
   it("keeps formal Task records limited to source identity and aliases", async () => {
     const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
     const { task } = await catalog.registerFormalTask(issueInput);
 
     const record = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
@@ -127,6 +194,7 @@ describe("Catalog", () => {
 
   it("creates a temporary Task with mutable-work lifecycle fields", async () => {
     const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
     const task = await catalog.registerTemporaryTask({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",
@@ -148,6 +216,7 @@ describe("Catalog", () => {
 
   it("refuses promotion when the Issue maps to another Task", async () => {
     const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
     const temp = await catalog.registerTemporaryTask({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",
@@ -166,6 +235,7 @@ describe("Catalog", () => {
 
   it("promotes a temporary Task and source index together, preserving its prior alias", async () => {
     const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
     const temp = await catalog.registerTemporaryTask({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",
@@ -194,6 +264,15 @@ describe("Catalog", () => {
     });
     expect(JSON.parse(await readFile(sourcePath, "utf8"))).toEqual({ task_id: temp.id });
     await expect(catalog.promoteTemporaryTask(temp.id, issueInput)).resolves.toEqual(promoted);
+
+    await expect(catalog.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: "wlan:tmp-20260813-01-fix",
+      goal: "different canonical work",
+      done_conditions: ["new test"],
+      expected_scope: ["src/new.ts"],
+    })).rejects.toMatchObject({ code: "TEMPORARY_ALIAS_CONFLICT" });
   });
 });
 
@@ -304,6 +383,7 @@ describe("Catalog Registry integrity and public input boundaries", () => {
 
   it("fails closed when a formal Task source index points to another Issue node", async () => {
     const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
     const taskId = "tsk-0181f8f0-0000-7000-8000-000000000001";
     await commitFile(
       fixture.registryDir,
@@ -328,7 +408,7 @@ describe("Catalog Registry integrity and public input boundaries", () => {
 
     await expect(catalog.registerFormalTask(issueInput)).rejects.toMatchObject({
       code: "REGISTRY_CORRUPT",
-      details: expect.objectContaining({ expectedIssueNodeId: issueInput.issue_node_id, actualIssueNodeId: "I_kwDOOther" }),
+      details: expect.objectContaining({ sourceIndexPath: expect.stringContaining("tasks/by-source/github/") }),
     });
   });
 
@@ -370,6 +450,7 @@ describe("Catalog Registry integrity and public input boundaries", () => {
 
   it("fails closed when promotion reads a Task record whose path and embedded ID differ", async () => {
     const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
     const temp = await catalog.registerTemporaryTask({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, readFile, rename, unlink, type FileHandle } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, unlink, type FileHandle } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, normalize, parse, relative, resolve, sep } from "node:path";
 import type { ZodType } from "zod";
 
@@ -119,6 +119,36 @@ export class RegistryRecordStore {
 
   async writeJson(relativePath: string, value: unknown): Promise<void> {
     await this.writeText(relativePath, `${JSON.stringify(value, null, 2)}\n`);
+  }
+
+  /** Lists only direct regular-file names under a descriptor-retained directory. */
+  async listRegularFileNames(relativeDirectory: string, maximumEntries: number): Promise<string[]> {
+    const components = safeRelativePath(relativeDirectory);
+    if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 1) {
+      throw new ControlError("INVALID_REGISTRY_BOUND", "Registry listing requires a positive deterministic bound");
+    }
+    let root: FileHandle | undefined;
+    let directory: FileHandle | undefined;
+    try {
+      root = await this.openRoot();
+      directory = await this.openParent(root, components, false);
+      if (!directory) return [];
+      const entries = await readdir(descriptorPath(directory, "."), { withFileTypes: true });
+      if (entries.length > maximumEntries) throw corrupt("Registry directory exceeds its deterministic bound", relativeDirectory);
+      const names: string[] = [];
+      for (const entry of entries) {
+        if (entry.isDirectory()) continue;
+        if (!entry.isFile()) throw corrupt("Registry directory contains a non-regular entry", relativeDirectory);
+        names.push(entry.name);
+      }
+      return names.sort((left, right) => left.localeCompare(right));
+    } catch (cause) {
+      if (cause instanceof ControlError) throw cause;
+      throw corrupt("Registry directory could not be listed safely", relativeDirectory);
+    } finally {
+      if (directory !== root) await closeQuietly(directory);
+      await closeQuietly(root);
+    }
   }
 
   /** Proves that both the checkout leaf and the exact HEAD entry are regular files. */

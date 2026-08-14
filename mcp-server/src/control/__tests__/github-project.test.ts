@@ -60,6 +60,7 @@ function projectPageFixture(input: {
       user: {
         projectV2: {
           id: "PVT_project",
+          public: false,
           updatedAt: "2026-08-13T00:00:00Z",
           fields: connection(input.fields ?? requiredFields, input.fields?.length ?? requiredFields.length),
           items: connection(
@@ -104,6 +105,45 @@ function client(gh: QueuedGhRunner, catalog = catalogFixture()) {
 }
 
 describe("GitHubProjectClient", () => {
+  it("rejects a public Project before treating it as trial authority", async () => {
+    const gh = new QueuedGhRunner();
+    const page = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });
+    (page.data.user.projectV2 as typeof page.data.user.projectV2 & { public: boolean }).public = true;
+    gh.enqueue(page);
+
+    await expect(client(gh).readAll()).rejects.toMatchObject({ code: "PROJECT_NOT_PRIVATE" });
+  });
+
+  it("proves a Project Record contains the Repository and is attached exactly once", async () => {
+    const gh = new QueuedGhRunner();
+    gh.enqueue(
+      projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null }),
+      [[issueFixture(1)]],
+    );
+
+    await expect(client(gh).requireProjectRepository("prj-project-1", "repo-control")).resolves.toBeUndefined();
+  });
+
+  it("rejects missing Repository membership or an unattached Project Record", async () => {
+    const wrongRepo = new QueuedGhRunner();
+    wrongRepo.enqueue(
+      projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null }),
+      [[issueFixture(1)]],
+    );
+    await expect(client(wrongRepo).requireProjectRepository("prj-project-1", "repo-other")).rejects.toMatchObject({
+      code: "PROJECT_REPOSITORY_MISMATCH",
+    });
+
+    const unattached = new QueuedGhRunner();
+    unattached.enqueue(
+      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
+      [[issueFixture(1)]],
+    );
+    await expect(client(unattached).requireProjectRepository("prj-project-1", "repo-control")).rejects.toMatchObject({
+      code: "PROJECT_RECORD_NOT_ATTACHED",
+    });
+  });
+
   it("continues until hasNextPage is false and rejects totalCount mismatch", async () => {
     const gh = new QueuedGhRunner();
     const github = client(gh);
@@ -145,6 +185,7 @@ describe("GitHubProjectClient", () => {
         user: {
           projectV2: {
             id: "PVT_project",
+            public: false,
             updatedAt: "2026-08-13T00:00:00Z",
             fields: connection([requiredFields[4], { ...requiredFields[0], id: "PVTF_status_duplicate" }], 6),
           },
@@ -183,6 +224,13 @@ describe("GitHubProjectClient", () => {
       body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
       labels: [{ name: "trial" }, { name: "project-record" }],
     };
+    const verifiedPage = projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null });
+    const verifiedItem = verifiedPage.data.user.projectV2.items.nodes[0]!;
+    verifiedItem.id = "PVTI_new";
+    verifiedItem.content = { __typename: "Issue", id: "I_new" };
+    verifiedItem.status = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" };
+    verifiedItem.health = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" };
+    verifiedItem.nextAction = { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select-first-task" };
     gh.enqueue(
       project,
       [[{
@@ -207,6 +255,7 @@ describe("GitHubProjectClient", () => {
         },
       },
       ...Array.from({ length: 5 }, () => ({ data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_new" } } } })),
+      verifiedPage,
     );
 
     const registered = await github.registerProject({
@@ -234,6 +283,60 @@ describe("GitHubProjectClient", () => {
     ]));
     expect(gh.calls.some((call) => call.args.includes("itemId=PVTI_new"))).toBe(true);
     expect(gh.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(5);
+  });
+
+  it("reuses exactly one already-attached Project item after an interrupted registration", async () => {
+    const gh = new QueuedGhRunner();
+    const page = projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null });
+    const item = page.data.user.projectV2.items.nodes[0]!;
+    item.id = "PVTI_existing";
+    item.content = { __typename: "Issue", id: "I_existing" };
+    item.status = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" };
+    item.health = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" };
+    item.nextAction = { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select" };
+    const issue = {
+      node_id: "I_existing",
+      number: 77,
+      title: "Example",
+      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
+      labels: [{ name: "trial" }, { name: "project-record" }],
+    };
+    gh.enqueue(
+      page,
+      [[issue]],
+      issue,
+      ...Array.from({ length: 5 }, () => ({ data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_existing" } } } })),
+      page,
+    );
+
+    await expect(client(gh).registerProject({
+      project_id: "prj-example",
+      title: "Example",
+      objective: "Prove the trial flow",
+      repo_ids: ["repo-example"],
+      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
+    })).resolves.toMatchObject({ project_item_id: "PVTI_existing", source_node_id: "I_existing" });
+
+    expect(gh.calls.some((call) => call.args.join(" ").includes("addProjectV2ItemById"))).toBe(false);
+  });
+
+  it("fails closed when one Project Record source is attached more than once", async () => {
+    const gh = new QueuedGhRunner();
+    const page = projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null });
+    for (const item of page.data.user.projectV2.items.nodes) item.content = { __typename: "Issue", id: "I_existing" };
+    const issue = {
+      node_id: "I_existing",
+      number: 77,
+      title: "Example",
+      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
+      labels: [{ name: "trial" }, { name: "project-record" }],
+    };
+    gh.enqueue(page, [[issue]], issue);
+
+    await expect(client(gh).registerProject({
+      project_id: "prj-example", title: "Example", objective: "Prove the trial flow", repo_ids: ["repo-example"],
+      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
+    })).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_ITEM" });
   });
 
   it("fails closed on duplicate/mismatched idempotency records and invalid active Next Action", async () => {

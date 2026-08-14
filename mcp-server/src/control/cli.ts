@@ -8,6 +8,7 @@ import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { GitHubProjectClient } from "./github-project.js";
+import { GitHubSourceService } from "./github-source.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
 import { MutationLock, ProcessRunner, type MutationLockPort } from "./process.js";
 import { PortfolioService } from "./portfolio.js";
@@ -38,7 +39,9 @@ const PROJECT_ID = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const REPO_ID = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 
 const commandNames = [
+  "repository register",
   "task start",
+  "task promote",
   "task status",
   "task finish",
   "task recover",
@@ -76,6 +79,8 @@ export interface CliDependencies {
   taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner">;
   claimService: Pick<ClaimService, "getActive">;
   catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask">;
+  source: Pick<GitHubSourceService,
+    "registerRepository" | "registerFormalTask" | "registerTemporaryTask" | "prepareExistingTask" | "promoteTemporaryTask">;
   portfolio: PortfolioPort;
   preflight: PreflightPort;
   mutationLock: MutationLockPort;
@@ -105,6 +110,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     runner,
     catalog,
   });
+  const source = new GitHubSourceService({ runner, catalog, projects: githubProject });
   const worktrees = new WorktreeManager(config, runner);
   const claims = new ClaimService(config, registry, catalog, {
     async inspect(claim) {
@@ -138,6 +144,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     taskService: new TaskService(config, claims, worktrees, registry),
     claimService: claims,
     catalog,
+    source,
     portfolio: new PortfolioService({ projectClient: githubProject, stateDir: config.stateDir }),
     preflight: new PreflightService({ config, environment: env, runner, project: githubProject }),
     mutationLock: new MutationLock(config, env),
@@ -161,6 +168,7 @@ function commandFor(argv: readonly string[]): CommandName {
     return `portfolio ${argv[1]}` as CommandName;
   }
   if (argv[0] === "project" && argv[1] === "register") return "project register";
+  if (argv[0] === "repository" && argv[1] === "register") return "repository register";
   if (argv.length === 1 && argv[0] === "preflight") return "preflight";
   return "invalid";
 }
@@ -323,13 +331,29 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     return { result: resultJson(command, { commands: commandNames }) };
   }
 
+  if (command === "repository register") {
+    const flags = parseFlags(argv.slice(2), new Set(["--repo-id", "--slug", "--repo-path"]));
+    const repo_id = assertPattern(required(flags, "--repo-id"), REPO_ID);
+    const slug = required(flags, "--slug");
+    const repository_path = required(flags, "--repo-path");
+    if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
+    const registered = await dependencies.source.registerRepository({ repo_id, slug, repository_path });
+    return {
+      flags,
+      result: resultJson(command, {
+        repo_id: registered.repository.id,
+        slug: registered.repository.slug,
+        created: registered.created,
+      }),
+    };
+  }
+
   if (command === "task start") {
     const flags = parseFlags(argv.slice(2), new Set([
+      "--task",
       "--project", "--repo-id", "--repo-path", "--issue-node-id", "--issue-url", "--issue-revision",
       "--temp-alias", "--goal", "--done", "--scope", "--session",
     ]), new Set(["--done", "--scope"]));
-    const project_id = assertPattern(required(flags, "--project"), PROJECT_ID);
-    const repo_id = assertPattern(required(flags, "--repo-id"), REPO_ID);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
     const session_id = required(flags, "--session");
@@ -337,12 +361,29 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const temporaryFields = ["--temp-alias", "--goal", "--done", "--scope"];
     const hasFormal = formalFields.some((flag) => flags.has(flag));
     const hasTemporary = temporaryFields.some((flag) => flags.has(flag));
-    if (hasFormal === hasTemporary) usage("Task start requires exactly one task source");
+    const existingTaskId = value(flags, "--task");
+    const hasExisting = existingTaskId !== undefined;
+    if (hasExisting && (hasFormal || hasTemporary || flags.has("--project") || flags.has("--repo-id"))) {
+      usage("Existing Task resume cannot include registration fields");
+    }
+    if (!hasExisting && hasFormal === hasTemporary) usage("Task start requires exactly one task source");
 
     let task: TaskRecord;
     let alias: string;
-    if (hasFormal) {
-      const issue_node_id = required(flags, "--issue-node-id");
+    let project_id: string;
+    let repo_id: string;
+    if (hasExisting) {
+      const existing = await dependencies.source.prepareExistingTask({
+        task_id: assertPattern(existingTaskId, TASK_ID),
+        repository_path,
+      });
+      task = existing.task;
+      alias = existing.alias;
+      project_id = task.project_id;
+      repo_id = task.repo_id;
+    } else if (hasFormal) {
+      project_id = assertPattern(required(flags, "--project"), PROJECT_ID);
+      repo_id = assertPattern(required(flags, "--repo-id"), REPO_ID);
       const issue_url = required(flags, "--issue-url");
       try {
         const parsed = new URL(issue_url);
@@ -351,24 +392,27 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         if (cause instanceof ControlError) throw cause;
         usage("Invalid issue URL");
       }
-      const issue_revision = required(flags, "--issue-revision");
-      const registration = await dependencies.catalog.registerFormalTask({
+      const registration = await dependencies.source.registerFormalTask({
         project_id,
         repo_id,
-        issue_node_id,
+        repository_path,
         issue_url,
-        issue_revision,
-        alias: issue_node_id,
+        ...(value(flags, "--issue-node-id") ? { expected_issue_node_id: value(flags, "--issue-node-id") } : {}),
+        ...(value(flags, "--issue-revision") ? { expected_issue_revision: value(flags, "--issue-revision") } : {}),
       });
       task = registration.task;
-      alias = task.aliases[0] ?? issue_node_id;
+      alias = task.aliases[0] ?? usage("Formal Task has no canonical alias");
     } else {
+      project_id = assertPattern(required(flags, "--project"), PROJECT_ID);
+      repo_id = assertPattern(required(flags, "--repo-id"), REPO_ID);
       alias = required(flags, "--temp-alias");
       const goal = required(flags, "--goal");
       const done_conditions = values(flags, "--done").filter((entry) => isNonEmpty(entry));
       const expected_scope = values(flags, "--scope").filter((entry) => isNonEmpty(entry));
       if (done_conditions.length === 0 || expected_scope.length === 0) usage("Temporary task needs done and scope values");
-      task = await dependencies.catalog.registerTemporaryTask({ project_id, repo_id, alias, goal, done_conditions, expected_scope });
+      task = await dependencies.source.registerTemporaryTask({
+        project_id, repo_id, repository_path, alias, goal, done_conditions, expected_scope,
+      });
     }
     const started = await dependencies.taskService.start({
       task_id: task.id,
@@ -388,6 +432,22 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         reused: started.reused,
       }),
     };
+  }
+
+  if (command === "task promote") {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--task", "--repo-path", "--issue-url", "--issue-node-id", "--issue-revision",
+    ]));
+    const repository_path = required(flags, "--repo-path");
+    if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
+    const promoted = await dependencies.source.promoteTemporaryTask({
+      task_id: requireTaskId(flags),
+      repository_path,
+      issue_url: required(flags, "--issue-url"),
+      ...(value(flags, "--issue-node-id") ? { expected_issue_node_id: value(flags, "--issue-node-id") } : {}),
+      ...(value(flags, "--issue-revision") ? { expected_issue_revision: value(flags, "--issue-revision") } : {}),
+    });
+    return { flags, result: resultJson(command, { task: taskSummary(promoted) }) };
   }
 
   if (command === "task status") {
@@ -623,7 +683,8 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
 /** True only for lifecycle mutations that require the host-global callback lock. */
 export function requiresMutationLock(argv: readonly string[]): boolean {
   if (argv.length === 1 && argv[0] === "preflight") return true;
-  if (argv[0] === "task" && (argv[1] === "start" || argv[1] === "finish")) return true;
+  if (argv[0] === "repository" && argv[1] === "register") return true;
+  if (argv[0] === "task" && (argv[1] === "start" || argv[1] === "finish" || argv[1] === "promote")) return true;
   if (argv[0] === "project" && argv[1] === "register") return true;
   if (argv[0] !== "task" || argv[1] !== "recover") return false;
   const index = argv.indexOf("--action");

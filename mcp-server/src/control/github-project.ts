@@ -38,6 +38,7 @@ const PROJECT_QUERY = `query ProjectPage($owner: String!, $number: Int!, $fieldC
   user(login: $owner) {
     projectV2(number: $number) {
       id
+      public
       updatedAt
       fields(first: 100, after: $fieldCursor) {
         totalCount
@@ -86,6 +87,7 @@ const FIELDS_QUERY = `query ProjectFields($owner: String!, $number: Int!, $field
   user(login: $owner) {
     projectV2(number: $number) {
       id
+      public
       updatedAt
       fields(first: 100, after: $fieldCursor) {
         totalCount
@@ -104,6 +106,7 @@ const ITEMS_QUERY = `query ProjectItems($owner: String!, $number: Int!, $itemCur
   user(login: $owner) {
     projectV2(number: $number) {
       id
+      public
       updatedAt
       items(first: 100, after: $itemCursor, archivedStates: [ARCHIVED, NOT_ARCHIVED]) {
         totalCount
@@ -192,6 +195,7 @@ const ProjectEnvelopeSchema = z.object({
     user: z.object({
       projectV2: z.object({
         id: z.string().min(1),
+        public: z.boolean(),
         updatedAt: z.string().min(1),
         fields: FieldConnectionSchema.optional(),
         items: ItemConnectionSchema.optional(),
@@ -285,6 +289,7 @@ function projectFrom(stdout: string): NonNullable<NonNullable<z.infer<typeof Pro
   const envelope = jsonFrom(stdout, ProjectEnvelopeSchema, "INVALID_PROJECT_RESPONSE");
   const project = envelope.data.user?.projectV2;
   if (!project) throw new ControlError("PROJECT_NOT_FOUND", "Configured personal Project does not exist");
+  if (project.public) throw new ControlError("PROJECT_NOT_PRIVATE", "Phase 1A requires a private GitHub Project");
   return project;
 }
 
@@ -621,18 +626,13 @@ export class GitHubProjectClient {
   }
 
   private async addItem(projectId: string, contentId: string): Promise<string> {
-    let result: z.infer<typeof MutationItemSchema>;
-    try {
-      result = jsonFrom(
-        (await this.options.runner.runGh(graphqlArgs(ADD_ITEM_MUTATION, [
-          ["raw", `projectId=${projectId}`], ["raw", `contentId=${contentId}`],
-        ]), "project")).stdout,
-        MutationItemSchema,
-        "INVALID_PROJECT_MUTATION",
-      );
-    } catch {
-      throw new ControlError("PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE", "Narrow Project credential could not attach the private trial Issue");
-    }
+    const result = jsonFrom(
+      (await this.options.runner.runGh(graphqlArgs(ADD_ITEM_MUTATION, [
+        ["raw", `projectId=${projectId}`], ["raw", `contentId=${contentId}`],
+      ]), "project")).stdout,
+      MutationItemSchema,
+      "INVALID_PROJECT_MUTATION",
+    );
     return result.data.addProjectV2ItemById.item.id;
   }
 
@@ -704,6 +704,30 @@ export class GitHubProjectClient {
     return source.data;
   }
 
+  /** Proves the canonical Project Record, its repository relation, and one attachment. */
+  async requireProjectRepository(projectId: string, repoId: string): Promise<void> {
+    const initial = await this.initialPage();
+    const itemNodes = await this.items(initial);
+    const matches: Array<{ issue: Issue; body: ProjectRecordBody }> = [];
+    for (const issue of await this.listProjectRecordIssues()) {
+      const body = projectBody(issue.body);
+      if (body.id === projectId) matches.push({ issue, body });
+    }
+    if (matches.length === 0) throw new ControlError("PROJECT_RECORD_NOT_FOUND", "Canonical Project Record does not exist");
+    if (matches.length !== 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Canonical Project Record is ambiguous");
+    const match = matches[0] as { issue: Issue; body: ProjectRecordBody };
+    if (!match.body.repositories.includes(repoId)) {
+      throw new ControlError("PROJECT_REPOSITORY_MISMATCH", "Project Record does not contain the canonical Repository");
+    }
+    const attached = itemNodes.filter((node) => sourceId(node.content) === match.issue.node_id);
+    if (attached.length === 0) {
+      throw new ControlError("PROJECT_RECORD_NOT_ATTACHED", "Canonical Project Record is not attached to the configured Project");
+    }
+    if (attached.length !== 1) {
+      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Canonical Project Record is attached more than once");
+    }
+  }
+
   async registerProject(rawInput: RegisterProjectInput): Promise<ProjectRecordLink> {
     const input = RegisterProjectInputSchema.safeParse(rawInput);
     if (!input.success) throw new ControlError("INVALID_PROJECT_REGISTRATION", "Project registration input is invalid");
@@ -714,6 +738,7 @@ export class GitHubProjectClient {
 
     const initial = await this.initialPage();
     const structure = await this.structure(initial);
+    const initialItems = await this.items(initial);
     const matches = await this.canonicalProjectRecords(input.data.project_id);
     if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple canonical Issues use the requested Project ID");
     let issue: Issue;
@@ -727,20 +752,25 @@ export class GitHubProjectClient {
     const verified = await this.readIssue(issue.number);
     this.verifyIssue(verified, input.data, issue.node_id);
 
-    const itemId = await this.addItem(structure.projectId, issue.node_id);
-    try {
-      if (await this.verifyItemContentId(itemId) !== issue.node_id) throw new Error("attached source mismatch");
-    } catch {
-      throw new ControlError(
-        "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
-        "Narrow Project credential could not identify the newly attached private Project Record",
-      );
+    const attached = initialItems.filter((item) => sourceId(item.content) === issue.node_id);
+    if (attached.length > 1) {
+      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project Record Issue is attached more than once");
+    }
+    let itemId: string;
+    if (attached.length === 1) {
+      itemId = (attached[0] as ItemNode).id;
+    } else {
+      itemId = await this.addItem(structure.projectId, issue.node_id);
+      if (await this.verifyItemContentId(itemId) !== issue.node_id) {
+        throw new ControlError("PROJECT_ATTACHMENT_MISMATCH", "New Project item does not reference the Project Record Issue");
+      }
     }
     await this.updateField(structure, itemId, "Status", "single", input.data.fields.status);
     await this.updateField(structure, itemId, "Priority", "single", input.data.fields.priority);
     await this.updateField(structure, itemId, "Health", "single", input.data.fields.health);
     await this.updateField(structure, itemId, "Next Action", "text", input.data.fields.next_action);
     await this.updateField(structure, itemId, "Last Reviewed", "date", input.data.fields.last_reviewed);
+    await this.verifyRegisteredItem(itemId, issue.node_id, input.data.fields, structure);
 
     const link = ProjectRecordLinkSchema.safeParse({
       project_id: input.data.project_id,
@@ -750,6 +780,23 @@ export class GitHubProjectClient {
     });
     if (!link.success) throw new ControlError("INVALID_PROJECT_MUTATION", "Project registration returned invalid coordinates");
     return link.data;
+  }
+
+  private async verifyRegisteredItem(
+    itemId: string,
+    sourceNodeId: string,
+    expected: ProjectOperationalFields,
+    structure: ProjectStructure,
+  ): Promise<void> {
+    const finalPage = await this.initialPage();
+    const matches = (await this.items(finalPage)).filter((item) => item.id === itemId);
+    if (matches.length !== 1 || sourceId((matches[0] as ItemNode).content) !== sourceNodeId) {
+      throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project item identity failed final verification");
+    }
+    const actual = operatingFields(matches[0] as ItemNode, structure);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project fields failed final verification");
+    }
   }
 
   async verifyFields(): Promise<void> {

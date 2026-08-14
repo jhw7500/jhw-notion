@@ -21,6 +21,10 @@ import {
 const projectIdPattern = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const repositoryIdPattern = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const taskIdPattern = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const githubSlugPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+const safeAliasPattern = /^[^\u0000-\u001f\u007f]{1,160}$/;
+const formalAliasPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}#[1-9][0-9]*$/;
+const maximumCatalogEntries = 10_000;
 
 const RepositorySourceIndexSchema = z.object({ repo_id: z.string().regex(repositoryIdPattern) }).strict();
 const TaskSourceIndexSchema = z.object({ task_id: z.string().regex(taskIdPattern) }).strict();
@@ -28,22 +32,22 @@ const TaskSourceIndexSchema = z.object({ task_id: z.string().regex(taskIdPattern
 const RegisterRepositoryInputSchema = z.object({
   repo_id: z.string().regex(repositoryIdPattern),
   github_node_id: z.string().min(1),
-  slug: z.string().min(1),
+  slug: z.string().regex(githubSlugPattern),
 }).strict();
 
 const RegisterFormalTaskInputSchema = z.object({
   project_id: z.string().regex(projectIdPattern),
   repo_id: z.string().regex(repositoryIdPattern),
   issue_node_id: z.string().min(1),
-  issue_revision: z.string().min(1),
+  issue_revision: z.string().datetime({ offset: true }),
   issue_url: z.string().url(),
-  alias: z.string().min(1),
+  alias: z.string().regex(formalAliasPattern),
 }).strict();
 
 const RegisterTemporaryTaskInputSchema = z.object({
   project_id: z.string().regex(projectIdPattern),
   repo_id: z.string().regex(repositoryIdPattern),
-  alias: z.string().min(1),
+  alias: z.string().regex(safeAliasPattern),
   goal: z.string().min(1),
   done_conditions: z.array(z.string().min(1)).min(1),
   expected_scope: z.array(z.string().min(1)).min(1),
@@ -162,8 +166,18 @@ export class Catalog {
             requested_repo_id: input.repo_id,
           });
         }
-        registration = { repository: indexed.repository, created: false };
-        return noChanges();
+        if (indexed.repository.slug === input.slug) {
+          registration = { repository: indexed.repository, created: false };
+          return noChanges();
+        }
+        const renamed = record(
+          RepositoryRecordSchema,
+          { ...indexed.repository, slug: input.slug },
+          "INVALID_REPOSITORY",
+        );
+        await this.records.writeJson(repositoryRelativePath(renamed.id), renamed);
+        registration = { repository: renamed, created: false };
+        return stage([repositoryRelativePath(renamed.id)]);
       }
 
       const existing = await this.repositoryAt(input.repo_id);
@@ -175,9 +189,18 @@ export class Catalog {
             requested_github_node_id: input.github_node_id,
           });
         }
-        await this.records.writeJson(sourcePath, { repo_id: existing.id });
-        registration = { repository: existing, created: false };
-        return stage([repositorySourceRelativePath(input.github_node_id)]);
+        const renamed = existing.slug === input.slug ? existing : record(
+          RepositoryRecordSchema,
+          { ...existing, slug: input.slug },
+          "INVALID_REPOSITORY",
+        );
+        if (renamed !== existing) await this.records.writeJson(repositoryRelativePath(renamed.id), renamed);
+        await this.records.writeJson(sourcePath, { repo_id: renamed.id });
+        registration = { repository: renamed, created: false };
+        return stage([
+          ...(renamed === existing ? [] : [repositoryRelativePath(renamed.id)]),
+          repositorySourceRelativePath(input.github_node_id),
+        ]);
       }
 
       const repository = record(
@@ -198,11 +221,38 @@ export class Catalog {
     const input = parseInput(RegisterFormalTaskInputSchema, rawInput, "INVALID_FORMAL_TASK");
     let registration: FormalTaskRegistration | undefined;
     await this.registry.transact(`registry: register formal task ${input.alias}`, async () => {
+      await this.requireRepository(input.repo_id);
+      await this.auditTaskSourceIndexes();
       const sourcePath = taskSourceRelativePath(input.issue_node_id);
       const indexed = await this.formalTaskForSource(sourcePath, input.issue_node_id);
       if (indexed) {
-        registration = { task: indexed.task, created: false };
-        return noChanges();
+        const current = indexed.task;
+        if (
+          current.project_id !== input.project_id ||
+          current.repo_id !== input.repo_id ||
+          current.issue_node_id !== input.issue_node_id ||
+          current.issue_url !== input.issue_url
+        ) {
+          throw new ControlError("FORMAL_TASK_SOURCE_MISMATCH", "Formal Task immutable source coordinates disagree");
+        }
+        const currentRevision = Date.parse(current.issue_revision);
+        const requestedRevision = Date.parse(input.issue_revision);
+        if (requestedRevision < currentRevision) {
+          throw new ControlError("STALE_SOURCE_REVISION", "Verified Issue revision is older than the canonical Task revision");
+        }
+        const aliases = distinctAliases(current.aliases, input.alias);
+        if (requestedRevision === currentRevision && aliases.length === current.aliases.length) {
+          registration = { task: current, created: false };
+          return noChanges();
+        }
+        const updated = record(FormalTaskSchema, {
+          ...current,
+          aliases,
+          issue_revision: input.issue_revision,
+        }, "INVALID_FORMAL_TASK");
+        await this.records.writeJson(taskRelativePath(updated.id), updated);
+        registration = { task: updated, created: false };
+        return stage([taskRelativePath(updated.id)]);
       }
 
       const task = record(
@@ -232,6 +282,25 @@ export class Catalog {
     const input = parseInput(RegisterTemporaryTaskInputSchema, rawInput, "INVALID_TEMPORARY_TASK");
     let task: TemporaryTask | undefined;
     await this.registry.transact(`registry: register temporary task ${input.alias}`, async () => {
+      await this.requireRepository(input.repo_id);
+      const aliases = await this.tasksForAlias(input.alias);
+      if (aliases.length > 1) throw corruption("Temporary Task alias is mapped more than once", { alias: input.alias });
+      if (aliases.length === 1) {
+        const existing = aliases[0] as TaskRecord;
+        if (existing.kind !== "temporary") {
+          throw new ControlError("TEMPORARY_ALIAS_CONFLICT", "Temporary Task alias already belongs to a formal Task");
+        }
+        if (
+          existing.project_id !== input.project_id || existing.repo_id !== input.repo_id ||
+          existing.goal !== input.goal || existing.lifecycle !== (input.lifecycle ?? "active") ||
+          JSON.stringify(existing.done_conditions) !== JSON.stringify(input.done_conditions) ||
+          JSON.stringify(existing.expected_scope) !== JSON.stringify(input.expected_scope)
+        ) {
+          throw new ControlError("TEMPORARY_ALIAS_CONFLICT", "Temporary Task alias already identifies different work");
+        }
+        task = existing;
+        return noChanges();
+      }
       task = record(
         TemporaryTaskSchema,
         {
@@ -260,6 +329,8 @@ export class Catalog {
     const input = parseInput(RegisterFormalTaskInputSchema, rawInput, "INVALID_FORMAL_TASK");
     let promoted: FormalTask | undefined;
     await this.registry.transact(`registry: promote temporary task ${taskId}`, async () => {
+      await this.requireRepository(input.repo_id);
+      await this.auditTaskSourceIndexes();
       const sourcePath = taskSourceRelativePath(input.issue_node_id);
       const indexed = await this.formalTaskForSource(sourcePath, input.issue_node_id);
       if (indexed && indexed.taskId !== taskId) {
@@ -324,6 +395,13 @@ export class Catalog {
   async getTask(taskId: string): Promise<TaskRecord> {
     assertTaskId(taskId);
     return this.taskAt(taskId);
+  }
+
+  async getTaskSourceRevision(taskId: string): Promise<string> {
+    const task = await this.getTask(taskId);
+    return task.kind === "formal"
+      ? task.issue_revision
+      : this.registry.headRegularBlobObjectId(taskRelativePath(task.id));
   }
 
   async getRepository(repoId: string): Promise<RepositoryRecord> {
@@ -423,6 +501,53 @@ export class Catalog {
       });
     }
     return repository;
+  }
+
+  private async requireRepository(repoId: string): Promise<RepositoryRecord> {
+    const repository = await this.repositoryAt(repoId);
+    if (!repository) {
+      throw new ControlError("REPOSITORY_NOT_FOUND", "Canonical Repository record does not exist", { repo_id: repoId });
+    }
+    return repository;
+  }
+
+  private async tasksForAlias(alias: string): Promise<TaskRecord[]> {
+    const names = await this.records.listRegularFileNames("tasks", maximumCatalogEntries);
+    const matches: TaskRecord[] = [];
+    for (const name of names) {
+      if (!/^tsk-[0-9a-f-]+\.yaml$/.test(name)) {
+        throw corruption("Task directory contains a non-canonical record name", { entry: name });
+      }
+      const id = name.slice(0, -".yaml".length);
+      if (!taskIdPattern.test(id)) throw corruption("Task directory contains a malformed Task ID", { entry: name });
+      const task = await this.taskAt(id);
+      if (task.aliases.includes(alias)) matches.push(task);
+    }
+    return matches;
+  }
+
+  private async auditTaskSourceIndexes(): Promise<void> {
+    const directory = "tasks/by-source/github";
+    const names = await this.records.listRegularFileNames(directory, maximumCatalogEntries);
+    const seenSources = new Set<string>();
+    const seenTasks = new Set<string>();
+    for (const name of names) {
+      if (!/^[A-Za-z0-9_-]+\.yaml$/.test(name)) {
+        throw corruption("Task source index has a malformed filename", { entry: name });
+      }
+      const path = `${directory}/${name}`;
+      const source = await this.sourceIndex(path, TaskSourceIndexSchema);
+      if (!source) throw corruption("Task source index disappeared during audit", { sourceIndexPath: path });
+      const task = await this.taskAt(source.task_id, path);
+      if (task.kind !== "formal" || `${sourceIndexKey(task.issue_node_id)}.yaml` !== name) {
+        throw corruption("Task source index filename and canonical source disagree", { sourceIndexPath: path });
+      }
+      if (seenSources.has(task.issue_node_id) || seenTasks.has(task.id)) {
+        throw corruption("Task source index is duplicated", { sourceIndexPath: path });
+      }
+      seenSources.add(task.issue_node_id);
+      seenTasks.add(task.id);
+    }
   }
 
   private async taskAt(taskId: string, sourceIndexPath?: string): Promise<TaskRecord> {
