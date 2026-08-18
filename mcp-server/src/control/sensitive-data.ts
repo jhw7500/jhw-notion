@@ -60,13 +60,17 @@ function scanBounded(value: unknown, inspect: (candidate: string) => void): void
 
 // A host path token may be framed by prose punctuation (`,/srv`, `[/srv]`,
 // `;C:\\private`) as well as whitespace.  Exclude only characters that can
-// legitimately continue a URL, repository slug, or relative path — letters and
-// digits in any script, since prose like `목적/경계` uses `/` as a word
-// separator — and retain the double-slash guard so `https://...` is not
-// classified as a Unix path.  The error sanitizer in errors.ts deliberately
-// keeps the narrower ASCII boundary: over-redaction is harmless there, while
-// content rejection here must not fail on non-ASCII prose.
-const embeddedUnixPath = /(?:^|[^\p{L}\p{N}_./-])\/(?!\/)[^\s"'`<>|]+/u;
+// legitimately continue a URL, repository slug, or relative path — letters,
+// digits, and combining marks in any script, since prose like `목적/경계` or
+// `ไทย์/ทาง` uses `/` as a word separator — and retain the double-slash guard
+// so `https://...` is not classified as a Unix path.  A slash-free first
+// segment carrying a colon (`/jhw:save`) is a slash command, not a host path;
+// once another `/` follows (`/home:evil/x`) the token is treated as a path
+// again, so the exemption exposes at most one root component.  The error
+// sanitizer in errors.ts deliberately keeps the narrower ASCII boundary:
+// over-redaction is harmless there, while content rejection here must not
+// fail on non-ASCII prose.
+const embeddedUnixPath = /(?:^|[^\p{L}\p{N}\p{M}_./-])\/(?!\/)(?![^\s"'`<>|/]*:[^\s"'`<>|/]*(?:[\s"'`<>|]|$))[^\s"'`<>|]+/u;
 const embeddedWindowsPath = /(?:^|[^A-Za-z0-9_./\\-])[A-Za-z]:[\\/][^\s"'`<>|]+/u;
 // File URIs are host-path carriers regardless of surrounding punctuation.
 // Keep this aligned with the direct-error sanitizer rather than trying to

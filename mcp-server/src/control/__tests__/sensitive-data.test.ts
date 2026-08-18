@@ -99,6 +99,44 @@ describe("SensitiveDataPolicy", () => {
       .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
   });
 
+  it.each([
+    "जानकारी/मार्ग खंड",
+    "ไทย์/ทาง",
+  ])("preserves prose whose word ends in a combining mark before a slash %s", (value) => {
+    expect(() => assertNoAbsoluteHostPaths(value)).not.toThrow();
+  });
+
+  it.each([
+    "작업은 /jhw:save 로 기록",
+    "/jhw:save 실행",
+    "실행 순서는 /oh-my-claudecode:verify 다음에 /jhw:review",
+  ])("preserves slash commands whose first segment carries a colon %s", (value) => {
+    expect(() => assertNoAbsoluteHostPaths(value)).not.toThrow();
+  });
+
+  // Word-glued absolute paths are the documented false-negative boundary of
+  // this heuristic in every script: configured host paths are still blocked
+  // by createSensitiveDataPolicy's exact term matching.
+  it.each([
+    "x/home/build-user/data 참조",
+    "한글/home/build-user/data 참조",
+    "́/home/build-user/data 참조",
+  ])("accepts word-glued paths as the documented false-negative boundary %s", (value) => {
+    expect(() => assertNoAbsoluteHostPaths(value)).not.toThrow();
+  });
+
+  it.each([
+    "ไทย์ /srv/private/source-checkout/file.ts",
+    "mem:/proc/self/environ",
+    "cmd;/jhw/absolute/segment",
+    "경로는 /home:evil/jhw/private-checkout",
+    "확인 /tmp:x/secret-payload",
+    "PATH=/usr/bin:/usr/local/bin:/home/build-user/bin",
+  ])("still rejects multi-segment paths regardless of colons %s", (value) => {
+    expect(() => assertNoAbsoluteHostPaths(value))
+      .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
+  });
+
   it("redacts punctuation-framed host paths from direct ControlError metadata", () => {
     const privatePath = "/srv/private/source-checkout/file.ts";
     const error = new ControlError("SAFE_FAILURE", `failed,${privatePath}`, {
