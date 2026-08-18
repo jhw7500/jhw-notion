@@ -82,6 +82,23 @@ describe("SensitiveDataPolicy", () => {
     ])).not.toThrow();
   });
 
+  it.each([
+    "README에 목적/경계/운영 절차 3개 섹션 존재 확인",
+    "지식/결정 기록은 상태 기반",
+    "사이클1/3 완료",
+  ])("preserves non-ASCII prose whose words are separated by slashes %s", (value) => {
+    expect(() => assertNoAbsoluteHostPaths(value)).not.toThrow();
+  });
+
+  it.each([
+    "정말 /srv/private/source-checkout/file.ts",
+    "경로,/srv/private/source-checkout/file.ts",
+    "한글</srv/private/source-checkout/file.ts>",
+  ])("still rejects host paths adjacent to non-ASCII prose %s", (value) => {
+    expect(() => assertNoAbsoluteHostPaths(value))
+      .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
+  });
+
   it("redacts punctuation-framed host paths from direct ControlError metadata", () => {
     const privatePath = "/srv/private/source-checkout/file.ts";
     const error = new ControlError("SAFE_FAILURE", `failed,${privatePath}`, {

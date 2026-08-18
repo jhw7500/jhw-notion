@@ -60,9 +60,13 @@ function scanBounded(value: unknown, inspect: (candidate: string) => void): void
 
 // A host path token may be framed by prose punctuation (`,/srv`, `[/srv]`,
 // `;C:\\private`) as well as whitespace.  Exclude only characters that can
-// legitimately continue a URL, repository slug, or relative path, and retain
-// the double-slash guard so `https://...` is not classified as a Unix path.
-const embeddedUnixPath = /(?:^|[^A-Za-z0-9_./-])\/(?!\/)[^\s"'`<>|]+/u;
+// legitimately continue a URL, repository slug, or relative path — letters and
+// digits in any script, since prose like `목적/경계` uses `/` as a word
+// separator — and retain the double-slash guard so `https://...` is not
+// classified as a Unix path.  The error sanitizer in errors.ts deliberately
+// keeps the narrower ASCII boundary: over-redaction is harmless there, while
+// content rejection here must not fail on non-ASCII prose.
+const embeddedUnixPath = /(?:^|[^\p{L}\p{N}_./-])\/(?!\/)[^\s"'`<>|]+/u;
 const embeddedWindowsPath = /(?:^|[^A-Za-z0-9_./\\-])[A-Za-z]:[\\/][^\s"'`<>|]+/u;
 // File URIs are host-path carriers regardless of surrounding punctuation.
 // Keep this aligned with the direct-error sanitizer rather than trying to
