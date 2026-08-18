@@ -73,6 +73,8 @@ jhw-control project register \
   --next-action <task:tsk-id-or-wait:condition> --last-reviewed <YYYY-MM-DD>
 ```
 
-성공 시 `project_id`, `project_item_id`, `source_node_id`, `issue_number`만 보고한다. partial failure 후에는 동일 approved payload만 재시도한다. 다른 body/field/node를 자동 채택하거나 중복 item을 만들지 않는다.
+Project Record는 비공개 Project의 canonical DraftIssue다. Registry Issue를 만들거나 source node ID로 결합하지 않는다.
+
+성공 시 `project_id`, `project_item_id`, `source_node_id`만 보고한다. partial failure 후에는 동일 approved payload와 정확히 하나인 같은 DraftIssue만 재사용한다. 다른 title/body/field/node를 자동 채택하거나 중복 item을 만들지 않는다.
 
 exit `0`에 `journal_warning.code=JOURNAL_WRITE_FAILED`가 있어도 registration은 이미 성공했으므로 재시도하지 않고 measurement gap만 보고한다. nonzero에서는 stable code만 보고 secret/private path를 출력하지 않는다.

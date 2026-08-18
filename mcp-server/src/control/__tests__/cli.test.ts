@@ -171,8 +171,7 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     registerProject: vi.fn(async (input: { project_id: string }) => ({
       project_id: input.project_id,
       project_item_id: "PVTI_control",
-      source_node_id: "I_control",
-      issue_number: 1,
+      source_node_id: "DI_control",
     })),
     ...overrides.portfolio,
   };
@@ -790,8 +789,7 @@ describe("runCli", () => {
         registerProject: vi.fn().mockResolvedValue({
           project_id: PROJECT_ID,
           project_item_id: `PVTI_${"a".repeat(20_000)}`,
-          source_node_id: `I_${"b".repeat(20_000)}`,
-          issue_number: 1,
+          source_node_id: `DI_${"b".repeat(20_000)}`,
         }),
       },
     });
@@ -939,7 +937,6 @@ describe("runCli", () => {
     "PROJECT_SCOPE_UNVERIFIABLE",
     "PROJECT_TOKEN_HAS_REPO_SCOPE",
     "PROJECT_SCOPE_MISSING",
-    "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
     "UNSUPPORTED_REGISTRY_OWNER",
     "REGISTRY_REMOTE_NOT_SSH",
     "COMMAND_TIMEOUT",

@@ -198,7 +198,7 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         markdownPath: "2026-08-13T00-00-00.000Z/portfolio.md",
         checksum: "a".repeat(64),
       }),
-      registerProject: async (input) => ({ project_id: input.project_id, project_item_id: "PVTI_control", source_node_id: "I_control", issue_number: 1 }),
+      registerProject: async (input) => ({ project_id: input.project_id, project_item_id: "PVTI_control", source_node_id: "DI_control" }),
     },
     preflight: { run: async () => ({
       status: "ready",
@@ -302,25 +302,39 @@ const gateProjectFields = [
   { __typename: "ProjectV2Field", id: "PVTF_reviewed", name: "Last Reviewed", dataType: "DATE" },
 ];
 
-function gateProjectPage(item: Record<string, unknown> | undefined) {
+function gateProjectPage(...items: Record<string, unknown>[]) {
   return {
     data: { user: { projectV2: {
       id: "PVT_project", public: false, updatedAt: "2026-08-13T00:00:00Z",
       fields: { totalCount: gateProjectFields.length, nodes: gateProjectFields, pageInfo: { hasNextPage: false, endCursor: null } },
-      items: { totalCount: item ? 1 : 0, nodes: item ? [item] : [], pageInfo: { hasNextPage: false, endCursor: null } },
+      items: { totalCount: items.length, nodes: items, pageInfo: { hasNextPage: false, endCursor: null } },
     } } },
   };
 }
 
-function gateProjectItem(complete: boolean) {
+function gatePreflightProjectItem() {
   return {
-    id: "PVTI_existing", isArchived: false, type: "ISSUE",
-    content: { __typename: "Issue", id: "I_existing" },
-    status: complete ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" } : null,
-    priority: complete ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P2", name: "P2" } : null,
-    health: complete ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" } : null,
-    nextAction: complete ? { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select" } : null,
-    lastReviewed: complete ? { __typename: "ProjectV2ItemFieldDateValue", date: "2026-08-13" } : null,
+    id: "PVTI_trial", isArchived: false, type: "DRAFT_ISSUE",
+    content: {
+      __typename: "DraftIssue", id: "DI_trial",
+      title: "[TRIAL] Project Control Preflight Fixture", body: "unchanged",
+    },
+    status: null, priority: null, health: null, nextAction: null, lastReviewed: null,
+  };
+}
+
+function gateProjectRecordItem(state: "first-two" | "complete") {
+  return {
+    id: "PVTI_existing", isArchived: false, type: "DRAFT_ISSUE",
+    content: {
+      __typename: "DraftIssue", id: "DI_existing", title: "Example",
+      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-control"] }),
+    },
+    status: { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" },
+    priority: { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P2", name: "P2" },
+    health: state === "complete" ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" } : null,
+    nextAction: state === "complete" ? { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select" } : null,
+    lastReviewed: state === "complete" ? { __typename: "ProjectV2ItemFieldDateValue", date: "2026-08-13" } : null,
   };
 }
 
@@ -1029,8 +1043,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(realisticIssue.labels).toEqual([{ name: "trial", color: "ededed" }]);
     const project: PreflightProjectPort = {
       verifyFields: async () => undefined,
-      addPreflightItem: async () => "PVTI_trial",
-      verifyItemContentId: async () => "I_fixture",
+      verifyPreflightItem: async () => undefined,
       readLastReviewed: async () => undefined,
       writeLastReviewed: async () => undefined,
       clearLastReviewed: async () => undefined,
@@ -1410,32 +1423,35 @@ describe("Phase 1A deterministic adversarial gate", () => {
       project_id: "prj-example", title: "Example", objective: "Prove the trial flow", repo_ids: ["repo-control"],
       fields: { status: "proposed" as const, priority: "P2" as const, health: "unknown" as const, next_action: "wait:select", last_reviewed: "2026-08-13" },
     };
-    const issue = {
-      node_id: "I_existing", number: 77, title: input.title,
-      body: JSON.stringify({ id: input.project_id, objective: input.objective, repositories: input.repo_ids }),
-      labels: [{ name: "trial" }, { name: "project-record" }],
-    };
+    const draftMutation = { data: { addProjectV2DraftIssue: { projectItem: {
+      id: "PVTI_existing", type: "DRAFT_ISSUE",
+      content: {
+        __typename: "DraftIssue", id: "DI_existing", title: input.title,
+        body: JSON.stringify({ id: input.project_id, objective: input.objective, repositories: input.repo_ids }),
+      },
+    } } } };
     const mutation = { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_existing" } } } };
     const interruptedRunner = new GateProjectRunner();
     interruptedRunner.enqueue(
-      gateProjectPage(gateProjectItem(false)), [[issue]], issue,
+      gateProjectPage(gatePreflightProjectItem()), draftMutation,
       mutation, mutation, new Error("injected third-field boundary"),
     );
     const interrupted = new GitHubProjectClient({
-      githubOwner: "jhw7500", projectNumber: 7, registryRepository: "jhw7500/project-registry",
+      githubOwner: "jhw7500", projectNumber: 7,
       preflightProjectItemId: "PVTI_trial", runner: interruptedRunner, catalog: graph.catalog,
     });
     await expect(interrupted.registerProject(input)).rejects.toThrow("injected third-field boundary");
-    expect(interruptedRunner.calls.some((call) => call.args.join(" ").includes("addProjectV2ItemById"))).toBe(false);
+    expect(interruptedRunner.calls.filter((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toHaveLength(1);
+    expect(interruptedRunner.calls.every((call) => call.credential === "project")).toBe(true);
 
     const retryRunner = new GateProjectRunner();
     retryRunner.enqueue(
-      gateProjectPage(gateProjectItem(false)), [[issue]], issue,
-      mutation, mutation, mutation, mutation, mutation,
-      gateProjectPage(gateProjectItem(true)),
+      gateProjectPage(gatePreflightProjectItem(), gateProjectRecordItem("first-two")),
+      mutation, mutation, mutation,
+      gateProjectPage(gatePreflightProjectItem(), gateProjectRecordItem("complete")),
     );
     const retry = new GitHubProjectClient({
-      githubOwner: "jhw7500", projectNumber: 7, registryRepository: "jhw7500/project-registry",
+      githubOwner: "jhw7500", projectNumber: 7,
       preflightProjectItemId: "PVTI_trial", runner: retryRunner, catalog: graph.catalog,
     });
     const dependencies = cliDependencies(graph, {
@@ -1448,10 +1464,11 @@ describe("Phase 1A deterministic adversarial gate", () => {
     ], dependencies);
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout).result).toEqual({
-      project_id: "prj-example", project_item_id: "PVTI_existing", source_node_id: "I_existing", issue_number: 77,
+      project_id: "prj-example", project_item_id: "PVTI_existing", source_node_id: "DI_existing",
     });
-    expect(retryRunner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(5);
-    expect(retryRunner.calls.some((call) => call.args.join(" ").includes("addProjectV2ItemById"))).toBe(false);
+    expect(retryRunner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(3);
+    expect(retryRunner.calls.some((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toBe(false);
+    expect(retryRunner.calls.every((call) => call.credential === "project")).toBe(true);
   }, 20_000);
 
   it("24. cleanup recovery resumes failures after release, pending-remove persistence, and physical removal before any successor Claim", async () => {
@@ -1524,7 +1541,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const secret = "unmistakably-fake-cross-boundary-secret";
     const projectRunner = new GateProjectRunner();
     const project = new GitHubProjectClient({
-      githubOwner: "jhw7500", projectNumber: 7, registryRepository: "jhw7500/project-registry",
+      githubOwner: "jhw7500", projectNumber: 7,
       preflightProjectItemId: "PVTI_trial", runner: projectRunner, catalog: graph.catalog,
       sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
     });
@@ -1593,8 +1610,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     let projectCalls = 0;
     const project: PreflightProjectPort = {
       verifyFields: async () => { projectCalls += 1; },
-      addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; },
-      verifyItemContentId: async () => { projectCalls += 1; return "I_trial"; },
+      verifyPreflightItem: async () => { projectCalls += 1; },
       readLastReviewed: async () => { projectCalls += 1; return undefined; },
       writeLastReviewed: async () => { projectCalls += 1; },
       clearLastReviewed: async () => { projectCalls += 1; },
@@ -1618,7 +1634,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
   it("27. journal gaps preserve Project registration and Task finish success coordinates without duplicate pressure", async () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
-    const projectLinks = new Map<string, { project_id: string; project_item_id: string; source_node_id: string; issue_number: number }>();
+    const projectLinks = new Map<string, { project_id: string; project_item_id: string; source_node_id: string }>();
     let projectCreates = 0;
     const failingJournal = { append: async () => { throw new Error("injected measurement outage"); } };
     const projectPort = {
@@ -1627,7 +1643,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
         let link = projectLinks.get(input.project_id);
         if (!link) {
           projectCreates += 1;
-          link = { project_id: input.project_id, project_item_id: "PVTI_journal", source_node_id: "I_journal", issue_number: 91 };
+          link = { project_id: input.project_id, project_item_id: "PVTI_journal", source_node_id: "DI_journal" };
           projectLinks.set(input.project_id, link);
         }
         return link;
@@ -1646,7 +1662,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(retryProject.exitCode).toBe(0);
     expect(JSON.parse(firstProject.stdout)).toEqual(JSON.parse(retryProject.stdout));
     expect(JSON.parse(firstProject.stdout)).toMatchObject({
-      result: { project_id: "prj-journal", project_item_id: "PVTI_journal", source_node_id: "I_journal", issue_number: 91 },
+      result: { project_id: "prj-journal", project_item_id: "PVTI_journal", source_node_id: "DI_journal" },
       journal_warning: { code: "JOURNAL_WRITE_FAILED" },
     });
     expect(projectCreates).toBe(1);

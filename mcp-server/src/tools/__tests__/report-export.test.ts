@@ -115,7 +115,7 @@ describe("registerReportExport", () => {
 
   it("writeBack.db=decisionLog면 decisionLog에 저장 + status/area 포함", async () => {
     const { server, capturedTools } = createMockServer();
-    registerReportExport(server);
+    registerReportExport(server, legacyAuthority);
     mockClient.dataSources.query.mockResolvedValue({ results: [] });
     mockClient.pages.create.mockResolvedValue({
       id: "d-1",

@@ -29,12 +29,20 @@ const requiredFields = [
   { __typename: "ProjectV2Field", id: "PVTF_reviewed", name: "Last Reviewed", dataType: "DATE" },
 ];
 
-function projectItem(index: number) {
+function connection<T>(nodes: T[], totalCount = nodes.length, hasNextPage = false, endCursor: string | null = null) {
+  return { totalCount, nodes, pageInfo: { hasNextPage, endCursor } };
+}
+
+function recordBody(index: number, projectId = `prj-project-${index}`) {
+  return JSON.stringify({ id: projectId, objective: `Objective ${index}`, repositories: ["repo-control"] });
+}
+
+function recordItem(index: number, projectId = `prj-project-${index}`) {
   return {
     id: `PVTI_${index}`,
     isArchived: false,
-    type: "ISSUE",
-    content: { __typename: "Issue", id: `I_${index}` },
+    type: "DRAFT_ISSUE",
+    content: { __typename: "DraftIssue", id: `DI_${index}`, title: `Project ${index}`, body: recordBody(index, projectId) },
     status: { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-active", name: "active" },
     priority: { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P2", name: "P2" },
     health: { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-on-track", name: "on-track" },
@@ -43,19 +51,55 @@ function projectItem(index: number) {
   };
 }
 
-function connection<T>(nodes: T[], totalCount: number, hasNextPage = false, endCursor: string | null = null) {
-  return { totalCount, nodes, pageInfo: { hasNextPage, endCursor } };
+function preflightItem() {
+  return {
+    id: "PVTI_preflight",
+    isArchived: false,
+    type: "DRAFT_ISSUE",
+    content: {
+      __typename: "DraftIssue",
+      id: "DI_preflight",
+      title: "[TRIAL] Project Control Preflight Fixture",
+      body: "unchanged",
+    },
+    status: null,
+    priority: null,
+    health: null,
+    nextAction: null,
+    lastReviewed: { __typename: "ProjectV2ItemFieldDateValue", date: "2026-08-13" },
+  };
 }
 
-function projectPageFixture(input: {
-  start?: number;
-  count: number;
-  totalCount: number;
-  hasNextPage: boolean;
-  endCursor: string | null;
+function projectPage(input: {
+  records?: ReturnType<typeof recordItem>[];
+  includeFixture?: boolean;
+  itemTotal?: number;
+  itemNext?: boolean;
+  itemCursor?: string | null;
   fields?: typeof requiredFields;
+  fieldTotal?: number;
+  fieldNext?: boolean;
+  fieldCursor?: string | null;
+  public?: boolean;
 }) {
-  const start = input.start ?? 1;
+  const records = input.records ?? [];
+  const nodes = [...(input.includeFixture === false ? [] : [preflightItem()]), ...records];
+  return {
+    data: {
+      user: {
+        projectV2: {
+          id: "PVT_project",
+          public: input.public ?? false,
+          updatedAt: "2026-08-13T00:00:00Z",
+          fields: connection(input.fields ?? requiredFields, input.fieldTotal ?? (input.fields?.length ?? requiredFields.length), input.fieldNext, input.fieldCursor ?? null),
+          items: connection(nodes, input.itemTotal ?? nodes.length, input.itemNext, input.itemCursor ?? null),
+        },
+      },
+    },
+  };
+}
+
+function fieldPage(fields: typeof requiredFields, total: number) {
   return {
     data: {
       user: {
@@ -63,655 +107,359 @@ function projectPageFixture(input: {
           id: "PVT_project",
           public: false,
           updatedAt: "2026-08-13T00:00:00Z",
-          fields: connection(input.fields ?? requiredFields, input.fields?.length ?? requiredFields.length),
-          items: connection(
-            Array.from({ length: input.count }, (_, offset) => projectItem(start + offset)),
-            input.totalCount,
-            input.hasNextPage,
-            input.endCursor,
-          ),
+          fields: connection(fields, total),
         },
       },
     },
   };
 }
 
-function issueFixture(index: number) {
+function preflightResponse(lastReviewed: unknown = null, content: unknown = preflightItem().content) {
   return {
-    node_id: `I_${index}`,
-    number: index,
-    title: `Project ${index}`,
-    body: JSON.stringify({ id: `prj-project-${index}`, objective: `Objective ${index}`, repositories: ["repo-control"] }),
-    labels: [{ name: "trial" }, { name: "project-record" }],
+    data: {
+      node: {
+        __typename: "ProjectV2Item",
+        id: "PVTI_preflight",
+        type: "DRAFT_ISSUE",
+        content,
+        lastReviewed,
+      },
+    },
   };
 }
 
 function catalogFixture() {
   return {
-    getRepository: vi.fn(async (repoId: string) => ({ id: repoId, github_node_id: "R_repo", slug: "owner/repo" })),
-    getTask: vi.fn(async (taskId: string) => ({ id: taskId })),
+    getRepository: vi.fn(async (id: string) => ({ id })),
+    getTask: vi.fn(async (id: string) => ({ id })),
   };
 }
 
-function client(gh: QueuedGhRunner, catalog = catalogFixture()) {
+function client(runner: QueuedGhRunner, catalog = catalogFixture()) {
   return new GitHubProjectClient({
     githubOwner: "owner",
     projectNumber: 7,
-    registryRepository: "owner/registry",
     preflightProjectItemId: "PVTI_preflight",
-    runner: gh,
+    runner,
     catalog,
     now: () => new Date("2026-08-13T00:00:00Z"),
   });
 }
 
+const registration = {
+  project_id: "prj-example",
+  title: "Example",
+  objective: "Prove the trial flow",
+  repo_ids: ["repo-example"],
+  fields: {
+    status: "proposed" as const,
+    priority: "P2" as const,
+    health: "unknown" as const,
+    next_action: "wait:select-first-task",
+    last_reviewed: "2026-08-13",
+  },
+};
+
+function registrationRecord(fields: "empty" | "complete" = "complete") {
+  const record = recordItem(1, registration.project_id);
+  record.content.id = "DI_registration";
+  record.content.title = registration.title;
+  record.content.body = JSON.stringify({
+    id: registration.project_id,
+    objective: registration.objective,
+    repositories: registration.repo_ids,
+  });
+  if (fields === "empty") {
+    record.status = null as never;
+    record.priority = null as never;
+    record.health = null as never;
+    record.nextAction = null as never;
+    record.lastReviewed = null as never;
+  } else {
+    record.status.name = registration.fields.status;
+    record.status.optionId = `status-${registration.fields.status}`;
+    record.priority.name = registration.fields.priority;
+    record.priority.optionId = `priority-${registration.fields.priority}`;
+    record.health.name = registration.fields.health;
+    record.health.optionId = `health-${registration.fields.health}`;
+    record.nextAction.text = registration.fields.next_action;
+    record.lastReviewed.date = registration.fields.last_reviewed;
+  }
+  return record;
+}
+
+function draftMutation(record = registrationRecord("empty")) {
+  return {
+    data: { addProjectV2DraftIssue: { projectItem: {
+      id: record.id,
+      type: record.type,
+      content: record.content,
+    } } },
+  };
+}
+
+const fieldMutation = { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_1" } } } };
+
 describe("GitHubProjectClient", () => {
   it("rejects protected registration content before any GitHub call", async () => {
-    const gh = new QueuedGhRunner();
+    const runner = new QueuedGhRunner();
     const secret = "unmistakably-fake-project-token";
     const github = new GitHubProjectClient({
-      githubOwner: "owner",
-      projectNumber: 7,
-      registryRepository: "owner/registry",
-      preflightProjectItemId: "PVTI_preflight",
-      runner: gh,
-      catalog: catalogFixture(),
+      githubOwner: "owner", projectNumber: 7,
+      preflightProjectItemId: "PVTI_preflight", runner, catalog: catalogFixture(),
       sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
     });
 
-    const error = await github.registerProject({
-      project_id: "prj-project-1",
-      title: "Project 1",
-      objective: `contains ${secret}`,
-      repo_ids: ["repo-control"],
-      fields: {
-        status: "active", priority: "P2", health: "blocked",
-        next_action: "wait:fixture", last_reviewed: "2026-08-13",
-      },
-    }).catch((cause) => cause);
+    const error = await github.registerProject({ ...registration, objective: `contains ${secret}` }).catch((cause) => cause);
     expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
     expect(JSON.stringify(error)).not.toContain(secret);
-    expect(gh.calls).toEqual([]);
+    expect(runner.calls).toEqual([]);
   });
 
-  it("rejects an absolute source-checkout path before any GitHub Project call", async () => {
-    const gh = new QueuedGhRunner();
-
-    await expect(client(gh).registerProject({
-      project_id: "prj-project-1",
-      title: "Project 1",
-      objective: "contains /srv/private/source-checkout",
-      repo_ids: ["repo-control"],
-      fields: {
-        status: "active", priority: "P2", health: "blocked",
-        next_action: "wait:fixture", last_reviewed: "2026-08-13",
-      },
-    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
-    expect(gh.calls).toEqual([]);
-  });
-
-  it("rejects a public Project before treating it as trial authority", async () => {
-    const gh = new QueuedGhRunner();
-    const page = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });
-    (page.data.user.projectV2 as typeof page.data.user.projectV2 & { public: boolean }).public = true;
-    gh.enqueue(page);
-
-    await expect(client(gh).readAll()).rejects.toMatchObject({ code: "PROJECT_NOT_PRIVATE" });
-  });
-
-  it("proves a Project Record contains the Repository and is attached exactly once", async () => {
-    const gh = new QueuedGhRunner();
-    gh.enqueue(
-      projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null }),
-      [[issueFixture(1)]],
-    );
-
-    await expect(client(gh).requireProjectRepository("prj-project-1", "repo-control")).resolves.toBeUndefined();
-  });
-
-  it("rejects an unlabeled canonical duplicate during Project membership proof", async () => {
-    const gh = new QueuedGhRunner();
-    const complete = issueFixture(1);
-    const unlabeled = { ...complete, node_id: "I_duplicate", number: 2, labels: [] };
-    gh.enqueue(
-      projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null }),
-      [[complete, unlabeled]],
-    );
-
-    await expect(client(gh).requireProjectRepository("prj-project-1", "repo-control")).rejects.toMatchObject({
-      code: "DUPLICATE_PROJECT_RECORD",
-    });
-  });
-
-  it("rejects missing Repository membership or an unattached Project Record", async () => {
-    const wrongRepo = new QueuedGhRunner();
-    wrongRepo.enqueue(
-      projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null }),
-      [[issueFixture(1)]],
-    );
-    await expect(client(wrongRepo).requireProjectRepository("prj-project-1", "repo-other")).rejects.toMatchObject({
-      code: "PROJECT_REPOSITORY_MISMATCH",
-    });
-
-    const unattached = new QueuedGhRunner();
-    unattached.enqueue(
-      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [[issueFixture(1)]],
-    );
-    await expect(client(unattached).requireProjectRepository("prj-project-1", "repo-control")).rejects.toMatchObject({
-      code: "PROJECT_RECORD_NOT_ATTACHED",
-    });
-  });
-
-  it("continues until hasNextPage is false and rejects totalCount mismatch", async () => {
-    const gh = new QueuedGhRunner();
-    const github = client(gh);
-    gh.enqueue(
-      projectPageFixture({ count: 100, totalCount: 101, hasNextPage: true, endCursor: "c1" }),
-      projectPageFixture({ start: 101, count: 1, totalCount: 101, hasNextPage: false, endCursor: null }),
-      [
-        Array.from({ length: 100 }, (_, index) => issueFixture(index + 1)),
-        [issueFixture(101)],
-      ],
-    );
-
-    const source = await github.readAll();
-
-    expect(source.items).toHaveLength(101);
-    expect(gh.calls.filter((call) => call.credential === "project")).toHaveLength(2);
-    expect(gh.calls[0]?.args.join("\n")).toContain("archivedStates: [ARCHIVED, NOT_ARCHIVED]");
-    expect(gh.calls[0]?.args).not.toContain("itemCursor=c1");
-    expect(gh.calls[1]?.args).toContain("itemCursor=c1");
-    expect(gh.calls.filter((call) => call.credential === "repo")).toHaveLength(1);
-    const issueCall = gh.calls.find((call) => call.credential === "repo");
-    expect(issueCall?.args).toEqual(expect.arrayContaining(["--paginate", "--slurp", "--raw-field", "labels=trial,project-record"]));
-    expect(issueCall?.args.some((arg) => arg.startsWith("page="))).toBe(false);
-
-    const incomplete = new QueuedGhRunner();
-    incomplete.enqueue(
-      projectPageFixture({ count: 1, totalCount: 2, hasNextPage: false, endCursor: null }),
-      [[issueFixture(1)]],
-    );
-    await expect(client(incomplete).readAll()).rejects.toMatchObject({ code: "INCOMPLETE_PROJECT_READ" });
-  });
-
-  it("paginates field definitions separately and rejects duplicate required fields", async () => {
-    const gh = new QueuedGhRunner();
-    const initial = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });
-    initial.data.user.projectV2.fields = connection(requiredFields.slice(0, 4), 6, true, "fields-c1");
-    const duplicate = {
-      data: {
-        user: {
-          projectV2: {
-            id: "PVT_project",
-            public: false,
-            updatedAt: "2026-08-13T00:00:00Z",
-            fields: connection([requiredFields[4], { ...requiredFields[0], id: "PVTF_status_duplicate" }], 6),
-          },
-        },
-      },
-    };
-    gh.enqueue(initial, duplicate);
-
-    await expect(client(gh).readAll()).rejects.toMatchObject({ code: "INVALID_PROJECT_FIELDS" });
-    expect(gh.calls[1]?.args).toContain("fieldCursor=fields-c1");
-  });
-
-  it("fails closed on a redacted source item or invalid operating-field option", async () => {
-    const redacted = new QueuedGhRunner();
-    const page = projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null });
-    page.data.user.projectV2.items.nodes[0]!.content = { __typename: "Redacted" } as { __typename: string; id: string };
-    redacted.enqueue(page);
-    await expect(client(redacted).readAll()).rejects.toMatchObject({ code: "PROJECT_SOURCE_REDACTED" });
-
-    const badOption = new QueuedGhRunner();
-    const optionPage = projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null });
-    optionPage.data.user.projectV2.items.nodes[0]!.priority.name = "P9";
-    badOption.enqueue(optionPage);
-    await expect(client(badOption).readAll()).rejects.toMatchObject({ code: "INVALID_PROJECT_ITEM" });
-  });
-
-  it("rejects duplicate source attachments before portfolio rows are emitted", async () => {
-    const gh = new QueuedGhRunner();
-    const page = projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null });
-    page.data.user.projectV2.items.nodes[1]!.content = { __typename: "Issue", id: "I_1" };
-    gh.enqueue(page, [[issueFixture(1)]]);
-
-    await expect(client(gh).readAll()).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_ITEM" });
-  });
-
-  it("rejects two Project Record Issues that claim one canonical Project ID", async () => {
-    const gh = new QueuedGhRunner();
-    const duplicate = issueFixture(2);
-    duplicate.body = JSON.stringify({ id: "prj-project-1", objective: "Other", repositories: ["repo-control"] });
-    gh.enqueue(
-      projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null }),
-      [[issueFixture(1), duplicate]],
-    );
-
-    await expect(client(gh).readAll()).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_RECORD" });
-  });
-
-  it("rejects protected or oversized API coordinates before they can be reused outbound", async () => {
-    const secret = "unmistakably-fake-project-api-token";
-    for (const [kind, mutate, expectedCode] of [
-      ["protected", (page: ReturnType<typeof projectPageFixture>) => { page.data.user.projectV2.fields.nodes[0]!.id = secret; }, "SENSITIVE_DATA_REJECTED"],
-      ["oversized", (page: ReturnType<typeof projectPageFixture>) => { page.data.user.projectV2.id = `PVT_${"x".repeat(300)}`; }, "INVALID_PROJECT_RESPONSE"],
-    ] as const) {
-      const gh = new QueuedGhRunner();
-      const page = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });
-      mutate(page);
-      gh.enqueue(page);
+  it("rejects protected DraftIssue mutation coordinates before any field write", async () => {
+    const secret = "unmistakably-fake-project-result-token";
+    for (const coordinate of [secret, "/srv/private-project-result"]) {
+      const runner = new QueuedGhRunner();
+      const record = registrationRecord("empty");
+      record.content.id = coordinate;
+      runner.enqueue(projectPage({}), draftMutation(record));
       const github = new GitHubProjectClient({
-        githubOwner: "owner",
-        projectNumber: 7,
-        registryRepository: "owner/registry",
-        preflightProjectItemId: "PVTI_preflight",
-        runner: gh,
-        catalog: catalogFixture(),
+        githubOwner: "owner", projectNumber: 7,
+        preflightProjectItemId: "PVTI_preflight", runner, catalog: catalogFixture(),
         sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
       });
 
-      const error = await github.readAll().catch((cause: unknown) => cause);
-      expect(error, kind).toMatchObject({ code: expectedCode });
-      expect(gh.calls, kind).toHaveLength(1);
-      expect(JSON.stringify(error), kind).not.toContain(secret);
+      const error = await github.registerProject(registration).catch((cause) => cause);
+      expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+      expect(JSON.stringify(error)).not.toContain(coordinate);
+      expect(runner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(0);
     }
   });
 
-  it("rejects a protected mutation result before any follow-up Project call", async () => {
-    const gh = new QueuedGhRunner();
-    const secret = "unmistakably-fake-project-mutation-token";
-    const issue = {
-      node_id: "I_new",
-      number: 77,
-      title: "Example",
-      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels: [{ name: "trial" }, { name: "project-record" }],
-    };
-    gh.enqueue(
-      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [[]],
-      issue,
-      issue,
-      { data: { addProjectV2ItemById: { item: { id: secret } } } },
-    );
-    const github = new GitHubProjectClient({
-      githubOwner: "owner",
-      projectNumber: 7,
-      registryRepository: "owner/registry",
-      preflightProjectItemId: "PVTI_preflight",
-      runner: gh,
-      catalog: catalogFixture(),
-      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
-    });
-
-    const error = await github.registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "Prove the trial flow",
-      repo_ids: ["repo-example"],
-      fields: {
-        status: "proposed", priority: "P2", health: "unknown",
-        next_action: "wait:select-first-task", last_reviewed: "2026-08-13",
-      },
-    }).catch((cause: unknown) => cause);
-
-    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
-    expect(gh.calls).toHaveLength(5);
-    expect(JSON.stringify(error)).not.toContain(secret);
+  it("rejects a public Project", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(projectPage({ public: true }));
+    await expect(client(runner).readAll()).rejects.toMatchObject({ code: "PROJECT_NOT_PRIVATE" });
   });
 
-  it("creates a verified trial Issue, attaches it, and writes all five fields", async () => {
-    const gh = new QueuedGhRunner();
-    const catalog = catalogFixture();
-    const github = client(gh, catalog);
-    const project = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });
-    const issue = {
-      node_id: "I_new",
-      number: 77,
-      title: "Example",
-      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels: [{ name: "trial" }, { name: "project-record" }],
-    };
-    const verifiedPage = projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null });
-    const verifiedItem = verifiedPage.data.user.projectV2.items.nodes[0]!;
-    verifiedItem.id = "PVTI_new";
-    verifiedItem.content = { __typename: "Issue", id: "I_new" };
-    verifiedItem.status = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" };
-    verifiedItem.health = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" };
-    verifiedItem.nextAction = { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select-first-task" };
-    gh.enqueue(
-      project,
-      [[{
-        node_id: "I_preflight",
-        number: 900,
-        title: "Preflight fixture",
-        body: "unchanged",
-        labels: [{ name: "trial" }],
-      }]],
-      issue,
-      issue,
-      { data: { addProjectV2ItemById: { item: { id: "PVTI_new" } } } },
-      {
-        data: {
-          node: {
-            __typename: "ProjectV2Item",
-            id: "PVTI_new",
-            type: "ISSUE",
-            content: { __typename: "Issue", id: "I_new" },
-            lastReviewed: null,
-          },
-        },
-      },
-      ...Array.from({ length: 5 }, () => ({ data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_new" } } } })),
-      verifiedPage,
+  it("proves repository membership from exactly one DraftIssue record", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(projectPage({ records: [recordItem(1)] }));
+    await expect(client(runner).requireProjectRepository("prj-project-1", "repo-control")).resolves.toBeUndefined();
+
+    const wrong = new QueuedGhRunner();
+    wrong.enqueue(projectPage({ records: [recordItem(1)] }));
+    await expect(client(wrong).requireProjectRepository("prj-project-1", "repo-other")).rejects.toMatchObject({ code: "PROJECT_REPOSITORY_MISMATCH" });
+  });
+
+  it("paginates archived and active Project items without any repo credential call", async () => {
+    const runner = new QueuedGhRunner();
+    const first = Array.from({ length: 100 }, (_, i) => recordItem(i + 1));
+    runner.enqueue(
+      projectPage({ records: first, itemTotal: 102, itemNext: true, itemCursor: "c1" }),
+      projectPage({ records: [recordItem(101)], includeFixture: false, itemTotal: 102 }),
     );
 
-    const registered = await github.registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "Prove the trial flow",
-      repo_ids: ["repo-example"],
-      fields: {
-        status: "proposed",
-        priority: "P2",
-        health: "unknown",
-        next_action: "wait:select-first-task",
-        last_reviewed: "2026-08-13",
-      },
-    });
+    const result = await client(runner).readAll();
+    expect(result.items).toHaveLength(101);
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls.every((call) => call.credential === "project")).toBe(true);
+    expect(runner.calls[0]?.args.join("\n")).toContain("archivedStates: [ARCHIVED, NOT_ARCHIVED]");
+    expect(runner.calls[1]?.args).toContain("itemCursor=c1");
 
-    expect(registered).toEqual({ project_id: "prj-example", project_item_id: "PVTI_new", source_node_id: "I_new", issue_number: 77 });
-    expect(catalog.getRepository).toHaveBeenCalledWith("repo-example");
-    const create = gh.calls.find((call) => call.args.includes("--method") && call.args.includes("POST") && call.args.includes("repos/owner/registry/issues"));
-    expect(create).toMatchObject({ credential: "repo" });
-    expect(create?.args).toEqual(expect.arrayContaining([
-      "-H", "X-GitHub-Api-Version: 2026-03-10",
-      "--raw-field", "labels[]=trial",
-      "--raw-field", "labels[]=project-record",
-    ]));
-    expect(gh.calls.some((call) => call.args.includes("itemId=PVTI_new"))).toBe(true);
-    expect(gh.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(5);
+    const incomplete = new QueuedGhRunner();
+    incomplete.enqueue(projectPage({ records: [recordItem(1)], itemTotal: 3 }));
+    await expect(client(incomplete).readAll()).rejects.toMatchObject({ code: "INCOMPLETE_PROJECT_READ" });
   });
 
-  it("rejects a duplicate source attachment that appears during final verification", async () => {
-    const gh = new QueuedGhRunner();
-    const initial = projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null });
-    const issue = {
-      node_id: "I_new",
-      number: 77,
-      title: "Example",
-      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels: [{ name: "trial" }, { name: "project-record" }],
-    };
-    const final = projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null });
-    for (const [index, item] of final.data.user.projectV2.items.nodes.entries()) {
-      item.id = index === 0 ? "PVTI_new" : "PVTI_duplicate";
-      item.content = { __typename: "Issue", id: "I_new" };
-      item.status = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" };
-      item.health = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" };
-      item.nextAction = { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select-first-task" };
-    }
-    gh.enqueue(
-      initial,
-      [[{ node_id: "I_preflight", number: 900, title: "Preflight fixture", body: "unchanged", labels: [{ name: "trial" }] }]],
-      issue,
-      issue,
-      { data: { addProjectV2ItemById: { item: { id: "PVTI_new" } } } },
-      { data: { node: { __typename: "ProjectV2Item", id: "PVTI_new", type: "ISSUE", content: { __typename: "Issue", id: "I_new" }, lastReviewed: null } } },
-      ...Array.from({ length: 5 }, () => ({ data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_new" } } } })),
-      final,
+  it("paginates field definitions separately and rejects a duplicate required field", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      projectPage({ fields: requiredFields.slice(0, 4), fieldTotal: 6, fieldNext: true, fieldCursor: "f1" }),
+      fieldPage([requiredFields[4]!, { ...requiredFields[0]!, id: "PVTF_duplicate" }], 6),
     );
-
-    await expect(client(gh).registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "Prove the trial flow",
-      repo_ids: ["repo-example"],
-      fields: {
-        status: "proposed", priority: "P2", health: "unknown",
-        next_action: "wait:select-first-task", last_reviewed: "2026-08-13",
-      },
-    })).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_ITEM" });
-  });
-
-  it("reuses exactly one already-attached Project item after an interrupted registration", async () => {
-    const gh = new QueuedGhRunner();
-    const page = projectPageFixture({ count: 1, totalCount: 1, hasNextPage: false, endCursor: null });
-    const item = page.data.user.projectV2.items.nodes[0]!;
-    item.id = "PVTI_existing";
-    item.content = { __typename: "Issue", id: "I_existing" };
-    item.status = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" };
-    item.health = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" };
-    item.nextAction = { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select" };
-    const issue = {
-      node_id: "I_existing",
-      number: 77,
-      title: "Example",
-      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels: [{ name: "trial" }, { name: "project-record" }],
-    };
-    gh.enqueue(
-      page,
-      [[issue]],
-      issue,
-      ...Array.from({ length: 5 }, () => ({ data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_existing" } } } })),
-      page,
-    );
-
-    await expect(client(gh).registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "Prove the trial flow",
-      repo_ids: ["repo-example"],
-      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
-    })).resolves.toMatchObject({ project_item_id: "PVTI_existing", source_node_id: "I_existing" });
-
-    expect(gh.calls.some((call) => call.args.join(" ").includes("addProjectV2ItemById"))).toBe(false);
-  });
-
-  it("fails closed when one Project Record source is attached more than once", async () => {
-    const gh = new QueuedGhRunner();
-    const page = projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null });
-    for (const item of page.data.user.projectV2.items.nodes) item.content = { __typename: "Issue", id: "I_existing" };
-    const issue = {
-      node_id: "I_existing",
-      number: 77,
-      title: "Example",
-      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels: [{ name: "trial" }, { name: "project-record" }],
-    };
-    gh.enqueue(page, [[issue]], issue);
-
-    await expect(client(gh).registerProject({
-      project_id: "prj-example", title: "Example", objective: "Prove the trial flow", repo_ids: ["repo-example"],
-      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
-    })).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_ITEM" });
-  });
-
-  it("fails closed on duplicate/mismatched idempotency records and invalid active Next Action", async () => {
-    const mismatch = new QueuedGhRunner();
-    const existing = issueFixture(1);
-    existing.body = JSON.stringify({ id: "prj-example", objective: "different", repositories: ["repo-example"] });
-    mismatch.enqueue(
-      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [[existing]],
-    );
-    await expect(client(mismatch).registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "expected",
-      repo_ids: ["repo-example"],
-      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
-    })).rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
-
-    const invalid = new QueuedGhRunner();
-    await expect(client(invalid).registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "expected",
-      repo_ids: ["repo-example"],
-      fields: { status: "active", priority: "P2", health: "on-track", next_action: "wait:not-blocked", last_reviewed: "2026-08-13" },
-    })).rejects.toMatchObject({ code: "INVALID_PROJECT_NEXT_ACTION" });
-    expect(invalid.calls).toHaveLength(0);
-  });
-
-  it("does not create a duplicate when a labeled Project Record body is malformed", async () => {
-    const gh = new QueuedGhRunner();
-    const malformed = {
-      ...issueFixture(77),
-      body: JSON.stringify({ id: "prj-example", objective: "Malformed", repositories: "repo-example" }),
-    };
-    gh.enqueue(
-      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [[malformed]],
-    );
-
-    await expect(client(gh).registerProject({
-      project_id: "prj-example", title: "Example", objective: "Prove the trial flow", repo_ids: ["repo-example"],
-      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
-    })).rejects.toMatchObject({ code: "INVALID_PROJECT_RECORD" });
-    expect(gh.calls.some((call) => call.args.includes("POST"))).toBe(false);
-  });
-
-  it("uses the shortest active cadence but never marks completed projects stale", async () => {
-    const gh = new QueuedGhRunner();
-    const page = projectPageFixture({ count: 2, totalCount: 2, hasNextPage: false, endCursor: null });
-    page.data.user.projectV2.items.nodes[0]!.priority.name = "P0";
-    page.data.user.projectV2.items.nodes[0]!.priority.optionId = "priority-P0";
-    page.data.user.projectV2.items.nodes[0]!.lastReviewed.date = "2026-08-11";
-    page.data.user.projectV2.items.nodes[1]!.status.name = "completed";
-    page.data.user.projectV2.items.nodes[1]!.status.optionId = "status-completed";
-    page.data.user.projectV2.items.nodes[1]!.priority.name = "P0";
-    page.data.user.projectV2.items.nodes[1]!.priority.optionId = "priority-P0";
-    page.data.user.projectV2.items.nodes[1]!.nextAction.text = "wait:done";
-    page.data.user.projectV2.items.nodes[1]!.lastReviewed.date = "2020-01-01";
-    gh.enqueue(page, [[issueFixture(1), issueFixture(2)]]);
-
-    const result = await client(gh).readAll();
-
-    expect(result.items.map((entry) => entry.stale)).toEqual([true, false]);
-  });
-
-  it("follows slurped Link pages even when the first page is short and ignores the trial-only preflight fixture", async () => {
-    const gh = new QueuedGhRunner();
-    const page = projectPageFixture({ count: 2, totalCount: 3, hasNextPage: false, endCursor: null });
-    page.data.user.projectV2.items.nodes.push({
-      id: "PVTI_preflight",
-      isArchived: false,
-      type: "ISSUE",
-      content: { __typename: "Issue", id: "I_preflight" },
-      status: null,
-      priority: null,
-      health: null,
-      nextAction: null,
-      lastReviewed: { __typename: "ProjectV2ItemFieldDateValue", date: "2026-08-13" },
-    });
-    const preflightFixture = {
-      node_id: "I_preflight",
-      number: 900,
-      title: "Preflight fixture",
-      body: "unchanged",
-      labels: [{ name: "trial" }],
-    };
-    gh.enqueue(page, [[preflightFixture, issueFixture(1)], [issueFixture(2)]]);
-
-    const result = await client(gh).readAll();
-
-    expect(result.items.map((entry) => entry.project_id)).toEqual(["prj-project-1", "prj-project-2"]);
-    expect(gh.calls.filter((call) => call.credential === "repo")).toHaveLength(1);
-  });
-
-  it("fails closed without creating a duplicate when an exact interrupted record is missing project-record", async () => {
-    const gh = new QueuedGhRunner();
-    const partial = {
-      node_id: "I_partial",
-      number: 77,
-      title: "Example",
-      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels: [{ name: "trial" }],
-    };
-    gh.enqueue(
-      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [[partial]],
-    );
-
-    const error = await client(gh).registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "Prove the trial flow",
-      repo_ids: ["repo-example"],
-      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
-    }).catch((cause: unknown) => cause);
-
-    expect(error).toMatchObject({
-      code: "PROJECT_RECORD_LABEL_RECOVERY_REQUIRED",
-      details: { issue_number: 77, missing_labels: ["project-record"] },
-    });
-    expect(gh.calls.some((call) => call.args.includes("POST") && call.args.includes("repos/owner/registry/issues"))).toBe(false);
+    await expect(client(runner).readAll()).rejects.toMatchObject({ code: "INVALID_PROJECT_FIELDS" });
+    expect(runner.calls[1]?.args).toContain("fieldCursor=f1");
   });
 
   it.each([
-    ["project-record-only", [{ name: "project-record" }], ["trial"]],
-    ["unlabeled", [], ["trial", "project-record"]],
-  ])("finds a canonical %s interrupted record without a label-filtered query", async (_case, labels, missingLabels) => {
-    const gh = new QueuedGhRunner();
-    const partial = {
-      node_id: "I_partial",
-      number: 78,
-      title: "Example",
-      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels,
-    };
-    gh.enqueue(
-      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [[partial]],
-    );
+    ["redacted", null],
+    ["repository Issue", { __typename: "Issue" }],
+  ])("fails closed on %s content without falling back to the repo credential", async (_label, content) => {
+    const runner = new QueuedGhRunner();
+    const record = recordItem(1);
+    record.content = content as typeof record.content;
+    runner.enqueue(projectPage({ records: [record] }));
 
-    const error = await client(gh).registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "Prove the trial flow",
-      repo_ids: ["repo-example"],
-      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
-    }).catch((cause: unknown) => cause);
-
-    expect(error).toMatchObject({
-      code: "PROJECT_RECORD_LABEL_RECOVERY_REQUIRED",
-      details: { issue_number: 78, missing_labels: missingLabels },
-    });
-    const issueList = gh.calls.find((call) => call.credential === "repo");
-    expect(issueList?.args).toEqual(expect.arrayContaining(["--paginate", "--slurp"]));
-    expect(issueList?.args.some((arg) => arg.startsWith("labels="))).toBe(false);
-    expect(gh.calls.some((call) => call.args.includes("POST") && call.args.includes("repos/owner/registry/issues"))).toBe(false);
+    await expect(client(runner).readAll()).rejects.toMatchObject({ code: "INVALID_PROJECT_RECORD" });
+    expect(runner.calls.every((call) => call.credential === "project")).toBe(true);
   });
 
-  it("detects a complete and partial canonical record with the same ID before any create or adoption", async () => {
-    const gh = new QueuedGhRunner();
-    const complete = {
-      node_id: "I_complete",
-      number: 79,
-      title: "Example",
-      body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-example"] }),
-      labels: [{ name: "trial" }, { name: "project-record" }],
+  it("rejects a missing or mispointed configured preflight fixture", async () => {
+    const missing = new QueuedGhRunner();
+    missing.enqueue(projectPage({ records: [recordItem(1)], includeFixture: false }));
+    await expect(client(missing).readAll()).rejects.toMatchObject({ code: "INVALID_PREFLIGHT_ITEM" });
+
+    const hidden = new QueuedGhRunner();
+    const fixture = preflightItem();
+    fixture.content = recordItem(9).content;
+    const page = projectPage({ records: [recordItem(1)] });
+    page.data.user.projectV2.items.nodes[0] = fixture;
+    hidden.enqueue(page);
+    await expect(client(hidden).readAll()).rejects.toMatchObject({ code: "INVALID_PREFLIGHT_ITEM" });
+  });
+
+  it("rejects malformed, duplicate-source, and duplicate-project DraftIssue records", async () => {
+    const malformed = new QueuedGhRunner();
+    const bad = recordItem(1);
+    bad.content.body = "{}";
+    malformed.enqueue(projectPage({ records: [bad] }));
+    await expect(client(malformed).readAll()).rejects.toMatchObject({ code: "INVALID_PROJECT_RECORD" });
+
+    const duplicateSource = new QueuedGhRunner();
+    const left = recordItem(1);
+    const right = recordItem(2);
+    right.content.id = left.content.id;
+    duplicateSource.enqueue(projectPage({ records: [left, right] }));
+    await expect(client(duplicateSource).readAll()).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_ITEM" });
+
+    const duplicateProject = new QueuedGhRunner();
+    duplicateProject.enqueue(projectPage({ records: [recordItem(1), recordItem(2, "prj-project-1")] }));
+    await expect(client(duplicateProject).readAll()).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_RECORD" });
+  });
+
+  it("rejects invalid operating fields and applies the shortest stale cadence", async () => {
+    const invalid = new QueuedGhRunner();
+    const bad = recordItem(1);
+    bad.priority.name = "P9";
+    invalid.enqueue(projectPage({ records: [bad] }));
+    await expect(client(invalid).readAll()).rejects.toMatchObject({ code: "INVALID_PROJECT_ITEM" });
+
+    const stale = new QueuedGhRunner();
+    const p0 = recordItem(1);
+    p0.priority = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P0", name: "P0" };
+    p0.lastReviewed.date = "2026-08-11";
+    const completed = recordItem(2);
+    completed.status = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-completed", name: "completed" };
+    completed.priority = { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P0", name: "P0" };
+    completed.nextAction.text = "wait:done";
+    completed.lastReviewed.date = "2020-01-01";
+    stale.enqueue(projectPage({ records: [p0, completed] }));
+    expect((await client(stale).readAll()).items.map((entry) => entry.stale)).toEqual([true, false]);
+  });
+
+  it("fails an idempotent retry when the exact Project ID has different content", async () => {
+    const runner = new QueuedGhRunner();
+    const existing = recordItem(1, "prj-example");
+    runner.enqueue(projectPage({ records: [existing] }));
+    await expect(client(runner).registerProject(registration)).rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("returns an exact complete retry without rewriting later operational state", async () => {
+    const runner = new QueuedGhRunner();
+    const complete = registrationRecord("complete");
+    runner.enqueue(projectPage({ records: [complete] }), projectPage({ records: [complete] }));
+
+    await expect(client(runner).registerProject(registration)).resolves.toMatchObject({
+      project_item_id: "PVTI_1",
+      source_node_id: "DI_registration",
+    });
+    expect(runner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(0);
+  });
+
+  it("rejects a present partial field mismatch before writing any missing field", async () => {
+    const runner = new QueuedGhRunner();
+    const partial = registrationRecord("empty");
+    partial.status = {
+      __typename: "ProjectV2ItemFieldSingleSelectValue",
+      optionId: "status-active",
+      name: "active",
     };
-    const partial = { ...complete, node_id: "I_partial", number: 80, labels: [{ name: "trial" }] };
-    gh.enqueue(
-      projectPageFixture({ count: 0, totalCount: 0, hasNextPage: false, endCursor: null }),
-      [[complete, partial]],
+    runner.enqueue(projectPage({ records: [partial] }));
+
+    await expect(client(runner).registerProject(registration)).rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
+    expect(runner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(0);
+  });
+
+  it("rejects unrelated duplicate canonical Project IDs before registration mutates anything", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(projectPage({ records: [recordItem(1), recordItem(2, "prj-project-1")] }));
+
+    await expect(client(runner).registerProject(registration)).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_RECORD" });
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("rejects a DraftIssue creation response whose canonical title or body differs", async () => {
+    for (const changed of ["title", "body"] as const) {
+      const runner = new QueuedGhRunner();
+      const record = registrationRecord("empty");
+      if (changed === "title") record.content.title = "Different";
+      else record.content.body = JSON.stringify({ id: registration.project_id, objective: "Different", repositories: registration.repo_ids });
+      runner.enqueue(projectPage({}), draftMutation(record));
+
+      await expect(client(runner).registerProject(registration)).rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
+      expect(runner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(0);
+    }
+  });
+
+  it("fails closed when the final five-field reread differs from the approved payload", async () => {
+    const runner = new QueuedGhRunner();
+    const final = registrationRecord("complete");
+    final.priority.name = "P1";
+    final.priority.optionId = "priority-P1";
+    runner.enqueue(
+      projectPage({}), draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [final] }),
     );
 
-    await expect(client(gh).registerProject({
-      project_id: "prj-example",
-      title: "Example",
-      objective: "Prove the trial flow",
-      repo_ids: ["repo-example"],
-      fields: { status: "proposed", priority: "P2", health: "unknown", next_action: "wait:select", last_reviewed: "2026-08-13" },
-    })).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_RECORD" });
+    await expect(client(runner).registerProject(registration)).rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
+  });
 
-    const issueList = gh.calls.find((call) => call.credential === "repo");
-    expect(issueList?.args.some((arg) => arg.startsWith("labels="))).toBe(false);
-    expect(gh.calls.some((call) => call.args.includes("POST") && call.args.includes("repos/owner/registry/issues"))).toBe(false);
+  it("rejects an invalid active Next Action before any Project call", async () => {
+    const runner = new QueuedGhRunner();
+    await expect(client(runner).registerProject({
+      ...registration,
+      fields: { ...registration.fields, status: "active", health: "on-track", next_action: "wait:not-blocked" },
+    })).rejects.toMatchObject({ code: "INVALID_PROJECT_NEXT_ACTION" });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("verifies the fixed DraftIssue fixture and its Last Reviewed read/write/clear boundary", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      projectPage({}),
+      preflightResponse({ __typename: "ProjectV2ItemFieldDateValue", date: "2026-08-12" }),
+      { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_preflight" } } } },
+      { data: { clearProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_preflight" } } } },
+    );
+    const github = client(runner);
+    await github.verifyFields();
+    await github.verifyPreflightItem("PVTI_preflight");
+    await github.writeLastReviewed("PVTI_preflight", "2026-08-13");
+    await github.clearLastReviewed("PVTI_preflight");
+    expect(runner.calls.every((call) => call.credential === "project")).toBe(true);
+  });
+
+  it("rejects protected or oversized API coordinates before reuse", async () => {
+    const secret = "unmistakably-fake-project-api-token";
+    for (const [mutate, expectedCode] of [
+      [(page: ReturnType<typeof projectPage>) => { page.data.user.projectV2.fields.nodes[0]!.id = secret; }, "SENSITIVE_DATA_REJECTED"],
+      [(page: ReturnType<typeof projectPage>) => { page.data.user.projectV2.id = `PVT_${"x".repeat(300)}`; }, "INVALID_PROJECT_RESPONSE"],
+    ] as const) {
+      const runner = new QueuedGhRunner();
+      const page = projectPage({});
+      mutate(page);
+      runner.enqueue(page);
+      const github = new GitHubProjectClient({
+        githubOwner: "owner", projectNumber: 7,
+        preflightProjectItemId: "PVTI_preflight", runner, catalog: catalogFixture(),
+        sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+      });
+      const error = await github.readAll().catch((cause) => cause);
+      expect(error).toMatchObject({ code: expectedCode });
+      expect(JSON.stringify(error)).not.toContain(secret);
+    }
   });
 });

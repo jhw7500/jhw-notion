@@ -11,6 +11,8 @@ import { NOTION_CONFIG } from "../../config.js";
 import { DATABASE_SCHEMAS } from "../../schema.js";
 import * as notionClientMod from "../../notion-client.js";
 
+const legacyAuthority = { assertNotionWriteAllowed: vi.fn(async () => undefined) };
+
 describe("project field consistency (P0-1 regression)", () => {
   let mockClient: ReturnType<typeof createMockNotionClient>;
 
@@ -21,7 +23,7 @@ describe("project field consistency (P0-1 regression)", () => {
 
   it("record.ts: decisionLog 작성 시 project를 relation으로 저장한다", async () => {
     const { server, capturedTools } = createMockServer();
-    registerRecord(server);
+    registerRecord(server, legacyAuthority);
 
     mockClient.dataSources.query.mockResolvedValueOnce({
       results: [
@@ -48,7 +50,7 @@ describe("project field consistency (P0-1 regression)", () => {
 
   it("start.ts: decisionLog의 project를 relation으로 작성한다 (rich_text 금지)", async () => {
     const { server, capturedTools } = createMockServer();
-    registerStart(server);
+    registerStart(server, legacyAuthority);
 
     mockClient.pages.create
       .mockResolvedValueOnce({ id: "proj-page", url: "u1" }) // projects

@@ -256,7 +256,6 @@ export const ProjectRecordLinkSchema = z
     project_id: projectId,
     project_item_id: githubApiId,
     source_node_id: githubNodeId,
-    issue_number: z.number().int().positive().safe(),
   })
   .strict();
 export type ProjectRecordLink = z.infer<typeof ProjectRecordLinkSchema>;

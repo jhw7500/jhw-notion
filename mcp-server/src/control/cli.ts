@@ -117,7 +117,6 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
   const githubProject = new GitHubProjectClient({
     githubOwner: config.githubOwner,
     projectNumber: config.projectNumber,
-    registryRepository: config.registryRepository,
     preflightProjectItemId: config.preflightProjectItemId,
     runner,
     catalog,
@@ -396,7 +395,6 @@ function exitCode(cause: unknown, command?: CommandName): CliResult["exitCode"] 
     "PROJECT_TOKEN_HAS_REPO_SCOPE",
     "PROJECT_SCOPE_MISSING",
     "PROJECT_SCOPE_NOT_EXACT",
-    "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
     "UNSUPPORTED_REGISTRY_OWNER",
     "REGISTRY_REMOTE_NOT_SSH",
     "REGISTRY_REMOTE_MISMATCH",

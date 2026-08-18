@@ -14,8 +14,7 @@ export interface PreflightRunner {
 
 export interface PreflightProjectPort {
   verifyFields(): Promise<void>;
-  addPreflightItem(contentId: string): Promise<string>;
-  verifyItemContentId(itemId: string): Promise<string | undefined>;
+  verifyPreflightItem(itemId: string): Promise<void>;
   readLastReviewed(itemId: string): Promise<string | undefined>;
   writeLastReviewed(itemId: string, date: string): Promise<void>;
   clearLastReviewed(itemId: string): Promise<void>;
@@ -107,19 +106,7 @@ function distinctProbeDate(original: string | undefined, proposed: string): stri
   return previous.toISOString().slice(0, 10);
 }
 
-function isProvenProjectScopeFailure(cause: unknown): boolean {
-  if (!(cause instanceof ControlError) || cause.code !== "COMMAND_FAILED") return false;
-  const stderr = typeof cause.details.stderr === "string" ? cause.details.stderr : "";
-  return /(?:resource not accessible by personal access token|insufficient (?:oauth )?scope|required scope|requires .*\bproject\b.*scope)/i.test(stderr);
-}
-
 function rethrowProjectProbeFailure(cause: unknown): never {
-  if (isProvenProjectScopeFailure(cause)) {
-    throw new ControlError(
-      "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE",
-      "Narrow Project credential lacks a capability required by the private fixture",
-    );
-  }
   if (cause instanceof ControlError) throw cause;
   throw new ControlError("PREFLIGHT_PROJECT_INTEGRITY", "Project preflight fixture integrity could not be proven");
 }
@@ -255,16 +242,8 @@ export class PreflightService {
     }
 
     await this.options.project.verifyFields();
-    let attachedItemId: string;
     try {
-      const contentId = await this.options.project.verifyItemContentId(this.options.config.preflightProjectItemId);
-      if (contentId !== issue.node_id) {
-        throw new ControlError("PREFLIGHT_PROJECT_INTEGRITY", "Configured Project fixture does not match its source Issue");
-      }
-      attachedItemId = await this.options.project.addPreflightItem(issue.node_id);
-      if (attachedItemId !== this.options.config.preflightProjectItemId) {
-        throw new ControlError("PREFLIGHT_PROJECT_INTEGRITY", "Project fixture attachment does not match its source Issue");
-      }
+      await this.options.project.verifyPreflightItem(this.options.config.preflightProjectItemId);
     } catch (cause) {
       rethrowProjectProbeFailure(cause);
     }
@@ -310,11 +289,14 @@ export class PreflightService {
       "INVALID_PREFLIGHT_ISSUE",
     );
     this.sensitiveData.assertSafe(updated);
+    const updatedLabels = new Set(updated.labels.map((label) => label.name));
     if (
       updated.node_id !== issue.node_id ||
       updated.number !== issue.number ||
       updated.html_url.toLowerCase() !== issue.html_url.toLowerCase() ||
-      updated.body !== issue.body
+      updated.body !== issue.body ||
+      !updatedLabels.has("trial") ||
+      updatedLabels.has("project-record")
     ) {
       throw new ControlError("INVALID_PREFLIGHT_ISSUE", "Registry Issue unchanged-write verification failed");
     }

@@ -38,7 +38,7 @@ Phase 1A는 위 Notion workspace를 대체하지 않는 trial control plane이�
         ↓
 build server의 jhw-control CLI
         ├─ 별도 private Registry checkout (identity, Task, Claim, governance)
-        ├─ personal private GitHub Project (5 operational fields)
+        ├─ personal private GitHub Project (DraftIssue Project Records + 5 operational fields)
         └─ private local state/snapshot (measurement, export)
 
 일반 /jhw:project, /jhw:status → 기존 Notion live authority
@@ -57,7 +57,9 @@ build server의 jhw-control CLI
 
 개인 account Project에는 fine-grained PAT를 사용할 수 없어 short-lived classic `GH_PROJECT_TOKEN`이 필요하다. normalized scope는 정확히 `project` 하나여야 하고 다른 scope를 허용하지 않는다. 분리된 `GH_REPO_TOKEN`은 Registry와 등록할 private source repository의 Issue/metadata API에 필요한 최소 repository 권한만 가진다. SSH Registry Git credential과도 역할을 섞지 않는다. host credential store가 token을 process environment에만 주입한다.
 
-`jhw-control preflight`는 mutation 전에 committed authority/version, read-only Notion ancestry, exact Project scope, private Project/Registry repository, unique matching SSH remote를 검증한다. 그 뒤 지정 Project/Issue fixture만 write/restore하고 fetch/dry-run push를 확인한다. 성공은 `credentials`, `authority`, `notion_guard`, `project`, `registry_repository`, `registry_issue`, `registry_git` 일곱 check가 모두 `ok`일 때뿐이다.
+Project Record는 Project-only token으로 완전히 읽고 쓸 수 있는 canonical DraftIssue다. DraftIssue의 제목과 exact `{id, objective, repositories}` 본문, 같은 Project item의 다섯 운영 필드가 한 레코드를 이룬다. Registry Issue나 repo token과 source ID를 결합하지 않는다.
+
+`jhw-control preflight`는 mutation 전에 committed authority/version, read-only Notion ancestry, exact Project scope, private Project/Registry repository, unique matching SSH remote를 검증한다. 그 뒤 고정 canonical Project DraftIssue fixture의 field를 write/restore하고, 이와 독립된 Registry Issue를 unchanged-write하며, fetch/dry-run push를 확인한다. 성공은 `credentials`, `authority`, `notion_guard`, `project`, `registry_repository`, `registry_issue`, `registry_git` 일곱 check가 모두 `ok`일 때뿐이다.
 
 모든 compliant process는 동일한 Registry realpath/inode/remote identity와 immutable absolute `JHW_CONTROL_STATE_DIR`를 사용한다. 그래야 하나의 `registry.lock`이 host mutation을 직렬화한다. process timeout은 bounded이며 Git/SSH는 noninteractive다. secret과 configured private path는 Registry/GitHub/Handoff/journal/snapshot/output/error에 쓰기 전에 중앙 reject policy가 차단한다.
 

@@ -56,8 +56,7 @@ function projectPort(overrides: Partial<PreflightProjectPort> = {}): PreflightPr
   let lastReviewed: string | undefined = "2026-08-12";
   return {
     verifyFields: async () => undefined,
-    addPreflightItem: async () => "PVTI_trial",
-    verifyItemContentId: async () => "I_fixture",
+    verifyPreflightItem: async () => undefined,
     readLastReviewed: async () => lastReviewed,
     writeLastReviewed: async (_itemId, date) => { lastReviewed = date; },
     clearLastReviewed: async () => { lastReviewed = undefined; },
@@ -127,7 +126,7 @@ describe("PreflightService", () => {
     let projectCalls = 0;
     const project = projectPort({
       verifyFields: async () => { projectCalls += 1; },
-      addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; },
+      verifyPreflightItem: async () => { projectCalls += 1; },
     });
     const { preflight } = service({
       runner,
@@ -180,7 +179,7 @@ describe("PreflightService", () => {
     ["repository", "REPOSITORY_NOT_PRIVATE"],
   ] as const)("fails before every Project/Issue mutation when %s prerequisite is unavailable", async (failed, code) => {
     const project = projectPort({
-      addPreflightItem: async () => { throw new Error("must not mutate"); },
+      verifyPreflightItem: async () => { throw new Error("must not read Project fixture"); },
       writeLastReviewed: async () => { throw new Error("must not mutate"); },
       clearLastReviewed: async () => { throw new Error("must not mutate"); },
     });
@@ -200,7 +199,7 @@ describe("PreflightService", () => {
     ["an assume-unchanged Registry index", "REGISTRY_INDEX_UNSAFE"],
   ])("rejects %s through the shared readiness proof before trial mutation", async (_label, code) => {
     let projectCalls = 0;
-    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const project = projectPort({ verifyPreflightItem: async () => { projectCalls += 1; } });
     const registry = { assertReady: async () => { throw new ControlError(code, "safe readiness failure"); } };
     const { preflight, runner } = service({ project, registry });
 
@@ -238,6 +237,23 @@ describe("PreflightService", () => {
     expect(runner.ghCalls).toHaveLength(2);
   });
 
+  it("rejects an unchanged-write response that no longer proves the trial-only label boundary", async () => {
+    const runner = new QueuedRunner();
+    runner.enqueueGh(
+      { stdout: "HTTP/2.0 200 OK\r\nx-oauth-scopes: project\r\n\r\n{}\n" },
+      { stdout: `${JSON.stringify(PREFLIGHT_ISSUE)}\n` },
+      { stdout: `${JSON.stringify({
+        ...PREFLIGHT_ISSUE,
+        labels: [{ name: "trial", color: "ededed" }, { name: "project-record", color: "ffffff" }],
+      })}\n` },
+    );
+    const { preflight } = service({ runner });
+
+    await expect(preflight.run()).rejects.toMatchObject({ code: "INVALID_PREFLIGHT_ISSUE" });
+    expect(runner.ghCalls).toHaveLength(3);
+    expect(runner.calls.some((call) => call.command === "git" && call.args[0] === "push")).toBe(false);
+  });
+
   it.each([
     ["wrong issue number", { number: 10 }],
     ["wrong issue URL", { html_url: "https://github.com/owner/other/issues/9" }],
@@ -248,7 +264,7 @@ describe("PreflightService", () => {
       { stdout: `${JSON.stringify({ ...PREFLIGHT_ISSUE, ...override })}\n` },
     );
     let projectCalls = 0;
-    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const project = projectPort({ verifyPreflightItem: async () => { projectCalls += 1; } });
 
     await expect(service({ runner, project }).preflight.run()).rejects.toMatchObject({ code: "INVALID_PREFLIGHT_ISSUE" });
     expect(projectCalls).toBe(0);
@@ -283,27 +299,24 @@ describe("PreflightService", () => {
     });
     const { preflight } = service({ project });
 
-    await expect(preflight.run()).rejects.toMatchObject({ code: "PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE" });
+    await expect(preflight.run()).rejects.toMatchObject({ code: "COMMAND_FAILED" });
     expect(writes).toEqual(["2026-08-13", "2026-08-12"]);
   });
 
-  it.each([
-    ["missing", undefined],
-    ["wrong", "I_other"],
-  ])("fails closed before add when the configured Project item has %s source identity", async (_label, contentId) => {
-    let addCalls = 0;
+  it.each(["missing", "wrong-content"])("fails closed when the configured DraftIssue fixture is %s", async (_label) => {
+    let writeCalls = 0;
     const { preflight } = service({ project: projectPort({
-      verifyItemContentId: async () => contentId,
-      addPreflightItem: async () => { addCalls += 1; return "PVTI_new"; },
+      verifyPreflightItem: async () => { throw new ControlError("INVALID_PREFLIGHT_ITEM", "invalid fixed DraftIssue"); },
+      writeLastReviewed: async () => { writeCalls += 1; },
     }) });
 
-    await expect(preflight.run()).rejects.toMatchObject({ code: "PREFLIGHT_PROJECT_INTEGRITY" });
-    expect(addCalls).toBe(0);
+    await expect(preflight.run()).rejects.toMatchObject({ code: "INVALID_PREFLIGHT_ITEM" });
+    expect(writeCalls).toBe(0);
   });
 
   it("preserves Project transport failures instead of misclassifying them as scope", async () => {
     const project = projectPort({
-      addPreflightItem: async () => { throw new ControlError("COMMAND_TIMEOUT", "bounded transport timeout"); },
+      verifyPreflightItem: async () => { throw new ControlError("COMMAND_TIMEOUT", "bounded transport timeout"); },
     });
 
     await expect(service({ project }).preflight.run()).rejects.toMatchObject({ code: "COMMAND_TIMEOUT" });
@@ -374,7 +387,7 @@ describe("PreflightService", () => {
 
   it("rejects an SSH Registry remote for a different canonical repository", async () => {
     const project = projectPort({
-      addPreflightItem: async () => { throw new Error("must not mutate"); },
+      verifyPreflightItem: async () => { throw new Error("must not read Project fixture"); },
       writeLastReviewed: async () => { throw new Error("must not mutate"); },
     });
     const { preflight, runner } = service({ remoteUrl: "git@github.com:owner/other.git", project });
@@ -396,7 +409,7 @@ describe("PreflightService", () => {
 
   it("rejects a different effective Registry push URL before trial mutations", async () => {
     let projectCalls = 0;
-    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const project = projectPort({ verifyPreflightItem: async () => { projectCalls += 1; } });
     const { preflight, runner } = service({
       pushRemoteUrl: "git@github.com:owner/other.git",
       project,
@@ -409,7 +422,7 @@ describe("PreflightService", () => {
 
   it("rejects a Registry subdirectory before trial mutations", async () => {
     let projectCalls = 0;
-    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const project = projectPort({ verifyPreflightItem: async () => { projectCalls += 1; } });
     const { preflight, runner } = service({
       registryRoot: "/srv/registry-parent",
       project,
@@ -428,7 +441,7 @@ describe("PreflightService", () => {
       ? { command, args, stdout: "?? repositories/untracked.yaml\n", stderr: "", exitCode: 0 }
       : run(command, args, options);
     let projectCalls = 0;
-    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const project = projectPort({ verifyPreflightItem: async () => { projectCalls += 1; } });
     const { preflight } = service({ runner, project });
 
     await expect(preflight.run()).rejects.toMatchObject({ code: "REGISTRY_DIRTY" });
@@ -449,7 +462,7 @@ describe("PreflightService", () => {
       }
       : run(command, args, options);
     let projectCalls = 0;
-    const project = projectPort({ addPreflightItem: async () => { projectCalls += 1; return "PVTI_trial"; } });
+    const project = projectPort({ verifyPreflightItem: async () => { projectCalls += 1; } });
     const { preflight } = service({ runner, project });
 
     await expect(preflight.run()).rejects.toMatchObject({ code: "REMOTE_DIVERGED" });

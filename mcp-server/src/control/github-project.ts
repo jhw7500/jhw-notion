@@ -18,10 +18,9 @@ import {
   type RegisterProjectInput,
 } from "./schemas.js";
 
-const API_VERSION = "2026-03-10";
 const MAX_PROJECT_PAGES = 10_000;
-const MAX_ISSUE_PAGES = 10_000;
-const PROJECT_RECORD_LABELS = ["trial", "project-record"] as const;
+const PREFLIGHT_DRAFT_TITLE = "[TRIAL] Project Control Preflight Fixture";
+const PREFLIGHT_DRAFT_BODY = "unchanged";
 const REQUIRED_OPTIONS = {
   Status: ["proposed", "active", "paused", "completed", "cancelled"],
   Priority: ["P0", "P1", "P2", "P3"],
@@ -59,7 +58,10 @@ const PROJECT_QUERY = `query ProjectPage($owner: String!, $number: Int!, $fieldC
           id
           isArchived
           type
-          content { __typename ... on Issue { id } }
+          content {
+            __typename
+            ... on DraftIssue { id title body }
+          }
           status: fieldValueByName(name: "Status") {
             __typename
             ... on ProjectV2ItemFieldSingleSelectValue { optionId name }
@@ -118,7 +120,10 @@ const ITEMS_QUERY = `query ProjectItems($owner: String!, $number: Int!, $itemCur
           id
           isArchived
           type
-          content { __typename ... on Issue { id } }
+          content {
+            __typename
+            ... on DraftIssue { id title body }
+          }
           status: fieldValueByName(name: "Status") { __typename ... on ProjectV2ItemFieldSingleSelectValue { optionId name } }
           priority: fieldValueByName(name: "Priority") { __typename ... on ProjectV2ItemFieldSingleSelectValue { optionId name } }
           health: fieldValueByName(name: "Health") { __typename ... on ProjectV2ItemFieldSingleSelectValue { optionId name } }
@@ -130,8 +135,14 @@ const ITEMS_QUERY = `query ProjectItems($owner: String!, $number: Int!, $itemCur
   }
 }`;
 
-const ADD_ITEM_MUTATION = `mutation Add($projectId: ID!, $contentId: ID!) {
-  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) { item { id } }
+const ADD_DRAFT_MUTATION = `mutation AddDraft($projectId: ID!, $title: String!, $body: String!) {
+  addProjectV2DraftIssue(input: { projectId: $projectId, title: $title, body: $body }) {
+    projectItem {
+      id
+      type
+      content { __typename ... on DraftIssue { id title body } }
+    }
+  }
 }`;
 const SET_SINGLE_MUTATION = `mutation SetSingle($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
   updateProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { singleSelectOptionId: $optionId } }) { projectV2Item { id } }
@@ -151,7 +162,10 @@ const PREFLIGHT_ITEM_QUERY = `query PreflightItem($itemId: ID!) {
     ... on ProjectV2Item {
       id
       type
-      content { __typename ... on Issue { id } }
+      content {
+        __typename
+        ... on DraftIssue { id title body }
+      }
       lastReviewed: fieldValueByName(name: "Last Reviewed") { __typename ... on ProjectV2ItemFieldDateValue { date } }
     }
   }
@@ -206,17 +220,22 @@ const ProjectEnvelopeSchema = z.object({
     }).strict().nullable(),
   }).strict(),
 }).passthrough();
-const IssueSchema = z.object({
-  node_id: apiId,
-  number: z.number().int().positive().safe(),
+const DraftIssueSchema = z.object({
+  __typename: z.literal("DraftIssue"),
+  id: apiId,
   title: z.string().min(1).max(256),
-  body: z.string().max(64 * 1024).nullable(),
-  labels: z.array(z.object({ name: apiName }).passthrough()).max(100),
-  pull_request: z.unknown().optional(),
-}).passthrough();
-const IssuePagesSchema = z.array(z.array(IssueSchema).max(100)).max(MAX_ISSUE_PAGES);
-const MutationItemSchema = z.object({
-  data: z.object({ addProjectV2ItemById: z.object({ item: z.object({ id: apiId }).strict() }).strict() }).strict(),
+  body: z.string().max(64 * 1024),
+}).strict();
+const MutationDraftSchema = z.object({
+  data: z.object({
+    addProjectV2DraftIssue: z.object({
+      projectItem: z.object({
+        id: apiId,
+        type: z.literal("DRAFT_ISSUE"),
+        content: DraftIssueSchema,
+      }).strict(),
+    }).strict(),
+  }).strict(),
 }).passthrough();
 const MutationUpdateSchema = z.object({
   data: z.object({ updateProjectV2ItemFieldValue: z.object({ projectV2Item: z.object({ id: apiId }).strict() }).strict() }).strict(),
@@ -238,7 +257,7 @@ const PreflightItemSchema = z.object({
 
 type FieldNode = z.infer<typeof FieldNodeSchema>;
 type ItemNode = z.infer<typeof ItemNodeSchema>;
-type Issue = z.infer<typeof IssueSchema>;
+type DraftIssue = z.infer<typeof DraftIssueSchema>;
 
 export interface GitHubRunner {
   runGh(args: string[], credential: "project" | "repo", options?: ProcessRunOptions): Promise<ProcessResult>;
@@ -252,7 +271,6 @@ export interface GitHubCatalogPort {
 export interface GitHubProjectClientOptions {
   githubOwner: string;
   projectNumber: number;
-  registryRepository: string;
   preflightProjectItemId: string;
   runner: GitHubRunner;
   catalog: GitHubCatalogPort;
@@ -347,17 +365,16 @@ function validateFieldDefinitions(nodes: FieldNode[]): { definitions: ProjectFie
   return { definitions, byName };
 }
 
-function projectBody(body: string | null): ProjectRecordBody {
-  if (body === null) throw new ControlError("INVALID_PROJECT_RECORD", "Trial Project Record Issue has no body");
+function projectBody(body: string): ProjectRecordBody {
   let raw: unknown;
   try {
     raw = JSON.parse(body);
   } catch {
-    throw new ControlError("INVALID_PROJECT_RECORD", "Trial Project Record body is not deterministic JSON-subset YAML");
+    throw new ControlError("INVALID_PROJECT_RECORD", "Trial Project Record body is not deterministic JSON");
   }
   const parsed = ProjectRecordBodySchema.safeParse(raw);
   if (!parsed.success || JSON.stringify(parsed.data) !== body) {
-    throw new ControlError("INVALID_PROJECT_RECORD", "Trial Project Record body is not canonical deterministic JSON-subset YAML");
+    throw new ControlError("INVALID_PROJECT_RECORD", "Trial Project Record body is not canonical deterministic JSON");
   }
   return parsed.data;
 }
@@ -366,18 +383,9 @@ function bodyFor(input: RegisterProjectInput): string {
   return JSON.stringify({ id: input.project_id, objective: input.objective, repositories: input.repo_ids });
 }
 
-function hasLabels(issue: Issue, expected: readonly string[]): boolean {
-  const names = new Set(issue.labels.map((label) => label.name));
-  return expected.every((label) => names.has(label));
-}
-
-function issueEqual(issue: Issue, input: RegisterProjectInput): boolean {
-  return issue.title === input.title && issue.body === bodyFor(input);
-}
-
-function sourceId(raw: unknown): string | undefined {
-  const parsed = z.object({ __typename: z.literal("Issue"), id: apiId }).strict().safeParse(raw);
-  return parsed.success ? parsed.data.id : undefined;
+function draftIssue(raw: unknown): DraftIssue | undefined {
+  const parsed = DraftIssueSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
 }
 
 function optionId(field: ProjectFieldDefinition, value: string): string {
@@ -451,7 +459,67 @@ function operatingFields(node: ItemNode, structure: ProjectStructure): ProjectOp
   return parsed.data;
 }
 
-/** Strict personal-Project adapter with a repository-token join at immutable Issue node IDs. */
+type RegistrationFieldUpdate = {
+  fieldName: keyof typeof REQUIRED_FIELD_TYPES;
+  kind: "single" | "text" | "date";
+  value: string;
+};
+
+function registrationFieldUpdates(fields: ProjectOperationalFields): RegistrationFieldUpdate[] {
+  return [
+    { fieldName: "Status", kind: "single", value: fields.status },
+    { fieldName: "Priority", kind: "single", value: fields.priority },
+    { fieldName: "Health", kind: "single", value: fields.health },
+    { fieldName: "Next Action", kind: "text", value: fields.next_action },
+    { fieldName: "Last Reviewed", kind: "date", value: fields.last_reviewed },
+  ];
+}
+
+function missingRegistrationFields(
+  node: ItemNode,
+  structure: ProjectStructure,
+  expected: ProjectOperationalFields,
+): RegistrationFieldUpdate[] {
+  const updates = registrationFieldUpdates(expected);
+  const rawByField: Record<RegistrationFieldUpdate["fieldName"], unknown> = {
+    Status: node.status,
+    Priority: node.priority,
+    Health: node.health,
+    "Next Action": node.nextAction,
+    "Last Reviewed": node.lastReviewed,
+  };
+  const missing: RegistrationFieldUpdate[] = [];
+  for (const update of updates) {
+    const raw = rawByField[update.fieldName];
+    if (raw === null) {
+      missing.push(update);
+      continue;
+    }
+    let matches = false;
+    if (update.kind === "single") {
+      const actual = SelectValueSchema.safeParse(raw);
+      const field = structure.byName.get(update.fieldName);
+      matches = actual.success && field !== undefined &&
+        actual.data.name === update.value && actual.data.optionId === optionId(field, update.value);
+    } else if (update.kind === "text") {
+      const actual = TextValueSchema.safeParse(raw);
+      matches = actual.success && actual.data.text === update.value;
+    } else {
+      const actual = DateValueSchema.safeParse(raw);
+      matches = actual.success && actual.data.date === update.value;
+    }
+    if (!matches) {
+      throw new ControlError(
+        "PROJECT_REGISTRATION_MISMATCH",
+        "Existing Project Record field differs from the approved registration payload",
+        { project_item_id: node.id, field: update.fieldName },
+      );
+    }
+  }
+  return missing;
+}
+
+/** Strict personal-Project adapter whose records are project-only DraftIssues. */
 export class GitHubProjectClient {
   private readonly now: () => Date;
   private readonly sensitiveData: SensitiveDataPolicy;
@@ -460,13 +528,6 @@ export class GitHubProjectClient {
   constructor(private readonly options: GitHubProjectClientOptions) {
     this.now = options.now ?? (() => new Date());
     this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy();
-  }
-
-  private assertSupportedOwner(): void {
-    const owner = this.options.registryRepository.split("/", 1)[0];
-    if (!owner || owner.toLowerCase() !== this.options.githubOwner.toLowerCase()) {
-      throw new ControlError("UNSUPPORTED_REGISTRY_OWNER", "Personal Project automation requires a Registry owned by the configured user");
-    }
   }
 
   private coordinates(): Array<["raw" | "typed", string]> {
@@ -490,7 +551,6 @@ export class GitHubProjectClient {
   }
 
   private async initialPage(): Promise<InitialProjectPage> {
-    this.assertSupportedOwner();
     const project = this.projectResponse((await this.options.runner.runGh(graphqlArgs(PROJECT_QUERY, this.coordinates()), "project")).stdout);
     if (!project.fields || !project.items) throw new ControlError("INVALID_PROJECT_RESPONSE", "Initial Project response is incomplete");
     return { projectId: project.id, revision: project.updatedAt, fields: project.fields, items: project.items };
@@ -551,121 +611,61 @@ export class GitHubProjectClient {
     return nodes;
   }
 
-  private issueHeaders(): string[] {
-    return ["-H", "Accept: application/vnd.github+json", "-H", `X-GitHub-Api-Version: ${API_VERSION}`];
-  }
-
-  private async listIssues(requiredLabels?: readonly string[]): Promise<Issue[]> {
-    this.assertSupportedOwner();
-    const endpoint = `repos/${this.options.registryRepository}/issues`;
-    const args = [
-      "api", "--method", "GET", endpoint,
-      ...this.issueHeaders(),
-      "--paginate", "--slurp",
-      "--raw-field", "state=all",
-      ...(requiredLabels === undefined ? [] : ["--raw-field", `labels=${requiredLabels.join(",")}`]),
-      "--field", "per_page=100",
-    ];
-    const pages = jsonFrom(
-      (await this.options.runner.runGh(args, "repo")).stdout,
-      IssuePagesSchema,
-      "INVALID_ISSUE_RESPONSE",
-    );
-    const allIssues = pages.flat().filter((issue) => issue.pull_request === undefined);
-    this.assertContentSafe(allIssues);
-    if (
-      new Set(allIssues.map((issue) => issue.node_id)).size !== allIssues.length ||
-      new Set(allIssues.map((issue) => issue.number)).size !== allIssues.length
-    ) {
-      throw new ControlError("INCOMPLETE_ISSUE_READ", "Registry Issue pagination returned duplicate records");
+  private recordItems(nodes: ItemNode[]): Array<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody }> {
+    const fixtures = nodes.filter((node) => node.id === this.options.preflightProjectItemId);
+    if (fixtures.length !== 1) {
+      throw new ControlError("INVALID_PREFLIGHT_ITEM", "The dedicated Project must contain exactly one configured preflight fixture");
     }
-    return requiredLabels === undefined
-      ? allIssues
-      : allIssues.filter((issue) => hasLabels(issue, requiredLabels));
-  }
-
-  private async listProjectRecordIssues(): Promise<Issue[]> {
-    const issues = await this.listIssues(PROJECT_RECORD_LABELS);
-    for (const issue of issues) projectBody(issue.body);
-    return issues;
-  }
-
-  private async canonicalProjectRecords(projectId: string): Promise<Issue[]> {
-    const candidates: Issue[] = [];
-    for (const issue of await this.listIssues()) {
-      let body: ProjectRecordBody;
-      try {
-        body = projectBody(issue.body);
-      } catch {
-        // Recovery scans every Issue independent of labels. Only canonical
-        // Project Record bodies participate in idempotency decisions, while a
-        // labeled malformed record is authority corruption rather than absence.
-        if (hasLabels(issue, PROJECT_RECORD_LABELS)) {
-          throw new ControlError("INVALID_PROJECT_RECORD", "Labeled Project Record Issue body is malformed");
-        }
-        continue;
+    this.assertPreflightItem(fixtures[0] as ItemNode, this.options.preflightProjectItemId);
+    const records: Array<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody }> = [];
+    for (const node of nodes) {
+      if (node.id === this.options.preflightProjectItemId) continue;
+      const content = draftIssue(node.content);
+      if (node.type !== "DRAFT_ISSUE" || !content) {
+        throw new ControlError(
+          "INVALID_PROJECT_RECORD",
+          "The dedicated Project contains a non-record item",
+          { project_item_id: node.id },
+        );
       }
-      if (body.id === projectId) candidates.push(issue);
+      records.push({ node, content, body: projectBody(content.body) });
     }
-    return candidates;
+    if (new Set(records.map(({ node }) => node.id)).size !== records.length) {
+      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project item identity is duplicated");
+    }
+    if (new Set(records.map(({ content }) => content.id)).size !== records.length) {
+      throw new ControlError("DUPLICATE_PROJECT_ITEM", "One DraftIssue source is attached more than once");
+    }
+    if (new Set(records.map(({ body }) => body.id)).size !== records.length) {
+      throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple DraftIssues claim one canonical Project ID");
+    }
+    return records;
   }
 
-  private async readIssue(number: number): Promise<Issue> {
-    const issue = jsonFrom(
-      (await this.options.runner.runGh([
-        "api", `repos/${this.options.registryRepository}/issues/${number}`, ...this.issueHeaders(),
-      ], "repo")).stdout,
-      IssueSchema,
-      "INVALID_ISSUE_RESPONSE",
-    );
-    this.assertContentSafe(issue);
-    return issue;
+  private verifyRecord(
+    record: { content: DraftIssue; body: ProjectRecordBody },
+    expected: RegisterProjectInput,
+  ): void {
+    if (record.content.title !== expected.title || record.content.body !== bodyFor(expected)) {
+      throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Project Record DraftIssue does not match the approved registration payload");
+    }
   }
 
-  private async createIssue(input: RegisterProjectInput): Promise<Issue> {
+  private async createDraft(structure: ProjectStructure, input: RegisterProjectInput): Promise<{ itemId: string; content: DraftIssue }> {
     this.assertContentSafe(input);
-    const issue = jsonFrom(
-      (await this.options.runner.runGh([
-        "api", "--method", "POST", `repos/${this.options.registryRepository}/issues`,
-        ...this.issueHeaders(),
-        "--raw-field", `title=${input.title}`,
-        "--raw-field", `body=${bodyFor(input)}`,
-        "--raw-field", "labels[]=trial",
-        "--raw-field", "labels[]=project-record",
-      ], "repo")).stdout,
-      IssueSchema,
-      "INVALID_ISSUE_RESPONSE",
-    );
-    this.assertContentSafe(issue);
-    return issue;
-  }
-
-  private verifyIssue(issue: Issue, expected: RegisterProjectInput, expectedNodeId?: string): void {
-    if (!issueEqual(issue, expected) || (expectedNodeId !== undefined && issue.node_id !== expectedNodeId)) {
-      throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Project Record Issue does not match the approved registration payload");
-    }
-    if (!hasLabels(issue, PROJECT_RECORD_LABELS)) {
-      const names = new Set(issue.labels.map((label) => label.name));
-      throw new ControlError(
-        "PROJECT_RECORD_LABEL_RECOVERY_REQUIRED",
-        "Project Record Issue is missing its disjoint classification labels",
-        {
-          issue_number: issue.number,
-          missing_labels: PROJECT_RECORD_LABELS.filter((label) => !names.has(label)),
-        },
-      );
-    }
-  }
-
-  private async addItem(projectId: string, contentId: string): Promise<string> {
     const result = this.safeApiResult(jsonFrom(
-      (await this.options.runner.runGh(graphqlArgs(ADD_ITEM_MUTATION, [
-        ["raw", `projectId=${projectId}`], ["raw", `contentId=${contentId}`],
+      (await this.options.runner.runGh(graphqlArgs(ADD_DRAFT_MUTATION, [
+        ["raw", `projectId=${structure.projectId}`],
+        ["raw", `title=${input.title}`],
+        ["raw", `body=${bodyFor(input)}`],
       ]), "project")).stdout,
-      MutationItemSchema,
+      MutationDraftSchema,
       "INVALID_PROJECT_MUTATION",
     ));
-    return result.data.addProjectV2ItemById.item.id;
+    const created = result.data.addProjectV2DraftIssue.projectItem;
+    const record = { content: created.content, body: projectBody(created.content.body) };
+    this.verifyRecord(record, input);
+    return { itemId: created.id, content: created.content };
   }
 
   private async updateField(
@@ -698,35 +698,18 @@ export class GitHubProjectClient {
   async readAll(): Promise<ProjectSnapshotSource> {
     const initial = await this.initialPage();
     const structure = await this.structure(initial);
-    const itemNodes = (await this.items(initial)).filter((node) => node.id !== this.options.preflightProjectItemId);
-    const parsedItems = itemNodes.map((node) => {
-      const source = sourceId(node.content);
-      if (!source) throw new ControlError("PROJECT_SOURCE_REDACTED", "Project item source identity is unavailable", { project_item_id: node.id });
-      return { node, source, fields: operatingFields(node, structure) };
-    });
-    if (new Set(parsedItems.map(({ source }) => source)).size !== parsedItems.length) {
-      throw new ControlError("DUPLICATE_PROJECT_ITEM", "One Project Record source is attached more than once");
-    }
-    const issues = await this.listProjectRecordIssues();
-    const byNode = new Map(issues.map((issue) => [issue.node_id, issue]));
+    const records = this.recordItems(await this.items(initial));
     const output: ProjectSnapshotItem[] = [];
-    const seenProjectIds = new Set<string>();
-    for (const { node, source, fields } of parsedItems) {
-      const issue = byNode.get(source);
-      if (!issue) throw new ControlError("PROJECT_RECORD_NOT_FOUND", "Project item is not backed by a trial Registry Issue", { project_item_id: node.id });
-      const body = projectBody(issue.body);
-      if (seenProjectIds.has(body.id)) {
-        throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple Project Record Issues claim one canonical Project ID");
-      }
-      seenProjectIds.add(body.id);
+    for (const { node, content, body } of records) {
       await Promise.all(body.repositories.map((repoId) => this.options.catalog.getRepository(repoId)));
+      const fields = operatingFields(node, structure);
       const nextTask = taskId(fields);
       if (nextTask) await this.options.catalog.getTask(nextTask);
       output.push({
         project_item_id: node.id,
-        source_node_id: source,
+        source_node_id: content.id,
         project_id: body.id,
-        title: issue.title,
+        title: content.title,
         objective: body.objective,
         repo_ids: body.repositories,
         fields,
@@ -748,23 +731,12 @@ export class GitHubProjectClient {
   /** Proves the canonical Project Record, its repository relation, and one attachment. */
   async requireProjectRepository(projectId: string, repoId: string): Promise<void> {
     const initial = await this.initialPage();
-    const itemNodes = await this.items(initial);
-    const matches = (await this.canonicalProjectRecords(projectId)).map((issue) => ({ issue, body: projectBody(issue.body) }));
+    const matches = this.recordItems(await this.items(initial)).filter(({ body }) => body.id === projectId);
     if (matches.length === 0) throw new ControlError("PROJECT_RECORD_NOT_FOUND", "Canonical Project Record does not exist");
     if (matches.length !== 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Canonical Project Record is ambiguous");
-    const match = matches[0] as { issue: Issue; body: ProjectRecordBody };
-    if (!hasLabels(match.issue, PROJECT_RECORD_LABELS)) {
-      throw new ControlError("PROJECT_RECORD_LABEL_RECOVERY_REQUIRED", "Canonical Project Record is missing required classification labels");
-    }
+    const match = matches[0] as { node: ItemNode; content: DraftIssue; body: ProjectRecordBody };
     if (!match.body.repositories.includes(repoId)) {
       throw new ControlError("PROJECT_REPOSITORY_MISMATCH", "Project Record does not contain the canonical Repository");
-    }
-    const attached = itemNodes.filter((node) => sourceId(node.content) === match.issue.node_id);
-    if (attached.length === 0) {
-      throw new ControlError("PROJECT_RECORD_NOT_ATTACHED", "Canonical Project Record is not attached to the configured Project");
-    }
-    if (attached.length !== 1) {
-      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Canonical Project Record is attached more than once");
     }
   }
 
@@ -780,44 +752,32 @@ export class GitHubProjectClient {
     const initial = await this.initialPage();
     const structure = await this.structure(initial);
     const initialItems = await this.items(initial);
-    const matches = await this.canonicalProjectRecords(input.data.project_id);
-    if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple canonical Issues use the requested Project ID");
-    let issue: Issue;
-    if (matches.length === 1) {
-      issue = matches[0] as Issue;
-      this.verifyIssue(issue, input.data);
-    } else {
-      issue = await this.createIssue(input.data);
-      this.verifyIssue(issue, input.data);
-    }
-    const verified = await this.readIssue(issue.number);
-    this.verifyIssue(verified, input.data, issue.node_id);
-
-    const attached = initialItems.filter((item) => sourceId(item.content) === issue.node_id);
-    if (attached.length > 1) {
-      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project Record Issue is attached more than once");
-    }
+    const matches = this.recordItems(initialItems).filter(({ body }) => body.id === input.data.project_id);
+    if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple DraftIssues use the requested Project ID");
     let itemId: string;
-    if (attached.length === 1) {
-      itemId = (attached[0] as ItemNode).id;
+    let sourceNodeId: string;
+    let updates: RegistrationFieldUpdate[];
+    if (matches.length === 1) {
+      const match = matches[0] as { node: ItemNode; content: DraftIssue; body: ProjectRecordBody };
+      this.verifyRecord(match, input.data);
+      itemId = match.node.id;
+      sourceNodeId = match.content.id;
+      updates = missingRegistrationFields(match.node, structure, input.data.fields);
     } else {
-      itemId = await this.addItem(structure.projectId, issue.node_id);
-      if (await this.verifyItemContentId(itemId) !== issue.node_id) {
-        throw new ControlError("PROJECT_ATTACHMENT_MISMATCH", "New Project item does not reference the Project Record Issue");
-      }
+      const created = await this.createDraft(structure, input.data);
+      itemId = created.itemId;
+      sourceNodeId = created.content.id;
+      updates = registrationFieldUpdates(input.data.fields);
     }
-    await this.updateField(structure, itemId, "Status", "single", input.data.fields.status);
-    await this.updateField(structure, itemId, "Priority", "single", input.data.fields.priority);
-    await this.updateField(structure, itemId, "Health", "single", input.data.fields.health);
-    await this.updateField(structure, itemId, "Next Action", "text", input.data.fields.next_action);
-    await this.updateField(structure, itemId, "Last Reviewed", "date", input.data.fields.last_reviewed);
-    await this.verifyRegisteredItem(itemId, issue.node_id, input.data.fields, structure);
+    for (const update of updates) {
+      await this.updateField(structure, itemId, update.fieldName, update.kind, update.value);
+    }
+    await this.verifyRegisteredItem(itemId, sourceNodeId, input.data, structure);
 
     const link = ProjectRecordLinkSchema.safeParse({
       project_id: input.data.project_id,
       project_item_id: itemId,
-      source_node_id: issue.node_id,
-      issue_number: issue.number,
+      source_node_id: sourceNodeId,
     });
     if (!link.success) throw new ControlError("INVALID_PROJECT_MUTATION", "Project registration returned invalid coordinates");
     return link.data;
@@ -826,19 +786,21 @@ export class GitHubProjectClient {
   private async verifyRegisteredItem(
     itemId: string,
     sourceNodeId: string,
-    expected: ProjectOperationalFields,
+    expected: RegisterProjectInput,
     structure: ProjectStructure,
   ): Promise<void> {
     const finalPage = await this.initialPage();
-    const matches = (await this.items(finalPage)).filter((item) => sourceId(item.content) === sourceNodeId);
+    const matches = this.recordItems(await this.items(finalPage)).filter(({ content }) => content.id === sourceNodeId);
     if (matches.length > 1) {
-      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project Record Issue is attached more than once after registration");
+      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project Record DraftIssue is attached more than once after registration");
     }
-    if (matches.length !== 1 || (matches[0] as ItemNode).id !== itemId) {
+    if (matches.length !== 1 || (matches[0] as { node: ItemNode }).node.id !== itemId) {
       throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project item identity failed final verification");
     }
-    const actual = operatingFields(matches[0] as ItemNode, structure);
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    const match = matches[0] as { node: ItemNode; content: DraftIssue; body: ProjectRecordBody };
+    this.verifyRecord(match, expected);
+    const actual = operatingFields(match.node, structure);
+    if (JSON.stringify(actual) !== JSON.stringify(expected.fields)) {
       throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project fields failed final verification");
     }
   }
@@ -846,12 +808,6 @@ export class GitHubProjectClient {
   async verifyFields(): Promise<void> {
     const initial = await this.initialPage();
     this.preflightStructure = await this.structure(initial);
-  }
-
-  async addPreflightItem(contentId: string): Promise<string> {
-    const structure = this.preflightStructure;
-    if (!structure) throw new ControlError("PREFLIGHT_SEQUENCE_INVALID", "Project fields must be verified before the fixture attach probe");
-    return this.addItem(structure.projectId, contentId);
   }
 
   private async preflightItem(itemId: string): Promise<z.infer<typeof PreflightItemSchema>["data"]["node"]> {
@@ -862,15 +818,26 @@ export class GitHubProjectClient {
     )).data.node;
   }
 
-  async verifyItemContentId(itemId: string): Promise<string | undefined> {
+  private assertPreflightItem(item: NonNullable<z.infer<typeof PreflightItemSchema>["data"]["node"]> | ItemNode, itemId: string): void {
+    const content = draftIssue(item.content);
+    if (
+      item.id !== itemId || item.type !== "DRAFT_ISSUE" || !content ||
+      content.title !== PREFLIGHT_DRAFT_TITLE || content.body !== PREFLIGHT_DRAFT_BODY
+    ) {
+      throw new ControlError("INVALID_PREFLIGHT_ITEM", "Configured Project fixture is not the canonical DraftIssue");
+    }
+  }
+
+  async verifyPreflightItem(itemId: string): Promise<void> {
     const item = await this.preflightItem(itemId);
-    if (!item || item.id !== itemId) return undefined;
-    return sourceId(item.content);
+    if (!item) throw new ControlError("INVALID_PREFLIGHT_ITEM", "Configured Project fixture does not exist");
+    this.assertPreflightItem(item, itemId);
   }
 
   async readLastReviewed(itemId: string): Promise<string | undefined> {
     const item = await this.preflightItem(itemId);
     if (!item || item.id !== itemId) throw new ControlError("INVALID_PREFLIGHT_ITEM", "Configured preflight Project item does not exist");
+    this.assertPreflightItem(item, itemId);
     if (item.lastReviewed === null) return undefined;
     const parsed = DateValueSchema.safeParse(item.lastReviewed);
     if (!parsed.success || !ProjectOperationalFieldsSchema.shape.last_reviewed.safeParse(parsed.data.date).success) {

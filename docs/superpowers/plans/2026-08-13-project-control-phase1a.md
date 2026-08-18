@@ -765,7 +765,7 @@ Expected: FAIL because Project/portfolio modules do not exist.
 
 - [ ] **Step 3: Implement the `gh api graphql` adapter**
 
-Use `GH_PROJECT_TOKEN` only for the personal Project query/mutation process and `GH_REPO_TOKEN` only for Registry Issue operations. For each subprocess, map the selected source variable to child `GH_TOKEN` and omit both source token variables from the child environment. Query the configured personal Project by owner and number; enumerate field definitions, item IDs, source node IDs, and field values until `hasNextPage=false`. Fetch private Registry Issue title/body separately with the repository-scoped token and join by immutable source node ID, so the classic Project token never needs `repo`. Require exactly these user fields and option names:
+Use `GH_PROJECT_TOKEN` only for personal Project queries and mutations. Project Records are canonical DraftIssues, so title, exact JSON-subset body, DraftIssue source ID, item ID, and all field values must be available through that credential alone; never fall back to `GH_REPO_TOKEN` or join a Registry Issue by source ID. `GH_REPO_TOKEN` remains isolated to Registry preflight Issue operations and verified source Repository/Issue metadata. For each subprocess, map the selected source variable to child `GH_TOKEN` and omit both source token variables from the child environment. Query the configured personal Project by owner and number; enumerate field definitions, archived/unarchived item IDs, DraftIssue source IDs/title/body, and field values until `hasNextPage=false`. Require exactly these user fields and option names:
 
 ```text
 Status: proposed | active | paused | completed | cancelled
@@ -775,11 +775,11 @@ Next Action: task:<canonical-task-id> | wait:<short-condition>
 Last Reviewed: YYYY-MM-DD
 ```
 
-The Project item title is the linked Project Record Issue title; do not create a duplicate Project/title custom field. `registerProject` creates a `trial`-labeled Issue in the private Registry repository with `id`, `objective`, and `repo_id` list, adds it to the Project, and writes the five fields. It rejects a non-canonical Task Next Action and computes stale using the shortest applicable cadence.
+The Project item title is the Project Record DraftIssue title; do not create a duplicate Project/title custom field. `registerProject` creates one DraftIssue whose body is exactly `{id, objective, repositories}`, then writes the five fields. Zero matching Project IDs creates; one exact title/body match is reused after interruption; multiple matches or any identity/title/body mismatch fails closed. It rejects a non-canonical Task Next Action and computes stale using the shortest applicable cadence.
 
 The internal CLI requires `--title`, `--objective`, one or more `--repo-id`, `--status`, `--priority`, `--health`, `--next-action`, and `--last-reviewed`; it has no project registration file and no silent defaults. Remove the superseded `--base-sha`/`--head-sha` registration placeholders. Validate every `repo_id` against an existing Repository Record and every `task:` value against an existing canonical Task. For `active`, require `wait:` when Health is `blocked` and `task:` otherwise. Non-active states still accept only the two defined syntaxes, and every `task:` must resolve.
 
-Treat `project_id` as the idempotency key. Search `trial` Registry Issues with the repository credential and parse only the deterministic JSON-subset body. Zero matches creates the Issue; one identical match is adopted so an interrupted run can finish Project attachment/fields; multiple matches or a mismatch in ID/objective/repository relationships fails closed. Never delete an Issue to hide a partial cross-system registration.
+Treat `project_id` as the idempotency key. Parse only DraftIssue content with the deterministic JSON-subset body and reject Issue, null, unknown, duplicate item, duplicate DraftIssue source, and duplicate Project ID content. Never delete a DraftIssue to hide a partial registration.
 
 - [ ] **Step 4: Implement export integrity and paging**
 
@@ -795,15 +795,15 @@ Never include tokens, raw API responses, private absolute paths, raw Evidence, o
 
 1. require distinct `GH_PROJECT_TOKEN` and `GH_REPO_TOKEN` values without printing either;
 2. inspect classic PAT response scopes and reject `repo` on the Project token;
-3. read the configured trial Project and its five field definitions;
-4. update and restore `Last Reviewed` on a designated trial item to prove write access;
+3. read the configured trial Project, its five field definitions, and the exact fixed DraftIssue fixture;
+4. update, read back, and restore `Last Reviewed` on that fixture to prove write access;
 5. verify Registry Issue read/write with the repository-scoped token;
 6. verify Registry Git fetch/push using its configured SSH remote;
 7. fail closed if any check fails.
 
-If personal Project mutation requires `repo`, report `PROJECT_TOKEN_REQUIRES_BROAD_REPO_SCOPE` and stop; do not add the scope automatically.
+If the Project-only credential cannot read the configured DraftIssue content or mutate its field, fail closed; do not add `repo` or another scope automatically and do not fall back to the repository credential.
 
-Add three non-secret, fail-closed coordinates: `JHW_REGISTRY_REPOSITORY=<owner/name>`, `JHW_PREFLIGHT_PROJECT_ITEM_ID=<PVTI...>`, and `JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER=<positive-integer>`. The designated Project item and Registry Issue are dedicated `trial` fixtures. Require the classic Project token to expose `project` and not `repo` in `X-OAuth-Scopes`; update/restore the fixture's `Last Reviewed` in `finally`. With the repository token, read the designated Issue and submit an unchanged-body update to prove write permission without changing canonical content. Verify the configured Registry remote is SSH, fetch it, and use a non-mutating dry-run push; never create a preflight commit.
+Add three non-secret, fail-closed coordinates: `JHW_REGISTRY_REPOSITORY=<owner/name>`, `JHW_PREFLIGHT_PROJECT_ITEM_ID=<PVTI...>`, and `JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER=<positive-integer>`. The designated Project item and Registry Issue are independent dedicated fixtures. The Project item must be a fixed DraftIssue with exact title `[TRIAL] Project Control Preflight Fixture` and body `unchanged`; it is excluded from Project Records only after exact validation. Require the classic Project token to expose exactly `project` in `X-OAuth-Scopes`; update/restore the fixture's `Last Reviewed` in `finally`. With the repository token, separately read the designated trial-only Issue and submit an unchanged-body update to prove write permission without changing canonical content. Never attach that Issue to the Project or pass its node ID to the Project adapter. Verify the configured Registry remote is SSH, fetch it, and use a non-mutating dry-run push; never create a preflight commit.
 
 - [ ] **Step 6: Verify and commit**
 

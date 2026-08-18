@@ -68,7 +68,7 @@ AI 도구·세션·저장소가 늘어나도 다음 질문에 모호하지 않�
 | 객체 | 편집 가능한 정본 | 다른 시스템의 역할 |
 |---|---|---|
 | 프로젝트 상태·우선순위·Health·검토일 | 비공개 GitHub Project | export는 읽기 전용 백업 |
-| 프로젝트 영구 ID·목표·저장소 관계 | 비공개 `project-registry`의 Project Record | 각 저장소는 링크만 보유 |
+| 프로젝트 영구 ID·목표·저장소 관계 | 개인 비공개 GitHub Project의 DraftIssue Project Record | 각 저장소와 Registry Git은 canonical `repo_id` 링크만 보유 |
 | 저장소 영구 ID·GitHub identity·현재 slug | Registry Git의 Repository Record | Project Record는 `repo_id`만 참조 |
 | 정식 실행 작업 | 대상 저장소 GitHub Issue | Registry는 링크·집계만 보유 |
 | 실행 작업 canonical identity | Registry Git의 persistent Task record | 정식 Issue의 내용/lifecycle은 Issue가 소유 |
@@ -90,8 +90,8 @@ AI 도구·세션·저장소가 늘어나도 다음 질문에 모호하지 않�
 
 | 객체 | 정확한 표현 |
 |---|---|
-| Project Record | 비공개 `project-registry` 저장소의 GitHub Issue 한 건 |
-| 프로젝트 운영 필드 | Project Record Issue를 item으로 등록한 개인 비공개 GitHub Project 사용자 필드 |
+| Project Record | 개인 비공개 GitHub Project의 DraftIssue 한 건 |
+| 프로젝트 운영 필드 | 같은 DraftIssue Project item의 사용자 필드 |
 | 프로젝트/거버넌스 ADR | Registry Git의 `projects/<project_id>/adr/`, `governance/adr/` |
 | 프로젝트/거버넌스 지식 | Registry Git의 `projects/<project_id>/knowledge/`, `governance/knowledge/` |
 | Repository canonical record | Registry Git의 `repositories/<repo_id>.yaml` |
@@ -105,7 +105,7 @@ AI 도구·세션·저장소가 늘어나도 다음 질문에 모호하지 않�
 | Evidence metadata | 원본과 같은 디렉터리의 `<evidence_id>.manifest.yaml` |
 | Project/Issue/export snapshot | 빌드 서버의 접근 제한 snapshot 디렉터리 |
 
-Git mirror는 Registry Git 파일만 보존한다. Project Record Issue와 GitHub Project 필드는 API snapshot에 별도로 포함한다. 두 백업을 서로 대체 가능하다고 표현하지 않는다.
+Git mirror는 Registry Git 파일만 보존한다. Project Record DraftIssue와 GitHub Project 필드는 API snapshot에 별도로 포함한다. 두 백업을 서로 대체 가능하다고 표현하지 않는다.
 
 ### 4.2 충돌 규칙
 
@@ -157,9 +157,9 @@ slug: jhw7500/wlan-package
 
 `project_id`와 `repo_id`는 한 번 생성하면 변경하거나 재사용하지 않는다. 저장소 이름이 바뀌면 Repository Record의 `slug`만 갱신하고 GitHub node ID와 Registry `repo_id`는 유지한다. 같은 저장소를 여러 프로젝트가 공유해도 모든 Project Record가 같은 `repo_id`를 참조한다. 최초 등록은 `repositories/by-source/github/<repository-node-id>.yaml` source index와 Repository Record를 같은 fast-forward/CAS commit으로 생성하며, 경쟁 시 승리한 `repo_id`를 채택한다.
 
-프로젝트 제목의 유일한 편집 위치는 Project Record GitHub Issue 제목이다. Issue 본문에는 `title`을 중복 저장하지 않는다.
+프로젝트 제목의 유일한 편집 위치는 Project Record DraftIssue 제목이다. DraftIssue 본문에는 `title`을 중복 저장하지 않는다.
 
-다음 운영 필드는 Project Record 본문에 중복 기록하지 않고 해당 Issue가 등록된 비공개 GitHub Project의 사용자 필드에서만 편집한다. GitHub Project item의 제목은 Project Record Issue 제목을 그대로 표시하는 읽기 전용 표현이며 별도 `Project` 사용자 필드를 만들지 않는다.
+다음 운영 필드는 Project Record 본문에 중복 기록하지 않고 같은 DraftIssue item의 사용자 필드에서만 편집한다. GitHub Project item의 제목은 DraftIssue 제목을 그대로 표시하는 읽기 전용 표현이며 별도 `Project` 사용자 필드를 만들지 않는다. Project Record는 Project-only token으로 완전히 읽고 쓰며 Registry Issue나 repo token과 identity join하지 않는다.
 
 ```yaml
 status: active
@@ -173,7 +173,7 @@ last_reviewed: 2026-08-13
 
 일반 사용자는 내부 CLI의 긴 인자를 직접 작성하지 않는다. 명시적으로 `Phase 1A 시험 프로젝트 등록`을 요청하면 AI skill은 현재 요청과 현재 저장소 맥락만 사용해 다음 항목을 한 번에 제안한다.
 
-- `project_id`, Issue `title`, `objective`
+- `project_id`, DraftIssue `title`, `objective`
 - 하나 이상의 canonical `repo_id`
 - `Status`, `Priority`, `Health`, `Next Action`, `Last Reviewed`
 
@@ -182,7 +182,7 @@ last_reviewed: 2026-08-13
 ```text
 jhw-control project register \
   --project prj-<slug> \
-  --title "<issue-title>" \
+  --title "<draft-title>" \
   --objective "<objective>" \
   --repo-id repo-<slug> [--repo-id repo-<slug> ...] \
   --status proposed|active|paused|completed|cancelled \
@@ -194,9 +194,9 @@ jhw-control project register \
 
 별도 등록 JSON 파일이나 프로젝트별 설정을 두지 않는다. CLI는 모든 항목을 명시적으로 검증하고 필드 값이나 원문 인자를 저널·출력에 반향하지 않는다. 일반 `/jhw:project` 작업은 자동으로 이 시험 등록을 실행하지 않으며, 사용자가 `--trial` 또는 동등한 명시적 요청을 한 경우에만 실행한다.
 
-Issue 본문은 JSON-subset YAML로 `id`, `objective`, `repositories` 세 필드만 보유하고, 제목은 Issue title에만 보유한다. `repo_id`는 모두 기존 Repository Record와 일치해야 한다. `task:` Next Action은 기존 canonical Task를 참조해야 한다. `active` 프로젝트에서 `Health=blocked`이면 `wait:`, 그 외이면 `task:`를 요구한다. 비활성 상태에서도 두 형식 중 하나만 허용하며 `task:`는 항상 실존을 검증한다.
+DraftIssue 본문은 deterministic JSON으로 `id`, `objective`, `repositories` 세 필드만 보유하고, 제목은 DraftIssue title에만 보유한다. `repo_id`는 모두 기존 Repository Record와 일치해야 한다. `task:` Next Action은 기존 canonical Task를 참조해야 한다. `active` 프로젝트에서 `Health=blocked`이면 `wait:`, 그 외이면 `task:`를 요구한다. 비활성 상태에서도 두 형식 중 하나만 허용하며 `task:`는 항상 실존을 검증한다.
 
-등록은 `project_id`를 idempotency key로 사용한다. 중간 실패 후 재실행하면 동일 `trial` Issue를 채택해 Project item/필드 설정을 이어서 완료하고, 동일 ID의 본문 식별자·목표·저장소 관계가 입력과 다르거나 동일 ID Issue가 둘 이상이면 자동 선택하지 않고 fail-closed한다. 일부 성공을 숨기기 위한 Issue 자동 삭제·rollback은 하지 않는다.
+등록은 `project_id`를 idempotency key로 사용한다. 중간 실패 후 재실행하면 정확히 하나인 byte-identical DraftIssue를 채택해 필드 설정을 이어서 완료하고, 동일 ID의 제목·본문 식별자·목표·저장소 관계가 입력과 다르거나 동일 ID DraftIssue가 둘 이상이면 자동 선택하지 않고 fail-closed한다. 일부 성공을 숨기기 위한 DraftIssue 자동 삭제·rollback은 하지 않는다.
 
 ### 5.2 상태와 Health
 
@@ -363,7 +363,7 @@ GitHub 또는 Registry 원격 상태를 확인할 수 없을 때:
 
 ### 7.1 운영 필드
 
-GitHub Project에는 Project Record Issue 제목과 다음 다섯 사용자 필드만 우선 사용한다.
+GitHub Project에는 Project Record DraftIssue 제목과 다음 다섯 사용자 필드만 우선 사용한다.
 
 ```text
 Status
@@ -420,7 +420,7 @@ Project Record 본문은 영구 ID·목표·범위·저장소 관계를 보유�
 
 ```text
 프로젝트 현재 상태     → GitHub Project 사용자 필드
-프로젝트 ID·목표·저장소 관계 → Registry Project Record
+프로젝트 ID·목표·저장소 관계 → GitHub Project DraftIssue 본문
 저장소 결정            → 해당 저장소 ADR
 프로젝트 공통 결정      → Registry ADR
 운영 정책              → Registry Governance ADR
@@ -625,14 +625,14 @@ Gateway 추가 조건은 일반 Task Recall이 반복적으로 불필요하게 �
 - [GitHub가 명시한 fine-grained PAT 제한](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#fine-grained-personal-access-tokens-limitations)상 개인 계정 소유 Projects에는 fine-grained PAT를 사용할 수 없으므로 Project API용으로 만료일이 짧은 classic PAT를 별도 사용한다. read-only export는 `read:project`, 상태 변경은 `project` scope만 부여한다.
 - classic PAT의 Project scope는 특정 개인 Project 하나로 제한할 수 없어서 접근 가능한 개인 Projects 전체에 더 큰 blast radius를 가진다. 또한 classic PAT는 저장소를 개별 선택할 수 없으므로 `repo` scope를 추가하면 개인 private 저장소 전반으로 권한이 넓어진다. 특정 Project에만 격리된 credential이라고 주장하지 않는다.
 - Registry Contents/Issues 접근은 가능한 경우 Registry 저장소만 선택한 별도 fine-grained PAT로 분리한다. Project classic PAT를 Git push나 Registry Issue 변경에 재사용하지 않는다.
-- Phase 1A preflight에서 classic PAT에 `repo` scope 없이 다섯 운영 필드와 필요한 Project item ID를 읽고 쓸 수 있는지 실제 API로 확인한다. private Issue content 때문에 `repo` scope가 필요하면 이를 자동 추가하지 않고 Project 자동화를 fail-closed로 중단한 뒤 수동 UI 운영 또는 조직 소유 Project 대안을 다시 승인받는다.
+- Phase 1A Project Record는 classic PAT의 exact `project` scope만으로 DraftIssue ID/title/body와 다섯 운영 필드를 모두 읽고 쓴다. Issue/null/unknown content는 fail-closed하며 `repo` scope를 자동 추가하거나 repository credential로 fallback하지 않는다.
 - 두 credential은 빌드 서버에서만 사용하고 짧은 만료, 정기 rotation, 사용 종료 즉시 revoke를 적용한다. Project별 격리가 필수 요구가 되면 개인 Project 자동화를 중단하거나 GitHub App을 사용할 수 있는 조직 소유 Project로 이전하는 설계를 별도 검토한다.
 - credential은 Git, Handoff, snapshot, command output, 로그, AI context에 포함하지 않는다.
 - 빌드 서버 credential/snapshot 디렉터리는 소유자만 접근하고 디렉터리 `0700`, 파일 `0600`을 기본값으로 한다.
 - Claim에는 host alias와 `worktree_ref`만 저장하고 실제 absolute path는 host-local mapping에 둔다.
 - export와 Recall은 allowlist된 필드만 포함한다. token, raw Evidence, 고객 식별자, 비밀 경로, 환경변수는 제외한다.
 - credential 폐기·교체 절차를 문서화하고 cutover·reverse-cutover 시 사용하지 않는 credential을 즉시 revoke한다.
-- preflight의 비밀이 아닌 시험 좌표는 `JHW_REGISTRY_REPOSITORY=<owner/name>`, `JHW_PREFLIGHT_PROJECT_ITEM_ID=<PVTI...>`, `JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER=<positive-integer>` 세 값으로 고정한다. Project item과 Registry Issue는 전용 `trial` fixture이며 실제 프로젝트 데이터에 의존하지 않는다. 값이 없거나 형식이 틀리면 추론하지 않고 fail-closed한다.
+- preflight의 비밀이 아닌 시험 좌표는 `JHW_REGISTRY_REPOSITORY=<owner/name>`, `JHW_PREFLIGHT_PROJECT_ITEM_ID=<PVTI...>`, `JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER=<positive-integer>` 세 값으로 고정한다. Project item은 exact title `[TRIAL] Project Control Preflight Fixture`와 body `unchanged`인 고정 DraftIssue이고, Registry Issue는 Project에 붙이지 않는 독립 trial-only unchanged-write fixture다. 값이 없거나 형식/identity/content가 틀리면 추론하지 않고 fail-closed한다.
 - snapshot 보존 기본값은 daily 30개와 weekly 12개다. 더 긴 보존은 근거가 있을 때만 추가한다.
 
 ### 12.3 초기 export
@@ -657,11 +657,11 @@ snapshots/
 ### 12.4 최소 복구 검증
 
 - Registry는 일반 Git mirror 또는 clone으로 보존한다.
-- Project Record Issue 본문·source ID와 GitHub Project 다섯 필드·field option은 구조화 JSON으로 보존한다.
+- Project Record DraftIssue 본문·source ID와 GitHub Project 다섯 필드·field option은 구조화 JSON으로 보존한다.
 - 빌드 서버에만 존재하는 export는 `snapshot`이라고 부른다. 다른 장비/저장소에 검증된 복사본이 생긴 뒤에만 `backup`이라고 부른다.
 - pilot 중 빈 임시 디렉터리에 Registry Git을 복원하고 snapshot으로 모든 활성 Project Record source ID와 다섯 운영 필드를 재구성하는 수동 drill을 한 번 수행한다. GitHub에 실제로 되쓰지는 않는다.
 - Evidence를 `재생성 가능`과 `대체 불가능`으로 분류한다. 대체 불가능 Evidence는 다른 물리 저장소 복제가 완료되어야 보호된 것으로 표시한다.
-- GitHub Project snapshot은 Registry Project Record를 복원하는 자료가 아니라 해당 Record에 연결된 운영 필드 배정을 복원하는 자료다.
+- GitHub Project snapshot은 DraftIssue Record와 다섯 운영 필드를 함께 수동 재구성하기 위한 one-way evidence다. snapshot을 편집해 authoritative reverse-sync하거나 Registry Git mirror의 대체물로 사용하지 않는다.
 
 ---
 
@@ -670,7 +670,7 @@ snapshots/
 ### Phase 1A — 최소 dry-run
 
 - 실제 활성 프로젝트 2~3개만 Registry와 GitHub Project에 시험 등록한다.
-- Project Record Issue 제목과 GitHub Project 사용자 필드 다섯 개만 사용한다.
+- Project Record DraftIssue 제목과 GitHub Project 사용자 필드 다섯 개만 사용한다.
 - `task start/status/finish/recover`, 독립 worktree, 미완료 Handoff, `portfolio status`, on-demand export만 제공한다.
 - Registry 시험 레코드는 `trial`로 표시하며 이 기간의 운영 정본은 기존 Notion이다.
 - 최소 3개의 자연스러운 Task cycle로 Claim과 관리 마찰을 확인한다.

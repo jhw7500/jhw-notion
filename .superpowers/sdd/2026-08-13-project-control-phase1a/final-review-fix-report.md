@@ -133,6 +133,33 @@ git log --reverse --oneline 9fbd7983c80ad19a7fb0a51e201f67ba60ee1133..HEAD
 
 The first exact-HEAD independent scoped re-review returned **Critical 0 / Important 2**. Both findings were reproduced before correction: absolute-path Handoff content completed release but failed later read/resume, and a verified same-node Repository rename was blocked when a formal Task existed. Commit `08cbff0` closed those direct paths. Its fix-round re-review then found **Critical 0 / Important 1**: replacing the old canonical alias stranded immutable active/history Claims. Commit `0e7b566` preserves globally unique prior same-Issue aliases and proves both active-Claim operations and a pre-rename Handoff resume. The final exact-HEAD scoped re-review returned **CLEAN — Critical 0 / Important 0**.
 
-**Live evidence remains insufficient.** This implementation intentionally did not run live preflight, mutate live GitHub/Notion, flip authority, or create synthetic natural-cycle evidence. Deployment readiness still requires the separately governed live trial and natural-cycle evidence described by the approved design. Phase 1B, distributed locks/retries, scheduler/Actions, TTL/heartbeat, automatic context loading, and cutover remain out of scope.
+**The original local gate had insufficient live evidence.** The later trial recorded one fail-closed live preflight and a reversible DraftIssue create/read/delete capability probe, but no corrected `ready` preflight or natural Task cycle yet. No Notion mutation, authority flip, cutover, or synthetic natural-cycle evidence occurred. Deployment readiness still requires the corrected fixture preflight and natural-cycle evidence described below. Phase 1B, distributed locks/retries, scheduler/Actions, TTL/heartbeat, automatic context loading, and cutover remain out of scope.
 
 The only nonblocking WATCH is that historical formal aliases are constrained by Issue number rather than by a separately persisted repository-slug lineage. Immutable Issue node/source indexes, canonical `task_id`, and global alias uniqueness retain Phase 1A authority and collision safety; no Phase 1B mechanism was added.
+
+## Live Trial Correction — Project Records as DraftIssues
+
+The first approved live preflight exposed a physical least-privilege contradiction that local fakes could not prove: the exact classic `project`-only credential could enumerate the private Project item but returned `content: null` for its private Registry Issue, while the separate repository credential could read the Issue but not the personal Project. The old immutable-node join therefore failed closed with `PREFLIGHT_PROJECT_INTEGRITY`. No scope was broadened, no Notion mutation or authority transition occurred, and the Registry Issue body, labels, Git HEAD, and remote remained unchanged.
+
+A reversible live capability probe then proved that the exact Project-only credential can create, read, and delete a ProjectV2 DraftIssue. The approved minimal correction is therefore:
+
+- Project Records are canonical ProjectV2 DraftIssues, not Registry Issues.
+- DraftIssue title plus exact `{id, objective, repositories}` body and the same item's five operational fields form one Project Record.
+- Project read/register uses only `GH_PROJECT_TOKEN`; Issue/null/unknown Project content fails closed and never falls back to `GH_REPO_TOKEN`.
+- `JHW_PREFLIGHT_PROJECT_ITEM_ID` remains a fixed item coordinate, but it must identify the exact reserved DraftIssue titled `[TRIAL] Project Control Preflight Fixture` with body `unchanged` before it can be excluded from Project Records.
+- The configured Registry Issue remains an independent trial-only repo-token read/byte-identical unchanged-write fixture and is never attached or identity-joined to the Project fixture.
+- Registration is idempotent at the DraftIssue boundary: zero exact records creates one, one byte-identical partial record is resumed, and duplicates or mismatched identity/title/body/fields fail closed without automatic deletion.
+- Public registration output is now only `project_id`, `project_item_id`, and DraftIssue `source_node_id`.
+
+Focused correction evidence:
+
+- Project adapter, dedicated DraftIssue contract, and preflight: **59/59 GREEN**.
+- Latest complete MCP suite: **52 files, 873/873 GREEN**.
+- DraftIssue partial-registration E2E scenario: GREEN, including no duplicate create on retry and five-field final reread.
+- Full Phase 1A adversarial gate: **28/28 GREEN**.
+- TypeScript build and canonical skill sync: GREEN.
+- A host-state isolation regression in three pre-existing Notion write tests was reproduced after live authority-cache creation; those tests now inject the intended legacy authority explicitly rather than consulting operator state. Focused result: **13/13 GREEN**.
+
+The existing Issue-backed Project fixture is intentionally not migrated by code. The approved operator fixture conversion is explicit and fail-stop rather than automatically reversible: preserve the old coordinates as private evidence, create and validate the fixed DraftIssue, update the non-secret item coordinate, remove only the old Issue-backed Project attachment, retain the Registry Issue itself, then require corrected live preflight plus portfolio status. On failure the operator stops without touching Notion, authority, Registry Issue content, or Registry Git records. Existing Notion data remains unchanged and authoritative throughout Phase 1A.
+
+Independent correction review converged to **CLEAN — Critical 0 / Important 0** in both code and architecture lanes. The final proof set also covers secret- and absolute-host-path-bearing Draft mutation coordinates before any field write. The only remaining deployment WATCH is the deliberately separate corrected live `ready` preflight and later natural Task-cycle evidence.

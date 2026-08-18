@@ -47,7 +47,7 @@ jhw-control preflight
 - committed regular HEAD authority가 epoch 1 / legacy / no-cutover이고 installed version이 minimum 이상인지 확인한다.
 - Notion database/data-source ancestry를 read-only로 확인한다.
 - Project token scope가 정확히 `project` 하나인지, Project/Registry repository가 private인지, Registry SSH remote identity가 exact/unique인지 확인한다.
-- read-only prerequisite가 모두 통과한 뒤에만 지정 Project/Issue fixture를 쓰고 원래 값/동일 body로 복구한다.
+- read-only prerequisite가 모두 통과한 뒤에만 exact title/body를 가진 고정 Project DraftIssue fixture의 field를 write/restore하고, 이와 독립된 Registry Issue를 unchanged-write한다. 둘의 source identity를 결합하지 않는다.
 
 실패를 cache/추정으로 덮거나 scope를 확장하지 않는다. 이 스킬은 Project 등록, Task Claim, authority file 생성/변경을 하지 않는다.
 

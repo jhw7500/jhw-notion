@@ -8,7 +8,7 @@ Phase 1A는 별도 private Registry와 개인 private GitHub Project를 이용�
 - 이 저장소와 분리된 private Registry 저장소/checkout
 - 등록할 private source repository의 정확한 checkout
 - 개인 계정 소유 private GitHub Project와 정확히 다섯 필드: `Status`, `Priority`, `Health`, `Next Action`, `Last Reviewed`
-- Registry의 `trial` 전용 preflight Issue와 그 Issue에 연결된 지정 Project item
+- exact title/body의 고정 Project DraftIssue fixture와, Project에 연결하지 않는 Registry `trial` 전용 preflight Issue
 - clean, fast-forward 가능한 Registry checkout과 canonical GitHub SSH remote
 
 ```bash
@@ -81,12 +81,12 @@ rc=$?
 1. `credentials` — token 분리와 Project token exact scope
 2. `authority` — committed regular HEAD authority, epoch/legacy/no-cutover/minimum version
 3. `notion_guard` — database/data-source ancestry를 포함한 read-only Notion route 검증
-4. `project` — private Project, 정확한 필드, 지정 item attach/field write/restore
+4. `project` — private Project, 정확한 필드, 고정 canonical DraftIssue fixture identity/content와 field write/restore
 5. `registry_repository` — configured Registry GitHub repository가 private
 6. `registry_issue` — 지정 trial Issue identity/label/unchanged write
 7. `registry_git` — 정확히 하나인 matching SSH remote, fetch, dry-run push
 
-Authority/Notion/repository prerequisite가 먼저 통과한 뒤에만 지정 preflight fixture를 건드린다. fixture field는 원래 값으로 복구되고 Registry Issue body는 byte-identical해야 한다. 실패를 cached 결과로 덮지 않는다.
+Authority/Notion/repository prerequisite가 먼저 통과한 뒤에만 두 preflight fixture를 건드린다. Project fixture는 exact title `[TRIAL] Project Control Preflight Fixture`, body `unchanged`인 고정 DraftIssue여야 하고 field는 원래 값으로 복구된다. Registry Issue는 Project에 붙이지 않는 독립 fixture이며 body가 byte-identical해야 한다. 실패를 cached 결과로 덮지 않는다.
 
 | Exit | 의미와 조치 |
 |---:|---|
@@ -98,6 +98,18 @@ Authority/Notion/repository prerequisite가 먼저 통과한 뒤에만 지정 pr
 | `1` | integrity, sensitive-data, worktree/snapshot/Handoff 등 fail-closed 오류. artifact와 stable `error.code`를 감사하고 복구한다. |
 
 실패 command에서 journal append도 실패하면 원래 nonzero exit와 원래 `error.code`가 유지되고 `journal_warning`만 추가된다. raw stderr, token, private path를 복사하지 않는다.
+
+### 기존 Issue-backed Project fixture 전환
+
+구 구현으로 만든 Issue-backed Project item이 있으면 새 reader는 이를 Project Record로 무시하지 않고 fail-closed한다. 전환은 자동 migration이나 authority cutover가 아니라 승인된 trial fixture 정리이며 다음 순서를 지킨다.
+
+1. 기존 Project item ID와 Registry Issue 번호를 비공개 operator evidence로 보존한다. token이나 private path는 기록하지 않는다.
+2. exact `project` scope credential로 title `[TRIAL] Project Control Preflight Fixture`, body `unchanged`인 DraftIssue를 생성하고 반환된 DraftIssue/item identity와 내용을 다시 읽어 검증한다.
+3. `JHW_PREFLIGHT_PROJECT_ITEM_ID`를 새 DraftIssue item ID로 갱신하고 설정 파일 mode를 유지한다.
+4. Project에서 **구 Issue-backed attachment만** 제거한다. Registry preflight Issue 자체와 그 body/label은 삭제·변경하지 않는다.
+5. 새 `jhw-control preflight`가 `ready`인지 확인한 뒤 `jhw-control portfolio status`로 전용 Project에 fixed fixture 외 non-DraftIssue/null content가 없음을 증명한다.
+
+어느 단계든 identity/content/field restore가 불명확하거나 명령이 실패하면 즉시 중단한다. Notion, authority file/cache, Registry Issue, Registry Git record를 수정해 우회하지 않으며 자동 rollback·재생성·scope 확장을 시도하지 않는다.
 
 ### Registry dirty/ahead fail-stop 진단
 
@@ -149,7 +161,7 @@ jhw-control project register \
   --next-action <task:tsk-id-or-wait:condition> --last-reviewed <YYYY-MM-DD>
 ```
 
-Project Record Issue와 Project item은 source node ID로 idempotently 재사용한다. 부분 실패 시 **같은 승인 payload만** 재시도한다. 중복 item, 다른 Issue body, field mismatch는 corruption으로 중단한다.
+Project Record는 개인 비공개 GitHub Project의 DraftIssue 한 건이다. DraftIssue 제목과 exact `{id, objective, repositories}` 본문, 같은 item의 다섯 운영 필드를 Project-only token으로 생성·검증한다. 부분 실패 시 **같은 승인 payload와 정확히 하나인 같은 DraftIssue만** 재사용한다. 중복 Project ID/source/item, 다른 title/body, field mismatch, Issue/null content는 corruption으로 중단한다. Registry Issue를 만들거나 Project Record와 결합하지 않는다.
 
 ## 6. 기존 Notion baseline 5회
 

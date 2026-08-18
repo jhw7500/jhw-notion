@@ -98,7 +98,8 @@ Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Regi
 - 일반 `/jhw:project`/`--start`/`--close`와 `/jhw:status`는 계속 기존 Notion workflow다. **Phase 1A에서 Notion이 변경 없이 live authority**이며 Registry trial은 authority flip이나 migration이 아니다.
 - 개인 Project는 fine-grained PAT로 제어할 수 없어 별도 short-lived classic Project token이 필요하다. `GH_PROJECT_TOKEN`은 정확히 `project` scope 하나만 허용한다. 분리된 `GH_REPO_TOKEN`은 Registry와 등록할 private source repository의 Issue/metadata 검증에 필요한 최소 repository 권한만 가진다. token을 재사용하거나 scope를 자동 확장하지 않는다.
 - `JHW_REGISTRY_DIR`, Registry SSH remote/repository slug, `JHW_CONTROL_STATE_DIR`를 한 host identity로 고정한다. alternate checkout/symlink/state directory를 섞으면 전역 lock과 Registry identity가 깨지므로 허용하지 않는다.
-- `jhw-control preflight`는 committed authority/tool version, read-only Notion ancestry guard, exact credential scope, private Project/Registry repository, designated Project/Issue fixture restore, unique matching SSH remote와 Git dry-run을 확인하는 운영 go/no-go다.
+- Project Record는 개인 비공개 GitHub Project의 canonical DraftIssue다. 제목과 `{id, objective, repositories}` 본문은 DraftIssue가, 다섯 운영 필드는 같은 Project item이 소유한다. Registry Issue와 node ID를 결합하지 않는다.
+- `jhw-control preflight`는 committed authority/tool version, read-only Notion ancestry guard, exact credential scope, private Project/Registry repository, 고정 Project DraftIssue와 독립 Registry Issue fixture restore, unique matching SSH remote와 Git dry-run을 확인하는 운영 go/no-go다.
 - build server에서 manual/on-demand로 실행한다. Phase 1A에는 GitHub Actions workflow/minutes 의존과 schedule이 없다.
 
 구현된 public control command는 다음 12개뿐이다.
