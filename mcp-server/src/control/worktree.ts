@@ -1,14 +1,27 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory } from "./schemas.js";
+import { LOCAL_HANDOFF_RELATIVE_PATH } from "./handoff.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
 
 const STATE_VERSION = 2;
+// Removal tolerates exactly the tool's own local handoff copy: its durable
+// copy lives in the Registry, so it is not evidence worth blocking on, while
+// any other residue keeps the fail-stop. The tolerance is limited to the
+// untracked status entry — a tracked `.ai/handoff.md`, or tracked changes to
+// it, are repository content and keep blocking like any other file.
+const EXPECTED_LOCAL_HANDOFF_ENTRY = `?? ${LOCAL_HANDOFF_RELATIVE_PATH}`;
+
+function removalBlockingEntries(statusEntries: readonly string[]): string[] {
+  const index = statusEntries.indexOf(EXPECTED_LOCAL_HANDOFF_ENTRY);
+  if (index < 0) return [...statusEntries];
+  return statusEntries.filter((_, current) => current !== index);
+}
 const canonicalTaskId = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const canonicalClaimId = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const canonicalProjectId = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
@@ -28,6 +41,14 @@ export interface WorktreeCreateResult {
   branch: string;
   worktree_ref: string;
   reused: boolean;
+}
+
+interface FullWorktreeInspection {
+  inspection: WorktreeInspection;
+  // Raw porcelain entries (`XY path`) so removal tolerance can distinguish
+  // the untracked tool copy from tracked changes to the same path. Kept off
+  // the public inspection shape so status payloads are unchanged.
+  status_entries: string[];
 }
 
 export interface WorktreeInspection {
@@ -434,6 +455,10 @@ export class WorktreeManager {
   }
 
   async inspect(claim: WorktreeClaim): Promise<WorktreeInspection> {
+    return (await this.inspectClaimFull(claim)).inspection;
+  }
+
+  private async inspectClaimFull(claim: WorktreeClaim): Promise<FullWorktreeInspection> {
     validateClaim(claim);
     this.assertLocalHost(claim);
     const state = await this.loadState();
@@ -457,7 +482,7 @@ export class WorktreeManager {
     }
     const repository = await this.repositoryInfo(mapping.repository_path);
     this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
-    return this.inspectMapped(mapping, claim, root);
+    return this.inspectMappedFull(mapping, claim, root);
   }
 
   async assertTakeoverEligible(previous: ActiveClaim): Promise<void> {
@@ -549,8 +574,8 @@ export class WorktreeManager {
       return this.resumePendingRemove(claim, root, true);
     }
 
-    const inspection = await this.inspect(claim);
-    if (inspection.dirty) {
+    const { inspection, status_entries } = await this.inspectClaimFull(claim);
+    if (removalBlockingEntries(status_entries).length > 0) {
       throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a dirty worktree", {
         worktree_ref: inspection.worktree_ref,
         dirty_files: inspection.dirty_files,
@@ -684,8 +709,8 @@ export class WorktreeManager {
 
     // This is deliberately after the durable intent write and immediately
     // before `git worktree remove`: dirty/ahead state can change meanwhile.
-    const current = await this.inspectMapped(mapping, claim, root);
-    if (current.dirty) {
+    const { inspection: current, status_entries } = await this.inspectMappedFull(mapping, claim, root);
+    if (removalBlockingEntries(status_entries).length > 0) {
       throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a newly dirty worktree", {
         worktree_ref: current.worktree_ref,
         dirty_files: current.dirty_files,
@@ -698,6 +723,39 @@ export class WorktreeManager {
       });
     }
 
+    // Drop the tool's own handoff copy so plain `git worktree remove` can
+    // proceed — but only when the tolerance actually applied: the copy must
+    // be the untracked entry the inspection saw, a plain directory, and a
+    // regular file. lstat cannot fully close the swap race (there is no
+    // unlinkat), yet a late symlink swap can remove at most one link name,
+    // and any other new file keeps `git worktree remove` refusing below.
+    if (status_entries.includes(EXPECTED_LOCAL_HANDOFF_ENTRY)) {
+      const localHandoffDirectory = join(current.path, ".ai");
+      const localHandoffPath = join(current.path, LOCAL_HANDOFF_RELATIVE_PATH);
+      const directoryInfo = await lstat(localHandoffDirectory).catch(() => null);
+      const fileInfo = await lstat(localHandoffPath).catch(() => null);
+      if (!directoryInfo?.isDirectory() || !fileInfo?.isFile()) {
+        throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a worktree whose handoff copy is not a plain file", {
+          worktree_ref: current.worktree_ref,
+          dirty_files: current.dirty_files,
+        });
+      }
+      await unlink(localHandoffPath).catch((cause) => {
+        if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw new ControlError("WORKTREE_CLEANUP_FAILED", "Failed to drop the local handoff copy before removal", {
+            worktree_ref: current.worktree_ref,
+          });
+        }
+      });
+      await rmdir(localHandoffDirectory).catch((cause) => {
+        const code = (cause as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTEMPTY") {
+          throw new ControlError("WORKTREE_CLEANUP_FAILED", "Failed to drop the local handoff directory before removal", {
+            worktree_ref: current.worktree_ref,
+          });
+        }
+      });
+    }
     await this.git(["-C", mapping.repository_path, "worktree", "remove", current.path]);
     mapping.lifecycle = "removed";
     // If this persistence fails, the original pending-remove state remains a
@@ -740,12 +798,13 @@ export class WorktreeManager {
     return output === `refs/heads/${branch}`;
   }
 
-  private async inspectMapped(mapping: WorktreeMapping, claim: WorktreeClaim, root: string): Promise<WorktreeInspection> {
+  private async inspectMappedFull(mapping: WorktreeMapping, claim: WorktreeClaim, root: string): Promise<FullWorktreeInspection> {
     await this.verifyWorktree(mapping.path, claim.branch, mapping.repository_identity, root);
     // Enumerate untracked files rather than collapsing a new `.ai/` directory;
     // retry evidence permits exactly `.ai/handoff.md`, never an opaque folder.
     const status = await this.git(["-C", mapping.path, "status", "--porcelain", "--untracked-files=all"]);
-    const dirtyFiles = status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3));
+    const statusEntries = status.stdout.split("\n").filter(Boolean);
+    const dirtyFiles = statusEntries.map((line) => line.slice(3));
     const head = (await this.git(["-C", mapping.path, "rev-parse", "HEAD"])).stdout.trim();
     const upstream = (await this.git([
       "-C",
@@ -758,15 +817,18 @@ export class WorktreeManager {
       ? parseAheadBehind((await this.git(["-C", mapping.path, "rev-list", "--left-right", "--count", `${upstream}...HEAD`])).stdout)
       : { behind: 0, ahead: parseCount((await this.git(["-C", mapping.path, "rev-list", "--count", `${mapping.base_sha}..HEAD`])).stdout, "INVALID_GIT_STATE") };
     return {
-      path: mapping.path,
-      repository_path: mapping.repository_path,
-      branch: claim.branch,
-      worktree_ref: claim.worktree_ref,
-      head_sha: head,
-      dirty: dirtyFiles.length > 0,
-      dirty_files: dirtyFiles,
-      ahead: counts.ahead,
-      behind: counts.behind,
+      inspection: {
+        path: mapping.path,
+        repository_path: mapping.repository_path,
+        branch: claim.branch,
+        worktree_ref: claim.worktree_ref,
+        head_sha: head,
+        dirty: dirtyFiles.length > 0,
+        dirty_files: dirtyFiles,
+        ahead: counts.ahead,
+        behind: counts.behind,
+      },
+      status_entries: statusEntries,
     };
   }
 

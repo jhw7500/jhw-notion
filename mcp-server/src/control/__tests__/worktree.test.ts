@@ -214,6 +214,98 @@ describe("WorktreeManager", () => {
     await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("removes a worktree whose only residue is the expected local handoff copy", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await mkdir(join(created.path, ".ai"), { recursive: true });
+    await writeFile(join(created.path, ".ai", "handoff.md"), "retry copy\n", "utf8");
+
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true });
+    await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("still refuses removal when anything beyond the local handoff copy is dirty", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await mkdir(join(created.path, ".ai"), { recursive: true });
+    await writeFile(join(created.path, ".ai", "handoff.md"), "retry copy\n", "utf8");
+    await writeFile(join(created.path, "notes.txt"), "precious\n", "utf8");
+
+    const error = await manager.removeIfSafe(active).catch((cause) => cause);
+    expect(error).toMatchObject({ code: "WORKTREE_DIRTY" });
+    expect((error as ControlError).details?.dirty_files).toEqual(
+      expect.arrayContaining([".ai/handoff.md", "notes.txt"]),
+    );
+    await expect(stat(join(created.path, ".ai", "handoff.md"))).resolves.toBeDefined();
+  });
+
+  it("refuses removal for unexpected files inside the local handoff directory", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await mkdir(join(created.path, ".ai"), { recursive: true });
+    await writeFile(join(created.path, ".ai", "extra.md"), "unexpected\n", "utf8");
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_DIRTY" });
+    await expect(stat(created.path)).resolves.toBeDefined();
+  });
+
+  it("removes a clean worktree whose repository tracks the handoff path without touching it early", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    await mkdir(join(repoDir, ".ai"), { recursive: true });
+    await writeFile(join(repoDir, ".ai", "handoff.md"), "tracked copy\n", "utf8");
+    await git(repoDir, "add", ".ai/handoff.md");
+    await git(repoDir, "commit", "-m", "Track a handoff artifact");
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await expect(stat(join(created.path, ".ai", "handoff.md"))).resolves.toBeDefined();
+
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true });
+    await expect(stat(join(repoDir, ".ai", "handoff.md"))).resolves.toBeDefined();
+  });
+
+  it("refuses removal when a tracked handoff copy has uncommitted changes", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    await mkdir(join(repoDir, ".ai"), { recursive: true });
+    await writeFile(join(repoDir, ".ai", "handoff.md"), "tracked copy\n", "utf8");
+    await git(repoDir, "add", ".ai/handoff.md");
+    await git(repoDir, "commit", "-m", "Track a handoff artifact");
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await writeFile(join(created.path, ".ai", "handoff.md"), "uncommitted edit\n", "utf8");
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_DIRTY" });
+    await expect(readFile(join(created.path, ".ai", "handoff.md"), "utf8")).resolves.toBe("uncommitted edit\n");
+  });
+
+  it("refuses removal when the handoff copy itself is a symlink", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const outsideFile = join(fixture.root, "outside-handoff.md");
+    await writeFile(outsideFile, "outside copy\n", "utf8");
+    await mkdir(join(created.path, ".ai"), { recursive: true });
+    await symlink(outsideFile, join(created.path, ".ai", "handoff.md"));
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_DIRTY" });
+    await expect(stat(outsideFile)).resolves.toBeDefined();
+  });
+
+  it("refuses removal when the handoff directory is a symlink", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const outside = join(fixture.root, "outside-handoff");
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "handoff.md"), "outside copy\n", "utf8");
+    await symlink(outside, join(created.path, ".ai"));
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_DIRTY" });
+    await expect(stat(join(outside, "handoff.md"))).resolves.toBeDefined();
+  });
+
   it("does not let a prior Claim generation inspect or remove a reused worktree", async () => {
     const { repoDir, manager } = await worktreeFixture();
     const original = claim();

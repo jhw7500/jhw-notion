@@ -14,6 +14,7 @@ import {
   canonicalHandoffPath,
   assertValidHandoff,
   parseHandoffSections,
+  LOCAL_HANDOFF_RELATIVE_PATH,
   MAX_HANDOFF_BYTES,
   writeRegistryHandoff,
   writeWorktreeHandoff,
@@ -233,7 +234,7 @@ function assertUniqueDirtyFiles(inspection: WorktreeInspection): void {
 }
 
 function withoutExpectedLocalHandoff(paths: readonly string[]): string[] {
-  const index = paths.indexOf(".ai/handoff.md");
+  const index = paths.indexOf(LOCAL_HANDOFF_RELATIVE_PATH);
   if (index < 0) return [...paths];
   // Remove one precise expected retry delta. A duplicated entry remains part
   // of evidence and therefore fails closed rather than being silently hidden.

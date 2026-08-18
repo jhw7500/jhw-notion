@@ -317,6 +317,13 @@ async function writeRegularFile(path: string, content: string, code: string): Pr
 }
 
 /** Writes the host-local Handoff without following a `.ai` or file symlink. */
+/**
+ * Worktree-relative path of the local handoff copy. Every place that treats
+ * this artifact as tool-owned (removal tolerance, retry-evidence comparison)
+ * must share this single definition.
+ */
+export const LOCAL_HANDOFF_RELATIVE_PATH = ".ai/handoff.md";
+
 export async function writeWorktreeHandoff(
   worktreePath: string,
   content: string,
