@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { constants, fsync } from "node:fs";
+import { closeSync, constants, fstatSync, fsync, openSync, readSync } from "node:fs";
 import { open, rename, stat, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, basename, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -503,11 +503,100 @@ export function loadAuthorityPolicy(env: NodeJS.ProcessEnv = process.env): Promi
   }).load();
 }
 
+const CONTROL_ENVIRONMENT_COMPONENTS = [".config", "jhw-control"];
+const CONTROL_ENVIRONMENT_NAME = "control.env";
+const CONTROL_ENVIRONMENT_MAX_BYTES = 64 * 1024;
+const controlEnvironmentLine = /^(?:export[ \t]+)?JHW_REGISTRY_DIR=(.*)$/;
+
+// The operator file is walked component by component (no symlinked parents),
+// must be a regular single-link private file owned by this user, and is read
+// non-blocking so a FIFO cannot stall the guard. Its text is parsed as
+// literal KEY=VALUE lines and never shell-evaluated, and only the registry
+// coordinate is taken — the cache location and every other knob stay derived
+// from the process environment, so the file cannot relocate the epoch
+// rollback evidence or leak a credential line.
+function controlEnvironmentRegistryDir(home: string): string | null {
+  let directory: number;
+  try {
+    directory = openSync(home, constants.O_RDONLY | constants.O_DIRECTORY);
+  } catch {
+    return null;
+  }
+  let file: number;
+  try {
+    for (const component of CONTROL_ENVIRONMENT_COMPONENTS) {
+      const next = openSync(`/proc/self/fd/${directory}/${component}`, centralDirectoryOpenFlags);
+      closeSync(directory);
+      directory = next;
+    }
+    file = openSync(
+      `/proc/self/fd/${directory}/${CONTROL_ENVIRONMENT_NAME}`,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch {
+    return null;
+  } finally {
+    closeSync(directory);
+  }
+  try {
+    const info = fstatSync(file);
+    if (
+      !info.isFile() ||
+      info.nlink !== 1 ||
+      (info.mode & 0o077) !== 0 ||
+      (process.getuid !== undefined && info.uid !== process.getuid())
+    ) {
+      return null;
+    }
+    const buffer = Buffer.alloc(CONTROL_ENVIRONMENT_MAX_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const read = readSync(file, buffer, total, buffer.length - total, total);
+      if (read === 0) break;
+      total += read;
+    }
+    if (total > CONTROL_ENVIRONMENT_MAX_BYTES) return null;
+    let selected: string | null = null;
+    for (const raw of buffer.subarray(0, total).toString("utf8").split("\n")) {
+      const match = controlEnvironmentLine.exec(raw.trim());
+      if (!match) continue;
+      let value = (match[1] as string).trim();
+      if (
+        value.length >= 2 &&
+        ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+      ) {
+        value = value.slice(1, -1);
+      }
+      // The last assignment wins, matching what sourcing the file in a shell
+      // would leave in the environment.
+      if (value) selected = value;
+    }
+    return selected;
+  } catch {
+    return null;
+  } finally {
+    closeSync(file);
+  }
+}
+
+// A guard process launched without the operator environment (a TUI-spawned
+// MCP server) would otherwise fail closed against its own host cache even
+// while the committed authority is legacy. A present-but-blank registry
+// coordinate counts as absent; any non-blank explicit env always wins.
+function withControlEnvironmentFallback(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (env.JHW_REGISTRY_DIR?.trim()) return env;
+  const home = env.HOME?.trim() || homedir();
+  const registryDir = controlEnvironmentRegistryDir(home);
+  if (!registryDir) return env;
+  return { ...env, JHW_REGISTRY_DIR: registryDir };
+}
+
 export function createDefaultAuthorityService(env: NodeJS.ProcessEnv = process.env): AuthorityService {
+  const resolved = withControlEnvironmentFallback(env);
   const home = env.HOME?.trim() || homedir();
   const stateDir = env.JHW_CONTROL_STATE_DIR?.trim() || join(home, ".local/state/jhw-control");
   return createAuthorityService({
-    readCentral: () => readCentralFromEnvironment(env),
+    readCentral: () => readCentralFromEnvironment(resolved),
     cachePath: join(stateDir, CACHE_FILE),
     writesDisabled: strictWritesDisabled(env),
   });

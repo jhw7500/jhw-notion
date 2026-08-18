@@ -831,3 +831,208 @@ describe("Notion authority service", () => {
     expect(JSON.parse(await readFile(external, "utf8"))).toEqual(authority(9, "registry"));
   });
 });
+
+describe("control environment file fallback", () => {
+  const defaultCache = (root: string): string => join(root, ".local/state/jhw-control", "authority-cache.json");
+
+  async function controlEnvFile(root: string, lines: string[]): Promise<string> {
+    const configDir = join(root, ".config", "jhw-control");
+    await mkdir(configDir, { recursive: true });
+    const path = join(configDir, "control.env");
+    await writeFile(path, `${lines.join("\n")}\n`, { mode: 0o600 });
+    return path;
+  }
+
+  it("resolves committed legacy authority from control.env when the process env has no registry", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    await controlEnvFile(root, [`export JHW_REGISTRY_DIR=${registryDir}`]);
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(defaultCache(root), "utf8")))
+      .toEqual({ authority_epoch: 1, mode: "legacy" });
+  });
+
+  it("prefers explicit process env over control.env coordinates", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    await controlEnvFile(root, [`export JHW_REGISTRY_DIR=${join(root, "missing-registry")}`]);
+
+    await expect(createDefaultAuthorityService({
+      HOME: root,
+      JHW_REGISTRY_DIR: registryDir,
+      JHW_CONTROL_STATE_DIR: join(root, "state"),
+    }).assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+  });
+
+  it("applies the fallback when the explicit registry coordinate is blank", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    await controlEnvFile(root, [`export JHW_REGISTRY_DIR=${registryDir}`]);
+
+    await expect(createDefaultAuthorityService({ HOME: root, JHW_REGISTRY_DIR: "   " })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(defaultCache(root), "utf8")))
+      .toEqual({ authority_epoch: 1, mode: "legacy" });
+  });
+
+  it("takes only the registry coordinate and never relocates the cache from the file", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    const decoyState = join(root, "decoy-state");
+    await controlEnvFile(root, [
+      `HOME=${join(root, "elsewhere")}`,
+      "GITHUB_TOKEN=fake-token-value-for-test",
+      `export JHW_CONTROL_STATE_DIR=${decoyState}`,
+      `export JHW_REGISTRY_DIR=${registryDir}`,
+    ]);
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(defaultCache(root), "utf8")))
+      .toEqual({ authority_epoch: 1, mode: "legacy" });
+    await expect(lstat(join(decoyState, "authority-cache.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("cannot bypass the epoch rollback guard through the fallback file", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    const stateDir = join(root, "state");
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, "authority-cache.json"), JSON.stringify({ authority_epoch: 5, mode: "registry" }));
+    await controlEnvFile(root, [
+      `export JHW_REGISTRY_DIR=${registryDir}`,
+      `export JHW_CONTROL_STATE_DIR=${join(root, "empty-decoy-state")}`,
+    ]);
+
+    await expect(createDefaultAuthorityService({
+      HOME: root,
+      JHW_CONTROL_STATE_DIR: stateDir,
+    }).assertNotionWriteAllowed("projects", "jhw_record")).rejects.toMatchObject({
+      code: "AUTHORITY_EPOCH_ROLLBACK",
+    });
+  });
+
+  it("treats control.env values as literal text and never evaluates them", async () => {
+    const { root } = await temporaryCache();
+    const marker = join(root, "pwned");
+    await controlEnvFile(root, [`export JHW_REGISTRY_DIR=$(touch ${marker})`]);
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).rejects.toMatchObject({
+        code: "AUTHORITY_UNAVAILABLE",
+      });
+    await expect(lstat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("takes the last assignment like a sourcing shell would", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    await controlEnvFile(root, [
+      `export JHW_REGISTRY_DIR=${join(root, "stale-registry")}`,
+      `export JHW_REGISTRY_DIR=${registryDir}`,
+    ]);
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(defaultCache(root), "utf8")))
+      .toEqual({ authority_epoch: 1, mode: "legacy" });
+  });
+
+  it("unquotes simple quoted values from control.env", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    await controlEnvFile(root, [`export JHW_REGISTRY_DIR="${registryDir}"`]);
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(defaultCache(root), "utf8")))
+      .toEqual({ authority_epoch: 1, mode: "legacy" });
+  });
+
+  it("keeps prior behavior when control.env is absent", async () => {
+    const { root } = await temporaryCache();
+
+    await expect(createDefaultAuthorityService({
+      HOME: root,
+      JHW_CONTROL_STATE_DIR: join(root, "state"),
+    }).assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+  });
+
+  it("still fails closed with a prior cache when control.env cannot restore the registry", async () => {
+    const { root } = await temporaryCache();
+    const stateDir = join(root, "state");
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, "authority-cache.json"), JSON.stringify({ authority_epoch: 1, mode: "legacy" }));
+    await controlEnvFile(root, [`export JHW_REGISTRY_DIR=${join(root, "missing-registry")}`]);
+
+    await expect(createDefaultAuthorityService({
+      HOME: root,
+      JHW_CONTROL_STATE_DIR: stateDir,
+    }).assertNotionWriteAllowed("projects", "jhw_record")).rejects.toMatchObject({
+      code: "AUTHORITY_UNAVAILABLE",
+    });
+  });
+
+  it("ignores a FIFO without blocking the guard", async () => {
+    const { root } = await temporaryCache();
+    await committedRegistry(root, authority(1, "legacy"));
+    const configDir = join(root, ".config", "jhw-control");
+    await mkdir(configDir, { recursive: true });
+    execFileSync("mkfifo", [join(configDir, "control.env")]);
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    await expect(lstat(defaultCache(root))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a symlinked parent directory", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    const elsewhere = join(root, "elsewhere");
+    await mkdir(join(elsewhere, "jhw-control"), { recursive: true });
+    await writeFile(join(elsewhere, "jhw-control", "control.env"),
+      `export JHW_REGISTRY_DIR=${registryDir}\n`, { mode: 0o600 });
+    await symlink(elsewhere, join(root, ".config"));
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    await expect(lstat(defaultCache(root))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a multi-link control.env", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    const path = await controlEnvFile(root, [`export JHW_REGISTRY_DIR=${registryDir}`]);
+    await link(path, join(root, "control.env.alias"));
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    await expect(lstat(defaultCache(root))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a group- or world-readable control.env", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    const path = await controlEnvFile(root, [`export JHW_REGISTRY_DIR=${registryDir}`]);
+    await chmod(path, 0o644);
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    await expect(lstat(defaultCache(root))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("ignores an oversized control.env", async () => {
+    const { root } = await temporaryCache();
+    const registryDir = await committedRegistry(root, authority(1, "legacy"));
+    await controlEnvFile(root, [
+      `export JHW_REGISTRY_DIR=${registryDir}`,
+      `# ${"x".repeat(64 * 1024)}`,
+    ]);
+
+    await expect(createDefaultAuthorityService({ HOME: root })
+      .assertNotionWriteAllowed("projects", "jhw_record")).resolves.toBeUndefined();
+    await expect(lstat(defaultCache(root))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
