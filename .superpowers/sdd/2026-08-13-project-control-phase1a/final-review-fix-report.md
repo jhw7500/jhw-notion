@@ -133,7 +133,7 @@ git log --reverse --oneline 9fbd7983c80ad19a7fb0a51e201f67ba60ee1133..HEAD
 
 The first exact-HEAD independent scoped re-review returned **Critical 0 / Important 2**. Both findings were reproduced before correction: absolute-path Handoff content completed release but failed later read/resume, and a verified same-node Repository rename was blocked when a formal Task existed. Commit `08cbff0` closed those direct paths. Its fix-round re-review then found **Critical 0 / Important 1**: replacing the old canonical alias stranded immutable active/history Claims. Commit `0e7b566` preserves globally unique prior same-Issue aliases and proves both active-Claim operations and a pre-rename Handoff resume. The final exact-HEAD scoped re-review returned **CLEAN — Critical 0 / Important 0**.
 
-**The original local gate had insufficient live evidence.** The later trial recorded one fail-closed live preflight and a reversible DraftIssue create/read/delete capability probe, but no corrected `ready` preflight or natural Task cycle yet. No Notion mutation, authority flip, cutover, or synthetic natural-cycle evidence occurred. Deployment readiness still requires the corrected fixture preflight and natural-cycle evidence described below. Phase 1B, distributed locks/retries, scheduler/Actions, TTL/heartbeat, automatic context loading, and cutover remain out of scope.
+**The original local gate had insufficient live evidence.** The later trial first recorded one fail-closed preflight and a reversible DraftIssue create/read/delete capability probe, then completed the corrected fixed-fixture preflight described below. No natural Task cycle, Notion mutation, authority flip, cutover, or synthetic evidence occurred. Deployment readiness still requires the natural-cycle evidence described below. Phase 1B, distributed locks/retries, scheduler/Actions, TTL/heartbeat, automatic context loading, and cutover remain out of scope.
 
 The only nonblocking WATCH is that historical formal aliases are constrained by Issue number rather than by a separately persisted repository-slug lineage. Immutable Issue node/source indexes, canonical `task_id`, and global alias uniqueness retain Phase 1A authority and collision safety; no Phase 1B mechanism was added.
 
@@ -162,4 +162,17 @@ Focused correction evidence:
 
 The existing Issue-backed Project fixture is intentionally not migrated by code. The approved operator fixture conversion is explicit and fail-stop rather than automatically reversible: preserve the old coordinates as private evidence, create and validate the fixed DraftIssue, update the non-secret item coordinate, remove only the old Issue-backed Project attachment, retain the Registry Issue itself, then require corrected live preflight plus portfolio status. On failure the operator stops without touching Notion, authority, Registry Issue content, or Registry Git records. Existing Notion data remains unchanged and authoritative throughout Phase 1A.
 
-Independent correction review converged to **CLEAN — Critical 0 / Important 0** in both code and architecture lanes. The final proof set also covers secret- and absolute-host-path-bearing Draft mutation coordinates before any field write. The only remaining deployment WATCH is the deliberately separate corrected live `ready` preflight and later natural Task-cycle evidence.
+Independent correction review converged to **CLEAN — Critical 0 / Important 0** in both code and architecture lanes. The final proof set also covers secret- and absolute-host-path-bearing Draft mutation coordinates before any field write. The only remaining deployment WATCH is the deliberately separate natural Task-cycle evidence.
+
+## Corrected Live Fixture Validation
+
+After commit `6135170`, the approved fixture-only conversion was executed with the exact Project-only credential:
+
+1. The old Issue-backed item coordinate and Registry Issue number were preserved in owner-only operator evidence.
+2. Exactly one fixed DraftIssue was created and its item/source identity, title, and body were read back.
+3. The non-secret configured item coordinate was atomically replaced with mode `0600` preserved.
+4. Only the old Project attachment was removed. The first post-delete read observed GitHub's transient item-count lag; the bounded retry reconciled the lost response by proving the old item absent and the single exact DraftIssue present, without issuing a second delete.
+5. A fresh live `jhw-control preflight` returned exit `0`, `status: ready`, and all seven checks `ok`.
+6. A fresh live `portfolio status` returned zero Project Records, proving that the fixed fixture is excluded and no Issue/null item remains.
+
+The post-run audit found the independent Registry Issue still open with byte-identical body `unchanged` and only the `trial` label. Registry Git was clean and equal to its fetched remote (`0/0` ahead/behind). Authority-cache, pilot journal, and conversion evidence remained owner-only mode `0600`. Notion access was limited to the configured read-only ancestry proof; authority epoch/mode/cutover and existing Notion data were not changed.
