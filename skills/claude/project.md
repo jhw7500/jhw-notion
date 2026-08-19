@@ -79,3 +79,18 @@ Project Record는 비공개 Project의 canonical DraftIssue다. Registry Issue�
 성공 시 `project_id`, `project_item_id`, `source_node_id`만 보고한다. partial failure 후에는 동일 approved payload와 정확히 하나인 같은 DraftIssue만 재사용한다. 다른 title/body/field/node를 자동 채택하거나 중복 item을 만들지 않는다.
 
 exit `0`에 `journal_warning.code=JOURNAL_WRITE_FAILED`가 있어도 registration은 이미 성공했으므로 재시도하지 않고 measurement gap만 보고한다. nonzero에서는 stable code만 보고 secret/private path를 출력하지 않는다.
+
+### 4. 등록된 Project의 운영 필드 갱신
+
+이미 등록된 Project의 다섯 운영 필드만 바뀌는 경우에는 재등록하지 않고 update를 쓴다. 바꿀 필드만 플래그로 준다.
+
+```bash
+jhw-control project update \
+  --project <prj-id> \
+  [--status <status>] [--priority <priority>] [--health <health>] \
+  [--next-action <task:tsk-id-or-wait:condition>] [--last-reviewed <YYYY-MM-DD>]
+```
+
+최소 한 필드를 명시해야 하고, 생략한 필드는 현재 값 그대로 둔다. title·objective·repository 목록은 이 명령으로 바꾸지 않는다 — 정체성 변경 요청은 진행하지 않고 사용자에게 되돌린다. Next Action을 `task:`로 바꿀 때는 canonical Task ID만 쓰고 생성하지 않는다. Next Action을 명시하면 현재 값과 같더라도 그 Task의 존재를 검증하고, 명시하지 않으면 레코드가 이미 갖고 있던 참조는 검증하지 않는다.
+
+성공 시 `project_id`, `project_item_id`, `source_node_id`, 갱신된 다섯 필드를 보고한다. `PROJECT_RECORD_NOT_FOUND`·`DUPLICATE_PROJECT_RECORD`에서는 레코드를 만들거나 고르지 않는다. `PROJECT_UPDATE_UNSETTLED`는 쓴 값이 아직 정착하지 않은 것이므로 같은 플래그로 다시 실행한다. `PROJECT_UPDATE_MISMATCH`는 다른 writer가 값을 바꿨을 수 있으므로 현재 상태를 다시 읽어 확인한 뒤 판단한다. `INVALID_PROJECT_NEXT_ACTION`은 병합 결과가 active 규칙을 어기는 것이므로 Health와 Next Action을 함께 맞춘 패치로 다시 낸다 — 중단된 재구성으로 어긋난 레코드도 이 방법으로 복구한다. `INVALID_PROJECT_ITEM`은 운영 필드가 비어 있거나 Project 옵션과 어긋난 상태이므로 update가 아니라 승인된 원래 payload의 `project register`로 복구한다.

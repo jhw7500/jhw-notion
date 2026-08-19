@@ -164,6 +164,24 @@ jhw-control project register \
 
 Project Record는 개인 비공개 GitHub Project의 DraftIssue 한 건이다. DraftIssue 제목과 exact `{id, objective, repositories}` 본문, 같은 item의 다섯 운영 필드를 Project-only token으로 생성·검증한다. 부분 실패 시 **같은 승인 payload와 정확히 하나인 같은 DraftIssue만** 재사용한다. 중복 Project ID/source/item, 다른 title/body, field mismatch, Issue/null content는 corruption으로 중단한다. Registry Issue를 만들거나 Project Record와 결합하지 않는다.
 
+등록 뒤 다섯 운영 필드만 바뀌는 경우 — 진행 중 Task가 생겨 Status와 Next Action을 올리거나, Priority·Health·Last Reviewed를 조정하는 경우 — 에는 Project Record를 다시 등록하지 않고 update를 쓴다.
+
+```bash
+jhw-control project update \
+  --project <prj-id> \
+  [--status <proposed|active|paused|completed|cancelled>] \
+  [--priority <P0|P1|P2|P3>] [--health <on-track|at-risk|blocked|unknown>] \
+  [--next-action <task:tsk-id-or-wait:condition>] [--last-reviewed <YYYY-MM-DD>]
+```
+
+다섯 운영 필드 중 최소 하나를 명시해야 하고, 생략한 필드는 현재 값 그대로 둔다. title, objective, repository 목록은 Project Record의 불변 정체성이므로 이 명령으로 바꾸지 않는다. 병합된 필드셋에 enum과 active Status의 Next Action·Health 정합을 검증한다. `task:` Next Action은 이 명령으로 **명시했을 때만** Registry Task 존재를 검증한다 — 현재 값과 같더라도 명시하면 검증하고, Next Action을 주지 않은 패치는 레코드가 이미 갖고 있던 참조 때문에 막히지 않는다. 등록이 언제나 검증하는 것과 다른 점이다. 대상 Project Record가 없거나 둘 이상이면 만들지도 고르지도 않고 멈춘다. 실제로 값이 바뀐 필드만 쓰고, 쓴 뒤에는 bounded backoff로 다시 읽어 다섯 필드와 DraftIssue 정체성이 요청과 정확히 일치할 때만 성공으로 보고한다. 쓴 값이 정착하지 않으면 `PROJECT_UPDATE_UNSETTLED`로, 다른 writer가 이겨 값이 달라졌으면 `PROJECT_UPDATE_MISMATCH`로 재작성 없이 멈춘다. 전자는 같은 플래그로 다시 실행하고, 후자는 현재 상태를 다시 읽어 확인한 뒤 판단한다. 쓰기 도중 실패하면 그 시점까지 적용된 필드는 Project에 남는다. 같은 플래그로 다시 실행하면 남은 필드만 써서 수렴하므로 재실행이 안전하다.
+
+Status는 active로 들어갈 때 마지막에, active에서 나올 때 처음에 쓴다. 그래서 그 두 전이에서는 reader가 거부하는 상태가 생기지 않는다 — 일부 필드만 반영된 중간 상태는 여전히 관측되지만 유효하다. active인 채로 Health와 Next Action을 함께 바꾸는 재구성만 짧은 부분 적용 창이 남는다 — Project API에 다중 필드 원자 mutation이 없기 때문이다. 그 창에 겹친 `portfolio status`/`portfolio export`는 `INVALID_PROJECT_ITEM`으로 실패할 수 있고, 다시 실행하면 해소된다.
+
+active 레코드를 재구성하다 쓰기가 중단되면 Health와 Next Action이 어긋난 채 남는다. 다섯 필드는 모두 존재하지만 `portfolio status`/`portfolio export`는 그 레코드 하나 때문에 `INVALID_PROJECT_ITEM`으로 실패한다. 이 상태는 update로 복구한다 — 유효한 조합을 만드는 패치(예: `--health on-track`)를 주면 되고, 여전히 무효인 조합은 write 없이 `INVALID_PROJECT_NEXT_ACTION`으로 거부된다.
+
+운영 필드가 비어 있거나 Project 옵션 정의와 어긋나는 경우는 다르다. update는 write 없이 `INVALID_PROJECT_ITEM`으로 막히므로, 승인된 원래 payload로 `project register`를 다시 실행해 다섯 필드를 채운 뒤 update를 재개한다.
+
 ## 6. 기존 Notion baseline 5회
 
 첫 trial Task 전에 기존 `/jhw:status`·`/jhw:recall` 방식으로 실제 lookup 5회를 측정한다. 매번 현재 상태, 다음 행동, 차단 원인, 재개 지점의 같은 네 질문을 사용한다. project/query, 시작·종료 시각, elapsed seconds, 답변 가능 여부만 비밀 없는 operator scorecard에 기록한다. Project Control이 Notion이나 과거 session을 자동 로드하게 만들지 않는다.

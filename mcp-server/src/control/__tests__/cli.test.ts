@@ -173,6 +173,12 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
       project_item_id: "PVTI_control",
       source_node_id: "DI_control",
     })),
+    updateProject: vi.fn(async (input: { project_id: string }) => ({
+      project_id: input.project_id,
+      project_item_id: "PVTI_control",
+      source_node_id: "DI_control",
+      fields: updatedFields(),
+    })),
     ...overrides.portfolio,
   };
   const preflight = {
@@ -230,6 +236,20 @@ function registerArgs(): string[] {
     "--next-action", "wait:select-first-task",
     "--last-reviewed", "2026-08-13",
   ];
+}
+
+function updatedFields() {
+  return {
+    status: "active" as const,
+    priority: "P2" as const,
+    health: "unknown" as const,
+    next_action: `task:${TASK_ID}`,
+    last_reviewed: "2026-08-13",
+  };
+}
+
+function updateArgs(): string[] {
+  return ["project", "update", "--project", PROJECT_ID, "--status", "active", "--next-action", `task:${TASK_ID}`];
 }
 
 function nearCliLimitPortfolioSource(): ProjectSnapshotSource {
@@ -624,6 +644,7 @@ describe("runCli", () => {
     expect(requiresMutationLock(["task", "recover", "--action", "takeover"])).toBe(true);
     expect(requiresMutationLock(["task", "recover", "--action", "cleanup"])).toBe(true);
     expect(requiresMutationLock(["project", "register"])).toBe(true);
+    expect(requiresMutationLock(["project", "update"])).toBe(true);
     expect(requiresMutationLock(["preflight"])).toBe(true);
     expect(requiresMutationLock(["task", "status"])).toBe(false);
     expect(requiresMutationLock(["task", "recover", "--action", "status"])).toBe(false);
@@ -875,6 +896,62 @@ describe("runCli", () => {
 
     expect(result.exitCode).toBe(2);
     expect(dependencies.portfolio.registerProject).not.toHaveBeenCalled();
+  });
+
+  it("passes only the explicitly supplied operating fields to the update port", async () => {
+    const dependencies = makeCliDependencies();
+
+    const result = await runCli(updateArgs(), dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.portfolio.updateProject).toHaveBeenCalledWith({
+      project_id: PROJECT_ID,
+      fields: { status: "active", next_action: `task:${TASK_ID}` },
+    });
+    expect(JSON.parse(result.stdout)).toEqual({
+      command: "project update",
+      result: {
+        project_id: PROJECT_ID,
+        project_item_id: "PVTI_control",
+        source_node_id: "DI_control",
+        fields: updatedFields(),
+      },
+    });
+  });
+
+  it.each([
+    ["project", "update", "--project", PROJECT_ID],
+    ["project", "update", "--project", PROJECT_ID, "--title", "Renamed"],
+    ["project", "update", "--project", PROJECT_ID, "--last-reviewed", "2026-02-30"],
+    ["project", "update", "--status", "active"],
+    ["project", "update", "--project", PROJECT_ID, "--status", ""],
+    ["project", "update", "--project", PROJECT_ID, "--next-action", "   "],
+    ["project", "update", "--project", PROJECT_ID, "--priority", "P1", "--priority", "P2"],
+    ["project", "update", "--project", PROJECT_ID, "--next-action", "--status"],
+  ])("rejects an empty, identity-bearing, or invalid update patch before the port", async (...args) => {
+    const dependencies = makeCliDependencies();
+
+    const result = await runCli(args, dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.portfolio.updateProject).not.toHaveBeenCalled();
+  });
+
+  it("rejects an update result that is oversized or names another Project", async () => {
+    for (const invalid of [
+      { project_id: PROJECT_ID, project_item_id: `PVTI_${"a".repeat(20_000)}`, source_node_id: "DI_control", fields: updatedFields() },
+      { project_id: "prj-other", project_item_id: "PVTI_control", source_node_id: "DI_control", fields: updatedFields() },
+    ]) {
+      const dependencies = makeCliDependencies({
+        portfolio: { updateProject: vi.fn().mockResolvedValue(invalid) },
+      });
+
+      const result = await runCli(updateArgs(), dependencies);
+
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.stderr)).toEqual({ error: { code: "INVALID_PROJECT_UPDATE_RESULT" } });
+      expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    }
   });
 
   it("allows an optional session for status/force-end recovery without echoing a takeover session", async () => {

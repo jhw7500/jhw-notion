@@ -102,13 +102,13 @@ Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Regi
 - `jhw-control preflight`는 committed authority/tool version, read-only Notion ancestry guard, exact credential scope, private Project/Registry repository, 고정 Project DraftIssue와 독립 Registry Issue fixture restore, unique matching SSH remote와 Git dry-run을 확인하는 운영 go/no-go다.
 - build server에서 manual/on-demand로 실행한다. Phase 1A에는 GitHub Actions workflow/minutes 의존과 schedule이 없다.
 
-구현된 public control command는 다음 12개뿐이다.
+구현된 public control command는 다음 13개뿐이다.
 
 | 영역 | command |
 |---|---|
 | Repository | `repository register` |
 | Task | `task start`, `task promote`, `task handoff`, `task status`, `task finish`, `task recover`, `task assert-owner` |
-| Portfolio/Project | `portfolio status`, `portfolio export`, `project register`, `preflight` |
+| Portfolio/Project | `portfolio status`, `portfolio export`, `project register`, `project update`, `preflight` |
 
 `task start --task`는 같은 persistent Task를 명시적으로 재개하고 bounded latest Handoff만 반환한다. Handoff source revision은 Claim 시점에 고정된다. release 뒤 local cleanup은 `task recover --action cleanup`으로 exact Claim generation만 복구한다. `task assert-owner`는 raw Git을 통합 enforce하지 않는 advisory check라서 승인된 takeover와 race할 수 있다.
 

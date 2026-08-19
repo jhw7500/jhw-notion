@@ -7,7 +7,9 @@ import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.j
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   type ProjectRecordLink,
+  type ProjectRecordUpdate,
   type RegisterProjectInput,
+  type UpdateProjectInput,
   ProjectSnapshotSourceSchema,
   type ProjectSnapshotItem,
   type ProjectSnapshotSource as ValidProjectSnapshotSource,
@@ -26,6 +28,7 @@ const readFileFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NO
 export interface ProjectSnapshotReader {
   readAll(): Promise<ProjectSnapshotSource>;
   registerProject?(input: RegisterProjectInput): Promise<ProjectRecordLink>;
+  updateProject?(input: UpdateProjectInput): Promise<ProjectRecordUpdate>;
 }
 
 export interface BoundedPayload {
@@ -360,6 +363,15 @@ export class PortfolioService {
       throw new ControlError("PROJECT_REGISTRATION_UNAVAILABLE", "Project snapshot reader does not support registration");
     }
     return this.options.projectClient.registerProject(input);
+  }
+
+  async updateProject(input: UpdateProjectInput): Promise<ProjectRecordUpdate> {
+    this.sensitiveData.assertSafe(input);
+    assertNoAbsoluteHostPaths(input);
+    if (!this.options.projectClient.updateProject) {
+      throw new ControlError("PROJECT_UPDATE_UNAVAILABLE", "Project snapshot reader does not support operating-field updates");
+    }
+    return this.options.projectClient.updateProject(input);
   }
 
   async exportSnapshot(): Promise<SnapshotExportResult> {

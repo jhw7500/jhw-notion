@@ -163,8 +163,9 @@ describe("PortfolioService", () => {
     const protectedSource = source(1);
     protectedSource.items[0] = { ...protectedSource.items[0]!, objective: `do not export ${sourceCheckout}` };
     const registerProject = vi.fn();
+    const updateProject = vi.fn();
     const portfolio = new PortfolioService({
-      projectClient: { readAll: async () => protectedSource, registerProject },
+      projectClient: { readAll: async () => protectedSource, registerProject, updateProject },
       stateDir: join(root, "state"),
     });
 
@@ -180,8 +181,34 @@ describe("PortfolioService", () => {
         next_action: "wait:fixture", last_reviewed: "2026-08-13",
       },
     })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    await expect(portfolio.updateProject({
+      project_id: "prj-control",
+      fields: { next_action: `wait:${sourceCheckout}` },
+    })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
     expect(registerProject).not.toHaveBeenCalled();
+    expect(updateProject).not.toHaveBeenCalled();
     await expect(lstat(join(root, "state"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("delegates an approved operating-field patch and fails closed without reader support", async () => {
+    const updateProject = vi.fn(async (input: { project_id: string }) => ({
+      project_id: input.project_id,
+      project_item_id: "PVTI_control",
+      source_node_id: "DI_control",
+      fields: item(1).fields,
+    }));
+    const patch = { project_id: "prj-control", fields: { priority: "P1" as const } };
+
+    await expect(new PortfolioService({
+      projectClient: { readAll: async () => source(), updateProject },
+      stateDir: "/unused",
+    }).updateProject(patch)).resolves.toMatchObject({ project_id: "prj-control", fields: item(1).fields });
+    expect(updateProject).toHaveBeenCalledWith(patch);
+
+    await expect(new PortfolioService({
+      projectClient: { readAll: async () => source() },
+      stateDir: "/unused",
+    }).updateProject(patch)).rejects.toMatchObject({ code: "PROJECT_UPDATE_UNAVAILABLE" });
   });
 
   it("caps portfolio markdown and CLI-safe payload at 12 KiB or 20 items and emits page IDs", async () => {

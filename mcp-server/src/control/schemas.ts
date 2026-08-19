@@ -206,6 +206,15 @@ export const RegisterProjectInputSchema = z
   .strict();
 export type RegisterProjectInput = z.infer<typeof RegisterProjectInputSchema>;
 
+export const UpdateProjectInputSchema = z
+  .object({
+    project_id: projectId,
+    fields: ProjectOperationalFieldsSchema.partial()
+      .refine((fields) => Object.values(fields).some((value) => value !== undefined), "At least one operating field is required"),
+  })
+  .strict();
+export type UpdateProjectInput = z.infer<typeof UpdateProjectInputSchema>;
+
 export const ProjectRecordBodySchema = z
   .object({
     id: projectId,
@@ -262,6 +271,11 @@ export const ProjectRecordLinkSchema = z
   })
   .strict();
 export type ProjectRecordLink = z.infer<typeof ProjectRecordLinkSchema>;
+
+export const ProjectRecordUpdateSchema = ProjectRecordLinkSchema
+  .extend({ fields: ProjectOperationalFieldsSchema })
+  .strict();
+export type ProjectRecordUpdate = z.infer<typeof ProjectRecordUpdateSchema>;
 
 export const BoundedPortfolioPayloadSchema = z
   .object({

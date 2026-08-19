@@ -7,18 +7,26 @@ import {
   ProjectOperationalFieldsSchema,
   ProjectRecordBodySchema,
   ProjectRecordLinkSchema,
+  ProjectRecordUpdateSchema,
   ProjectSnapshotSourceSchema,
   RegisterProjectInputSchema,
+  UpdateProjectInputSchema,
   type ProjectFieldDefinition,
   type ProjectOperationalFields,
   type ProjectRecordBody,
   type ProjectRecordLink,
+  type ProjectRecordUpdate,
   type ProjectSnapshotItem,
   type ProjectSnapshotSource,
   type RegisterProjectInput,
+  type UpdateProjectInput,
 } from "./schemas.js";
 
 const MAX_PROJECT_PAGES = 10_000;
+// A Project field write is visible to its own read-back only eventually, so an
+// update confirms through a bounded backoff instead of a single immediate read.
+const UPDATE_VERIFY_ATTEMPTS = 4;
+const UPDATE_VERIFY_BACKOFF_MS = 250;
 const PREFLIGHT_DRAFT_TITLE = "[TRIAL] Project Control Preflight Fixture";
 const PREFLIGHT_DRAFT_BODY = "unchanged";
 const REQUIRED_OPTIONS = {
@@ -276,6 +284,8 @@ export interface GitHubProjectClientOptions {
   catalog: GitHubCatalogPort;
   now?: () => Date;
   sensitiveData?: SensitiveDataPolicy;
+  /** Test-only replacement for the bounded update read-back backoff. */
+  sleep?: (milliseconds: number) => Promise<void>;
 }
 
 interface ProjectStructure {
@@ -420,7 +430,13 @@ function stale(fields: ProjectOperationalFields, now: Date): boolean {
   return today > reviewed + Math.min(...cadences) * 86_400_000;
 }
 
-function operatingFields(node: ItemNode, structure: ProjectStructure): ProjectOperationalFields {
+/**
+ * Parses the five stored operating fields without asserting the resting active
+ * rule. A partially applied write can leave every field present yet violate the
+ * Health/Next Action coupling, and that record still has to be readable so an
+ * approved patch can repair it.
+ */
+function storedOperatingFields(node: ItemNode, structure: ProjectStructure): ProjectOperationalFields {
   const status = SelectValueSchema.safeParse(node.status);
   const priority = SelectValueSchema.safeParse(node.priority);
   const health = SelectValueSchema.safeParse(node.health);
@@ -449,14 +465,19 @@ function operatingFields(node: ItemNode, structure: ProjectStructure): ProjectOp
     last_reviewed: lastReviewed.data.date,
   });
   if (!parsed.success) throw new ControlError("INVALID_PROJECT_ITEM", "Project item operating fields are invalid", { project_item_id: node.id });
+  return parsed.data;
+}
+
+function operatingFields(node: ItemNode, structure: ProjectStructure): ProjectOperationalFields {
+  const stored = storedOperatingFields(node, structure);
   try {
-    validateActiveNextAction(parsed.data);
+    validateActiveNextAction(stored);
   } catch {
     throw new ControlError("INVALID_PROJECT_ITEM", "Active Project item Next Action does not match its Health", {
       project_item_id: node.id,
     });
   }
-  return parsed.data;
+  return stored;
 }
 
 type RegistrationFieldUpdate = {
@@ -473,6 +494,32 @@ function registrationFieldUpdates(fields: ProjectOperationalFields): Registratio
     { fieldName: "Next Action", kind: "text", value: fields.next_action },
     { fieldName: "Last Reviewed", kind: "date", value: fields.last_reviewed },
   ];
+}
+
+function changedFieldUpdates(
+  current: ProjectOperationalFields,
+  merged: ProjectOperationalFields,
+): RegistrationFieldUpdate[] {
+  const before = new Map(registrationFieldUpdates(current).map((update) => [update.fieldName, update.value]));
+  const changed = registrationFieldUpdates(merged).filter((update) => before.get(update.fieldName) !== update.value);
+  // The Next Action/Health rule binds only while Status is active, so a record
+  // entering active writes Status last and one leaving active writes it first.
+  // That removes the window where a concurrent reader would reject a partially
+  // applied record; an active-to-active change cannot avoid one because the
+  // Project API has no multi-field mutation.
+  const status = changed.filter((update) => update.fieldName === "Status");
+  const others = changed.filter((update) => update.fieldName !== "Status");
+  return merged.status === "active" ? [...others, ...status] : [...status, ...others];
+}
+
+/** Reads operating fields, treating a partially applied write as not yet settled. */
+function settledOperatingFields(node: ItemNode, structure: ProjectStructure): ProjectOperationalFields | undefined {
+  try {
+    return operatingFields(node, structure);
+  } catch (cause) {
+    if (cause instanceof ControlError && cause.code === "INVALID_PROJECT_ITEM") return undefined;
+    throw cause;
+  }
 }
 
 function missingRegistrationFields(
@@ -523,11 +570,13 @@ function missingRegistrationFields(
 export class GitHubProjectClient {
   private readonly now: () => Date;
   private readonly sensitiveData: SensitiveDataPolicy;
+  private readonly sleep: (milliseconds: number) => Promise<void>;
   private preflightStructure?: ProjectStructure;
 
   constructor(private readonly options: GitHubProjectClientOptions) {
     this.now = options.now ?? (() => new Date());
     this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy();
+    this.sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => { setTimeout(resolve, milliseconds); }));
   }
 
   private coordinates(): Array<["raw" | "typed", string]> {
@@ -781,6 +830,86 @@ export class GitHubProjectClient {
     });
     if (!link.success) throw new ControlError("INVALID_PROJECT_MUTATION", "Project registration returned invalid coordinates");
     return link.data;
+  }
+
+  /** Patches only the operating fields of one existing canonical Project Record. */
+  async updateProject(rawInput: UpdateProjectInput): Promise<ProjectRecordUpdate> {
+    this.assertContentSafe(rawInput);
+    const input = UpdateProjectInputSchema.safeParse(rawInput);
+    if (!input.success) throw new ControlError("INVALID_PROJECT_UPDATE", "Project update input is invalid");
+
+    const initial = await this.initialPage();
+    const structure = await this.structure(initial);
+    const matches = this.recordItems(await this.items(initial)).filter(({ body }) => body.id === input.data.project_id);
+    if (matches.length === 0) throw new ControlError("PROJECT_RECORD_NOT_FOUND", "Canonical Project Record does not exist");
+    if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple DraftIssues use the requested Project ID");
+    const match = matches[0] as { node: ItemNode; content: DraftIssue; body: ProjectRecordBody };
+
+    // Title, objective, and repositories stay the record's immutable identity.
+    // The stored read deliberately skips the resting active rule: a record left
+    // mid-reconfiguration violates it, and refusing to read that record would
+    // make the approved patch that repairs it unreachable. The merged result is
+    // still held to the rule below, so no update can leave a record invalid.
+    const current = storedOperatingFields(match.node, structure);
+    const merged = ProjectOperationalFieldsSchema.safeParse({ ...current, ...input.data.fields });
+    if (!merged.success) throw new ControlError("INVALID_PROJECT_UPDATE", "Merged Project operating fields are invalid");
+    validateActiveNextAction(merged.data);
+    const updates = changedFieldUpdates(current, merged.data);
+    // Prove every Task reference this patch asserts, including one restated at
+    // its current value, because naming it is the operator's claim that it
+    // exists. A patch that omits Next Action is never blocked by the reference
+    // the record already carried.
+    // Repository membership is not re-proven: this command cannot change it,
+    // and registration already established it for the record being patched.
+    if (input.data.fields.next_action !== undefined) {
+      const nextTask = taskId(merged.data);
+      if (nextTask) await this.options.catalog.getTask(nextTask);
+    }
+
+    for (const update of updates) {
+      await this.updateField(structure, match.node.id, update.fieldName, update.kind, update.value);
+    }
+    await this.verifyUpdatedItem(match.node.id, match.content, merged.data, structure);
+
+    const updated = ProjectRecordUpdateSchema.safeParse({
+      project_id: input.data.project_id,
+      project_item_id: match.node.id,
+      source_node_id: match.content.id,
+      fields: merged.data,
+    });
+    if (!updated.success) throw new ControlError("INVALID_PROJECT_MUTATION", "Project update returned invalid coordinates");
+    return updated.data;
+  }
+
+  private async verifyUpdatedItem(
+    itemId: string,
+    content: DraftIssue,
+    expected: ProjectOperationalFields,
+    structure: ProjectStructure,
+  ): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      const page = await this.initialPage();
+      const matches = this.recordItems(await this.items(page)).filter((record) => record.content.id === content.id);
+      if (matches.length > 1) {
+        throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project Record DraftIssue is attached more than once after the update");
+      }
+      const match = matches[0];
+      if (!match || match.node.id !== itemId) {
+        throw new ControlError("PROJECT_UPDATE_MISMATCH", "Updated Project item identity failed final verification");
+      }
+      if (match.content.title !== content.title || match.content.body !== content.body) {
+        throw new ControlError("PROJECT_UPDATE_MISMATCH", "Project Record identity changed during the operating-field update");
+      }
+      const actual = settledOperatingFields(match.node, structure);
+      if (actual && JSON.stringify(actual) === JSON.stringify(expected)) return;
+      if (attempt >= UPDATE_VERIFY_ATTEMPTS) {
+        // Distinguish a read that never settled from one that settled on
+        // another writer's values: only the error code reaches the operator.
+        if (!actual) throw new ControlError("PROJECT_UPDATE_UNSETTLED", "Updated Project fields never settled within the bounded read-back");
+        throw new ControlError("PROJECT_UPDATE_MISMATCH", "Updated Project fields failed final verification");
+      }
+      await this.sleep(UPDATE_VERIFY_BACKOFF_MS * 2 ** (attempt - 1));
+    }
   }
 
   private async verifyRegisteredItem(

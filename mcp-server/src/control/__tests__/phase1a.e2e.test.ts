@@ -200,6 +200,14 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         checksum: "a".repeat(64),
       }),
       registerProject: async (input) => ({ project_id: input.project_id, project_item_id: "PVTI_control", source_node_id: "DI_control" }),
+      updateProject: async (input) => ({
+        project_id: input.project_id, project_item_id: "PVTI_control", source_node_id: "DI_control",
+        fields: {
+          status: "proposed", priority: "P2", health: "unknown",
+          next_action: "wait:select", last_reviewed: "2026-08-13",
+          ...input.fields,
+        },
+      }),
     },
     preflight: { run: async () => ({
       status: "ready",
@@ -324,7 +332,8 @@ function gatePreflightProjectItem() {
   };
 }
 
-function gateProjectRecordItem(state: "first-two" | "complete") {
+function gateProjectRecordItem(state: "first-two" | "complete" | "updated") {
+  const settled = state !== "first-two";
   return {
     id: "PVTI_existing", isArchived: false, type: "DRAFT_ISSUE",
     content: {
@@ -332,10 +341,14 @@ function gateProjectRecordItem(state: "first-two" | "complete") {
       body: JSON.stringify({ id: "prj-example", objective: "Prove the trial flow", repositories: ["repo-control"] }),
     },
     status: { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "status-proposed", name: "proposed" },
-    priority: { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P2", name: "P2" },
-    health: state === "complete" ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" } : null,
-    nextAction: state === "complete" ? { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select" } : null,
-    lastReviewed: state === "complete" ? { __typename: "ProjectV2ItemFieldDateValue", date: "2026-08-13" } : null,
+    priority: state === "updated"
+      ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P1", name: "P1" }
+      : { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "priority-P2", name: "P2" },
+    health: settled ? { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "health-unknown", name: "unknown" } : null,
+    nextAction: settled ? { __typename: "ProjectV2ItemFieldTextValue", text: "wait:select" } : null,
+    lastReviewed: settled
+      ? { __typename: "ProjectV2ItemFieldDateValue", date: state === "updated" ? "2026-08-19" : "2026-08-13" }
+      : null,
   };
 }
 
@@ -1470,6 +1483,48 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(retryRunner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(3);
     expect(retryRunner.calls.some((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toBe(false);
     expect(retryRunner.calls.every((call) => call.credential === "project")).toBe(true);
+  }, 20_000);
+
+  it("23b. Project update writes only the changed operating fields through the locked CLI and leaves identity untouched", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const mutation = { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_existing" } } } };
+    const runner = new GateProjectRunner();
+    runner.enqueue(
+      gateProjectPage(gatePreflightProjectItem(), gateProjectRecordItem("complete")),
+      mutation, mutation,
+      gateProjectPage(gatePreflightProjectItem(), gateProjectRecordItem("updated")),
+    );
+    const project = new GitHubProjectClient({
+      githubOwner: "jhw7500", projectNumber: 7,
+      preflightProjectItemId: "PVTI_trial", runner, catalog: graph.catalog,
+    });
+    let locked = 0;
+    const base = cliDependencies(graph);
+    const dependencies = cliDependencies(graph, {
+      portfolio: { ...base.portfolio, updateProject: project.updateProject.bind(project) },
+      mutationLock: { run: async (callback) => { locked += 1; return callback(); } },
+    });
+
+    const result = await runCli([
+      "project", "update", "--project", "prj-example", "--priority", "P1", "--last-reviewed", "2026-08-19",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).toEqual({
+      project_id: "prj-example", project_item_id: "PVTI_existing", source_node_id: "DI_existing",
+      fields: {
+        status: "proposed", priority: "P1", health: "unknown",
+        next_action: "wait:select", last_reviewed: "2026-08-19",
+      },
+    });
+    expect(locked).toBe(1);
+    const written = runner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"));
+    expect(written).toHaveLength(2);
+    expect(written.some((call) => call.args.join(" ").includes("optionId=status-"))).toBe(false);
+    expect(runner.calls.some((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toBe(false);
+    expect(runner.calls.every((call) => call.credential === "project")).toBe(true);
   }, 20_000);
 
   it("24. cleanup recovery resumes failures after release, pending-remove persistence, and physical removal before any successor Claim", async () => {

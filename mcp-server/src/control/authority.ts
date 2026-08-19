@@ -132,7 +132,7 @@ function epochRollback(operation = "authority.load", db = "unknown"): ControlErr
 function moved(operation: string, db: string): ControlError {
   const route = db === "decisionLog"
     ? "Route formal decisions to a Git ADR."
-    : "Route Project state through `jhw-control project register` and the Project workflow.";
+    : "Route Project state through `jhw-control project register`/`project update` and the Project workflow.";
   return structuredError("AUTHORITY_MOVED", operation, db, route);
 }
 

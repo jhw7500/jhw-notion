@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { GitHubProjectClient, type GitHubRunner } from "../github-project.js";
+import type { ProjectOperationalFields } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000001";
@@ -17,6 +18,7 @@ class QueuedGhRunner implements GitHubRunner {
     this.calls.push({ args, credential });
     const response = this.responses.shift();
     if (response === undefined) throw new Error("QueuedGhRunner exhausted");
+    if (response instanceof Error) throw response;
     return { command: "gh", args, stdout: `${JSON.stringify(response)}\n`, stderr: "", exitCode: 0 as const };
   }
 }
@@ -135,7 +137,7 @@ function catalogFixture() {
   };
 }
 
-function client(runner: QueuedGhRunner, catalog = catalogFixture()) {
+function client(runner: QueuedGhRunner, catalog = catalogFixture(), sleep?: (milliseconds: number) => Promise<void>) {
   return new GitHubProjectClient({
     githubOwner: "owner",
     projectNumber: 7,
@@ -143,6 +145,7 @@ function client(runner: QueuedGhRunner, catalog = catalogFixture()) {
     runner,
     catalog,
     now: () => new Date("2026-08-13T00:00:00Z"),
+    ...(sleep ? { sleep } : {}),
   });
 }
 
@@ -186,6 +189,24 @@ function registrationRecord(fields: "empty" | "complete" = "complete") {
     record.lastReviewed.date = registration.fields.last_reviewed;
   }
   return record;
+}
+
+function updatedRecord(fields: Partial<ProjectOperationalFields> = {}) {
+  const record = registrationRecord("complete");
+  const merged: ProjectOperationalFields = { ...registration.fields, ...fields };
+  record.status.name = merged.status;
+  record.status.optionId = `status-${merged.status}`;
+  record.priority.name = merged.priority;
+  record.priority.optionId = `priority-${merged.priority}`;
+  record.health.name = merged.health;
+  record.health.optionId = `health-${merged.health}`;
+  record.nextAction.text = merged.next_action;
+  record.lastReviewed.date = merged.last_reviewed;
+  return record;
+}
+
+function mutations(runner: QueuedGhRunner) {
+  return runner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"));
 }
 
 function draftMutation(record = registrationRecord("empty")) {
@@ -460,6 +481,409 @@ describe("GitHubProjectClient", () => {
       const error = await github.readAll().catch((cause) => cause);
       expect(error).toMatchObject({ code: expectedCode });
       expect(JSON.stringify(error)).not.toContain(secret);
+    }
+  });
+
+  it("writes only the changed operating fields and returns the merged record", async () => {
+    const runner = new QueuedGhRunner();
+    const catalog = catalogFixture();
+    runner.enqueue(
+      projectPage({ records: [updatedRecord()] }),
+      fieldMutation,
+      fieldMutation,
+      projectPage({ records: [updatedRecord({ status: "active", next_action: `task:${TASK_ID}` })] }),
+    );
+
+    await expect(client(runner, catalog).updateProject({
+      project_id: registration.project_id,
+      fields: { status: "active", next_action: `task:${TASK_ID}` },
+    })).resolves.toEqual({
+      project_id: registration.project_id,
+      project_item_id: "PVTI_1",
+      source_node_id: "DI_registration",
+      fields: {
+        status: "active",
+        priority: "P2",
+        health: "unknown",
+        next_action: `task:${TASK_ID}`,
+        last_reviewed: "2026-08-13",
+      },
+    });
+    expect(mutations(runner)).toHaveLength(2);
+    // Status enters active last so no reader observes a partially applied record.
+    expect(mutations(runner)[0]?.args.join(" ")).toContain(`text=task:${TASK_ID}`);
+    expect(mutations(runner)[1]?.args.join(" ")).toContain("optionId=status-active");
+    expect(catalog.getTask).toHaveBeenCalledWith(TASK_ID);
+    expect(catalog.getRepository).not.toHaveBeenCalled();
+    expect(runner.calls.every((call) => call.credential === "project")).toBe(true);
+  });
+
+  it("re-verifies an unchanged patch without writing any field", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(projectPage({ records: [updatedRecord()] }), projectPage({ records: [updatedRecord()] }));
+
+    await expect(client(runner).updateProject({
+      project_id: registration.project_id,
+      fields: { priority: registration.fields.priority },
+    })).resolves.toMatchObject({ fields: registration.fields });
+    expect(mutations(runner)).toHaveLength(0);
+  });
+
+  it("rejects an empty or malformed patch before any Project call", async () => {
+    const runner = new QueuedGhRunner();
+    const github = client(runner);
+
+    await expect(github.updateProject({ project_id: registration.project_id, fields: {} }))
+      .rejects.toMatchObject({ code: "INVALID_PROJECT_UPDATE" });
+    await expect(github.updateProject({ project_id: registration.project_id, fields: { last_reviewed: "2026-02-30" } }))
+      .rejects.toMatchObject({ code: "INVALID_PROJECT_UPDATE" });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("refuses to update identity or membership through the operating-field patch", async () => {
+    const runner = new QueuedGhRunner();
+
+    await expect(client(runner).updateProject({
+      project_id: registration.project_id,
+      title: "Renamed",
+      fields: { priority: "P1" },
+    } as never)).rejects.toMatchObject({ code: "INVALID_PROJECT_UPDATE" });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("rejects protected update content before any GitHub call", async () => {
+    const runner = new QueuedGhRunner();
+    const secret = "unmistakably-fake-project-update-token";
+    const github = new GitHubProjectClient({
+      githubOwner: "owner", projectNumber: 7,
+      preflightProjectItemId: "PVTI_preflight", runner, catalog: catalogFixture(),
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+
+    const error = await github.updateProject({
+      project_id: registration.project_id,
+      fields: { next_action: `wait:${secret}` },
+    }).catch((cause) => cause);
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("fails closed on an absent or ambiguous canonical Project Record", async () => {
+    const missing = new QueuedGhRunner();
+    missing.enqueue(projectPage({ records: [recordItem(1)] }));
+    await expect(client(missing).updateProject({
+      project_id: registration.project_id,
+      fields: { priority: "P1" },
+    })).rejects.toMatchObject({ code: "PROJECT_RECORD_NOT_FOUND" });
+    expect(missing.calls).toHaveLength(1);
+
+    const ambiguous = new QueuedGhRunner();
+    ambiguous.enqueue(projectPage({ records: [updatedRecord(), recordItem(2, registration.project_id)] }));
+    await expect(client(ambiguous).updateProject({
+      project_id: registration.project_id,
+      fields: { priority: "P1" },
+    })).rejects.toMatchObject({ code: "DUPLICATE_PROJECT_RECORD" });
+    expect(mutations(ambiguous)).toHaveLength(0);
+  });
+
+  it("rejects a merged active Next Action that contradicts its Health before any write", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(projectPage({ records: [updatedRecord()] }));
+
+    await expect(client(runner).updateProject({
+      project_id: registration.project_id,
+      fields: { status: "active" },
+    })).rejects.toMatchObject({ code: "INVALID_PROJECT_NEXT_ACTION" });
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("converges a delayed read through bounded backoff without rewriting the field", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    runner.enqueue(
+      projectPage({ records: [updatedRecord()] }),
+      fieldMutation,
+      projectPage({ records: [updatedRecord()] }),
+      projectPage({ records: [updatedRecord({ priority: "P1" })] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); })
+      .updateProject({ project_id: registration.project_id, fields: { priority: "P1" } }))
+      .resolves.toMatchObject({ fields: { priority: "P1" } });
+    expect(pauses).toEqual([250]);
+    expect(mutations(runner)).toHaveLength(1);
+  });
+
+  it("converges the active reconfiguration whose intermediate state no ordering can avoid", async () => {
+    // Status ordering removes the window for entering and leaving active, so an
+    // active-to-active Health/Next Action swap is the only reachable state that
+    // still needs the transient read to be treated as unsettled.
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    const blocked = { status: "active" as const, health: "blocked" as const, next_action: "wait:blocked-on-review" };
+    const settled = { health: "on-track" as const, next_action: `task:${TASK_ID}` };
+    runner.enqueue(
+      projectPage({ records: [updatedRecord(blocked)] }),
+      fieldMutation, fieldMutation,
+      projectPage({ records: [updatedRecord({ ...blocked, health: "on-track" })] }),
+      projectPage({ records: [updatedRecord({ ...blocked, ...settled })] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); })
+      .updateProject({ project_id: registration.project_id, fields: settled }))
+      .resolves.toMatchObject({ fields: { status: "active", health: "on-track", next_action: `task:${TASK_ID}` } });
+    expect(pauses).toEqual([250]);
+    expect(mutations(runner)).toHaveLength(2);
+  });
+
+  it("fails closed when the bounded read-back never converges", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    runner.enqueue(
+      projectPage({ records: [updatedRecord()] }),
+      fieldMutation,
+      projectPage({ records: [updatedRecord()] }),
+      projectPage({ records: [updatedRecord()] }),
+      projectPage({ records: [updatedRecord()] }),
+      projectPage({ records: [updatedRecord()] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); })
+      .updateProject({ project_id: registration.project_id, fields: { priority: "P1" } }))
+      .rejects.toMatchObject({ code: "PROJECT_UPDATE_MISMATCH" });
+    expect(pauses).toEqual([250, 500, 1000]);
+    expect(mutations(runner)).toHaveLength(1);
+
+    const unsettled = new QueuedGhRunner();
+    const unsettledPauses: number[] = [];
+    const blocked = { status: "active" as const, health: "blocked" as const, next_action: "wait:blocked-on-review" };
+    const halfApplied = projectPage({ records: [updatedRecord({ ...blocked, health: "on-track" })] });
+    unsettled.enqueue(
+      projectPage({ records: [updatedRecord(blocked)] }),
+      fieldMutation, fieldMutation,
+      halfApplied, halfApplied, halfApplied, halfApplied,
+    );
+    await expect(client(unsettled, catalogFixture(), async (milliseconds) => { unsettledPauses.push(milliseconds); })
+      .updateProject({
+        project_id: registration.project_id,
+        fields: { health: "on-track", next_action: `task:${TASK_ID}` },
+      })).rejects.toMatchObject({ code: "PROJECT_UPDATE_UNSETTLED" });
+    expect(unsettledPauses).toEqual([250, 500, 1000]);
+  });
+
+  it("orders the Status write so a concurrent reader never sees a half-applied active record", async () => {
+    const entering = { status: "active" as const, health: "blocked" as const, next_action: "wait:blocked-on-review" };
+    const enter = new QueuedGhRunner();
+    enter.enqueue(
+      projectPage({ records: [updatedRecord()] }),
+      fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [updatedRecord(entering)] }),
+    );
+    await expect(client(enter).updateProject({ project_id: registration.project_id, fields: entering }))
+      .resolves.toMatchObject({ fields: entering });
+    expect(mutations(enter).map((call) => call.args.join(" "))).toEqual([
+      expect.stringContaining("optionId=health-blocked"),
+      expect.stringContaining("text=wait:blocked-on-review"),
+      expect.stringContaining("optionId=status-active"),
+    ]);
+
+    const leaving = { status: "completed" as const, health: "on-track" as const, next_action: "wait:archived" };
+    const leave = new QueuedGhRunner();
+    leave.enqueue(
+      projectPage({ records: [updatedRecord(entering)] }),
+      fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [updatedRecord(leaving)] }),
+    );
+    await expect(client(leave).updateProject({ project_id: registration.project_id, fields: leaving }))
+      .resolves.toMatchObject({ fields: leaving });
+    expect(mutations(leave).map((call) => call.args.join(" "))).toEqual([
+      expect.stringContaining("optionId=status-completed"),
+      expect.stringContaining("optionId=health-on-track"),
+      expect.stringContaining("text=wait:archived"),
+    ]);
+  });
+
+  it("proves every Task reference the patch asserts and none that it omits", async () => {
+    const referencing = { next_action: `task:${TASK_ID}` };
+    const deadCatalog = () => ({
+      getRepository: vi.fn(async (id: string) => ({ id })),
+      getTask: vi.fn(async () => { throw new Error("task is not in the catalog"); }),
+    });
+
+    const omitted = new QueuedGhRunner();
+    const omittedCatalog = catalogFixture();
+    omitted.enqueue(
+      projectPage({ records: [updatedRecord(referencing)] }),
+      fieldMutation,
+      projectPage({ records: [updatedRecord({ ...referencing, priority: "P1" })] }),
+    );
+    await expect(client(omitted, omittedCatalog)
+      .updateProject({ project_id: registration.project_id, fields: { priority: "P1" } }))
+      .resolves.toMatchObject({ fields: { priority: "P1", next_action: `task:${TASK_ID}` } });
+    expect(omittedCatalog.getTask).not.toHaveBeenCalled();
+
+    const restated = new QueuedGhRunner();
+    const restatedCatalog = catalogFixture();
+    restated.enqueue(
+      projectPage({ records: [updatedRecord(referencing)] }),
+      projectPage({ records: [updatedRecord(referencing)] }),
+    );
+    await expect(client(restated, restatedCatalog)
+      .updateProject({ project_id: registration.project_id, fields: referencing }))
+      .resolves.toMatchObject({ fields: referencing });
+    expect(restatedCatalog.getTask).toHaveBeenCalledWith(TASK_ID);
+    expect(mutations(restated)).toHaveLength(0);
+
+    // Restating a reference is still an assertion, so a vanished Task fails it
+    // even though the update would write nothing.
+    const restatedDead = new QueuedGhRunner();
+    restatedDead.enqueue(projectPage({ records: [updatedRecord(referencing)] }));
+    await expect(client(restatedDead, deadCatalog())
+      .updateProject({ project_id: registration.project_id, fields: referencing }))
+      .rejects.toThrow("task is not in the catalog");
+    expect(mutations(restatedDead)).toHaveLength(0);
+
+    const changedDead = new QueuedGhRunner();
+    changedDead.enqueue(projectPage({ records: [updatedRecord()] }));
+    await expect(client(changedDead, deadCatalog())
+      .updateProject({ project_id: registration.project_id, fields: referencing }))
+      .rejects.toThrow("task is not in the catalog");
+    expect(mutations(changedDead)).toHaveLength(0);
+  });
+
+  it("patches the Last Reviewed date on its own field mutation path", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      projectPage({ records: [updatedRecord()] }),
+      fieldMutation,
+      projectPage({ records: [updatedRecord({ last_reviewed: "2026-08-19" })] }),
+    );
+
+    await expect(client(runner).updateProject({
+      project_id: registration.project_id,
+      fields: { last_reviewed: "2026-08-19" },
+    })).resolves.toMatchObject({ fields: { last_reviewed: "2026-08-19" } });
+    expect(mutations(runner)).toHaveLength(1);
+    expect(mutations(runner)[0]?.args.join(" ")).toContain("date=2026-08-19");
+  });
+
+  it("repairs a record left mid-reconfiguration by an interrupted active update", async () => {
+    const healthy = { status: "active" as const, health: "on-track" as const, next_action: `task:${TASK_ID}` };
+    const interrupted = new QueuedGhRunner();
+    interrupted.enqueue(
+      projectPage({ records: [updatedRecord(healthy)] }),
+      fieldMutation,
+      new Error("injected reconfiguration boundary"),
+    );
+    await expect(client(interrupted).updateProject({
+      project_id: registration.project_id,
+      fields: { health: "blocked", next_action: "wait:blocked-on-review" },
+    })).rejects.toThrow("injected reconfiguration boundary");
+
+    // Health landed and Next Action did not, so every field is present while the
+    // active rule is violated — a state only an overwriting writer can produce.
+    const wedged = updatedRecord({ ...healthy, health: "blocked" });
+    const reader = new QueuedGhRunner();
+    reader.enqueue(projectPage({ records: [wedged] }));
+    await expect(client(reader).readAll()).rejects.toMatchObject({ code: "INVALID_PROJECT_ITEM" });
+
+    // The runbook promises the same flags converge on re-run; that is exactly
+    // the case an interrupted reconfiguration used to make unreachable.
+    const rerun = new QueuedGhRunner();
+    const reconfigured = { ...healthy, health: "blocked" as const, next_action: "wait:blocked-on-review" };
+    rerun.enqueue(
+      projectPage({ records: [wedged] }),
+      fieldMutation,
+      projectPage({ records: [updatedRecord(reconfigured)] }),
+    );
+    await expect(client(rerun).updateProject({
+      project_id: registration.project_id,
+      fields: { health: "blocked", next_action: "wait:blocked-on-review" },
+    })).resolves.toMatchObject({ fields: reconfigured });
+    expect(mutations(rerun)).toHaveLength(1);
+
+    const repair = new QueuedGhRunner();
+    repair.enqueue(
+      projectPage({ records: [wedged] }),
+      fieldMutation,
+      projectPage({ records: [updatedRecord(healthy)] }),
+    );
+    await expect(client(repair).updateProject({
+      project_id: registration.project_id,
+      fields: { health: "on-track" },
+    })).resolves.toMatchObject({ fields: healthy });
+    expect(mutations(repair)).toHaveLength(1);
+
+    // A patch that would leave the record invalid still stops before any write.
+    const refused = new QueuedGhRunner();
+    refused.enqueue(projectPage({ records: [wedged] }));
+    await expect(client(refused).updateProject({
+      project_id: registration.project_id,
+      fields: { last_reviewed: "2026-08-19" },
+    })).rejects.toMatchObject({ code: "INVALID_PROJECT_NEXT_ACTION" });
+    expect(mutations(refused)).toHaveLength(0);
+  });
+
+  it("fails closed without retry when the updated record disappears or its item moves", async () => {
+    const gone = new QueuedGhRunner();
+    const gonePauses: number[] = [];
+    gone.enqueue(projectPage({ records: [updatedRecord()] }), fieldMutation, projectPage({ records: [] }));
+    await expect(client(gone, catalogFixture(), async (milliseconds) => { gonePauses.push(milliseconds); })
+      .updateProject({ project_id: registration.project_id, fields: { priority: "P1" } }))
+      .rejects.toMatchObject({ code: "PROJECT_UPDATE_MISMATCH" });
+    expect(gonePauses).toEqual([]);
+
+    const moved = new QueuedGhRunner();
+    const movedPauses: number[] = [];
+    const relocated = updatedRecord({ priority: "P1" });
+    relocated.id = "PVTI_moved";
+    moved.enqueue(projectPage({ records: [updatedRecord()] }), fieldMutation, projectPage({ records: [relocated] }));
+    await expect(client(moved, catalogFixture(), async (milliseconds) => { movedPauses.push(milliseconds); })
+      .updateProject({ project_id: registration.project_id, fields: { priority: "P1" } }))
+      .rejects.toMatchObject({ code: "PROJECT_UPDATE_MISMATCH" });
+    expect(movedPauses).toEqual([]);
+  });
+
+  it("resumes a write interrupted midway without rewriting the settled fields", async () => {
+    const patch = { priority: "P1" as const, last_reviewed: "2026-08-19" };
+    const interrupted = new QueuedGhRunner();
+    interrupted.enqueue(
+      projectPage({ records: [updatedRecord()] }),
+      fieldMutation,
+      new Error("injected second-field boundary"),
+    );
+
+    await expect(client(interrupted).updateProject({ project_id: registration.project_id, fields: patch }))
+      .rejects.toThrow("injected second-field boundary");
+    expect(mutations(interrupted)).toHaveLength(2);
+
+    const resumed = new QueuedGhRunner();
+    resumed.enqueue(
+      projectPage({ records: [updatedRecord({ priority: "P1" })] }),
+      fieldMutation,
+      projectPage({ records: [updatedRecord(patch)] }),
+    );
+
+    await expect(client(resumed).updateProject({ project_id: registration.project_id, fields: patch }))
+      .resolves.toMatchObject({ fields: { priority: "P1", last_reviewed: "2026-08-19" } });
+    expect(mutations(resumed)).toHaveLength(1);
+    expect(mutations(resumed)[0]?.args.join(" ")).toContain("date=2026-08-19");
+  });
+
+  it("fails closed immediately when the record identity changed during the update", async () => {
+    for (const changed of ["title", "body"] as const) {
+      const runner = new QueuedGhRunner();
+      const pauses: number[] = [];
+      const final = updatedRecord({ priority: "P1" });
+      if (changed === "title") final.content.title = "Renamed";
+      else final.content.body = JSON.stringify({ id: registration.project_id, objective: "Different", repositories: registration.repo_ids });
+      runner.enqueue(projectPage({ records: [updatedRecord()] }), fieldMutation, projectPage({ records: [final] }));
+
+      await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); })
+        .updateProject({ project_id: registration.project_id, fields: { priority: "P1" } }))
+        .rejects.toMatchObject({ code: "PROJECT_UPDATE_MISMATCH" });
+      expect(pauses).toEqual([]);
     }
   });
 });

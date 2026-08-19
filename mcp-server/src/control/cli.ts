@@ -29,16 +29,20 @@ import {
   ConflictingClaimSummarySchema,
   PreflightResultSchema,
   ProjectRecordLinkSchema,
+  ProjectRecordUpdateSchema,
   RegisterProjectInputSchema,
   SnapshotExportResultSchema,
+  UpdateProjectInputSchema,
   type ActiveClaim,
   type BoundedPortfolioPayload,
   type ConflictingClaimSummary,
   type PreflightResult,
   type ProjectRecordLink,
+  type ProjectRecordUpdate,
   type RegisterProjectInput,
   type SnapshotExportResult,
   type TaskRecord,
+  type UpdateProjectInput,
 } from "./schemas.js";
 
 const TASK_ID = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -60,6 +64,7 @@ const commandNames = [
   "portfolio status",
   "portfolio export",
   "project register",
+  "project update",
   "preflight",
 ] as const;
 
@@ -77,6 +82,7 @@ export interface PortfolioPort {
   status(projectId?: string, pageId?: string): Promise<BoundedPortfolioPayload>;
   exportSnapshot(): Promise<SnapshotExportResult>;
   registerProject(input: RegisterProjectInput): Promise<ProjectRecordLink>;
+  updateProject(input: UpdateProjectInput): Promise<ProjectRecordUpdate>;
 }
 
 export interface PreflightPort {
@@ -218,6 +224,7 @@ function commandFor(argv: readonly string[]): CommandName {
     return `portfolio ${argv[1]}` as CommandName;
   }
   if (argv[0] === "project" && argv[1] === "register") return "project register";
+  if (argv[0] === "project" && argv[1] === "update") return "project update";
   if (argv[0] === "repository" && argv[1] === "register") return "repository register";
   if (argv.length === 1 && argv[0] === "preflight") return "preflight";
   return "invalid";
@@ -806,6 +813,33 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     return { flags, result: resultJson(command, registered) };
   }
 
+  if (command === "project update") {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--project", "--status", "--priority", "--health", "--next-action", "--last-reviewed",
+    ]));
+    assertSafeFlags(flags, dependencies);
+    // Only the flags the operator actually supplied become the patch, so an
+    // omitted field is never silently rewritten to a default.
+    const supplied = ([
+      ["status", "--status"], ["priority", "--priority"], ["health", "--health"],
+      ["next_action", "--next-action"], ["last_reviewed", "--last-reviewed"],
+    ] as const).filter(([, flag]) => flags.has(flag));
+    const parsedInput = UpdateProjectInputSchema.safeParse({
+      project_id: required(flags, "--project"),
+      fields: Object.fromEntries(supplied.map(([field, flag]) => [field, required(flags, flag)])),
+    });
+    if (!parsedInput.success) usage("Invalid project update arguments");
+    const updated = validatedPortResult(
+      ProjectRecordUpdateSchema,
+      await dependencies.portfolio.updateProject(parsedInput.data),
+      "INVALID_PROJECT_UPDATE_RESULT",
+    );
+    if (updated.project_id !== parsedInput.data.project_id) {
+      throw new ControlError("INVALID_PROJECT_UPDATE_RESULT", "Updated Project ID does not match the request");
+    }
+    return { flags, result: resultJson(command, updated) };
+  }
+
   if (command === "preflight") {
     const flags = parseFlags(argv.slice(1), new Set());
     assertSafeFlags(flags, dependencies);
@@ -882,7 +916,7 @@ export function requiresMutationLock(argv: readonly string[]): boolean {
   if (argv.length === 1 && argv[0] === "preflight") return true;
   if (argv[0] === "repository" && argv[1] === "register") return true;
   if (argv[0] === "task" && (argv[1] === "start" || argv[1] === "finish" || argv[1] === "promote")) return true;
-  if (argv[0] === "project" && argv[1] === "register") return true;
+  if (argv[0] === "project" && (argv[1] === "register" || argv[1] === "update")) return true;
   if (argv[0] === "portfolio" && argv[1] === "export") return true;
   if (argv[0] !== "task" || argv[1] !== "recover") return false;
   const index = argv.indexOf("--action");

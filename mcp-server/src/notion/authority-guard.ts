@@ -236,7 +236,7 @@ const authorityCodes = new Set([
 function routeFor(db: NotionWriteTarget, code: string): string {
   if (db === "decisionLog") return "Route formal decisions to a Git ADR.";
   if (db === "projects") {
-    return "Route Project state through `jhw-control project register` and the Project workflow.";
+    return "Route Project state through `jhw-control project register`/`project update` and the Project workflow.";
   }
   if (code === "NOTION_WRITES_DISABLED") return "Use the owning workflow or ask the operator to re-enable Notion writes.";
   return "Retry only after the central authority policy is available; do not bypass the guard.";
