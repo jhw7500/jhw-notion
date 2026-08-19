@@ -677,6 +677,29 @@ describe("GitHubProjectClient", () => {
     expect(pauses).toEqual([2000]);
   });
 
+  it("ignores coordinates whose item fails the content policy", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    const unsafe = registrationRecord("empty");
+    unsafe.content.title = "/srv/private-project";
+    runner.enqueue(
+      projectPage({}),
+      hintedItem(unsafe),
+      projectPage({}),
+      draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+
+    // Discarded unread rather than raised: the shortcut must not turn a
+    // registration that would have succeeded into a failure, and the listing
+    // this falls back to applies the same policy to whatever it returns.
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, new FakeHints(recordedHint))
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(pauses).toEqual([2000]);
+  });
+
   it("ignores coordinates that name the preflight fixture", async () => {
     const runner = new QueuedGhRunner();
     const pauses: number[] = [];

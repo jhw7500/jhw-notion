@@ -1043,8 +1043,15 @@ export class GitHubProjectClient {
     // Project's item is not this registration's to scan, let alone to reuse.
     if (node.project.id !== structure.projectId) return undefined;
     // From here the content gates still apply in full: a hint may select which
-    // item to look at, but never what counts as a usable record.
-    this.assertContentSafe(node);
+    // item to look at, but never what counts as a usable record. A node that
+    // fails the content policy is discarded unread rather than raised — the
+    // shortcut must not turn a registration that would have succeeded into a
+    // failure, and the listing this falls back to applies the same policy.
+    try {
+      this.assertContentSafe(node);
+    } catch {
+      return undefined;
+    }
     const content = draftIssue(node.content);
     if (node.type !== "DRAFT_ISSUE" || !content) return undefined;
     let body: ProjectRecordBody;
