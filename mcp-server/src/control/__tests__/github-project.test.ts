@@ -159,28 +159,36 @@ function client(
 /** An in-memory hint store whose individual operations can be made to fail. */
 class FakeHints implements RegistrationHintPort {
   readonly recorded: RegistrationHint[] = [];
-  private tracked?: RegistrationHint;
+  readonly seeded: RegistrationHint[] = [];
+  private readonly tracked = new Map<string, RegistrationHint>();
   private initialized: boolean;
 
   constructor(
     tracked: RegistrationHint | undefined = undefined,
-    private readonly faults: { read?: boolean; record?: boolean } = {},
+    private readonly faults: { read?: boolean; record?: boolean; seed?: boolean } = {},
     initialized = tracked !== undefined,
   ) {
-    this.tracked = tracked;
+    if (tracked) this.tracked.set(tracked.project_id, tracked);
     this.initialized = initialized;
   }
 
   async read(projectId: string): Promise<RegistrationHintLookup> {
     if (this.faults.read) throw new Error("hint state is unreadable");
-    const hint = this.tracked?.project_id === projectId ? this.tracked : undefined;
+    const hint = this.tracked.get(projectId);
     return { initialized: this.initialized, ...(hint ? { hint } : {}) };
   }
 
   async record(hint: RegistrationHint): Promise<void> {
     if (this.faults.record) throw new Error("hint state is unwritable");
     this.recorded.push(hint);
-    this.tracked = hint;
+    this.tracked.set(hint.project_id, hint);
+    this.initialized = true;
+  }
+
+  async seed(hints: readonly RegistrationHint[]): Promise<void> {
+    if (this.faults.seed) throw new Error("hint state is unwritable");
+    this.seeded.push(...hints);
+    for (const hint of hints) this.tracked.set(hint.project_id, hint);
     this.initialized = true;
   }
 }
@@ -224,6 +232,21 @@ const registration = {
 };
 
 const recordedHint = { project_id: registration.project_id, item_id: "PVTI_1", source_node_id: "DI_registration" };
+
+/** Matches `recordItem(2)` exactly, so re-registering it needs no field write. */
+const olderRegistration = {
+  project_id: "prj-project-2",
+  title: "Project 2",
+  objective: "Objective 2",
+  repo_ids: ["repo-control"],
+  fields: {
+    status: "active" as const,
+    priority: "P2" as const,
+    health: "on-track" as const,
+    next_action: `task:${TASK_ID}`,
+    last_reviewed: "2026-08-13",
+  },
+};
 
 function registrationRecord(fields: "empty" | "complete" = "complete") {
   const record = recordItem(1, registration.project_id);
@@ -597,7 +620,9 @@ describe("GitHubProjectClient", () => {
       draftMutation(),
       fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
       projectPage({ records: [registrationRecord("complete")] }),
-      // Second registration: the list read no longer shows the record.
+      // Second registration: the list read no longer shows the record. Nothing
+      // here answers a create, so a regression that reaches one fails on the
+      // draft mutation rather than on the count asserted below.
       projectPage({}),
       hintedItem(registrationRecord("complete")),
       projectPage({ records: [registrationRecord("complete")] }),
@@ -612,6 +637,60 @@ describe("GitHubProjectClient", () => {
     expect(hintLookups(runner)).toHaveLength(1);
     expect(mutations(runner)).toHaveLength(5);
     expect(pauses).toEqual([]);
+  });
+
+  // A record older than the store would otherwise read as one this host never
+  // created, so the run that establishes the store captures the whole board.
+  it("establishes the store from the read that made it, and still waits itself", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    const older = recordItem(2);
+    const hints = new FakeHints();
+    runner.enqueue(
+      projectPage({ records: [older] }),
+      projectPage({ records: [older] }), projectPage({ records: [older] }),
+      draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [older, registrationRecord("complete")] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, hints)
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(hints.seeded).toEqual([{ project_id: "prj-project-2", item_id: "PVTI_2", source_node_id: "DI_2" }]);
+    // A seed only captures what the Project had already made visible, so the
+    // registration that establishes the store still confirms absence by waiting.
+    expect(pauses).toEqual([2000, 4000]);
+    expect(hints.recorded).toEqual([{ project_id: registration.project_id }, recordedHint]);
+  });
+
+  it("resolves a seeded record when its own list read lags behind", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    const older = recordItem(2);
+    const hints = new FakeHints();
+    runner.enqueue(
+      // Establishing registration: seeds the board's existing record.
+      projectPage({ records: [older] }),
+      projectPage({ records: [older] }), projectPage({ records: [older] }),
+      draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [older, registrationRecord("complete")] }),
+      // Re-registering the seeded project while its list read lags.
+      projectPage({ records: [registrationRecord("complete")] }),
+      hintedItem(older),
+      projectPage({ records: [older, registrationRecord("complete")] }),
+    );
+    const github = client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, hints);
+
+    await github.registerProject(registration);
+    await expect(github.registerProject(olderRegistration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_2", source_node_id: "DI_2" });
+
+    // Only the establishing registration created, and only it waited.
+    expect(runner.calls.filter((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toHaveLength(1);
+    expect(pauses).toEqual([2000, 4000]);
+    expect(hintLookups(runner)).toHaveLength(1);
   });
 
   // The recorded coordinates are a shortcut for an empty read, never a detour

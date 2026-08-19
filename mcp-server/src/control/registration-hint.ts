@@ -54,6 +54,12 @@ export interface RegistrationHintPort {
    * that exists is exactly what a later registration needs to be told about.
    */
   record(hint: RegistrationHint): Promise<void>;
+  /**
+   * Establishes the store from a complete read of the Project. Until that has
+   * happened a missing entry cannot mean "this host never created it", because
+   * every record older than the store predates everything it could record.
+   */
+  seed(hints: readonly RegistrationHint[]): Promise<void>;
 }
 
 export interface RegistrationHintStoreHooks {
@@ -112,15 +118,30 @@ export class RegistrationHintStore implements RegistrationHintPort {
   }
 
   async record(hint: RegistrationHint): Promise<void> {
-    const parsed = RegistrationHintSchema.safeParse(hint);
-    if (!parsed.success) {
-      throw new ControlError("INVALID_REGISTRATION_HINT", "Registration hint is not a bounded coordinate set");
+    await this.merge([hint]);
+  }
+
+  async seed(hints: readonly RegistrationHint[]): Promise<void> {
+    // Publishing even an empty seed matters: it is what makes a later missing
+    // entry mean "not on the board when this store was established".
+    await this.merge(hints);
+  }
+
+  private async merge(hints: readonly RegistrationHint[]): Promise<void> {
+    const entries: RegistrationHint[] = [];
+    for (const hint of hints) {
+      const parsed = RegistrationHintSchema.safeParse(hint);
+      if (!parsed.success) {
+        throw new ControlError("INVALID_REGISTRATION_HINT", "Registration hint is not a bounded coordinate set");
+      }
+      entries.push(parsed.data);
     }
     const state = await this.load();
-    const records = { ...state?.records, [parsed.data.project_id]: parsed.data };
+    const records = { ...state?.records };
+    for (const entry of entries) records[entry.project_id] = entry;
     // Entries are kept for the life of the record they name, so the bound is a
-    // ceiling on registered projects rather than on concurrent work. Refusing
-    // past it costs the next registration its absence window, never its record.
+    // ceiling on projects this host has registered or tried to, not on
+    // concurrent work. Refusing past it leaves the absence window in place.
     if (Object.keys(records).length > MAX_TRACKED_PROJECTS) {
       throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state tracks too many projects");
     }

@@ -172,6 +172,48 @@ describe("RegistrationHintStore", () => {
     await expect(store.read("prj-example")).resolves.toEqual({ initialized: true, hint });
   });
 
+  it("establishes the store from a seed, including an empty one", async () => {
+    const store = new RegistrationHintStore(await stateDir());
+
+    await store.seed([]);
+
+    // An empty seed still matters: it is what makes a later missing entry mean
+    // "not on the board when this store was established".
+    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true });
+  });
+
+  it("seeds many projects in one publish and merges with what is already tracked", async () => {
+    const directory = await stateDir();
+    const store = new RegistrationHintStore(directory);
+    await store.record({ project_id: "prj-example" });
+
+    await store.seed([
+      { project_id: "prj-one", item_id: "PVTI_one", source_node_id: "DI_one" },
+      { project_id: "prj-two", item_id: "PVTI_two", source_node_id: "DI_two" },
+    ]);
+
+    await expect(store.read("prj-one")).resolves.toEqual({
+      initialized: true,
+      hint: { project_id: "prj-one", item_id: "PVTI_one", source_node_id: "DI_one" },
+    });
+    await expect(store.read("prj-example")).resolves.toEqual({
+      initialized: true,
+      hint: { project_id: "prj-example" },
+    });
+    expect(await readdir(directory)).toEqual(["project-registrations.json"]);
+  });
+
+  it("refuses a seed that would exceed the ceiling without publishing part of it", async () => {
+    const directory = await stateDir();
+    const store = new RegistrationHintStore(directory);
+
+    await expect(store.seed(
+      Array.from({ length: 257 }, (_unused, index) => ({ project_id: `prj-${index}` })),
+    )).rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT_STATE" });
+    // Nothing was established, so the next registration still pays its window.
+    await expect(store.read("prj-0")).resolves.toEqual({ initialized: false });
+  });
+
   it("writes deterministic JSON that another reader can parse", async () => {
     const directory = await stateDir();
 

@@ -871,7 +871,8 @@ export class GitHubProjectClient {
     const initial = await this.initialPage();
     const structure = await this.structure(initial);
     const initialItems = await this.items(initial);
-    const matches = this.recordItems(initialItems).filter(({ body }) => body.id === input.data.project_id);
+    const knownRecords = this.recordItems(initialItems);
+    const matches = knownRecords.filter(({ body }) => body.id === input.data.project_id);
     if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple DraftIssues use the requested Project ID");
     let itemId: string;
     let sourceNodeId: string;
@@ -879,7 +880,7 @@ export class GitHubProjectClient {
     // Creating is the only irreversible step here, so an empty read is resolved
     // against the durable hint before it is taken, and confirmed by waiting
     // only when the hint cannot rule out a run that already created the record.
-    const existing = matches[0] ?? await this.resolveAbsentRecord(input.data.project_id, structure);
+    const existing = matches[0] ?? await this.resolveAbsentRecord(input.data.project_id, structure, knownRecords);
     if (existing) {
       const match = existing;
       this.verifyRecord(match, input.data);
@@ -1001,6 +1002,7 @@ export class GitHubProjectClient {
   private async resolveAbsentRecord(
     projectId: string,
     structure: ProjectStructure,
+    knownRecords: ReadonlyArray<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody }>,
   ): Promise<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody } | undefined> {
     const hint = await this.readHint(projectId);
     if (hint.value?.item_id) {
@@ -1010,14 +1012,24 @@ export class GitHubProjectClient {
     // An entry already on disk is never narrowed: coordinates that did not
     // resolve this time are still the best thing a later run has to go on.
     if (hint.value !== undefined) return this.awaitVisibleRecord(projectId);
+    // An empty store speaks only for what it has seen, so establish it from the
+    // complete read this registration already made. Otherwise every record that
+    // predates the store would read as one this host never created.
+    if (hint.known && !hint.initialized) {
+      await this.seedHints(knownRecords.map(({ node, content, body }) => ({
+        project_id: body.id,
+        item_id: node.id,
+        source_node_id: content.id,
+      })));
+    }
     // The intent is claimed before the wait is decided, because skipping the
     // wait is only sound while this run's own create is durably recorded.
     const marked = await this.rememberHint({ project_id: projectId });
     // Waiting only pays off when this host may already have created the record.
     // Entries outlive the registrations that wrote them, so a store that is
-    // readable, writable, and already in use says this host never created one.
-    // Before it has been written once it cannot say that about records that
-    // predate it, which is why an uninitialized store still costs the window.
+    // readable, writable, and already established says none did. The run that
+    // establishes it still waits, because a seed can only capture the records
+    // the Project had already made visible to it.
     if (!marked || !hint.known || !hint.initialized) return this.awaitVisibleRecord(projectId);
     return undefined;
   }
@@ -1095,6 +1107,16 @@ export class GitHubProjectClient {
       return { known: true, initialized: lookup.initialized, ...(lookup.hint ? { value: lookup.hint } : {}) };
     } catch {
       return { known: false, initialized: false };
+    }
+  }
+
+  /** Establishes the store. A seed that fails leaves it unestablished, so the
+   * next registration pays the window again rather than trusting a partial view. */
+  private async seedHints(hints: readonly RegistrationHint[]): Promise<void> {
+    try {
+      await this.options.registrationHints?.seed(hints);
+    } catch {
+      return;
     }
   }
 
