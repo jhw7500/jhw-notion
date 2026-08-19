@@ -160,6 +160,7 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
       page_id: "page-1",
       markdown: "# Portfolio\n",
       items: [],
+      repositories: [],
       truncated: false,
       total_items: 0,
     }),
@@ -554,6 +555,7 @@ describe("runCli", () => {
   it("reserves enough portfolio output for a journal-gap warning without crossing 12 KiB", async () => {
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => nearCliLimitPortfolioSource() },
+      repositories: { listRepositories: async () => [] },
       stateDir: "/unused",
     });
     const dependencies = makeCliDependencies({
@@ -1132,7 +1134,7 @@ describe("runCli", () => {
     const dependencies = makeCliDependencies({
       portfolio: {
         status: vi.fn()
-          .mockResolvedValueOnce({ page_id: "page-1", markdown: "# Portfolio\n", items: [], truncated: false, total_items: 0 })
+          .mockResolvedValueOnce({ page_id: "page-1", markdown: "# Portfolio\n", items: [], repositories: [], truncated: false, total_items: 0 })
           .mockResolvedValueOnce({ page_id: "raw-page-input", nested: { path: "/private/portfolio" } }),
       },
     });

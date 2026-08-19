@@ -34,6 +34,8 @@ jhw-control portfolio export
 
 반환된 JSON/Markdown relative path와 checksum만 보여준다. export는 private host snapshot으로 향하는 on-demand 단방향 파생 출력이다. import, 역동기화, timer, schedule을 만들지 않는다.
 
+status·export 공통 산출물 구성: 항목은 Priority(P0→P3)→project_id로 정렬되고 markdown은 `## P1` 식 그룹 헤딩 아래 Objective·Repositories 컬럼을 포함한다(Priority는 컬럼이 아니라 헤딩). Registry 파생 `## Repositories` 요약(`allow_public` = Record에 영속된 opt-in이며 live 공개여부가 아님)은 **page-1 markdown에만** 렌더되고(export는 `portfolio.md`), JSON 쪽 `repositories` 배열은 status 전 페이지 payload와 `schema_version: 2` snapshot에 항상 실린다. status와 export는 페이지 예산 계산이 달라 page-N 항목 구성이 서로 일치하지 않을 수 있다. 두 명령 모두 Registry 요약을 읽으므로 Registry 손상 시 corruption 계열 오류로 fail-closed한다.
+
 ## preflight
 
 사용자가 live go/no-go를 명시적으로 요청한 경우에만 실행한다.

@@ -277,11 +277,25 @@ export const ProjectRecordUpdateSchema = ProjectRecordLinkSchema
   .strict();
 export type ProjectRecordUpdate = z.infer<typeof ProjectRecordUpdateSchema>;
 
+export const PortfolioRepositorySummarySchema = z
+  .object({
+    repo_id: repositoryId,
+    slug: z.string().regex(githubSlugPattern),
+    // Registry-record derivation: true reflects the persisted operator opt-in,
+    // not the repository's live GitHub visibility.
+    allow_public: z.boolean(),
+  })
+  .strict();
+export type PortfolioRepositorySummary = z.infer<typeof PortfolioRepositorySummarySchema>;
+
 export const BoundedPortfolioPayloadSchema = z
   .object({
     page_id: z.string().regex(/^page-[1-9][0-9]*$/),
     markdown: z.string().refine((value) => Buffer.byteLength(value, "utf8") <= 12 * 1024),
     items: z.array(ProjectSnapshotItemSchema).max(20),
+    // Bounded by the Registry catalog listing limit (maximumCatalogEntries),
+    // not the per-project repo_ids cap — the byte envelope is the real gate.
+    repositories: z.array(PortfolioRepositorySummarySchema).max(10_000),
     truncated: z.boolean(),
     total_items: z.number().int().nonnegative(),
     next_page_id: z.string().regex(/^page-[1-9][0-9]*$/).optional(),

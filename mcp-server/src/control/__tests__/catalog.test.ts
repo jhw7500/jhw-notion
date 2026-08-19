@@ -891,6 +891,19 @@ describe("Catalog Registry integrity and public input boundaries", () => {
     expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
   });
 
+  it("lists Repository records sorted by ID for portfolio derivation", async () => {
+    const { catalog } = await catalogFixture();
+    await expect(catalog.listRepositories()).resolves.toEqual([]);
+
+    await catalog.registerRepository({ ...repositoryInput, allow_public: true });
+    await catalog.registerRepository({ repo_id: "repo-alpha", github_node_id: "R_alpha", slug: "jhw7500/alpha" });
+
+    const listed = await catalog.listRepositories();
+    expect(listed.map((repository) => repository.id)).toEqual(["repo-alpha", "repo-wlan"]);
+    expect(listed[1]).toMatchObject({ slug: "jhw7500/wlan", allow_public: true });
+    expect(listed[0]?.allow_public).toBeUndefined();
+  });
+
   it("persists the public opt-in on the record and drops it on re-register without the flag", async () => {
     const { catalog } = await catalogFixture();
 

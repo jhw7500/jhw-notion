@@ -193,7 +193,7 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
       promoteTemporaryTask: async (input) => graph.catalog.promoteTemporaryTask(input.task_id, issueInput),
     },
     portfolio: {
-      status: async () => ({ page_id: "page-1", markdown: "# Portfolio\n", items: [], truncated: false, total_items: 0 }),
+      status: async () => ({ page_id: "page-1", markdown: "# Portfolio\n", items: [], repositories: [], truncated: false, total_items: 0 }),
       exportSnapshot: async () => ({
         jsonPath: "2026-08-13T00-00-00.000Z/portfolio.json",
         markdownPath: "2026-08-13T00-00-00.000Z/portfolio.md",
@@ -974,7 +974,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
   it("12. portfolio pages keep the exact CLI envelope within 12 KiB and 20 items", async () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
-    const portfolio = new PortfolioService({ projectClient: { readAll: async () => projectSource() }, stateDir: fixture.stateDir });
+    const portfolio = new PortfolioService({ projectClient: { readAll: async () => projectSource() }, repositories: { listRepositories: async () => [] }, stateDir: fixture.stateDir });
     const dependencies = cliDependencies(graph, { portfolio: { ...cliDependencies(graph).portfolio, status: portfolio.status.bind(portfolio) } });
     let page: string | undefined;
     const observed: string[] = [];
@@ -1645,7 +1645,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
     const snapshotSource = projectSource(1);
     snapshotSource.items[0]!.objective = `${fixture.sourceRepo}/snapshot-source`;
-    const snapshots = new PortfolioService({ projectClient: { readAll: async () => snapshotSource }, stateDir: fixture.stateDir });
+    const snapshots = new PortfolioService({ projectClient: { readAll: async () => snapshotSource }, repositories: { listRepositories: async () => [] }, stateDir: fixture.stateDir });
     await expect(snapshots.exportSnapshot()).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
     expect(await exists(join(fixture.stateDir, "snapshots"))).toBe(false);
   }, 25_000);

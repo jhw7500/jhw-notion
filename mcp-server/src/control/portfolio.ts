@@ -6,9 +6,11 @@ import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
+  type PortfolioRepositorySummary,
   type ProjectRecordLink,
   type ProjectRecordUpdate,
   type RegisterProjectInput,
+  type RepositoryRecord,
   type UpdateProjectInput,
   ProjectSnapshotSourceSchema,
   type ProjectSnapshotItem,
@@ -31,10 +33,15 @@ export interface ProjectSnapshotReader {
   updateProject?(input: UpdateProjectInput): Promise<ProjectRecordUpdate>;
 }
 
+export interface RepositoryListingPort {
+  listRepositories(): Promise<RepositoryRecord[]>;
+}
+
 export interface BoundedPayload {
   page_id: string;
   markdown: string;
   items: ProjectSnapshotItem[];
+  repositories: PortfolioRepositorySummary[];
   truncated: boolean;
   total_items: number;
   next_page_id?: string;
@@ -48,6 +55,7 @@ export interface SnapshotExportResult {
 
 export interface PortfolioServiceOptions {
   projectClient: ProjectSnapshotReader;
+  repositories: RepositoryListingPort;
   stateDir: string;
   now?: () => Date;
   sensitiveData?: SensitiveDataPolicy;
@@ -76,25 +84,62 @@ function markdownCell(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f|]/g, (character) => character === "|" ? "\\|" : " ");
 }
 
-function renderMarkdown(items: readonly ProjectSnapshotItem[], pageId: string, total: number, nextPageId?: string): string {
-  const rows = items.map((item) => [
-    item.project_id,
-    item.title,
-    item.fields.status,
-    item.fields.priority,
-    item.fields.health,
-    item.fields.next_action,
-    item.fields.last_reviewed,
-    item.stale ? "STALE" : "",
-  ].map(markdownCell).join(" | "));
+const priorityRank: Record<ProjectSnapshotItem["fields"]["priority"], number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+
+function sortItems(items: readonly ProjectSnapshotItem[]): ProjectSnapshotItem[] {
+  return [...items].sort((a, b) =>
+    priorityRank[a.fields.priority] - priorityRank[b.fields.priority] ||
+    (a.project_id < b.project_id ? -1 : a.project_id > b.project_id ? 1 : 0));
+}
+
+const itemColumns = "Project ID | Title | Objective | Repositories | Status | Health | Next Action | Last Reviewed | Warning";
+const itemSeparator = "--- | --- | --- | --- | --- | --- | --- | --- | ---";
+
+/** Renders one bounded page. Items must arrive pre-sorted by sortItems so each priority group emits exactly once. */
+function renderMarkdown(
+  items: readonly ProjectSnapshotItem[],
+  pageId: string,
+  total: number,
+  repositories: readonly PortfolioRepositorySummary[],
+  nextPageId?: string,
+): string {
+  const grouped: string[] = [];
+  let currentPriority: string | undefined;
+  for (const item of items) {
+    if (item.fields.priority !== currentPriority) {
+      currentPriority = item.fields.priority;
+      grouped.push("", `## ${currentPriority}`, "", itemColumns, itemSeparator);
+    }
+    grouped.push([
+      item.project_id,
+      item.title,
+      item.objective,
+      item.repo_ids.join(", "),
+      item.fields.status,
+      item.fields.health,
+      item.fields.next_action,
+      item.fields.last_reviewed,
+      item.stale ? "STALE" : "",
+    ].map(markdownCell).join(" | "));
+  }
+  // The Registry-derived repository summary renders once, on the first page.
+  const repositorySection = pageId === "page-1"
+    ? [
+      "",
+      "## Repositories",
+      "",
+      "Repo ID | Slug | Public Opt-In",
+      "--- | --- | ---",
+      ...repositories.map((repository) =>
+        [repository.repo_id, repository.slug, repository.allow_public ? "yes" : "no"].map(markdownCell).join(" | ")),
+    ]
+    : [];
   return [
     "# Portfolio",
     "",
     `Page: ${pageId} · Total: ${total}`,
-    "",
-    "Project ID | Title | Status | Priority | Health | Next Action | Last Reviewed | Warning",
-    "--- | --- | --- | --- | --- | --- | --- | ---",
-    ...rows,
+    ...grouped,
+    ...repositorySection,
     "",
     ...(nextPageId ? [`Next Page: ${nextPageId}`, ""] : []),
   ].join("\n");
@@ -108,7 +153,10 @@ function pageName(index: number): string {
   return `page-${index + 1}`;
 }
 
-function boundedPages(items: readonly ProjectSnapshotItem[]): BoundedPayload[] {
+function boundedPages(
+  items: readonly ProjectSnapshotItem[],
+  repositories: readonly PortfolioRepositorySummary[],
+): BoundedPayload[] {
   const pages: BoundedPayload[] = [];
   let offset = 0;
   while (offset < items.length || pages.length === 0) {
@@ -119,14 +167,27 @@ function boundedPages(items: readonly ProjectSnapshotItem[]): BoundedPayload[] {
       const hasMore = offset + candidateItems.length < items.length;
       const candidate: BoundedPayload = {
         page_id: pageName(index),
-        markdown: renderMarkdown(candidateItems, pageName(index), items.length, hasMore ? pageName(index + 1) : undefined),
+        markdown: renderMarkdown(candidateItems, pageName(index), items.length, repositories, hasMore ? pageName(index + 1) : undefined),
         items: candidateItems,
+        repositories: [...repositories],
         truncated: hasMore,
         total_items: items.length,
         ...(hasMore ? { next_page_id: pageName(index + 1) } : {}),
       };
       if (Buffer.byteLength(candidate.markdown, "utf8") > MAX_PAYLOAD_BYTES || serializedCliBytes(candidate) > MAX_PAYLOAD_BYTES) {
         if (selected.length === 0) {
+          // Distinguish an oversized item from a page whose item-free baseline
+          // (repository summary plus envelope) already exhausts the budget.
+          const baseline: BoundedPayload = {
+            ...candidate,
+            markdown: renderMarkdown([], pageName(index), items.length, repositories, hasMore ? pageName(index + 1) : undefined),
+            items: [],
+          };
+          if (Buffer.byteLength(baseline.markdown, "utf8") > MAX_PAYLOAD_BYTES || serializedCliBytes(baseline) > MAX_PAYLOAD_BYTES) {
+            throw new ControlError("PORTFOLIO_REPOSITORY_SECTION_TOO_LARGE", "The Registry repository summary exceeds the bounded payload limit", {
+              repositories: repositories.length,
+            });
+          }
           throw new ControlError("PORTFOLIO_ITEM_TOO_LARGE", "One portfolio item exceeds the bounded payload limit", {
             project_id: candidateItems[0]?.project_id,
           });
@@ -139,13 +200,21 @@ function boundedPages(items: readonly ProjectSnapshotItem[]): BoundedPayload[] {
     const hasMore = offset + selected.length < items.length;
     const payload: BoundedPayload = {
       page_id: pageName(index),
-      markdown: renderMarkdown(selected, pageName(index), items.length, hasMore ? pageName(index + 1) : undefined),
+      markdown: renderMarkdown(selected, pageName(index), items.length, repositories, hasMore ? pageName(index + 1) : undefined),
       items: selected,
+      repositories: [...repositories],
       truncated: hasMore,
       total_items: items.length,
       ...(hasMore ? { next_page_id: pageName(index + 1) } : {}),
     };
     if (serializedCliBytes(payload) > MAX_PAYLOAD_BYTES) {
+      // A page with items always equals its last accepted candidate, so only
+      // the item-free baseline (repository summary) can overflow here.
+      if (selected.length === 0) {
+        throw new ControlError("PORTFOLIO_REPOSITORY_SECTION_TOO_LARGE", "The Registry repository summary exceeds the bounded payload limit", {
+          repositories: repositories.length,
+        });
+      }
       throw new ControlError("PORTFOLIO_PAYLOAD_TOO_LARGE", "Portfolio payload exceeds its serialized byte boundary");
     }
     pages.push(payload);
@@ -155,7 +224,10 @@ function boundedPages(items: readonly ProjectSnapshotItem[]): BoundedPayload[] {
   return pages;
 }
 
-function markdownPages(items: readonly ProjectSnapshotItem[]): string[] {
+function markdownPages(
+  items: readonly ProjectSnapshotItem[],
+  repositories: readonly PortfolioRepositorySummary[],
+): string[] {
   const pages: string[] = [];
   let offset = 0;
   while (offset < items.length || pages.length === 0) {
@@ -167,10 +239,17 @@ function markdownPages(items: readonly ProjectSnapshotItem[]): string[] {
         candidate,
         pageName(pages.length),
         items.length,
+        repositories,
         hasMore ? pageName(pages.length + 1) : undefined,
       );
       if (Buffer.byteLength(rendered, "utf8") > MAX_PAYLOAD_BYTES) {
         if (selected.length === 0) {
+          const baseline = renderMarkdown([], pageName(pages.length), items.length, repositories, hasMore ? pageName(pages.length + 1) : undefined);
+          if (Buffer.byteLength(baseline, "utf8") > MAX_PAYLOAD_BYTES) {
+            throw new ControlError("PORTFOLIO_REPOSITORY_SECTION_TOO_LARGE", "The Registry repository summary exceeds the bounded payload limit", {
+              repositories: repositories.length,
+            });
+          }
           throw new ControlError("PORTFOLIO_ITEM_TOO_LARGE", "One portfolio markdown item exceeds the byte boundary");
         }
         break;
@@ -178,12 +257,21 @@ function markdownPages(items: readonly ProjectSnapshotItem[]): string[] {
       selected.push(candidate[candidate.length - 1] as ProjectSnapshotItem);
     }
     const hasMore = offset + selected.length < items.length;
-    pages.push(renderMarkdown(
+    const finalPage = renderMarkdown(
       selected,
       pageName(pages.length),
       items.length,
+      repositories,
       hasMore ? pageName(pages.length + 1) : undefined,
-    ));
+    );
+    // With items present this equals the last accepted candidate; the check
+    // guards the item-free page whose repository summary never met the loop.
+    if (Buffer.byteLength(finalPage, "utf8") > MAX_PAYLOAD_BYTES) {
+      throw new ControlError("PORTFOLIO_REPOSITORY_SECTION_TOO_LARGE", "The Registry repository summary exceeds the bounded payload limit", {
+        repositories: repositories.length,
+      });
+    }
+    pages.push(finalPage);
     offset += selected.length;
     if (items.length === 0) break;
   }
@@ -345,8 +433,9 @@ export class PortfolioService {
     this.sensitiveData.assertSafe(rawSource);
     assertNoAbsoluteHostPaths(rawSource);
     const source = parseSource(rawSource);
-    const items = projectId ? source.items.filter((item) => item.project_id === projectId) : source.items;
-    const pages = boundedPages(items);
+    const repositories = await this.repositorySummaries();
+    const items = sortItems(projectId ? source.items.filter((item) => item.project_id === projectId) : source.items);
+    const pages = boundedPages(items, repositories);
     const requested = pageId ?? "page-1";
     if (!/^page-[1-9][0-9]*$/.test(requested)) {
       throw new ControlError("INVALID_PAGE_ID", "Portfolio page ID is invalid");
@@ -354,6 +443,15 @@ export class PortfolioService {
     const page = pages.find((candidate) => candidate.page_id === requested);
     if (!page) throw new ControlError("INVALID_PAGE_ID", "Portfolio page ID does not exist");
     return page;
+  }
+
+  private async repositorySummaries(): Promise<PortfolioRepositorySummary[]> {
+    const records = await this.options.repositories.listRepositories();
+    this.sensitiveData.assertSafe(records);
+    assertNoAbsoluteHostPaths(records);
+    return records
+      .map((record) => ({ repo_id: record.id, slug: record.slug, allow_public: record.allow_public === true }))
+      .sort((a, b) => (a.repo_id < b.repo_id ? -1 : a.repo_id > b.repo_id ? 1 : 0));
   }
 
   async registerProject(input: RegisterProjectInput): Promise<ProjectRecordLink> {
@@ -379,19 +477,22 @@ export class PortfolioService {
     this.sensitiveData.assertSafe(rawSource);
     assertNoAbsoluteHostPaths(rawSource);
     const source = parseSource(rawSource);
+    const repositories = await this.repositorySummaries();
+    const items = sortItems(source.items);
     const { generatedAt, directoryName } = safeGeneratedDirectory(this.now());
     const payloadWithoutChecksum = {
-      schema_version: 1,
+      schema_version: 2,
       generated_at: generatedAt,
       project_node_id: source.project_node_id,
       source_revision: source.source_revision,
       field_definitions: source.field_definitions,
-      items: source.items,
+      repositories,
+      items,
       total_count: source.total_count,
     };
     const checksum = createHash("sha256").update(JSON.stringify(payloadWithoutChecksum)).digest("hex");
     const json = `${JSON.stringify({ ...payloadWithoutChecksum, checksum })}\n`;
-    const pages = markdownPages(source.items);
+    const pages = markdownPages(items, repositories);
     this.sensitiveData.assertSafe([json, pages]);
 
     let state: SecureStateDirectory | undefined;

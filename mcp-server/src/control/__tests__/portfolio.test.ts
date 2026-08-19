@@ -8,10 +8,13 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
+import { BoundedPortfolioPayloadSchema } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const roots: string[] = [];
 const execFile = promisify(execFileCallback);
+
+const emptyRepositories = { listRepositories: async () => [] };
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -52,7 +55,177 @@ function source(count = 23): ProjectSnapshotSource {
   };
 }
 
+const repositoryRecords = [
+  { id: "repo-zeta", github_node_id: "R_zeta", slug: "jhw7500/zeta", allow_public: true as const },
+  { id: "repo-alpha", github_node_id: "R_alpha", slug: "jhw7500/alpha" },
+];
+
+function mixedSource(): ProjectSnapshotSource {
+  const base = source(3);
+  base.items = [
+    { ...item(1), project_id: "prj-c-low", fields: { ...item(1).fields, priority: "P3" as const } },
+    { ...item(2), project_id: "prj-b-top", fields: { ...item(2).fields, priority: "P1" as const } },
+    { ...item(3), project_id: "prj-a-top", fields: { ...item(3).fields, priority: "P1" as const } },
+  ];
+  return base;
+}
+
 describe("PortfolioService", () => {
+  it("exposes Registry repository summaries with the public opt-in on every page payload", async () => {
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source() },
+      stateDir: "/unused",
+      repositories: { listRepositories: async () => repositoryRecords },
+    });
+
+    const first = await portfolio.status();
+    expect(first.repositories).toEqual([
+      { repo_id: "repo-alpha", slug: "jhw7500/alpha", allow_public: false },
+      { repo_id: "repo-zeta", slug: "jhw7500/zeta", allow_public: true },
+    ]);
+    expect(first.markdown).toContain("## Repositories");
+    expect(first.markdown).toContain("repo-zeta | jhw7500/zeta | yes");
+    expect(first.markdown).toContain("repo-alpha | jhw7500/alpha | no");
+
+    const second = await portfolio.status(undefined, "page-2");
+    expect(second.repositories).toEqual(first.repositories);
+    expect(second.markdown).not.toContain("## Repositories");
+  });
+
+  it("orders items by priority then project ID and groups markdown by priority", async () => {
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => mixedSource() },
+      stateDir: "/unused",
+      repositories: { listRepositories: async () => [] },
+    });
+
+    const output = await portfolio.status();
+    expect(output.items.map((entry) => entry.project_id)).toEqual(["prj-a-top", "prj-b-top", "prj-c-low"]);
+    const markdown = output.markdown;
+    expect(markdown).toContain("## P1");
+    expect(markdown).toContain("## P3");
+    expect(markdown.indexOf("## P1")).toBeLessThan(markdown.indexOf("## P3"));
+    expect(markdown).toContain(
+      "Project ID | Title | Objective | Repositories | Status | Health | Next Action | Last Reviewed | Warning",
+    );
+    expect(markdown).toContain("prj-a-top | Project 3 | Objective 3 | repo-control | active");
+  });
+
+  it("exports the versioned snapshot with repository summaries and priority-sorted items", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => mixedSource() },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      repositories: { listRepositories: async () => repositoryRecords },
+    });
+
+    await portfolio.exportSnapshot();
+    const snapshotDir = join(stateDir, "snapshots", "2026-08-13T12-34-56.000Z");
+    const parsed = JSON.parse(await readFile(join(snapshotDir, "portfolio.json"), "utf8"));
+    expect(parsed.schema_version).toBe(2);
+    expect(parsed.repositories).toEqual([
+      { repo_id: "repo-alpha", slug: "jhw7500/alpha", allow_public: false },
+      { repo_id: "repo-zeta", slug: "jhw7500/zeta", allow_public: true },
+    ]);
+    expect((parsed.items as Array<{ project_id: string }>).map((entry) => entry.project_id))
+      .toEqual(["prj-a-top", "prj-b-top", "prj-c-low"]);
+    const markdown = await readFile(join(snapshotDir, "portfolio.md"), "utf8");
+    expect(markdown).toContain("## Repositories");
+    expect(markdown).toContain("repo-zeta | jhw7500/zeta | yes");
+    expect(markdown.indexOf("## P1")).toBeLessThan(markdown.indexOf("## P3"));
+  });
+
+  it("accepts a bounded payload carrying more than 64 repository summaries", () => {
+    const payload = {
+      page_id: "page-1",
+      markdown: "# Portfolio\n",
+      items: [],
+      repositories: Array.from({ length: 65 }, (_, index) => ({
+        repo_id: `repo-r${index}`,
+        slug: `jhw7500/r${index}`,
+        allow_public: false,
+      })),
+      truncated: false,
+      total_items: 0,
+    };
+
+    expect(BoundedPortfolioPayloadSchema.safeParse(payload).success).toBe(true);
+  });
+
+  it("blames the repository summary, not an item, when the summary alone overflows a page", async () => {
+    const oversized = Array.from({ length: 400 }, (_, index) => ({
+      id: `repo-r${String(index).padStart(3, "0")}`,
+      github_node_id: `R_${index}`,
+      slug: `jhw7500/repository-${String(index).padStart(3, "0")}`,
+    }));
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir: "/unused",
+      repositories: { listRepositories: async () => oversized },
+    });
+
+    await expect(portfolio.status()).rejects.toMatchObject({ code: "PORTFOLIO_REPOSITORY_SECTION_TOO_LARGE" });
+  });
+
+  it("fails the export instead of writing an unbounded page when an empty portfolio cannot fit the summary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const oversized = Array.from({ length: 400 }, (_, index) => ({
+      id: `repo-r${String(index).padStart(3, "0")}`,
+      github_node_id: `R_${index}`,
+      slug: `jhw7500/repository-${String(index).padStart(3, "0")}`,
+    }));
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source(0) },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      repositories: { listRepositories: async () => oversized },
+    });
+
+    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "PORTFOLIO_REPOSITORY_SECTION_TOO_LARGE" });
+    await expect(lstat(join(stateDir, "snapshots", "current"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("renders the repository summary only on the first exported markdown page", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source() },
+      stateDir,
+      now: () => new Date("2026-08-13T12:34:56.000Z"),
+      repositories: { listRepositories: async () => repositoryRecords },
+    });
+
+    await portfolio.exportSnapshot();
+    const snapshotDir = join(stateDir, "snapshots", "2026-08-13T12-34-56.000Z");
+    expect(await readFile(join(snapshotDir, "portfolio.md"), "utf8")).toContain("## Repositories");
+    expect(await readFile(join(snapshotDir, "portfolio.page-2.md"), "utf8")).not.toContain("## Repositories");
+  });
+
+  it("rejects a protected repository record before any snapshot persistence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const secret = "unmistakably-fake-repository-token";
+    const portfolio = new PortfolioService({
+      projectClient: { readAll: async () => source(1) },
+      stateDir,
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+      repositories: {
+        listRepositories: async () => [{ id: "repo-poison", github_node_id: "R_poison", slug: `jhw7500/${secret}` }],
+      },
+    });
+
+    await expect(portfolio.status()).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    await expect(portfolio.exportSnapshot()).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    await expect(lstat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("syncs the state parent before each snapshot namespace publication", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-portfolio-"));
     roots.push(root);
@@ -60,12 +233,14 @@ describe("PortfolioService", () => {
     let parentSyncs = 0;
     const first = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
       afterSnapshotsParentSync: () => { parentSyncs += 1; },
     });
     const second = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:35:56.000Z"),
       afterSnapshotsParentSync: () => { parentSyncs += 1; },
@@ -84,6 +259,7 @@ describe("PortfolioService", () => {
     let reportedSynced = false;
     const service = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
       syncSnapshotsParent: async () => { throw new Error("injected parent sync failure"); },
@@ -103,6 +279,7 @@ describe("PortfolioService", () => {
     let syncAttempts = 0;
     const service = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
       syncSnapshotsParent: async () => {
@@ -130,6 +307,7 @@ describe("PortfolioService", () => {
     protectedSource.items[0] = { ...protectedSource.items[0]!, objective: `contains ${secret}` };
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => protectedSource },
+      repositories: emptyRepositories,
       stateDir,
       sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
     });
@@ -147,6 +325,7 @@ describe("PortfolioService", () => {
     invalid[secret] = true;
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => invalid as never },
+      repositories: emptyRepositories,
       stateDir: "/unused",
       sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
     });
@@ -166,6 +345,7 @@ describe("PortfolioService", () => {
     const updateProject = vi.fn();
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => protectedSource, registerProject, updateProject },
+      repositories: emptyRepositories,
       stateDir: join(root, "state"),
     });
 
@@ -201,12 +381,14 @@ describe("PortfolioService", () => {
 
     await expect(new PortfolioService({
       projectClient: { readAll: async () => source(), updateProject },
+      repositories: emptyRepositories,
       stateDir: "/unused",
     }).updateProject(patch)).resolves.toMatchObject({ project_id: "prj-control", fields: item(1).fields });
     expect(updateProject).toHaveBeenCalledWith(patch);
 
     await expect(new PortfolioService({
       projectClient: { readAll: async () => source() },
+      repositories: emptyRepositories,
       stateDir: "/unused",
     }).updateProject(patch)).rejects.toMatchObject({ code: "PROJECT_UPDATE_UNAVAILABLE" });
   });
@@ -214,6 +396,7 @@ describe("PortfolioService", () => {
   it("caps portfolio markdown and CLI-safe payload at 12 KiB or 20 items and emits page IDs", async () => {
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source() },
+      repositories: emptyRepositories,
       stateDir: "/unused",
       now: () => new Date("2026-08-13T00:00:00Z"),
     });
@@ -228,7 +411,7 @@ describe("PortfolioService", () => {
   });
 
   it("filters by project before paging and rejects unknown page IDs", async () => {
-    const portfolio = new PortfolioService({ projectClient: { readAll: async () => source() }, stateDir: "/unused" });
+    const portfolio = new PortfolioService({ repositories: emptyRepositories, projectClient: { readAll: async () => source() }, stateDir: "/unused" });
 
     const one = await portfolio.status("prj-project-21", undefined);
     expect(one.items.map((entry) => entry.project_id)).toEqual(["prj-project-21"]);
@@ -238,7 +421,7 @@ describe("PortfolioService", () => {
   it("paginates before the serialized CLI envelope exceeds the byte cap", async () => {
     const large = source();
     large.items = large.items.map((entry) => ({ ...entry, objective: "x".repeat(1_000) }));
-    const portfolio = new PortfolioService({ projectClient: { readAll: async () => large }, stateDir: "/unused" });
+    const portfolio = new PortfolioService({ repositories: emptyRepositories, projectClient: { readAll: async () => large }, stateDir: "/unused" });
 
     const first = await portfolio.status();
 
@@ -250,7 +433,7 @@ describe("PortfolioService", () => {
   it("fails closed when a project source contains non-allowlisted data", async () => {
     const invalid = source(1) as ProjectSnapshotSource & { token?: string };
     invalid.token = "must-not-enter-output";
-    const portfolio = new PortfolioService({ projectClient: { readAll: async () => invalid }, stateDir: "/unused" });
+    const portfolio = new PortfolioService({ repositories: emptyRepositories, projectClient: { readAll: async () => invalid }, stateDir: "/unused" });
 
     await expect(portfolio.status()).rejects.toMatchObject({ code: "INVALID_PROJECT_SOURCE" });
   });
@@ -261,6 +444,7 @@ describe("PortfolioService", () => {
     const stateDir = join(root, "state");
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source() },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
     });
@@ -283,7 +467,7 @@ describe("PortfolioService", () => {
     expect((await lstat(join(snapshotDir, "portfolio.md"))).mode & 0o777).toBe(0o600);
     expect((await lstat(join(snapshotDir, "portfolio.page-2.md"))).isFile()).toBe(true);
     expect(await readFile(join(snapshotDir, "portfolio.md"), "utf8")).toContain("Next Page: page-2");
-    expect(parsed).toMatchObject({ schema_version: 1, total_count: 23, project_node_id: "PVT_project" });
+    expect(parsed).toMatchObject({ schema_version: 2, total_count: 23, project_node_id: "PVT_project" });
   });
 
   it("atomically replaces a symbolic current pointer without touching its target", async () => {
@@ -297,6 +481,7 @@ describe("PortfolioService", () => {
     await symlink(external, join(snapshots, "current"));
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
     });
@@ -313,6 +498,7 @@ describe("PortfolioService", () => {
     const stateDir = join(root, "state");
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
       beforeSnapshotValidation: async (snapshotDirectory) => {
@@ -331,6 +517,7 @@ describe("PortfolioService", () => {
     let fifoPath = "";
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
       beforeSnapshotValidation: async (snapshotDirectory) => {
@@ -362,6 +549,7 @@ describe("PortfolioService", () => {
     const stateDir = join(root, "state");
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
       beforeSnapshotValidation: async (snapshotDirectory) => {
@@ -382,6 +570,7 @@ describe("PortfolioService", () => {
     const stateDir = join(root, "state");
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source(1) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
       beforeSnapshotValidation: async (snapshotDirectory) => {
@@ -399,6 +588,7 @@ describe("PortfolioService", () => {
     const stateDir = join(root, "state");
     const portfolio = new PortfolioService({
       projectClient: { readAll: async () => source(23) },
+      repositories: emptyRepositories,
       stateDir,
       now: () => new Date("2026-08-13T12:34:56.000Z"),
       beforeSnapshotValidation: async (snapshotDirectory) => {

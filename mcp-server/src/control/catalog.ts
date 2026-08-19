@@ -511,6 +511,25 @@ export class Catalog {
     return repository;
   }
 
+  async listRepositories(): Promise<RepositoryRecord[]> {
+    await this.auditRepositorySourceIndexes();
+    const entries = await this.records.listDirectoryEntries("repositories", maximumCatalogEntries);
+    const repositories: RepositoryRecord[] = [];
+    for (const entry of entries) {
+      // The audit above already fails closed on malformed names, subdirectories
+      // other than by-source, and records without their exact source index.
+      if (entry.kind !== "file") continue;
+      const match = entry.name.match(/^(repo-[a-z0-9][a-z0-9-]{1,62})\.yaml$/);
+      if (!match) continue;
+      const repository = await this.repositoryAt(match[1] as string);
+      if (repository) {
+        this.sensitiveData.assertSafe(repository);
+        repositories.push(repository);
+      }
+    }
+    return repositories.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  }
+
   private async repositoryForSource(
     sourceIndexPath: string,
     expectedGithubNodeId: string,

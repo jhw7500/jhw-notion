@@ -191,7 +191,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     claimService: claims,
     catalog,
     source,
-    portfolio: new PortfolioService({ projectClient: githubProject, stateDir: config.stateDir, sensitiveData }),
+    portfolio: new PortfolioService({ projectClient: githubProject, repositories: catalog, stateDir: config.stateDir, sensitiveData }),
     preflight: new PreflightService({
       config,
       environment: env,
