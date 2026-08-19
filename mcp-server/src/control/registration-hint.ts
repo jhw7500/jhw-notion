@@ -9,7 +9,7 @@ import { ControlError } from "./errors.js";
 
 const STATE_FILE = "project-registrations.json";
 const STATE_VERSION = 1;
-const MAX_PENDING_PROJECTS = 64;
+const MAX_TRACKED_PROJECTS = 256;
 
 const coordinate = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
 
@@ -21,29 +21,39 @@ const RegistrationHintSchema = z.object({
 
 const RegistrationHintStateSchema = z.object({
   version: z.literal(STATE_VERSION),
-  pending: z.record(coordinate, RegistrationHintSchema),
+  records: z.record(coordinate, RegistrationHintSchema),
 }).strict();
 
 /**
- * What one interrupted registration left behind. A hint without coordinates
- * means a run was about to create the DraftIssue; a hint with them means it
- * created one and may not have finished writing its fields.
+ * What this host knows about one Project Record it created. Without coordinates
+ * it means a run was about to create the DraftIssue; with them it names the
+ * DraftIssue that run created, whether or not that run went on to finish.
  */
 export type RegistrationHint = z.infer<typeof RegistrationHintSchema>;
 type RegistrationHintState = z.infer<typeof RegistrationHintStateSchema>;
 
+export interface RegistrationHintLookup {
+  /**
+   * False until this host has recorded anything. A missing entry only means "no
+   * record was created" once the store exists to have recorded one.
+   */
+  initialized: boolean;
+  hint?: RegistrationHint;
+}
+
 /**
- * Remembers the coordinates a registration is about to create, so a later run
- * can find that DraftIssue instead of waiting for it to become visible. Every
- * method may fail: the caller treats this as a hint, never as authority.
+ * Remembers every Project Record this host has created, so a later run can find
+ * one the Project has not made visible yet. Every method may fail: the caller
+ * treats this as a hint, never as authority.
  */
 export interface RegistrationHintPort {
-  /** The pending hint for one Project ID, or undefined when none is recorded. */
-  read(projectId: string): Promise<RegistrationHint | undefined>;
-  /** Publishes one hint durably before the irreversible step it describes. */
+  /** What this host knows about one Project ID. */
+  read(projectId: string): Promise<RegistrationHintLookup>;
+  /**
+   * Publishes one hint durably. Entries are never removed on success: a record
+   * that exists is exactly what a later registration needs to be told about.
+   */
   record(hint: RegistrationHint): Promise<void>;
-  /** Drops the hint for one Project ID once its registration has settled. */
-  clear(projectId: string): Promise<void>;
 }
 
 export interface RegistrationHintStoreHooks {
@@ -69,7 +79,7 @@ function parseState(raw: unknown): RegistrationHintState {
   if (!parsed.success) {
     throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state failed strict validation");
   }
-  for (const [projectId, hint] of Object.entries(parsed.data.pending)) {
+  for (const [projectId, hint] of Object.entries(parsed.data.records)) {
     if (hint.project_id !== projectId) {
       throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint is filed under another Project ID");
     }
@@ -78,10 +88,15 @@ function parseState(raw: unknown): RegistrationHintState {
 }
 
 /**
- * A durable, host-local record of registrations that reached their create step.
- * It lives beside the pilot journal under the same private state directory, but
+ * A durable, host-local record of every Project Record this host created. It
+ * lives beside the pilot journal under the same private state directory, but
  * unlike the journal it is read on the control path, so it is published through
  * a temporary file and a rename rather than appended.
+ *
+ * `record` is a read-modify-write over the whole file and is not atomic against
+ * a concurrent one. Callers must already hold the host-global mutation lock —
+ * every lifecycle command that reaches this store does — because a lost entry
+ * is exactly what would let the next run skip its absence window.
  */
 export class RegistrationHintStore implements RegistrationHintPort {
   constructor(
@@ -89,8 +104,11 @@ export class RegistrationHintStore implements RegistrationHintPort {
     private readonly hooks: RegistrationHintStoreHooks = {},
   ) {}
 
-  async read(projectId: string): Promise<RegistrationHint | undefined> {
-    return (await this.load()).pending[projectId];
+  async read(projectId: string): Promise<RegistrationHintLookup> {
+    const state = await this.load();
+    if (!state) return { initialized: false };
+    const hint = state.records[projectId];
+    return hint === undefined ? { initialized: true } : { initialized: true, hint };
   }
 
   async record(hint: RegistrationHint): Promise<void> {
@@ -99,32 +117,25 @@ export class RegistrationHintStore implements RegistrationHintPort {
       throw new ControlError("INVALID_REGISTRATION_HINT", "Registration hint is not a bounded coordinate set");
     }
     const state = await this.load();
-    const pending = { ...state.pending, [parsed.data.project_id]: parsed.data };
-    // An unbounded pending set would mean hints are never being cleared, which
-    // is a state-directory fault rather than something to keep growing through.
-    if (Object.keys(pending).length > MAX_PENDING_PROJECTS) {
-      throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state holds too many pending projects");
+    const records = { ...state?.records, [parsed.data.project_id]: parsed.data };
+    // Entries are kept for the life of the record they name, so the bound is a
+    // ceiling on registered projects rather than on concurrent work. Refusing
+    // past it costs the next registration its absence window, never its record.
+    if (Object.keys(records).length > MAX_TRACKED_PROJECTS) {
+      throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state tracks too many projects");
     }
-    await this.save({ version: STATE_VERSION, pending });
+    await this.save({ version: STATE_VERSION, records });
   }
 
-  async clear(projectId: string): Promise<void> {
-    const state = await this.load();
-    if (!(projectId in state.pending)) return;
-    const pending = { ...state.pending };
-    delete pending[projectId];
-    await this.save({ version: STATE_VERSION, pending });
-  }
-
-  private async load(): Promise<RegistrationHintState> {
+  /** The stored state, or undefined when this host has never written one. */
+  private async load(): Promise<RegistrationHintState | undefined> {
     const statePath = await this.statePath();
     try {
       const entry = await lstat(statePath);
       if (entry.isSymbolicLink() || !entry.isFile()) throw unsafeStatePath({ path: statePath });
     } catch (cause) {
       if (cause instanceof ControlError) throw cause;
-      // No file is the ordinary first-registration state, not a fault.
-      if (isNotFound(cause)) return { version: STATE_VERSION, pending: {} };
+      if (isNotFound(cause)) return undefined;
       throw cause;
     }
     let raw: unknown;

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { GitHubProjectClient, type GitHubRunner } from "../github-project.js";
-import type { RegistrationHint, RegistrationHintPort } from "../registration-hint.js";
+import type { RegistrationHint, RegistrationHintLookup, RegistrationHintPort } from "../registration-hint.js";
 import type { ProjectOperationalFields } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
@@ -159,28 +159,29 @@ function client(
 /** An in-memory hint store whose individual operations can be made to fail. */
 class FakeHints implements RegistrationHintPort {
   readonly recorded: RegistrationHint[] = [];
-  readonly cleared: string[] = [];
+  private tracked?: RegistrationHint;
+  private initialized: boolean;
 
   constructor(
-    private pending: RegistrationHint | undefined = undefined,
-    private readonly faults: { read?: boolean; record?: boolean; clear?: boolean } = {},
-  ) {}
+    tracked: RegistrationHint | undefined = undefined,
+    private readonly faults: { read?: boolean; record?: boolean } = {},
+    initialized = tracked !== undefined,
+  ) {
+    this.tracked = tracked;
+    this.initialized = initialized;
+  }
 
-  async read(projectId: string): Promise<RegistrationHint | undefined> {
+  async read(projectId: string): Promise<RegistrationHintLookup> {
     if (this.faults.read) throw new Error("hint state is unreadable");
-    return this.pending?.project_id === projectId ? this.pending : undefined;
+    const hint = this.tracked?.project_id === projectId ? this.tracked : undefined;
+    return { initialized: this.initialized, ...(hint ? { hint } : {}) };
   }
 
   async record(hint: RegistrationHint): Promise<void> {
     if (this.faults.record) throw new Error("hint state is unwritable");
     this.recorded.push(hint);
-    this.pending = hint;
-  }
-
-  async clear(projectId: string): Promise<void> {
-    if (this.faults.clear) throw new Error("hint state is unwritable");
-    this.cleared.push(projectId);
-    if (this.pending?.project_id === projectId) this.pending = undefined;
+    this.tracked = hint;
+    this.initialized = true;
   }
 }
 
@@ -541,10 +542,10 @@ describe("GitHubProjectClient", () => {
     expect(pauses).toEqual([2000, 4000]);
   });
 
-  it("creates a first Project Record without paying the absence window", async () => {
+  it("creates without paying the absence window once the hint store is in use", async () => {
     const runner = new QueuedGhRunner();
     const pauses: number[] = [];
-    const hints = new FakeHints();
+    const hints = new FakeHints(undefined, {}, true);
     runner.enqueue(
       projectPage({}),
       draftMutation(),
@@ -555,13 +556,78 @@ describe("GitHubProjectClient", () => {
     await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, hints)
       .registerProject(registration))
       .resolves.toMatchObject({ project_item_id: "PVTI_1", source_node_id: "DI_registration" });
-    // An empty, readable hint store proves no earlier run reached the create.
+    // Entries outlive the registrations that write them, so an initialized
+    // store with no entry says this host never created this record.
     expect(pauses).toEqual([]);
     expect(hintLookups(runner)).toHaveLength(0);
     expect(runner.calls.filter((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toHaveLength(1);
     // Intent is durable before the irreversible step, coordinates right after.
     expect(hints.recorded).toEqual([{ project_id: registration.project_id }, recordedHint]);
-    expect(hints.cleared).toEqual([registration.project_id]);
+  });
+
+  // Records that predate the store are the one thing it cannot speak for.
+  it("still confirms absence by waiting while the hint store is uninitialized", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    const hints = new FakeHints();
+    runner.enqueue(
+      projectPage({}), projectPage({}), projectPage({}),
+      draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, hints)
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(pauses).toEqual([2000, 4000]);
+    expect(hints.recorded).toEqual([{ project_id: registration.project_id }, recordedHint]);
+  });
+
+  // The regression this design exists to prevent: a settled registration keeps
+  // its entry, so re-running it against a lagging list read reuses the record
+  // instead of creating a second one for the same Project ID.
+  it("reuses the record it already registered when the list read lags behind", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    const hints = new FakeHints(undefined, {}, true);
+    runner.enqueue(
+      // First registration: create, write the fields, verify.
+      projectPage({}),
+      draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [registrationRecord("complete")] }),
+      // Second registration: the list read no longer shows the record.
+      projectPage({}),
+      hintedItem(registrationRecord("complete")),
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+    const github = client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, hints);
+
+    await expect(github.registerProject(registration)).resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    await expect(github.registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1", source_node_id: "DI_registration" });
+
+    expect(runner.calls.filter((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toHaveLength(1);
+    expect(hintLookups(runner)).toHaveLength(1);
+    expect(mutations(runner)).toHaveLength(5);
+    expect(pauses).toEqual([]);
+  });
+
+  // The recorded coordinates are a shortcut for an empty read, never a detour
+  // around one that already found the record.
+  it("ignores the recorded coordinates when the first read already shows the record", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      projectPage({ records: [registrationRecord("complete")] }),
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async () => undefined, new FakeHints(recordedHint))
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(hintLookups(runner)).toHaveLength(0);
+    expect(mutations(runner)).toHaveLength(0);
   });
 
   it("resumes a create that crashed before its fields through the recorded coordinates", async () => {
@@ -582,7 +648,6 @@ describe("GitHubProjectClient", () => {
     expect(hintLookups(runner)).toHaveLength(1);
     expect(pauses).toEqual([]);
     expect(mutations(runner)).toHaveLength(5);
-    expect(hints.cleared).toEqual([registration.project_id]);
   });
 
   it("falls back to the absence window when the recorded coordinates no longer resolve", async () => {
@@ -634,27 +699,12 @@ describe("GitHubProjectClient", () => {
         projectPage({ records: [registrationRecord("complete")] }),
       );
 
-      await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, new FakeHints(undefined, faults))
+      await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, new FakeHints(undefined, faults, true))
         .registerProject(registration))
         .resolves.toMatchObject({ project_item_id: "PVTI_1" });
       // A store that cannot be read or written costs the window, not the record.
       expect(pauses).toEqual([2000, 4000]);
     }
-  });
-
-  it("completes the registration when the settled hint cannot be cleared", async () => {
-    const runner = new QueuedGhRunner();
-    const hints = new FakeHints(undefined, { clear: true });
-    runner.enqueue(
-      projectPage({}),
-      draftMutation(),
-      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
-      projectPage({ records: [registrationRecord("complete")] }),
-    );
-
-    await expect(client(runner, catalogFixture(), async () => undefined, hints).registerProject(registration))
-      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
-    expect(hints.cleared).toEqual([]);
   });
 
   it("ignores a hint that resolves to an item outside the configured Project", async () => {

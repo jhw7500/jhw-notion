@@ -25,20 +25,27 @@ const hint = {
 };
 
 describe("RegistrationHintStore", () => {
-  it("reports no hint for a state directory that has never been written", async () => {
-    const directory = await stateDir();
-
-    await expect(new RegistrationHintStore(directory).read("prj-example")).resolves.toBeUndefined();
+  // "no entry" only means "this host created nothing" once the store exists.
+  // Before that it cannot speak for records that predate it.
+  it("reports an unwritten store as uninitialized rather than empty", async () => {
+    await expect(new RegistrationHintStore(await stateDir()).read("prj-example"))
+      .resolves.toEqual({ initialized: false });
   });
 
-  it("round-trips one hint and forgets it on clear", async () => {
+  it("separates a project it has never seen from a store it has never written", async () => {
+    const store = new RegistrationHintStore(await stateDir());
+
+    await store.record({ project_id: "prj-other" });
+
+    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true });
+  });
+
+  it("round-trips one hint", async () => {
     const store = new RegistrationHintStore(await stateDir());
 
     await store.record(hint);
-    await expect(store.read("prj-example")).resolves.toEqual(hint);
 
-    await store.clear("prj-example");
-    await expect(store.read("prj-example")).resolves.toBeUndefined();
+    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true, hint });
   });
 
   it("keeps an intent that has no coordinates yet distinguishable from no intent", async () => {
@@ -46,8 +53,10 @@ describe("RegistrationHintStore", () => {
 
     await store.record({ project_id: "prj-example" });
 
-    await expect(store.read("prj-example")).resolves.toEqual({ project_id: "prj-example" });
-    await expect(store.read("prj-other")).resolves.toBeUndefined();
+    await expect(store.read("prj-example")).resolves.toEqual({
+      initialized: true,
+      hint: { project_id: "prj-example" },
+    });
   });
 
   it("upgrades an intent to coordinates without disturbing another project", async () => {
@@ -57,20 +66,11 @@ describe("RegistrationHintStore", () => {
     await store.record({ project_id: "prj-example" });
     await store.record(hint);
 
-    await expect(store.read("prj-example")).resolves.toEqual(hint);
-    await expect(store.read("prj-other")).resolves.toEqual({ project_id: "prj-other" });
-
-    await store.clear("prj-example");
-    await expect(store.read("prj-other")).resolves.toEqual({ project_id: "prj-other" });
-  });
-
-  it("clears a project that has no hint without writing anything", async () => {
-    const directory = await stateDir();
-    const store = new RegistrationHintStore(directory);
-
-    await store.clear("prj-example");
-
-    await expect(lstat(join(directory, "project-registrations.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true, hint });
+    await expect(store.read("prj-other")).resolves.toEqual({
+      initialized: true,
+      hint: { project_id: "prj-other" },
+    });
   });
 
   it("publishes a private state file and leaves no temporary behind", async () => {
@@ -112,7 +112,7 @@ describe("RegistrationHintStore", () => {
     await store.record(hint);
     await writeFile(
       join(directory, "project-registrations.json"),
-      `${JSON.stringify({ version: 1, pending: { "prj-example": { ...hint, project_id: "prj-other" } } })}\n`,
+      `${JSON.stringify({ version: 1, records: { "prj-example": { ...hint, project_id: "prj-other" } } })}\n`,
       "utf8",
     );
 
@@ -142,22 +142,34 @@ describe("RegistrationHintStore", () => {
       .rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT" });
   });
 
-  it("refuses to grow a pending set that is never being cleared", async () => {
+  it("refuses to track more projects than its ceiling", async () => {
     const directory = await stateDir();
     const store = new RegistrationHintStore(directory);
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    const pending = Object.fromEntries(
-      Array.from({ length: 64 }, (_unused, index) => [`prj-${index}`, { project_id: `prj-${index}` }]),
+    const records = Object.fromEntries(
+      Array.from({ length: 256 }, (_unused, index) => [`prj-${index}`, { project_id: `prj-${index}` }]),
     );
     await writeFile(
       join(directory, "project-registrations.json"),
-      `${JSON.stringify({ version: 1, pending })}\n`,
+      `${JSON.stringify({ version: 1, records })}\n`,
       "utf8",
     );
 
+    // Refusing costs the next registration its absence window, never its record.
     await expect(store.record(hint)).rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT_STATE" });
-    // Re-recording one of the projects already pending stays within the bound.
+    // Re-recording a project already tracked stays within the bound.
     await expect(store.record({ project_id: "prj-0", item_id: "PVTI_0" })).resolves.toBeUndefined();
+  });
+
+  // A settled registration keeps its entry: dropping it would make "no entry"
+  // mean both "never created" and "created and verified".
+  it("keeps a settled entry so a later registration can still resolve it", async () => {
+    const store = new RegistrationHintStore(await stateDir());
+
+    await store.record({ project_id: "prj-example" });
+    await store.record(hint);
+
+    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true, hint });
   });
 
   it("writes deterministic JSON that another reader can parse", async () => {
@@ -167,6 +179,6 @@ describe("RegistrationHintStore", () => {
 
     const raw = await readFile(join(directory, "project-registrations.json"), "utf8");
     expect(raw.endsWith("\n")).toBe(true);
-    expect(JSON.parse(raw)).toEqual({ version: 1, pending: { "prj-example": hint } });
+    expect(JSON.parse(raw)).toEqual({ version: 1, records: { "prj-example": hint } });
   });
 });

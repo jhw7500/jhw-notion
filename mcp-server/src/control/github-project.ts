@@ -903,9 +903,6 @@ export class GitHubProjectClient {
       await this.updateField(structure, itemId, update.fieldName, update.kind, update.value);
     }
     await this.verifyRegisteredItem(itemId, sourceNodeId, input.data, structure);
-    // Nothing is left to resume once the record is verified. A clear that fails
-    // is safe: the next registration resolves the stale hint and reuses it.
-    await this.forgetHint(input.data.project_id);
 
     const link = ProjectRecordLinkSchema.safeParse({
       project_id: input.data.project_id,
@@ -1010,15 +1007,18 @@ export class GitHubProjectClient {
       const record = await this.recordFromHint(hint.value.item_id, projectId, structure);
       if (record) return record;
     }
-    // An intent already on disk is never narrowed: coordinates that did not
+    // An entry already on disk is never narrowed: coordinates that did not
     // resolve this time are still the best thing a later run has to go on.
     if (hint.value !== undefined) return this.awaitVisibleRecord(projectId);
     // The intent is claimed before the wait is decided, because skipping the
     // wait is only sound while this run's own create is durably recorded.
     const marked = await this.rememberHint({ project_id: projectId });
-    // Waiting only pays off when some earlier run may already have created the
-    // record. A hint store that is readable, writable, and empty proves none did.
-    if (!marked || !hint.known) return this.awaitVisibleRecord(projectId);
+    // Waiting only pays off when this host may already have created the record.
+    // Entries outlive the registrations that wrote them, so a store that is
+    // readable, writable, and already in use says this host never created one.
+    // Before it has been written once it cannot say that about records that
+    // predate it, which is why an uninitialized store still costs the window.
+    if (!marked || !hint.known || !hint.initialized) return this.awaitVisibleRecord(projectId);
     return undefined;
   }
 
@@ -1049,10 +1049,12 @@ export class GitHubProjectClient {
     if (!response.success) return undefined;
     const node = response.data.data.node;
     if (!node) return undefined;
-    // The content gates still apply in full: a hint may select which item to
-    // look at, but never what counts as a usable record.
-    this.assertContentSafe(node);
+    // Ownership is settled before the content is inspected at all: another
+    // Project's item is not this registration's to scan, let alone to reuse.
     if (node.project.id !== structure.projectId) return undefined;
+    // From here the content gates still apply in full: a hint may select which
+    // item to look at, but never what counts as a usable record.
+    this.assertContentSafe(node);
     const content = draftIssue(node.content);
     if (node.type !== "DRAFT_ISSUE" || !content) return undefined;
     let body: ProjectRecordBody;
@@ -1080,17 +1082,19 @@ export class GitHubProjectClient {
   }
 
   /**
-   * A hint that cannot be read is reported as unknown rather than as absent, so
-   * an unavailable store costs the absence window instead of correctness.
+   * A store that cannot be read is reported as unknown rather than as empty, so
+   * an unavailable one costs the absence window instead of correctness.
    */
-  private async readHint(projectId: string): Promise<{ known: boolean; value?: RegistrationHint }> {
+  private async readHint(
+    projectId: string,
+  ): Promise<{ known: boolean; initialized: boolean; value?: RegistrationHint }> {
     const hints = this.options.registrationHints;
-    if (!hints) return { known: false };
+    if (!hints) return { known: false, initialized: false };
     try {
-      const value = await hints.read(projectId);
-      return value === undefined ? { known: true } : { known: true, value };
+      const lookup = await hints.read(projectId);
+      return { known: true, initialized: lookup.initialized, ...(lookup.hint ? { value: lookup.hint } : {}) };
     } catch {
-      return { known: false };
+      return { known: false, initialized: false };
     }
   }
 
@@ -1104,15 +1108,6 @@ export class GitHubProjectClient {
       return true;
     } catch {
       return false;
-    }
-  }
-
-  /** Drops a settled hint. A stale one only costs the next run one lookup. */
-  private async forgetHint(projectId: string): Promise<void> {
-    try {
-      await this.options.registrationHints?.clear(projectId);
-    } catch {
-      return;
     }
   }
 
