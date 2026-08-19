@@ -145,10 +145,11 @@ dirty/ahead/diverged content의 의도와 소유 workflow를 operator가 확인�
 
 ```bash
 jhw-control repository register \
-  --repo-id <repo-id> --slug <owner/name> --repo-path <absolute-checkout-root>
+  --repo-id <repo-id> --slug <owner/name> --repo-path <absolute-checkout-root> \
+  [--allow-public true]
 ```
 
-이 명령은 exact checkout root, 단 하나의 matching GitHub origin, private repository, GitHub node ID를 검증한 뒤 Repository Record를 만든다. 동일 node/slug 재호출은 idempotent다. 저장소 rename 후 origin과 `--slug`가 새 이름을 가리키더라도 GitHub node ID가 같으면 Repository Record와 종속 formal Task의 Issue URL·현재 정식 alias를 한 Registry transaction에서 갱신한다. 이미 생성된 Claim·Handoff·worktree 좌표가 참조하는 이전 정식 alias는 같은 `task_id`의 호환 alias로 보존하므로 active 작업과 기존 Handoff를 계속 종료·재개할 수 있다. 다른 node 또는 전역 alias 충돌에서는 Registry를 바꾸지 않고 멈춘다.
+이 명령은 exact checkout root, 단 하나의 matching GitHub origin, private repository, GitHub node ID를 검증한 뒤 Repository Record를 만든다. public repository는 기본 거부(`REPOSITORY_NOT_PRIVATE`)이며, `--allow-public true`(정확한 리터럴)로만 opt-in할 수 있다 — opt-in은 Record에 영속되어 이후 task start 재검증에도 적용되고, 이때 추가 노출은 push되는 task 브랜치명과 formal Issue 내용뿐이다(Registry·Project는 여전히 private 필수). 동일 node/slug이면서 `--allow-public` 상태도 같은 재호출은 idempotent다. opt-in 상태가 달라지면 Record를 갱신하는 Registry commit이 한 건 생기되, 저장소가 여전히 public이면 무플래그 재호출은 `REPOSITORY_NOT_PRIVATE`로 실패하고 Record의 opt-in은 유지된다(소거는 private 복귀 후 무플래그 재등록에서만 일어난다). 저장소 rename 후 origin과 `--slug`가 새 이름을 가리키더라도 GitHub node ID가 같으면 Repository Record와 종속 formal Task의 Issue URL·현재 정식 alias를 한 Registry transaction에서 갱신한다. 이미 생성된 Claim·Handoff·worktree 좌표가 참조하는 이전 정식 alias는 같은 `task_id`의 호환 alias로 보존하므로 active 작업과 기존 Handoff를 계속 종료·재개할 수 있다. 다른 node 또는 전역 alias 충돌에서는 Registry를 바꾸지 않고 멈춘다.
 
 그 다음 `/jhw:project --trial`에서 Project ID, title, objective, repository ID 목록, 다섯 운영 필드를 하나의 제안으로 보고 한 번 승인한다.
 
@@ -190,6 +191,8 @@ jhw-control task start \
   --done <condition> [--done <condition> ...] \
   --scope <scope> [--scope <scope> ...] --session <session-id>
 ```
+
+push되는 branch 이름에 Task alias가 그대로 포함되므로 temporary alias에 비밀·내부 코드네임 같은 민감 라벨을 넣지 않는다.
 
 ### 기존 Task 재개
 

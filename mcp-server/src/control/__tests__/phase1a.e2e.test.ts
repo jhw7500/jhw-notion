@@ -168,6 +168,7 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         repo_id: input.repo_id,
         slug: input.slug,
         github_node_id: repositoryInput.github_node_id,
+        ...(input.allow_public === true ? { allow_public: true as const } : {}),
       }),
       registerFormalTask: async (input) => {
         await ensureRepository();

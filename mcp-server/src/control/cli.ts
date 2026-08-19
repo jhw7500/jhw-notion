@@ -456,18 +456,26 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "repository register") {
-    const flags = parseFlags(argv.slice(2), new Set(["--repo-id", "--slug", "--repo-path"]));
+    const flags = parseFlags(argv.slice(2), new Set(["--repo-id", "--slug", "--repo-path", "--allow-public"]));
     assertSafeFlags(flags, dependencies);
     const repo_id = assertPattern(required(flags, "--repo-id"), REPO_ID);
     const slug = required(flags, "--slug");
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
-    const registered = await dependencies.source.registerRepository({ repo_id, slug, repository_path });
+    const allowPublic = value(flags, "--allow-public");
+    if (allowPublic !== undefined && allowPublic !== "true") usage("Public opt-in must be the exact literal true");
+    const registered = await dependencies.source.registerRepository({
+      repo_id,
+      slug,
+      repository_path,
+      ...(allowPublic === "true" ? { allow_public: true as const } : {}),
+    });
     return {
       flags,
       result: resultJson(command, {
         repo_id: registered.repository.id,
         slug: registered.repository.slug,
+        allow_public: registered.repository.allow_public === true,
         created: registered.created,
       }),
     };

@@ -45,7 +45,7 @@ export interface ProjectMembershipPort {
 }
 
 export interface SourceCatalogPort {
-  registerRepository(input: { repo_id: string; github_node_id: string; slug: string }): Promise<RepositoryRegistration>;
+  registerRepository(input: { repo_id: string; github_node_id: string; slug: string; allow_public?: true }): Promise<RepositoryRegistration>;
   getRepository(repoId: string): Promise<RepositoryRecord>;
   getTask(taskId: string): Promise<TaskRecord>;
   getTaskSourceRevision(taskId: string): Promise<string>;
@@ -138,24 +138,25 @@ export class GitHubSourceService {
     this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy();
   }
 
-  async registerRepository(input: { repo_id: string; slug: string; repository_path: string }): Promise<RepositoryRegistration> {
+  async registerRepository(input: { repo_id: string; slug: string; repository_path: string; allow_public?: true }): Promise<RepositoryRegistration> {
     if (!repoIdPattern.test(input.repo_id) || !slugPattern.test(input.slug)) {
       throw new ControlError("INVALID_REPOSITORY", "Repository registration coordinates are invalid");
     }
     this.assertCheckoutSafe({ repo_id: input.repo_id, slug: input.slug }, input.repository_path);
     await this.verifyCheckout(input.repository_path, input.slug);
-    const resolved = await this.resolveRepository(input.slug);
+    const resolved = await this.resolveRepository(input.slug, input.allow_public === true);
     this.assertCheckoutSafe(resolved, input.repository_path);
     return this.options.catalog.registerRepository({
       repo_id: input.repo_id,
       slug: resolved.full_name,
       github_node_id: resolved.node_id,
+      ...(input.allow_public === true ? { allow_public: true as const } : {}),
     });
   }
 
   async verifyPrivateRepository(slug: string): Promise<void> {
     if (!slugPattern.test(slug)) throw new ControlError("INVALID_REPOSITORY", "Repository slug is invalid");
-    await this.resolveRepository(slug);
+    await this.resolveRepository(slug, false);
   }
 
   async registerFormalTask(input: {
@@ -264,7 +265,7 @@ export class GitHubSourceService {
     this.assertCheckoutSafe(repository, repositoryPath);
     await this.options.projects.requireProjectRepository(projectId, repoId);
     await this.verifyCheckout(repositoryPath, repository.slug);
-    const actual = await this.resolveRepository(repository.slug);
+    const actual = await this.resolveRepository(repository.slug, repository.allow_public === true);
     this.assertCheckoutSafe(actual, repositoryPath);
     if (actual.node_id !== repository.github_node_id) {
       throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "Repository Record and GitHub node identity disagree");
@@ -306,7 +307,7 @@ export class GitHubSourceService {
     createSensitiveDataPolicy({}, [repositoryPath]).assertSafe(value);
   }
 
-  private async resolveRepository(slug: string): Promise<z.infer<typeof RepositoryResponseSchema>> {
+  private async resolveRepository(slug: string, allowPublic: boolean): Promise<z.infer<typeof RepositoryResponseSchema>> {
     const resolved = parseJson(
       (await this.options.runner.runGh(["api", `repos/${slug}`], "repo")).stdout,
       RepositoryResponseSchema,
@@ -315,7 +316,11 @@ export class GitHubSourceService {
     if (!sameSlug(resolved.full_name, slug)) {
       throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "GitHub repository slug does not match the request");
     }
-    if (!resolved.private) throw new ControlError("REPOSITORY_NOT_PRIVATE", "Phase 1A requires a private GitHub repository");
+    // The private requirement stays the default; a public repository passes
+    // only through the explicit operator opt-in persisted on its record.
+    if (!resolved.private && !allowPublic) {
+      throw new ControlError("REPOSITORY_NOT_PRIVATE", "Phase 1A requires a private GitHub repository");
+    }
     this.sensitiveData.assertSafe(resolved);
     return resolved;
   }

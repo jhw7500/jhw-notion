@@ -46,6 +46,9 @@ export const RepositoryRecordSchema = z
     id: repositoryId,
     github_node_id: githubNodeId,
     slug: z.string().regex(githubSlugPattern),
+    // Explicit operator opt-in: the source repository may be public. Absent
+    // means the Phase 1A private requirement stays enforced on every use.
+    allow_public: z.literal(true).optional(),
   })
   .strict();
 export type RepositoryRecord = z.infer<typeof RepositoryRecordSchema>;

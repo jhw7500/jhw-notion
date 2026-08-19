@@ -37,6 +37,7 @@ const RegisterRepositoryInputSchema = z.object({
   repo_id: z.string().regex(repositoryIdPattern),
   github_node_id: githubNodeId,
   slug: z.string().regex(githubSlugPattern),
+  allow_public: z.literal(true).optional(),
 }).strict();
 
 const RegisterFormalTaskInputSchema = z.object({
@@ -191,14 +192,22 @@ export class Catalog {
             requested_repo_id: input.repo_id,
           });
         }
-        if (indexed.repository.slug === input.slug) {
+        const sameAllowIndexed = (indexed.repository.allow_public === true) === (input.allow_public === true);
+        if (indexed.repository.slug === input.slug && sameAllowIndexed) {
           registration = { repository: indexed.repository, created: false };
           return noChanges();
         }
-        const migratedTaskPaths = await this.migrateRepositorySlugDependencies(indexed.repository, input.slug);
+        const migratedTaskPaths = indexed.repository.slug === input.slug
+          ? []
+          : await this.migrateRepositorySlugDependencies(indexed.repository, input.slug);
         const renamed = record(
           RepositoryRecordSchema,
-          { ...indexed.repository, slug: input.slug },
+          {
+            id: indexed.repository.id,
+            github_node_id: indexed.repository.github_node_id,
+            slug: input.slug,
+            ...(input.allow_public === true ? { allow_public: true as const } : {}),
+          },
           "INVALID_REPOSITORY",
         );
         await this.records.writeJson(repositoryRelativePath(renamed.id), renamed);
@@ -218,9 +227,19 @@ export class Catalog {
         const migratedTaskPaths = existing.slug === input.slug
           ? []
           : await this.migrateRepositorySlugDependencies(existing, input.slug);
-        const renamed = existing.slug === input.slug
+        const sameAllowExisting = (existing.allow_public === true) === (input.allow_public === true);
+        const renamed = existing.slug === input.slug && sameAllowExisting
           ? existing
-          : record(RepositoryRecordSchema, { ...existing, slug: input.slug }, "INVALID_REPOSITORY");
+          : record(
+            RepositoryRecordSchema,
+            {
+              id: existing.id,
+              github_node_id: existing.github_node_id,
+              slug: input.slug,
+              ...(input.allow_public === true ? { allow_public: true as const } : {}),
+            },
+            "INVALID_REPOSITORY",
+          );
         if (renamed !== existing) await this.records.writeJson(repositoryRelativePath(renamed.id), renamed);
         await this.records.writeJson(sourcePath, { repo_id: renamed.id });
         registration = { repository: renamed, created: false };
@@ -233,7 +252,12 @@ export class Catalog {
 
       const repository = record(
         RepositoryRecordSchema,
-        { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug },
+        {
+          id: input.repo_id,
+          github_node_id: input.github_node_id,
+          slug: input.slug,
+          ...(input.allow_public === true ? { allow_public: true as const } : {}),
+        },
         "INVALID_REPOSITORY",
       );
       await this.records.writeJson(repositoryRelativePath(repository.id), repository);

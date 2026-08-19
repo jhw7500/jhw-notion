@@ -154,6 +154,62 @@ describe("GitHubSourceService", () => {
     expect(catalog.registerRepository).not.toHaveBeenCalled();
   });
 
+  it("registers a public repository only with the explicit opt-in and persists it", async () => {
+    const { service, catalog } = fixture({ private: false });
+
+    await expect(service.registerRepository({
+      repo_id: "repo-wlan", slug: "jhw7500/wlan", repository_path: checkout, allow_public: true,
+    })).resolves.toMatchObject({ created: true });
+
+    expect(catalog.registerRepository).toHaveBeenCalledWith({
+      repo_id: "repo-wlan", slug: "jhw7500/wlan", github_node_id: "R_wlan", allow_public: true,
+    });
+  });
+
+  it("keeps the private requirement for task context on records without the opt-in", async () => {
+    const { service, catalog } = fixture({ private: false });
+
+    const error = await service.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      repository_path: checkout,
+      alias: "wlan:tmp-20260819-01-optin",
+      goal: "document the opt-in boundary",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/control"],
+    }).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "REPOSITORY_NOT_PRIVATE" });
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+  });
+
+  it("allows task context on a public repository whose record carries the opt-in", async () => {
+    const { service, catalog } = fixture({ private: false });
+    catalog.getRepository.mockResolvedValue({
+      id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan", allow_public: true,
+    });
+
+    await service.registerTemporaryTask({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      repository_path: checkout,
+      alias: "wlan:tmp-20260819-02-optin",
+      goal: "document the opt-in boundary",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/control"],
+    });
+
+    expect(catalog.registerTemporaryTask).toHaveBeenCalled();
+  });
+
+  it("verifies the Registry repository with no tolerance for the public opt-in", async () => {
+    const { service } = fixture({ private: false });
+
+    await expect(service.verifyPrivateRepository("jhw7500/wlan")).rejects.toMatchObject({
+      code: "REPOSITORY_NOT_PRIVATE",
+    });
+  });
+
   it("derives formal Issue coordinates and alias after Project/Repository/checkout verification", async () => {
     const { service, catalog, projects } = fixture();
 

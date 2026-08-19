@@ -44,10 +44,11 @@ Project가 사용할 Repository Record가 없으면 operator가 승인한 `repo-
 
 ```bash
 jhw-control repository register \
-  --repo-id <repo-id> --slug <owner/name> --repo-path <absolute-checkout-root>
+  --repo-id <repo-id> --slug <owner/name> --repo-path <absolute-checkout-root> \
+  [--allow-public true]
 ```
 
-이 명령이 checkout root/origin, private GitHub repository, node ID를 검증한다. 실패하면 Project 등록을 진행하지 않는다. 다른 node 충돌, ambiguous origin, public repository에서 새 ID나 파일 편집으로 우회하지 않는다.
+이 명령이 checkout root/origin, GitHub repository, node ID를 검증한다. public repository는 기본 거부(`REPOSITORY_NOT_PRIVATE`)이며, operator가 명시적으로 승인한 경우에만 `--allow-public true`(정확한 리터럴)로 opt-in한다 — opt-in은 Record에 영속되어 이후 task start 재검증에도 적용되며, 재등록마다 다시 선언한다. 저장소가 여전히 public이면 플래그 없는 재등록은 `REPOSITORY_NOT_PRIVATE`로 실패하고 Record의 opt-in은 유지된다(public 상태에서는 opt-out 경로가 없다). private으로 되돌린 뒤 플래그 없이 재등록하면 opt-in이 소거되고 결과의 `allow_public`이 `false`가 된다. 추가 노출은 push되는 task 브랜치명과 formal Issue 내용뿐이며 Registry·GitHub Project는 여전히 private 필수다. 실패하면 Project 등록을 진행하지 않는다. 다른 node 충돌, ambiguous origin, opt-in 없는 public repository에서 새 ID나 파일 편집으로 우회하지 않으며, operator 명시 승인 없이 `--allow-public`을 붙이지 않는다.
 
 ### 2. Project 통합 제안
 

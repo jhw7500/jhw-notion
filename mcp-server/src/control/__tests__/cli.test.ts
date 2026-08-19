@@ -279,6 +279,45 @@ describe("runCli", () => {
     expect(result.stdout).not.toContain("/srv/source/control");
   });
 
+  it("accepts the public opt-in only as the exact literal true", async () => {
+    const dependencies = makeCliDependencies();
+    const accepted = await runCli([
+      "repository", "register", "--repo-id", REPO_ID, "--slug", "example/control",
+      "--repo-path", "/srv/source/control", "--allow-public", "true",
+    ], dependencies);
+    expect(accepted.exitCode).toBe(0);
+    expect(dependencies.source.registerRepository).toHaveBeenCalledWith({
+      repo_id: REPO_ID, slug: "example/control", repository_path: "/srv/source/control", allow_public: true,
+    });
+
+    const rejected = await runCli([
+      "repository", "register", "--repo-id", REPO_ID, "--slug", "example/control",
+      "--repo-path", "/srv/source/control", "--allow-public", "yes",
+    ], makeCliDependencies());
+    expect(rejected.exitCode).toBe(2);
+  });
+
+  it("exposes the persisted public opt-in state in the registration result", async () => {
+    const dependencies = makeCliDependencies();
+    vi.mocked(dependencies.source.registerRepository).mockResolvedValueOnce({
+      repository: { id: REPO_ID, github_node_id: "R_control", slug: "example/control", allow_public: true },
+      created: true,
+    });
+    const optIn = await runCli([
+      "repository", "register", "--repo-id", REPO_ID, "--slug", "example/control",
+      "--repo-path", "/srv/source/control", "--allow-public", "true",
+    ], dependencies);
+    expect(optIn.exitCode).toBe(0);
+    expect(JSON.parse(optIn.stdout).result).toMatchObject({ allow_public: true });
+
+    const revoked = await runCli([
+      "repository", "register", "--repo-id", REPO_ID, "--slug", "example/control",
+      "--repo-path", "/srv/source/control",
+    ], dependencies);
+    expect(revoked.exitCode).toBe(0);
+    expect(JSON.parse(revoked.stdout).result).toMatchObject({ allow_public: false });
+  });
+
   it("resumes an existing immutable Task only after source context validation", async () => {
     const dependencies = makeCliDependencies();
     const result = await runCli([

@@ -890,4 +890,65 @@ describe("Catalog Registry integrity and public input boundaries", () => {
     await expect(catalog.promoteTemporaryTask(temp.id, issueInput)).rejects.toMatchObject({ code: "TASK_COMPLETED" });
     expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
   });
+
+  it("persists the public opt-in on the record and drops it on re-register without the flag", async () => {
+    const { catalog } = await catalogFixture();
+
+    await catalog.registerRepository({ ...repositoryInput, allow_public: true });
+    await expect(catalog.getRepository("repo-wlan")).resolves.toMatchObject({ allow_public: true });
+
+    const second = await catalog.registerRepository(repositoryInput);
+    expect(second.created).toBe(false);
+    const cleared = await catalog.getRepository("repo-wlan");
+    expect(cleared.allow_public).toBeUndefined();
+  });
+
+  it("commits the Registry when re-registration only toggles the public opt-in", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository({ ...repositoryInput, allow_public: true });
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    const cleared = await catalog.registerRepository(repositoryInput);
+    expect(cleared.created).toBe(false);
+    const after = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    expect(after).not.toBe(before);
+
+    const idempotent = await catalog.registerRepository(repositoryInput);
+    expect(idempotent.created).toBe(false);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(after);
+  });
+
+  it("applies a rename and a public opt-in change as one Registry commit", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository({ ...repositoryInput, allow_public: true });
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    const combined = await catalog.registerRepository({ ...repositoryInput, slug: "jhw7500/wlan-renamed" });
+    expect(combined.created).toBe(false);
+    expect(combined.repository.slug).toBe("jhw7500/wlan-renamed");
+    expect(combined.repository.allow_public).toBeUndefined();
+
+    const record = await catalog.getRepository("repo-wlan");
+    expect(record.slug).toBe("jhw7500/wlan-renamed");
+    expect(record.allow_public).toBeUndefined();
+    const after = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    expect(after).not.toBe(before);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD~1")).trim()).toBe(before);
+  });
+
+  it("fails closed instead of toggling the opt-in when the record has no source index", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository({ ...repositoryInput, allow_public: true });
+    const sourcePath = `repositories/by-source/github/${sourceIndexKey(repositoryInput.github_node_id)}.yaml`;
+    await git(fixture.registryDir, "rm", "--quiet", "--", sourcePath);
+    await git(fixture.registryDir, "commit", "-m", `Remove ${sourcePath}`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerRepository(repositoryInput)).rejects.toMatchObject({
+      code: "REGISTRY_CORRUPT",
+      details: expect.objectContaining({ repo_id: "repo-wlan" }),
+    });
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+  });
 });

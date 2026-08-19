@@ -45,7 +45,7 @@ build server의 jhw-control CLI
 ```
 
 - Registry는 `jhw-notion` 워킹 트리 안의 디렉터리가 아니라 독립된 GitHub 저장소/checkout이다.
-- `repository register`가 exact checkout root/origin/private GitHub node identity를 검증한 뒤에만 Repository Record를 만든다. Project registration과 formal/temporary Task는 이 verified mapping을 요구하며 Registry file 손편집은 public bootstrap 경로가 아니다.
+- `repository register`가 exact checkout root/origin/GitHub node identity를 검증한 뒤에만 Repository Record를 만든다. private이 기본이며 public repository는 `--allow-public true` 명시 opt-in이 Record에 영속된 경우에만 등록과 task start 재검증을 통과한다(opt-in은 재등록마다 다시 선언한다 — public 상태의 무플래그 재등록은 `REPOSITORY_NOT_PRIVATE`로 실패하며 opt-in을 유지하고, 소거는 private 복귀 후 무플래그 재등록에서만 일어난다; Registry·GitHub Project는 여전히 private 필수). Project registration과 formal/temporary Task는 이 verified mapping을 요구하며 Registry file 손편집은 public bootstrap 경로가 아니다.
 - public surface는 `repository register`; `task start|promote|handoff|status|finish|recover|assert-owner`; `portfolio status|export`; `project register`; `preflight`다. `task start --task`는 같은 persistent Task의 새 Claim generation을 만들고 explicit resume에서만 bounded latest Handoff를 반환한다.
 - Claim은 source revision을 acquisition 때 고정한다. temporary lifecycle과 Claim create/release/history는 같은 Registry transaction이다. release 뒤 host cleanup은 authority와 분리되며 exact archived generation의 `recover --action cleanup`만 허용한다.
 - Registry Task/Claim/Handoff I/O는 descriptor-relative no-follow record store를 공유하며 symlink, non-directory ancestor, nonregular/multi-link leaf, traversal, path/content ID mismatch를 거부한다. Registry transaction은 host lock, clean/fast-forward check, push/refetch verification 전체를 감싼다.
