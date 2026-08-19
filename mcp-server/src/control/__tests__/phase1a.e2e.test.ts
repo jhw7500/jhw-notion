@@ -1446,10 +1446,9 @@ describe("Phase 1A deterministic adversarial gate", () => {
     } } } };
     const mutation = { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_existing" } } } };
     const interruptedRunner = new GateProjectRunner();
-    // The create path now confirms the record is absent across the visibility
+    // The create path confirms the record is absent across the visibility
     // window before taking the irreversible step.
     interruptedRunner.enqueue(
-      gateProjectPage(gatePreflightProjectItem()),
       gateProjectPage(gatePreflightProjectItem()),
       gateProjectPage(gatePreflightProjectItem()),
       draftMutation,

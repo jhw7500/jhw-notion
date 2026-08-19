@@ -24,20 +24,15 @@ const hint = {
   source_node_id: "DI_created",
 };
 
+const other = {
+  project_id: "prj-other",
+  item_id: "PVTI_other",
+  source_node_id: "DI_other",
+};
+
 describe("RegistrationHintStore", () => {
-  // "no entry" only means "this host created nothing" once the store exists.
-  // Before that it cannot speak for records that predate it.
-  it("reports an unwritten store as uninitialized rather than empty", async () => {
-    await expect(new RegistrationHintStore(await stateDir()).read("prj-example"))
-      .resolves.toEqual({ initialized: false });
-  });
-
-  it("separates a project it has never seen from a store it has never written", async () => {
-    const store = new RegistrationHintStore(await stateDir());
-
-    await store.record({ project_id: "prj-other" });
-
-    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true });
+  it("reports nothing for a state directory that has never been written", async () => {
+    await expect(new RegistrationHintStore(await stateDir()).read("prj-example")).resolves.toBeUndefined();
   });
 
   it("round-trips one hint", async () => {
@@ -45,31 +40,32 @@ describe("RegistrationHintStore", () => {
 
     await store.record(hint);
 
-    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true, hint });
+    await expect(store.read("prj-example")).resolves.toEqual(hint);
+    await expect(store.read("prj-missing")).resolves.toBeUndefined();
   });
 
-  it("keeps an intent that has no coordinates yet distinguishable from no intent", async () => {
+  // The entry outlives the registration that wrote it: what it answers is
+  // "where is this record", which stays true long after that run finished.
+  it("keeps an entry across later registrations of other projects", async () => {
     const store = new RegistrationHintStore(await stateDir());
 
-    await store.record({ project_id: "prj-example" });
+    await store.record(hint);
+    await store.record(other);
+
+    await expect(store.read("prj-example")).resolves.toEqual(hint);
+    await expect(store.read("prj-other")).resolves.toEqual(other);
+  });
+
+  it("replaces the coordinates recorded for a project it already tracks", async () => {
+    const store = new RegistrationHintStore(await stateDir());
+
+    await store.record(hint);
+    await store.record({ ...hint, item_id: "PVTI_recreated", source_node_id: "DI_recreated" });
 
     await expect(store.read("prj-example")).resolves.toEqual({
-      initialized: true,
-      hint: { project_id: "prj-example" },
-    });
-  });
-
-  it("upgrades an intent to coordinates without disturbing another project", async () => {
-    const store = new RegistrationHintStore(await stateDir());
-
-    await store.record({ project_id: "prj-other" });
-    await store.record({ project_id: "prj-example" });
-    await store.record(hint);
-
-    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true, hint });
-    await expect(store.read("prj-other")).resolves.toEqual({
-      initialized: true,
-      hint: { project_id: "prj-other" },
+      project_id: "prj-example",
+      item_id: "PVTI_recreated",
+      source_node_id: "DI_recreated",
     });
   });
 
@@ -95,8 +91,8 @@ describe("RegistrationHintStore", () => {
     expect((await readdir(directory)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 
-  // A hint is only ever a shortcut, so its reader has to be able to tell "no
-  // registration is in flight" from "this store cannot answer".
+  // Failing the read is what keeps a damaged file from being read as "no record
+  // was created here"; the caller then waits exactly as it would have without.
   it("fails the read instead of reporting absence when the state is unparseable", async () => {
     const directory = await stateDir();
     const store = new RegistrationHintStore(directory);
@@ -135,10 +131,12 @@ describe("RegistrationHintStore", () => {
       .rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
   });
 
-  it("rejects an unbounded coordinate rather than persisting it", async () => {
+  it("rejects an unbounded or incomplete coordinate rather than persisting it", async () => {
     const store = new RegistrationHintStore(await stateDir());
 
-    await expect(store.record({ project_id: "x".repeat(257) }))
+    await expect(store.record({ ...hint, project_id: "x".repeat(257) }))
+      .rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT" });
+    await expect(store.record({ project_id: "prj-example" } as never))
       .rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT" });
   });
 
@@ -147,7 +145,10 @@ describe("RegistrationHintStore", () => {
     const store = new RegistrationHintStore(directory);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const records = Object.fromEntries(
-      Array.from({ length: 256 }, (_unused, index) => [`prj-${index}`, { project_id: `prj-${index}` }]),
+      Array.from({ length: 256 }, (_unused, index) => [
+        `prj-${index}`,
+        { project_id: `prj-${index}`, item_id: `PVTI_${index}`, source_node_id: `DI_${index}` },
+      ]),
     );
     await writeFile(
       join(directory, "project-registrations.json"),
@@ -155,63 +156,11 @@ describe("RegistrationHintStore", () => {
       "utf8",
     );
 
-    // Refusing costs the next registration its absence window, never its record.
+    // Refusing costs a later retry its shortcut, never a registration.
     await expect(store.record(hint)).rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT_STATE" });
     // Re-recording a project already tracked stays within the bound.
-    await expect(store.record({ project_id: "prj-0", item_id: "PVTI_0" })).resolves.toBeUndefined();
-  });
-
-  // A settled registration keeps its entry: dropping it would make "no entry"
-  // mean both "never created" and "created and verified".
-  it("keeps a settled entry so a later registration can still resolve it", async () => {
-    const store = new RegistrationHintStore(await stateDir());
-
-    await store.record({ project_id: "prj-example" });
-    await store.record(hint);
-
-    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true, hint });
-  });
-
-  it("establishes the store from a seed, including an empty one", async () => {
-    const store = new RegistrationHintStore(await stateDir());
-
-    await store.seed([]);
-
-    // An empty seed still matters: it is what makes a later missing entry mean
-    // "not on the board when this store was established".
-    await expect(store.read("prj-example")).resolves.toEqual({ initialized: true });
-  });
-
-  it("seeds many projects in one publish and merges with what is already tracked", async () => {
-    const directory = await stateDir();
-    const store = new RegistrationHintStore(directory);
-    await store.record({ project_id: "prj-example" });
-
-    await store.seed([
-      { project_id: "prj-one", item_id: "PVTI_one", source_node_id: "DI_one" },
-      { project_id: "prj-two", item_id: "PVTI_two", source_node_id: "DI_two" },
-    ]);
-
-    await expect(store.read("prj-one")).resolves.toEqual({
-      initialized: true,
-      hint: { project_id: "prj-one", item_id: "PVTI_one", source_node_id: "DI_one" },
-    });
-    await expect(store.read("prj-example")).resolves.toEqual({
-      initialized: true,
-      hint: { project_id: "prj-example" },
-    });
-    expect(await readdir(directory)).toEqual(["project-registrations.json"]);
-  });
-
-  it("refuses a seed that would exceed the ceiling without publishing part of it", async () => {
-    const directory = await stateDir();
-    const store = new RegistrationHintStore(directory);
-
-    await expect(store.seed(
-      Array.from({ length: 257 }, (_unused, index) => ({ project_id: `prj-${index}` })),
-    )).rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT_STATE" });
-    // Nothing was established, so the next registration still pays its window.
-    await expect(store.read("prj-0")).resolves.toEqual({ initialized: false });
+    await expect(store.record({ project_id: "prj-0", item_id: "PVTI_0", source_node_id: "DI_0" }))
+      .resolves.toBeUndefined();
   });
 
   it("writes deterministic JSON that another reader can parse", async () => {

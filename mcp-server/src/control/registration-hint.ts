@@ -15,8 +15,8 @@ const coordinate = z.string().min(1).max(256).refine((value) => Buffer.byteLengt
 
 const RegistrationHintSchema = z.object({
   project_id: coordinate,
-  item_id: coordinate.optional(),
-  source_node_id: coordinate.optional(),
+  item_id: coordinate,
+  source_node_id: coordinate,
 }).strict();
 
 const RegistrationHintStateSchema = z.object({
@@ -24,42 +24,21 @@ const RegistrationHintStateSchema = z.object({
   records: z.record(coordinate, RegistrationHintSchema),
 }).strict();
 
-/**
- * What this host knows about one Project Record it created. Without coordinates
- * it means a run was about to create the DraftIssue; with them it names the
- * DraftIssue that run created, whether or not that run went on to finish.
- */
+/** Where one Project Record this host created can be read directly. */
 export type RegistrationHint = z.infer<typeof RegistrationHintSchema>;
 type RegistrationHintState = z.infer<typeof RegistrationHintStateSchema>;
 
-export interface RegistrationHintLookup {
-  /**
-   * False until this host has recorded anything. A missing entry only means "no
-   * record was created" once the store exists to have recorded one.
-   */
-  initialized: boolean;
-  hint?: RegistrationHint;
-}
-
 /**
- * Remembers every Project Record this host has created, so a later run can find
- * one the Project has not made visible yet. Every method may fail: the caller
- * treats this as a hint, never as authority.
+ * Remembers the DraftIssue a registration created, so a retry that runs while
+ * the Project has not made it visible yet can read it by ID instead of waiting
+ * for it to appear in a listing. Nothing here decides anything: a registration
+ * that cannot read or write this store behaves exactly as it did without one.
  */
 export interface RegistrationHintPort {
-  /** What this host knows about one Project ID. */
-  read(projectId: string): Promise<RegistrationHintLookup>;
-  /**
-   * Publishes one hint durably. Entries are never removed on success: a record
-   * that exists is exactly what a later registration needs to be told about.
-   */
+  /** The recorded coordinates for one Project ID, if this host has any. */
+  read(projectId: string): Promise<RegistrationHint | undefined>;
+  /** Records where a Project Record was created. */
   record(hint: RegistrationHint): Promise<void>;
-  /**
-   * Establishes the store from a complete read of the Project. Until that has
-   * happened a missing entry cannot mean "this host never created it", because
-   * every record older than the store predates everything it could record.
-   */
-  seed(hints: readonly RegistrationHint[]): Promise<void>;
 }
 
 export interface RegistrationHintStoreHooks {
@@ -94,15 +73,15 @@ function parseState(raw: unknown): RegistrationHintState {
 }
 
 /**
- * A durable, host-local record of every Project Record this host created. It
- * lives beside the pilot journal under the same private state directory, but
- * unlike the journal it is read on the control path, so it is published through
- * a temporary file and a rename rather than appended.
+ * A durable, host-local index of Project Records this host created. It lives
+ * beside the pilot journal under the same private state directory, but unlike
+ * the journal it is read on the control path, so it is published through a
+ * temporary file and a rename rather than appended.
  *
  * `record` is a read-modify-write over the whole file and is not atomic against
- * a concurrent one. Callers must already hold the host-global mutation lock —
- * every lifecycle command that reaches this store does — because a lost entry
- * is exactly what would let the next run skip its absence window.
+ * a concurrent one. Callers hold the host-global mutation lock — every
+ * lifecycle command that reaches this store does — so a lost entry would only
+ * cost a later registration its shortcut, never its correctness.
  */
 export class RegistrationHintStore implements RegistrationHintPort {
   constructor(
@@ -110,38 +89,20 @@ export class RegistrationHintStore implements RegistrationHintPort {
     private readonly hooks: RegistrationHintStoreHooks = {},
   ) {}
 
-  async read(projectId: string): Promise<RegistrationHintLookup> {
-    const state = await this.load();
-    if (!state) return { initialized: false };
-    const hint = state.records[projectId];
-    return hint === undefined ? { initialized: true } : { initialized: true, hint };
+  async read(projectId: string): Promise<RegistrationHint | undefined> {
+    return (await this.load())?.records[projectId];
   }
 
   async record(hint: RegistrationHint): Promise<void> {
-    await this.merge([hint]);
-  }
-
-  async seed(hints: readonly RegistrationHint[]): Promise<void> {
-    // Publishing even an empty seed matters: it is what makes a later missing
-    // entry mean "not on the board when this store was established".
-    await this.merge(hints);
-  }
-
-  private async merge(hints: readonly RegistrationHint[]): Promise<void> {
-    const entries: RegistrationHint[] = [];
-    for (const hint of hints) {
-      const parsed = RegistrationHintSchema.safeParse(hint);
-      if (!parsed.success) {
-        throw new ControlError("INVALID_REGISTRATION_HINT", "Registration hint is not a bounded coordinate set");
-      }
-      entries.push(parsed.data);
+    const parsed = RegistrationHintSchema.safeParse(hint);
+    if (!parsed.success) {
+      throw new ControlError("INVALID_REGISTRATION_HINT", "Registration hint is not a bounded coordinate set");
     }
     const state = await this.load();
-    const records = { ...state?.records };
-    for (const entry of entries) records[entry.project_id] = entry;
+    const records = { ...state?.records, [parsed.data.project_id]: parsed.data };
     // Entries are kept for the life of the record they name, so the bound is a
-    // ceiling on projects this host has registered or tried to, not on
-    // concurrent work. Refusing past it leaves the absence window in place.
+    // ceiling on projects this host has registered rather than on concurrent
+    // work. Refusing past it costs a later retry its shortcut and nothing else.
     if (Object.keys(records).length > MAX_TRACKED_PROJECTS) {
       throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state tracks too many projects");
     }
@@ -180,8 +141,8 @@ export class RegistrationHintStore implements RegistrationHintPort {
       handle = await open(temporary, "wx", 0o600);
       await handle.chmod(0o600);
       await handle.writeFile(serialized, "utf8");
-      // The hint only helps a run that starts after this one died, so it has to
-      // reach the disk before the create it describes, not merely the cache.
+      // The entry only helps a run that starts after this one died, so it has
+      // to reach the disk rather than merely the cache.
       await handle.sync();
       await handle.close();
       handle = undefined;

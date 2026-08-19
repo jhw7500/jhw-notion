@@ -31,11 +31,13 @@ const UPDATE_VERIFY_BACKOFF_MS = 250;
 // Registration waits far longer than an update, and its two waits are budgeted
 // differently because their cost and benefit are inverted. Reading back after a
 // write costs nothing when the write is already visible, so it gets the full
-// window. Confirming that no record exists only pays off when a previous run
-// created one, so it gets a short window — and, once a hint store says no
-// previous run ever reached the create step, no window at all.
+// window. Confirming that no record exists is paid by every registration that
+// creates, and its main case — a retry of a run that already created the
+// DraftIssue — is now answered exactly by the recorded coordinates, so one
+// attempt is left to cover what the record cannot: a run that died before it
+// could record anything.
 const REGISTER_VERIFY_ATTEMPTS = 4;
-const REGISTER_ABSENCE_ATTEMPTS = 3;
+const REGISTER_ABSENCE_ATTEMPTS = 2;
 const REGISTER_BACKOFF_MS = 2_000;
 const PREFLIGHT_DRAFT_TITLE = "[TRIAL] Project Control Preflight Fixture";
 const PREFLIGHT_DRAFT_BODY = "unchanged";
@@ -351,9 +353,8 @@ export interface GitHubProjectClientOptions {
   /** Test-only replacement for the bounded update read-back backoff. */
   sleep?: (milliseconds: number) => Promise<void>;
   /**
-   * Durable record of a registration that is about to create, or has created,
-   * its DraftIssue. Without one, registration keeps confirming absence by
-   * waiting, because it cannot tell a first attempt from a resumed one.
+   * Durable index of the Project Records this host created. Without one,
+   * registration resolves a lagging read by waiting alone.
    */
   registrationHints?: RegistrationHintPort;
 }
@@ -871,16 +872,15 @@ export class GitHubProjectClient {
     const initial = await this.initialPage();
     const structure = await this.structure(initial);
     const initialItems = await this.items(initial);
-    const knownRecords = this.recordItems(initialItems);
-    const matches = knownRecords.filter(({ body }) => body.id === input.data.project_id);
+    const matches = this.recordItems(initialItems).filter(({ body }) => body.id === input.data.project_id);
     if (matches.length > 1) throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple DraftIssues use the requested Project ID");
     let itemId: string;
     let sourceNodeId: string;
     let updates: RegistrationFieldUpdate[];
     // Creating is the only irreversible step here, so an empty read is resolved
-    // against the durable hint before it is taken, and confirmed by waiting
-    // only when the hint cannot rule out a run that already created the record.
-    const existing = matches[0] ?? await this.resolveAbsentRecord(input.data.project_id, structure, knownRecords);
+    // against the recorded coordinates first and then confirmed across the
+    // visibility window before it is taken.
+    const existing = matches[0] ?? await this.resolveAbsentRecord(input.data.project_id, structure);
     if (existing) {
       const match = existing;
       this.verifyRecord(match, input.data);
@@ -891,15 +891,16 @@ export class GitHubProjectClient {
       const created = await this.createDraft(structure, input.data);
       itemId = created.itemId;
       sourceNodeId = created.content.id;
-      // Coordinates turn the intent already on disk into an exact lookup, so a
-      // run interrupted during the field writes resumes without waiting.
-      await this.rememberHint({
-        project_id: input.data.project_id,
-        item_id: itemId,
-        source_node_id: sourceNodeId,
-      });
       updates = registrationFieldUpdates(input.data.fields);
     }
+    // Recording where the record is turns the next run's empty listing into an
+    // exact lookup. It is written for a reused record too, because a listing
+    // that showed it now is not one that will show it in a second.
+    await this.rememberHint({
+      project_id: input.data.project_id,
+      item_id: itemId,
+      source_node_id: sourceNodeId,
+    });
     for (const update of updates) {
       await this.updateField(structure, itemId, update.fieldName, update.kind, update.value);
     }
@@ -995,43 +996,20 @@ export class GitHubProjectClient {
   }
 
   /**
-   * Decides what an empty first read means. A recorded hint answers it exactly
-   * and immediately; only an unreadable, unwritable, or unresolved hint leaves
-   * the question open, and only then is it worth paying the absence window.
+   * Resolves an empty first read. Recorded coordinates answer it exactly and
+   * immediately, which is what a retry of an interrupted registration needs;
+   * anything else falls back to confirming absence by waiting.
    */
   private async resolveAbsentRecord(
     projectId: string,
     structure: ProjectStructure,
-    knownRecords: ReadonlyArray<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody }>,
   ): Promise<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody } | undefined> {
     const hint = await this.readHint(projectId);
-    if (hint.value?.item_id) {
-      const record = await this.recordFromHint(hint.value.item_id, projectId, structure);
+    if (hint) {
+      const record = await this.recordFromHint(hint.item_id, projectId, structure);
       if (record) return record;
     }
-    // An entry already on disk is never narrowed: coordinates that did not
-    // resolve this time are still the best thing a later run has to go on.
-    if (hint.value !== undefined) return this.awaitVisibleRecord(projectId);
-    // An empty store speaks only for what it has seen, so establish it from the
-    // complete read this registration already made. Otherwise every record that
-    // predates the store would read as one this host never created.
-    if (hint.known && !hint.initialized) {
-      await this.seedHints(knownRecords.map(({ node, content, body }) => ({
-        project_id: body.id,
-        item_id: node.id,
-        source_node_id: content.id,
-      })));
-    }
-    // The intent is claimed before the wait is decided, because skipping the
-    // wait is only sound while this run's own create is durably recorded.
-    const marked = await this.rememberHint({ project_id: projectId });
-    // Waiting only pays off when this host may already have created the record.
-    // Entries outlive the registrations that wrote them, so a store that is
-    // readable, writable, and already established says none did. The run that
-    // establishes it still waits, because a seed can only capture the records
-    // the Project had already made visible to it.
-    if (!marked || !hint.known || !hint.initialized) return this.awaitVisibleRecord(projectId);
-    return undefined;
+    return this.awaitVisibleRecord(projectId);
   }
 
   /**
@@ -1093,43 +1071,23 @@ export class GitHubProjectClient {
     };
   }
 
-  /**
-   * A store that cannot be read is reported as unknown rather than as empty, so
-   * an unavailable one costs the absence window instead of correctness.
-   */
-  private async readHint(
-    projectId: string,
-  ): Promise<{ known: boolean; initialized: boolean; value?: RegistrationHint }> {
-    const hints = this.options.registrationHints;
-    if (!hints) return { known: false, initialized: false };
+  /** A store that cannot be read simply has nothing to offer: the caller's
+   * fallback is the same wait it would have done without one. */
+  private async readHint(projectId: string): Promise<RegistrationHint | undefined> {
     try {
-      const lookup = await hints.read(projectId);
-      return { known: true, initialized: lookup.initialized, ...(lookup.hint ? { value: lookup.hint } : {}) };
+      return await this.options.registrationHints?.read(projectId);
     } catch {
-      return { known: false, initialized: false };
+      return undefined;
     }
   }
 
-  /** Establishes the store. A seed that fails leaves it unestablished, so the
-   * next registration pays the window again rather than trusting a partial view. */
-  private async seedHints(hints: readonly RegistrationHint[]): Promise<void> {
+  /** Publishes a hint, swallowing failure rather than raising it: the shortcut
+   * it buys is worth nothing next to the registration it must not refuse. */
+  private async rememberHint(hint: RegistrationHint): Promise<void> {
     try {
-      await this.options.registrationHints?.seed(hints);
+      await this.options.registrationHints?.record(hint);
     } catch {
       return;
-    }
-  }
-
-  /** Publishes a hint, reporting failure instead of raising it: the caller's
-   * fallback is to wait, and no registration is refused over a lost shortcut. */
-  private async rememberHint(hint: RegistrationHint): Promise<boolean> {
-    const hints = this.options.registrationHints;
-    if (!hints) return false;
-    try {
-      await hints.record(hint);
-      return true;
-    } catch {
-      return false;
     }
   }
 
