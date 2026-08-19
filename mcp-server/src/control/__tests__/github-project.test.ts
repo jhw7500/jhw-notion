@@ -697,6 +697,7 @@ describe("GitHubProjectClient", () => {
     await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); }, new FakeHints(recordedHint))
       .registerProject(registration))
       .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(hintLookups(runner)).toHaveLength(1);
     expect(pauses).toEqual([2000]);
   });
 
