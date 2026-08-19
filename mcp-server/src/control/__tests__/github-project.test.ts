@@ -243,11 +243,12 @@ describe("GitHubProjectClient", () => {
       const runner = new QueuedGhRunner();
       const record = registrationRecord("empty");
       record.content.id = coordinate;
-      runner.enqueue(projectPage({}), draftMutation(record));
+      runner.enqueue(projectPage({}), projectPage({}), projectPage({}), draftMutation(record));
       const github = new GitHubProjectClient({
         githubOwner: "owner", projectNumber: 7,
         preflightProjectItemId: "PVTI_preflight", runner, catalog: catalogFixture(),
         sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+        sleep: async () => undefined,
       });
 
       const error = await github.registerProject(registration).catch((cause) => cause);
@@ -417,9 +418,10 @@ describe("GitHubProjectClient", () => {
       const record = registrationRecord("empty");
       if (changed === "title") record.content.title = "Different";
       else record.content.body = JSON.stringify({ id: registration.project_id, objective: "Different", repositories: registration.repo_ids });
-      runner.enqueue(projectPage({}), draftMutation(record));
+      runner.enqueue(projectPage({}), projectPage({}), projectPage({}), draftMutation(record));
 
-      await expect(client(runner).registerProject(registration)).rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
+      await expect(client(runner, catalogFixture(), async () => undefined).registerProject(registration))
+        .rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
       expect(runner.calls.filter((call) => call.args.join(" ").includes("updateProjectV2ItemFieldValue"))).toHaveLength(0);
     }
   });
@@ -430,12 +432,106 @@ describe("GitHubProjectClient", () => {
     final.priority.name = "P1";
     final.priority.optionId = "priority-P1";
     runner.enqueue(
-      projectPage({}), draftMutation(),
+      projectPage({}), projectPage({}), projectPage({}), draftMutation(),
       fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [final] }),
+      projectPage({ records: [final] }),
+      projectPage({ records: [final] }),
       projectPage({ records: [final] }),
     );
 
-    await expect(client(runner).registerProject(registration)).rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
+    await expect(client(runner, catalogFixture(), async () => undefined).registerProject(registration))
+      .rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
+  });
+
+  it("reuses a record that appears during the bounded absence window instead of creating a second one", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    const complete = registrationRecord("complete");
+    runner.enqueue(
+      projectPage({}),
+      projectPage({ records: [complete] }),
+      projectPage({ records: [complete] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); })
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1", source_node_id: "DI_registration" });
+    expect(runner.calls.some((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toBe(false);
+    expect(mutations(runner)).toHaveLength(0);
+    expect(pauses).toEqual([2000]);
+  });
+
+  it("creates only after the record stays invisible for the whole absence window", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    runner.enqueue(
+      projectPage({}), projectPage({}), projectPage({}),
+      draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); })
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(runner.calls.filter((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toHaveLength(1);
+    // The absence window is deliberately shorter than the verification window.
+    expect(pauses).toEqual([2000, 4000]);
+  });
+
+  it("converges a delayed registration read-back instead of failing a settled write", async () => {
+    const runner = new QueuedGhRunner();
+    const pauses: number[] = [];
+    runner.enqueue(
+      projectPage({ records: [registrationRecord("empty")] }),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [registrationRecord("empty")] }),
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async (milliseconds) => { pauses.push(milliseconds); })
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1", source_node_id: "DI_registration" });
+    expect(pauses).toEqual([2000]);
+    expect(mutations(runner)).toHaveLength(5);
+  });
+
+  it("separates a registration that never settles from one another writer won", async () => {
+    const unsettled = new QueuedGhRunner();
+    const unsettledPauses: number[] = [];
+    const stale = registrationRecord("empty");
+    unsettled.enqueue(
+      projectPage({ records: [stale] }),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [stale] }),
+      projectPage({ records: [stale] }),
+      projectPage({ records: [stale] }),
+      projectPage({ records: [stale] }),
+    );
+
+    await expect(client(unsettled, catalogFixture(), async (milliseconds) => { unsettledPauses.push(milliseconds); })
+      .registerProject(registration))
+      .rejects.toMatchObject({ code: "PROJECT_REGISTRATION_UNSETTLED" });
+    expect(unsettledPauses).toEqual([2000, 4000, 8000]);
+    expect(unsettled.calls.some((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toBe(false);
+
+    // A record that settled on values nobody asked for is contention, not lag.
+    const contended = new QueuedGhRunner();
+    const other = registrationRecord("complete");
+    other.priority.name = "P1";
+    other.priority.optionId = "priority-P1";
+    contended.enqueue(
+      projectPage({ records: [registrationRecord("empty")] }),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [other] }),
+      projectPage({ records: [other] }),
+      projectPage({ records: [other] }),
+      projectPage({ records: [other] }),
+    );
+
+    await expect(client(contended, catalogFixture(), async () => undefined).registerProject(registration))
+      .rejects.toMatchObject({ code: "PROJECT_REGISTRATION_MISMATCH" });
   });
 
   it("rejects an invalid active Next Action before any Project call", async () => {

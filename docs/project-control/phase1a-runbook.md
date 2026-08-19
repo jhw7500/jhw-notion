@@ -164,6 +164,17 @@ jhw-control project register \
 
 Project Record는 개인 비공개 GitHub Project의 DraftIssue 한 건이다. DraftIssue 제목과 exact `{id, objective, repositories}` 본문, 같은 item의 다섯 운영 필드를 Project-only token으로 생성·검증한다. 부분 실패 시 **같은 승인 payload와 정확히 하나인 같은 DraftIssue만** 재사용한다. 중복 Project ID/source/item, 다른 title/body, field mismatch, Issue/null content는 corruption으로 중단한다. Registry Issue를 만들거나 Project Record와 결합하지 않는다.
 
+Project write는 이후 read에 **즉시 보이지 않는다**. 등록은 그래서 두 곳에서 기다리되, 두 대기의 예산이 다르다.
+
+- **부재 확인 (2·4초, 최대 6초)**: 레코드가 안 보여도 곧바로 만들지 않고 재조회한다. 직전 실행이 만든 DraftIssue가 아직 복제 중일 때 재시도가 **같은 Project ID로 두 번째 레코드를 만드는 것**이 실측된 정본 오염 경로였다. 이 대기는 신규 등록마다 무조건 지불되므로 짧게 잡았다.
+- **최종 검증 (2·4·8초, 최대 14초)**: 쓰기 뒤 확인이 아직 반영되지 않았으면 재조회한다. 이미 보이면 첫 읽기에서 끝나므로 정상 등록에는 비용이 0이다.
+
+두 창은 합성될 수 있다. 부재 확인을 다 쓰고 만든 레코드가 다시 늦게 보이면 **최악 20초**가 걸린다. 그 사이 호스트 전역 lock을 잡고 있으므로 다른 세션의 lifecycle 명령은 `LOCK_CONTENDED`(exit 75)로 즉시 실패한다 — 일괄 등록은 한가한 시간에 한다. **중간에 끊지 않는다.**
+
+실패 코드는 셋으로 갈린다. `PROJECT_REGISTRATION_UNSETTLED`는 쓴 값이 창 안에 정착하지 않은 것이므로 같은 승인 payload로 다시 실행한다 — 재시도는 기존 DraftIssue를 재사용한다. `PROJECT_REGISTRATION_MISMATCH`는 레코드가 **정착했는데 값이 다른** 것이므로 다시 실행하지 말고 Project 보드의 현재 상태를 먼저 확인한다(다른 writer나 수동 편집일 수 있고, 그대로 재실행하면 계속 실패한다). `DUPLICATE_PROJECT_RECORD`는 이미 중복이 생긴 상태이므로 자동 정리하지 않고 수동 해소 후 재실행한다.
+
+잔여 위험이 남는다. 지연이 창보다 길면 여전히 중복이 생길 수 있고, 호스트 전역 lock은 **한 호스트 안에서만** 직렬화하므로 다중 호스트 동시 등록은 이 보호 범위 밖이다.
+
 등록 뒤 다섯 운영 필드만 바뀌는 경우 — 진행 중 Task가 생겨 Status와 Next Action을 올리거나, Priority·Health·Last Reviewed를 조정하는 경우 — 에는 Project Record를 다시 등록하지 않고 update를 쓴다.
 
 ```bash

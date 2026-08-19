@@ -78,6 +78,10 @@ Project Record는 비공개 Project의 canonical DraftIssue다. Registry Issue�
 
 성공 시 `project_id`, `project_item_id`, `source_node_id`만 보고한다. partial failure 후에는 동일 approved payload와 정확히 하나인 같은 DraftIssue만 재사용한다. 다른 title/body/field/node를 자동 채택하거나 중복 item을 만들지 않는다.
 
+Project write는 read에 지연되어 반영되므로 등록은 두 번 기다린다 — 레코드 부재 확인(최대 6초)과 최종 검증(최대 14초)이며, 둘이 합성되면 **최악 20초**다. **그 시간이 걸리는 것은 정상**이므로 중간에 끊지 않는다. 그동안 호스트 전역 lock을 잡으므로 다른 세션의 lifecycle 명령이 `LOCK_CONTENDED`로 실패할 수 있다.
+
+실패 코드별 대응이 다르다. `PROJECT_REGISTRATION_UNSETTLED`는 아직 정착하지 않은 것이므로 같은 payload로 다시 실행한다(기존 DraftIssue 재사용). `PROJECT_REGISTRATION_MISMATCH`는 정착했는데 값이 다른 것이므로 **재실행하지 말고** Project 보드의 현재 상태를 먼저 확인한다. `DUPLICATE_PROJECT_RECORD`는 이미 중복이 생긴 상태이므로 수동 해소 후 재실행하며, 도구가 자동으로 지우지 않는다.
+
 exit `0`에 `journal_warning.code=JOURNAL_WRITE_FAILED`가 있어도 registration은 이미 성공했으므로 재시도하지 않고 measurement gap만 보고한다. nonzero에서는 stable code만 보고 secret/private path를 출력하지 않는다.
 
 ### 4. 등록된 Project의 운영 필드 갱신

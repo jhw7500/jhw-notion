@@ -66,6 +66,7 @@ function page(items: unknown[]) {
 class DraftRunner implements GitHubRunner {
   readonly calls: Array<{ args: string[]; credential: "project" | "repo" }> = [];
   private projectReads = 0;
+  private created = false;
 
   constructor(private readonly initiallyExisting: boolean, private readonly archived = false) {}
 
@@ -78,10 +79,14 @@ class DraftRunner implements GitHubRunner {
       this.projectReads += 1;
       const initialRecord = item("empty");
       initialRecord.isArchived = this.archived;
-      response = page(this.projectReads === 1
-        ? [preflightItem, ...(this.initiallyExisting ? [initialRecord] : [])]
-        : [preflightItem, item("complete")]);
+      // A record only becomes visible because it exists: either it was already
+      // there, or this run created it. Materialising it on the second read
+      // regardless would hide whether the create actually happened.
+      const present = this.initiallyExisting || this.created;
+      if (!present) response = page([preflightItem]);
+      else response = page([preflightItem, this.projectReads === 1 ? initialRecord : item("complete")]);
     } else if (joined.includes("addProjectV2DraftIssue")) {
+      this.created = true;
       response = {
         data: {
           addProjectV2DraftIssue: {
@@ -113,6 +118,9 @@ function client(runner: GitHubRunner) {
       getTask: vi.fn(async (id: string) => ({ id })),
     },
     now: () => new Date("2026-08-18T00:00:00Z"),
+    // The visibility window is exercised by its own tests; here it only needs
+    // to not spend real seconds.
+    sleep: async () => undefined,
   });
 }
 

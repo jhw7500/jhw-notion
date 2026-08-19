@@ -1446,13 +1446,19 @@ describe("Phase 1A deterministic adversarial gate", () => {
     } } } };
     const mutation = { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_existing" } } } };
     const interruptedRunner = new GateProjectRunner();
+    // The create path now confirms the record is absent across the visibility
+    // window before taking the irreversible step.
     interruptedRunner.enqueue(
-      gateProjectPage(gatePreflightProjectItem()), draftMutation,
+      gateProjectPage(gatePreflightProjectItem()),
+      gateProjectPage(gatePreflightProjectItem()),
+      gateProjectPage(gatePreflightProjectItem()),
+      draftMutation,
       mutation, mutation, new Error("injected third-field boundary"),
     );
     const interrupted = new GitHubProjectClient({
       githubOwner: "jhw7500", projectNumber: 7,
       preflightProjectItemId: "PVTI_trial", runner: interruptedRunner, catalog: graph.catalog,
+      sleep: async () => undefined,
     });
     await expect(interrupted.registerProject(input)).rejects.toThrow("injected third-field boundary");
     expect(interruptedRunner.calls.filter((call) => call.args.join(" ").includes("addProjectV2DraftIssue"))).toHaveLength(1);
@@ -1467,6 +1473,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const retry = new GitHubProjectClient({
       githubOwner: "jhw7500", projectNumber: 7,
       preflightProjectItemId: "PVTI_trial", runner: retryRunner, catalog: graph.catalog,
+      sleep: async () => undefined,
     });
     const dependencies = cliDependencies(graph, {
       portfolio: { ...cliDependencies(graph).portfolio, registerProject: retry.registerProject.bind(retry) },

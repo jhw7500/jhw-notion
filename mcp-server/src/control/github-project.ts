@@ -27,6 +27,14 @@ const MAX_PROJECT_PAGES = 10_000;
 // update confirms through a bounded backoff instead of a single immediate read.
 const UPDATE_VERIFY_ATTEMPTS = 4;
 const UPDATE_VERIFY_BACKOFF_MS = 250;
+// Registration waits far longer than an update, and its two waits are budgeted
+// differently because their cost and benefit are inverted. Reading back after a
+// write costs nothing when the write is already visible, so it gets the full
+// window. Confirming that no record exists is paid by every first registration
+// and only pays off when a previous run created one, so it gets a short window.
+const REGISTER_VERIFY_ATTEMPTS = 4;
+const REGISTER_ABSENCE_ATTEMPTS = 3;
+const REGISTER_BACKOFF_MS = 2_000;
 const PREFLIGHT_DRAFT_TITLE = "[TRIAL] Project Control Preflight Fixture";
 const PREFLIGHT_DRAFT_BODY = "unchanged";
 const REQUIRED_OPTIONS = {
@@ -806,8 +814,11 @@ export class GitHubProjectClient {
     let itemId: string;
     let sourceNodeId: string;
     let updates: RegistrationFieldUpdate[];
-    if (matches.length === 1) {
-      const match = matches[0] as { node: ItemNode; content: DraftIssue; body: ProjectRecordBody };
+    // Creating is the only irreversible step here, so an empty read is
+    // confirmed across the visibility window before it is taken.
+    const existing = matches[0] ?? await this.awaitVisibleRecord(input.data.project_id);
+    if (existing) {
+      const match = existing;
       this.verifyRecord(match, input.data);
       itemId = match.node.id;
       sourceNodeId = match.content.id;
@@ -912,25 +923,62 @@ export class GitHubProjectClient {
     }
   }
 
+  /**
+   * Re-reads until the Project ID becomes visible or the window closes. The
+   * caller has already looked once; this exists so a retry that runs while the
+   * previous run's DraftIssue is still replicating reuses it instead of
+   * creating a duplicate.
+   */
+  private async awaitVisibleRecord(
+    projectId: string,
+  ): Promise<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody } | undefined> {
+    for (let attempt = 1; attempt < REGISTER_ABSENCE_ATTEMPTS; attempt += 1) {
+      await this.sleep(REGISTER_BACKOFF_MS * 2 ** (attempt - 1));
+      const page = await this.initialPage();
+      const matches = this.recordItems(await this.items(page)).filter(({ body }) => body.id === projectId);
+      if (matches.length > 1) {
+        throw new ControlError("DUPLICATE_PROJECT_RECORD", "Multiple DraftIssues use the requested Project ID");
+      }
+      const match = matches[0];
+      if (match) return match;
+    }
+    return undefined;
+  }
+
   private async verifyRegisteredItem(
     itemId: string,
     sourceNodeId: string,
     expected: RegisterProjectInput,
     structure: ProjectStructure,
   ): Promise<void> {
-    const finalPage = await this.initialPage();
-    const matches = this.recordItems(await this.items(finalPage)).filter(({ content }) => content.id === sourceNodeId);
-    if (matches.length > 1) {
-      throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project Record DraftIssue is attached more than once after registration");
-    }
-    if (matches.length !== 1 || (matches[0] as { node: ItemNode }).node.id !== itemId) {
-      throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project item identity failed final verification");
-    }
-    const match = matches[0] as { node: ItemNode; content: DraftIssue; body: ProjectRecordBody };
-    this.verifyRecord(match, expected);
-    const actual = operatingFields(match.node, structure);
-    if (JSON.stringify(actual) !== JSON.stringify(expected.fields)) {
-      throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project fields failed final verification");
+    for (let attempt = 1; ; attempt += 1) {
+      const finalPage = await this.initialPage();
+      const matches = this.recordItems(await this.items(finalPage)).filter(({ content }) => content.id === sourceNodeId);
+      if (matches.length > 1) {
+        throw new ControlError("DUPLICATE_PROJECT_ITEM", "Project Record DraftIssue is attached more than once after registration");
+      }
+      const match = matches[0];
+      // An absent or half-applied record is what a lagging read looks like. A
+      // record that is visible under another item ID, or with different
+      // content, is corruption and never becomes correct by waiting.
+      if (match && match.node.id !== itemId) {
+        throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project item identity failed final verification");
+      }
+      let settled = false;
+      if (match) {
+        this.verifyRecord(match, expected);
+        const actual = settledOperatingFields(match.node, structure);
+        settled = actual !== undefined;
+        if (actual && JSON.stringify(actual) === JSON.stringify(expected.fields)) return;
+      }
+      if (attempt >= REGISTER_VERIFY_ATTEMPTS) {
+        // A record that never appeared or never settled is a read that lost the
+        // race; one that settled on other values means another writer won. The
+        // operator's next step differs, and only the code reaches them.
+        if (!settled) throw new ControlError("PROJECT_REGISTRATION_UNSETTLED", "Registered Project record did not settle within the bounded read-back");
+        throw new ControlError("PROJECT_REGISTRATION_MISMATCH", "Registered Project fields failed final verification");
+      }
+      await this.sleep(REGISTER_BACKOFF_MS * 2 ** (attempt - 1));
     }
   }
 
