@@ -6,13 +6,16 @@ on:
 
 jobs:
   gemini-review:
-    if: ${{ github.event.pull_request.head.repo.fork == false }}
+    if: ${{ github.event.pull_request.head.repo.fork == false && github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
-      contents: 'read'
-      pull-requests: 'write'
-      issues: 'write'
-      id-token: 'write'
-    uses: 'jhw7500/automation/.github/workflows/gemini-auto-review.yml@v1.33'
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/gemini-auto-review.yml@b40074e89fbe039e5e605b8d65a1f758298830d9
     with:
-      pr_number: '${{ github.event.pull_request.number }}'
-    secrets: 'inherit'
+      pr_number: ${{ github.event.pull_request.number }}
+      repo_write_auth: github_app
+      app_id: ${{ vars.APP_ID }}
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

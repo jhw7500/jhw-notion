@@ -1,30 +1,29 @@
-name: '🔀 Gemini Dispatch'
+name: Gemini Dispatch
 
 on:
   pull_request_review_comment:
-    types:
-      - 'created'
+    types: [created]
   pull_request:
-    types:
-      - 'opened'
+    types: [opened]
   issues:
-    types:
-      - 'opened'
-      - 'reopened'
+    types: [opened, reopened]
   issue_comment:
-    types:
-      - 'created'
+    types: [created]
 
 defaults:
   run:
-    shell: 'bash'
+    shell: bash
 
 jobs:
   dispatch:
-    uses: 'jhw7500/automation/.github/workflows/gemini-dispatch.yml@v1.33'
     permissions:
-      contents: 'read'
-      id-token: 'write'
-      issues: 'write'
-      pull-requests: 'write'
-    secrets: inherit
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/gemini-dispatch.yml@b40074e89fbe039e5e605b8d65a1f758298830d9
+    with:
+      repo_write_auth: github_app
+      app_id: ${{ vars.APP_ID }}
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
