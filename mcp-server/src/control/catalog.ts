@@ -58,29 +58,14 @@ const RegisterTemporaryTaskInputSchema = z.object({
   expected_scope: z.array(z.string().min(1)).min(1),
 }).strict();
 
-export interface RegisterRepositoryInput {
-  repo_id: string;
-  github_node_id: string;
-  slug: string;
-}
-
-export interface RegisterFormalTaskInput {
-  project_id: string;
-  repo_id: string;
-  issue_node_id: string;
-  issue_revision: string;
-  issue_url: string;
-  alias: string;
-}
-
-export interface RegisterTemporaryTaskInput {
-  project_id: string;
-  repo_id: string;
-  alias: string;
-  goal: string;
-  done_conditions: string[];
-  expected_scope: string[];
-}
+// Derived from the schemas that actually validate these inputs. A hand-written
+// restatement drifted once already: the public opt-in reached the schema and
+// the record but not the type, so a caller could not name the field the command
+// accepts. These name what a caller may supply, so they follow the schema input
+// rather than its parsed output.
+export type RegisterRepositoryInput = z.input<typeof RegisterRepositoryInputSchema>;
+export type RegisterFormalTaskInput = z.input<typeof RegisterFormalTaskInputSchema>;
+export type RegisterTemporaryTaskInput = z.input<typeof RegisterTemporaryTaskInputSchema>;
 
 export interface RepositoryRegistration {
   repository: RepositoryRecord;

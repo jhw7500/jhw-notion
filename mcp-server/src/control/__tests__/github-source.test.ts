@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { GitHubSourceService } from "../github-source.js";
+import type { RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const checkout = "/fixture/private-source/wlan";
-const repository = { id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" };
+const repository: RepositoryRecord = { id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" };
 const formal = {
   id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab",
   kind: "formal" as const,

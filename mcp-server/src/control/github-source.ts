@@ -6,6 +6,7 @@ import type {
   Catalog,
   FormalTaskRegistration,
   RegisterFormalTaskInput,
+  RegisterRepositoryInput,
   RegisterTemporaryTaskInput,
   RepositoryRegistration,
 } from "./catalog.js";
@@ -45,7 +46,7 @@ export interface ProjectMembershipPort {
 }
 
 export interface SourceCatalogPort {
-  registerRepository(input: { repo_id: string; github_node_id: string; slug: string; allow_public?: true }): Promise<RepositoryRegistration>;
+  registerRepository(input: RegisterRepositoryInput): Promise<RepositoryRegistration>;
   getRepository(repoId: string): Promise<RepositoryRecord>;
   getTask(taskId: string): Promise<TaskRecord>;
   getTaskSourceRevision(taskId: string): Promise<string>;
@@ -138,7 +139,7 @@ export class GitHubSourceService {
     this.sensitiveData = options.sensitiveData ?? createSensitiveDataPolicy();
   }
 
-  async registerRepository(input: { repo_id: string; slug: string; repository_path: string; allow_public?: true }): Promise<RepositoryRegistration> {
+  async registerRepository(input: Pick<RegisterRepositoryInput, "repo_id" | "slug" | "allow_public"> & { repository_path: string }): Promise<RepositoryRegistration> {
     if (!repoIdPattern.test(input.repo_id) || !slugPattern.test(input.slug)) {
       throw new ControlError("INVALID_REPOSITORY", "Repository registration coordinates are invalid");
     }
