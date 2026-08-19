@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { ControlError } from "./errors.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
+import type { RegistrationHint, RegistrationHintPort } from "./registration-hint.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   ProjectOperationalFieldsSchema,
@@ -30,8 +31,9 @@ const UPDATE_VERIFY_BACKOFF_MS = 250;
 // Registration waits far longer than an update, and its two waits are budgeted
 // differently because their cost and benefit are inverted. Reading back after a
 // write costs nothing when the write is already visible, so it gets the full
-// window. Confirming that no record exists is paid by every first registration
-// and only pays off when a previous run created one, so it gets a short window.
+// window. Confirming that no record exists only pays off when a previous run
+// created one, so it gets a short window — and, once a hint store says no
+// previous run ever reached the create step, no window at all.
 const REGISTER_VERIFY_ATTEMPTS = 4;
 const REGISTER_ABSENCE_ATTEMPTS = 3;
 const REGISTER_BACKOFF_MS = 2_000;
@@ -172,6 +174,44 @@ const SET_DATE_MUTATION = `mutation SetDate($projectId: ID!, $itemId: ID!, $fiel
 const CLEAR_FIELD_MUTATION = `mutation ClearField($projectId: ID!, $itemId: ID!, $fieldId: ID!) {
   clearProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId }) { projectV2Item { id } }
 }`;
+// Resolving a hint reads exactly the item it names. The list query would answer
+// the same question, but it paginates the whole Project and lags behind a fresh
+// write for longer, which is the delay this lookup exists to avoid.
+const HINTED_ITEM_QUERY = `query HintedProjectRecord($itemId: ID!) {
+  node(id: $itemId) {
+    __typename
+    ... on ProjectV2Item {
+      id
+      isArchived
+      type
+      project { id }
+      content {
+        __typename
+        ... on DraftIssue { id title body }
+      }
+      status: fieldValueByName(name: "Status") {
+        __typename
+        ... on ProjectV2ItemFieldSingleSelectValue { optionId name }
+      }
+      priority: fieldValueByName(name: "Priority") {
+        __typename
+        ... on ProjectV2ItemFieldSingleSelectValue { optionId name }
+      }
+      health: fieldValueByName(name: "Health") {
+        __typename
+        ... on ProjectV2ItemFieldSingleSelectValue { optionId name }
+      }
+      nextAction: fieldValueByName(name: "Next Action") {
+        __typename
+        ... on ProjectV2ItemFieldTextValue { text }
+      }
+      lastReviewed: fieldValueByName(name: "Last Reviewed") {
+        __typename
+        ... on ProjectV2ItemFieldDateValue { date }
+      }
+    }
+  }
+}`;
 const PREFLIGHT_ITEM_QUERY = `query PreflightItem($itemId: ID!) {
   node(id: $itemId) {
     __typename
@@ -259,6 +299,22 @@ const MutationUpdateSchema = z.object({
 const MutationClearSchema = z.object({
   data: z.object({ clearProjectV2ItemFieldValue: z.object({ projectV2Item: z.object({ id: apiId }).strict() }).strict() }).strict(),
 }).passthrough();
+const HintedItemSchema = z.object({
+  __typename: z.literal("ProjectV2Item"),
+  id: apiId,
+  isArchived: z.boolean(),
+  type: apiName,
+  project: z.object({ id: apiId }).strict(),
+  content: z.unknown().nullable(),
+  status: z.unknown().nullable(),
+  priority: z.unknown().nullable(),
+  health: z.unknown().nullable(),
+  nextAction: z.unknown().nullable(),
+  lastReviewed: z.unknown().nullable(),
+}).strict();
+const HintedItemResponseSchema = z.object({
+  data: z.object({ node: HintedItemSchema.nullable() }).strict(),
+}).passthrough();
 const PreflightItemSchema = z.object({
   data: z.object({
     node: z.object({
@@ -294,6 +350,12 @@ export interface GitHubProjectClientOptions {
   sensitiveData?: SensitiveDataPolicy;
   /** Test-only replacement for the bounded update read-back backoff. */
   sleep?: (milliseconds: number) => Promise<void>;
+  /**
+   * Durable record of a registration that is about to create, or has created,
+   * its DraftIssue. Without one, registration keeps confirming absence by
+   * waiting, because it cannot tell a first attempt from a resumed one.
+   */
+  registrationHints?: RegistrationHintPort;
 }
 
 interface ProjectStructure {
@@ -814,9 +876,10 @@ export class GitHubProjectClient {
     let itemId: string;
     let sourceNodeId: string;
     let updates: RegistrationFieldUpdate[];
-    // Creating is the only irreversible step here, so an empty read is
-    // confirmed across the visibility window before it is taken.
-    const existing = matches[0] ?? await this.awaitVisibleRecord(input.data.project_id);
+    // Creating is the only irreversible step here, so an empty read is resolved
+    // against the durable hint before it is taken, and confirmed by waiting
+    // only when the hint cannot rule out a run that already created the record.
+    const existing = matches[0] ?? await this.resolveAbsentRecord(input.data.project_id, structure);
     if (existing) {
       const match = existing;
       this.verifyRecord(match, input.data);
@@ -827,12 +890,22 @@ export class GitHubProjectClient {
       const created = await this.createDraft(structure, input.data);
       itemId = created.itemId;
       sourceNodeId = created.content.id;
+      // Coordinates turn the intent already on disk into an exact lookup, so a
+      // run interrupted during the field writes resumes without waiting.
+      await this.rememberHint({
+        project_id: input.data.project_id,
+        item_id: itemId,
+        source_node_id: sourceNodeId,
+      });
       updates = registrationFieldUpdates(input.data.fields);
     }
     for (const update of updates) {
       await this.updateField(structure, itemId, update.fieldName, update.kind, update.value);
     }
     await this.verifyRegisteredItem(itemId, sourceNodeId, input.data, structure);
+    // Nothing is left to resume once the record is verified. A clear that fails
+    // is safe: the next registration resolves the stale hint and reuses it.
+    await this.forgetHint(input.data.project_id);
 
     const link = ProjectRecordLinkSchema.safeParse({
       project_id: input.data.project_id,
@@ -920,6 +993,126 @@ export class GitHubProjectClient {
         throw new ControlError("PROJECT_UPDATE_MISMATCH", "Updated Project fields failed final verification");
       }
       await this.sleep(UPDATE_VERIFY_BACKOFF_MS * 2 ** (attempt - 1));
+    }
+  }
+
+  /**
+   * Decides what an empty first read means. A recorded hint answers it exactly
+   * and immediately; only an unreadable, unwritable, or unresolved hint leaves
+   * the question open, and only then is it worth paying the absence window.
+   */
+  private async resolveAbsentRecord(
+    projectId: string,
+    structure: ProjectStructure,
+  ): Promise<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody } | undefined> {
+    const hint = await this.readHint(projectId);
+    if (hint.value?.item_id) {
+      const record = await this.recordFromHint(hint.value.item_id, projectId, structure);
+      if (record) return record;
+    }
+    // An intent already on disk is never narrowed: coordinates that did not
+    // resolve this time are still the best thing a later run has to go on.
+    if (hint.value !== undefined) return this.awaitVisibleRecord(projectId);
+    // The intent is claimed before the wait is decided, because skipping the
+    // wait is only sound while this run's own create is durably recorded.
+    const marked = await this.rememberHint({ project_id: projectId });
+    // Waiting only pays off when some earlier run may already have created the
+    // record. A hint store that is readable, writable, and empty proves none did.
+    if (!marked || !hint.known) return this.awaitVisibleRecord(projectId);
+    return undefined;
+  }
+
+  /**
+   * Reads the exact item a hint names. The hint is a shortcut, never authority:
+   * anything unresolvable, foreign, or unparseable falls back to the ordinary
+   * path rather than deciding anything on its own.
+   */
+  private async recordFromHint(
+    itemId: string,
+    projectId: string,
+    structure: ProjectStructure,
+  ): Promise<{ node: ItemNode; content: DraftIssue; body: ProjectRecordBody } | undefined> {
+    // The configured fixture is never a Project Record, so a hint naming it is
+    // corrupt rather than resumable.
+    if (itemId === this.options.preflightProjectItemId) return undefined;
+    let raw: unknown;
+    try {
+      raw = JSON.parse((await this.options.runner.runGh(
+        graphqlArgs(HINTED_ITEM_QUERY, [["raw", `itemId=${itemId}`]]),
+        "project",
+      )).stdout);
+    } catch {
+      return undefined;
+    }
+    if (typeof raw === "object" && raw !== null && "errors" in raw) return undefined;
+    const response = HintedItemResponseSchema.safeParse(raw);
+    if (!response.success) return undefined;
+    const node = response.data.data.node;
+    if (!node) return undefined;
+    // The content gates still apply in full: a hint may select which item to
+    // look at, but never what counts as a usable record.
+    this.assertContentSafe(node);
+    if (node.project.id !== structure.projectId) return undefined;
+    const content = draftIssue(node.content);
+    if (node.type !== "DRAFT_ISSUE" || !content) return undefined;
+    let body: ProjectRecordBody;
+    try {
+      body = projectBody(content.body);
+    } catch {
+      return undefined;
+    }
+    if (body.id !== projectId) return undefined;
+    return {
+      node: {
+        id: node.id,
+        isArchived: node.isArchived,
+        type: node.type,
+        content: node.content,
+        status: node.status,
+        priority: node.priority,
+        health: node.health,
+        nextAction: node.nextAction,
+        lastReviewed: node.lastReviewed,
+      },
+      content,
+      body,
+    };
+  }
+
+  /**
+   * A hint that cannot be read is reported as unknown rather than as absent, so
+   * an unavailable store costs the absence window instead of correctness.
+   */
+  private async readHint(projectId: string): Promise<{ known: boolean; value?: RegistrationHint }> {
+    const hints = this.options.registrationHints;
+    if (!hints) return { known: false };
+    try {
+      const value = await hints.read(projectId);
+      return value === undefined ? { known: true } : { known: true, value };
+    } catch {
+      return { known: false };
+    }
+  }
+
+  /** Publishes a hint, reporting failure instead of raising it: the caller's
+   * fallback is to wait, and no registration is refused over a lost shortcut. */
+  private async rememberHint(hint: RegistrationHint): Promise<boolean> {
+    const hints = this.options.registrationHints;
+    if (!hints) return false;
+    try {
+      await hints.record(hint);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Drops a settled hint. A stale one only costs the next run one lookup. */
+  private async forgetHint(projectId: string): Promise<void> {
+    try {
+      await this.options.registrationHints?.clear(projectId);
+    } catch {
+      return;
     }
   }
 

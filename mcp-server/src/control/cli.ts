@@ -16,6 +16,7 @@ import { PilotJournal, type JournalPort } from "./journal.js";
 import { MutationLock, ProcessRunner, type MutationLockPort } from "./process.js";
 import { PortfolioService } from "./portfolio.js";
 import { PreflightService } from "./preflight.js";
+import { RegistrationHintStore } from "./registration-hint.js";
 import { RegistryGit } from "./registry-git.js";
 import { createSensitiveDataPolicy } from "./sensitive-data.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
@@ -127,6 +128,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     runner,
     catalog,
     sensitiveData,
+    registrationHints: new RegistrationHintStore(config.stateDir),
   });
   const source = new GitHubSourceService({ runner, catalog, projects: githubProject, sensitiveData });
   const records = new RegistryRecordStore(config.registryDir, registry, sensitiveData);
