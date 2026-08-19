@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
+import { ControlError } from "../errors.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
@@ -123,10 +124,10 @@ async function replaceActiveWithExternalSymlink(
 
 describe("ClaimService", () => {
   it.each([
-    [{ status: "completed" }, "completed release without an outcome"],
-    [{ status: "handoff" }, "Handoff release without a pointer"],
-    [{ status: "abandoned", handoff_path: `handoffs/tsk-0198aabb-ccdd-7eef-8abc-0123456789ab/clm-0198aabb-ccdd-7eef-8abc-0123456789ab.md` }, "non-Handoff release with a pointer"],
-  ])("rejects an incoherent %s before mutating Registry authority", async (fields) => {
+    ["completed release without an outcome", { status: "completed" }],
+    ["Handoff release without a pointer", { status: "handoff" }],
+    ["non-Handoff release with a pointer", { status: "abandoned", handoff_path: `handoffs/tsk-0198aabb-ccdd-7eef-8abc-0123456789ab/clm-0198aabb-ccdd-7eef-8abc-0123456789ab.md` }],
+  ])("rejects an incoherent %s before mutating Registry authority", async (_description, fields) => {
     const { claims, fixture, task } = await claimsFixture();
     const active = await claims.claimTask(claimInput(task.id));
     const before = await git(fixture.registryDir, "rev-parse", "HEAD");

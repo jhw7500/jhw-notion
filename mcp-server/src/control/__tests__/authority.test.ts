@@ -25,12 +25,10 @@ async function temporaryCache(): Promise<{ root: string; cachePath: string }> {
 }
 
 function authority(authority_epoch: number, mode: "legacy" | "registry"): AuthorityRecord {
-  return {
-    authority_epoch,
-    mode,
-    cutover_at: mode === "registry" ? "2026-08-20T00:00:00Z" : null,
-    minimum_tool_version: "1.0.0",
-  };
+  const base = { authority_epoch, minimum_tool_version: "1.0.0" };
+  return mode === "registry"
+    ? { ...base, mode, cutover_at: "2026-08-20T00:00:00Z" }
+    : { ...base, mode, cutover_at: null };
 }
 
 function namespaceChain(stateDir: string): string[] {

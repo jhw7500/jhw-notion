@@ -11,5 +11,5 @@
     "declaration": true
   },
   "include": ["src/**/*"],
-  "exclude": ["src/**/*.test.ts", "src/__tests__/**", "src/tools/__tests__/**"]
+  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"]
 }

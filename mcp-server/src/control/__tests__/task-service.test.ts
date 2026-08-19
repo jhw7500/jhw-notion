@@ -50,37 +50,7 @@ afterEach(async () => {
   await Promise.all(localPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-async function taskFixture(sensitiveData?: SensitiveDataPolicy): Promise<{
-  tasks: TaskService;
-  claims: {
-    claimTask: ReturnType<typeof vi.fn>;
-    assertOwner: ReturnType<typeof vi.fn>;
-    finishClaim: ReturnType<typeof vi.fn>;
-    recoverClaim: ReturnType<typeof vi.fn>;
-    getActive: ReturnType<typeof vi.fn>;
-    getClaimHistory: ReturnType<typeof vi.fn>;
-    latestClaimHistory: ReturnType<typeof vi.fn>;
-    latestHandoffHistory: ReturnType<typeof vi.fn>;
-  };
-  worktrees: {
-    createOrReuse: ReturnType<typeof vi.fn>;
-    assertStartReady: ReturnType<typeof vi.fn>;
-    cleanupReleased: ReturnType<typeof vi.fn>;
-    inspect: ReturnType<typeof vi.fn>;
-    removeIfSafe: ReturnType<typeof vi.fn>;
-    assertTakeoverEligible: ReturnType<typeof vi.fn>;
-    rebindTakeover: ReturnType<typeof vi.fn>;
-  };
-  registry: {
-    transact: ReturnType<typeof vi.fn>;
-    assertHeadRegularFile: ReturnType<typeof vi.fn>;
-    readHeadRegularBlob: ReturnType<typeof vi.fn>;
-    listHeadDirectoryEntries: ReturnType<typeof vi.fn>;
-    readHeadRegularFile: ReturnType<typeof vi.fn>;
-  };
-  worktreePath: string;
-  fixture: RegistryFixture;
-}> {
+async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
   const fixture = await makeRegistryFixture();
   fixtures.push(fixture);
   const worktreePath = await mkdtemp(join(tmpdir(), "jhw-task-worktree-"));
@@ -601,6 +571,7 @@ describe("TaskService", () => {
         }
         return worktrees.removeIfSafe(...args);
       },
+      assertForceEndEligible: worktrees.assertForceEndEligible.bind(worktrees),
       assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
       rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
       cleanupReleased: worktrees.cleanupReleased.bind(worktrees),
@@ -1092,6 +1063,7 @@ describe("TaskService", () => {
         return reorderInspection ? { ...current, dirty_files: [...current.dirty_files].reverse() } : current;
       },
       removeIfSafe: worktrees.removeIfSafe.bind(worktrees),
+      assertForceEndEligible: worktrees.assertForceEndEligible.bind(worktrees),
       assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
       rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
       cleanupReleased: worktrees.cleanupReleased.bind(worktrees),
@@ -1489,6 +1461,7 @@ describe("TaskService", () => {
       },
       inspect: vi.fn(),
       removeIfSafe: vi.fn(),
+      assertForceEndEligible: vi.fn(),
       assertTakeoverEligible: vi.fn(),
       rebindTakeover: vi.fn(),
       cleanupReleased: vi.fn(),

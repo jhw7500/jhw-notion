@@ -104,7 +104,9 @@ type Overrides = {
   catalog?: Record<string, unknown>;
   portfolio?: Record<string, unknown>;
   preflight?: Record<string, unknown>;
-  mutationLock?: { run: ReturnType<typeof vi.fn> };
+  // vitest erases the generic on `run`, so a behaviourally correct fake cannot
+  // satisfy MutationLockPort structurally. Accept either and bridge once below.
+  mutationLock?: CliDependencies['mutationLock'] | { run: ReturnType<typeof vi.fn> };
   journal?: { append: ReturnType<typeof vi.fn> };
 };
 
@@ -192,9 +194,9 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     }),
     ...overrides.preflight,
   };
-  const mutationLock = overrides.mutationLock ?? {
+  const mutationLock = (overrides.mutationLock ?? {
     run: vi.fn(async <T>(callback: () => Promise<T>) => callback()),
-  };
+  }) as CliDependencies['mutationLock'];
 
   return {
     stateDir: overrides.stateDir ?? join(tmpdir(), "jhw-control-cli-state"),
@@ -888,11 +890,13 @@ describe("runCli", () => {
     expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
   });
 
+  // Each argument list is paired with a label so vitest passes the list as one
+  // value instead of spreading it, and so a failure names the case.
   it.each([
-    registerArgs().filter((_, index) => index < 4 || index > 5),
-    [...registerArgs(), "--base-sha", "a".repeat(40)],
-    [...registerArgs().slice(0, -2), "2026-02-30"],
-  ])("rejects incomplete, superseded, or invalid registration inputs before the port", async (args) => {
+    ["a missing required flag", registerArgs().filter((_, index) => index < 4 || index > 5)],
+    ["an unknown flag", [...registerArgs(), "--base-sha", "a".repeat(40)]],
+    ["an invalid calendar date", [...registerArgs().slice(0, -1), "2026-02-30"]],
+  ])("rejects registration input with %s before the port", async (_label, args) => {
     const dependencies = makeCliDependencies();
     const result = await runCli(args, dependencies);
 
