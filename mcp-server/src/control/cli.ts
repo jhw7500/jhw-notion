@@ -702,6 +702,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         status: finished.history.status,
         released_at: finished.history.released_at,
         worktree_removed: finished.worktree_removed,
+        ...(finished.cleanup_error ? { cleanup_error: finished.cleanup_error } : {}),
         ...(finished.history.handoff_pointer ? { handoff_pointer: finished.history.handoff_pointer } : {}),
       }),
     };

@@ -581,8 +581,8 @@ export class WorktreeManager {
         dirty_files: inspection.dirty_files,
       });
     }
-    if (inspection.ahead > 0) {
-      throw new ControlError("WORKTREE_UNPUSHED", "Refusing to remove a worktree with unpushed commits", {
+    if (inspection.ahead > 0 && !await this.isIntegrated(inspection.repository_path, inspection.head_sha)) {
+      throw new ControlError("WORKTREE_UNPUSHED", "Refusing to remove a worktree with unintegrated commits", {
         worktree_ref: inspection.worktree_ref,
         ahead: inspection.ahead,
       });
@@ -716,8 +716,8 @@ export class WorktreeManager {
         dirty_files: current.dirty_files,
       });
     }
-    if (current.ahead > 0) {
-      throw new ControlError("WORKTREE_UNPUSHED", "Refusing to remove a worktree with newly unpushed commits", {
+    if (current.ahead > 0 && !await this.isIntegrated(current.repository_path, current.head_sha)) {
+      throw new ControlError("WORKTREE_UNPUSHED", "Refusing to remove a worktree with newly unintegrated commits", {
         worktree_ref: current.worktree_ref,
         ahead: current.ahead,
       });
@@ -1155,6 +1155,27 @@ export class WorktreeManager {
     const path = join(root, "worktrees.json");
     if (!isWithin(root, path)) throw new ControlError("UNSAFE_STATE_PATH", "Worktree state path escapes state directory", { root, path });
     return path;
+  }
+
+  /**
+   * True when the source checkout already reaches this commit. The recorded
+   * base only answers "did this branch commit at all", which stays true forever
+   * once a Task has done its job, so it cannot decide whether removing the
+   * worktree would lose work. Reachability from the checkout can.
+   */
+  private async isIntegrated(repositoryPath: string, headSha: string): Promise<boolean> {
+    if (!canonicalGitObjectId.test(headSha)) {
+      throw new ControlError("INVALID_GIT_STATE", "Worktree HEAD is not a canonical object ID");
+    }
+    // Only an attached branch is an integration point. A detached HEAD is a
+    // transient inspection state, and one parked on the Task tip would report
+    // the branch as integrated when nothing has merged it.
+    const checkedOut = (await this.git(["-C", repositoryPath, "rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
+    if (!checkedOut || checkedOut === "HEAD") return false;
+    const counted = (await this.git(["-C", repositoryPath, "rev-list", "--count", `HEAD..${headSha}`])).stdout.trim();
+    // A safety predicate must never read absent output as permission.
+    if (!counted) throw new ControlError("INVALID_GIT_STATE", "Source checkout returned no integration count");
+    return parseCount(counted, "INVALID_GIT_STATE") === 0;
   }
 
   private async git(args: string[]): Promise<ProcessResult> {

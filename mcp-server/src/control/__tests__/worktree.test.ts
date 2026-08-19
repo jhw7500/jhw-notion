@@ -794,6 +794,106 @@ describe("WorktreeManager", () => {
     await expect(stat(created.path)).resolves.toBeDefined();
   });
 
+  it("removes a worktree once the source checkout has integrated its commits", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await writeFile(join(created.path, "committed.txt"), "commit\n", "utf8");
+    await git(created.path, "add", "committed.txt");
+    await git(created.path, "commit", "-m", "Task change");
+
+    // Unintegrated commits must still be refused.
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_UNPUSHED" });
+
+    await git(repoDir, "merge", "--ff-only", active.branch);
+
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true, lifecycle: "removed" });
+  });
+
+  it("refuses removal when the source checkout is detached instead of on a branch", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await writeFile(join(created.path, "committed.txt"), "commit\n", "utf8");
+    await git(created.path, "add", "committed.txt");
+    await git(created.path, "commit", "-m", "Task change");
+    await git(repoDir, "merge", "--ff-only", active.branch);
+
+    // Git allows detaching onto a branch another worktree holds, so parking the
+    // checkout on the Task tip must not be read as integration.
+    await git(repoDir, "checkout", "--detach", active.branch);
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_UNPUSHED" });
+
+    await git(repoDir, "checkout", "main");
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true });
+  });
+
+  it("accepts integration through a merge commit and keeps the Task branch restorable", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await writeFile(join(created.path, "committed.txt"), "commit\n", "utf8");
+    await git(created.path, "add", "committed.txt");
+    await git(created.path, "commit", "-m", "Task change");
+    const taskTip = (await git(created.path, "rev-parse", "HEAD")).trim();
+
+    // Diverge the checkout so integration can only be a real merge commit.
+    await writeFile(join(repoDir, "MAIN.md"), "main\n", "utf8");
+    await git(repoDir, "add", "MAIN.md");
+    await git(repoDir, "commit", "-m", "Source change");
+    await git(repoDir, "merge", "--no-ff", "-m", "Integrate task", active.branch);
+
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true });
+
+    // The whole safety argument rests on this: removal drops the checkout, not
+    // the commits, so the worktree can be recreated from the surviving ref.
+    expect(await git(repoDir, "branch", "--list", active.branch)).toContain(active.branch);
+    expect((await git(repoDir, "rev-parse", active.branch)).trim()).toBe(taskTip);
+  });
+
+  it("allows removal of an upstream-tracking branch whose commits the checkout integrated", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    // An upstream that lacks the Task commits keeps ahead > 0 on that measure.
+    await git(repoDir, "branch", "shared-base");
+    await git(created.path, "branch", `--set-upstream-to=shared-base`, active.branch);
+    await writeFile(join(created.path, "committed.txt"), "commit\n", "utf8");
+    await git(created.path, "add", "committed.txt");
+    await git(created.path, "commit", "-m", "Task change");
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_UNPUSHED" });
+
+    await git(repoDir, "merge", "--ff-only", active.branch);
+
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true });
+  });
+
+  it("re-checks integration on the pending-remove resume rather than the commit count alone", async () => {
+    let saves = 0;
+    const { repoDir, manager } = await worktreeFixtureWithHooks({
+      afterSave: () => {
+        saves += 1;
+        if (saves === 3) throw new Error("state write failed before git remove");
+      },
+    });
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.removeIfSafe(active)).rejects.toThrow("state write failed before git remove");
+    await expect(stat(created.path)).resolves.toBeDefined();
+
+    await writeFile(join(created.path, "committed.txt"), "commit\n", "utf8");
+    await git(created.path, "add", "committed.txt");
+    await git(created.path, "commit", "-m", "Task change after the pending intent");
+
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_UNPUSHED" });
+
+    await git(repoDir, "merge", "--ff-only", active.branch);
+
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true, lifecycle: "removed" });
+  });
+
   it("persists pending-create before Git allocation so a post-create state-save failure is recoverable", async () => {
     let saves = 0;
     const { fixture, repoDir, manager } = await worktreeFixtureWithHooks({

@@ -295,7 +295,9 @@ Takeover 성공 후 반환된 **새 Claim ID**로 status를 다시 확인한다.
 jhw-control task recover --task <tsk-id> --expect <released-claim-id> --action cleanup
 ```
 
-exact `pending-remove`는 이 cleanup이 재개하는 상태다. active successor, 다른 host/coordinates, dirty/ahead, `pending-create`, 또는 다른 generation의 ambiguous pending state면 stop하고 evidence를 보존한다. 자동 reset/rebase/force push, 경로 삭제, Claim 재생성으로 우회하지 않는다.
+exact `pending-remove`는 이 cleanup이 재개하는 상태다. active successor, 다른 host/coordinates, dirty worktree, source checkout에 통합되지 않은 commit, `pending-create`, 또는 다른 generation의 ambiguous pending state면 stop하고 evidence를 보존한다. 자동 reset/rebase/force push, 경로 삭제, Claim 재생성으로 우회하지 않는다.
+
+worktree 제거는 commit 개수가 아니라 **통합 여부**로 판정한다. source checkout이 branch를 체크아웃한 상태에서 그 HEAD가 worktree의 HEAD에 도달 가능하면 허용하고, 도달 불가능하거나 checkout이 detached면 `WORKTREE_UNPUSHED`로 멈춘다. detached HEAD는 통합 지점이 아니므로 신뢰하지 않는다. 제거해도 **commit은 `refs/heads/task/...` branch ref에 그대로 남아** `git worktree add <path> <branch>`로 완전 복원된다. 다만 **gitignore된 로컬 파일은 worktree와 함께 삭제된다**(`dist/`·`node_modules/` 등) — 재생성 불가능한 로컬 산출물을 worktree 안에 두지 않는다. 따라서 병합 전에 `completed`로 끝내면 worktree가 남는다. **병합을 먼저 하고 나서 종료하거나, 이미 종료했다면 병합 뒤 위 cleanup을 released Claim ID로 실행한다.** 이 판정이 도입되기 전에 완료돼 남아 있는 worktree도 같은 방법으로 정리한다.
 
 ## 9. audit와 즉시 중단 조건
 
