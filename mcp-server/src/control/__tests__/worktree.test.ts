@@ -292,12 +292,39 @@ describe("WorktreeManager", () => {
     const active = claim();
     const created = await manager.createOrReuse(active, repoDir);
     await writeFile(join(created.path, ".ai", "handoff.md"), "retry copy\n", "utf8");
+    await expect(stat(join(created.path, ".ai", "keep.md"))).resolves.toBeDefined();
 
     await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true });
     await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(join(repoDir, ".ai", "keep.md"))).resolves.toBeDefined();
   });
 
+  // The errno is the whole diagnosis when the drop fails, so it has to survive
+  // into the error. A read-only `.ai` still lists for `git status` but refuses
+  // the unlink, which is the only way to reach this branch without a fault
+  // injector.
+  it("reports why dropping the handoff copy failed", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const handoffDirectory = join(created.path, ".ai");
+    await mkdir(handoffDirectory, { recursive: true });
+    await writeFile(join(handoffDirectory, "handoff.md"), "retry copy\n", "utf8");
+    await chmod(handoffDirectory, 0o500);
+
+    try {
+      await expect(manager.removeIfSafe(active)).rejects.toMatchObject({
+        code: "WORKTREE_CLEANUP_FAILED",
+        details: { errno: "EACCES" },
+      });
+    } finally {
+      await chmod(handoffDirectory, 0o700);
+    }
+  });
+
+  // Git still reports `?? .ai/handoff.md` for a symlinked copy, so the tolerance
+  // applies and its regular-file guard is what refuses. The reason distinguishes
+  // that from the plain dirty refusal the next test gets.
   it("refuses removal when the handoff copy itself is a symlink", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const active = claim();
@@ -307,11 +334,17 @@ describe("WorktreeManager", () => {
     await mkdir(join(created.path, ".ai"), { recursive: true });
     await symlink(outsideFile, join(created.path, ".ai", "handoff.md"));
 
-    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_DIRTY" });
+    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({
+      code: "WORKTREE_DIRTY",
+      details: { reason: "handoff_copy_not_plain_file" },
+    });
     await expect(stat(outsideFile)).resolves.toBeDefined();
   });
 
-  it("refuses removal when the handoff directory is a symlink", async () => {
+  // A symlinked `.ai` is reported as `?? .ai`, never as `?? .ai/handoff.md`, so
+  // this never reaches the tolerance at all — it is refused as an ordinary dirty
+  // worktree. Naming it after the guard would be reading the fixture, not Git.
+  it("refuses removal for a symlinked handoff directory as ordinary dirty residue", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const active = claim();
     const created = await manager.createOrReuse(active, repoDir);
@@ -320,7 +353,10 @@ describe("WorktreeManager", () => {
     await writeFile(join(outside, "handoff.md"), "outside copy\n", "utf8");
     await symlink(outside, join(created.path, ".ai"));
 
-    await expect(manager.removeIfSafe(active)).rejects.toMatchObject({ code: "WORKTREE_DIRTY" });
+    const error = await manager.removeIfSafe(active).catch((cause) => cause);
+    expect(error).toMatchObject({ code: "WORKTREE_DIRTY" });
+    expect((error as ControlError).details?.reason).toBeUndefined();
+    expect((error as ControlError).details?.dirty_files).toEqual([".ai"]);
     await expect(stat(join(outside, "handoff.md"))).resolves.toBeDefined();
   });
 

@@ -740,8 +740,11 @@ export class WorktreeManager {
     // copy still reports as `?? .ai/handoff.md`. The directory half cannot be,
     // because Git never produces that entry when `.ai` is a symlink — it
     // reports `?? .ai` when the link is untracked and says nothing at all when
-    // the link is committed, since it does not descend through one. That half
-    // exists for the swap race alone, which is why no fixture reaches it.
+    // the link is committed, since it does not descend through one. The same
+    // holds for the directory being absent or not a directory at all: none of
+    // those coexist with the entry. That half exists for the swap race alone,
+    // which is why no fixture reaches it — the symlinked-directory test is
+    // stopped by the dirty check above, before this tolerance is consulted.
     if (status_entries.includes(EXPECTED_LOCAL_HANDOFF_ENTRY)) {
       const localHandoffDirectory = join(current.path, LOCAL_HANDOFF_DIRECTORY);
       const localHandoffPath = join(current.path, LOCAL_HANDOFF_RELATIVE_PATH);
