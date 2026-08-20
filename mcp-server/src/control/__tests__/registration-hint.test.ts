@@ -161,7 +161,13 @@ describe("RegistrationHintStore", () => {
     await store.record(hint);
     await writeFile(join(directory, "project-registrations.json"), "x".repeat(1024 * 1024 + 1), "utf8");
 
-    await expect(store.read("prj-example")).rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT_STATE" });
+    // Asserting the message, not just the code: oversized bytes are also
+    // unparseable, so the parse failure would report the same code and this
+    // test would keep passing with the size gate deleted.
+    await expect(store.read("prj-example")).rejects.toMatchObject({
+      code: "INVALID_REGISTRATION_HINT_STATE",
+      message: "Registration hint state is larger than this store writes",
+    });
   });
 
   it("refuses a relative state directory", async () => {

@@ -4,13 +4,15 @@ import { constants } from "node:fs";
 import { z } from "zod";
 
 import { ControlError } from "./errors.js";
-import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
+import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
 
 const STATE_FILE = "project-registrations.json";
 const STATE_VERSION = 1;
 const MAX_TRACKED_PROJECTS = 256;
 // The ceiling above bounds what this store writes; this bounds what it will
-// read back, so a file that grew by some other hand cannot be loaded whole.
+// read back, so a file already grown past it by some other hand is refused
+// rather than loaded. A file that grows between the stat and the read is not
+// covered, which needs a writer inside this trust boundary to arrange.
 const MAX_STATE_BYTES = 1024 * 1024;
 const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const createFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
@@ -98,14 +100,15 @@ export class RegistrationHintStore implements RegistrationHintPort {
       throw new ControlError("INVALID_REGISTRATION_HINT", "Registration hint is not a bounded coordinate set");
     }
     await this.withDirectory(async (directory) => {
-    const state = await this.load(directory);
-    const records = { ...state?.records, [parsed.data.project_id]: parsed.data };
-    // Entries are kept for the life of the record they name, so the bound is a
-    // ceiling on projects this host has registered rather than on concurrent
-    // work. Refusing past it costs a later retry its shortcut and nothing else.
-    if (Object.keys(records).length > MAX_TRACKED_PROJECTS) {
-      throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state tracks too many projects");
-    }
+      const state = await this.load(directory);
+      const records = { ...state?.records, [parsed.data.project_id]: parsed.data };
+      // Entries are kept for the life of the record they name, so the bound is
+      // a ceiling on projects this host has registered rather than on
+      // concurrent work. Refusing past it costs a later retry its shortcut and
+      // nothing else.
+      if (Object.keys(records).length > MAX_TRACKED_PROJECTS) {
+        throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state tracks too many projects");
+      }
       await this.save(directory, { version: STATE_VERSION, records });
     });
   }
