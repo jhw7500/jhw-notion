@@ -384,6 +384,130 @@ describe("RegistryGit", () => {
     await expect(registry.readHeadRegularFile("handoffs/large.md")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
   });
 
+  it("answers reads inside a held subtree from one listing", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    for (const name of ["one", "two", "three"]) {
+      await writeFile(join(registryDir, "tasks", `${name}.json`), `{"n":"${name}"}\n`, "utf8");
+    }
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "Tasks");
+    const calls: string[][] = [];
+    const runner = new ProcessRunner();
+    const registry = fixtureRegistryGit(configFor(registryDir), {
+      run: async (command: string, args: string[], options?: Parameters<ProcessRunner["run"]>[2]) => {
+        calls.push(args);
+        return runner.run(command, args, options);
+      },
+      runRaw: runner.runRaw.bind(runner),
+    } as unknown as ProcessRunnerLike);
+
+    const seen = await registry.withCommittedTree(["tasks"], async () => [
+      await registry.headRegularBlobObjectId("tasks/one.json"),
+      await registry.headRegularBlobObjectId("tasks/two.json"),
+      await registry.headRegularBlobObjectId("tasks/three.json"),
+    ]);
+
+    expect(new Set(seen).size).toBe(3);
+    // One recursive listing answered all three, and no path was asked for
+    // individually.
+    expect(calls.filter((args) => args[0] === "ls-tree" && args[1] === "-r")).toHaveLength(1);
+    expect(calls.filter((args) => args[0] === "ls-tree" && args[1] === "-l")).toHaveLength(0);
+  });
+
+  it("agrees with a single lookup about the same record", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "Tasks");
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    const alone = await registry.headRegularBlobObjectId("tasks/one.json");
+    const held = await registry.withCommittedTree(["tasks"], () => registry.headRegularBlobObjectId("tasks/one.json"));
+
+    expect(held).toBe(alone);
+  });
+
+  it("still asks individually for a path the held listing does not cover", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await writeFile(join(registryDir, "outside.json"), `{"n":"outside"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks", "outside.json");
+    await git(registryDir, "commit", "-m", "Both");
+    const calls: string[][] = [];
+    const runner = new ProcessRunner();
+    const registry = fixtureRegistryGit(configFor(registryDir), {
+      run: async (command: string, args: string[], options?: Parameters<ProcessRunner["run"]>[2]) => {
+        calls.push(args);
+        return runner.run(command, args, options);
+      },
+      runRaw: runner.runRaw.bind(runner),
+    } as unknown as ProcessRunnerLike);
+
+    // A listing that does not cover a path cannot say it is absent, so the
+    // scope must not answer for one.
+    await registry.withCommittedTree(["tasks"], async () => {
+      await registry.headRegularBlobObjectId("outside.json");
+    });
+
+    expect(calls.filter((args) => args[0] === "ls-tree" && args[1] === "-l")).toHaveLength(1);
+  });
+
+  it("reports a record missing from the held subtree as missing", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "Tasks");
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.withCommittedTree(["tasks"], () => registry.headRegularBlobObjectId("tasks/absent.json")))
+      .rejects.toMatchObject({ code: "HANDOFF_MISSING" });
+  });
+
+  // The gate that a batched listing could most easily lose: git records a
+  // symlink as a blob, and only the mode tells them apart.
+  it("refuses a subtree that holds a committed symlink", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await symlink("/etc/passwd", join(registryDir, "tasks", "link.json"));
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "Tasks with a symlink");
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.withCommittedTree(["tasks"], () => registry.headRegularBlobObjectId("tasks/one.json")))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("releases the held subtree when the work inside it throws", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "Tasks");
+    const calls: string[][] = [];
+    const runner = new ProcessRunner();
+    const registry = fixtureRegistryGit(configFor(registryDir), {
+      run: async (command: string, args: string[], options?: Parameters<ProcessRunner["run"]>[2]) => {
+        calls.push(args);
+        return runner.run(command, args, options);
+      },
+      runRaw: runner.runRaw.bind(runner),
+    } as unknown as ProcessRunnerLike);
+
+    await expect(registry.withCommittedTree(["tasks"], async () => {
+      throw new Error("work failed");
+    })).rejects.toThrow("work failed");
+    await registry.headRegularBlobObjectId("tasks/one.json");
+
+    // Back to asking per path, rather than answering from a listing that
+    // outlived the call that took it.
+    expect(calls.filter((args) => args[0] === "ls-tree" && args[1] === "-l")).toHaveLength(1);
+  });
+
   it("preflights an oversized proven blob without invoking the raw content command", async () => {
     const { registryDir } = await fixture();
     const objectId = "a".repeat(40);

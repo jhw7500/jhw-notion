@@ -40,6 +40,33 @@ function isSafeRegistryRelativePath(path: string): boolean {
     path.split("/").every((component) => component.length > 0 && component !== "." && component !== "..");
 }
 
+interface HeadBlobEntry {
+  objectId: string;
+  size: bigint;
+}
+
+/**
+ * One `ls-tree -l` row, or undefined when it is not a regular file. `-l`
+ * right-aligns the size, so the metadata is whitespace separated rather than
+ * single-space separated. Shared so a batched listing and a single lookup
+ * cannot come to different conclusions about the same row.
+ */
+function parseHeadTreeRow(row: string): { path: string; objectId: string; size: bigint } | undefined {
+  const tab = row.indexOf("\t");
+  if (tab < 0) return undefined;
+  const metadata = row.slice(0, tab).split(/ +/).filter((field) => field.length > 0);
+  const [mode, type, objectId, size] = metadata;
+  if (
+    (mode !== "100644" && mode !== "100755") ||
+    type !== "blob" ||
+    !/^[0-9a-f]{40,64}$/.test(objectId ?? "") ||
+    !/^(?:0|[1-9][0-9]*)$/.test(size ?? "")
+  ) {
+    return undefined;
+  }
+  return { path: row.slice(tab + 1), objectId: objectId as string, size: BigInt(size as string) };
+}
+
 function isNonFastForwardPushFailure(error: ControlError): boolean {
   const stderr = typeof error.details.stderr === "string" ? error.details.stderr : "";
   return /(?:non-fast-forward|\(fetch first\)|Updates were rejected because the remote contains work)/i.test(stderr);
@@ -62,6 +89,13 @@ export class RegistryGit {
   ) {}
 
   /**
+   * Entries of one committed subtree, held only for the call that asked for
+   * them. An audit reads every record under a directory, and asking the tree
+   * once for all of them costs the same as asking it once for one.
+   */
+  private committedTree?: { directories: readonly string[]; entries: Map<string, HeadBlobEntry> };
+
+  /**
    * Requires an exact path in the current clean HEAD tree to be a regular file.
    * This deliberately consults Git metadata rather than trusting the worktree.
    */
@@ -75,14 +109,81 @@ export class RegistryGit {
   }
 
   /**
+   * Runs `read` with the committed entries of `relativeDirectories` already in
+   * hand, so the reads inside it consult one tree listing instead of asking for
+   * each path in turn. The scope is the call: nothing survives it, and a path
+   * outside those directories is still asked for individually, because a
+   * listing that does not cover a path cannot say it is absent.
+   *
+   * HEAD is fixed for the duration by the caller — every audit that uses this
+   * runs under the host mutation lock and writes nothing — so the listing
+   * cannot go stale while it is being read.
+   */
+  async withCommittedTree<T>(relativeDirectories: readonly string[], read: () => Promise<T>): Promise<T> {
+    if (this.committedTree) return read();
+    const entries = new Map<string, HeadBlobEntry>();
+    for (const directory of relativeDirectories) {
+      for (const [path, entry] of await this.committedSubtree(directory)) entries.set(path, entry);
+    }
+    this.committedTree = { directories: [...relativeDirectories], entries };
+    try {
+      return await read();
+    } finally {
+      this.committedTree = undefined;
+    }
+  }
+
+  /** One recursive listing, held to the same gates a single lookup applies. */
+  private async committedSubtree(relativeDirectory: string): Promise<Map<string, HeadBlobEntry>> {
+    if (!isSafeRegistryRelativePath(relativeDirectory)) {
+      throw new ControlError("INVALID_REGISTRY_PATH", "Registry directory path must be a safe relative path", { relativeDirectory });
+    }
+    let output: string;
+    try {
+      output = (await this.git(["ls-tree", "-r", "-l", "-z", "HEAD", "--", relativeDirectory])).stdout;
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD subtree", { relativeDirectory });
+    }
+    const entries = new Map<string, HeadBlobEntry>();
+    for (const row of output.split("\0")) {
+      if (row.length === 0) continue;
+      const parsed = parseHeadTreeRow(row);
+      if (!parsed) {
+        // `-r` returns blobs and submodules; anything that is not a regular
+        // file under a directory this audit walks is corruption, and saying so
+        // here keeps the batched read exactly as strict as the single one.
+        throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD subtree contains a non-regular entry", { relativeDirectory });
+      }
+      if (entries.has(parsed.path)) {
+        throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD subtree repeats a path", { relativeDirectory });
+      }
+      entries.set(parsed.path, { objectId: parsed.objectId, size: parsed.size });
+    }
+    return entries;
+  }
+
+  /** True when a held listing is authoritative about this path's absence. */
+  private coveredByCommittedTree(relativePath: string): boolean {
+    return this.committedTree?.directories.some(
+      (directory) => relativePath.startsWith(`${directory}/`),
+    ) ?? false;
+  }
+
+  /**
    * Reads the whole HEAD tree entry for a path: mode, type, object ID and size
    * together. `-l` is what makes the size part of the same answer, so nothing
    * has to ask a second process for it, and every gate a read passes through
    * is decided by one atomic view of the tree.
    */
-  private async headRegularBlobEntry(relativePath: string): Promise<{ objectId: string; size: bigint }> {
+  private async headRegularBlobEntry(relativePath: string): Promise<HeadBlobEntry> {
     if (!isSafeRegistryRelativePath(relativePath)) {
       throw new ControlError("INVALID_REGISTRY_PATH", "Registry file path must be a safe relative path", { relativePath });
+    }
+
+    if (this.coveredByCommittedTree(relativePath)) {
+      const held = this.committedTree?.entries.get(relativePath);
+      if (held) return held;
+      throw new ControlError("HANDOFF_MISSING", "Registry HEAD does not contain the required file", { relativePath });
     }
 
     let output: string;
@@ -100,22 +201,11 @@ export class RegistryGit {
       throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD returned an ambiguous file entry", { relativePath });
     }
 
-    const tab = entries[0].indexOf("\t");
-    // `-l` right-aligns the size, so the metadata is whitespace separated
-    // rather than single-space separated.
-    const metadata = tab >= 0 ? entries[0].slice(0, tab).split(/ +/).filter((field) => field.length > 0) : [];
-    const entryPath = tab >= 0 ? entries[0].slice(tab + 1) : "";
-    const [mode, type, objectId, size] = metadata;
-    if (
-      entryPath !== relativePath ||
-      (mode !== "100644" && mode !== "100755") ||
-      type !== "blob" ||
-      !/^[0-9a-f]{40,64}$/.test(objectId ?? "") ||
-      !/^(?:0|[1-9][0-9]*)$/.test(size ?? "")
-    ) {
+    const parsed = parseHeadTreeRow(entries[0] as string);
+    if (!parsed || parsed.path !== relativePath) {
       throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD path is not a regular file", { relativePath });
     }
-    return { objectId: objectId as string, size: BigInt(size as string) };
+    return { objectId: parsed.objectId, size: parsed.size };
   }
 
   /**

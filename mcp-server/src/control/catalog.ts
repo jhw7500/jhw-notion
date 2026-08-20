@@ -681,6 +681,12 @@ export class Catalog {
   }
 
   private async auditTaskSourceIndexes(): Promise<void> {
+    // The audit reads every record under tasks/, so it takes the committed
+    // entries for that subtree once instead of asking per record.
+    return this.registry.withCommittedTree(["tasks"], () => this.auditTaskSourceIndexesWithin());
+  }
+
+  private async auditTaskSourceIndexesWithin(): Promise<void> {
     const directory = "tasks/by-source/github";
     const indexEntries = await this.records.listDirectoryEntries(directory, maximumCatalogEntries);
     const seenSources = new Set<string>();
@@ -732,6 +738,10 @@ export class Catalog {
   }
 
   private async auditRepositorySourceIndexes(): Promise<void> {
+    return this.registry.withCommittedTree(["repositories"], () => this.auditRepositorySourceIndexesWithin());
+  }
+
+  private async auditRepositorySourceIndexesWithin(): Promise<void> {
     const directory = "repositories/by-source/github";
     const indexEntries = await this.records.listDirectoryEntries(directory, maximumCatalogEntries);
     const seenRepositories = new Set<string>();
