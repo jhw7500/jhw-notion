@@ -389,10 +389,13 @@ describe("RegistryGit", () => {
     const objectId = "a".repeat(40);
     const run = vi.fn(async (_command: string, args: string[]) => {
       if (args[0] === "ls-tree") {
-        return { command: "git", args, stdout: `100644 blob ${objectId}\thandoffs/large.md\0`, stderr: "", exitCode: 0 };
-      }
-      if (args[0] === "cat-file" && args[1] === "-s") {
-        return { command: "git", args, stdout: `${MAX_HANDOFF_BYTES + 1}\n`, stderr: "", exitCode: 0 };
+        return {
+          command: "git",
+          args,
+          stdout: `100644 blob ${objectId} ${MAX_HANDOFF_BYTES + 1}\thandoffs/large.md\0`,
+          stderr: "",
+          exitCode: 0,
+        };
       }
       throw new Error(`unexpected command: ${args.join(" ")}`);
     });
@@ -400,7 +403,8 @@ describe("RegistryGit", () => {
     const registry = fixtureRegistryGit(configFor(registryDir), { run, runRaw });
 
     await expect(registry.readHeadRegularFile("handoffs/large.md")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
-    expect(run).toHaveBeenCalledWith("git", ["cat-file", "-s", objectId], { cwd: registryDir });
+    // The size arrives with the rest of the entry, so nothing else is asked.
+    expect(run).toHaveBeenCalledExactlyOnceWith("git", ["ls-tree", "-l", "-z", "HEAD", "--", "handoffs/large.md"], { cwd: registryDir });
     expect(runRaw).not.toHaveBeenCalled();
   });
 
@@ -409,18 +413,29 @@ describe("RegistryGit", () => {
     const objectId = "b".repeat(40);
     const run = vi.fn(async (_command: string, args: string[]) => {
       if (args[0] === "ls-tree") {
-        return { command: "git", args, stdout: `100644 blob ${objectId}\thandoffs/invalid-size.md\0`, stderr: "", exitCode: 0 };
-      }
-      if (args[0] === "cat-file" && args[1] === "-s") {
-        return { command: "git", args, stdout: "12 bytes\n", stderr: "", exitCode: 0 };
+        return {
+          command: "git",
+          args,
+          stdout: `100644 blob ${objectId}     BAD\thandoffs/invalid-size.md\0`,
+          stderr: "",
+          exitCode: 0,
+        };
       }
       throw new Error(`unexpected command: ${args.join(" ")}`);
     });
     const runRaw = vi.fn();
     const registry = fixtureRegistryGit(configFor(registryDir), { run, runRaw });
 
-    await expect(registry.readHeadRegularFile("handoffs/invalid-size.md")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
-    expect(run).toHaveBeenCalledWith("git", ["cat-file", "-s", objectId], { cwd: registryDir });
+    // Asserted on the blob reader rather than the text reader: the latter maps
+    // anything that escapes into the same code, so it would keep passing with
+    // the size format guard deleted and BigInt throwing instead.
+    await expect(registry.readHeadRegularBlob("handoffs/invalid-size.md"))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(run).toHaveBeenCalledExactlyOnceWith(
+      "git",
+      ["ls-tree", "-l", "-z", "HEAD", "--", "handoffs/invalid-size.md"],
+      { cwd: registryDir },
+    );
     expect(runRaw).not.toHaveBeenCalled();
   });
 
@@ -429,10 +444,8 @@ describe("RegistryGit", () => {
     const objectId = "c".repeat(40);
     const run = vi.fn(async (_command: string, args: string[]) => {
       if (args[0] === "ls-tree") {
-        return { command: "git", args, stdout: `100644 blob ${objectId}\thandoffs/exact.md\0`, stderr: "", exitCode: 0 };
-      }
-      if (args[0] === "cat-file" && args[1] === "-s") {
-        return { command: "git", args, stdout: "8\n", stderr: "", exitCode: 0 };
+        // git right-aligns the size in a seven-wide field.
+        return { command: "git", args, stdout: `100644 blob ${objectId}       8\thandoffs/exact.md\0`, stderr: "", exitCode: 0 };
       }
       throw new Error(`unexpected command: ${args.join(" ")}`);
     });

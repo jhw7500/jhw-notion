@@ -71,13 +71,23 @@ export class RegistryGit {
 
   /** Reads the exact regular blob object ID selected by HEAD tree metadata. */
   async headRegularBlobObjectId(relativePath: string): Promise<string> {
+    return (await this.headRegularBlobEntry(relativePath)).objectId;
+  }
+
+  /**
+   * Reads the whole HEAD tree entry for a path: mode, type, object ID and size
+   * together. `-l` is what makes the size part of the same answer, so nothing
+   * has to ask a second process for it, and every gate a read passes through
+   * is decided by one atomic view of the tree.
+   */
+  private async headRegularBlobEntry(relativePath: string): Promise<{ objectId: string; size: bigint }> {
     if (!isSafeRegistryRelativePath(relativePath)) {
       throw new ControlError("INVALID_REGISTRY_PATH", "Registry file path must be a safe relative path", { relativePath });
     }
 
     let output: string;
     try {
-      output = (await this.git(["ls-tree", "-z", "HEAD", "--", relativePath])).stdout;
+      output = (await this.git(["ls-tree", "-l", "-z", "HEAD", "--", relativePath])).stdout;
     } catch {
       throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD file", { relativePath });
     }
@@ -91,18 +101,21 @@ export class RegistryGit {
     }
 
     const tab = entries[0].indexOf("\t");
-    const metadata = tab >= 0 ? entries[0].slice(0, tab).split(" ") : [];
+    // `-l` right-aligns the size, so the metadata is whitespace separated
+    // rather than single-space separated.
+    const metadata = tab >= 0 ? entries[0].slice(0, tab).split(/ +/).filter((field) => field.length > 0) : [];
     const entryPath = tab >= 0 ? entries[0].slice(tab + 1) : "";
-    const [mode, type, objectId] = metadata;
+    const [mode, type, objectId, size] = metadata;
     if (
       entryPath !== relativePath ||
       (mode !== "100644" && mode !== "100755") ||
       type !== "blob" ||
-      !/^[0-9a-f]{40,64}$/.test(objectId ?? "")
+      !/^[0-9a-f]{40,64}$/.test(objectId ?? "") ||
+      !/^(?:0|[1-9][0-9]*)$/.test(size ?? "")
     ) {
       throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD path is not a regular file", { relativePath });
     }
-    return objectId as string;
+    return { objectId: objectId as string, size: BigInt(size as string) };
   }
 
   /**
@@ -111,12 +124,17 @@ export class RegistryGit {
    * byte-for-byte (including content that happens to equal a host secret).
    */
   async readHeadRegularBlob(relativePath: string, maximumBytes = MAX_REGISTRY_RECORD_BYTES): Promise<Buffer> {
-    const objectId = await this.headRegularBlobObjectId(relativePath);
+    const { objectId, size } = await this.headRegularBlobEntry(relativePath);
     const rawRunner = this.runner as Partial<RawProcessRunnerLike>;
     if (typeof rawRunner.runRaw !== "function") {
       throw new ControlError("REGISTRY_CORRUPT", "Registry runner cannot read committed blob bytes", { relativePath });
     }
-    await this.assertHeadBlobSize(relativePath, objectId, maximumBytes);
+    if (size > BigInt(maximumBytes)) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD blob exceeds the Handoff byte limit", {
+        relativePath,
+        object_id: objectId,
+      });
+    }
     try {
       const bytes = await rawRunner.runRaw(
         "git",
@@ -205,32 +223,6 @@ export class RegistryGit {
     }
     this.sensitiveData.assertSafe(rows);
     return rows;
-  }
-
-  /** Proves a HEAD-selected blob is bounded before requesting its content. */
-  private async assertHeadBlobSize(relativePath: string, objectId: string, maximumBytes: number): Promise<void> {
-    let output: string;
-    try {
-      output = (await this.git(["cat-file", "-s", objectId])).stdout;
-    } catch {
-      throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD blob size", {
-        relativePath,
-        object_id: objectId,
-      });
-    }
-    if (!/^(?:0|[1-9][0-9]*)\n?$/.test(output)) {
-      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD blob size is invalid", {
-        relativePath,
-        object_id: objectId,
-      });
-    }
-    const size = BigInt(output.endsWith("\n") ? output.slice(0, -1) : output);
-    if (size > BigInt(maximumBytes)) {
-      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD blob exceeds the Handoff byte limit", {
-        relativePath,
-        object_id: objectId,
-      });
-    }
   }
 
   /** Reads a bounded, valid UTF-8 Handoff from a proven regular HEAD blob. */
