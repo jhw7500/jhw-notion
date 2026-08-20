@@ -1,12 +1,21 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ControlError } from "../errors.js";
 import { GitHubProjectClient, type GitHubRunner, type RegistrationRecordWarning } from "../github-project.js";
-import type { RegistrationHint, RegistrationHintPort } from "../registration-hint.js";
+import { RegistrationHintStore, type RegistrationHint, type RegistrationHintPort } from "../registration-hint.js";
 import type { ProjectOperationalFields } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000001";
+const temporaryRoots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 class QueuedGhRunner implements GitHubRunner {
   readonly calls: Array<{ args: string[]; credential: "project" | "repo" }> = [];
@@ -648,8 +657,61 @@ describe("GitHubProjectClient", () => {
       await expect(client(runner, catalogFixture(), async () => undefined, new FakeHints(undefined, faults), (code) => { reported.push(code); })
         .registerProject(registration))
         .resolves.toMatchObject({ project_item_id: "PVTI_1" });
-      expect(reported, expected).toContain(expected);
+      // The whole sequence, not just membership: a second, milder code must
+      // not follow the one the operator has to act on.
+      expect(reported, expected).toEqual([expected]);
     }
+  });
+
+  // The store reads its file before writing it, so a damaged file surfaces as a
+  // write failure. A record found in the first listing never consults the store
+  // beforehand, which makes this the only place that failure is classified —
+  // and reporting it as unwritable would send the operator to a directory that
+  // is fine. Driven through the real store, because a fake cannot get the
+  // error codes the classification reads wrong.
+  it("reports a damaged store as unreadable even when only the write touched it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-hint-classify-"));
+    temporaryRoots.push(root);
+    const stateDir = join(root, "state");
+    const store = new RegistrationHintStore(stateDir);
+    await store.record({ project_id: "prj-other", item_id: "PVTI_2", source_node_id: "DI_2" });
+    await writeFile(join(stateDir, "project-registrations.json"), "{not json", "utf8");
+
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      projectPage({ records: [registrationRecord("complete")] }),
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+    const reported: RegistrationRecordWarning[] = [];
+
+    await expect(client(runner, catalogFixture(), async () => undefined, store, (code) => { reported.push(code); })
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(reported).toEqual(["REGISTRATION_RECORD_UNREADABLE"]);
+  });
+
+  it("reports a full store apart from a damaged one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-hint-classify-"));
+    temporaryRoots.push(root);
+    const stateDir = join(root, "state");
+    await mkdir(stateDir, { recursive: true, mode: 0o700 });
+    const records = Object.fromEntries(Array.from({ length: 256 }, (_unused, index) => [
+      `prj-${index}`,
+      { project_id: `prj-${index}`, item_id: `PVTI_${index}`, source_node_id: `DI_${index}` },
+    ]));
+    await writeFile(join(stateDir, "project-registrations.json"), `${JSON.stringify({ version: 1, records })}\n`, "utf8");
+
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      projectPage({ records: [registrationRecord("complete")] }),
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+    const reported: RegistrationRecordWarning[] = [];
+
+    await expect(client(runner, catalogFixture(), async () => undefined, new RegistrationHintStore(stateDir), (code) => { reported.push(code); })
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(reported).toEqual(["REGISTRATION_RECORD_AT_CAPACITY"]);
   });
 
   it("keeps registering when the report itself throws", async () => {

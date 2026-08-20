@@ -80,7 +80,7 @@ Project Record는 비공개 Project의 canonical DraftIssue다. Registry Issue�
 
 Project write는 read에 지연되어 반영되므로 등록은 두 번 기다린다 — 레코드 부재 확인(2초 1회)과 최종 검증(최대 14초)이며, 둘이 합성되면 **최악 16초**다. **그 시간이 걸리는 것은 정상**이므로 중간에 끊지 않는다. 그동안 호스트 전역 lock을 잡으므로 다른 세션의 lifecycle 명령이 `LOCK_CONTENDED`로 실패할 수 있다. 중단된 등록을 재시도하면 host-local 등록 기록의 좌표로 기존 DraftIssue를 단건 조회해 재사용하므로 중복이 생기지 않는다. 그 기록은 보조 수단이라 없거나 읽히지 않아도 등록은 그대로 진행된다.
 
-성공 결과에 `registration_record_warning`이 실려 오면 등록은 정상이고 host-local 등록 기록만 고장난 것이다 — exit code는 `0`이며, `REGISTRATION_RECORD_UNREADABLE`·`REGISTRATION_RECORD_AT_CAPACITY`는 등록이 진행 중이 아닐 때 `project-registrations.json`을 삭제해 복구하고, `REGISTRATION_RECORD_UNWRITABLE`은 state directory 권한·디스크를 확인한다. 방치해도 등록은 옳지만 재시도가 단건 조회로 수렴하지 못한다.
+성공 결과에 `registration_record_warning`이 실려 오면 등록은 정상이고 host-local 등록 기록만 고장난 것이다 — exit code는 `0`이며, `REGISTRATION_RECORD_UNREADABLE`·`REGISTRATION_RECORD_AT_CAPACITY`는 등록이 진행 중이 아닐 때 `project-registrations.json`을 삭제해 복구하고, `REGISTRATION_RECORD_UNWRITABLE`은 디스크 여유와 상위 경로 권한을 확인한다. 실패한 등록의 `stderr`에도 실리므로, 재실행을 지시받은 경우 그 재시도는 좌표 없이 돈다. 방치해도 등록은 옳지만 재시도가 단건 조회로 수렴하지 못한다.
 
 실패 코드별 대응이 다르다. `PROJECT_REGISTRATION_UNSETTLED`는 아직 정착하지 않은 것이므로 같은 payload로 다시 실행한다(기존 DraftIssue 재사용). `PROJECT_REGISTRATION_MISMATCH`는 정착했는데 값이 다른 것이므로 **재실행하지 말고** Project 보드의 현재 상태를 먼저 확인한다. `DUPLICATE_PROJECT_RECORD`는 이미 중복이 생긴 상태이므로 수동 해소 후 재실행하며, 도구가 자동으로 지우지 않는다.
 

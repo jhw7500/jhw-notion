@@ -560,6 +560,29 @@ describe("runCli", () => {
     }
   });
 
+  // The record is written before the field writes, so a registration that fails
+  // afterwards has already lost its coordinates — and the retry the runbook
+  // prescribes is the one that would pay for it.
+  it("rides the warning out on a failed registration too", async () => {
+    const dependencies = makeCliDependencies({
+      registrationRecordWarning: { code: "REGISTRATION_RECORD_UNREADABLE" },
+      portfolio: {
+        registerProject: vi.fn().mockRejectedValue(
+          new ControlError("PROJECT_REGISTRATION_UNSETTLED", "did not settle"),
+        ),
+      },
+    });
+
+    const result = await runCli(registerArgs(), dependencies);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: { code: "PROJECT_REGISTRATION_UNSETTLED" },
+      registration_record_warning: { code: "REGISTRATION_RECORD_UNREADABLE" },
+    });
+    expect(result.stdout).toBe("");
+  });
+
   it("leaves a successful registration unmarked when the record did its job", async () => {
     const result = await runCli(registerArgs(), makeCliDependencies());
 

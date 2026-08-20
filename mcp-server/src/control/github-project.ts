@@ -26,13 +26,28 @@ import {
 const MAX_PROJECT_PAGES = 10_000;
 /**
  * Why the durable registration record stopped helping. Unreadable and
- * unwritable are repaired by fixing the state directory; at-capacity is
- * repaired by pruning the file. All three leave registration correct and slow.
+ * at-capacity are repaired by deleting the file; unwritable is repaired by
+ * fixing the state directory. All three leave registration correct and slow.
  */
 export type RegistrationRecordWarning =
   | "REGISTRATION_RECORD_UNREADABLE"
   | "REGISTRATION_RECORD_UNWRITABLE"
   | "REGISTRATION_RECORD_AT_CAPACITY";
+
+/**
+ * Maps a store failure to the repair it needs. State the store rejected — a
+ * damaged file, a path it will not follow — is the same problem a read would
+ * have reported, and is fixed by removing the file. Anything else is the
+ * directory or the disk.
+ */
+function recordFailure(cause: unknown): RegistrationRecordWarning {
+  if (!(cause instanceof ControlError)) return "REGISTRATION_RECORD_UNWRITABLE";
+  if (cause.code === "REGISTRATION_HINT_AT_CAPACITY") return "REGISTRATION_RECORD_AT_CAPACITY";
+  if (cause.code === "INVALID_REGISTRATION_HINT_STATE" || cause.code === "UNSAFE_STATE_PATH") {
+    return "REGISTRATION_RECORD_UNREADABLE";
+  }
+  return "REGISTRATION_RECORD_UNWRITABLE";
+}
 // A Project field write is visible to its own read-back only eventually, so an
 // update confirms through a bounded backoff instead of a single immediate read.
 const UPDATE_VERIFY_ATTEMPTS = 4;
@@ -1110,10 +1125,12 @@ export class GitHubProjectClient {
     try {
       await this.options.registrationHints?.record(hint);
     } catch (cause) {
-      // A full store and a broken one both stop the shortcut, but only one of
-      // them is repaired by pruning, so they are reported apart.
-      const full = cause instanceof ControlError && cause.code === "REGISTRATION_HINT_AT_CAPACITY";
-      this.reportRecordUnavailable(full ? "REGISTRATION_RECORD_AT_CAPACITY" : "REGISTRATION_RECORD_UNWRITABLE");
+      // Writing reads the file first, so most of what fails here is the stored
+      // state rather than the write. Reporting all of it as unwritable would
+      // send the operator to check a directory that is fine — and a record
+      // reused from the first listing never calls readHint, so this is the
+      // only place that failure is ever classified.
+      this.reportRecordUnavailable(recordFailure(cause));
     }
   }
 
