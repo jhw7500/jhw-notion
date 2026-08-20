@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, readdir, readFile, realpath, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, readdir, readFile, realpath, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -145,9 +145,13 @@ describe("WorktreeManager", () => {
     await expect(manager.inspect(claim())).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
   });
 
-  // Publishing now renames and re-reads through the retained descriptor, so a
-  // directory swapped in after the checks lands nothing in the decoy.
-  it("publishes into the directory it validated even when the path is swapped", async () => {
+  // The durability re-read is the part that used to open the path again, which
+  // is what the anchor exists to stop. afterPublish fires between the rename
+  // and that re-read, so swapping the directory there is the one window that
+  // tells the two implementations apart: reading through the descriptor finds
+  // the file on the inode it published to, while reopening the path finds a
+  // directory that never received it.
+  it("re-reads the state it published even when the directory is swapped underneath", async () => {
     let swapped = false;
     const fixture = await makeRegistryFixture();
     fixtures.push(fixture);
@@ -158,31 +162,45 @@ describe("WorktreeManager", () => {
     await writeFile(join(repoDir, "README.md"), "# Source\n", "utf8");
     await git(repoDir, "add", "README.md");
     await git(repoDir, "commit", "-m", "Initial source");
-    const config = configFor(fixture.registryDir);
-    const decoy = join(fixture.root, "decoy-state");
-    await mkdir(decoy, { recursive: true, mode: 0o700 });
+
+    const anchored = join(fixture.root, "anchored-parent");
+    const decoy = join(fixture.root, "decoy-parent");
+    await mkdir(join(anchored, "state"), { recursive: true, mode: 0o700 });
+    await mkdir(join(decoy, "state"), { recursive: true, mode: 0o700 });
+    const config = { ...configFor(fixture.registryDir), stateDir: join(anchored, "state") };
     const Constructor = WorktreeManager as unknown as new (
       config: ReturnType<typeof configFor>,
       runner: undefined,
-      hooks: { beforeSave?: () => void | Promise<void> },
+      hooks: { afterPublish?: (statePath: string) => void | Promise<void> },
     ) => WorktreeManager;
     const manager = new Constructor(config, undefined, {
-      beforeSave: async () => {
+      afterPublish: async () => {
         if (swapped) return;
         swapped = true;
-        await rename(config.stateDir, join(fixture.root, "moved-state"));
-        await rename(decoy, config.stateDir);
+        await rename(anchored, join(fixture.root, "moved-parent"));
+        await rename(decoy, anchored);
       },
     });
 
-    await manager.createOrReuse(claim(), repoDir);
+    await expect(manager.createOrReuse(claim(), repoDir)).resolves.toBeDefined();
 
-    // The descriptor was taken after the swap here, so what matters is that the
-    // publish and its verification agree on one directory rather than drifting
-    // between two.
-    const written = await readFile(join(config.stateDir, "worktrees.json"), "utf8");
-    expect(JSON.parse(written).worktrees).toBeDefined();
-    expect((await readdir(config.stateDir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    // The publish that ran during the swap verified itself against the inode it
+    // wrote to. Later saves take a fresh descriptor and follow the configured
+    // path to wherever it now points, which is why the decoy is not empty and
+    // why the assertion is that nothing refused rather than where things land.
+    const published = join(fixture.root, "moved-parent", "state", "worktrees.json");
+    expect(JSON.parse(await readFile(published, "utf8")).worktrees).toBeDefined();
+  });
+
+  // The read path gained these refusals; every other state file in the tree
+  // already had them.
+  it("refuses a state file that is not a private regular file", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    await manager.createOrReuse(claim(), repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    await link(statePath, join(fixture.root, "state", "worktrees.link"));
+
+    await expect(manager.inspect(claim())).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
   });
 
   it("rejects a FIFO published state without blocking its type check", async () => {

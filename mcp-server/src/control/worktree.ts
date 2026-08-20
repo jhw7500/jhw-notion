@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rmdir, unlink, type FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, realpath, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory } from "./schemas.js";
@@ -1166,6 +1166,13 @@ export class WorktreeManager {
    * re-resolving the configured directory, which is what let an ancestor
    * symlink through and what left a window between each check and the open
    * that followed it.
+   *
+   * A load and the save that follows it take separate descriptors, because a
+   * `git worktree add` runs between them. That is safe because every command
+   * that writes this state holds the host-global mutation lock — start,
+   * finish, and the recovering actions all do — while the commands that only
+   * read it see whatever the last rename published, which is a whole state or
+   * the one before it, never half of either.
    */
   private async withStateDirectory<T>(operation: (directory: SecureStateDirectory) => Promise<T>): Promise<T> {
     const directory = await openSecureStateDirectory(this.config.stateDir);
