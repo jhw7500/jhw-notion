@@ -137,10 +137,10 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     catalog,
     sensitiveData,
     registrationHints: new RegistrationHintStore(config.stateDir),
-    // First one wins. Both report sites classify the same failure the same
-    // way, so today they agree and this changes nothing; it is here so that a
-    // later divergence cannot let a milder second reason overwrite the one the
-    // operator has to act on.
+    // First one wins. Both report sites run the same classifier, so they
+    // disagree only if the underlying failure changes between the read and the
+    // write; this keeps that case from letting the second reason overwrite the
+    // first rather than deciding which is worth more.
     onRegistrationRecordUnavailable: (code) => {
       registrationRecordWarning.code ??= code;
     },
@@ -899,11 +899,10 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
     if (result.exitCode === 2) return result;
   }
 
-  // A failed registration is when the missing shortcut matters most: the
-  // record is written before the field writes, so anything that fails after
-  // it has already lost its coordinates, and the retry the operator is told
-  // to run would be the one paying for it. Rides the failing stream too, the
-  // way journal_warning does.
+  // A warning here means the record write failed, so this registration has no
+  // coordinates to resume from — and a failure after that point is exactly
+  // when the operator is told to retry. Rides the failing stream too, the way
+  // journal_warning does.
   const warning = dependencies.registrationRecordWarning?.code;
   if (warning) {
     const stream = result.exitCode === 0 ? result.stdout : result.stderr;

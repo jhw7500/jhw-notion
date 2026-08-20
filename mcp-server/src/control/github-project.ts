@@ -1113,8 +1113,11 @@ export class GitHubProjectClient {
   private async readHint(projectId: string): Promise<RegistrationHint | undefined> {
     try {
       return await this.options.registrationHints?.read(projectId);
-    } catch {
-      this.reportRecordUnavailable("REGISTRATION_RECORD_UNREADABLE");
+    } catch (cause) {
+      // Classified the same way the write classifies it. Reading and writing
+      // fail for the same reasons — the write reads first — so hardcoding one
+      // of them made the reported repair depend on which call happened to run.
+      this.reportRecordUnavailable(recordFailure(cause));
       return undefined;
     }
   }
@@ -1126,10 +1129,10 @@ export class GitHubProjectClient {
       await this.options.registrationHints?.record(hint);
     } catch (cause) {
       // Writing reads the file first, so most of what fails here is the stored
-      // state rather than the write. Reporting all of it as unwritable would
-      // send the operator to check a directory that is fine — and a record
-      // reused from the first listing never calls readHint, so this is the
-      // only place that failure is ever classified.
+      // state rather than the write, and reporting all of it as unwritable
+      // would send the operator to check a directory that is fine. A record
+      // reused from the first listing never calls readHint, which makes this
+      // the only site that reports at all on that path.
       this.reportRecordUnavailable(recordFailure(cause));
     }
   }

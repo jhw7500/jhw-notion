@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,8 +12,11 @@ import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000001";
 const temporaryRoots: string[] = [];
+const temporaryRestores: Array<() => Promise<unknown>> = [];
 
 afterEach(async () => {
+  // Permissions come back before removal, or the tree cannot be deleted.
+  await Promise.all(temporaryRestores.splice(0).map((restore) => restore().catch(() => undefined)));
   await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -181,7 +184,11 @@ class FakeHints implements RegistrationHintPort {
   }
 
   async read(projectId: string): Promise<RegistrationHint | undefined> {
-    if (this.faults.read) throw new Error("hint state is unreadable");
+    // The shape the real store fails in: a damaged file is a rejected state,
+    // while a directory it cannot reach raises a plain errno.
+    if (this.faults.read) {
+      throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state could not be parsed");
+    }
     return this.tracked.get(projectId);
   }
 
@@ -189,7 +196,8 @@ class FakeHints implements RegistrationHintPort {
     if (this.faults.atCapacity) {
       throw new ControlError("REGISTRATION_HINT_AT_CAPACITY", "Registration hint state tracks too many projects");
     }
-    if (this.faults.record) throw new Error("hint state is unwritable");
+    // A plain errno, which is what an unreachable directory actually raises.
+    if (this.faults.record) throw new Error("EACCES: permission denied");
     this.recorded.push(hint);
     this.tracked.set(hint.project_id, hint);
   }
@@ -712,6 +720,54 @@ describe("GitHubProjectClient", () => {
       .registerProject(registration))
       .resolves.toMatchObject({ project_item_id: "PVTI_1" });
     expect(reported).toEqual(["REGISTRATION_RECORD_AT_CAPACITY"]);
+  });
+
+  it("reports a state path it will not follow as unreadable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-hint-classify-"));
+    temporaryRoots.push(root);
+    await mkdir(join(root, "real"), { mode: 0o700 });
+    const stateDir = join(root, "state");
+    await symlink(join(root, "real"), stateDir);
+
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      projectPage({ records: [registrationRecord("complete")] }),
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+    const reported: RegistrationRecordWarning[] = [];
+
+    await expect(client(runner, catalogFixture(), async () => undefined, new RegistrationHintStore(stateDir), (code) => { reported.push(code); })
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(reported).toEqual(["REGISTRATION_RECORD_UNREADABLE"]);
+  });
+
+  // The store reaches its directory through every ancestor, so an ancestor the
+  // process cannot traverse raises a plain errno rather than a control error.
+  // Both report sites have to call that the same thing, or the repair an
+  // operator is handed would depend on which of them happened to run.
+  it.skipIf(process.getuid?.() === 0)("reports an untraversable ancestor as unwritable from both sites", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-hint-classify-"));
+    temporaryRoots.push(root);
+    const blocked = join(root, "blocked");
+    await mkdir(join(blocked, "state"), { recursive: true, mode: 0o700 });
+    await chmod(blocked, 0o000);
+    temporaryRestores.push(() => chmod(blocked, 0o700));
+
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      // Absent from the first listing, so the read and the write both run.
+      projectPage({}), projectPage({}),
+      draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+    const reported: RegistrationRecordWarning[] = [];
+
+    await expect(client(runner, catalogFixture(), async () => undefined, new RegistrationHintStore(join(blocked, "state")), (code) => { reported.push(code); })
+      .registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+    expect(reported).toEqual(["REGISTRATION_RECORD_UNWRITABLE", "REGISTRATION_RECORD_UNWRITABLE"]);
   });
 
   it("keeps registering when the report itself throws", async () => {
