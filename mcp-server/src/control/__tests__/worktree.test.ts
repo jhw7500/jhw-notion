@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, readFile, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, realpath, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -119,6 +119,70 @@ describe("WorktreeManager", () => {
 
     await expect(manager.createOrReuse(claim(), repoDir)).rejects.toMatchObject({ code: "WORKTREE_STATE_WRITE_FAILED" });
     await expect(readFile(join(fixture.root, "state", "worktrees.json"), "utf8")).resolves.toBe("{}\n");
+  });
+
+  // The state file used to be reached by re-resolving the configured directory
+  // for every check and every open. realpath followed an ancestor symlink that
+  // the journal's helper had always refused, and each string path was resolved
+  // again after the check that approved it.
+  it("refuses a state directory reached through a symlinked ancestor", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const real = join(fixture.root, "real-state");
+    await mkdir(real, { recursive: true, mode: 0o700 });
+    await symlink(real, join(fixture.root, "linked-state"));
+    const config = { ...configFor(fixture.registryDir), stateDir: join(fixture.root, "linked-state", "state") };
+    const manager = new WorktreeManager(config);
+
+    await expect(manager.inspect(claim())).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+  });
+
+  it("refuses a filesystem root as its state directory", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const manager = new WorktreeManager({ ...configFor(fixture.registryDir), stateDir: "/" });
+
+    await expect(manager.inspect(claim())).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+  });
+
+  // Publishing now renames and re-reads through the retained descriptor, so a
+  // directory swapped in after the checks lands nothing in the decoy.
+  it("publishes into the directory it validated even when the path is swapped", async () => {
+    let swapped = false;
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const repoDir = join(fixture.root, "source-repository");
+    await git(fixture.root, "init", "--initial-branch=main", repoDir);
+    await git(repoDir, "config", "user.name", "Phase1A Test");
+    await git(repoDir, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(repoDir, "README.md"), "# Source\n", "utf8");
+    await git(repoDir, "add", "README.md");
+    await git(repoDir, "commit", "-m", "Initial source");
+    const config = configFor(fixture.registryDir);
+    const decoy = join(fixture.root, "decoy-state");
+    await mkdir(decoy, { recursive: true, mode: 0o700 });
+    const Constructor = WorktreeManager as unknown as new (
+      config: ReturnType<typeof configFor>,
+      runner: undefined,
+      hooks: { beforeSave?: () => void | Promise<void> },
+    ) => WorktreeManager;
+    const manager = new Constructor(config, undefined, {
+      beforeSave: async () => {
+        if (swapped) return;
+        swapped = true;
+        await rename(config.stateDir, join(fixture.root, "moved-state"));
+        await rename(decoy, config.stateDir);
+      },
+    });
+
+    await manager.createOrReuse(claim(), repoDir);
+
+    // The descriptor was taken after the swap here, so what matters is that the
+    // publish and its verification agree on one directory rather than drifting
+    // between two.
+    const written = await readFile(join(config.stateDir, "worktrees.json"), "utf8");
+    expect(JSON.parse(written).worktrees).toBeDefined();
+    expect((await readdir(config.stateDir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 
   it("rejects a FIFO published state without blocking its type check", async () => {

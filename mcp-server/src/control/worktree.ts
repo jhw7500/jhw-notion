@@ -1,15 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory } from "./schemas.js";
 import { LOCAL_HANDOFF_DIRECTORY, LOCAL_HANDOFF_RELATIVE_PATH } from "./handoff.js";
+import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
 
 const STATE_VERSION = 2;
+const WORKTREE_STATE_FILE = "worktrees.json";
+const stateReadFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const stateCreateFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
 // Removal tolerates exactly the tool's own local handoff copy: its durable
 // copy lives in the Registry, so it is not evidence worth blocking on, while
 // any other residue keeps the fail-stop. The tolerance is limited to the
@@ -108,7 +112,7 @@ export interface WorktreeStateHooks {
   beforeSave?: () => void | Promise<void>;
   afterPublish?: (statePath: string) => void | Promise<void>;
   syncPublishedFile?: (file: FileHandle) => void | Promise<void>;
-  syncStateDirectory?: (directory: FileHandle) => void | Promise<void>;
+  syncStateDirectory?: (directory: SecureStateDirectory) => void | Promise<void>;
   afterSave?: () => void | Promise<void>;
 }
 
@@ -1086,66 +1090,60 @@ export class WorktreeManager {
   }
 
   private async loadState(): Promise<WorktreeState> {
-    const statePath = await this.statePath();
-    try {
-      const entry = await lstat(statePath);
-      if (entry.isSymbolicLink() || !entry.isFile()) {
-        throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file", { path: statePath });
+    return this.withStateDirectory(async (directory) => {
+      let file;
+      try {
+        file = await directory.openFile(WORKTREE_STATE_FILE, stateReadFlags);
+      } catch (cause) {
+        if (isNotFound(cause)) return { version: STATE_VERSION, worktrees: {} };
+        throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file");
       }
-    } catch (cause) {
-      if (cause instanceof ControlError) throw cause;
-      if (isNotFound(cause)) return { version: STATE_VERSION, worktrees: {} };
-      throw cause;
-    }
-    try {
-      return parseState(JSON.parse(await readFile(statePath, "utf8")));
-    } catch (cause) {
-      if (cause instanceof ControlError) throw cause;
-      throw new ControlError("INVALID_WORKTREE_STATE", "Worktree state could not be parsed", {
-        path: statePath,
-        cause: cause instanceof Error ? cause.message : String(cause),
-      });
-    }
+      try {
+        const info = await file.stat();
+        if (!info.isFile() || info.nlink !== 1) {
+          throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file");
+        }
+        return parseState(JSON.parse(await file.readFile("utf8")));
+      } catch (cause) {
+        if (cause instanceof ControlError) throw cause;
+        throw new ControlError("INVALID_WORKTREE_STATE", "Worktree state could not be parsed", {
+          cause: cause instanceof Error ? cause.message : String(cause),
+        });
+      } finally {
+        await file.close().catch(() => undefined);
+      }
+    });
   }
 
   private async saveState(state: WorktreeState): Promise<void> {
     await this.stateHooks.beforeSave?.();
-    const statePath = await this.statePath();
     const serialized = `${JSON.stringify(state, null, 2)}\n`;
-    try {
-      const existing = await lstat(statePath);
-      if (existing.isSymbolicLink() || !existing.isFile()) {
-        throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file", { path: statePath });
+    await this.withStateDirectory(async (directory) => {
+      const temporary = `.worktrees.${randomUUID()}.tmp`;
+      let handle: Awaited<ReturnType<SecureStateDirectory["openFile"]>> | undefined;
+      try {
+        handle = await directory.openFile(temporary, stateCreateFlags, 0o600);
+        await handle.chmod(0o600);
+        await handle.writeFile(serialized, "utf8");
+        await handle.sync();
+        await handle.close();
+        handle = undefined;
+        await directory.renameWithin(temporary, WORKTREE_STATE_FILE);
+        await this.stateHooks.afterPublish?.(join(directory.path, WORKTREE_STATE_FILE));
+        await this.verifyPublishedState(directory, serialized);
+      } catch (cause) {
+        if (handle) await handle.close().catch(() => undefined);
+        await directory.unlinkWithin(temporary).catch(() => undefined);
+        throw cause;
       }
-    } catch (cause) {
-      if (cause instanceof ControlError) throw cause;
-      if (!isNotFound(cause)) throw cause;
-    }
-    const temporary = join(this.config.stateDir, `.worktrees.${randomUUID()}.tmp`);
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      handle = await open(temporary, "wx", 0o600);
-      await handle.chmod(0o600);
-      await handle.writeFile(serialized, "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await rename(temporary, statePath);
-      await this.stateHooks.afterPublish?.(statePath);
-      await this.verifyPublishedState(statePath, serialized);
-    } catch (cause) {
-      if (handle) await handle.close().catch(() => undefined);
-      await unlink(temporary).catch(() => undefined);
-      throw cause;
-    }
+    });
     await this.stateHooks.afterSave?.();
   }
 
-  private async verifyPublishedState(statePath: string, expected: string): Promise<void> {
-    let published: Awaited<ReturnType<typeof open>> | undefined;
-    let directory: Awaited<ReturnType<typeof open>> | undefined;
+  private async verifyPublishedState(directory: SecureStateDirectory, expected: string): Promise<void> {
+    let published: Awaited<ReturnType<SecureStateDirectory["openFile"]>> | undefined;
     try {
-      published = await open(statePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      published = await directory.openFile(WORKTREE_STATE_FILE, stateReadFlags);
       const info = await published.stat();
       if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600) throw new Error("unsafe published state");
       const actual = await published.readFile("utf8");
@@ -1154,35 +1152,28 @@ export class WorktreeManager {
       if (this.stateHooks.syncPublishedFile) await this.stateHooks.syncPublishedFile(published);
       else await published.sync();
 
-      directory = await open(this.config.stateDir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-      const directoryInfo = await directory.stat();
-      if (!directoryInfo.isDirectory()) throw new Error("unsafe state directory");
       if (this.stateHooks.syncStateDirectory) await this.stateHooks.syncStateDirectory(directory);
       else await directory.sync();
     } catch {
       throw new ControlError("WORKTREE_STATE_WRITE_FAILED", "Published worktree state failed durability verification");
     } finally {
-      await directory?.close().catch(() => undefined);
       await published?.close().catch(() => undefined);
     }
   }
 
-  private async statePath(): Promise<string> {
-    if (!isAbsolute(this.config.stateDir)) {
-      throw new ControlError("UNSAFE_STATE_PATH", "Control state directory must be absolute", { state_dir: this.config.stateDir });
+  /**
+   * Every state operation runs against one retained descriptor rather than
+   * re-resolving the configured directory, which is what let an ancestor
+   * symlink through and what left a window between each check and the open
+   * that followed it.
+   */
+  private async withStateDirectory<T>(operation: (directory: SecureStateDirectory) => Promise<T>): Promise<T> {
+    const directory = await openSecureStateDirectory(this.config.stateDir);
+    try {
+      return await operation(directory);
+    } finally {
+      await directory.close().catch(() => undefined);
     }
-    await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 });
-    const entry = await lstat(this.config.stateDir);
-    if (entry.isSymbolicLink() || !entry.isDirectory()) {
-      throw new ControlError("UNSAFE_STATE_PATH", "Control state directory must be a non-symbolic directory", {
-        state_dir: this.config.stateDir,
-      });
-    }
-    await chmod(this.config.stateDir, 0o700);
-    const root = await realpath(this.config.stateDir);
-    const path = join(root, "worktrees.json");
-    if (!isWithin(root, path)) throw new ControlError("UNSAFE_STATE_PATH", "Worktree state path escapes state directory", { root, path });
-    return path;
   }
 
   /**
