@@ -2,15 +2,18 @@ import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import { ControlError } from "../errors.js";
 import { MAX_HANDOFF_BYTES } from "../handoff.js";
+import { RegistryRecordStore } from "../codec.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit, type ProcessRunnerLike, type RegistryMutationResult } from "../registry-git.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
+const RecordShape = z.object({ n: z.string() });
 
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
@@ -490,6 +493,100 @@ describe("RegistryGit", () => {
     expect(seen.listed.map((entry) => entry.name)).toEqual(["one.json"]);
     expect(await registry.headRegularBlobObjectId("tasks/one.json")).not.toBe(pinned);
     expect(await registry.headRegularBlobObjectId("tasks/two.json")).toMatch(/^[0-9a-f]{40,64}$/);
+  });
+
+  // Pinning freezes the committed side but not the checkout, so once HEAD
+  // moves the two stop agreeing. That is this read being stale, and calling it
+  // corruption would send an operator after a Registry that is fine.
+  it("reports a moved HEAD as a stale read rather than a damaged Registry", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "First");
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+    const records = new RegistryRecordStore(registryDir, registry, createSensitiveDataPolicy({}));
+
+    const outcome = await registry.withCommittedTree(["tasks"], async () => {
+      await writeFile(join(registryDir, "tasks", "two.json"), `{"n":"two"}\n`, "utf8");
+      await git(registryDir, "add", "--", "tasks");
+      await git(registryDir, "commit", "-m", "Landed underneath");
+      return records.listDirectoryEntries("tasks", 100).catch((cause: unknown) => cause);
+    });
+
+    expect(outcome).toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
+  });
+
+  // The record comparison has the same skew as the directory one and needs its
+  // own guard: removing only this branch left the whole suite green.
+  it("reports a moved HEAD as stale when a record disagrees, not just a directory", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "First");
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+    const records = new RegistryRecordStore(registryDir, registry, createSensitiveDataPolicy({}));
+
+    const outcome = await registry.withCommittedTree(["tasks"], async () => {
+      await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"changed"}\n`, "utf8");
+      await git(registryDir, "add", "--", "tasks");
+      await git(registryDir, "commit", "-m", "Landed underneath");
+      return records.readOptionalJson("tasks/one.json", RecordShape).catch((cause: unknown) => cause);
+    });
+
+    expect(outcome).toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
+  });
+
+  // A scope is published before the commit it will read is resolved, so a read
+  // arriving in that window must be refused rather than handed an empty
+  // revision — and the scope has to work normally once it resolves.
+  it("refuses a read that arrives before the scope has resolved its commit", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "Tasks");
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    const scoped = registry.withCommittedTree(["tasks"], () => registry.headRegularBlobObjectId("tasks/one.json"));
+    const during = await registry.headRegularBlobObjectId("tasks/one.json").catch((cause: unknown) => cause);
+    const inside = await scoped;
+
+    // Both assertions carry weight: the first catches a revision that is empty,
+    // the second a scope that quietly falls back to HEAD and answers anyway.
+    expect(during).toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(inside).toMatch(/^[0-9a-f]{40,64}$/);
+  });
+
+  it("forgets a subtree listing that failed so the scope can read it again", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "Tasks");
+    let failNext = true;
+    const runner = new ProcessRunner();
+    const registry = fixtureRegistryGit(configFor(registryDir), {
+      run: async (command: string, args: string[], options?: Parameters<ProcessRunner["run"]>[2]) => {
+        if (failNext && args[0] === "ls-tree" && args[1] === "-r") {
+          failNext = false;
+          throw new ControlError("COMMAND_FAILED", "injected listing failure");
+        }
+        return runner.run(command, args, options);
+      },
+      runRaw: runner.runRaw.bind(runner),
+    } as unknown as ProcessRunnerLike);
+
+    const outcome = await registry.withCommittedTree(["tasks"], async () => {
+      const first = await registry.headRegularBlobObjectId("tasks/one.json").catch((cause: unknown) => cause);
+      // One transient failure must not decide every later read of the
+      // directory for the rest of the scope.
+      return { first, second: await registry.headRegularBlobObjectId("tasks/one.json") };
+    });
+
+    expect(outcome.first).toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(outcome.second).toMatch(/^[0-9a-f]{40,64}$/);
   });
 
   it("holds one scope for concurrent callers and releases it once", async () => {

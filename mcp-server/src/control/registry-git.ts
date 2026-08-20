@@ -94,7 +94,7 @@ export class RegistryGit {
    * once for all of them costs the same as asking it once for one.
    */
   private committedTree?: {
-    commit: string;
+    commit?: string;
     directories: readonly string[];
     subtrees: Map<string, Promise<Map<string, HeadBlobEntry>>>;
     holders: number;
@@ -141,8 +141,8 @@ export class RegistryGit {
       held.holders += 1;
       return this.releasingCommittedTree(held, read);
     }
-    const scope = {
-      commit: "",
+    const scope: NonNullable<RegistryGit["committedTree"]> = {
+      commit: undefined,
       directories: [...relativeDirectories],
       subtrees: new Map<string, Promise<Map<string, HeadBlobEntry>>>(),
       holders: 1,
@@ -192,6 +192,22 @@ export class RegistryGit {
     return this.committedTree?.commit ?? "HEAD";
   }
 
+  /**
+   * Whether a scope is reading a commit HEAD has since left. A scope freezes
+   * the committed side but not the checkout, so once HEAD moves the two stop
+   * agreeing — which is a stale read, not a damaged Registry, and the caller
+   * has to be able to tell them apart before it says which.
+   */
+  async committedViewIsStale(): Promise<boolean> {
+    const pinned = this.committedTree?.commit;
+    if (pinned === undefined) return false;
+    try {
+      return (await this.headCommit()) !== pinned;
+    } catch {
+      return false;
+    }
+  }
+
   /** One recursive listing, held to the same gates a single lookup applies. */
   private async committedSubtree(relativeDirectory: string, commit: string): Promise<Map<string, HeadBlobEntry>> {
     if (!isSafeRegistryRelativePath(relativeDirectory)) {
@@ -236,7 +252,14 @@ export class RegistryGit {
   ): Promise<Map<string, HeadBlobEntry>> {
     const started = scope.subtrees.get(directory);
     if (started) return started;
-    const pending = this.committedSubtree(directory, scope.commit);
+    const commit = scope.commit;
+    if (commit === undefined) throw new ControlError("REGISTRY_CORRUPT", "Registry scope has no resolved commit");
+    // A failed listing is not remembered: one transient git failure would
+    // otherwise fail every later read of the same directory in this scope.
+    const pending = this.committedSubtree(directory, commit).catch((cause: unknown) => {
+      scope.subtrees.delete(directory);
+      throw cause;
+    });
     scope.subtrees.set(directory, pending);
     return pending;
   }

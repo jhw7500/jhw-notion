@@ -16,6 +16,8 @@ export interface RegistryHeadPort {
   assertHeadRegularFile(relativePath: string): Promise<void>;
   readHeadRegularBlob(relativePath: string): Promise<Buffer>;
   listHeadDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]>;
+  /** True when the committed side of a comparison is behind the checkout. */
+  committedViewIsStale?(): Promise<boolean>;
 }
 
 export interface RecordIdentity {
@@ -104,8 +106,18 @@ export class RegistryRecordStore {
         throw corrupt("Registry record leaf must be a single-link regular file", relativePath);
       }
       const bytes = await this.boundedFileBytes(file, info, relativePath);
-      if (!committed) throw corrupt("Existing Registry record is not present in HEAD", relativePath);
-      if (!bytes.equals(committed)) throw corrupt("Registry checkout bytes disagree with HEAD", relativePath);
+      if (!committed || !bytes.equals(committed)) {
+        // Same distinction the directory listing makes: a pinned read whose
+        // checkout has moved on is stale, and saying "corrupt" would send the
+        // operator after a Registry that is fine.
+        if (await this.head.committedViewIsStale?.()) {
+          throw new ControlError("REGISTRY_MOVED_DURING_READ", "Registry HEAD moved while this read was in progress", {
+            relativePath,
+          });
+        }
+        if (!committed) throw corrupt("Existing Registry record is not present in HEAD", relativePath);
+        throw corrupt("Registry checkout bytes disagree with HEAD", relativePath);
+      }
       let text: string;
       try {
         text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -178,6 +190,14 @@ export class RegistryRecordStore {
       }
       const sorted = output.sort((left, right) => left.name.localeCompare(right.name));
       if (JSON.stringify(sorted) !== JSON.stringify(committed)) {
+        // A read that pinned a commit sees the checkout move ahead of it. That
+        // is this read being stale, not the Registry being damaged, and only
+        // the difference between the two tells the operator whether to retry.
+        if (await this.head.committedViewIsStale?.()) {
+          throw new ControlError("REGISTRY_MOVED_DURING_READ", "Registry HEAD moved while this read was in progress", {
+            relativeDirectory,
+          });
+        }
         throw corrupt("Registry checkout directory disagrees with HEAD", relativeDirectory);
       }
       return committed;

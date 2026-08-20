@@ -144,4 +144,5 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
 - exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.
 - exit `75`: Registry dirty/diverged 또는 lock contention/acquisition timeout. stop; 자동 retry/rebase/force 금지. Lock helper spawn/setup/acquire 실패는 일반 command `1`, preflight NO-GO `78`이다.
+- `REGISTRY_MOVED_DURING_READ`: 읽기 도중 다른 세션이 Registry에 커밋해 이 읽기가 뒤처진 것이다. **Registry 손상이 아니므로 같은 명령을 그대로 다시 실행**한다. 읽기 전용 명령(`status`·`handoff`·`assert-owner`·`recover --action status`)은 host lock을 잡지 않아 이 조건에 걸릴 수 있다. 반복되면 쓰기가 계속 들어오는 것이니 한가한 시점에 다시 본다.
 - 다른 nonzero: stable `error.code`만 보고하고 secret/raw path를 출력하지 않는다.
