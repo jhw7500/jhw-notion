@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, open, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 import { ControlError } from "./errors.js";
@@ -41,6 +41,15 @@ export interface SecureStateDirectory {
   readonly path: string;
   readonly fd: number;
   openFile(name: string, flags: number, mode?: number): Promise<FileHandle>;
+  /**
+   * Publishes one child name over another within this directory. A state file
+   * that is replaced rather than appended needs this to stay anchored too:
+   * resolving either side through the configured path again would reopen the
+   * window the descriptor exists to close.
+   */
+  renameWithin(from: string, to: string): Promise<void>;
+  /** Removes one child name, for abandoning a temporary that never published. */
+  unlinkWithin(name: string): Promise<void>;
   sync(): Promise<void>;
   close(): Promise<void>;
 }
@@ -91,7 +100,17 @@ class AnchoredStateDirectory implements SecureStateDirectory {
     if (!safeStateFileName(name)) throw unsafeStatePath();
     // The descriptor-backed path retains the directory inode even if a hostile
     // concurrent actor renames a validated ancestor after the open below.
-    return open(`/proc/self/fd/${this.handle.fd}/${name}`, flags | constants.O_NOFOLLOW, mode);
+    return open(this.child(name), flags | constants.O_NOFOLLOW, mode);
+  }
+
+  async renameWithin(from: string, to: string): Promise<void> {
+    if (!safeStateFileName(from) || !safeStateFileName(to)) throw unsafeStatePath();
+    await rename(this.child(from), this.child(to));
+  }
+
+  async unlinkWithin(name: string): Promise<void> {
+    if (!safeStateFileName(name)) throw unsafeStatePath();
+    await unlink(this.child(name));
   }
 
   async sync(): Promise<void> {
@@ -100,6 +119,10 @@ class AnchoredStateDirectory implements SecureStateDirectory {
 
   async close(): Promise<void> {
     await this.handle.close();
+  }
+
+  private child(name: string): string {
+    return `/proc/self/fd/${this.handle.fd}/${name}`;
   }
 }
 

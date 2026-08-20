@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -124,6 +124,44 @@ describe("RegistrationHintStore", () => {
     await symlink(join(directory, "elsewhere.json"), statePath);
 
     await expect(store.read("prj-example")).rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+  });
+
+  // The store used to validate only the final component and then re-resolve the
+  // configured path for every read and write. An ancestor symlink slipped
+  // through that, while the journal's helper had always refused it.
+  it("refuses a state directory reached through a symlinked ancestor", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-registration-hint-"));
+    roots.push(root);
+    const real = join(root, "real");
+    await mkdir(join(real, "state"), { recursive: true, mode: 0o700 });
+    await symlink(real, join(root, "link"));
+
+    await expect(new RegistrationHintStore(join(root, "link", "state")).read("prj-example"))
+      .rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+  });
+
+  it("refuses a filesystem root as its state directory", async () => {
+    await expect(new RegistrationHintStore("/").read("prj-example"))
+      .rejects.toMatchObject({ code: "UNSAFE_STATE_PATH" });
+  });
+
+  it("restores the directory mode a previous run left too permissive", async () => {
+    const directory = await stateDir();
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o755);
+
+    await new RegistrationHintStore(directory).record(hint);
+
+    expect((await lstat(directory)).mode & 0o777).toBe(0o700);
+  });
+
+  it("refuses to load a state file larger than it would ever write", async () => {
+    const directory = await stateDir();
+    const store = new RegistrationHintStore(directory);
+    await store.record(hint);
+    await writeFile(join(directory, "project-registrations.json"), "x".repeat(1024 * 1024 + 1), "utf8");
+
+    await expect(store.read("prj-example")).rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT_STATE" });
   });
 
   it("refuses a relative state directory", async () => {

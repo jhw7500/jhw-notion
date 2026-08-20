@@ -1,15 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
-import { isAbsolute, join, relative, sep } from "node:path";
 
 import { z } from "zod";
 
 import { ControlError } from "./errors.js";
+import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
 
 const STATE_FILE = "project-registrations.json";
 const STATE_VERSION = 1;
 const MAX_TRACKED_PROJECTS = 256;
+// The ceiling above bounds what this store writes; this bounds what it will
+// read back, so a file that grew by some other hand cannot be loaded whole.
+const MAX_STATE_BYTES = 1024 * 1024;
+const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const createFlags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
 
 const coordinate = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
 
@@ -50,13 +54,8 @@ function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
 }
 
-function isWithin(root: string, candidate: string): boolean {
-  const path = relative(root, candidate);
-  return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
-}
-
-function unsafeStatePath(detail: Record<string, unknown> = {}): ControlError {
-  return new ControlError("UNSAFE_STATE_PATH", "Registration hint state path is not a private regular file", detail);
+function unsafeStatePath(): ControlError {
+  return new ControlError("UNSAFE_STATE_PATH", "Registration hint state path is not a private regular file");
 }
 
 function parseState(raw: unknown): RegistrationHintState {
@@ -90,7 +89,7 @@ export class RegistrationHintStore implements RegistrationHintPort {
   ) {}
 
   async read(projectId: string): Promise<RegistrationHint | undefined> {
-    return (await this.load())?.records[projectId];
+    return this.withDirectory(async (directory) => (await this.load(directory))?.records[projectId]);
   }
 
   async record(hint: RegistrationHint): Promise<void> {
@@ -98,7 +97,8 @@ export class RegistrationHintStore implements RegistrationHintPort {
     if (!parsed.success) {
       throw new ControlError("INVALID_REGISTRATION_HINT", "Registration hint is not a bounded coordinate set");
     }
-    const state = await this.load();
+    await this.withDirectory(async (directory) => {
+    const state = await this.load(directory);
     const records = { ...state?.records, [parsed.data.project_id]: parsed.data };
     // Entries are kept for the life of the record they name, so the bound is a
     // ceiling on projects this host has registered rather than on concurrent
@@ -106,39 +106,48 @@ export class RegistrationHintStore implements RegistrationHintPort {
     if (Object.keys(records).length > MAX_TRACKED_PROJECTS) {
       throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state tracks too many projects");
     }
-    await this.save({ version: STATE_VERSION, records });
+      await this.save(directory, { version: STATE_VERSION, records });
+    });
   }
 
   /** The stored state, or undefined when this host has never written one. */
-  private async load(): Promise<RegistrationHintState | undefined> {
-    const statePath = await this.statePath();
+  private async load(directory: SecureStateDirectory): Promise<RegistrationHintState | undefined> {
+    let file;
     try {
-      const entry = await lstat(statePath);
-      if (entry.isSymbolicLink() || !entry.isFile()) throw unsafeStatePath({ path: statePath });
+      file = await directory.openFile(STATE_FILE, readFlags);
     } catch (cause) {
-      if (cause instanceof ControlError) throw cause;
       if (isNotFound(cause)) return undefined;
-      throw cause;
+      throw unsafeStatePath();
     }
-    let raw: unknown;
     try {
-      raw = JSON.parse(await readFile(statePath, "utf8"));
-    } catch (cause) {
-      throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state could not be parsed", {
-        cause: cause instanceof Error ? cause.message : String(cause),
-      });
+      const info = await file.stat();
+      if (!info.isFile() || info.nlink !== 1) throw unsafeStatePath();
+      if (info.size > MAX_STATE_BYTES) {
+        throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state is larger than this store writes");
+      }
+      let raw: unknown;
+      try {
+        raw = JSON.parse(await file.readFile("utf8"));
+      } catch (cause) {
+        throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state could not be parsed", {
+          cause: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+      return parseState(raw);
+    } finally {
+      await file.close().catch(() => undefined);
     }
-    return parseState(raw);
   }
 
-  private async save(state: RegistrationHintState): Promise<void> {
+  private async save(directory: SecureStateDirectory, state: RegistrationHintState): Promise<void> {
     await this.hooks.beforeSave?.();
-    const statePath = await this.statePath();
     const serialized = `${JSON.stringify(state, null, 2)}\n`;
-    const temporary = join(this.stateDir, `.project-registrations.${randomUUID()}.tmp`);
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    const temporary = `.project-registrations.${randomUUID()}.tmp`;
+    let handle: Awaited<ReturnType<SecureStateDirectory["openFile"]>> | undefined;
     try {
-      handle = await open(temporary, "wx", 0o600);
+      handle = await directory.openFile(temporary, createFlags, 0o600);
+      // O_EXCL fixes the mode at creation, but umask can still clear bits from
+      // it, so the mode is asserted rather than requested.
       await handle.chmod(0o600);
       await handle.writeFile(serialized, "utf8");
       // The entry only helps a run that starts after this one died, so it has
@@ -146,35 +155,27 @@ export class RegistrationHintStore implements RegistrationHintPort {
       await handle.sync();
       await handle.close();
       handle = undefined;
-      await rename(temporary, statePath);
-      await this.hooks.afterPublish?.(statePath);
-      await this.syncDirectory();
+      await directory.renameWithin(temporary, STATE_FILE);
+      await this.hooks.afterPublish?.(directory.path);
+      await directory.sync();
     } catch (cause) {
       if (handle) await handle.close().catch(() => undefined);
-      await unlink(temporary).catch(() => undefined);
+      await directory.unlinkWithin(temporary).catch(() => undefined);
       throw cause;
     }
   }
 
-  private async syncDirectory(): Promise<void> {
-    let directory: Awaited<ReturnType<typeof open>> | undefined;
+  /**
+   * Every operation runs against one descriptor rather than re-resolving the
+   * configured directory, so a read and the write that follows it cannot land
+   * in two different directories.
+   */
+  private async withDirectory<T>(operation: (directory: SecureStateDirectory) => Promise<T>): Promise<T> {
+    const directory = await openSecureStateDirectory(this.stateDir);
     try {
-      directory = await open(this.stateDir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-      await directory.sync();
+      return await operation(directory);
     } finally {
-      await directory?.close().catch(() => undefined);
+      await directory.close().catch(() => undefined);
     }
-  }
-
-  private async statePath(): Promise<string> {
-    if (!isAbsolute(this.stateDir)) throw unsafeStatePath({ state_dir: this.stateDir });
-    await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
-    const entry = await lstat(this.stateDir);
-    if (entry.isSymbolicLink() || !entry.isDirectory()) throw unsafeStatePath({ state_dir: this.stateDir });
-    await chmod(this.stateDir, 0o700);
-    const root = await realpath(this.stateDir);
-    const path = join(root, STATE_FILE);
-    if (!isWithin(root, path)) throw unsafeStatePath({ root, path });
-    return path;
   }
 }
