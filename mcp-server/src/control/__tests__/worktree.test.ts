@@ -280,6 +280,24 @@ describe("WorktreeManager", () => {
     await expect(readFile(join(created.path, ".ai", "handoff.md"), "utf8")).resolves.toBe("uncommitted edit\n");
   });
 
+  // The tolerance drops the copy and then tries to drop its directory. When a
+  // tracked sibling lives there the rmdir fails with ENOTEMPTY, which must not
+  // become an error: nothing was lost, and Git still decides about the rest.
+  it("tolerates a handoff directory that a tracked sibling keeps non-empty", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    await mkdir(join(repoDir, ".ai"), { recursive: true });
+    await writeFile(join(repoDir, ".ai", "keep.md"), "tracked sibling\n", "utf8");
+    await git(repoDir, "add", ".ai/keep.md");
+    await git(repoDir, "commit", "-m", "Track a sibling of the handoff copy");
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await writeFile(join(created.path, ".ai", "handoff.md"), "retry copy\n", "utf8");
+
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true });
+    await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(repoDir, ".ai", "keep.md"))).resolves.toBeDefined();
+  });
+
   it("refuses removal when the handoff copy itself is a symlink", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const active = claim();

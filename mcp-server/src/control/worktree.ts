@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, open, readFile, realpath, rename, rmdir, unlink, t
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory } from "./schemas.js";
-import { LOCAL_HANDOFF_RELATIVE_PATH } from "./handoff.js";
+import { LOCAL_HANDOFF_DIRECTORY, LOCAL_HANDOFF_RELATIVE_PATH } from "./handoff.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
@@ -15,6 +15,12 @@ const STATE_VERSION = 2;
 // any other residue keeps the fail-stop. The tolerance is limited to the
 // untracked status entry — a tracked `.ai/handoff.md`, or tracked changes to
 // it, are repository content and keep blocking like any other file.
+//
+// This is deliberately stricter than the retry-evidence tolerance in
+// `task-service.ts`, which excuses the same artifact by path alone. That one
+// only decides whether two inspections describe the same worktree; this one
+// decides whether to delete a file. Only one of them can lose an operator's
+// work, so only one insists the file be untracked. Do not harmonize them.
 const EXPECTED_LOCAL_HANDOFF_ENTRY = `?? ${LOCAL_HANDOFF_RELATIVE_PATH}`;
 
 function removalBlockingEntries(statusEntries: readonly string[]): string[] {
@@ -729,29 +735,48 @@ export class WorktreeManager {
     // regular file. lstat cannot fully close the swap race (there is no
     // unlinkat), yet a late symlink swap can remove at most one link name,
     // and any other new file keeps `git worktree remove` refusing below.
+    //
+    // Only the regular-file half is reachable from a file layout: a symlinked
+    // copy still reports as `?? .ai/handoff.md`. The directory half cannot be,
+    // because Git never produces that entry when `.ai` is a symlink — it
+    // reports `?? .ai` when the link is untracked and says nothing at all when
+    // the link is committed, since it does not descend through one. That half
+    // exists for the swap race alone, which is why no fixture reaches it.
     if (status_entries.includes(EXPECTED_LOCAL_HANDOFF_ENTRY)) {
-      const localHandoffDirectory = join(current.path, ".ai");
+      const localHandoffDirectory = join(current.path, LOCAL_HANDOFF_DIRECTORY);
       const localHandoffPath = join(current.path, LOCAL_HANDOFF_RELATIVE_PATH);
       const directoryInfo = await lstat(localHandoffDirectory).catch(() => null);
       const fileInfo = await lstat(localHandoffPath).catch(() => null);
       if (!directoryInfo?.isDirectory() || !fileInfo?.isFile()) {
+        // Reuses WORKTREE_DIRTY because the outcome is the same fail-stop, but
+        // the reason distinguishes it: the worktree is not dirty with operator
+        // work, the artifact this tolerance exists for is not what it claimed.
         throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a worktree whose handoff copy is not a plain file", {
           worktree_ref: current.worktree_ref,
           dirty_files: current.dirty_files,
+          reason: "handoff_copy_not_plain_file",
         });
       }
       await unlink(localHandoffPath).catch((cause) => {
-        if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
+        const code = (cause as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") {
+          // The errno is the whole diagnosis here — a permission problem and a
+          // path that turned into something else need different responses.
           throw new ControlError("WORKTREE_CLEANUP_FAILED", "Failed to drop the local handoff copy before removal", {
             worktree_ref: current.worktree_ref,
+            errno: code ?? "unknown",
           });
         }
       });
+      // ENOTEMPTY is tolerated: something else lives in `.ai`, which is not
+      // this tolerance's business. `git worktree remove` below still refuses
+      // if that leftover matters, so nothing is silently discarded.
       await rmdir(localHandoffDirectory).catch((cause) => {
         const code = (cause as NodeJS.ErrnoException).code;
         if (code !== "ENOENT" && code !== "ENOTEMPTY") {
           throw new ControlError("WORKTREE_CLEANUP_FAILED", "Failed to drop the local handoff directory before removal", {
             worktree_ref: current.worktree_ref,
+            errno: code ?? "unknown",
           });
         }
       });

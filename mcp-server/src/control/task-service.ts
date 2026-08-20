@@ -238,6 +238,12 @@ function withoutExpectedLocalHandoff(paths: readonly string[]): string[] {
   if (index < 0) return [...paths];
   // Remove one precise expected retry delta. A duplicated entry remains part
   // of evidence and therefore fails closed rather than being silently hidden.
+  //
+  // This excuses the artifact by path, without asking whether Git considers it
+  // tracked — deliberately looser than the removal tolerance in `worktree.ts`,
+  // which requires the untracked status entry. The difference is what the two
+  // decisions cost: this one only compares two inspections of the same
+  // worktree, while that one deletes a file. Do not harmonize them.
   return paths.filter((_, current) => current !== index);
 }
 

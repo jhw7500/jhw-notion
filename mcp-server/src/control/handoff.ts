@@ -316,14 +316,23 @@ async function writeRegularFile(path: string, content: string, code: string): Pr
   }
 }
 
-/** Writes the host-local Handoff without following a `.ai` or file symlink. */
+/**
+ * The two components the local handoff copy is made of. They are the primitives
+ * here so that writing the artifact and tolerating it cannot drift apart: the
+ * writer joins them, and every reader derives from the same pair.
+ */
+export const LOCAL_HANDOFF_DIRECTORY = ".ai";
+const LOCAL_HANDOFF_FILE = "handoff.md";
+
 /**
  * Worktree-relative path of the local handoff copy. Every place that treats
  * this artifact as tool-owned (removal tolerance, retry-evidence comparison)
- * must share this single definition.
+ * must share this single definition. The separator is `/` rather than the
+ * platform's, because this value is compared against `git status` output.
  */
-export const LOCAL_HANDOFF_RELATIVE_PATH = ".ai/handoff.md";
+export const LOCAL_HANDOFF_RELATIVE_PATH = `${LOCAL_HANDOFF_DIRECTORY}/${LOCAL_HANDOFF_FILE}`;
 
+/** Writes the host-local Handoff without following a `.ai` or file symlink. */
 export async function writeWorktreeHandoff(
   worktreePath: string,
   content: string,
@@ -333,8 +342,8 @@ export async function writeWorktreeHandoff(
   assertNoAbsoluteHostPaths(content);
   assertValidHandoff(content);
   const worktreeRoot = await rootDirectory(worktreePath, "UNSAFE_WORKTREE_PATH");
-  const aiDirectory = await containedDirectory(worktreeRoot, ".ai", "UNSAFE_HANDOFF_PATH");
-  const handoffPath = join(aiDirectory, "handoff.md");
+  const aiDirectory = await containedDirectory(worktreeRoot, LOCAL_HANDOFF_DIRECTORY, "UNSAFE_HANDOFF_PATH");
+  const handoffPath = join(aiDirectory, LOCAL_HANDOFF_FILE);
   await writeRegularFile(handoffPath, content, "UNSAFE_HANDOFF_PATH");
   return handoffPath;
 }
