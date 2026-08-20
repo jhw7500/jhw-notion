@@ -173,9 +173,14 @@ describe("WorktreeManager", () => {
       runner: undefined,
       hooks: { afterPublish?: (statePath: string) => void | Promise<void> },
     ) => WorktreeManager;
+    // Creating publishes twice — pending-create, then active. Racing the last
+    // one means no later save follows the configured path to the decoy, so the
+    // decoy staying empty is itself part of the claim being made.
+    let publishes = 0;
     const manager = new Constructor(config, undefined, {
       afterPublish: async () => {
-        if (swapped) return;
+        publishes += 1;
+        if (publishes !== 2) return;
         swapped = true;
         await rename(anchored, join(fixture.root, "moved-parent"));
         await rename(decoy, anchored);
@@ -183,13 +188,31 @@ describe("WorktreeManager", () => {
     });
 
     await expect(manager.createOrReuse(claim(), repoDir)).resolves.toBeDefined();
+    expect(swapped).toBe(true);
 
-    // The publish that ran during the swap verified itself against the inode it
-    // wrote to. Later saves take a fresh descriptor and follow the configured
-    // path to wherever it now points, which is why the decoy is not empty and
-    // why the assertion is that nothing refused rather than where things land.
     const published = join(fixture.root, "moved-parent", "state", "worktrees.json");
-    expect(JSON.parse(await readFile(published, "utf8")).worktrees).toBeDefined();
+    const state = JSON.parse(await readFile(published, "utf8")) as {
+      worktrees: Record<string, { lifecycle: string }>;
+    };
+    expect(Object.values(state.worktrees).map((entry) => entry.lifecycle)).toEqual(["active"]);
+    expect(await readdir(join(anchored, "state"))).toEqual([]);
+  });
+
+  // O_NONBLOCK keeps the open from hanging on a FIFO, so only the regular-file
+  // check refuses it. The publish path already had this test; the read path
+  // gained the same refusal in this change and needed its own.
+  it("refuses a FIFO in place of the state file without blocking", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    await manager.createOrReuse(claim(), repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    await unlink(statePath);
+    await execFile("mkfifo", [statePath]);
+
+    const outcome = await Promise.race([
+      manager.inspect(claim()).catch((cause: unknown) => cause),
+      new Promise((resolve) => setTimeout(() => resolve("hung"), 200)),
+    ]);
+    expect(outcome).toMatchObject({ code: "UNSAFE_STATE_PATH" });
   });
 
   // The read path gained these refusals; every other state file in the tree
