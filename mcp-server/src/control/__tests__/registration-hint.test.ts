@@ -200,8 +200,10 @@ describe("RegistrationHintStore", () => {
       "utf8",
     );
 
-    // Refusing costs a later retry its shortcut, never a registration.
-    await expect(store.record(hint)).rejects.toMatchObject({ code: "INVALID_REGISTRATION_HINT_STATE" });
+    // A distinct code from a damaged file: this one is repaired by pruning,
+    // and the caller reports the two apart. Refusing costs a later retry its
+    // shortcut, never a registration.
+    await expect(store.record(hint)).rejects.toMatchObject({ code: "REGISTRATION_HINT_AT_CAPACITY" });
     // Re-recording a project already tracked stays within the bound.
     await expect(store.record({ project_id: "prj-0", item_id: "PVTI_0", source_node_id: "DI_0" }))
       .resolves.toBeUndefined();

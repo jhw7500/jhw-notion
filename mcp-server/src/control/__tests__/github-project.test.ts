@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { GitHubProjectClient, type GitHubRunner } from "../github-project.js";
+import { ControlError } from "../errors.js";
+import { GitHubProjectClient, type GitHubRunner, type RegistrationRecordWarning } from "../github-project.js";
 import type { RegistrationHint, RegistrationHintPort } from "../registration-hint.js";
 import type { ProjectOperationalFields } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
@@ -143,6 +144,7 @@ function client(
   catalog = catalogFixture(),
   sleep?: (milliseconds: number) => Promise<void>,
   registrationHints?: RegistrationHintPort,
+  onRegistrationRecordUnavailable?: (code: RegistrationRecordWarning) => void,
 ) {
   return new GitHubProjectClient({
     githubOwner: "owner",
@@ -153,6 +155,7 @@ function client(
     now: () => new Date("2026-08-13T00:00:00Z"),
     ...(sleep ? { sleep } : {}),
     ...(registrationHints ? { registrationHints } : {}),
+    ...(onRegistrationRecordUnavailable ? { onRegistrationRecordUnavailable } : {}),
   });
 }
 
@@ -163,7 +166,7 @@ class FakeHints implements RegistrationHintPort {
 
   constructor(
     tracked: RegistrationHint | undefined = undefined,
-    private readonly faults: { read?: boolean; record?: boolean } = {},
+    private readonly faults: { read?: boolean; record?: boolean; atCapacity?: boolean } = {},
   ) {
     if (tracked) this.tracked.set(tracked.project_id, tracked);
   }
@@ -174,6 +177,9 @@ class FakeHints implements RegistrationHintPort {
   }
 
   async record(hint: RegistrationHint): Promise<void> {
+    if (this.faults.atCapacity) {
+      throw new ControlError("REGISTRATION_HINT_AT_CAPACITY", "Registration hint state tracks too many projects");
+    }
     if (this.faults.record) throw new Error("hint state is unwritable");
     this.recorded.push(hint);
     this.tracked.set(hint.project_id, hint);
@@ -620,6 +626,45 @@ describe("GitHubProjectClient", () => {
       // An unusable store costs the shortcut, never the registration.
       expect(pauses).toEqual([2000]);
     }
+  });
+
+  // Registration stays correct when the record fails, which is exactly why the
+  // failure needs saying: otherwise the only symptom is that it got slow again.
+  it("reports which way the registration record became unavailable", async () => {
+    for (const [faults, expected] of [
+      [{ read: true }, "REGISTRATION_RECORD_UNREADABLE"],
+      [{ record: true }, "REGISTRATION_RECORD_UNWRITABLE"],
+      [{ atCapacity: true }, "REGISTRATION_RECORD_AT_CAPACITY"],
+    ] as const) {
+      const runner = new QueuedGhRunner();
+      runner.enqueue(
+        projectPage({}), projectPage({}),
+        draftMutation(),
+        fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+        projectPage({ records: [registrationRecord("complete")] }),
+      );
+      const reported: RegistrationRecordWarning[] = [];
+
+      await expect(client(runner, catalogFixture(), async () => undefined, new FakeHints(undefined, faults), (code) => { reported.push(code); })
+        .registerProject(registration))
+        .resolves.toMatchObject({ project_item_id: "PVTI_1" });
+      expect(reported, expected).toContain(expected);
+    }
+  });
+
+  it("keeps registering when the report itself throws", async () => {
+    const runner = new QueuedGhRunner();
+    runner.enqueue(
+      projectPage({}), projectPage({}),
+      draftMutation(),
+      fieldMutation, fieldMutation, fieldMutation, fieldMutation, fieldMutation,
+      projectPage({ records: [registrationRecord("complete")] }),
+    );
+
+    await expect(client(runner, catalogFixture(), async () => undefined, new FakeHints(undefined, { record: true }), () => {
+      throw new Error("reporting is broken too");
+    }).registerProject(registration))
+      .resolves.toMatchObject({ project_item_id: "PVTI_1" });
   });
 
   it("falls back to the window when the recorded coordinates no longer resolve", async () => {

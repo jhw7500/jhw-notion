@@ -108,6 +108,7 @@ type Overrides = {
   // satisfy MutationLockPort structurally. Accept either and bridge once below.
   mutationLock?: CliDependencies['mutationLock'] | { run: ReturnType<typeof vi.fn> };
   journal?: { append: ReturnType<typeof vi.fn> };
+  registrationRecordWarning?: CliDependencies["registrationRecordWarning"];
 };
 
 function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
@@ -210,6 +211,7 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     preflight,
     mutationLock,
     ...(overrides.journal ? { journal: overrides.journal } : {}),
+    ...(overrides.registrationRecordWarning ? { registrationRecordWarning: overrides.registrationRecordWarning } : {}),
   } as unknown as CliDependencies;
 }
 
@@ -536,6 +538,51 @@ describe("runCli", () => {
     const journal = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
     expect(`${result.stdout}${result.stderr}${journal}`).not.toContain("secret-token");
     expect((await stat(join(stateDir, "pilot-journal.jsonl"))).mode & 0o777).toBe(0o600);
+  });
+
+  // The record is deliberately allowed to fail without failing registration,
+  // so the only way an operator learns the store stopped working is here.
+  it("rides a registration-record warning out on the successful result", async () => {
+    for (const code of [
+      "REGISTRATION_RECORD_UNREADABLE",
+      "REGISTRATION_RECORD_UNWRITABLE",
+      "REGISTRATION_RECORD_AT_CAPACITY",
+    ] as const) {
+      const dependencies = makeCliDependencies({ registrationRecordWarning: { code } });
+
+      const result = await runCli(registerArgs(), dependencies);
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        result: { project_id: PROJECT_ID },
+        registration_record_warning: { code },
+      });
+    }
+  });
+
+  it("leaves a successful registration unmarked when the record did its job", async () => {
+    const result = await runCli(registerArgs(), makeCliDependencies());
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).not.toHaveProperty("registration_record_warning");
+  });
+
+  // Both warnings ride the same result, and the journal one must not drop the
+  // other while rewriting the payload.
+  it("keeps both warnings when the journal fails during a degraded registration", async () => {
+    const dependencies = makeCliDependencies({
+      registrationRecordWarning: { code: "REGISTRATION_RECORD_AT_CAPACITY" },
+      journal: { append: vi.fn().mockRejectedValue(new Error("injected journal failure")) },
+    });
+
+    const result = await runCli(registerArgs(), dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      registration_record_warning: { code: "REGISTRATION_RECORD_AT_CAPACITY" },
+      journal_warning: { code: "JOURNAL_WRITE_FAILED" },
+    });
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
   });
 
   it("keeps authoritative success coordinates when the derived journal append fails", async () => {

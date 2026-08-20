@@ -24,6 +24,15 @@ import {
 } from "./schemas.js";
 
 const MAX_PROJECT_PAGES = 10_000;
+/**
+ * Why the durable registration record stopped helping. Unreadable and
+ * unwritable are repaired by fixing the state directory; at-capacity is
+ * repaired by pruning the file. All three leave registration correct and slow.
+ */
+export type RegistrationRecordWarning =
+  | "REGISTRATION_RECORD_UNREADABLE"
+  | "REGISTRATION_RECORD_UNWRITABLE"
+  | "REGISTRATION_RECORD_AT_CAPACITY";
 // A Project field write is visible to its own read-back only eventually, so an
 // update confirms through a bounded backoff instead of a single immediate read.
 const UPDATE_VERIFY_ATTEMPTS = 4;
@@ -357,6 +366,12 @@ export interface GitHubProjectClientOptions {
    * registration resolves a lagging read by waiting alone.
    */
   registrationHints?: RegistrationHintPort;
+  /**
+   * Told when that index could not do its job. The registration still
+   * succeeds, so without this the only symptom is that registering got slow
+   * again, which is not something an operator can be expected to notice.
+   */
+  onRegistrationRecordUnavailable?: (code: RegistrationRecordWarning) => void;
 }
 
 interface ProjectStructure {
@@ -1084,6 +1099,7 @@ export class GitHubProjectClient {
     try {
       return await this.options.registrationHints?.read(projectId);
     } catch {
+      this.reportRecordUnavailable("REGISTRATION_RECORD_UNREADABLE");
       return undefined;
     }
   }
@@ -1093,6 +1109,18 @@ export class GitHubProjectClient {
   private async rememberHint(hint: RegistrationHint): Promise<void> {
     try {
       await this.options.registrationHints?.record(hint);
+    } catch (cause) {
+      // A full store and a broken one both stop the shortcut, but only one of
+      // them is repaired by pruning, so they are reported apart.
+      const full = cause instanceof ControlError && cause.code === "REGISTRATION_HINT_AT_CAPACITY";
+      this.reportRecordUnavailable(full ? "REGISTRATION_RECORD_AT_CAPACITY" : "REGISTRATION_RECORD_UNWRITABLE");
+    }
+  }
+
+  /** Reporting must never be able to fail the registration it is describing. */
+  private reportRecordUnavailable(code: RegistrationRecordWarning): void {
+    try {
+      this.options.onRegistrationRecordUnavailable?.(code);
     } catch {
       return;
     }

@@ -10,7 +10,7 @@ import { RegistryRecordStore } from "./codec.js";
 import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
-import { GitHubProjectClient } from "./github-project.js";
+import { GitHubProjectClient, type RegistrationRecordWarning } from "./github-project.js";
 import { GitHubSourceService } from "./github-source.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
 import { MutationLock, ProcessRunner, type MutationLockPort } from "./process.js";
@@ -92,6 +92,13 @@ export interface PreflightPort {
 
 export interface CliDependencies {
   stateDir: string;
+  /**
+   * Set by the Project client when its durable registration record could not
+   * do its job. The command still succeeded, so this rides out on the result
+   * rather than changing it — the same shape `journal_warning` uses, and for
+   * the same reason: the operator has to be told without the outcome moving.
+   */
+  registrationRecordWarning?: { code?: RegistrationRecordWarning };
   env: NodeJS.ProcessEnv;
   now?: () => Date;
   taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff">;
@@ -117,6 +124,7 @@ class ParsedCommandFailure extends Error {
 /** Builds the production graph while retaining explicitly injectable future ports. */
 export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): CliDependencies {
   const config = loadControlConfig(env);
+  const registrationRecordWarning: { code?: RegistrationRecordWarning } = {};
   const runner = new ProcessRunner(env);
   const sensitiveData = createSensitiveDataPolicy(env, [config.registryDir, config.stateDir, config.worktreeRoot]);
   const registry = new RegistryGit(config, runner, sensitiveData);
@@ -129,6 +137,11 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     catalog,
     sensitiveData,
     registrationHints: new RegistrationHintStore(config.stateDir),
+    // First one wins: a later, milder degradation must not overwrite the
+    // reason the operator actually has to act on.
+    onRegistrationRecordUnavailable: (code) => {
+      registrationRecordWarning.code ??= code;
+    },
   });
   const source = new GitHubSourceService({ runner, catalog, projects: githubProject, sensitiveData });
   const records = new RegistryRecordStore(config.registryDir, registry, sensitiveData);
@@ -206,6 +219,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
       sensitiveData,
     }),
     mutationLock: new MutationLock(config, env),
+    registrationRecordWarning,
   };
 }
 
@@ -881,6 +895,14 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
     // Argument rejection is not a command execution and therefore must not
     // invoke the measurement journal.
     if (result.exitCode === 2) return result;
+  }
+
+  const warning = dependencies.registrationRecordWarning?.code;
+  if (warning && result.exitCode === 0) {
+    result = { ...result, stdout: `${JSON.stringify({
+      ...JSON.parse(result.stdout) as Record<string, unknown>,
+      registration_record_warning: { code: warning },
+    })}\n` };
   }
 
   const finished = dependencies.now?.() ?? new Date();

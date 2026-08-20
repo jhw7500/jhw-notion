@@ -107,7 +107,9 @@ export class RegistrationHintStore implements RegistrationHintPort {
       // concurrent work. Refusing past it costs a later retry its shortcut and
       // nothing else.
       if (Object.keys(records).length > MAX_TRACKED_PROJECTS) {
-        throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state tracks too many projects");
+        // A distinct code because the caller reports this one differently: a
+        // full store is not a damaged one, and it stays full until pruned.
+        throw new ControlError("REGISTRATION_HINT_AT_CAPACITY", "Registration hint state tracks too many projects");
       }
       await this.save(directory, { version: STATE_VERSION, records });
     });
