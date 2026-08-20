@@ -178,14 +178,15 @@ class FakeHints implements RegistrationHintPort {
 
   constructor(
     tracked: RegistrationHint | undefined = undefined,
-    private readonly faults: { read?: boolean; record?: boolean; atCapacity?: boolean } = {},
+    private readonly faults: { read?: boolean; readRaw?: boolean; record?: boolean; atCapacity?: boolean } = {},
   ) {
     if (tracked) this.tracked.set(tracked.project_id, tracked);
   }
 
   async read(projectId: string): Promise<RegistrationHint | undefined> {
     // The shape the real store fails in: a damaged file is a rejected state,
-    // while a directory it cannot reach raises a plain errno.
+    // while a directory it cannot reach raises an ordinary errno.
+    if (this.faults.readRaw) throw Object.assign(new Error("permission denied"), { code: "EACCES", errno: -13 });
     if (this.faults.read) {
       throw new ControlError("INVALID_REGISTRATION_HINT_STATE", "Registration hint state could not be parsed");
     }
@@ -196,8 +197,7 @@ class FakeHints implements RegistrationHintPort {
     if (this.faults.atCapacity) {
       throw new ControlError("REGISTRATION_HINT_AT_CAPACITY", "Registration hint state tracks too many projects");
     }
-    // A plain errno, which is what an unreachable directory actually raises.
-    if (this.faults.record) throw new Error("EACCES: permission denied");
+    if (this.faults.record) throw Object.assign(new Error("permission denied"), { code: "EACCES", errno: -13 });
     this.recorded.push(hint);
     this.tracked.set(hint.project_id, hint);
   }
@@ -652,6 +652,10 @@ describe("GitHubProjectClient", () => {
       [{ read: true }, "REGISTRATION_RECORD_UNREADABLE"],
       [{ record: true }, "REGISTRATION_RECORD_UNWRITABLE"],
       [{ atCapacity: true }, "REGISTRATION_RECORD_AT_CAPACITY"],
+      // The read site runs the same classifier as the write site, which the
+      // real-store test below also shows but only where uid cannot override
+      // permissions.
+      [{ readRaw: true }, "REGISTRATION_RECORD_UNWRITABLE"],
     ] as const) {
       const runner = new QueuedGhRunner();
       runner.enqueue(
@@ -673,10 +677,10 @@ describe("GitHubProjectClient", () => {
 
   // The store reads its file before writing it, so a damaged file surfaces as a
   // write failure. A record found in the first listing never consults the store
-  // beforehand, which makes this the only place that failure is classified —
+  // beforehand, which makes the write the only site that reports on that path —
   // and reporting it as unwritable would send the operator to a directory that
-  // is fine. Driven through the real store, because a fake cannot get the
-  // error codes the classification reads wrong.
+  // is fine. Driven through the real store so that the codes the classifier
+  // reads are the ones the store actually produces.
   it("reports a damaged store as unreadable even when only the write touched it", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-hint-classify-"));
     temporaryRoots.push(root);

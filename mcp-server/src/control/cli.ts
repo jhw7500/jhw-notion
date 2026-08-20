@@ -899,10 +899,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
     if (result.exitCode === 2) return result;
   }
 
-  // A warning here means the record write failed, so this registration has no
-  // coordinates to resume from — and a failure after that point is exactly
-  // when the operator is told to retry. Rides the failing stream too, the way
-  // journal_warning does.
+  // A warning here means the record is unusable, so this registration leaves no
+  // coordinates to resume from — and a failure is exactly when the operator is
+  // told to retry. Rides the failing stream too, the way journal_warning does.
   const warning = dependencies.registrationRecordWarning?.code;
   if (warning) {
     const stream = result.exitCode === 0 ? result.stdout : result.stderr;
