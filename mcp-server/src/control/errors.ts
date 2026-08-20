@@ -11,6 +11,20 @@ function protectedTerms(): string[] {
     .sort((left, right) => right.length - left.length);
 }
 
+/**
+ * Deliberately conservative, and it costs nothing to be. A message is never
+ * emitted — `controlErrorResult` sends the stable code and, for a Claim
+ * conflict, the claim coordinates, and nothing else — so a slash command or
+ * non-ASCII prose mangled here is read only by whoever is debugging. Anything
+ * an operator has to act on belongs in the code, not the message.
+ *
+ * What must survive is the other half: the coordinates that are emitted. Branch
+ * names and worktree refs carry slashes, and a Claim conflict is useless
+ * without them, so widening this to catch every slash would break the one
+ * diagnosis that reaches anyone. The Claim conflict test in
+ * __tests__/cli.test.ts pins that, and it is not alone: catching every slash
+ * fails five tests across four suites.
+ */
 function sanitizeString(value: string, terms: readonly string[]): string {
   let safe = value;
   for (const term of terms) safe = safe.split(term).join("[REDACTED]");

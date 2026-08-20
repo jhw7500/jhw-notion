@@ -440,6 +440,9 @@ describe("runCli", () => {
     expect(payload.journal_warning).toEqual({ code: "JOURNAL_WRITE_FAILED" });
   });
 
+  // The branch and worktree ref here carry slashes on purpose: they are the
+  // only diagnosis a Claim conflict gives anyone, and redaction that reached
+  // them would leave the operator with a code and nothing to act on.
   it("returns stable JSON and exit code 4 for a Claim conflict", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-conflict-"));
     const conflictingClaim = {
