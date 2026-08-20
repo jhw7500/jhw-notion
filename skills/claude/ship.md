@@ -21,10 +21,16 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 |---|---|---|---|
 | Codex (앱) | `chatgpt-codex-connector[bot]` | 리뷰/diff코멘트 **또는 PR 👍 리액션** | 👍 리액션만 있고 actionable 코멘트 없음 |
 | Gemini Assist (앱) | `gemini-code-assist[bot]` | `eyes`👀 ack → `COMMENTED` 리뷰 + inline | inline 지적 없음(요약만) |
-| Claude 리뷰 (워크플로우) | `claude[bot]` 리뷰 + `Claude Code Review` run | run 완료 + 리뷰 | "no issues"/LGTM, change 요청 없음 |
-| Gemini 리뷰 (워크플로우) | `Gemini Auto PR Review` run (+`github-actions[bot]` 코멘트) | run 완료 | 코멘트에 지적 없음 (실패 run은 앱이 커버) |
+| Claude 리뷰 (워크플로우) | 봇 **스티키 코멘트**(마커 `<!-- automation:claude-code-review -->`) + `Claude Code Review` run | run 완료 + 스티키 `- Reviewed:` = 현재 SHA | `[CRITICAL]`/`[HIGH]` 0건 ("No blocking issues found" 포함) |
+| Gemini 리뷰 (워크플로우) | 봇 **스티키 코멘트**(마커 `<!-- automation:gemini-auto-review -->`) + `Gemini Auto PR Review` run | run 완료 + 스티키 `- Reviewed:` = 현재 SHA | `[CRITICAL]`/`[HIGH]` 0건 |
+| OpenCode 리뷰 (워크플로우, 리포에 활성화된 경우) | 봇 코멘트(마커 `<!-- automation:opencode-auto-review -->`, **라운드마다 새 코멘트** — 스티키 아님) + `OpenCode Auto PR Review` run | run 완료 + 이번 라운드 마커 코멘트 | `[CRITICAL]`/`[HIGH]` 0건 |
 
-**단축 이름 매핑** (`--reviewers`용): `codex`→`chatgpt-codex-connector[bot]`, `gemini-assist`→`gemini-code-assist[bot]`, `claude`→`Claude Code Review`(워크플로우), `gemini`→`Gemini Auto PR Review`(워크플로우).
+**스티키 코멘트 체계 (automation v1.42+)** — Claude/Gemini 리뷰 워크플로우는 라운드마다 코멘트를 쌓지 않고 마커 달린 **코멘트 하나를 제자리 갱신**한다. 작성자 로그인은 리포 인증 모드에 따라 `github-actions[bot]` 또는 App 봇으로 달라지므로, 식별은 **마커 + `user.type == "Bot"`**으로 한다. 스티키 상단 메타 라인이 라운드 판정 근거다:
+- `- Reviewed: <sha>` — 마지막 **성공** 리뷰가 본 head SHA. **현재 SHA와 같아야 이번 라운드 응답**(재푸시 후 이전 SHA면 아직 PENDING).
+- `- Status: failure` — 리뷰 산출 실패(보존할 이전 정상 리뷰 없음) → FAILED.
+- `- Last attempt: failure (run-url)` — 이번 시도 실패, 직전 정상 리뷰는 보존됨 → 이번 라운드 FAILED(재실행 후보). 본문 리뷰 내용은 이전 라운드 것이니 이번 라운드 판정에 쓰지 않는다.
+
+**단축 이름 매핑** (`--reviewers`용): `codex`→`chatgpt-codex-connector[bot]`, `gemini-assist`→`gemini-code-assist[bot]`, `claude`→`Claude Code Review`(워크플로우), `gemini`→`Gemini Auto PR Review`(워크플로우), `opencode`→`OpenCode Auto PR Review`(워크플로우).
 
 ## 인자 / 옵션
 
@@ -36,7 +42,7 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 | `--target[=<cmd>]` | 타겟 장치 검증을 머지 게이트에 추가(리뷰와 병렬). PASS여야 머지 | off |
 | `--auto-fix` | actionable 지적을 고쳐 재푸시 → 재리뷰 라운드 반복 | off (보고만) |
 | `--base <branch>` | PR 대상(base) 브랜치 | `main` |
-| `--reviewers <list>` | 대기할 리뷰어 부분집합 (예: `codex,gemini-assist`) | 전체 4채널 |
+| `--reviewers <list>` | 대기할 리뷰어 부분집합 (예: `codex,gemini-assist`) | 감지된 전체 채널 |
 | `--timeout <min>` | **한 라운드**의 폴링 최대 대기 (간격 ~60s) | 12분 |
 | `--max-rounds <n>` | `--auto-fix` 재리뷰 라운드 상한 | 3 |
 
@@ -114,11 +120,12 @@ collect > /tmp/ship_signals.$PR   # 매 호출 1회분. 에이전트가 읽어 �
 
 ### 리뷰어별 terminal 판정 규칙
 
-- **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`. 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`)는 무시. run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**.
+- **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**.
 - **Codex**: **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**. (a) 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) 리뷰·코멘트가 전혀 없고 `chatgpt-codex-connector[bot] +1` 리액션만 있으면 → **CLEAN**(무지적 신호), (c) 아무 신호도 없으면 **PENDING**.
 - **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
-- **Claude 리뷰**: `Claude Code Review` run이 `completed`면 terminal — `claude[bot]` 본문 심각도로 판정(`must-fix` 있으면 **FEEDBACK**, `should-fix`/`minor`/`nit`만이면 **CLEAN**). run `failure`/`in_progress`면 FAILED/PENDING(게이트에선 미응답 취급 — 보고). **멈춘 in_progress run**(INTERVAL 3회 연속 in_progress 또는 TIMEOUT_MIN 초과)은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체.
-- **Gemini 리뷰(워크플로우)**: `Gemini Auto PR Review` `completed`면 terminal. 실패해도 Gemini Assist 앱 결과로 대체 가능(중복이면 앱 우선).
+- **Claude 리뷰**: `Claude Code Review` run `completed` **그리고** 마커 스티키의 `- Reviewed:`가 현재 SHA면 terminal — 스티키 본문 심각도로 판정(`[CRITICAL]`/`[HIGH]` 있으면 **FEEDBACK**, `[MEDIUM]`/`[LOW]`만이거나 "No blocking issues found"면 **CLEAN**). 스티키가 `- Status: failure`거나 `- Last attempt: failure`가 이번 run을 가리키면 **FAILED**(run 재실행이 1차 복구 — 워크플로우 파일을 바꾸는 PR에선 claude-code-action의 workflow-validation 가드가 의도적으로 스킵하므로 FAILED가 정상). run `in_progress`면 PENDING. **멈춘 in_progress run**(INTERVAL 3회 연속 in_progress 또는 TIMEOUT_MIN 초과)은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체.
+- **Gemini 리뷰(워크플로우)**: `Gemini Auto PR Review` run `completed` + 스티키 `- Reviewed:` = 현재 SHA면 terminal(판정 라벨은 Claude와 동일 `[CRITICAL]`~`[LOW]`). 실패(429 등)는 스티키에 `- Last attempt: failure`로 남고 v1.43+는 지터 재시도가 내장돼 있어 드묾 — 남으면 run 재실행, 또는 Gemini Assist 앱 결과로 대체 가능(중복이면 앱 우선).
+- **OpenCode 리뷰(활성화된 리포)**: `OpenCode Auto PR Review` run `completed` + **이번 라운드에 새로 달린** 마커 코멘트(스티키가 아니라 누적형 — 최신 것만 이번 라운드)로 판정. run은 완료됐는데 새 코멘트가 없거나 "Failed to get summary from agent"로 실패하면 **FAILED** — CLI 플레이크로 재실행이 1차 복구.
 - **미응답(timeout)**: 끝까지 PENDING인 리뷰어는 `TIMEOUT`으로 보고하고 머지 차단(전원 CLEAN 조건 미충족).
 
 ### 심각도 게이트 — CLEAN/종료 정의
@@ -126,10 +133,10 @@ collect > /tmp/ship_signals.$PR   # 매 호출 1회분. 에이전트가 읽어 �
 LLM 자동 리뷰어는 라운드마다 새 nit을 만들어 "지적 0건"에 도달하지 않는다. 그래서 CLEAN은 **"블로킹 심각도 지적 0건"**으로 판정해 루프가 반드시 종료되게 한다.
 
 - **블로킹 임계** = `--block-on`(기본 `must-fix`) 이상. 리뷰어 라벨 매핑:
-  - Claude: `must-fix`(블로킹) ▸ `should-fix` ▸ `minor` ▸ `nit`/`info`
+  - Claude/Gemini/OpenCode 워크플로우 리뷰: `[CRITICAL]`/`[HIGH]`(블로킹) ▸ `[MEDIUM]` ▸ `[LOW]` (automation v1.41+ 공통 라벨)
   - Codex: `P1`(블로킹) ▸ `P2` ▸ `P3`
   - Gemini Assist: `critical`/`high`(블로킹) ▸ `medium` ▸ `low`
-  - `--block-on should-fix`면 `should-fix`/`P2`/`medium`까지 블로킹으로 포함.
+  - `--block-on should-fix`면 `[MEDIUM]`/`P2`/`medium`까지 블로킹으로 포함.
 - **CLEAN** = 응답 완료 + **열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만, 게이트 통과).
 - **결정 추적(resolved/declined)** — 이미 반영했거나 **근거와 함께 반려**한 지적은 resolved로 기록(`.jhw/ship-decisions.md` 권장)하고, 다음 라운드에 재등장해도 다시 블로킹하지 않는다. (예: "bash -c는 사용자 신뢰입력이라 인젝션 비대상" 반려.)
 - **수렴/종료** — 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) 전원 CLEAN으로 간주하고 루프를 종료(→ 머지 게이트). 그래서 nit이 무한히 나와도 항상 끝난다.
