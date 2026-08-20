@@ -93,7 +93,13 @@ export class RegistryGit {
    * them. An audit reads every record under a directory, and asking the tree
    * once for all of them costs the same as asking it once for one.
    */
-  private committedTree?: { directories: readonly string[]; entries: Map<string, HeadBlobEntry> };
+  private committedTree?: {
+    commit: string;
+    directories: readonly string[];
+    subtrees: Map<string, Promise<Map<string, HeadBlobEntry>>>;
+    holders: number;
+    ready: Promise<void>;
+  };
 
   /**
    * Requires an exact path in the current clean HEAD tree to be a regular file.
@@ -109,38 +115,91 @@ export class RegistryGit {
   }
 
   /**
-   * Runs `read` with the committed entries of `relativeDirectories` already in
-   * hand, so the reads inside it consult one tree listing instead of asking for
-   * each path in turn. The scope is the call: nothing survives it, and a path
-   * outside those directories is still asked for individually, because a
-   * listing that does not cover a path cannot say it is absent.
+   * Runs `read` against one commit, with the entries of `relativeDirectories`
+   * already in hand so the reads inside it consult one tree listing instead of
+   * asking for each path in turn. A path outside those directories is still
+   * asked for individually, because a listing that does not cover a path cannot
+   * say it is absent.
    *
-   * HEAD is fixed for the duration by the caller — every audit that uses this
-   * runs under the host mutation lock and writes nothing — so the listing
-   * cannot go stale while it is being read.
+   * The commit is resolved once and every read inside the scope uses it rather
+   * than HEAD. That is not an optimisation: read-only commands reach these
+   * audits without the host mutation lock, so HEAD can move underneath one, and
+   * a listing taken before the reads would otherwise be older than they are —
+   * turning "added while we looked" from something harmless into a record the
+   * directory lists and the read cannot find.
+   *
+   * The scope belongs to the instance rather than to one call. Concurrent
+   * callers share it and it is released when the last of them leaves; one that
+   * arrives while another holds a scope for different directories reads through
+   * the ordinary path, since the held listing cannot answer for it.
    */
   async withCommittedTree<T>(relativeDirectories: readonly string[], read: () => Promise<T>): Promise<T> {
-    if (this.committedTree) return read();
-    const entries = new Map<string, HeadBlobEntry>();
-    for (const directory of relativeDirectories) {
-      for (const [path, entry] of await this.committedSubtree(directory)) entries.set(path, entry);
+    // Published before the listing is fetched, so callers that arrive while it
+    // is still being fetched wait for that one rather than starting their own.
+    const held = this.committedTree;
+    if (held) {
+      held.holders += 1;
+      return this.releasingCommittedTree(held, read);
     }
-    this.committedTree = { directories: [...relativeDirectories], entries };
+    const scope = {
+      commit: "",
+      directories: [...relativeDirectories],
+      subtrees: new Map<string, Promise<Map<string, HeadBlobEntry>>>(),
+      holders: 1,
+      ready: Promise.resolve(),
+    };
+    // Only the commit is resolved up front. A subtree is listed the first time
+    // something under it is read, so declaring a directory the work turns out
+    // not to touch costs nothing.
+    scope.ready = (async () => { scope.commit = await this.headCommit(); })();
+    this.committedTree = scope;
+    return this.releasingCommittedTree(scope, read);
+  }
+
+  private async releasingCommittedTree<T>(
+    scope: NonNullable<RegistryGit["committedTree"]>,
+    read: () => Promise<T>,
+  ): Promise<T> {
     try {
+      await scope.ready;
       return await read();
     } finally {
-      this.committedTree = undefined;
+      // Released by the last caller out, not by the first: a scope torn down
+      // early would leave the others reading a different commit than they
+      // started on.
+      if ((scope.holders -= 1) === 0 && this.committedTree === scope) this.committedTree = undefined;
     }
   }
 
+  /** The commit a scope pins itself to, proven to be an object name. */
+  private async headCommit(): Promise<string> {
+    let output: string;
+    try {
+      output = (await this.git(["rev-parse", "HEAD"])).stdout.trim();
+    } catch {
+      // Reported the way every other failed HEAD inspection here is, rather
+      // than leaking the command failure this one happens to start from.
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to resolve Registry HEAD");
+    }
+    if (!/^[0-9a-f]{40,64}$/.test(output)) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry HEAD is not an object name");
+    }
+    return output;
+  }
+
+  /** The commit reads should name: a scope's, or HEAD outside one. */
+  private headRevision(): string {
+    return this.committedTree?.commit ?? "HEAD";
+  }
+
   /** One recursive listing, held to the same gates a single lookup applies. */
-  private async committedSubtree(relativeDirectory: string): Promise<Map<string, HeadBlobEntry>> {
+  private async committedSubtree(relativeDirectory: string, commit: string): Promise<Map<string, HeadBlobEntry>> {
     if (!isSafeRegistryRelativePath(relativeDirectory)) {
       throw new ControlError("INVALID_REGISTRY_PATH", "Registry directory path must be a safe relative path", { relativeDirectory });
     }
     let output: string;
     try {
-      output = (await this.git(["ls-tree", "-r", "-l", "-z", "HEAD", "--", relativeDirectory])).stdout;
+      output = (await this.git(["ls-tree", "-r", "-l", "-z", commit, "--", relativeDirectory])).stdout;
     } catch {
       throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD subtree", { relativeDirectory });
     }
@@ -162,11 +221,24 @@ export class RegistryGit {
     return entries;
   }
 
-  /** True when a held listing is authoritative about this path's absence. */
-  private coveredByCommittedTree(relativePath: string): boolean {
-    return this.committedTree?.directories.some(
-      (directory) => relativePath.startsWith(`${directory}/`),
-    ) ?? false;
+  /** The scoped directory a path belongs to, when a held scope covers it. */
+  private coveringDirectory(
+    scope: NonNullable<RegistryGit["committedTree"]>,
+    relativePath: string,
+  ): string | undefined {
+    return scope.directories.find((directory) => relativePath.startsWith(`${directory}/`));
+  }
+
+  /** One listing per scoped directory, shared by everything that reads it. */
+  private async subtreeEntries(
+    scope: NonNullable<RegistryGit["committedTree"]>,
+    directory: string,
+  ): Promise<Map<string, HeadBlobEntry>> {
+    const started = scope.subtrees.get(directory);
+    if (started) return started;
+    const pending = this.committedSubtree(directory, scope.commit);
+    scope.subtrees.set(directory, pending);
+    return pending;
   }
 
   /**
@@ -180,15 +252,17 @@ export class RegistryGit {
       throw new ControlError("INVALID_REGISTRY_PATH", "Registry file path must be a safe relative path", { relativePath });
     }
 
-    if (this.coveredByCommittedTree(relativePath)) {
-      const held = this.committedTree?.entries.get(relativePath);
+    const scope = this.committedTree;
+    const covering = scope && this.coveringDirectory(scope, relativePath);
+    if (scope && covering !== undefined) {
+      const held = (await this.subtreeEntries(scope, covering)).get(relativePath);
       if (held) return held;
       throw new ControlError("HANDOFF_MISSING", "Registry HEAD does not contain the required file", { relativePath });
     }
 
     let output: string;
     try {
-      output = (await this.git(["ls-tree", "-l", "-z", "HEAD", "--", relativePath])).stdout;
+      output = (await this.git(["ls-tree", "-l", "-z", this.headRevision(), "--", relativePath])).stdout;
     } catch {
       throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect Registry HEAD file", { relativePath });
     }
@@ -255,7 +329,7 @@ export class RegistryGit {
     let roots: string[];
     try {
       const selected = await this.rawGit(
-        ["ls-tree", "-z", "HEAD", "--", relativeDirectory],
+        ["ls-tree", "-z", this.headRevision(), "--", relativeDirectory],
         Buffer.byteLength(relativeDirectory, "utf8") + 128,
       );
       roots = this.decodeNulRows(selected);

@@ -681,9 +681,9 @@ export class Catalog {
   }
 
   private async auditTaskSourceIndexes(): Promise<void> {
-    // The audit reads every record under tasks/, so it takes the committed
-    // entries for that subtree once instead of asking per record.
-    return this.registry.withCommittedTree(["tasks"], () => this.auditTaskSourceIndexesWithin());
+    // Each task it walks is checked against its repository, so the scope covers
+    // both subtrees rather than leaving half the reads asking per path.
+    return this.registry.withCommittedTree(["tasks", "repositories"], () => this.auditTaskSourceIndexesWithin());
   }
 
   private async auditTaskSourceIndexesWithin(): Promise<void> {

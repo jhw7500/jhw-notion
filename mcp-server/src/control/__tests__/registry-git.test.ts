@@ -434,7 +434,9 @@ describe("RegistryGit", () => {
     await mkdir(join(registryDir, "tasks"), { recursive: true });
     await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
     await writeFile(join(registryDir, "outside.json"), `{"n":"outside"}\n`, "utf8");
-    await git(registryDir, "add", "--", "tasks", "outside.json");
+    await mkdir(join(registryDir, "tasks-other"), { recursive: true });
+    await writeFile(join(registryDir, "tasks-other", "x.json"), `{"n":"x"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks", "outside.json", "tasks-other");
     await git(registryDir, "commit", "-m", "Both");
     const calls: string[][] = [];
     const runner = new ProcessRunner();
@@ -450,9 +452,77 @@ describe("RegistryGit", () => {
     // scope must not answer for one.
     await registry.withCommittedTree(["tasks"], async () => {
       await registry.headRegularBlobObjectId("outside.json");
+      // A sibling whose name merely starts with the scoped directory is not in
+      // it, so the boundary has to test the separator and not just the prefix.
+      await registry.headRegularBlobObjectId("tasks-other/x.json");
     });
 
-    expect(calls.filter((args) => args[0] === "ls-tree" && args[1] === "-l")).toHaveLength(1);
+    expect(calls.filter((args) => args[0] === "ls-tree" && args[1] === "-l")).toHaveLength(2);
+  });
+
+  // Read-only commands reach these audits without the mutation lock, so a
+  // commit can land while a scope is open. Pinning the commit is what keeps a
+  // record the directory still lists from reading as absent.
+  it("reads one commit for the life of the scope", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "First");
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+    const pinned = await registry.headRegularBlobObjectId("tasks/one.json");
+
+    const seen = await registry.withCommittedTree(["tasks"], async () => {
+      await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"changed"}\n`, "utf8");
+      await writeFile(join(registryDir, "tasks", "two.json"), `{"n":"two"}\n`, "utf8");
+      await git(registryDir, "add", "--", "tasks");
+      await git(registryDir, "commit", "-m", "Moved underneath");
+      return {
+        entry: await registry.headRegularBlobObjectId("tasks/one.json"),
+        listed: await registry.listHeadDirectoryEntries("tasks", 100),
+      };
+    });
+
+    expect(seen.entry).toBe(pinned);
+    // The listing has to name the same commit the entries came from. Reading it
+    // at HEAD would show two.json, which the held entries cannot resolve — the
+    // audit would then call a record the directory lists a missing one.
+    expect(seen.listed.map((entry) => entry.name)).toEqual(["one.json"]);
+    expect(await registry.headRegularBlobObjectId("tasks/one.json")).not.toBe(pinned);
+    expect(await registry.headRegularBlobObjectId("tasks/two.json")).toMatch(/^[0-9a-f]{40,64}$/);
+  });
+
+  it("holds one scope for concurrent callers and releases it once", async () => {
+    const { registryDir } = await fixture();
+    await mkdir(join(registryDir, "tasks"), { recursive: true });
+    await writeFile(join(registryDir, "tasks", "one.json"), `{"n":"one"}\n`, "utf8");
+    await git(registryDir, "add", "--", "tasks");
+    await git(registryDir, "commit", "-m", "Tasks");
+    const calls: string[][] = [];
+    const runner = new ProcessRunner();
+    const registry = fixtureRegistryGit(configFor(registryDir), {
+      run: async (command: string, args: string[], options?: Parameters<ProcessRunner["run"]>[2]) => {
+        calls.push(args);
+        return runner.run(command, args, options);
+      },
+      runRaw: runner.runRaw.bind(runner),
+    } as unknown as ProcessRunnerLike);
+
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const first = registry.withCommittedTree(["tasks"], async () => {
+      await gate;
+      return registry.headRegularBlobObjectId("tasks/one.json");
+    });
+    const second = registry.withCommittedTree(["tasks"], () => registry.headRegularBlobObjectId("tasks/one.json"));
+    await second;
+    release();
+    await first;
+
+    // One listing served both, and the first caller's scope survived the
+    // second one leaving it.
+    expect(calls.filter((args) => args[0] === "ls-tree" && args[1] === "-r")).toHaveLength(1);
+    expect(calls.filter((args) => args[0] === "ls-tree" && args[1] === "-l")).toHaveLength(0);
   });
 
   it("reports a record missing from the held subtree as missing", async () => {
