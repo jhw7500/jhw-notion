@@ -28,6 +28,7 @@ import {
   AuthorityRecordSchema,
   BoundedPortfolioPayloadSchema,
   ConflictingClaimSummarySchema,
+  ErrorReasonSchema,
   PreflightResultSchema,
   ProjectRecordLinkSchema,
   ProjectRecordUpdateSchema,
@@ -442,6 +443,12 @@ function retainedClaim(cause: unknown): Record<string, string> | undefined {
   return { task_id, claim_id, state: claim_state };
 }
 
+function errorReason(cause: unknown): string | undefined {
+  if (!(cause instanceof ControlError)) return undefined;
+  const parsed = ErrorReasonSchema.safeParse(cause.details.reason);
+  return parsed.success ? parsed.data : undefined;
+}
+
 function conflictingClaim(cause: unknown): ConflictingClaimSummary | undefined {
   if (!(cause instanceof ControlError) || cause.code !== "TASK_ALREADY_CLAIMED") return undefined;
   const parsed = ConflictingClaimSummarySchema.safeParse(cause.details.conflicting_claim);
@@ -450,10 +457,12 @@ function conflictingClaim(cause: unknown): ConflictingClaimSummary | undefined {
 
 export function controlErrorResult(cause: unknown, command?: CommandName): CliResult {
   const code = errorCode(cause);
+  const reason = errorReason(cause);
   const conflict = conflictingClaim(cause);
   const retained = code === "TASK_ALREADY_CLAIMED" ? undefined : retainedClaim(cause);
   const error = {
     code,
+    ...(reason ? { reason } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),
     ...(retained ? { retained_claim: retained } : {}),
   };

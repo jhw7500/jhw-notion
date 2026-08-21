@@ -926,6 +926,7 @@ describe("TaskService", () => {
     });
     await expect(tasks.finish({ ...input, progress: "conflicting retry" })).rejects.toMatchObject({
       code: "HANDOFF_RETRY_CONFLICT",
+      details: { reason: "retry_fields_changed" },
     });
     await expect(tasks.finish(input)).resolves.toMatchObject({ history: { handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md` } });
 
@@ -935,10 +936,10 @@ describe("TaskService", () => {
   });
 
   it.each([
-    ["a new commit", { head_sha: "deadbeef", dirty: true, dirty_files: [".ai/handoff.md"], ahead: 0, behind: 0 }],
-    ["an unrelated dirty file", { head_sha: "0123456789abcdef", dirty: true, dirty_files: ["src/unrelated.ts"], ahead: 0, behind: 0 }],
-    ["advanced ahead state", { head_sha: "0123456789abcdef", dirty: true, dirty_files: [".ai/handoff.md"], ahead: 1, behind: 0 }],
-  ] as const)("retains the Claim when retry Git evidence is stale due to %s", async (_reason, changed) => {
+    ["a new commit", "git_identity_changed", { head_sha: "deadbeef", dirty: true, dirty_files: [".ai/handoff.md"], ahead: 0, behind: 0 }],
+    ["an unrelated dirty file", "dirty_delta_changed", { head_sha: "0123456789abcdef", dirty: true, dirty_files: ["src/unrelated.ts"], ahead: 0, behind: 0 }],
+    ["advanced ahead state", "git_identity_changed", { head_sha: "0123456789abcdef", dirty: true, dirty_files: [".ai/handoff.md"], ahead: 1, behind: 0 }],
+  ] as const)("retains the Claim when retry Git evidence is stale due to %s", async (_label, expectedReason, changed) => {
     const { tasks, claims, worktrees, worktreePath } = await taskFixture();
     claims.finishClaim.mockRejectedValueOnce(new Error("release failed"));
     const input = {
@@ -958,7 +959,10 @@ describe("TaskService", () => {
       ...changed,
     });
 
-    await expect(tasks.finish(input)).rejects.toMatchObject({ code: "HANDOFF_RETRY_CONFLICT" });
+    await expect(tasks.finish(input)).rejects.toMatchObject({
+      code: "HANDOFF_RETRY_CONFLICT",
+      details: { reason: expectedReason },
+    });
     expect(claims.finishClaim).toHaveBeenCalledTimes(1);
   });
 
@@ -992,6 +996,39 @@ describe("TaskService", () => {
       validation: ["npm test: pass"],
       source_task_revision: "issue-revision-7",
     })).rejects.toMatchObject({ code: "HANDOFF_RETRY_CONFLICT" });
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+  });
+
+  it("tells committed-metadata drift apart from evidence drift on retry", async () => {
+    const { tasks, claims, fixture } = await taskFixture();
+    const pointer = join(fixture.registryDir, "handoffs", TASK_ID, `${CLAIM_ID}.md`);
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(pointer, buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: "issue-revision-8",
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+      git_state: [
+        "branch: task/000000000001-control-task",
+        "head_sha: 0123456789abcdef",
+        "dirty_count: 0",
+        `dirty_digest: ${"0".repeat(64)}`,
+        "ahead: 0",
+        "behind: 0",
+      ],
+      validation: ["npm test: pass"],
+    }), "utf8");
+
+    await expect(tasks.finish({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      status: "handoff",
+      validation: ["npm test: pass"],
+      source_task_revision: "issue-revision-7",
+    })).rejects.toMatchObject({
+      code: "HANDOFF_RETRY_CONFLICT",
+      details: { reason: "handoff_metadata_mismatch" },
+    });
     expect(claims.finishClaim).not.toHaveBeenCalled();
   });
 

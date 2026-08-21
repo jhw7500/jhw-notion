@@ -13,10 +13,11 @@ function protectedTerms(): string[] {
 
 /**
  * Deliberately conservative, and it costs nothing to be. A message is never
- * emitted — `controlErrorResult` sends the stable code and, for a Claim
- * conflict, the claim coordinates, and nothing else — so a slash command or
- * non-ASCII prose mangled here is read only by whoever is debugging. Anything
- * an operator has to act on belongs in the code, not the message.
+ * emitted — `controlErrorResult` sends the stable code, the claim coordinates
+ * on a Claim conflict, a schema-pinned `reason` identifier where a throw site
+ * sets one, and nothing else — so a slash command or non-ASCII prose mangled
+ * here is read only by whoever is debugging. Anything an operator has to act
+ * on belongs in the code or that bounded reason, not the message.
  *
  * What must survive is the other half: the coordinates that are emitted. Branch
  * names and worktree refs carry slashes, and a Claim conflict is useless

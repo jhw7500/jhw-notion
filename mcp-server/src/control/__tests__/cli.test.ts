@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { requiresMutationLock, runCli, type CliDependencies } from "../cli.js";
+import { controlErrorResult, requiresMutationLock, runCli, type CliDependencies } from "../cli.js";
 import { ControlError } from "../errors.js";
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { MutationLock, type MutationLockRuntime } from "../process.js";
@@ -507,6 +507,56 @@ describe("runCli", () => {
     expect(result.exitCode).toBe(4);
     expect(JSON.parse(result.stderr)).toEqual({ error: { code: "TASK_ALREADY_CLAIMED" } });
     expect(result.stderr).not.toContain("must-reject-extra-field");
+  });
+
+  it("emits the schema-pinned reason for a Handoff retry conflict", async () => {
+    const result = await runCli([
+      "task", "finish", "--task", TASK_ID, "--claim", CLAIM_ID, "--status", "handoff", "--validation", "npm test: pass",
+    ], makeCliDependencies({
+      taskService: {
+        finish: async () => {
+          throw new ControlError("HANDOFF_RETRY_CONFLICT", "Committed Handoff conflicts with current Git evidence", {
+            handoff_path: "/registry/handoffs/committed.md",
+            reason: "git_identity_changed",
+          });
+        },
+      },
+    }));
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "HANDOFF_RETRY_CONFLICT", reason: "git_identity_changed" },
+    });
+    expect(result.stderr).not.toContain("registry");
+  });
+
+  it("carries the reason that tells a malformed handoff copy apart from operator work", () => {
+    const result = controlErrorResult(new ControlError(
+      "WORKTREE_DIRTY",
+      "Refusing to remove a worktree whose handoff copy is not a plain file",
+      {
+        worktree_ref: "wt-000000000001-control-task",
+        dirty_files: [".ai/handoff.md"],
+        reason: "handoff_copy_not_plain_file",
+      },
+    ));
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "WORKTREE_DIRTY", reason: "handoff_copy_not_plain_file" },
+    });
+  });
+
+  it.each([
+    42,
+    "worktree moved underneath",
+    "task/branch-moved",
+    "GIT_IDENTITY_CHANGED",
+    "x",
+    "_leading_underscore",
+  ])("fails closed instead of emitting a reason that is not a bounded identifier: %s", (reason) => {
+    const result = controlErrorResult(new ControlError("HANDOFF_RETRY_CONFLICT", "conflict", { reason }));
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "HANDOFF_RETRY_CONFLICT" } });
   });
 
   it("never emits conflicting_claim for unrelated errors", async () => {

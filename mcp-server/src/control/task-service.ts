@@ -531,6 +531,7 @@ export class TaskService {
         ) {
           throw new ControlError("HANDOFF_RETRY_CONFLICT", "Committed Handoff metadata conflicts with the requested release", {
             handoff_path: handoffPath,
+            reason: "handoff_metadata_mismatch",
           });
         }
         const sections = parseHandoffSections(committed);
@@ -548,6 +549,7 @@ export class TaskService {
         if (requested !== committed) {
           throw new ControlError("HANDOFF_RETRY_CONFLICT", "Committed Handoff conflicts with requested retry fields", {
             handoff_path: handoffPath,
+            reason: "retry_fields_changed",
           });
         }
         handoff = committed;

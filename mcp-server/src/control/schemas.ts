@@ -144,6 +144,14 @@ export const ConflictingClaimSummarySchema = ActiveClaimSchema.pick({
 }).strict();
 export type ConflictingClaimSummary = z.infer<typeof ConflictingClaimSummarySchema>;
 
+/**
+ * Machine-readable cause emitted next to a stable error code when one code
+ * covers operator actions that differ. Bounded to a lower_snake identifier so
+ * only literals set at throw sites can ever emit — prose, paths, and anything
+ * redaction touches fail the shape and are dropped.
+ */
+export const ErrorReasonSchema = z.string().min(2).max(64).regex(/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/);
+
 export const ClaimHistorySchema = z
   .object({
     task_id: canonicalId("tsk"),
