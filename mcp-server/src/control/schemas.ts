@@ -145,12 +145,36 @@ export const ConflictingClaimSummarySchema = ActiveClaimSchema.pick({
 export type ConflictingClaimSummary = z.infer<typeof ConflictingClaimSummarySchema>;
 
 /**
- * Machine-readable cause emitted next to a stable error code when one code
- * covers operator actions that differ. Bounded to a lower_snake identifier so
- * only literals set at throw sites can ever emit — prose, paths, and anything
- * redaction touches fail the shape and are dropped.
+ * The closed vocabulary of machine-readable causes emitted next to a stable
+ * error code when one code covers operator actions that differ. Emission is
+ * membership: a value not registered here is dropped, so a throw site cannot
+ * invent a synonym or leak free text. Registering an entry carries two duties
+ * a test walks: the untyped `reason:` literals in control sources must come
+ * from this list, and the operator doc that interprets the axis must name it.
  */
-export const ErrorReasonSchema = z.string().min(2).max(64).regex(/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/);
+export const ERROR_REASONS = [
+  // HANDOFF_RETRY_CONFLICT — committed-handoff parse failures; one operator
+  // action for all seven: the committed artifact is corrupt.
+  "invalid_git_state_line",
+  "duplicate_git_state_key",
+  "unexpected_git_state_key",
+  "missing_git_state_key",
+  "invalid_git_state_count",
+  "missing_git_identity",
+  "invalid_dirty_digest",
+  // HANDOFF_RETRY_CONFLICT — axes whose operator actions differ.
+  "legacy_dirty_evidence_ambiguous",
+  "git_identity_changed",
+  "dirty_delta_changed",
+  "handoff_metadata_mismatch",
+  "retry_fields_changed",
+  // INVALID_WORKTREE_INSPECTION
+  "duplicate_dirty_files",
+  // WORKTREE_DIRTY
+  "handoff_copy_not_plain_file",
+] as const;
+export const ErrorReasonSchema = z.enum(ERROR_REASONS);
+export type ErrorReason = z.infer<typeof ErrorReasonSchema>;
 
 export const ClaimHistorySchema = z
   .object({

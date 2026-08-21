@@ -20,6 +20,7 @@ export interface JournalEvent {
   elapsed_ms: number;
   ok: boolean;
   error_code?: string;
+  error_reason?: string;
   bypass_reason?: string;
   payload_bytes: number;
   active_work_minutes?: number;

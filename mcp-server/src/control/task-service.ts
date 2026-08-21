@@ -21,7 +21,7 @@ import {
   type HandoffInput,
 } from "./handoff.js";
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
-import type { ActiveClaim, ClaimHistory } from "./schemas.js";
+import type { ActiveClaim, ClaimHistory, ErrorReason } from "./schemas.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   worktreePlan,
@@ -202,7 +202,7 @@ interface HandoffGitState {
   behind: number;
 }
 
-function handoffRetryConflict(handoffPath: string, reason: string): ControlError {
+function handoffRetryConflict(handoffPath: string, reason: ErrorReason): ControlError {
   return new ControlError("HANDOFF_RETRY_CONFLICT", "Committed Handoff conflicts with current Git evidence", {
     handoff_path: handoffPath,
     reason,

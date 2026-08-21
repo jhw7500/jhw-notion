@@ -480,6 +480,7 @@ describe("runCli", () => {
     expect(`${result.stderr}${journal}`).not.toContain("raw-secret-message");
     expect(`${result.stderr}${journal}`).not.toContain("/private/source/control");
     expect(JSON.parse(journal)).toMatchObject({ ok: false, error_code: "TASK_ALREADY_CLAIMED" });
+    expect(JSON.parse(journal)).not.toHaveProperty("error_reason");
   });
 
   it.each([
@@ -509,10 +510,12 @@ describe("runCli", () => {
     expect(result.stderr).not.toContain("must-reject-extra-field");
   });
 
-  it("emits the schema-pinned reason for a Handoff retry conflict", async () => {
+  it("emits the schema-pinned reason for a Handoff retry conflict and journals it", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-reason-"));
     const result = await runCli([
       "task", "finish", "--task", TASK_ID, "--claim", CLAIM_ID, "--status", "handoff", "--validation", "npm test: pass",
     ], makeCliDependencies({
+      stateDir,
       taskService: {
         finish: async () => {
           throw new ControlError("HANDOFF_RETRY_CONFLICT", "Committed Handoff conflicts with current Git evidence", {
@@ -522,12 +525,18 @@ describe("runCli", () => {
         },
       },
     }));
+    const journal = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
 
     expect(result.exitCode).toBe(1);
     expect(JSON.parse(result.stderr)).toEqual({
       error: { code: "HANDOFF_RETRY_CONFLICT", reason: "git_identity_changed" },
     });
     expect(result.stderr).not.toContain("registry");
+    expect(JSON.parse(journal)).toMatchObject({
+      ok: false,
+      error_code: "HANDOFF_RETRY_CONFLICT",
+      error_reason: "git_identity_changed",
+    });
   });
 
   it("carries the reason that tells a malformed handoff copy apart from operator work", () => {
@@ -553,7 +562,8 @@ describe("runCli", () => {
     "GIT_IDENTITY_CHANGED",
     "x",
     "_leading_underscore",
-  ])("fails closed instead of emitting a reason that is not a bounded identifier: %s", (reason) => {
+    "git_identity_change", // a plausible typo: the shape allows it, only membership rejects it
+  ])("fails closed instead of emitting a reason that is not in the registered vocabulary: %s", (reason) => {
     const result = controlErrorResult(new ControlError("HANDOFF_RETRY_CONFLICT", "conflict", { reason }));
 
     expect(JSON.parse(result.stderr)).toEqual({ error: { code: "HANDOFF_RETRY_CONFLICT" } });

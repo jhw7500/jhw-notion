@@ -455,6 +455,13 @@ function conflictingClaim(cause: unknown): ConflictingClaimSummary | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
+// Mirrors the emitted envelope, never raw details: the journal records the
+// reason exactly when the operator saw one.
+function journalErrorFields(stderr: string): { error_code: string; error_reason?: string } {
+  const error = JSON.parse(stderr).error as { code: string; reason?: string };
+  return { error_code: error.code, ...(error.reason ? { error_reason: error.reason } : {}) };
+}
+
 export function controlErrorResult(cause: unknown, command?: CommandName): CliResult {
   const code = errorCode(cause);
   const reason = errorReason(cause);
@@ -931,7 +938,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
       finished_at: finished.toISOString(),
       elapsed_ms: elapsed,
       ok: result.exitCode === 0,
-      ...(result.exitCode === 0 ? {} : { error_code: JSON.parse(result.stderr).error.code }),
+      ...(result.exitCode === 0 ? {} : journalErrorFields(result.stderr)),
       payload_bytes: Buffer.byteLength(result.stdout || result.stderr, "utf8"),
       ...metadata,
     });
