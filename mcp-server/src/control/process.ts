@@ -7,6 +7,7 @@ import type { Readable } from "node:stream";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
+import type { ErrorReason } from "./schemas.js";
 import { isSensitiveEnvironmentKey } from "./sensitive-data.js";
 
 const MAX_CAPTURE_BYTES = 1024 * 1024;
@@ -503,13 +504,34 @@ const productionLockRuntime: MutationLockRuntime = {
   spawn: (command, args, options) => spawn(command, args, options),
 };
 
-function acquisitionFailure(status: number | null): ControlError {
-  if (status === 75) return new ControlError("LOCK_CONTENDED", "Host mutation lock is already held");
+/** Non-default lock identity: a second host-global lock that must not contend with registry.lock. */
+export interface MutationLockOptions {
+  lockFileName?: string;
+  /** Present switches the helper from non-blocking `-n` to a bounded blocking `-w` wait. */
+  waitSeconds?: number;
+  /**
+   * Registered reason emitted with LOCK_CONTENDED so the two lock files stay
+   * distinguishable. Typed to the closed vocabulary: a bare string here would
+   * bypass both the compiler and the literal sweep (the value flows through a
+   * variable), and an unregistered synonym would be silently dropped at
+   * emission — exactly the regression the vocabulary closure exists to block.
+   */
+  contendedReason?: ErrorReason;
+}
+
+function acquisitionFailure(status: number | null, contendedReason?: string): ControlError {
+  if (status === 75) {
+    return new ControlError(
+      "LOCK_CONTENDED",
+      "Host mutation lock is already held",
+      contendedReason ? { reason: contendedReason } : {},
+    );
+  }
   return new ControlError("LOCK_ACQUIRE_FAILED", "Host lock acquisition command failed");
 }
 
 /** Waits for one flock acquisition process; it owns no long-lived child streams. */
-function acquireLock(child: MutationLockChild): Promise<void> {
+function acquireLock(child: MutationLockChild, helperTimeoutMs: number, contendedReason?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const settle = (result: () => void) => {
@@ -521,12 +543,12 @@ function acquireLock(child: MutationLockChild): Promise<void> {
     const timer = setTimeout(() => settle(() => {
       try { child.kill?.("SIGKILL"); } catch { /* stable timeout below */ }
       reject(new ControlError("LOCK_ACQUIRE_TIMEOUT", "Host lock acquisition exceeded its bounded execution time"));
-    }), LOCK_HELPER_TIMEOUT_MS);
+    }), helperTimeoutMs);
     child.once("error", () => settle(() => reject(new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock acquisition"))));
     child.once("close", (status) => settle(() => {
       const code = typeof status === "number" ? status : null;
       if (code === 0) resolve();
-      else reject(acquisitionFailure(code));
+      else reject(acquisitionFailure(code, contendedReason));
     }));
   });
 }
@@ -542,6 +564,7 @@ export class MutationLock implements MutationLockPort {
     private readonly environment: NodeJS.ProcessEnv = process.env,
     private readonly runtime: MutationLockRuntime = productionLockRuntime,
     private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
+    private readonly options: MutationLockOptions = {},
   ) {}
 
   async run<T>(callback: () => Promise<T>): Promise<T> {
@@ -550,7 +573,7 @@ export class MutationLock implements MutationLockPort {
     try {
       try {
         directory = await openSecureStateDirectory(this.config.stateDir, this.secureDirectoryHooks);
-        lockFile = await directory.openFile("registry.lock", lockOpenFlags, 0o600);
+        lockFile = await directory.openFile(this.options.lockFileName ?? "registry.lock", lockOpenFlags, 0o600);
         const info = await lockFile.stat();
         if (!info.isFile() || info.nlink !== 1) {
           throw new ControlError("UNSAFE_STATE_PATH", "Host lock is not a private single-link regular file");
@@ -567,17 +590,27 @@ export class MutationLock implements MutationLockPort {
       const helperEnvironment = sanitizedChildEnvironment(this.environment);
       // The historic marker has no authority and is never passed to the helper.
       delete helperEnvironment.JHW_CONTROL_LOCK_HELD;
+      const wait = this.options.waitSeconds;
+      if (wait !== undefined && (!Number.isSafeInteger(wait) || wait <= 0 || wait > 60)) {
+        throw new ControlError("LOCK_SETUP_FAILED", "Lock wait must be a bounded positive integer");
+      }
       let child: MutationLockChild;
       try {
         child = this.runtime.spawn(
           "flock",
-          ["-n", "-E", "75", "3"],
+          wait === undefined ? ["-n", "-E", "75", "3"] : ["-w", String(wait), "-E", "75", "3"],
           { env: helperEnvironment, stdio: ["ignore", "ignore", "ignore", lockFile.fd] },
         );
       } catch {
         throw new ControlError("LOCK_SPAWN_FAILED", "Unable to start host lock acquisition");
       }
-      await acquireLock(child);
+      // A blocking helper legitimately runs for its full wait; the watchdog
+      // must outlive it or every contended blocking acquire reports a timeout.
+      await acquireLock(
+        child,
+        wait === undefined ? LOCK_HELPER_TIMEOUT_MS : Math.max(LOCK_HELPER_TIMEOUT_MS, (wait + 2) * 1000),
+        this.options.contendedReason,
+      );
       return await callback();
     } finally {
       await lockFile?.close();

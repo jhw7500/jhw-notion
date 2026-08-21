@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm") =>
+const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm" | "hld" | "rsv") =>
   z.string().regex(new RegExp(`^${prefix}-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`));
 
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
@@ -172,9 +172,124 @@ export const ERROR_REASONS = [
   "duplicate_dirty_files",
   // WORKTREE_DIRTY
   "handoff_copy_not_plain_file",
+  // BOARD_BUSY — which holder class blocks, so the caller can tell "wait or
+  // share" apart from "the blocker has already overstayed its lease".
+  "exclusive_holder",
+  "shared_holders_block_exclusive",
+  "overstay_holder",
+  // BOARD_RESERVED — a live reservation window versus a mid-window fence the
+  // caller declined to accept as a shortened grant.
+  "reservation_window_active",
+  "shortening_not_accepted",
+  // RESERVATION_CONFLICT
+  "overlaps_reservation",
+  "overlaps_active_grant",
+  "mode_mismatch",
+  "reservation_not_started",
+  // BOARD_LIMIT_EXCEEDED
+  "lease_too_long",
+  "reservation_too_long",
+  "reservation_horizon",
+  "reservation_count",
+  "holder_count",
+  // HOLDER_MISMATCH — the coordinate matched but the operation's condition
+  // did not.
+  "cross_session_flag_required",
+  "live_pid_recorded",
+  // LOCK_CONTENDED — boards.lock, distinguished from registry.lock contention.
+  "board_state_lock",
 ] as const;
 export const ErrorReasonSchema = z.enum(ERROR_REASONS);
 export type ErrorReason = z.infer<typeof ErrorReasonSchema>;
+
+export const BoardIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}$/);
+export const BoardModeSchema = z.enum(["exclusive", "shared"]);
+export type BoardMode = z.infer<typeof BoardModeSchema>;
+
+// Display-only connection metadata: it never participates in lock decisions,
+// and the address is deliberately an opaque bounded string (a serial device
+// path or an IP), never parsed and never a credential.
+export const BoardInterfaceSchema = z
+  .object({
+    type: z.enum(["ethernet", "wireless", "serial"]),
+    address: boundedCoordinate(255),
+  })
+  .strict();
+export type BoardInterface = z.infer<typeof BoardInterfaceSchema>;
+
+export const BoardHolderSchema = z
+  .object({
+    holder_id: canonicalId("hld"),
+    session: claimCoordinate,
+    pid: z.number().int().gt(1).nullable(),
+    pid_start_time: boundedCoordinate(64).nullable(),
+    boot_id: boundedCoordinate(64).nullable(),
+    mode: BoardModeSchema,
+    purpose: boundedCoordinate(255),
+    acquired_at: OffsetDateTimeSchema,
+    granted_until: OffsetDateTimeSchema,
+    extended_after_expiry: z.number().int().nonnegative(),
+  })
+  .strict()
+  .superRefine((holder, context) => {
+    // The liveness trio is atomic: a pid without its reuse fences would revive
+    // the pid-recycling misjudgement the fences exist to block.
+    const nulls = [holder.pid, holder.pid_start_time, holder.boot_id].filter((value) => value === null).length;
+    if (nulls !== 0 && nulls !== 3) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["pid"], message: "pid, pid_start_time, boot_id are recorded atomically" });
+    }
+  });
+export type BoardHolder = z.infer<typeof BoardHolderSchema>;
+
+export const BoardReservationSchema = z
+  .object({
+    reservation_id: canonicalId("rsv"),
+    session: claimCoordinate,
+    mode: BoardModeSchema,
+    from: OffsetDateTimeSchema,
+    to: OffsetDateTimeSchema,
+    purpose: boundedCoordinate(255),
+    created_at: OffsetDateTimeSchema,
+    consumed_by: canonicalId("hld").nullable(),
+  })
+  .strict();
+export type BoardReservation = z.infer<typeof BoardReservationSchema>;
+
+export const BoardRecordSchema = z
+  .object({
+    description: boundedCoordinate(255).optional(),
+    interfaces: z.array(BoardInterfaceSchema).max(8),
+    registered_at: OffsetDateTimeSchema,
+    holders: z.array(BoardHolderSchema).max(16)
+      .refine((holders) => new Set(holders.map((holder) => holder.holder_id)).size === holders.length, "Duplicate holder"),
+    reservations: z.array(BoardReservationSchema).max(32)
+      .refine((entries) => new Set(entries.map((entry) => entry.reservation_id)).size === entries.length, "Duplicate reservation"),
+  })
+  .strict();
+export type BoardRecord = z.infer<typeof BoardRecordSchema>;
+
+export const BoardStateSchema = z
+  .object({
+    version: z.literal(1),
+    boards: z.record(BoardIdSchema, BoardRecordSchema),
+  })
+  .strict();
+export type BoardState = z.infer<typeof BoardStateSchema>;
+
+/** Deliberately bounded public coordinates for a blocking holder or reservation. */
+export const BoardConflictSummarySchema = z
+  .object({
+    board_id: BoardIdSchema,
+    holder_id: canonicalId("hld").optional(),
+    reservation_id: canonicalId("rsv").optional(),
+    mode: BoardModeSchema,
+    purpose: safeClaimConflictText.optional(),
+    granted_until: OffsetDateTimeSchema.optional(),
+    from: OffsetDateTimeSchema.optional(),
+    to: OffsetDateTimeSchema.optional(),
+  })
+  .strict();
+export type BoardConflictSummary = z.infer<typeof BoardConflictSummarySchema>;
 
 export const ClaimHistorySchema = z
   .object({

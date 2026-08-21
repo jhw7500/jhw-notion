@@ -170,6 +170,77 @@ export async function openSecureStateDirectory(
   }
 }
 
+export interface JournalLineLabels {
+  tooLarge: string;
+  incomplete: string;
+  failed: string;
+}
+
+/**
+ * The one bounded, hardened append used by every journal stream. Streams
+ * differ only in file name and message labels; the safety mechanics — line
+ * bound, O_APPEND|O_NOFOLLOW, single-link 0600 enforcement, complete-write
+ * check, sync cascade, and unsafe-path errno mapping — live here once so a
+ * future hardening fix cannot silently apply to one stream and not another.
+ */
+export async function appendBoundedJournalLine(
+  stateDir: string,
+  hooks: SecureStateDirectoryHooks,
+  sensitiveData: SensitiveDataPolicy,
+  fileName: string,
+  event: unknown,
+  labels: JournalLineLabels,
+): Promise<void> {
+  sensitiveData.assertSafe(event);
+  const line = `${JSON.stringify(event)}\n`;
+  if (Buffer.byteLength(line, "utf8") > MAX_JOURNAL_LINE_BYTES) {
+    throw new ControlError("JOURNAL_EVENT_TOO_LARGE", labels.tooLarge);
+  }
+
+  let directory: SecureStateDirectory | undefined;
+  try {
+    directory = await openSecureStateDirectory(stateDir, hooks);
+    const file = await directory.openFile(fileName, journalOpenFlags, 0o600);
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.nlink !== 1) throw unsafeStatePath();
+      await file.chmod(0o600);
+      // One bounded write on an O_APPEND descriptor preserves a complete
+      // event line across concurrently finishing read-only invocations.
+      const bytes = Buffer.from(line, "utf8");
+      const written = await file.write(bytes);
+      if (written.bytesWritten !== bytes.length) {
+        throw new ControlError("JOURNAL_WRITE_FAILED", labels.incomplete);
+      }
+      // The journal remains derived data, but once append resolves its line
+      // and a newly-created namespace entry have crossed the durability gate.
+      if (hooks.syncJournalFile) {
+        await hooks.syncJournalFile(file);
+      } else {
+        // Full sync, rather than datasync, also covers the enforced 0600 mode.
+        await file.sync();
+      }
+      if (hooks.syncJournalDirectory) {
+        await hooks.syncJournalDirectory(directory);
+      } else {
+        await directory.sync();
+      }
+      await hooks.afterJournalSync?.();
+    } finally {
+      await file.close();
+    }
+  } catch (cause) {
+    if (cause instanceof ControlError) throw cause;
+    if (typeof cause === "object" && cause !== null && "code" in cause &&
+      (cause.code === "ELOOP" || cause.code === "ENOTDIR" || cause.code === "ENXIO")) {
+      throw unsafeStatePath();
+    }
+    throw new ControlError("JOURNAL_WRITE_FAILED", labels.failed);
+  } finally {
+    await directory?.close();
+  }
+}
+
 /**
  * A narrow append-only pilot journal. Events deliberately hold only stable
  * command metadata, never argument values or host-local paths.
@@ -186,53 +257,10 @@ export class PilotJournal implements JournalPort {
   }
 
   async append(event: JournalEvent): Promise<void> {
-    this.sensitiveData.assertSafe(event);
-    const line = `${JSON.stringify(event)}\n`;
-    if (Buffer.byteLength(line, "utf8") > MAX_JOURNAL_LINE_BYTES) {
-      throw new ControlError("JOURNAL_EVENT_TOO_LARGE", "Pilot journal event exceeds the atomic append boundary");
-    }
-
-    let directory: SecureStateDirectory | undefined;
-    try {
-      directory = await openSecureStateDirectory(this.stateDir, this.secureDirectoryHooks);
-      const file = await directory.openFile(JOURNAL_FILE, journalOpenFlags, 0o600);
-      try {
-        const info = await file.stat();
-        if (!info.isFile() || info.nlink !== 1) throw unsafeStatePath();
-        await file.chmod(0o600);
-        // One bounded write on an O_APPEND descriptor preserves a complete
-        // event line across concurrently finishing read-only invocations.
-        const bytes = Buffer.from(line, "utf8");
-        const written = await file.write(bytes);
-        if (written.bytesWritten !== bytes.length) {
-          throw new ControlError("JOURNAL_WRITE_FAILED", "Pilot journal append was incomplete");
-        }
-        // The journal remains derived data, but once append resolves its line
-        // and a newly-created namespace entry have crossed the durability gate.
-        if (this.secureDirectoryHooks.syncJournalFile) {
-          await this.secureDirectoryHooks.syncJournalFile(file);
-        } else {
-          // Full sync, rather than datasync, also covers the enforced 0600 mode.
-          await file.sync();
-        }
-        if (this.secureDirectoryHooks.syncJournalDirectory) {
-          await this.secureDirectoryHooks.syncJournalDirectory(directory);
-        } else {
-          await directory.sync();
-        }
-        await this.secureDirectoryHooks.afterJournalSync?.();
-      } finally {
-        await file.close();
-      }
-    } catch (cause) {
-      if (cause instanceof ControlError) throw cause;
-      if (typeof cause === "object" && cause !== null && "code" in cause &&
-        (cause.code === "ELOOP" || cause.code === "ENOTDIR" || cause.code === "ENXIO")) {
-        throw unsafeStatePath();
-      }
-      throw new ControlError("JOURNAL_WRITE_FAILED", "Unable to append the pilot journal");
-    } finally {
-      await directory?.close();
-    }
+    await appendBoundedJournalLine(this.stateDir, this.secureDirectoryHooks, this.sensitiveData, JOURNAL_FILE, event, {
+      tooLarge: "Pilot journal event exceeds the atomic append boundary",
+      incomplete: "Pilot journal append was incomplete",
+      failed: "Unable to append the pilot journal",
+    });
   }
 }
