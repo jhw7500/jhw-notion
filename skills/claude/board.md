@@ -144,3 +144,5 @@ jhw-control board recover --action reset-state --confirm reset-state --session <
 - board 커맨드는 pilot journal에 기록되지 않는다. 측정 스트림은
   `board-journal.jsonl`(event-typed: command / holder_reaped /
   holder_evicted_expired / reservation_lapsed / state_reset)이다.
+- 서브커맨드 `--help`는 미지원 — `INVALID_CLI_ARGUMENT`로 응답한다(2026-08-22
+  실측). 커맨드 규격의 정본은 이 문서와 설계 스펙이다.
