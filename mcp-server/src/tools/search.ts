@@ -9,7 +9,11 @@ import { callNotion } from "../notion/api.js";
 const DB_NAMES = Object.keys(NOTION_CONFIG.databases) as [DatabaseName, ...DatabaseName[]];
 
 const SearchInput = z.object({
-  query: z.string().describe("검색 키워드"),
+  query: z
+    .string()
+    .describe(
+      "검색 키워드 — 단일 토큰 권장. 다중 토큰이면 Notion 검색이 오류 없이 쿼리와 무관한 최근순 목록으로 열화될 수 있음. 여러 키워드는 한 쿼리에 합치지 말고 병렬 호출로 분리"
+    ),
   db: z
     .enum(DB_NAMES)
     .optional()
@@ -64,6 +68,9 @@ function jsonContent(payload: unknown) {
 }
 
 // Notion search 응답이 내부 결과 한도로 잘렸는지 판정 (type 없이 incomplete_reason만 오는 변종도 포착).
+// 이 신호는 응답에 searchIncomplete로 분리 노출한다 — 엔진이 검색을 포기하면 오류 없이 쿼리와 무관한
+// 최근순 목록이 올 수 있어(다중 토큰 쿼리에서 관측), truncated(잔여 있음)와 달리 결과가 N건이어도
+// "매칭 없음"의 근거로 쓸 수 없다.
 function isSearchIncomplete(response: any): boolean {
   return (
     response?.request_status?.type === "incomplete" ||
@@ -74,7 +81,7 @@ function isSearchIncomplete(response: any): boolean {
 export function registerSearch(server: McpServer) {
   server.tool(
     "jhw_search",
-    "Notion AI Workspace 키워드 검색 — db 지정 시 해당 DB로 한정(페이지네이션 후 서버측 필터)",
+    "Notion AI Workspace 키워드 검색 — db 지정 시 해당 DB로 한정(페이지네이션 후 서버측 필터). searchIncomplete:true면 결과가 있어도 '매칭 없음'의 근거로 쓰지 말 것",
     SearchInput.shape,
     async ({ query, db, limit }) => {
       const notion = getNotionClient();
@@ -89,15 +96,16 @@ export function registerSearch(server: McpServer) {
         const raw = (response.results as any[]) ?? [];
         const results = raw.map(mapPage).slice(0, lim);
         // db 한정 응답과 형태를 맞춘다: scannedItems(받은 항목 수)·truncated(잘렸는지).
-        // request_status.incomplete(내부 절단)도 db 한정 경로와 동일하게 반영한다.
-        const truncated =
-          raw.length > lim || Boolean(response.has_more) || isSearchIncomplete(response);
+        // request_status.incomplete(내부 절단)는 truncated에 합산하되 searchIncomplete로도 분리 노출한다.
+        const incomplete = isSearchIncomplete(response);
+        const truncated = raw.length > lim || Boolean(response.has_more) || incomplete;
         return jsonContent({
           query,
           db: null,
           scannedItems: raw.length,
           count: results.length,
           truncated,
+          searchIncomplete: incomplete,
           results,
         });
       }
@@ -151,8 +159,17 @@ export function registerSearch(server: McpServer) {
       const results = collected.map(mapPage).slice(0, lim);
       // truncated: 미스캔 잔여(more) + 이번 스캔에서 lim 초과분을 잘라냄(collected>lim) + Notion 내부 절단(incomplete).
       // → 셋 중 하나라도면 "동일 DB 결과가 더 있을 수 있음" = 호출부가 NEW 확정에 보수적이어야 함을 신호.
+      // incomplete는 결과 신뢰 자체의 신호이므로 searchIncomplete로도 분리 노출한다(isSearchIncomplete 주석 참조).
       const truncated = collected.length > lim || more || incomplete;
-      return jsonContent({ query, db, scannedItems, count: results.length, truncated, results });
+      return jsonContent({
+        query,
+        db,
+        scannedItems,
+        count: results.length,
+        truncated,
+        searchIncomplete: incomplete,
+        results,
+      });
     }
   );
 }
