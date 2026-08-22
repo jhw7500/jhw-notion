@@ -5,6 +5,18 @@ import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
 import type { ZodType } from "zod";
 
+import { spawn } from "node:child_process";
+import { writeSync } from "node:fs";
+import { constants as osConstants } from "node:os";
+
+import { BoardJournal, type BoardJournalPort } from "./board-journal.js";
+import {
+  BoardService,
+  captureLivenessTrio,
+  createProcessLivenessProbe,
+  type BoardAcquireInput,
+  type LivenessProbe,
+} from "./board-service.js";
 import { Catalog } from "./catalog.js";
 import { RegistryRecordStore } from "./codec.js";
 import { ClaimService } from "./claim-service.js";
@@ -26,6 +38,7 @@ import { getNotionClient } from "../notion-client.js";
 import { verifyConfiguredNotionAuthorityRoutes } from "../notion/authority-guard.js";
 import {
   AuthorityRecordSchema,
+  BoardConflictSummarySchema,
   BoundedPortfolioPayloadSchema,
   ConflictingClaimSummarySchema,
   ErrorReasonSchema,
@@ -36,6 +49,8 @@ import {
   SnapshotExportResultSchema,
   UpdateProjectInputSchema,
   type ActiveClaim,
+  type BoardConflictSummary,
+  type BoardMode,
   type BoundedPortfolioPayload,
   type ConflictingClaimSummary,
   type PreflightResult,
@@ -68,7 +83,25 @@ const commandNames = [
   "project register",
   "project update",
   "preflight",
+  "board register",
+  "board update",
+  "board unregister",
+  "board list",
+  "board status",
+  "board acquire",
+  "board release",
+  "board extend",
+  "board share",
+  "board reserve",
+  "board unreserve",
+  "board wait",
+  "board recover",
 ] as const;
+
+const BOARD_ID = /^[a-z0-9][a-z0-9-]{1,62}$/;
+const HOLDER_ID = /^hld-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const RESERVATION_ID = /^rsv-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const osSignals: Partial<Record<string, number>> = osConstants.signals;
 
 type CommandName = (typeof commandNames)[number] | "help" | "invalid";
 type FlagValue = string | string[];
@@ -111,6 +144,13 @@ export interface CliDependencies {
   preflight: PreflightPort;
   mutationLock: MutationLockPort;
   journal?: JournalPort;
+  boardService: Pick<
+    BoardService,
+    "register" | "update" | "unregister" | "list" | "status" | "acquire" | "wait" |
+    "release" | "extend" | "share" | "reserve" | "unreserve" | "adoptHolder" | "recoverResetState"
+  >;
+  boardJournal: BoardJournalPort;
+  livenessProbe: LivenessProbe;
 }
 
 class ParsedCommandFailure extends Error {
@@ -176,6 +216,8 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     },
   };
   const worktrees = new WorktreeManager(config, runner);
+  const livenessProbe = createProcessLivenessProbe();
+  const boardJournal = new BoardJournal(config.stateDir, {}, sensitiveData);
   const claims = new ClaimService(config, registry, catalog, {
     async inspect(claim) {
       try {
@@ -222,6 +264,24 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
       sensitiveData,
     }),
     mutationLock: new MutationLock(config, env),
+    // The board lock is a second host-global lock with its own identity: board
+    // commands must never contend with registry.lock, and boards.lock waits
+    // briefly instead of failing fast because its critical sections are ms-long.
+    boardService: new BoardService(
+      config,
+      new MutationLock(config, env, undefined, {}, {
+        lockFileName: "boards.lock",
+        waitSeconds: 5,
+        contendedReason: "board_state_lock",
+      }),
+      livenessProbe,
+      () => new Date(),
+      boardJournal,
+      {},
+      sensitiveData,
+    ),
+    boardJournal,
+    livenessProbe,
     registrationRecordWarning,
   };
 }
@@ -241,6 +301,9 @@ function commandFor(argv: readonly string[]): CommandName {
   }
   if (argv[0] === "portfolio" && argv[1] && commandNames.includes(`portfolio ${argv[1]}` as (typeof commandNames)[number])) {
     return `portfolio ${argv[1]}` as CommandName;
+  }
+  if (argv[0] === "board" && argv[1] && commandNames.includes(`board ${argv[1]}` as (typeof commandNames)[number])) {
+    return `board ${argv[1]}` as CommandName;
   }
   if (argv[0] === "project" && argv[1] === "register") return "project register";
   if (argv[0] === "project" && argv[1] === "update") return "project update";
@@ -397,7 +460,16 @@ function errorCode(cause: unknown): string {
 
 function exitCode(cause: unknown, command?: CommandName): CliResult["exitCode"] {
   const code = errorCode(cause);
-  if (new Set(["TASK_ALREADY_CLAIMED", "CLAIM_MISMATCH", "CLAIM_NOT_FOUND"]).has(code)) return 4;
+  if (new Set([
+    "TASK_ALREADY_CLAIMED", "CLAIM_MISMATCH", "CLAIM_NOT_FOUND",
+    // Board occupancy/coordinate conflicts are the same family: a script must
+    // tell "the board is busy" apart from a crash.
+    "BOARD_NOT_FOUND", "BOARD_ALREADY_REGISTERED", "BOARD_NOT_EMPTY", "BOARD_BUSY", "BOARD_RESERVED",
+    "RESERVATION_CONFLICT", "HOLDER_NOT_FOUND", "RESERVATION_NOT_FOUND", "HOLDER_AMBIGUOUS", "HOLDER_MISMATCH",
+    // A full board or reservation table is a transient occupancy refusal with
+    // a reason axis, not a crash.
+    "BOARD_LIMIT_EXCEEDED",
+  ]).has(code)) return 4;
   if (new Set([
     "REMOTE_DIVERGED", "REMOTE_VERIFY_FAILED", "REGISTRY_DIRTY", "LOCK_BUSY", "LOCK_CONTENDED", "LOCK_ACQUIRE_TIMEOUT",
   ]).has(code)) return 75;
@@ -455,6 +527,12 @@ function conflictingClaim(cause: unknown): ConflictingClaimSummary | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
+function conflictingBoard(cause: unknown): BoardConflictSummary | undefined {
+  if (!(cause instanceof ControlError)) return undefined;
+  const parsed = BoardConflictSummarySchema.safeParse(cause.details.conflicting_board);
+  return parsed.success ? parsed.data : undefined;
+}
+
 // Mirrors the emitted envelope, never raw details: the journal records the
 // reason exactly when the operator saw one.
 function journalErrorFields(stderr: string): { error_code: string; error_reason?: string } {
@@ -466,11 +544,13 @@ export function controlErrorResult(cause: unknown, command?: CommandName): CliRe
   const code = errorCode(cause);
   const reason = errorReason(cause);
   const conflict = conflictingClaim(cause);
+  const boardConflict = conflictingBoard(cause);
   const retained = code === "TASK_ALREADY_CLAIMED" ? undefined : retainedClaim(cause);
   const error = {
     code,
     ...(reason ? { reason } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),
+    ...(boardConflict ? { conflicting_board: boardConflict } : {}),
     ...(retained ? { retained_claim: retained } : {}),
   };
   return { exitCode: exitCode(cause, command), stdout: "", stderr: `${JSON.stringify({ error })}\n` };
@@ -491,9 +571,239 @@ function journalMetadata(command: CommandName, flags: ParsedFlags | undefined): 
   };
 }
 
+/** Durations are explicit minute/hour literals; no default lease exists on purpose. */
+function parseBoardDuration(raw: string): number {
+  const match = raw.match(/^([1-9]\d{0,4})([mh])$/);
+  if (!match) usage("Invalid duration");
+  const amount = Number(match[1]);
+  return match[2] === "h" ? amount * 60 : amount;
+}
+
+/** Board booleans follow the --allow-public precedent: the exact literal true. */
+function boardBoolean(flags: ParsedFlags, flag: string): boolean {
+  const raw = value(flags, flag);
+  if (raw === undefined) return false;
+  if (raw !== "true") usage("Board flag opt-in must be the exact literal true");
+  return true;
+}
+
+function requireBoardPositional(argv: readonly string[]): string {
+  const raw = argv[2];
+  if (!raw || raw.startsWith("--") || !BOARD_ID.test(raw)) usage("Invalid board identifier");
+  return raw;
+}
+
+function parseBoardInterfaces(flags: ParsedFlags): Array<{ type: "ethernet" | "wireless" | "serial"; address: string }> {
+  return values(flags, "--interface").map((entry) => {
+    const separator = entry.indexOf("=");
+    if (separator <= 0) usage("Interface must be type=address");
+    const type = entry.slice(0, separator);
+    const address = entry.slice(separator + 1);
+    if (type !== "ethernet" && type !== "wireless" && type !== "serial") usage("Invalid interface type");
+    if (!isNonEmpty(address)) usage("Interface requires an address");
+    return { type, address };
+  });
+}
+
+function boardMode(flags: ParsedFlags): BoardMode {
+  const raw = required(flags, "--mode");
+  if (raw !== "exclusive" && raw !== "shared") usage("Invalid board mode");
+  return raw;
+}
+
+async function boardWindowAndLiveness(
+  flags: ParsedFlags,
+  dependencies: CliDependencies,
+): Promise<Pick<BoardAcquireInput, "for_minutes" | "until" | "liveness">> {
+  const rawFor = value(flags, "--for");
+  const rawUntil = value(flags, "--until");
+  if ((rawFor === undefined) === (rawUntil === undefined)) usage("Exactly one of --for or --until is required");
+  const rawPid = value(flags, "--pid");
+  let liveness: BoardAcquireInput["liveness"];
+  if (rawPid !== undefined) {
+    if (!/^[1-9]\d{0,9}$/.test(rawPid) || Number(rawPid) <= 1) usage("Invalid pid");
+    liveness = await captureLivenessTrio(dependencies.livenessProbe, Number(rawPid));
+  }
+  return {
+    ...(rawFor !== undefined ? { for_minutes: parseBoardDuration(rawFor) } : {}),
+    ...(rawUntil !== undefined ? { until: rawUntil } : {}),
+    ...(liveness ? { liveness } : {}),
+  };
+}
+
+async function executeBoard(
+  command: CommandName,
+  argv: readonly string[],
+  dependencies: CliDependencies,
+): Promise<{ result: CliResult; flags?: ParsedFlags }> {
+  const board = dependencies.boardService;
+
+  if (command === "board list") {
+    const flags = parseFlags(argv.slice(2), new Set());
+    assertSafeFlags(flags, dependencies);
+    return { flags, result: resultJson(command, await board.list()) };
+  }
+
+  if (command === "board status") {
+    const positional = argv[2] !== undefined && !argv[2].startsWith("--") ? requireBoardPositional(argv) : undefined;
+    const flags = parseFlags(argv.slice(positional === undefined ? 2 : 3), new Set());
+    assertSafeFlags(flags, dependencies);
+    return { flags, result: resultJson(command, await board.status(positional)) };
+  }
+
+  if (command === "board recover") {
+    const flags = parseFlags(argv.slice(2), new Set(["--action", "--confirm", "--session"]));
+    assertSafeFlags(flags, dependencies);
+    if (required(flags, "--action") !== "reset-state") usage("Invalid recovery action");
+    // Non-interactive contract: the confirmation is an exact literal argument.
+    if (required(flags, "--confirm") !== "reset-state") usage("Reset requires the exact literal confirmation");
+    const result = await board.recoverResetState({ session: required(flags, "--session") });
+    return { flags, result: resultJson(command, result) };
+  }
+
+  const boardId = requireBoardPositional(argv);
+  const rest = argv.slice(3);
+
+  if (command === "board register" || command === "board update") {
+    const flags = parseFlags(rest, new Set(["--description", "--interface", "--session"]), new Set(["--interface"]));
+    assertSafeFlags(flags, dependencies);
+    const session = required(flags, "--session");
+    const description = value(flags, "--description");
+    const interfaces = parseBoardInterfaces(flags);
+    const result = command === "board register"
+      ? await board.register({ board_id: boardId, ...(description ? { description } : {}), interfaces, session })
+      : await board.update({
+        board_id: boardId,
+        ...(description !== undefined ? { description } : {}),
+        ...(flags.has("--interface") ? { interfaces } : {}),
+        session,
+      });
+    return { flags, result: resultJson(command, result) };
+  }
+
+  if (command === "board unregister") {
+    const flags = parseFlags(rest, new Set(["--session"]));
+    assertSafeFlags(flags, dependencies);
+    return { flags, result: resultJson(command, await board.unregister({ board_id: boardId, session: required(flags, "--session") })) };
+  }
+
+  if (command === "board acquire" || command === "board wait") {
+    const allowed = new Set([
+      "--mode", "--for", "--until", "--session", "--purpose", "--pid",
+      "--consume", "--claim-expired", "--accept-shortened", "--long-lease", "--cross-session",
+      ...(command === "board wait" ? ["--timeout"] : []),
+    ]);
+    const flags = parseFlags(rest, allowed);
+    assertSafeFlags(flags, dependencies);
+    const consume = value(flags, "--consume");
+    if (consume !== undefined && !RESERVATION_ID.test(consume)) usage("Invalid reservation coordinate");
+    const input: BoardAcquireInput = {
+      board_id: boardId,
+      mode: boardMode(flags),
+      session: required(flags, "--session"),
+      purpose: required(flags, "--purpose"),
+      ...(await boardWindowAndLiveness(flags, dependencies)),
+      ...(consume !== undefined ? { consume } : {}),
+      ...(boardBoolean(flags, "--claim-expired") ? { claim_expired: true } : {}),
+      ...(boardBoolean(flags, "--accept-shortened") ? { accept_shortened: true } : {}),
+      ...(boardBoolean(flags, "--long-lease") ? { long_lease: true } : {}),
+      ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+    };
+    if (command === "board acquire") {
+      return { flags, result: resultJson(command, await board.acquire(input)) };
+    }
+    const rawTimeout = value(flags, "--timeout");
+    const options = rawTimeout !== undefined ? { timeout_ms: parseBoardDuration(rawTimeout) * 60_000 } : {};
+    return { flags, result: resultJson(command, await board.wait(input, options)) };
+  }
+
+  if (command === "board release") {
+    const flags = parseFlags(rest, new Set(["--holder", "--session", "--cross-session"]));
+    assertSafeFlags(flags, dependencies);
+    const holder = value(flags, "--holder");
+    if (holder !== undefined && !HOLDER_ID.test(holder)) usage("Invalid holder coordinate");
+    return {
+      flags,
+      result: resultJson(command, await board.release({
+        board_id: boardId,
+        ...(holder !== undefined ? { holder_id: holder } : {}),
+        session: required(flags, "--session"),
+        ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+      })),
+    };
+  }
+
+  if (command === "board extend") {
+    const flags = parseFlags(rest, new Set(["--holder", "--for", "--session", "--long-lease", "--cross-session"]));
+    assertSafeFlags(flags, dependencies);
+    return {
+      flags,
+      result: resultJson(command, await board.extend({
+        board_id: boardId,
+        holder_id: assertPattern(required(flags, "--holder"), HOLDER_ID),
+        for_minutes: parseBoardDuration(required(flags, "--for")),
+        session: required(flags, "--session"),
+        ...(boardBoolean(flags, "--long-lease") ? { long_lease: true } : {}),
+        ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+      })),
+    };
+  }
+
+  if (command === "board share") {
+    const flags = parseFlags(rest, new Set(["--holder", "--exclusive", "--session", "--cross-session"]));
+    assertSafeFlags(flags, dependencies);
+    return {
+      flags,
+      result: resultJson(command, await board.share({
+        board_id: boardId,
+        holder_id: assertPattern(required(flags, "--holder"), HOLDER_ID),
+        ...(boardBoolean(flags, "--exclusive") ? { exclusive: true } : {}),
+        session: required(flags, "--session"),
+        ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+      })),
+    };
+  }
+
+  if (command === "board reserve") {
+    const flags = parseFlags(rest, new Set(["--mode", "--from", "--to", "--session", "--purpose"]));
+    assertSafeFlags(flags, dependencies);
+    return {
+      flags,
+      result: resultJson(command, await board.reserve({
+        board_id: boardId,
+        mode: boardMode(flags),
+        from: required(flags, "--from"),
+        to: required(flags, "--to"),
+        session: required(flags, "--session"),
+        purpose: required(flags, "--purpose"),
+      })),
+    };
+  }
+
+  if (command === "board unreserve") {
+    const flags = parseFlags(rest, new Set(["--reservation", "--session", "--cross-session"]));
+    assertSafeFlags(flags, dependencies);
+    return {
+      flags,
+      result: resultJson(command, await board.unreserve({
+        board_id: boardId,
+        reservation_id: assertPattern(required(flags, "--reservation"), RESERVATION_ID),
+        session: required(flags, "--session"),
+        ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+      })),
+    };
+  }
+
+  usage("Unknown command");
+}
+
 async function execute(command: CommandName, argv: readonly string[], dependencies: CliDependencies): Promise<{ result: CliResult; flags?: ParsedFlags }> {
   if (command === "help") {
     return { result: resultJson(command, { commands: commandNames }) };
+  }
+
+  if (command.startsWith("board ")) {
+    return executeBoard(command, argv, dependencies);
   }
 
   if (command === "repository register") {
@@ -931,6 +1241,45 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
   const finished = dependencies.now?.() ?? new Date();
   const elapsed = Math.max(0, finished.getTime() - started.getTime());
   try {
+    // Board rows go to their own stream and NEVER to the pilot journal: the
+    // pilot journal is the Phase 1A trial audit set, and mixing board commands
+    // into it would contaminate what that audit measures.
+    if (command.startsWith("board ")) {
+      const boardId = argv[2] !== undefined && BOARD_ID.test(argv[2]) ? argv[2] : undefined;
+      // The journal row records what the service resolved, not just what the
+      // flags said: an implicit release still names its holder, and the
+      // cross-session audit trail the design's evidence gates rely on comes
+      // from the result, never from caller input.
+      let resolved: Record<string, unknown> = {};
+      if (result.exitCode === 0) {
+        try {
+          resolved = (JSON.parse(result.stdout) as { result?: Record<string, unknown> }).result ?? {};
+        } catch {
+          resolved = {};
+        }
+      }
+      const resolvedHolder = resolved.holder_id ?? (resolved.holder as { holder_id?: unknown } | undefined)?.holder_id;
+      const holderId = typeof resolvedHolder === "string" ? resolvedHolder : (flags ? value(flags, "--holder") : undefined);
+      const resolvedReservation = resolved.reservation_id ?? resolved.consumed_reservation;
+      const reservationId = typeof resolvedReservation === "string"
+        ? resolvedReservation
+        : (flags ? (value(flags, "--reservation") ?? value(flags, "--consume")) : undefined);
+      await dependencies.boardJournal.append({
+        event: "command",
+        command,
+        ...(boardId ? { board_id: boardId } : {}),
+        ...(holderId && HOLDER_ID.test(holderId) ? { holder_id: holderId } : {}),
+        ...(reservationId && RESERVATION_ID.test(reservationId) ? { reservation_id: reservationId } : {}),
+        ...(resolved.cross_session === true ? { cross_session: true } : {}),
+        started_at: started.toISOString(),
+        finished_at: finished.toISOString(),
+        elapsed_ms: elapsed,
+        ok: result.exitCode === 0,
+        ...(result.exitCode === 0 ? {} : journalErrorFields(result.stderr)),
+        payload_bytes: Buffer.byteLength(result.stdout || result.stderr, "utf8"),
+      });
+      return result;
+    }
     const metadata = journalMetadata(command, flags);
     await (dependencies.journal ?? new PilotJournal(dependencies.stateDir)).append({
       command,
@@ -971,8 +1320,156 @@ export function requiresMutationLock(argv: readonly string[]): boolean {
   return argv[index + 1] === "force-end" || argv[index + 1] === "takeover" || argv[index + 1] === "cleanup";
 }
 
+/**
+ * `board with` runs outside the JSON envelope on purpose: the child inherits
+ * stdio (its output must not hit the 12KiB envelope), its exit code is
+ * propagated verbatim, and the wrapper's own pid is the liveness anchor that
+ * makes automatic reclamation certain. Signals are forwarded and release only
+ * happens after the child has fully exited, so the wrapper never leaves a
+ * holderless occupation behind.
+ */
+export async function runBoardWith(argv: string[], dependencies: CliDependencies): Promise<number> {
+  const separator = argv.indexOf("--");
+  if (separator === -1 || separator === argv.length - 1) usage("board with requires -- <command>");
+  const head = argv.slice(0, separator);
+  const childCommand = argv.slice(separator + 1);
+  const boardId = requireBoardPositional(head);
+  const flags = parseFlags(head.slice(3), new Set([
+    "--mode", "--for", "--until", "--session", "--purpose",
+    "--consume", "--long-lease", "--cross-session", "--use-holder", "--json-fd",
+  ]));
+  assertSafeFlags(flags, dependencies);
+  const session = required(flags, "--session");
+  const useHolder = value(flags, "--use-holder");
+  // Adoption keeps the holder's existing mode and lease; accepting acquisition
+  // flags here and silently ignoring them would let the operator believe a
+  // lease they never received.
+  if (useHolder !== undefined) {
+    for (const flag of ["--mode", "--for", "--until", "--purpose", "--consume", "--long-lease"]) {
+      if (flags.has(flag)) usage("--use-holder adopts the existing grant and takes no acquisition flags");
+    }
+  }
+  const rawJsonFd = value(flags, "--json-fd");
+  if (rawJsonFd !== undefined && !/^[1-9]\d{0,2}$/.test(rawJsonFd)) usage("Invalid json fd");
+  const trio = await captureLivenessTrio(dependencies.livenessProbe, process.pid);
+
+  let holderId: string;
+  let coordinates: unknown;
+  if (useHolder !== undefined) {
+    const adopted = await dependencies.boardService.adoptHolder({
+      board_id: boardId,
+      holder_id: assertPattern(useHolder, HOLDER_ID),
+      session,
+      liveness: trio,
+      ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+    });
+    holderId = adopted.holder_id;
+    coordinates = adopted;
+  } else {
+    const consume = value(flags, "--consume");
+    if (consume !== undefined && !RESERVATION_ID.test(consume)) usage("Invalid reservation coordinate");
+    const acquired = await dependencies.boardService.acquire({
+      board_id: boardId,
+      mode: boardMode(flags),
+      session,
+      purpose: required(flags, "--purpose"),
+      ...(await (async () => {
+        const rawFor = value(flags, "--for");
+        const rawUntil = value(flags, "--until");
+        if ((rawFor === undefined) === (rawUntil === undefined)) usage("Exactly one of --for or --until is required");
+        return {
+          ...(rawFor !== undefined ? { for_minutes: parseBoardDuration(rawFor) } : {}),
+          ...(rawUntil !== undefined ? { until: rawUntil } : {}),
+        };
+      })()),
+      liveness: trio,
+      ...(consume !== undefined ? { consume } : {}),
+      ...(boardBoolean(flags, "--long-lease") ? { long_lease: true } : {}),
+      ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+    });
+    holderId = acquired.holder.holder_id;
+    coordinates = acquired;
+  }
+
+  const coordinateLine = `${JSON.stringify({ command: "board with", coordinates })}\n`;
+  if (rawJsonFd !== undefined) {
+    try {
+      writeSync(Number(rawJsonFd), coordinateLine);
+    } catch {
+      await writeStream(process.stderr, coordinateLine);
+    }
+  } else {
+    await writeStream(process.stderr, coordinateLine);
+  }
+
+  // The child deliberately inherits the full environment: it is the operator's
+  // own test command, not a control subprocess, and stripping credentials here
+  // would silently break tests that legitimately need them.
+  let childExit = 1;
+  try {
+    childExit = await new Promise<number>((resolve) => {
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(childCommand[0] as string, childCommand.slice(1), { stdio: "inherit" });
+      } catch {
+        resolve(1);
+        return;
+      }
+      const forward = (signal: NodeJS.Signals) => {
+        try { child.kill(signal); } catch { /* the child is already gone */ }
+      };
+      const onInt = () => forward("SIGINT");
+      const onTerm = () => forward("SIGTERM");
+      process.on("SIGINT", onInt);
+      process.on("SIGTERM", onTerm);
+      child.once("error", () => {
+        process.off("SIGINT", onInt);
+        process.off("SIGTERM", onTerm);
+        resolve(1);
+      });
+      child.once("close", (code, signal) => {
+        process.off("SIGINT", onInt);
+        process.off("SIGTERM", onTerm);
+        // Shell convention for every signal, not just the interrupt family: a
+        // SIGSEGV crash must surface as 139, never masquerade as Ctrl+C's 130.
+        resolve(code ?? (signal ? 128 + (osSignals[signal] ?? 2) : 1));
+      });
+    });
+  } finally {
+    try {
+      await dependencies.boardService.release({ board_id: boardId, holder_id: holderId, session });
+    } catch (cause) {
+      // Release failure (for example an eviction that already happened) is a
+      // warning; it never overwrites the child's exit code.
+      await writeStream(process.stderr, controlErrorResult(cause).stderr);
+    }
+    try {
+      await dependencies.boardJournal.append({
+        event: "command",
+        command: "board with",
+        board_id: boardId,
+        holder_id: holderId,
+        ok: childExit === 0,
+      });
+    } catch {
+      // The board journal is derived measurement, never lock authority.
+    }
+  }
+  return childExit;
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
+  if (argv[0] === "board" && argv[1] === "with") {
+    try {
+      process.exitCode = await runBoardWith(argv, createCliDependencies(process.env));
+    } catch (cause) {
+      const result = controlErrorResult(cause);
+      await writeStream(process.stderr, result.stderr);
+      process.exitCode = result.exitCode;
+    }
+    return;
+  }
   if (commandFor(argv) === "help") {
     // Help is intentionally configuration-free so an operator can discover the
     // required command contract before host authority has been provisioned.

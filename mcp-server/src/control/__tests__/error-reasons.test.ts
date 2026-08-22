@@ -39,7 +39,11 @@ describe("error reason vocabulary", () => {
   });
 
   it("documents every registered reason where the operator is told to read it", () => {
-    const doc = readFileSync(join(repositoryRoot, "skills", "claude", "task.md"), "utf8");
+    // The operator docs are the skill files; every axis must be named in at
+    // least one of them, not necessarily in task.md specifically.
+    const doc = ["task.md", "board.md"]
+      .map((name) => readFileSync(join(repositoryRoot, "skills", "claude", name), "utf8"))
+      .join("\n");
 
     expect(doc).toContain("git-state 파스 계열");
     for (const family of GIT_STATE_PARSE_FAMILY) expect(ERROR_REASONS).toContain(family);

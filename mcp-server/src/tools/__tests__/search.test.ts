@@ -172,6 +172,8 @@ describe("jhw_search", () => {
     expect(parsed.count).toBe(1);
     expect(parsed.results[0].id).toBe("k1");
     expect(parsed.truncated).toBe(true);
+    // 양성 절단(잔여 있음)이지 엔진 절단이 아님 — 분리 신호는 false
+    expect(parsed.searchIncomplete).toBe(false);
   });
 
   it("db 한정 검색은 스캔 상한(5페이지)에서 멈추고 truncated=true", async () => {
@@ -221,6 +223,8 @@ describe("jhw_search", () => {
 
     expect(parsed.count).toBe(1);
     expect(parsed.truncated).toBe(true);
+    // 엔진 절단 — 결과가 있어도 "매칭 없음"의 근거로 못 쓴다는 분리 신호
+    expect(parsed.searchIncomplete).toBe(true);
   });
 
   it("db 한정: request_status가 type 없이 incomplete_reason만 와도 truncated=true", async () => {
@@ -277,8 +281,9 @@ describe("jhw_search", () => {
     expect(parsed.db).toBe(null);
     expect(parsed.scannedItems).toBe(3);
     expect(parsed.count).toBe(2);
-    // 3건 받았는데 2건만 반환 → truncated:true
+    // 3건 받았는데 2건만 반환 → truncated:true (양성 절단 — searchIncomplete는 false)
     expect(parsed.truncated).toBe(true);
+    expect(parsed.searchIncomplete).toBe(false);
   });
 
   it("전역 검색도 request_status.incomplete면 truncated=true (db 한정과 대칭)", async () => {
@@ -293,5 +298,6 @@ describe("jhw_search", () => {
 
     expect(parsed.db).toBe(null);
     expect(parsed.truncated).toBe(true);
+    expect(parsed.searchIncomplete).toBe(true);
   });
 });

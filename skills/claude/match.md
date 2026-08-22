@@ -32,12 +32,14 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
    - 제목에서 명사·고유명사·기술 용어 우선.
    - 본문 첫 paragraph에서 보강.
    - 흔한 단어("정리", "메모", "지식", "참고")는 제외.
+   - 추출한 핵심어는 **각각 별도의 단일 토큰 쿼리**로 쓴다 — 한 쿼리에 합치지 않는다. 다중 토큰 쿼리는 Notion 검색이 오류 없이 쿼리와 무관한 최근순 목록으로 열화된다(제목에 두 단어가 다 있어도 못 찾음).
 
 3. **1단계 — 키워드 검색** (병렬)
-   - 후보마다 `mcp__jhw-notion__jhw_search`를 **한 메시지 안에서 병렬 호출**.
-   - `jhw_search`를 `db=<후보 DB>`로 호출한다 — 서버가 전역 검색을 **페이지네이션(최대 500건 스캔)** 하며 해당 DB 결과만 수집해 반환하므로, 전역 top-10 한계 없이 동일 DB 매칭을 안정적으로 찾는다 (KB 후보는 `db=knowledgeBase`, References 후보는 `db=references` 등). 스캔 상한을 넘겨 잔여가 있으면 응답에 `truncated:true`가 온다. (db 한정은 내부적으로 **최대 5회 직렬 API 호출** — 후보가 많고 매칭이 희박하면 응답 지연에 유의.)
+   - 후보마다 **핵심어당 1회씩(단일 토큰 쿼리)** `mcp__jhw-notion__jhw_search`를 **한 메시지 안에서 병렬 호출**.
+   - `jhw_search`를 `db=<후보 DB>`로 호출한다 — 서버가 전역 검색을 **페이지네이션(최대 500건 스캔)** 하며 해당 DB 결과만 수집해 반환하므로, 전역 top-10 한계 없이 동일 DB 매칭을 안정적으로 찾는다 (KB 후보는 `db=knowledgeBase`, References 후보는 `db=references` 등). 스캔 상한을 넘겨 잔여가 있으면 응답에 `truncated:true`가, Notion 엔진이 검색 자체를 포기하면 `searchIncomplete:true`가 온다. (db 한정은 내부적으로 **최대 5회 직렬 API 호출** — 후보가 많고 매칭이 희박하면 응답 지연에 유의.)
    - 도구가 이미 해당 DB 결과만 반환하므로(기본 상위 10건, `limit`로 조정) 그 상위 몇 건을 대조에 쓴다. report·project로는 좁히지 않는다 — `jhw_search`에 그 인자가 없고, 다른 report로 잘못 저장된 중복도 잡기 위함.
-   - 결과 0건 **그리고 `truncated:false`** 면 그 후보는 **NEW**로 확정 (이후 단계 건너뜀). **0건이어도 `truncated:true`면 확정 NEW 금지** — 스캔이 잘렸으니 키워드를 좁혀 재검색하거나 SIMILAR(불확실)로 보수 처리한다.
+   - 모든 핵심어 쿼리가 결과 0건 **그리고 `truncated:false`·`searchIncomplete:false`** 면 그 후보는 **NEW**로 확정 (이후 단계 건너뜀).
+   - **가드는 건수와 무관하다**: `searchIncomplete:true`면 엔진이 검색을 포기한 것으로, **결과가 N건 와도** 쿼리와 무관한 최근순 폴백일 수 있다 — 그 쿼리를 "매칭 없음"의 근거로 쓰지 않는다(있는 매칭의 참고는 가능). `truncated:true`(잔여 있음)인 0건도 NEW 확정 금지. 두 경우 모두 단일 토큰으로 좁혀 재검색하거나 SIMILAR(불확실)로 보수 처리한다.
 
 4. **2단계 — 본문 fetch** (병렬)
    - ≥1건 매칭된 후보들에 대해 top-5 페이지 본문을 `mcp__notion__notion-fetch`로 **한 메시지 안에서 모두 병렬** 호출.
@@ -56,7 +58,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 
 | Verdict | 기준 | 동작 |
 |---|---|---|
-| **NEW** | 매칭 0건(단 `truncated:false`) 또는 모두 무관 | 신규 생성 |
+| **NEW** | 매칭 0건(단 `truncated:false`·`searchIncomplete:false`) 또는 모두 무관 | 신규 생성 |
 | **SIMILAR** | 같은 카테고리지만 서로 독립 검색이 자연스러움 | 신규 생성 + 참고 표시 |
 | **AUGMENT** | 같은 주제 + 새 정보(후속 수치/새 사례/정정) | 기존 페이지 본문에 append |
 | **DUPLICATE** | 같은 사실·수치·명령이 ≥80% 겹침 | skip |
@@ -65,7 +67,7 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
 - 단순 키워드 중복이 아닌 **의미적 중복**을 본다. 같은 단어라도 다른 맥락이면 SIMILAR.
 - AUGMENT는 기존 본문에 정보가 추가되는 게 자연스러운 경우만. 본문 구조가 크게 다르면 SIMILAR로.
 - DUPLICATE 판정에 확신이 없으면 **SIMILAR로 보수적으로 떨어뜨린다** (의도치 않은 skip이 정보 손실보다 나쁨).
-- **`truncated:true`인 0건은 NEW 확정 금지** — 스캔이 잘려 동일 DB 매칭을 놓쳤을 수 있으니 키워드를 좁혀 재검색하거나 SIMILAR(불확실)로 보수 처리한다 (§흐름3).
+- **`truncated:true`인 0건, 그리고 건수 무관 `searchIncomplete:true`는 NEW 근거 금지** — 스캔이 잘렸거나 엔진이 검색을 포기해 매칭을 놓쳤을 수 있으니 단일 토큰으로 좁혀 재검색하거나 SIMILAR(불확실)로 보수 처리한다 (§흐름3).
 
 판정 결과 구조:
 ```
@@ -159,7 +161,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 - **/jhw:review와 역할 구분**: review는 가벼운 저장 흐름, match는 옵트인 대조.
 - **성과 필드 자동 채움**: NEW/SIMILAR로 projects(완료)·decisionLog(확정) 신규 저장 시 `impact`+`achievement:true`를 함께 넣는다 → 🏆 성과 뷰·보고서 자동 누적. AUGMENT는 properties 미변경 원칙이라 성과 필드도 건드리지 않는다.
 - **무인자 자동 from-review**: 인자 없이 `/jhw:match` 호출 시 대화의 **가장 마지막** `/jhw:review` 후보 카드를 자동 입력으로 사용한다(그 이후 새 저장/대조가 없을 때만). 없거나 stale하면 되묻는다. 명시적 `--from-review`는 강제용.
-- 매칭 결과 0건 + `truncated:false`면 카드에 NEW로 표시. **0건이어도 `truncated:true`면 NEW 확정 금지**(재검색/SIMILAR — §흐름3). 매칭이 있어도 모두 SIMILAR면 신규 저장이 기본 동작.
+- 매칭 결과 0건 + `truncated:false`·`searchIncomplete:false`면 카드에 NEW로 표시. **0건의 `truncated:true`, 건수 무관 `searchIncomplete:true`는 NEW 확정 금지**(재검색/SIMILAR — §흐름3). 매칭이 있어도 모두 SIMILAR면 신규 저장이 기본 동작.
 - **`/jhw:review --match` 재사용 정본**: review의 `--match` 플래그는 본 스킬의 verdict 파이프라인(§verdict)·AUGMENT 절차(§AUGMENT)를 단일 정본으로 재사용한다. 단 review --match는 **저장 전** 대조라 중복 페이지를 애초에 생성하지 않는다(DUPLICATE 판정 시 skip — 순차 `/jhw:review`→`/jhw:match`의 사후 정리와 다름). 대조 로직 변경 시 여기만 고치면 review에도 반영된다.
 
 ## 참고

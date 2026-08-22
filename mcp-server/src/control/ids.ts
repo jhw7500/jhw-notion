@@ -35,4 +35,8 @@ export const newTaskId = (now?: number): string => `tsk-${uuid7(now)}`;
 
 export const newClaimId = (now?: number): string => `clm-${uuid7(now)}`;
 
+export const newHolderId = (now?: number): string => `hld-${uuid7(now)}`;
+
+export const newReservationId = (now?: number): string => `rsv-${uuid7(now)}`;
+
 export const sourceIndexKey = (nodeId: string): string => Buffer.from(nodeId, "utf8").toString("base64url");

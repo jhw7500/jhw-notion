@@ -218,6 +218,11 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
     }) },
     mutationLock: new MutationLock(graph.config, {}),
     journal: noopJournal(),
+    // Board commands are outside the Phase 1A e2e surface; the ports only need
+    // to exist so the dependency graph typechecks.
+    boardService: {} as CliDependencies["boardService"],
+    boardJournal: { append: async () => undefined },
+    livenessProbe: { currentBootId: async () => undefined, inspect: async () => ({ state: "unknown" as const }) },
     ...overrides,
   };
 }
