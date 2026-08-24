@@ -8,6 +8,16 @@ import { ControlError } from "../errors.js";
 const HOLDER = `hld-0189a7f0-1234-7abc-8def-0123456789ab`;
 const RESERVATION = `rsv-0189a7f0-1234-7abc-8def-0123456789ab`;
 
+function largeBoardSummaries(count = 20): Array<Record<string, unknown>> {
+  return Array.from({ length: count }, (_, index) => ({
+    board_id: `board-${String(index).padStart(3, "0")}`,
+    description: "d".repeat(64),
+    interfaces: Array.from({ length: 8 }, () => ({ type: "serial", address: "a".repeat(255) })),
+    holder_count: 0,
+    reservation_count: 0,
+  }));
+}
+
 interface BoardOverrides {
   boardService?: Record<string, unknown>;
 }
@@ -90,6 +100,61 @@ describe("board CLI wiring", () => {
       journal_warning: { code: "JOURNAL_WRITE_FAILED" },
     });
     expect(`${result.stdout}${result.stderr}`).not.toContain("injected board journal failure");
+  });
+
+  it("paginates a large board list within the CLI envelope without gaps or duplicates", async () => {
+    const boards = largeBoardSummaries();
+    const { dependencies, boardJournal } = makeDependencies({
+      boardService: { list: vi.fn().mockResolvedValue({ boards }) },
+    });
+    boardJournal.append.mockRejectedValue(new Error("injected board journal failure"));
+    const seen: string[] = [];
+    let after: string | undefined;
+
+    for (let pageNumber = 0; pageNumber <= boards.length; pageNumber += 1) {
+      const result = await runCli(["board", "list", ...(after ? ["--after", after] : [])], dependencies);
+      expect(result.exitCode).toBe(0);
+      expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+      const envelope = JSON.parse(result.stdout) as {
+        result: { boards: Array<{ board_id: string }>; total_boards: number; truncated: boolean; next_after?: string };
+        journal_warning?: { code: string };
+      };
+      expect(envelope.journal_warning).toEqual({ code: "JOURNAL_WRITE_FAILED" });
+      const page = envelope.result;
+      expect(page.total_boards).toBe(boards.length);
+      seen.push(...page.boards.map((board) => board.board_id));
+      if (!page.truncated) {
+        expect(page.next_after).toBeUndefined();
+        break;
+      }
+      expect(page.boards.length).toBeGreaterThan(0);
+      expect(page.next_after).toBe(page.boards.at(-1)?.board_id);
+      after = page.next_after;
+    }
+
+    expect(seen).toEqual(boards.map((board) => board.board_id));
+  });
+
+  it("supports the same cursor on all-board status but rejects it on named detail", async () => {
+    const boards = largeBoardSummaries(8);
+    const status = vi.fn().mockResolvedValue({ boards });
+    const { dependencies } = makeDependencies({ boardService: { status } });
+
+    const page = await runCli(["board", "status", "--after", "board-003"], dependencies);
+    expect(page.exitCode).toBe(0);
+    expect(status).toHaveBeenCalledWith(undefined);
+    expect((JSON.parse(page.stdout) as { result: { boards: Array<{ board_id: string }> } }).result.boards[0]?.board_id)
+      .toBe("board-004");
+
+    const named = await runCli(["board", "status", "wlan-01", "--after", "board-003"], dependencies);
+    expect(named.exitCode).toBe(2);
+  });
+
+  it("rejects an invalid board page cursor before calling the service", async () => {
+    const { dependencies, boardService } = makeDependencies();
+    const result = await runCli(["board", "list", "--after", "../board-001"], dependencies);
+    expect(result.exitCode).toBe(2);
+    expect(boardService.list).not.toHaveBeenCalled();
   });
 
   it("dispatches acquire with parsed duration and coordinates, journaling the board id", async () => {

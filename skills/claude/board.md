@@ -28,8 +28,9 @@ jhw-control board register <board-id> [--description <text>] \
   [--interface serial=/dev/ttyUSB0] [--interface ethernet=<ip>] --session <session-id>
 jhw-control board update <board-id> [--description <text>] [--interface <type>=<address>] --session <session-id>
 jhw-control board unregister <board-id> --session <session-id>
-jhw-control board list
-jhw-control board status [<board-id>]
+jhw-control board list [--after <board-id>]
+jhw-control board status [--after <board-id>]
+jhw-control board status <board-id>
 ```
 
 interface type은 `ethernet|wireless|serial`. address는 표시용이며 자격증명을 넣지
@@ -38,7 +39,13 @@ interface type은 `ethernet|wireless|serial`. address는 표시용이며 자격�
 계산이며 파일을 바꾸지 않는다. **상세(홀더·예약 좌표)는 단일 보드 조회
 (`board status <board-id>`)만 반환**하고 전체 조회는 카운트 요약이다 — 상세의
 예약 표시는 12개까지(`truncated`), session/purpose는 64자 표시 절단이며 좌표는
-절단되지 않는다.
+절단되지 않는다. 전체 `list`/`status`는 실제 CLI byte 예산까지 board-id 순으로
+반환하며 `total_boards`와 `truncated`를 포함한다. `truncated: true`이면
+`next_after`를 다음 호출의 `--after`에 그대로 전달해 이어서 읽는다. 커서가 사이에
+삭제돼도 그 ID보다 큰 첫 보드부터 계속하며, 단일 보드 상세에는 `--after`를 쓰지
+않는다. 각 페이지는 호출 시점의 새 registry snapshot이고 `total_boards`도 그 호출
+시점의 전체 수다. 페이지 사이에 등록·삭제가 일어나면 전체 순회는 하나의 고정
+snapshot과 일치하지 않을 수 있다.
 
 ## 점유·해제
 

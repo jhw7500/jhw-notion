@@ -447,6 +447,53 @@ function boundedHandoffResult(
   return best;
 }
 
+function boardSummaryId(summary: Record<string, unknown>): string {
+  const boardId = summary.board_id;
+  if (typeof boardId !== "string" || !BOARD_ID.test(boardId)) {
+    throw new ControlError("BOARD_STATE_CORRUPT", "Board summary has an invalid identifier");
+  }
+  return boardId;
+}
+
+/**
+ * Pages compact all-board views by their actual serialized envelope size.
+ * A deleted cursor still resumes at the next lexicographic board id.
+ */
+function boundedBoardCollectionResult(
+  command: CommandName,
+  collection: { boards: Array<Record<string, unknown>> },
+  after?: string,
+): CliResult {
+  const allBoards = [...collection.boards].sort((left, right) => {
+    const leftId = boardSummaryId(left);
+    const rightId = boardSummaryId(right);
+    return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+  });
+  const remaining = after === undefined
+    ? allBoards
+    : allBoards.filter((board) => boardSummaryId(board) > after);
+  let selected: Array<Record<string, unknown>> = [];
+
+  const render = (boards: Array<Record<string, unknown>>, truncated: boolean): CliResult => resultJson(command, {
+    boards,
+    total_boards: allBoards.length,
+    truncated,
+    ...(truncated ? { next_after: boardSummaryId(boards[boards.length - 1] as Record<string, unknown>) } : {}),
+  });
+
+  for (let index = 0; index < remaining.length; index += 1) {
+    const candidateBoards = [...selected, remaining[index] as Record<string, unknown>];
+    const candidate = render(candidateBoards, index + 1 < remaining.length);
+    if (Buffer.byteLength(candidate.stdout, "utf8") > CLI_RESULT_BUDGET) break;
+    selected = candidateBoards;
+  }
+
+  if (selected.length === 0 && remaining.length > 0) {
+    throw new ControlError("CLI_OUTPUT_TOO_LARGE", "One board summary exceeded the bounded output envelope");
+  }
+  return render(selected, selected.length < remaining.length);
+}
+
 function validatedPortResult<T>(schema: ZodType<T>, raw: unknown, code: string): T {
   const parsed = schema.safeParse(raw);
   if (!parsed.success) throw new ControlError(code, "A control port returned an invalid result");
@@ -639,16 +686,24 @@ async function executeBoard(
   const board = dependencies.boardService;
 
   if (command === "board list") {
-    const flags = parseFlags(argv.slice(2), new Set());
+    const flags = parseFlags(argv.slice(2), new Set(["--after"]));
     assertSafeFlags(flags, dependencies);
-    return { flags, result: resultJson(command, await board.list()) };
+    const after = value(flags, "--after");
+    if (after !== undefined && !BOARD_ID.test(after)) usage("Invalid board page cursor");
+    return { flags, result: boundedBoardCollectionResult(command, await board.list(), after) };
   }
 
   if (command === "board status") {
     const positional = argv[2] !== undefined && !argv[2].startsWith("--") ? requireBoardPositional(argv) : undefined;
-    const flags = parseFlags(argv.slice(positional === undefined ? 2 : 3), new Set());
+    const flags = parseFlags(
+      argv.slice(positional === undefined ? 2 : 3),
+      new Set(positional === undefined ? ["--after"] : []),
+    );
     assertSafeFlags(flags, dependencies);
-    return { flags, result: resultJson(command, await board.status(positional)) };
+    if (positional !== undefined) return { flags, result: resultJson(command, await board.status(positional)) };
+    const after = value(flags, "--after");
+    if (after !== undefined && !BOARD_ID.test(after)) usage("Invalid board page cursor");
+    return { flags, result: boundedBoardCollectionResult(command, await board.status(undefined), after) };
   }
 
   if (command === "board recover") {
