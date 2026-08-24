@@ -9,6 +9,7 @@ import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDi
 import type { MutationLockPort } from "./process.js";
 import {
   BoardStateSchema,
+  OffsetDateTimeSchema,
   type BoardConflictSummary,
   type BoardHolder,
   type BoardInterface,
@@ -29,6 +30,7 @@ const MAX_HOLDERS = 16;
 const MAX_RESERVATIONS = 32;
 const RESERVATION_DISPLAY_LIMIT = 12;
 const DISPLAY_CHARACTERS = 64;
+const BOARD_OFFSET_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
 const BOARD_ID = /^[a-z0-9][a-z0-9-]{1,62}$/;
 const HOLDER_ID = /^hld-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RESERVATION_ID = /^rsv-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -1045,8 +1047,11 @@ export class BoardService {
   }
 
   private parseInstant(value: string): number {
+    if (!BOARD_OFFSET_DATETIME.test(value) || !OffsetDateTimeSchema.safeParse(value).success) {
+      throw invalidInput("Invalid instant");
+    }
     const ms = new Date(value).getTime();
-    if (!Number.isFinite(ms) || value.length > 64) throw invalidInput("Invalid instant");
+    if (!Number.isFinite(ms)) throw invalidInput("Invalid instant");
     return ms;
   }
 
