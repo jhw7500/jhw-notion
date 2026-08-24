@@ -4,7 +4,8 @@
 개정 이력: 초안 → critic 리뷰(CRITICAL 3·MAJOR 10·MINOR 7) 반영 전면 개정(2판)
 → 재검증 지적(N1~N6·MINOR 7) 반영(3판): 타인 예약 정의·acquire 평가 순서·bearer
 한계 정정(`--cross-session`)·`with --use-holder`·consume 세부·pilot-journal 제외
-분기·읽기 락 프리 등.
+분기·읽기 락 프리 등 → #63 검토 반영(4판): `board with` 래퍼의 catchable signal과
+`SIGKILL` 경계를 분리하고 guardian 도입의 증거 게이트를 명시.
 
 ---
 
@@ -52,7 +53,9 @@ board journal 기록으로만 남긴다.
 - cross-host 보드 공유 — 보드가 여러 호스트로 분산되면 자체 확장 대신 labgrid류
   기존 보드팜 도구 평가를 먼저 한다 (§11).
 - 실행 중 프로세스의 강제 종료(자동 kill) — 회수는 락만 회수하며 테스트 프로세스를
-  죽이지 않는다.
+  죽이지 않는다. 따라서 래퍼가 `SIGKILL` 또는 선택적 OOM 종료로 먼저 사라지면
+  자식 종료를 강제하거나 확인할 수 없다. 이때 래퍼 pid의 사망 증거와 실제 보드
+  사용 종료가 어긋날 수 있는 것은 v1의 알려진 advisory 한계다.
 - 반복(cron식) 예약, 보드 풀 자동 배정, 대기열 우선순위.
 - Claim/Task 스키마와의 결합. Registry 기록.
 - heartbeat 데몬. 상주 프로세스는 두지 않는다 — 모든 판정은 커맨드 실행 시점에 한다.
@@ -242,6 +245,12 @@ journal 미기록이라 기록 여부가 갈리지 않게).
   않는다. 만료는 본인이 약속한 시각이 지난 것이라 제거의 정당성이 기록에 있다.
 - advisory이므로 evict가 실행 중 테스트를 죽이지는 않는다. 제거 판단은 표시된
   overstay 정보를 보고 사람이 한다.
+- `board with` 홀더도 래퍼 pid만 추적한다. catchable signal과 정상 종료에서는
+  래퍼가 자식 종료를 기다리지만, 래퍼가 `SIGKILL`되면 자식이 고아로 계속 실행될 수
+  있다. 다음 mutation은 래퍼 사망을 근거로 홀더를 reap할 수 있으므로, 이 창에서는
+  살아 있는 자식과 새 홀더가 물리 보드를 동시에 사용할 수 있다. process group을
+  만드는 것만으로 부모 사망 시 자식 종료가 보장되지는 않으며, v1은 이를 보장하는
+  guardian/handshake 프로토콜을 두지 않는다.
 - 좌표를 잃은 홀더(결과 JSON 유실)는 `board status`가 holder_id를 표시하므로
   거기서 복구한다 — 별도 recover 커맨드가 필요 없다.
 
@@ -320,7 +329,10 @@ jhw-control board with <board-id> --use-holder <hld-id> --session <session-id> -
 ### pid 기록 규칙
 
 - `board with`는 래퍼 자신의 pid + start_time + boot_id를 기록한다. 래퍼가 테스트
-  동안 살아 있으므로 생존 판정이 정확하고, **자동 회수가 확실한 유일한 경로다.**
+  동안 살아 있는 정상·catchable-signal 경로에서는 생존 판정과 종료 후 release가
+  일치한다. `SIGKILL`/선택적 OOM 종료에서는 자식 생존과 래퍼 pid 사망이 어긋날 수
+  있으므로 자동 회수는 **래퍼 사망 기준의 홀더 회수**만 보장하며 자식 사용 종료를
+  보장하지 않는다(§3, §7).
 - bare `acquire`/`wait`는 CLI 프로세스가 즉시 종료되므로 자기 pid를 기록하지 않는다.
   `--pid <n>`(정수 > 1, acquire 시점 생존 확인 통과 필수)을 명시하지 않으면
   `pid: null`로 기록되고, 결과에 "생존 기반 자동 회수 대상 아님"을 명시한다.
@@ -337,8 +349,11 @@ jhw-control board with <board-id> --use-holder <hld-id> --session <session-id> -
   `--json-fd <n>`으로 좌표 출력 fd를 분리한다.
 - **exit code는 자식의 것을 그대로 전파한다** (`CliResult`의 `0|1|2|4|75|78`
   유니온 예외 — acquire 단계 실패 시에만 기존 code 체계 사용).
-- SIGINT/SIGTERM은 자식에게 전달하고 **자식 종료를 기다린 뒤** release한다. 래퍼만
-  죽고 자식이 남는 "홀더 없는 점유"를 만들지 않는다.
+- SIGINT/SIGTERM은 자식에게 전달하고 **자식 종료를 기다린 뒤** release한다. 이
+  보장은 래퍼가 처리할 수 있는 signal과 정상 종료에 한정한다. `SIGKILL`/선택적 OOM
+  종료는 래퍼가 가로채거나 `finally`를 실행할 수 없으므로, 자식이 계속 실행되는
+  동안 다음 mutation이 래퍼 사망 홀더를 reap할 수 있다. v1의 advisory 계약은 이
+  물리 충돌 창을 제거하지 않는다.
 - 종료 시 release 실패(그 사이 reap/evict된 경우 포함)는 stderr 경고로만 싣고
   자식 exit code를 덮어쓰지 않는다 (`journal_warning` 선례와 같은 형태).
 
@@ -403,13 +418,14 @@ jhw-control board with <board-id> --use-holder <hld-id> --session <session-id> -
 
 ## 11. 확장 게이트 (증거 기반)
 
-SSOT 스펙 §6.5의 방식을 따라, 아래는 실제 사건이 board journal 기록으로 2회
-쌓이면 재검토한다.
+SSOT 스펙 §6.5의 방식을 따라, 아래는 실제 사건이 board journal 또는 함께 보존한
+incident 증거로 2회 쌓이면 재검토한다.
 
 | 후보 | 트리거 증거 |
 |---|---|
 | cross-host 공유 (labgrid류 평가 포함) | 다른 호스트에서 같은 보드를 써야 하는 실제 필요 2회 |
 | 강제 회수(자동 evict) | overstay(`extended_after_expiry` 누적 포함)로 인한 실질 차단 2회 |
+| `board with` guardian/handshake | 래퍼 강제종료 뒤 자식 생존과 `holder_reaped` 또는 후속 중복 점유가 함께 확인된 incident 2회 |
 | 대기열 우선순위/공정성 | wait 기아(starvation) 관측 2회 |
 | 반복 예약 | 같은 구간 수동 재예약 반복 2회 |
 
