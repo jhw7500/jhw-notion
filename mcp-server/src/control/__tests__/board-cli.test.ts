@@ -73,6 +73,25 @@ describe("board CLI wiring", () => {
     expect(requiresMutationLock(["board", "acquire", "wlan-01"])).toBe(false);
   });
 
+  it("preserves a successful board result when its derived journal append fails", async () => {
+    const { dependencies, boardJournal, boardService } = makeDependencies();
+    boardJournal.append.mockRejectedValueOnce(new Error("injected board journal failure"));
+
+    const result = await runCli([
+      "board", "acquire", "wlan-01",
+      "--mode", "exclusive", "--for", "30m", "--session", "sess-a", "--purpose", "smoke",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(boardService.acquire).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      command: "board acquire",
+      result: { holder: { holder_id: HOLDER } },
+      journal_warning: { code: "JOURNAL_WRITE_FAILED" },
+    });
+    expect(`${result.stdout}${result.stderr}`).not.toContain("injected board journal failure");
+  });
+
   it("dispatches acquire with parsed duration and coordinates, journaling the board id", async () => {
     const { dependencies, boardJournal, boardService } = makeDependencies();
     const result = await runCli([
