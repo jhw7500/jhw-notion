@@ -118,10 +118,16 @@ jhw-control board with <board-id> --use-holder <hld-id> --session <session-id> -
 
 - `wait`는 10초 간격 폴링으로 전 구간을 확보할 수 있을 때만 성공한다(단축 승인
   없음). BG로 실행하면 종료 시 task-notification으로 돌아온다.
-- `with`는 **권장 진입점**이다: 래퍼 pid를 기록해 자동 회수가 확실하고, 자식의
-  stdio·exit code를 그대로 전파하며(JSON 봉투 밖 실행), SIGINT/SIGTERM을 자식에
-  전달하고 자식 종료 후에만 release한다. 락 좌표 JSON 1줄은 stderr로 나온다
-  (기계 파싱은 `--json-fd <n>`). `--use-holder`는 bare acquire/wait로 잡은 홀더의
+- `with`는 **권장 진입점**이다: 정상 종료와 SIGINT/SIGTERM에서는 래퍼 pid를
+  기록하고 signal을 자식에게 전달한 뒤 자식 종료를 기다려 release한다. 자식의
+  stdio·exit code는 그대로 전파하며(JSON 봉투 밖 실행), 락 좌표 JSON 1줄은
+  stderr로 나온다(기계 파싱은 `--json-fd <n>`). 다만 래퍼가 `SIGKILL` 또는 선택적
+  OOM 종료로 먼저 사라지면 자식은 계속 실행될 수 있고, 다음 mutation은 죽은 래퍼
+  pid를 근거로 홀더를 reap할 수 있다. 이때 살아 있는 자식과 새 홀더가 보드를 함께
+  쓰는 물리 충돌 창이 생긴다. process group만으로 부모 사망 시 자식 종료가
+  보장되지는 않는다. v1은 이 advisory 한계를 수용하며, 강제종료 뒤 자식 생존과
+  `holder_reaped` 또는 후속 중복 점유가 함께 확인된 incident가 2회 쌓일 때만
+  guardian/handshake를 재검토한다. `--use-holder`는 bare acquire/wait로 잡은 홀더의
   pid를 래퍼로 갱신한다 — `acquire --claim-expired true`로 잡은 락 위에서 테스트를
   돌리는 경로가 이것이다. `--use-holder`는 기존 grant를 그대로 승계하므로
   `--mode`/`--for`/`--until`/`--purpose`/`--consume`을 받지 않는다(연장은
