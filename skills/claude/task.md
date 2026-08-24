@@ -1,5 +1,5 @@
 ---
-description: Use when the user explicitly requests a Project Control Task start, existing-Task resume, promotion, Handoff, finish, a finish-then-start switch to another Task/Issue, or recovery
+description: Use when the user explicitly requests a Project Control Task start, existing-Task resume, promotion, Handoff, finish, a finish-then-start switch, recovery, says 태스크 받아서 or 작업준비, or asks to receive or continue from a HANDOFF*.md file
 argument-hint: "(start | resume | promote | handoff | finish | switch | recover) <task-or-issue>"
 ---
 
@@ -14,6 +14,17 @@ argument-hint: "(start | resume | promote | handoff | finish | switch | recover)
 - canonical `task_id`·`repo_id`·`claim_id`, Issue node/revision을 추측하지 않는다.
 - token, private configured path, secret-like text를 content flag/Handoff/output에 넣지 않는다. `--repo-path`는 command에만 전달하고 응답에 반복하지 않는다.
 - nonzero exit에서 자동 reset/rebase/force/retry/takeover하지 않는다.
+
+## 좌표 없는 Task/Handoff 수신 발견
+
+사용자가 `태스크 받아서`, `작업준비`, `HANDOFF*.md`를 받아서/이어서 작업하라는 표현으로 Task 인수를 명시했지만 canonical `task_id`·Issue URL이 없으면 다음 discovery만 먼저 수행한다. 일반 조사 요청에는 자동 실행하지 않는다.
+
+1. `git rev-parse --show-toplevel`로 현재 저장소를 확정하고, 그 루트에서 `git worktree list --porcelain -z`를 실행한다. NUL field/빈 NUL record 경계로 파싱하고 공백·줄·`eval`로 쪼개거나 C-quoted path를 직접 복원하지 않는다. `-z`를 지원하지 않거나 record가 malformed이면 fail-closed한다. 이 명령이 열거한 **같은 저장소의 worktree**만 대상으로 삼는다.
+2. 각 worktree root 바로 아래의 symlink가 아닌 regular file `HANDOFF*.md`만 후보로 검사한다. 하위 디렉터리, 다른 repository, home, session/history, Notion으로 검색을 넓히지 않는다.
+3. 사용자가 파일명을 지정했다면 path component나 traversal을 받지 말고 그 **exact basename**과 일치하는 후보를 모든 worktree에서 먼저 찾는다. glob 확장·부분 일치·현재 checkout 우선 선택으로 대체하지 않는다. 파일명을 지정하지 않았을 때만 모든 `HANDOFF*.md`를 후보로 삼는다.
+4. 후보를 원래 filename byte와 porcelain record 기준으로 안정 정렬한다. 0개면 발견 실패를 보고하고 멈춘다. 여러 개면 임의로 읽거나 선택하거나 Claim하지 말고 총 개수와 최대 20개만 보여준 뒤 사용자 선택을 기다린다. 각 항목은 `순번 + JSON-style escaped basename + escaped branch(없으면 detached) + worktree-key`로 표시한다. `worktree-key`는 해당 NUL porcelain record의 SHA-256 앞 12 hex인 선택용 비권위 식별자다. C0/C1·ESC·bidi/non-printable 문자를 escape하고 원래 filename byte로 비교한다. 절대 worktree path는 출력하지 않으며 20개 초과분은 생략 수를 표시한다.
+5. 단일 후보를 읽기 직전과 사용자가 복수 후보를 선택한 뒤에는 `git worktree list --porcelain -z`부터 다시 실행한다. 내부에 보존한 exact worktree root, `worktree-key`, exact basename이 모두 그대로인지 확인하고 root와 파일을 no-follow 방식(`openat`/`O_NOFOLLOW` 후 `fstat`)으로 열어 regular file임을 재검증한다. 최대 12 KiB와 초과 확인용 1 byte만 읽고, 초과·교체·누락·symlink이면 truncate하거나 다른 후보로 넘어가지 말고 멈춘다.
+6. 선택한 Handoff의 Task/Issue/branch/worktree 표기는 **discovery hint**일 뿐이다. canonical Task 좌표, 현재 Claim, owner는 `jhw-control task status` 또는 명시적 기존-Task `start`의 성공 결과로만 확정한다. 다른 owner·충돌·불일치·좌표 부재에서는 작업하거나 자동 takeover하지 않는다.
 
 ## 새 Task 시작
 
