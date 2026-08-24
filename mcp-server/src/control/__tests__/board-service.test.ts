@@ -235,6 +235,45 @@ describe("reservation fencing", () => {
 });
 
 describe("reservation lifecycle", () => {
+  it.each([
+    "2026-08-23",
+    "2026-08-23 10:00",
+    "2026-09-31T10:00:00Z",
+    "2026-08-22T20:00:00+0900",
+  ])("rejects a non-offset or invalid-calendar until instant: %s", async (until) => {
+    const fixture = makeFixture();
+    await registered(fixture);
+    await expect(fixture.service.acquire({
+      board_id: "wlan-01", mode: "exclusive", session: "sess-a", purpose: "invalid", until,
+    })).rejects.toMatchObject({ code: "INVALID_BOARD_INPUT" });
+  });
+
+  it("rejects an invalid-calendar reservation instant before normalization", async () => {
+    const fixture = makeFixture();
+    await registered(fixture);
+    await expect(fixture.service.reserve({
+      board_id: "wlan-01",
+      mode: "exclusive",
+      from: "2026-09-31T10:00:00Z",
+      to: "2026-10-01T12:00:00Z",
+      session: "sess-a",
+      purpose: "invalid",
+    })).rejects.toMatchObject({ code: "INVALID_BOARD_INPUT" });
+  });
+
+  it("accepts an explicit offset datetime and stores its UTC instant", async () => {
+    const fixture = makeFixture();
+    await registered(fixture);
+    const acquired = await fixture.service.acquire({
+      board_id: "wlan-01",
+      mode: "exclusive",
+      session: "sess-a",
+      purpose: "offset",
+      until: "2026-08-22T20:00:00+09:00",
+    });
+    expect(acquired.holder.granted_until).toBe("2026-08-22T11:00:00.000Z");
+  });
+
   it("validates windows, bounds, and overlap conflicts", async () => {
     const fixture = makeFixture();
     await registered(fixture);
