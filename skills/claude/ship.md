@@ -21,14 +21,17 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 |---|---|---|---|
 | Codex (앱) | `chatgpt-codex-connector[bot]` | 리뷰/diff코멘트 **또는 PR 👍 리액션** | 👍 리액션만 있고 actionable 코멘트 없음 |
 | Gemini Assist (앱) | `gemini-code-assist[bot]` | `eyes`👀 ack → `COMMENTED` 리뷰 + inline | inline 지적 없음(요약만) |
-| Claude 리뷰 (워크플로우) | 봇 **스티키 코멘트**(마커 `<!-- automation:claude-code-review -->`) + `Claude Code Review` run | run 완료 + 스티키 `- Reviewed:` = 현재 SHA | `[CRITICAL]`/`[HIGH]` 0건 ("No blocking issues found" 포함) |
-| Gemini 리뷰 (워크플로우) | 봇 **스티키 코멘트**(마커 `<!-- automation:gemini-auto-review -->`) + `Gemini Auto PR Review` run | run 완료 + 스티키 `- Reviewed:` = 현재 SHA | `[CRITICAL]`/`[HIGH]` 0건 |
+| Claude 리뷰 (워크플로우) | 봇 **스티키 코멘트**(v3 마커 `<!-- automation:claude-code-review:v3 -->`) + `Claude Code Review` run | run 완료 + 유효한 schema-3 state가 현재 run/head 성공을 증명 | 활성 canonical `[CRITICAL]`/`[HIGH]` 0건 |
+| Gemini 리뷰 (워크플로우) | 봇 **스티키 코멘트**(v3 마커 `<!-- automation:gemini-auto-review:v3 -->`) + `Gemini Auto PR Review` run | run 완료 + 유효한 schema-3 state가 현재 run/head 성공을 증명 | 활성 canonical `[CRITICAL]`/`[HIGH]` 0건 |
 | OpenCode 리뷰 (워크플로우, 리포에 활성화된 경우) | 봇 코멘트(마커 `<!-- automation:opencode-auto-review -->`, **라운드마다 새 코멘트** — 스티키 아님) + `OpenCode Auto PR Review` run | run 완료 + 이번 라운드 마커 코멘트 | `[CRITICAL]`/`[HIGH]` 0건 |
 
-**스티키 코멘트 체계 (automation v1.42+)** — Claude/Gemini 리뷰 워크플로우는 라운드마다 코멘트를 쌓지 않고 마커 달린 **코멘트 하나를 제자리 갱신**한다. 작성자 로그인은 리포 인증 모드에 따라 `github-actions[bot]` 또는 App 봇으로 달라지므로, 식별은 **마커 + `user.type == "Bot"`**으로 한다. 스티키 상단 메타 라인이 라운드 판정 근거다:
-- `- Reviewed: <sha>` — 마지막 **성공** 리뷰가 본 head SHA. **현재 SHA와 같아야 이번 라운드 응답**(재푸시 후 이전 SHA면 아직 PENDING).
-- `- Status: failure` — 리뷰 산출 실패(보존할 이전 정상 리뷰 없음) → FAILED.
-- `- Last attempt: failure (run-url)` — 이번 시도 실패, 직전 정상 리뷰는 보존됨 → 이번 라운드 FAILED(재실행 후보). 본문 리뷰 내용은 이전 라운드 것이니 이번 라운드 판정에 쓰지 않는다.
+**스티키 코멘트 체계 (automation v1.46+)** — Claude/Gemini 리뷰 워크플로우는 라운드마다 코멘트를 쌓지 않고 마커 달린 **코멘트 하나를 제자리 갱신**한다. 작성자 로그인은 리포 인증 모드에 따라 `github-actions[bot]` 또는 App 봇으로 달라지므로, 식별은 **정확한 reviewer 마커 + `user.type == "Bot"`**으로 한다. v3 코멘트의 첫 세 줄은 header, reviewer별 v3 마커, `<!-- automation-state:{...} -->`이며 숨은 JSON state가 권위다. 표시용 `Status`/`Run`/`Reviewed`/`Validation`은 state와 일치하는지 확인하지만 그것만으로 성공을 만들지 않는다.
+
+- v3 state는 `schema == 3`, reviewer/PR 일치, 양의 `run_id`/`run_attempt`, 현재 `attempt_head`, 허용된 `attempt_status`/`diff_mode`, 일관된 성공·실패 의미를 모두 만족해야 한다. 대응하는 현재-head Actions run의 ID/attempt도 같아야 한다.
+- 성공은 `attempt_status == "success"`, `successful_head == attempt_head == 현재 SHA`, `quality_schema == 1`, 비음수 정수 `accepted_count`/`filtered_count`/`normalized_count`, 허용된 `filtered_max_severity`가 모두 확인된 경우뿐이다.
+- 현재-head state가 `attempt_status == "failure"`이면 이전 `successful_head`와 canonical 본문이 보존돼 있어도 이번 라운드는 FAILED다. 보존 본문을 현재 리뷰 판정에 재사용하지 않는다.
+- `filtered_count`와 `normalized_count`는 반드시 보고할 품질 경고다. `filtered_max_severity`가 HIGH/CRITICAL이어도 거부된 후보의 주장일 뿐이므로 단독으로 FEEDBACK을 만들지 않는다.
+- v3 마커가 하나라도 있으면 invalid/ambiguous v3를 legacy v2로 downgrade하지 않는다. v3 마커가 전혀 없는 v1.42~v1.45 소비자에서만 기존 `<!-- automation:claude-code-review -->`/`<!-- automation:gemini-auto-review -->`와 표시 메타를 호환 경로로 사용한다.
 
 **단축 이름 매핑** (`--reviewers`용): `codex`→`chatgpt-codex-connector[bot]`, `gemini-assist`→`gemini-code-assist[bot]`, `claude`→`Claude Code Review`(워크플로우), `gemini`→`Gemini Auto PR Review`(워크플로우), `opencode`→`OpenCode Auto PR Review`(워크플로우).
 
@@ -97,10 +100,20 @@ collect() {   # CLEAN/FEEDBACK 분류엔 본문이 필요하므로 reviews/comme
   echo "## reviews";   gh api "repos/$REPO_NWO/pulls/$PR/reviews"   -q '.[] | "\(.user.login)\t\(.state)\t\(.commit_id[0:7])\t\((.body//"")|gsub("[\n\t]";" ")|.[0:200])"' 2>/dev/null
   echo "## pcomments"; gh api "repos/$REPO_NWO/pulls/$PR/comments"  -q '.[] | "\(.user.login)\t\(.commit_id[0:7])\t\((.body//"")|gsub("[\n\t]";" ")|.[0:200])"' 2>/dev/null
   echo "## icomments"; gh api "repos/$REPO_NWO/issues/$PR/comments" -q '.[] | "\(.user.login)\t\((.body//"")|gsub("[\n\t]";" ")|.[0:200])"' 2>/dev/null
+  # v3 state와 canonical 활성 섹션은 200자 요약으로 판정할 수 없다. 해당 봇 코멘트는
+  # JSON 문자열 이스케이프를 보존한 전체 객체로 별도 수집한다.
+  echo "## workflow_comments"; gh api "repos/$REPO_NWO/issues/$PR/comments" \
+    -q '.[] | select((.user.type//"") == "Bot")
+        | select((.body//"") | contains("<!-- automation:claude-code-review:v3 -->")
+          or contains("<!-- automation:gemini-auto-review:v3 -->")
+          or contains("<!-- automation:claude-code-review -->")
+          or contains("<!-- automation:gemini-auto-review -->"))
+        | {id, author:.user.login, type:.user.type, created_at, updated_at, body}' 2>/dev/null
   echo "## reactions"; gh api "repos/$REPO_NWO/issues/$PR/reactions" -q '.[] | "\(.user.login)\t\(.content)\t\(.created_at)"' 2>/dev/null   # +1/heart=긍정, eyes=확인중, -1/confused=부정. created_at로 라운드 스코프.
   echo "## runs";      gh api "repos/$REPO_NWO/actions/runs?head_sha=$SHA" \
-                         -q '.workflow_runs[] | "\(.name)\t\(.status)\t\(.conclusion)"' 2>/dev/null
-                         # head_sha 스코프(브랜치 삭제 후에도 동작). 필드: .name(=워크플로우명), conclusion 미정은 리터럴 "null"=non-terminal.
+                         -q '.workflow_runs[] | "\(.id)\t\(.run_attempt)\t\(.name)\t\(.head_sha)\t\(.status)\t\(.conclusion)\t\(.html_url)"' 2>/dev/null
+                         # head_sha 스코프(브랜치 삭제 후에도 동작). state의 run_id/run_attempt와 결합한다.
+                         # conclusion 미정은 리터럴 "null"=non-terminal.
 }
 collect
 ```
@@ -123,8 +136,10 @@ collect > /tmp/ship_signals.$PR   # 매 호출 1회분. 에이전트가 읽어 �
 - **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**.
 - **Codex**: **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**. (a) 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) 리뷰·코멘트가 전혀 없고 `chatgpt-codex-connector[bot] +1` 리액션만 있으면 → **CLEAN**(무지적 신호), (c) 아무 신호도 없으면 **PENDING**.
 - **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
-- **Claude 리뷰**: `Claude Code Review` run `completed` **그리고** 마커 스티키의 `- Reviewed:`가 현재 SHA면 terminal — 스티키 본문 심각도로 판정(`[CRITICAL]`/`[HIGH]` 있으면 **FEEDBACK**, `[MEDIUM]`/`[LOW]`만이거나 "No blocking issues found"면 **CLEAN**). 스티키가 `- Status: failure`거나 `- Last attempt: failure`가 이번 run을 가리키면 **FAILED**(run 재실행이 1차 복구 — 워크플로우 파일을 바꾸는 PR에선 claude-code-action의 workflow-validation 가드가 의도적으로 스킵하므로 FAILED가 정상). run `in_progress`면 PENDING. **멈춘 in_progress run**(INTERVAL 3회 연속 in_progress 또는 TIMEOUT_MIN 초과)은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체.
-- **Gemini 리뷰(워크플로우)**: `Gemini Auto PR Review` run `completed` + 스티키 `- Reviewed:` = 현재 SHA면 terminal(판정 라벨은 Claude와 동일 `[CRITICAL]`~`[LOW]`). 실패(429 등)는 스티키에 `- Last attempt: failure`로 남고 v1.43+는 지터 재시도가 내장돼 있어 드묾 — 남으면 run 재실행, 또는 Gemini Assist 앱 결과로 대체 가능(중복이면 앱 우선).
+- **Claude/Gemini schema-3 공통 판정**: reviewer별 v3 스티키가 정확히 하나이고 위 state 계약과 동일 ID/attempt의 현재-head run이 `completed`여야 terminal이다. 성공 state이면 canonical 본문의 `### New findings`와 `### Still open` 아래에서만 정확한 `#### RVW-<12hex> [SEVERITY] title` heading을 센다. `### Resolved`/`### Retracted`, 일반 산문의 bracket 문자열, `filtered_max_severity`는 활성 지적이 아니다. `accepted_count`와 활성 heading 수가 다르거나 state/표시 메타가 불일치하면 성공으로 간주하지 않고 FAILED로 보고한다.
+- **Claude 리뷰**: 유효한 현재-head v3 성공에서 활성 `[CRITICAL]`/`[HIGH]`이 있으면 FEEDBACK, 없으면 CLEAN이다. 유효한 현재-head 실패 state는 FAILED(재실행 후보). run이 `in_progress`면 PENDING. 워크플로우 파일을 바꾸는 PR에서 claude-code-action의 default-branch 동일성 검증으로 모델이 의도적으로 스킵된 경우도 FAILED로 명시하되, 같은 역할의 앱 대체 신호 적용 여부는 아래 규칙을 따른다. **멈춘 in_progress run**(INTERVAL 3회 연속 in_progress 또는 TIMEOUT_MIN 초과)은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체한다.
+- **Gemini 리뷰(워크플로우)**: 유효한 현재-head v3 성공은 Claude와 같은 canonical 활성 heading 규칙으로 판정한다. provider/quota/지역/출력 계약 실패를 포함한 현재-head 실패 state는 FAILED이며, run 재실행 또는 Gemini Assist 앱 결과로 대체할 수 있다(중복이면 앱 우선).
+- **Claude/Gemini legacy v2 호환**: v3 마커가 전혀 없을 때만 완료 run + legacy marker + `- Reviewed: 현재 SHA`를 terminal로 인정하고, 기존 bracket 심각도 규칙을 적용한다. 현재-head v2 `Status: failure`/`Last attempt: failure`는 FAILED다.
 - **OpenCode 리뷰(활성화된 리포)**: `OpenCode Auto PR Review` run `completed` + **이번 라운드에 새로 달린** 마커 코멘트(스티키가 아니라 누적형 — 최신 것만 이번 라운드)로 판정. run은 완료됐는데 새 코멘트가 없거나 "Failed to get summary from agent"로 실패하면 **FAILED** — CLI 플레이크로 재실행이 1차 복구.
 - **미응답(timeout)**: 끝까지 PENDING인 리뷰어는 `TIMEOUT`으로 보고하고 머지 차단(전원 CLEAN 조건 미충족).
 
@@ -133,7 +148,8 @@ collect > /tmp/ship_signals.$PR   # 매 호출 1회분. 에이전트가 읽어 �
 LLM 자동 리뷰어는 라운드마다 새 nit을 만들어 "지적 0건"에 도달하지 않는다. 그래서 CLEAN은 **"블로킹 심각도 지적 0건"**으로 판정해 루프가 반드시 종료되게 한다.
 
 - **블로킹 임계** = `--block-on`(기본 `must-fix`) 이상. 리뷰어 라벨 매핑:
-  - Claude/Gemini/OpenCode 워크플로우 리뷰: `[CRITICAL]`/`[HIGH]`(블로킹) ▸ `[MEDIUM]` ▸ `[LOW]` (automation v1.41+ 공통 라벨)
+  - Claude/Gemini schema-3: 활성 섹션에서 정규식 `^#### RVW-[0-9a-f]{12} \[(CRITICAL|HIGH|MEDIUM)\] .+$`와 일치하는 canonical heading만 센다. `[CRITICAL]`/`[HIGH]`(블로킹) ▸ `[MEDIUM]`; filtered/normalized 후보와 Resolved/Retracted는 경고·이력이며 블로킹이 아니다.
+  - Claude/Gemini legacy v2 및 OpenCode v2: `[CRITICAL]`/`[HIGH]`(블로킹) ▸ `[MEDIUM]` ▸ `[LOW]`.
   - Codex: `P1`(블로킹) ▸ `P2` ▸ `P3`
   - Gemini Assist: `critical`/`high`(블로킹) ▸ `medium` ▸ `low`
   - `--block-on should-fix`면 `[MEDIUM]`/`P2`/`medium`까지 블로킹으로 포함.
