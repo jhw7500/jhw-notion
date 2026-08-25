@@ -217,17 +217,18 @@ function commandFromToolInput(input: JsonValue): string {
   return command;
 }
 
-function shellExecutionMaterial(input: JsonValue, digestArgv?: readonly string[]): JsonValue {
-  if (!digestArgv) return input;
+function shellExecutionMaterial(input: JsonValue, rawCommand: string, digestArgv?: readonly string[]): JsonValue {
   const object = asObject(input);
   if (!object) throw new OperationNormalizationError("invalid_tool_input");
   const options: Record<string, JsonValue> = {};
   for (const [key, value] of Object.entries(object)) {
     if (key !== "command") options[key] = value;
   }
-  return Object.keys(options).length === 0
-    ? { argv: [...digestArgv] }
-    : { argv: [...digestArgv], options };
+  return {
+    raw_command: rawCommand,
+    ...(digestArgv ? { argv: [...digestArgv] } : {}),
+    ...(Object.keys(options).length === 0 ? {} : { options }),
+  };
 }
 
 function summaryFor(requirements: readonly OperationRequirement[]): string {
@@ -324,7 +325,7 @@ async function normalizeTool(
       requirements: classification.requirements,
       risk: classification.risk,
       execution_boundary: classification.execution_boundary,
-      execution: shellExecutionMaterial(event.tool_input, classification.digest_argv),
+      execution: shellExecutionMaterial(event.tool_input, command, classification.digest_argv),
       ...(classification.script_content_sha256
         ? { script_content_sha256: classification.script_content_sha256 }
         : {}),

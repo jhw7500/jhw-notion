@@ -24,6 +24,7 @@ describe("conservative shell classification", () => {
     root = await mkdtemp(join(tmpdir(), "guard-shell-"));
     cwd = join(root, "subdir");
     await mkdir(cwd);
+    await mkdir(join(root, ".git"));
     context = { trusted_worktree_path: root, cwd, repository, issue, board };
   });
 
@@ -38,6 +39,104 @@ describe("conservative shell classification", () => {
     expect(result.execution_boundary).toBe("hook");
     expect(result.risk).toBe("medium");
     expect(result.ambiguous).toBe(false);
+  });
+
+  it("binds Git effective-directory options only when they resolve to the trusted repository", async () => {
+    for (const command of [
+      `git -C ${root} commit -m bounded`,
+      "git -C . commit -m bounded",
+      `git --git-dir=${join(root, ".git")} --work-tree=${root} commit -m bounded`,
+    ]) {
+      const result = await classifyShell(command, context);
+      expect(result.requirements).toContainEqual({ capability: "git.commit", resource: repository });
+      expect(result.unresolved_signals).not.toContainEqual({
+        capability: "git.commit",
+        boundary: "guarded_command",
+      });
+    }
+  });
+
+  it("does not attach the current repository to external Git effective targets", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "guard-shell-outside-"));
+    await mkdir(join(outside, ".git"));
+    try {
+      for (const command of [
+        `git -C ${outside} commit -m bounded`,
+        `git --git-dir=${join(outside, ".git")} --work-tree=${outside} commit -m bounded`,
+      ]) {
+        const result = await classifyShell(command, context);
+        expect(result.requirements).not.toContainEqual({ capability: "git.commit", resource: repository });
+        expect(result.unresolved_signals).toContainEqual({
+          capability: "git.commit",
+          boundary: "guarded_command",
+        });
+      }
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for dynamic, missing, or incomplete Git effective targets", async () => {
+    for (const command of [
+      'git -C "$TARGET" commit -m bounded',
+      'git -C"$TARGET" commit -m bounded',
+      "git -C missing-directory commit -m bounded",
+      "git --git-dir commit -m bounded",
+      "git --work-tree=/srv/other commit -m bounded",
+    ]) {
+      const result = await classifyShell(command, context);
+      expect(result.requirements).not.toContainEqual({ capability: "git.commit", resource: repository });
+      expect(result.unresolved_signals).toContainEqual({
+        capability: "git.commit",
+        boundary: "guarded_command",
+      });
+    }
+  });
+
+  it("does not let environment overrides or bare mode redirect repository authority", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "guard-shell-env-outside-"));
+    await mkdir(join(outside, ".git"));
+    try {
+      for (const command of [
+        `GIT_DIR=${join(outside, ".git")} git commit -m bounded`,
+        `env GIT_WORK_TREE=${outside} git commit -m bounded`,
+        'GIT_DIR="$TARGET" git commit -m bounded',
+        "cd /srv/other && git commit -m bounded",
+        "git --bare commit -m bounded",
+        "GH_REPO=cli/cli gh pr create --title bounded",
+        'env GH_REPO="$TARGET" gh pr create --title bounded',
+        "env GH_HOST=github.example gh pr create --title bounded",
+        "gh --hostname github.example pr create --title bounded",
+      ]) {
+        const result = await classifyShell(command, context);
+        const capability = command.includes("gh ") ? "git.publish" : "git.commit";
+        expect(result.requirements.map((requirement) => requirement.capability)).not.toContain(capability);
+        expect(result.unresolved_signals).toContainEqual({ capability, boundary: "guarded_command" });
+      }
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat PATH-selected or local lookalike executables as canonical Git", async () => {
+    const lookalike = join(cwd, "git");
+    const content = "#!/bin/sh\necho not-git\n";
+    await writeFile(lookalike, content, { mode: 0o700 });
+
+    for (const command of [
+      `PATH=${cwd} git commit -m bounded`,
+      "env -i git commit -m bounded",
+      "./git commit -m bounded",
+    ]) {
+      const result = await classifyShell(command, context);
+      expect(result.requirements.map((requirement) => requirement.capability)).not.toContain("git.commit");
+      expect(result.unresolved_signals).toContainEqual({
+        capability: "git.commit",
+        boundary: "guarded_command",
+      });
+    }
+    const local = await classifyShell("./git commit -m bounded", context);
+    expect(local.script_content_sha256).toBe(createHash("sha256").update(content).digest("hex"));
   });
 
   it.each([
@@ -58,10 +157,11 @@ describe("conservative shell classification", () => {
     "gh issue close 42",
     "gh issue edit 42 --title bounded",
     "gh issue comment 42 --body bounded",
-  ])("maps tracker command %s to the exact issue resource", async (command) => {
+  ])("keeps tracker command %s unresolved until the authoritative tracker resolver", async (command) => {
     const result = await classifyShell(command, context);
 
-    expect(result.requirements).toEqual([{ capability: "tracker.mutate", resource: issue }]);
+    expect(result.requirements.map((requirement) => requirement.capability)).not.toContain("tracker.mutate");
+    expect(result.unresolved_signals).toContainEqual({ capability: "tracker.mutate", boundary: "tracker" });
     expect(result.execution_boundary).toBe("tracker");
     expect(result.direct_high_risk).toBe(true);
   });
@@ -116,6 +216,45 @@ describe("conservative shell classification", () => {
     expect(result.self_approval).toBe(true);
   });
 
+  it("applies high-risk and self-approval detection to quote-composed executable argv", async () => {
+    const remote = await classifyShell("s's'h target.example uname -a", context);
+    const selfApproval = await classifyShell(
+      "jhw-control g'u'ard approve req-018f21e0-7b2c-7a00-8000-000000000003",
+      context,
+    );
+
+    expect(remote.unresolved_signals).toContainEqual({
+      capability: "remote.execute",
+      boundary: "guarded_command",
+    });
+    expect(remote.direct_high_risk).toBe(true);
+    expect(selfApproval.self_approval).toBe(true);
+  });
+
+  it.each([
+    ["gh --repo cli/cli pr create --title bounded", "git.publish", "guarded_command"],
+    ["gh -R cli/cli issue close 999", "tracker.mutate", "tracker"],
+  ] as const)("retains installed-valid gh global-option form %s as unresolved high risk", async (
+    command,
+    capability,
+    boundary,
+  ) => {
+    const result = await classifyShell(command, context);
+    expect(result.unresolved_signals).toContainEqual({ capability, boundary });
+    expect(result.requirements.map((requirement) => requirement.capability)).not.toContain(capability);
+    expect(result.direct_high_risk).toBe(true);
+  });
+
+  it("keeps an uninterpretable known gh executable in the high-risk boundary", async () => {
+    const result = await classifyShell("gh --repo pr create --title bounded", context);
+
+    expect(result.unresolved_signals).toContainEqual({
+      capability: "git.publish",
+      boundary: "guarded_command",
+    });
+    expect(result.direct_high_risk).toBe(true);
+  });
+
   it("maps a simple unknown executable only to shell.unclassified", async () => {
     const result = await classifyShell("custom-tool --opaque value", context);
 
@@ -135,8 +274,8 @@ describe("conservative shell classification", () => {
     expect(result.requirements).toEqual([
       { capability: "git.publish", resource: repository },
       { capability: "shell.unclassified", resource: repository },
-      { capability: "tracker.mutate", resource: issue },
     ]);
+    expect(result.unresolved_signals).toContainEqual({ capability: "tracker.mutate", boundary: "tracker" });
     expect(result.unresolved_signals).toContainEqual({
       capability: "remote.execute",
       boundary: "guarded_command",
@@ -229,6 +368,139 @@ describe("conservative shell classification", () => {
     expect(result.digest_argv).toEqual(["./safe-script.sh", "--flag", "two words"]);
     expect(JSON.stringify(result)).not.toContain(content);
     expect(JSON.stringify(result)).not.toContain(script);
+  });
+
+  it("uses POSIX double-quote backslash rules without collapsing distinct argv", async () => {
+    const preserved = await classifyShell('custom-tool "a\\q"', context);
+    const plain = await classifyShell('custom-tool "aq"', context);
+    const continued = await classifyShell("custom-tool \"a\\\nq\"", context);
+
+    expect(preserved.digest_argv).toEqual(["custom-tool", "a\\q"]);
+    expect(plain.digest_argv).toEqual(["custom-tool", "aq"]);
+    expect(preserved.digest_argv).not.toEqual(plain.digest_argv);
+    expect(continued.digest_argv).toEqual(["custom-tool", "aq"]);
+  });
+
+  it.each([
+    "custom-tool *.ts",
+    "custom-tool {alpha,beta}",
+    "custom-tool ~/runtime-target",
+    'custom-tool "$RUNTIME_TARGET"',
+  ])("treats runtime expansion %s as ambiguous shell.unclassified", async (command) => {
+    const result = await classifyShell(command, context);
+
+    expect(result.ambiguous).toBe(true);
+    expect(result.requirements).toContainEqual({ capability: "shell.unclassified", resource: repository });
+    expect(result.digest_argv).toBeUndefined();
+  });
+
+  it("finds and hashes local scripts after assignments and env prefixes", async () => {
+    const script = join(cwd, "prefixed.sh");
+    const content = "#!/bin/sh\necho prefixed\n";
+    await writeFile(script, content, { mode: 0o700 });
+    const expected = createHash("sha256").update(content).digest("hex");
+
+    for (const command of [
+      "MODE=safe ./prefixed.sh",
+      "env MODE=safe ./prefixed.sh",
+      "env -i MODE=safe ./prefixed.sh",
+      "env --unset UNUSED MODE=safe ./prefixed.sh",
+    ]) {
+      const result = await classifyShell(command, context);
+      expect(result.script_content_sha256).toBe(expected);
+    }
+  });
+
+  it("fails closed for an env-prefixed unsafe local script", async () => {
+    const script = join(cwd, "prefixed-safe.sh");
+    await writeFile(script, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    await symlink(script, join(cwd, "prefixed-linked.sh"));
+
+    await expect(classifyShell("env MODE=safe ./prefixed-linked.sh", context)).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
+  });
+
+  it("fails closed instead of resolving a local script through env chdir", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "guard-shell-env-chdir-"));
+    const script = join(outside, "outside.sh");
+    await writeFile(script, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    try {
+      for (const option of [`-C ${outside}`, `--chdir=${outside}`]) {
+        await expect(classifyShell(`env ${option} ./outside.sh`, context)).rejects.toMatchObject({
+          name: "ShellClassificationError",
+          code: "unsafe_local_script",
+        } satisfies Partial<ShellClassificationError>);
+      }
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps generic guard wrappers for tracker, remote, and deployment targets unresolved", async () => {
+    const prefix = "jhw-control guard with --task tsk-018f21e0-7b2c-7a00-8000-000000000001 --claim clm-018f21e0-7b2c-7a00-8000-000000000002 --session codex-local --origin-adapter codex --";
+    const cases = [
+      {
+        command: `${prefix} gh issue comment 999 --body bounded`,
+        capability: "tracker.mutate" as const,
+        boundary: "tracker" as const,
+      },
+      {
+        command: `${prefix} ssh arbitrary.example uname -a`,
+        capability: "remote.execute" as const,
+        boundary: "guarded_command" as const,
+      },
+      {
+        command: `${prefix} kubectl apply -f deployment.yaml`,
+        capability: "deploy.execute" as const,
+        boundary: "guarded_command" as const,
+      },
+    ];
+
+    for (const candidate of cases) {
+      const result = await classifyShell(candidate.command, {
+        ...context,
+        remote_host: { kind: "remote_host", id: "rhost-alpha" },
+        deployment_target: { kind: "deployment_target", id: "dpl-alpha" },
+      });
+      expect(result.owned_wrapper).toBe("guard");
+      expect(result.requirements.map((requirement) => requirement.capability)).not.toContain(candidate.capability);
+      expect(result.unresolved_signals).toContainEqual({
+        capability: candidate.capability,
+        boundary: candidate.boundary,
+      });
+    }
+  });
+
+  it("does not let a board wrapper borrow a generic remote-host context", async () => {
+    const result = await classifyShell(
+      "jhw-control board with --board board-alpha --mode exclusive --task tsk-018f21e0-7b2c-7a00-8000-000000000001 --claim clm-018f21e0-7b2c-7a00-8000-000000000002 --session codex-local --origin-adapter codex --purpose bounded -- ssh arbitrary.example uname -a",
+      { ...context, remote_host: { kind: "remote_host", id: "rhost-alpha" } },
+    );
+
+    expect(result.requirements).toContainEqual({ capability: "board.execute", resource: board });
+    expect(result.requirements).not.toContainEqual({
+      capability: "remote.execute",
+      resource: { kind: "remote_host", id: "rhost-alpha" },
+    });
+    expect(result.unresolved_signals).toContainEqual({
+      capability: "remote.execute",
+      boundary: "guarded_command",
+    });
+  });
+
+  it("binds board-wrapped firmware only to the exact board coordinate", async () => {
+    const result = await classifyShell(
+      "jhw-control board with --board board-alpha --mode exclusive --task tsk-018f21e0-7b2c-7a00-8000-000000000001 --claim clm-018f21e0-7b2c-7a00-8000-000000000002 --session codex-local --origin-adapter codex --purpose bounded -- flashrom -w firmware.bin",
+      { ...context, firmware_target: { kind: "firmware_target", id: "fwt-unproven" } },
+    );
+
+    expect(result.requirements).toContainEqual({ capability: "firmware.change", resource: board });
+    expect(result.requirements).not.toContainEqual({
+      capability: "firmware.change",
+      resource: { kind: "firmware_target", id: "fwt-unproven" },
+    });
   });
 
   it("fails closed for a symlink, directory, non-executable, outside, or oversized script", async () => {

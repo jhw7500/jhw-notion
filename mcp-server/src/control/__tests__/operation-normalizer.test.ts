@@ -27,6 +27,7 @@ describe("operation normalization", () => {
     root = await mkdtemp(join(tmpdir(), "guard-operation-"));
     subdir = join(root, "src");
     await mkdir(subdir);
+    await mkdir(join(root, ".git"));
     context = {
       evaluation_stage: "hook",
       task_id: TASK_ID,
@@ -63,7 +64,7 @@ describe("operation normalization", () => {
   }
 
   it("produces a strict, sorted, secret-safe canonical operation", async () => {
-    const rawCommand = "git push https://user:credential@example.invalid/private HEAD && gh issue comment 42 --body secret";
+    const rawCommand = "git push https://user:credential@example.invalid/private HEAD && echo secret";
     const operation = await normalizeOperation(event({ tool_input: { command: rawCommand } }), context, KEY);
 
     expect(CanonicalOperationSchema.safeParse(operation).success).toBe(true);
@@ -79,10 +80,9 @@ describe("operation normalization", () => {
       requirements: [
         { capability: "git.publish", resource: context.repository },
         { capability: "shell.unclassified", resource: context.repository },
-        { capability: "tracker.mutate", resource: context.issue },
       ],
       risk: "high",
-      execution_boundary: "tracker",
+      execution_boundary: "guarded_command",
     });
     expect(operation.operation_id).toMatch(/^op-[0-9a-f-]+$/);
     expect(operation.digest).toMatch(/^[0-9a-f]{64}$/);
@@ -203,6 +203,46 @@ describe("operation normalization", () => {
     for (const candidate of await Promise.all(cases)) expect(candidate.digest).not.toBe(base.digest);
   });
 
+  it("privately binds distinct raw shell command bytes without exposing them", async () => {
+    const preserved = await normalizeOperation(event({
+      tool_input: { command: 'custom-tool "a\\q"' },
+    }), context, KEY);
+    const plain = await normalizeOperation(event({
+      tool_input: { command: 'custom-tool "aq"' },
+    }), context, KEY);
+
+    expect(preserved.digest).not.toBe(plain.digest);
+    expect(JSON.stringify(preserved)).not.toContain('custom-tool "a\\q"');
+    expect(JSON.stringify(plain)).not.toContain('custom-tool "aq"');
+  });
+
+  it("fails normalization for Git effective targets outside the trusted repository", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "guard-operation-outside-"));
+    await mkdir(join(outside, ".git"));
+    try {
+      await expect(normalizeOperation(event({
+        tool_input: { command: `git -C ${outside} commit -m bounded` },
+      }), context, KEY)).rejects.toMatchObject({
+        code: "unresolved_boundary",
+        signals: [{ capability: "git.commit", boundary: "guarded_command" }],
+      } satisfies Partial<OperationNormalizationError>);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("binds verified effective Git target syntax into the operation digest", async () => {
+    const plain = await normalizeOperation(event({
+      tool_input: { command: "git commit -m bounded" },
+    }), context, KEY);
+    const explicit = await normalizeOperation(event({
+      tool_input: { command: `git -C ${root} commit -m bounded` },
+    }), context, KEY);
+
+    expect(explicit.requirements).toEqual([{ capability: "git.commit", resource: context.repository }]);
+    expect(explicit.digest).not.toBe(plain.digest);
+  });
+
   it("binds non-command JSON fields that can affect shell execution", async () => {
     const first = await normalizeOperation(event({
       tool_input: { command: "git commit -m bounded", timeout_ms: 1_000, background: false },
@@ -240,6 +280,23 @@ describe("operation normalization", () => {
       expect(JSON.stringify(operation)).not.toContain("echo first");
       expect(JSON.stringify(operation)).not.toContain("echo changed");
     }
+  });
+
+  it("binds env-prefixed local script content changes", async () => {
+    const script = join(root, "prefixed.sh");
+    await writeFile(script, "#!/bin/sh\necho first\n", { mode: 0o700 });
+    const first = await normalizeOperation(event({
+      tool_input: { command: "env MODE=safe ./prefixed.sh" },
+    }), context, KEY);
+    await writeFile(script, "#!/bin/sh\necho second\n", { mode: 0o700 });
+    await chmod(script, 0o700);
+    const second = await normalizeOperation(event({
+      tool_input: { command: "env MODE=safe ./prefixed.sh" },
+    }), context, KEY);
+
+    expect(first.digest).not.toBe(second.digest);
+    expect(JSON.stringify(first)).not.toContain("echo first");
+    expect(JSON.stringify(second)).not.toContain("echo second");
   });
 
   it("excludes operation, correlation, stage, and summary metadata from explicit digest material", () => {

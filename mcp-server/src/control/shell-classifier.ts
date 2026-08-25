@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { OperationRequirement } from "./guard-protocol.js";
 import type { ResourceRef } from "./work-contract.js";
@@ -15,6 +15,8 @@ const scriptOpenFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_
 export type ExecutionBoundary = "hook" | "guarded_command" | "tracker" | "notion" | "board";
 export type OperationRisk = "low" | "medium" | "high";
 export type UnresolvedCapability =
+  | "git.commit"
+  | "git.publish"
   | "tracker.mutate"
   | "notion.mutate"
   | "board.observe"
@@ -76,6 +78,7 @@ interface Detection {
     | "deploy.execute";
   boundary: ExecutionBoundary;
   risk: OperationRisk;
+  repository_target?: "current" | "unresolved";
 }
 
 interface ParseResult {
@@ -123,7 +126,10 @@ function strongerRisk(left: OperationRisk, right: OperationRisk): OperationRisk 
 }
 
 function rawWords(command: string): string[] {
-  return command.match(/--?[A-Za-z0-9][A-Za-z0-9_.-]*|[A-Za-z0-9_./:-]+/g)?.map((word) => word.toLowerCase()) ?? [];
+  // Removing quote delimiters reconstructs adjacent POSIX quote composition
+  // for conservative detection only. It never produces executable argv.
+  const dequoted = command.replace(/["']/gu, "");
+  return dequoted.match(/--?[A-Za-z0-9][A-Za-z0-9_.-]*|[A-Za-z0-9_./:-]+/g)?.map((word) => word.toLowerCase()) ?? [];
 }
 
 function executableName(value: string): string {
@@ -143,27 +149,49 @@ function scanHighRisk(command: string): { detections: Detection[]; selfApproval:
   const detections: Detection[] = [];
   let selfApproval = false;
   const add = (detection: Detection): void => {
-    const key = `${detection.capability}\u0000${detection.boundary}`;
-    if (!detections.some((candidate) => `${candidate.capability}\u0000${candidate.boundary}` === key)) {
+    const key = `${detection.capability}\u0000${detection.boundary}\u0000${detection.repository_target ?? ""}`;
+    if (!detections.some((candidate) =>
+      `${candidate.capability}\u0000${candidate.boundary}\u0000${candidate.repository_target ?? ""}` === key)) {
       detections.push(detection);
     }
   };
+  const riskCommand = command.replace(/["']/gu, "");
+  const hasWorkingDirectoryOverride = /(?:^|[;&|()\s])(?:cd|pushd|popd)(?:\s|$)|--chdir(?:=|\s|$)/u.test(riskCommand);
+  const hasGitTargetOption =
+    /(?:^|\s)-C(?:\S*)|--(?:git-dir|work-tree)(?:=|\s|$)|\b(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_OBJECT_DIRECTORY|GIT_INDEX_FILE)=/u
+      .test(riskCommand) || hasWorkingDirectoryOverride;
+  const hasGhRepositoryOption =
+    /(?:^|\s)(?:--repo(?:=|\s|$)|-R(?:=|\s|$))|\b(?:GH_REPO|GH_HOST)=|--hostname(?:=|\s|$)/u
+      .test(riskCommand) || hasWorkingDirectoryOverride;
 
   for (let index = 0; index < words.length; index += 1) {
     const word = executableName(words[index] as string);
     if (word === "git") {
       const action = findFollowing(words, index, new Set(["commit", "push"]));
-      if (action === "commit") add({ capability: "git.commit", boundary: "hook", risk: "medium" });
-      if (action === "push") add({ capability: "git.publish", boundary: "guarded_command", risk: "high" });
+      const repositoryTarget = hasGitTargetOption ? "unresolved" as const : "current" as const;
+      if (action === "commit") add({
+        capability: "git.commit",
+        boundary: repositoryTarget === "current" ? "hook" : "guarded_command",
+        risk: "medium",
+        repository_target: repositoryTarget,
+      });
+      if (action === "push") add({
+        capability: "git.publish",
+        boundary: "guarded_command",
+        risk: "high",
+        repository_target: repositoryTarget,
+      });
     }
     if (word === "gh") {
-      const family = words[index + 1];
-      const action = words[index + 2];
+      const family = findFollowing(words, index, new Set(["pr", "release", "issue"]), 8);
+      const familyIndex = family ? words.indexOf(family, index + 1) : -1;
+      const action = familyIndex >= 0 ? words[familyIndex + 1] : undefined;
+      const repositoryTarget = hasGhRepositoryOption ? "unresolved" as const : "current" as const;
       if (family === "pr" && (action === "create" || action === "merge")) {
-        add({ capability: "git.publish", boundary: "guarded_command", risk: "high" });
+        add({ capability: "git.publish", boundary: "guarded_command", risk: "high", repository_target: repositoryTarget });
       }
       if (family === "release" && action === "create") {
-        add({ capability: "git.publish", boundary: "guarded_command", risk: "high" });
+        add({ capability: "git.publish", boundary: "guarded_command", risk: "high", repository_target: repositoryTarget });
       }
       if (family === "issue" && (action === "close" || action === "edit" || action === "comment")) {
         add({ capability: "tracker.mutate", boundary: "tracker", risk: "high" });
@@ -239,7 +267,13 @@ function parseSimpleArgv(command: string): ParseResult {
       if (character === '"') {
         quote = undefined;
       } else if (character === "\\") {
-        escaped = true;
+        if (next === "\n") {
+          index += 1;
+        } else if (next === "$" || next === "`" || next === '"' || next === "\\") {
+          escaped = true;
+        } else {
+          token += character;
+        }
       } else {
         if (character === "$" || character === "`") return { ambiguous: true };
         token += character;
@@ -248,6 +282,10 @@ function parseSimpleArgv(command: string): ParseResult {
       continue;
     }
     if (character === "\\") {
+      if (next === "\n") {
+        index += 1;
+        continue;
+      }
       escaped = true;
       tokenStarted = true;
       continue;
@@ -267,7 +305,11 @@ function parseSimpleArgv(command: string): ParseResult {
       push();
       continue;
     }
-    if (";&|<>()`".includes(character) || character === "$" || (character === "<" && next === "<")) {
+    if (
+      ";&|<>()`".includes(character) || character === "$" ||
+      "*?[{}".includes(character) || (character === "~" && !tokenStarted) ||
+      (character === "<" && next === "<")
+    ) {
       return { ambiguous: true };
     }
     token += character;
@@ -286,6 +328,280 @@ function parseSimpleArgv(command: string): ParseResult {
 function isWithin(root: string, target: string): boolean {
   const path = relative(root, target);
   return path === "" || (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`));
+}
+
+function isAssignment(value: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/u.test(value);
+}
+
+function executableArgv(argv: readonly string[]): string[] | undefined {
+  let index = 0;
+  while (index < argv.length && isAssignment(argv[index] as string)) index += 1;
+  if (index >= argv.length) return undefined;
+  if (executableName(argv[index] as string) !== "env") return argv.slice(index);
+
+  index += 1;
+  while (index < argv.length) {
+    const argument = argv[index] as string;
+    if (argument === "--") {
+      index += 1;
+      break;
+    }
+    if (isAssignment(argument)) {
+      index += 1;
+      continue;
+    }
+    if (argument === "-i" || argument === "--ignore-environment") {
+      index += 1;
+      continue;
+    }
+    if (argument === "-u" || argument === "--unset") {
+      if (argv[index + 1] === undefined) return undefined;
+      index += 2;
+      continue;
+    }
+    if (
+      argument === "-C" || argument === "--chdir" || argument.startsWith("--chdir=") ||
+      argument === "-S" || argument === "--split-string" || argument.startsWith("--split-string=")
+    ) {
+      // These options change how the following executable or its relative
+      // path is interpreted. This layer deliberately does not emulate env.
+      throw new ShellClassificationError("unsafe_local_script");
+    }
+    if (argument.startsWith("--unset=")) {
+      if (argument.length === "--unset=".length) return undefined;
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("-")) return undefined;
+    break;
+  }
+  return index < argv.length ? argv.slice(index) : undefined;
+}
+
+function hasRepositoryEnvironmentOverride(
+  classifiedArgv: readonly string[],
+  commandArgv: readonly string[],
+): boolean {
+  const executable = executableName(commandArgv[0] as string);
+  const prefixes = classifiedArgv.slice(0, classifiedArgv.length - commandArgv.length);
+  const names = executable === "git"
+    ? new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_INDEX_FILE"])
+    : executable === "gh"
+      ? new Set(["GH_REPO", "GH_HOST"])
+      : new Set<string>();
+  return prefixes.some((argument) => {
+    const separator = argument.indexOf("=");
+    return separator > 0 && names.has(argument.slice(0, separator));
+  });
+}
+
+function hasExecutableResolutionOverride(
+  classifiedArgv: readonly string[],
+  commandArgv: readonly string[],
+): boolean {
+  if ((commandArgv[0] as string).includes("/") || (commandArgv[0] as string).includes("\\")) return true;
+  const prefixes = classifiedArgv.slice(0, classifiedArgv.length - commandArgv.length);
+  return prefixes.some((argument) =>
+    argument === "-i" || argument === "--ignore-environment" || argument === "PATH" || argument.startsWith("PATH="));
+}
+
+async function trustedRepositoryRoot(context: ShellClassifierContext): Promise<string | undefined> {
+  const trustedRoot = await realpath(context.trusted_worktree_path).catch(() => undefined);
+  if (!trustedRoot) return undefined;
+  const marker = join(trustedRoot, ".git");
+  const markerStat = await lstat(marker).catch(() => undefined);
+  if (!markerStat || markerStat.isSymbolicLink() || (!markerStat.isDirectory() && !markerStat.isFile())) return undefined;
+  return trustedRoot;
+}
+
+async function isCurrentRepositoryDirectory(
+  context: ShellClassifierContext,
+  directory: string,
+  trustedRoot?: string,
+): Promise<boolean> {
+  const root = trustedRoot ?? await trustedRepositoryRoot(context);
+  if (!root) return false;
+  const current = await realpath(directory).catch(() => undefined);
+  if (!current || !isWithin(root, current)) return false;
+
+  let cursor = current;
+  while (cursor !== root) {
+    const marker = await lstat(join(cursor, ".git")).catch(() => undefined);
+    if (marker) return false;
+    const parent = dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
+  return true;
+}
+
+async function gitDetection(
+  argv: readonly string[],
+  context: ShellClassifierContext,
+): Promise<Detection | undefined> {
+  const arguments_ = argv.slice(1);
+  const fallbackAction = arguments_.find((argument) => argument === "commit" || argument === "push");
+  const unresolved = (action = fallbackAction): Detection | undefined => {
+    if (action !== "commit" && action !== "push") return undefined;
+    return {
+      capability: action === "commit" ? "git.commit" : "git.publish",
+      boundary: "guarded_command",
+      risk: action === "commit" ? "medium" : "high",
+      repository_target: "unresolved",
+    };
+  };
+
+  const trustedRoot = await trustedRepositoryRoot(context);
+  let effectiveDirectory = await realpath(context.cwd).catch(() => undefined);
+  let gitDirectory: string | undefined;
+  let workTree: string | undefined;
+  let index = 0;
+  let targetOptionSeen = false;
+  if (!trustedRoot || !effectiveDirectory || !isWithin(trustedRoot, effectiveDirectory)) return unresolved();
+
+  while (index < arguments_.length) {
+    const argument = arguments_[index] as string;
+    if (argument === "--") {
+      index += 1;
+      break;
+    }
+    if (!argument.startsWith("-")) break;
+
+    if (argument === "-C" || argument.startsWith("-C")) {
+      const value = argument === "-C" ? arguments_[index + 1] : argument.slice(2);
+      if (!value) return unresolved();
+      targetOptionSeen = true;
+      const candidate = resolve(effectiveDirectory, value);
+      effectiveDirectory = await realpath(candidate).catch(() => undefined);
+      if (!effectiveDirectory || !isWithin(trustedRoot, effectiveDirectory)) return unresolved();
+      index += argument === "-C" ? 2 : 1;
+      continue;
+    }
+    if (argument === "--git-dir" || argument.startsWith("--git-dir=")) {
+      const value = argument === "--git-dir" ? arguments_[index + 1] : argument.slice("--git-dir=".length);
+      if (!value) return unresolved();
+      targetOptionSeen = true;
+      gitDirectory = resolve(effectiveDirectory, value);
+      index += argument === "--git-dir" ? 2 : 1;
+      continue;
+    }
+    if (argument === "--work-tree" || argument.startsWith("--work-tree=")) {
+      const value = argument === "--work-tree" ? arguments_[index + 1] : argument.slice("--work-tree=".length);
+      if (!value) return unresolved();
+      targetOptionSeen = true;
+      workTree = resolve(effectiveDirectory, value);
+      index += argument === "--work-tree" ? 2 : 1;
+      continue;
+    }
+    if (argument === "-c" || argument === "--config-env" || argument === "--namespace" || argument === "--exec-path") {
+      if (arguments_[index + 1] === undefined) return unresolved();
+      index += 2;
+      continue;
+    }
+    if (
+      argument.startsWith("-c=") || argument.startsWith("--config-env=") ||
+      argument.startsWith("--namespace=") || argument.startsWith("--exec-path=") ||
+      new Set(["-p", "-P", "--paginate", "--no-pager", "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks"]).has(argument)
+    ) {
+      index += 1;
+      continue;
+    }
+    if (argument === "--bare") return unresolved();
+    return unresolved();
+  }
+
+  const action = arguments_[index];
+  if (action !== "commit" && action !== "push") return targetOptionSeen ? unresolved() : undefined;
+  if (!await isCurrentRepositoryDirectory(context, effectiveDirectory, trustedRoot)) return unresolved(action);
+
+  if (workTree) {
+    const resolvedWorkTree = await realpath(workTree).catch(() => undefined);
+    if (resolvedWorkTree !== trustedRoot) return unresolved(action);
+  }
+  if (gitDirectory) {
+    const expectedMarker = join(trustedRoot, ".git");
+    if (gitDirectory !== expectedMarker) return unresolved(action);
+    const marker = await lstat(gitDirectory).catch(() => undefined);
+    if (!marker || marker.isSymbolicLink() || (!marker.isDirectory() && !marker.isFile())) return unresolved(action);
+  }
+
+  return {
+    capability: action === "commit" ? "git.commit" : "git.publish",
+    boundary: action === "commit" ? "hook" : "guarded_command",
+    risk: action === "commit" ? "medium" : "high",
+    repository_target: "current",
+  };
+}
+
+function ghDetection(argv: readonly string[]): Detection | undefined {
+  const arguments_ = argv.slice(1);
+  let index = 0;
+  let explicitRepository = false;
+  let invalidGlobalOptions = false;
+  while (index < arguments_.length && (arguments_[index] as string).startsWith("-")) {
+    const argument = arguments_[index] as string;
+    if (argument === "--repo" || argument === "-R") {
+      explicitRepository = true;
+      const value = arguments_[index + 1];
+      if (!value || value.startsWith("-")) invalidGlobalOptions = true;
+      index += 2;
+      continue;
+    }
+    if (argument.startsWith("--repo=") || (argument.startsWith("-R") && argument !== "-R")) {
+      explicitRepository = true;
+      if (argument.endsWith("=" ) || argument === "-R") invalidGlobalOptions = true;
+      index += 1;
+      continue;
+    }
+    if (argument === "--hostname") {
+      explicitRepository = true;
+      if (arguments_[index + 1] === undefined) invalidGlobalOptions = true;
+      index += 2;
+      continue;
+    }
+    if (argument.startsWith("--hostname=")) {
+      explicitRepository = true;
+      if (argument.length === "--hostname=".length) invalidGlobalOptions = true;
+      index += 1;
+      continue;
+    }
+    if (argument === "--help" || argument === "--version") {
+      index += 1;
+      continue;
+    }
+    invalidGlobalOptions = true;
+    index += 1;
+  }
+
+  let family: string | undefined = arguments_[index];
+  let action: string | undefined = arguments_[index + 1];
+  if (invalidGlobalOptions || !new Set(["pr", "release", "issue"]).has(family ?? "")) {
+    const familyIndex = arguments_.findIndex((argument) => argument === "pr" || argument === "release" || argument === "issue");
+    family = familyIndex >= 0 ? arguments_[familyIndex] : undefined;
+    action = familyIndex >= 0 ? arguments_[familyIndex + 1] : undefined;
+    explicitRepository = true;
+  }
+  if (family === "pr" && (action === "create" || action === "merge")) {
+    return {
+      capability: "git.publish",
+      boundary: "guarded_command",
+      risk: "high",
+      repository_target: explicitRepository ? "unresolved" : "current",
+    };
+  }
+  if (family === "release" && action === "create") {
+    return {
+      capability: "git.publish",
+      boundary: "guarded_command",
+      risk: "high",
+      repository_target: explicitRepository ? "unresolved" : "current",
+    };
+  }
+  if (family === "issue" && (action === "close" || action === "edit" || action === "comment")) {
+    return { capability: "tracker.mutate", boundary: "tracker", risk: "high" };
+  }
+  return undefined;
 }
 
 async function localScriptDigest(argv: readonly string[], context: ShellClassifierContext): Promise<string | undefined> {
@@ -337,31 +653,32 @@ function requirementFor(
   switch (detection.capability) {
     case "git.commit":
     case "git.publish":
-      return { capability: detection.capability, resource: context.repository };
+      return detection.repository_target === "current"
+        ? { capability: detection.capability, resource: context.repository }
+        : undefined;
     case "tracker.mutate":
-      return context.issue ? { capability: detection.capability, resource: context.issue } : undefined;
+      return undefined;
     case "board.execute":
       return wrapper?.kind === "board" && context.board?.id === wrapper.boardId
         ? { capability: detection.capability, resource: context.board }
         : undefined;
     case "remote.execute":
-      return wrapper && context.remote_host ? { capability: detection.capability, resource: context.remote_host } : undefined;
+      return undefined;
     case "firmware.change":
       if (wrapper?.kind !== "board") return undefined;
-      if (context.firmware_target) return { capability: detection.capability, resource: context.firmware_target };
       return context.board?.id === wrapper.boardId
         ? { capability: detection.capability, resource: context.board }
         : undefined;
     case "deploy.execute":
-      return wrapper && context.deployment_target
-        ? { capability: detection.capability, resource: context.deployment_target }
-        : undefined;
+      return undefined;
   }
 }
 
 function signalFor(detection: Detection): ShellBoundarySignal | undefined {
-  if (detection.capability === "git.commit" || detection.capability === "git.publish") return undefined;
-  if (detection.boundary === "hook") return undefined;
+  if (detection.boundary === "hook") {
+    if (detection.repository_target !== "unresolved") return undefined;
+    return { capability: detection.capability, boundary: "guarded_command" };
+  }
   return { capability: detection.capability, boundary: detection.boundary };
 }
 
@@ -420,25 +737,57 @@ function exactBoardWrapper(argv: readonly string[]): { separator: number; boardI
   return { separator, boardId: seen.get("--board") as string };
 }
 
-function simpleKnownDetection(argv: readonly string[]): Detection | undefined {
+async function simpleKnownDetection(
+  argv: readonly string[],
+  context: ShellClassifierContext,
+): Promise<{ detection?: Detection; selfApproval: boolean }> {
+  if ((argv[0] as string).includes("/") || (argv[0] as string).includes("\\")) {
+    return { selfApproval: false };
+  }
   const executable = executableName(argv[0] as string);
   if (executable === "git") {
-    const action = argv.find((argument, index) => index > 0 && (argument === "commit" || argument === "push"));
-    if (action === "commit") return { capability: "git.commit", boundary: "hook", risk: "medium" };
-    if (action === "push") return { capability: "git.publish", boundary: "guarded_command", risk: "high" };
+    return { detection: await gitDetection(argv, context), selfApproval: false };
   }
   if (executable === "gh") {
-    if (argv[1] === "pr" && (argv[2] === "create" || argv[2] === "merge")) {
-      return { capability: "git.publish", boundary: "guarded_command", risk: "high" };
+    const detection = ghDetection(argv);
+    if (detection?.repository_target === "current" && !await isCurrentRepositoryDirectory(context, context.cwd)) {
+      return {
+        detection: { ...detection, boundary: "guarded_command", repository_target: "unresolved" },
+        selfApproval: false,
+      };
     }
-    if (argv[1] === "release" && argv[2] === "create") {
-      return { capability: "git.publish", boundary: "guarded_command", risk: "high" };
-    }
-    if (argv[1] === "issue" && (argv[2] === "close" || argv[2] === "edit" || argv[2] === "comment")) {
-      return { capability: "tracker.mutate", boundary: "tracker", risk: "high" };
+    return { detection, selfApproval: false };
+  }
+  if (executable === "ssh" || executable === "scp" || executable === "sftp") {
+    return {
+      detection: { capability: "remote.execute", boundary: "guarded_command", risk: "high" },
+      selfApproval: false,
+    };
+  }
+  if (new Set(["flashrom", "dfu-util", "openocd", "esptool", "esptool.py", "fwupdmgr"]).has(executable)) {
+    return { detection: { capability: "firmware.change", boundary: "board", risk: "high" }, selfApproval: false };
+  }
+  if (new Set(["iw", "iwconfig", "wpa_cli", "antcfg", "rmmod", "insmod"]).has(executable)) {
+    return { detection: { capability: "board.execute", boundary: "board", risk: "high" }, selfApproval: false };
+  }
+  if (executable === "kubectl" && argv.slice(1).some((argument) => new Set(["apply", "delete", "replace", "patch"]).has(argument))) {
+    return { detection: { capability: "deploy.execute", boundary: "guarded_command", risk: "high" }, selfApproval: false };
+  }
+  if (executable === "helm" && argv.slice(1).some((argument) => new Set(["install", "upgrade", "uninstall", "rollback"]).has(argument))) {
+    return { detection: { capability: "deploy.execute", boundary: "guarded_command", risk: "high" }, selfApproval: false };
+  }
+  if (executable === "terraform" && argv.slice(1).some((argument) => argument === "apply" || argument === "destroy")) {
+    return { detection: { capability: "deploy.execute", boundary: "guarded_command", risk: "high" }, selfApproval: false };
+  }
+  if (executable === "jhw-control" && argv[1] === "board") {
+    const action = argv[2];
+    if (action && !new Set(["list", "status"]).has(action)) {
+      return { detection: { capability: "board.execute", boundary: "board", risk: "high" }, selfApproval: false };
     }
   }
-  return undefined;
+  const selfApproval = executable === "jhw-control" && argv[1] === "guard" &&
+    new Set(["prompt", "approve", "consume"]).has(argv[2] ?? "");
+  return { selfApproval };
 }
 
 export async function classifyShell(input: string, context: ShellClassifierContext): Promise<ShellClassification> {
@@ -454,20 +803,27 @@ export async function classifyShell(input: string, context: ShellClassifierConte
     : boardWrapper
       ? { kind: "board" as const, boardId: boardWrapper.boardId }
       : undefined;
-  let requirements: OperationRequirement[] = [];
-  let unresolvedSignals: ShellBoundarySignal[] = [];
+  const requirements: OperationRequirement[] = [];
+  const unresolvedSignals: ShellBoundarySignal[] = [];
   let risk: OperationRisk = "low";
   let executionBoundary: ExecutionBoundary = "hook";
-  for (const detection of raw.detections) {
+  const applyDetection = (detection: Detection): void => {
     const requirement = requirementFor(detection, context, wrapper);
     const signal = requirement ? undefined : signalFor(detection);
     if (requirement) requirements.push(requirement);
     if (signal) unresolvedSignals.push(signal);
     risk = strongerRisk(risk, detection.risk);
     executionBoundary = strongerBoundary(executionBoundary, detection.boundary);
-  }
+  };
 
   if (parsed.ambiguous || !parsed.argv) {
+    const repositoryIsCurrent = await isCurrentRepositoryDirectory(context, context.cwd);
+    for (const rawDetection of raw.detections) {
+      const detection = rawDetection.repository_target === "current" && !repositoryIsCurrent
+        ? { ...rawDetection, boundary: "guarded_command" as const, repository_target: "unresolved" as const }
+        : rawDetection;
+      applyDetection(detection);
+    }
     requirements.push({ capability: "shell.unclassified", resource: context.repository });
     return {
       requirements: sortRequirements(requirements),
@@ -498,28 +854,43 @@ export async function classifyShell(input: string, context: ShellClassifierConte
     executionBoundary = "board";
   }
 
-  const known = simpleKnownDetection(classifiedArgv);
-  if (known) {
-    const requirement = requirementFor(known, context, wrapper);
-    const signal = requirement ? undefined : signalFor(known);
-    if (requirement) requirements.push(requirement);
-    if (signal) unresolvedSignals.push(signal);
-    risk = strongerRisk(risk, known.risk);
-    executionBoundary = strongerBoundary(executionBoundary, known.boundary);
-  } else {
+  const commandArgv = executableArgv(classifiedArgv);
+  const known = commandArgv
+    ? await simpleKnownDetection(commandArgv, context)
+    : { selfApproval: false };
+  const repositoryBindingUnsafe = commandArgv !== undefined && (
+    hasRepositoryEnvironmentOverride(classifiedArgv, commandArgv) ||
+    hasExecutableResolutionOverride(classifiedArgv, commandArgv)
+  );
+  const knownDetection = known.detection?.repository_target === "current" && repositoryBindingUnsafe
+    ? { ...known.detection, boundary: "guarded_command" as const, repository_target: "unresolved" as const }
+    : known.detection;
+  const repositoryIsCurrent = await isCurrentRepositoryDirectory(context, context.cwd);
+  const authoritativeCapability = knownDetection?.capability;
+  const rawDetections = raw.detections
+    .filter((rawDetection) => rawDetection.capability !== authoritativeCapability)
+    .map((rawDetection) =>
+    rawDetection.repository_target === "current" && (!repositoryIsCurrent || repositoryBindingUnsafe)
+      ? { ...rawDetection, boundary: "guarded_command" as const, repository_target: "unresolved" as const }
+      : rawDetection);
+  for (const detection of rawDetections) applyDetection(detection);
+  if (knownDetection) applyDetection(knownDetection);
+  if (!knownDetection) {
     requirements.push({ capability: "shell.unclassified", resource: context.repository });
     risk = strongerRisk(risk, "high");
   }
 
-  const scriptContentSha256 = await localScriptDigest(classifiedArgv, context);
+  const scriptContentSha256 = commandArgv ? await localScriptDigest(commandArgv, context) : undefined;
+  const highRiskDetected = [...rawDetections, ...(knownDetection ? [knownDetection] : [])]
+    .some((detection) => detection.risk === "high");
   return {
     requirements: sortRequirements(requirements),
     unresolved_signals: sortSignals(unresolvedSignals),
     risk,
     execution_boundary: executionBoundary,
     ambiguous: false,
-    direct_high_risk: ownedWrapper === undefined && raw.detections.some((detection) => detection.risk === "high"),
-    self_approval: raw.selfApproval,
+    direct_high_risk: ownedWrapper === undefined && highRiskDetected,
+    self_approval: raw.selfApproval || known.selfApproval,
     ...(ownedWrapper ? { owned_wrapper: ownedWrapper } : {}),
     digest_argv: [...argv],
     ...(scriptContentSha256 ? { script_content_sha256: scriptContentSha256 } : {}),
