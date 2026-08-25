@@ -313,6 +313,7 @@ export class ClaimService {
             "Completion evidence does not match the active Claim and Work Contract",
           );
         }
+        await this.assertFormalCompletionSemantics(task, completion.evidence);
         completionBinding = {
           completion_evidence_path: taskCompletionRelativePath(task.id, active.claim_id),
           completion_evidence_digest: taskCompletionEvidenceDigest(completion),
@@ -398,14 +399,7 @@ export class ClaimService {
         "INVALID_COMPLETION_EVIDENCE",
         "Completion evidence failed validation",
       );
-      if (task.task_role === "parent") {
-        assertParentCompletionReady(task, await this.catalog.listChildren(task.id), evidence);
-      } else if (evidence.child_dispositions.length !== 0) {
-        throw new ControlError(
-          "INVALID_PARENT_COMPLETION",
-          "Standalone Task completion cannot carry child dispositions",
-        );
-      }
+      await this.assertFormalCompletionSemantics(task, evidence);
 
       const existing = await this.completionEvidenceAt(taskId, expectedClaimId);
       if (existing) {
@@ -834,6 +828,26 @@ export class ClaimService {
     }
     if (record) this.sensitiveData.assertSafe(record);
     return record;
+  }
+
+  private async assertFormalCompletionSemantics(
+    task: TaskRecord,
+    evidence: TaskCompletionEvidence,
+  ): Promise<void> {
+    if (task.kind !== "formal" || task.task_role === undefined || task.work_contract === undefined) {
+      throw new ControlError(
+        "TASK_COMPLETION_FORMAL_REQUIRED",
+        "Completion readiness requires a configured formal standalone or parent Task",
+      );
+    }
+    if (task.task_role === "parent") {
+      assertParentCompletionReady(task, await this.catalog.listChildren(task.id), evidence);
+    } else if (evidence.child_dispositions.length !== 0) {
+      throw new ControlError(
+        "INVALID_PARENT_COMPLETION",
+        "Standalone Task completion cannot carry child dispositions",
+      );
+    }
   }
 
   private requireTaskContract(task: TaskRecord): WorkContract {

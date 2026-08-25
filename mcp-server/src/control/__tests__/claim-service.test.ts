@@ -229,6 +229,82 @@ describe("ClaimService", () => {
     ))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("revalidates parent readiness at completed release after a new required child is registered", async () => {
+    const { claims, task, catalog, fixture } = await formalClaimsFixture("parent");
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    await claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"],
+      child_dispositions: [],
+    });
+    await catalog.registerChildTask({
+      parent_task_id: task.id,
+      alias: "wlan:late-required-child",
+      required_for_parent: true,
+      goal: "late required work",
+      done_conditions: ["done"],
+      grants: [],
+      dependencies: [],
+    });
+    const activePath = join(fixture.registryDir, "claims", "active", `${task.id}.yaml`);
+    const evidencePath = join(fixture.registryDir, "task-completion", task.id, `${active.claim_id}.yaml`);
+    const activeBytes = await readFile(activePath, "utf8");
+    const evidenceBytes = await readFile(evidencePath, "utf8");
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.finishClaim(task.id, active.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    })).rejects.toMatchObject({ code: "PARENT_CHILDREN_INCOMPLETE" });
+
+    expect(await readFile(activePath, "utf8")).toBe(activeBytes);
+    expect(await readFile(evidencePath, "utf8")).toBe(evidenceBytes);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+    await expect(readFile(join(fixture.registryDir, historyRelativePath(active))))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("revalidates standalone empty dispositions at completed release", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    const evidence = await claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"],
+      child_dispositions: [],
+    });
+    const evidenceRelative = `task-completion/${task.id}/${active.claim_id}.yaml`;
+    await commitRegistryFile(fixture, evidenceRelative, `${JSON.stringify({
+      ...evidence,
+      evidence: {
+        ...evidence.evidence,
+        child_dispositions: [{
+          task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000099",
+          disposition: "accepted-risk",
+        }],
+      },
+    }, null, 2)}\n`);
+    const activePath = join(fixture.registryDir, "claims", "active", `${task.id}.yaml`);
+    const evidencePath = join(fixture.registryDir, evidenceRelative);
+    const activeBytes = await readFile(activePath, "utf8");
+    const evidenceBytes = await readFile(evidencePath, "utf8");
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.finishClaim(task.id, active.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    })).rejects.toMatchObject({ code: "INVALID_PARENT_COMPLETION" });
+
+    expect(await readFile(activePath, "utf8")).toBe(activeBytes);
+    expect(await readFile(evidencePath, "utf8")).toBe(evidenceBytes);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+    await expect(readFile(join(fixture.registryDir, historyRelativePath(active))))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("refuses formal completion evidence on temporary and child Task flows", async () => {
     const temporary = await claimsFixture();
     const temporaryClaim = await temporary.claims.claimTask(claimInput(temporary.task.id));
