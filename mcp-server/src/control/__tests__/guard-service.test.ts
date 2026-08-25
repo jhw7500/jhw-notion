@@ -551,6 +551,128 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
+  it("preserves an exact committed permit decision when barrier release rejects after callback completion", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    const result = await fixture.service({
+      registry_mutation_barrier: {
+        run: async <T>(read: () => Promise<T>) => {
+          await read();
+          throw new Error("bounded post-callback release failure");
+        },
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+
+    expect(result).toMatchObject({
+      decision: "PERMIT_REQUIRED",
+      request_id: REQUEST_ID,
+      approval_command: `/jhw:unlock ${REQUEST_ID}`,
+    });
+    expect(fixture.permitCalls).toBe(1);
+  });
+
+  it("does not trust a barrier result when its callback was never entered", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const fabricated = GuardDecisionSchema.parse({
+      decision: "ALLOW",
+      operation_id: "op-018f21e0-7b2c-7a00-8000-000000000099",
+      summary: "fabricated barrier result",
+      execution_boundary: "hook",
+    });
+
+    const result = await fixture.service({
+      registry_mutation_barrier: {
+        run: async <T>() => fabricated as T,
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+
+    expect(result).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("publishes exact callback completion instead of a fabricated barrier return", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const fabricated = GuardDecisionSchema.parse({
+      decision: "ALLOW",
+      operation_id: "op-018f21e0-7b2c-7a00-8000-000000000099",
+      summary: "fabricated barrier result",
+      execution_boundary: "hook",
+    });
+
+    const result = await fixture.service({
+      registry_mutation_barrier: {
+        run: async <T>(read: () => Promise<T>) => {
+          await read();
+          return fabricated as T;
+        },
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+
+    expect(result).toMatchObject({ decision: "PERMIT_REQUIRED", request_id: REQUEST_ID });
+    expect(fixture.permitCalls).toBe(1);
+  });
+
+  it("does not let a barrier that returns before callback completion create request state later", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let background: Promise<unknown> | undefined;
+    const claims = fixture.options().claims;
+
+    const result = await fixture.service({
+      claims: {
+        ...claims,
+        listActiveClaims: async () => {
+          await gate;
+          return fixture.activeClaims;
+        },
+      },
+      registry_mutation_barrier: {
+        run: async <T>(read: () => Promise<T>) => {
+          background = read();
+          return undefined as T;
+        },
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+    release();
+    await background;
+
+    expect(result).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("enters an injected barrier callback at most once and preserves the first committed permit", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    const result = await fixture.service({
+      registry_mutation_barrier: {
+        run: async <T>(read: () => Promise<T>) => {
+          const first = await read();
+          await read();
+          return first;
+        },
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+
+    expect(result).toMatchObject({ decision: "PERMIT_REQUIRED", request_id: REQUEST_ID });
+    expect(fixture.permitCalls).toBe(1);
+  });
+
   it.each(["before", "during"] as const)(
     "queues a cooperating Registry writer %s the permit seam until the decision is stable",
     async (timing) => {

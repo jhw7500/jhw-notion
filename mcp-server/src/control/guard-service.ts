@@ -83,7 +83,10 @@ export interface GuardRegistryViewPort {
   committedViewIsStale(): Promise<boolean>;
 }
 
-/** Task 4 must bind this to the same host MutationLock used by Registry writers. */
+/**
+ * Task 4 must bind this to the same host MutationLock used by Registry writers.
+ * Implementations must enter the callback exactly once and await its completion.
+ */
 export interface GuardRegistryMutationBarrierPort {
   run<T>(read: () => Promise<T>): Promise<T>;
 }
@@ -461,6 +464,11 @@ interface EvaluationContext {
   classification?: ShellClassification;
 }
 
+interface PermitLifecycleBoundary {
+  mayCommit(): Promise<boolean>;
+  complete(decision: GuardDecision): void;
+}
+
 export class GuardService {
   private readonly mode: GuardEvaluationMode | undefined;
 
@@ -497,21 +505,66 @@ export class GuardService {
     if (!this.options.registry_view || !this.options.registry_mutation_barrier) {
       return this.deny("GUARD_UNAVAILABLE");
     }
+
+    const callbackCompletion = Symbol("guard-registry-barrier-callback-complete");
+    let callbackEntered = false;
+    let callbackDecision: GuardDecision | undefined;
+    let authoritativeDecision: GuardDecision | undefined;
+    let barrierSettled = false;
+    const evaluateWithinBarrier = async (): Promise<typeof callbackCompletion> => {
+      if (callbackEntered) throw new Error("Registry mutation barrier callback entered more than once");
+      callbackEntered = true;
+      callbackDecision = await this.options.registry_view.withCommittedView(async () => {
+        const decision = await this.evaluatePinned(event, {
+          mayCommit: async () => {
+            if (barrierSettled) return false;
+            try {
+              if (await this.options.registry_view.committedViewIsStale()) return false;
+            } catch {
+              return false;
+            }
+            return !barrierSettled;
+          },
+          complete: (committedDecision) => {
+            if (barrierSettled || authoritativeDecision) {
+              throw new Error("Guard permit decision completed outside its Registry barrier");
+            }
+            authoritativeDecision = committedDecision;
+          },
+        });
+        if (authoritativeDecision) return authoritativeDecision;
+        if (await this.options.registry_view.committedViewIsStale()) {
+          return this.deny("GUARD_UNAVAILABLE");
+        }
+        return decision;
+      });
+      return callbackCompletion;
+    };
+
     try {
-      return await this.options.registry_mutation_barrier.run(() =>
-        this.options.registry_view.withCommittedView(async () => {
-          const decision = await this.evaluatePinned(event);
-          if (await this.options.registry_view.committedViewIsStale()) {
-            return this.deny("GUARD_UNAVAILABLE");
-          }
-          return decision;
-        }));
+      const barrierResult = await this.options.registry_mutation_barrier.run(evaluateWithinBarrier).then(
+        (result) => {
+          barrierSettled = true;
+          return result;
+        },
+        (cause: unknown) => {
+          barrierSettled = true;
+          throw cause;
+        },
+      );
+      if (authoritativeDecision) return authoritativeDecision;
+      if (!callbackDecision || barrierResult !== callbackCompletion) return this.deny("GUARD_UNAVAILABLE");
+      return callbackDecision;
     } catch {
-      return this.deny("GUARD_UNAVAILABLE");
+      barrierSettled = true;
+      return authoritativeDecision ?? this.deny("GUARD_UNAVAILABLE");
     }
   }
 
-  private async evaluatePinned(event: PreToolUseEvent): Promise<GuardDecision> {
+  private async evaluatePinned(
+    event: PreToolUseEvent,
+    permitLifecycle: PermitLifecycleBoundary,
+  ): Promise<GuardDecision> {
     let activeClaims: ActiveClaim[];
     let claim: ActiveClaim | undefined;
     try {
@@ -645,12 +698,15 @@ export class GuardService {
     }
     if (!this.options.permit_decisions) return this.deny("GUARD_UNAVAILABLE", claim, operation);
     try {
+      if (!await permitLifecycle.mayCommit()) return this.deny("GUARD_UNAVAILABLE", claim, operation);
       const result = GuardPermitResultSchema.safeParse(
         await this.options.permit_decisions.decideMissingGrant(operation, missing),
       );
       if (!result.success) return this.deny("GUARD_UNAVAILABLE", claim, operation);
       if ("decision" in result.data) {
-        return this.deny(result.data.code, claim, operation);
+        const decision = this.deny(result.data.code, claim, operation);
+        permitLifecycle.complete(decision);
+        return decision;
       }
       if (
         result.data.task_id !== operation.task_id ||
@@ -662,7 +718,7 @@ export class GuardService {
         !sameRequirements(result.data.requirements, operation.requirements) ||
         !sameRequirements(result.data.missing_requirements, missing)
       ) return this.deny("GUARD_UNAVAILABLE", claim, operation);
-      return GuardDecisionSchema.parse({
+      const decision = GuardDecisionSchema.parse({
         decision: "PERMIT_REQUIRED",
         operation_id: operation.operation_id,
         request_id: result.data.request_id,
@@ -670,6 +726,8 @@ export class GuardService {
         approval_command: `/jhw:unlock ${result.data.request_id}`,
         approval_expires_at: result.data.approval_expires_at,
       });
+      permitLifecycle.complete(decision);
+      return decision;
     } catch {
       return this.deny("GUARD_UNAVAILABLE", claim, operation);
     }
