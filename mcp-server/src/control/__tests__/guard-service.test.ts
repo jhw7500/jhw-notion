@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,13 +8,18 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createGuardRegistryMutationBarrier,
   GuardDecisionSchema,
   GuardService,
   GuardSideEventResultSchema,
   type GuardPermitDecisionPort,
+  type GuardRegistryMutationBarrierPort,
   type GuardServiceOptions,
 } from "../guard-service.js";
+import type { ControlConfig } from "../config.js";
 import type { OperationRequirement } from "../guard-protocol.js";
+import type { SecureStateDirectoryHooks } from "../journal.js";
+import { MutationLock, type MutationLockRuntime } from "../process.js";
 import {
   ContractActiveClaimSchema,
   type ActiveClaim,
@@ -38,6 +44,54 @@ const HOST = "cantopsbuildserver";
 const REPOSITORY = { kind: "repository", id: "repo-guard" } as const;
 const BOARD = { kind: "board", id: "board-alpha" } as const;
 const runFile = promisify(execFile);
+
+function lockConfig(stateDir: string): ControlConfig {
+  return {
+    registryDir: "/srv/registry",
+    registryRemote: "origin",
+    registryBranch: "main",
+    worktreeRoot: "/srv/worktrees",
+    buildHost: HOST,
+    githubOwner: "owner",
+    projectNumber: 1,
+    registryRepository: "owner/registry",
+    preflightProjectItemId: "PVTI_guard",
+    preflightRegistryIssueNumber: 1,
+    stateDir,
+  };
+}
+
+function completedLockAcquisition(status = 0): ReturnType<MutationLockRuntime["spawn"]> {
+  const child = Object.assign(new EventEmitter(), { kill: vi.fn(() => true) });
+  queueMicrotask(() => child.emit("close", status));
+  return child;
+}
+
+function trustedBarrier(
+  stateDir: string,
+  options: {
+    acquisitionStatus?: number;
+    onAcquire?: () => void;
+    secureDirectoryHooks?: SecureStateDirectoryHooks;
+  } = {},
+): GuardRegistryMutationBarrierPort {
+  const runtime: MutationLockRuntime = {
+    spawn: () => {
+      options.onAcquire?.();
+      return completedLockAcquisition(options.acquisitionStatus);
+    },
+  };
+  return createGuardRegistryMutationBarrier(new MutationLock(
+    lockConfig(stateDir),
+    {},
+    runtime,
+    options.secureDirectoryHooks,
+  ));
+}
+
+function untrustedBarrier(run: unknown): GuardRegistryMutationBarrierPort {
+  return { run } as unknown as GuardRegistryMutationBarrierPort;
+}
 
 function contract(taskId: string, grants: WorkGrant[]): WorkContract {
   return normalizeWorkContract({ version: 1, task_id: taskId, grants, dependencies: [] });
@@ -150,6 +204,11 @@ describe("GuardService", () => {
       ahead: 0,
       behind: 0,
     };
+    const registryMutationBarrier = trustedBarrier(join(root, "registry-state"), {
+      onAcquire: () => {
+        fixture.barrierCalls += 1;
+      },
+    });
 
     fixture = {
       root,
@@ -215,12 +274,7 @@ describe("GuardService", () => {
             withCommittedView: async <T>(read: () => Promise<T>) => read(),
             committedViewIsStale: async () => false,
           },
-          registry_mutation_barrier: {
-            run: async <T>(read: () => Promise<T>) => {
-              fixture.barrierCalls += 1;
-              return read();
-            },
-          },
+          registry_mutation_barrier: registryMutationBarrier,
         };
         return { ...base, ...overrides };
       },
@@ -536,34 +590,71 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
-  it("fails closed before permit evaluation when the Registry mutation barrier throws", async () => {
+  it("mints Guard barrier authority only from an unmodified concrete MutationLock", () => {
+    const structuralFake = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
+    const overridden = new MutationLock(
+      lockConfig(join(fixture.root, "overridden-registry-state")),
+      {},
+      { spawn: () => completedLockAcquisition() },
+    );
+    Object.defineProperty(overridden, "run", {
+      value: async <T>(callback: () => Promise<T>) => callback(),
+    });
+
+    expect(() => createGuardRegistryMutationBarrier(structuralFake as unknown as MutationLock))
+      .toThrow("concrete MutationLock");
+    expect(() => createGuardRegistryMutationBarrier(overridden)).toThrow("concrete MutationLock");
+    expect(structuralFake.run).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before permit evaluation when concrete MutationLock acquisition fails", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
     fixture.currentClaim = activeClaim(fixture.currentContract);
     fixture.activeClaims = [fixture.currentClaim];
 
     await expect(fixture.service({
-      registry_mutation_barrier: {
-        run: async () => { throw new Error("bounded barrier failure"); },
-      },
+      registry_mutation_barrier: trustedBarrier(join(fixture.root, "failed-registry-state"), {
+        acquisitionStatus: 75,
+      }),
     }).evaluatePreTool(preTool(fixture.cwd)))
       .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
     expect(fixture.permitCalls).toBe(0);
   });
 
-  it("preserves an exact committed permit decision when barrier release rejects after callback completion", async () => {
+  it.each(["lock file", "state directory"] as const)(
+    "preserves an exact committed permit decision when %s cleanup rejects after callback completion",
+    async (cleanupTarget) => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
     fixture.currentClaim = activeClaim(fixture.currentContract);
     fixture.activeClaims = [fixture.currentClaim];
 
     const result = await fixture.service({
-      registry_mutation_barrier: {
-        run: async <T>(read: () => Promise<T>) => {
-          await read();
-          throw new Error("bounded post-callback release failure");
+      registry_mutation_barrier: trustedBarrier(join(fixture.root, "release-failure-state"), {
+        secureDirectoryHooks: {
+          afterDirectoryOpen: (directory) => {
+            if (cleanupTarget === "lock file") {
+              const openFile = directory.openFile.bind(directory);
+              directory.openFile = async (name, flags, mode) => {
+                const file = await openFile(name, flags, mode);
+                const close = file.close.bind(file);
+                file.close = async () => {
+                  await close();
+                  throw new Error("bounded post-callback lock-file release failure");
+                };
+                return file;
+              };
+            } else {
+              const close = directory.close.bind(directory);
+              directory.close = async () => {
+                await close();
+                throw new Error("bounded post-callback directory release failure");
+              };
+            }
+          },
         },
-      },
+      }),
     }).evaluatePreTool(preTool(fixture.cwd));
 
     expect(result).toMatchObject({
@@ -572,7 +663,8 @@ describe("GuardService", () => {
       approval_command: `/jhw:unlock ${REQUEST_ID}`,
     });
     expect(fixture.permitCalls).toBe(1);
-  });
+    },
+  );
 
   it("does not trust a barrier result when its callback was never entered", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
@@ -585,18 +677,18 @@ describe("GuardService", () => {
       summary: "fabricated barrier result",
       execution_boundary: "hook",
     });
+    const run = vi.fn(async <T>() => fabricated as T);
 
     const result = await fixture.service({
-      registry_mutation_barrier: {
-        run: async <T>() => fabricated as T,
-      },
+      registry_mutation_barrier: untrustedBarrier(run),
     }).evaluatePreTool(preTool(fixture.cwd));
 
     expect(result).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(run).not.toHaveBeenCalled();
     expect(fixture.permitCalls).toBe(0);
   });
 
-  it("publishes exact callback completion instead of a fabricated barrier return", async () => {
+  it("rejects an untrusted barrier that would substitute a fabricated callback return", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
     fixture.currentClaim = activeClaim(fixture.currentContract);
@@ -607,18 +699,18 @@ describe("GuardService", () => {
       summary: "fabricated barrier result",
       execution_boundary: "hook",
     });
+    const run = vi.fn(async <T>(read: () => Promise<T>) => {
+      await read();
+      return fabricated as T;
+    });
 
     const result = await fixture.service({
-      registry_mutation_barrier: {
-        run: async <T>(read: () => Promise<T>) => {
-          await read();
-          return fabricated as T;
-        },
-      },
+      registry_mutation_barrier: untrustedBarrier(run),
     }).evaluatePreTool(preTool(fixture.cwd));
 
-    expect(result).toMatchObject({ decision: "PERMIT_REQUIRED", request_id: REQUEST_ID });
-    expect(fixture.permitCalls).toBe(1);
+    expect(result).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(run).not.toHaveBeenCalled();
+    expect(fixture.permitCalls).toBe(0);
   });
 
   it("does not let a barrier that returns before callback completion create request state later", async () => {
@@ -630,6 +722,10 @@ describe("GuardService", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let background: Promise<unknown> | undefined;
     const claims = fixture.options().claims;
+    const run = vi.fn(async <T>(read: () => Promise<T>) => {
+      background = read();
+      return undefined as T;
+    });
 
     const result = await fixture.service({
       claims: {
@@ -639,38 +735,78 @@ describe("GuardService", () => {
           return fixture.activeClaims;
         },
       },
-      registry_mutation_barrier: {
-        run: async <T>(read: () => Promise<T>) => {
-          background = read();
-          return undefined as T;
-        },
-      },
+      registry_mutation_barrier: untrustedBarrier(run),
     }).evaluatePreTool(preTool(fixture.cwd));
     release();
     await background;
 
     expect(result).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(run).not.toHaveBeenCalled();
     expect(fixture.permitCalls).toBe(0);
   });
 
-  it("enters an injected barrier callback at most once and preserves the first committed permit", async () => {
+  it("rejects an untrusted early-returning barrier before the permit-adjacent freshness boundary", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
     fixture.currentClaim = activeClaim(fixture.currentContract);
     fixture.activeClaims = [fixture.currentClaim];
+    let staleCalls = 0;
+    let permitAdjacentReadStarted!: () => void;
+    const permitAdjacentStarted = new Promise<void>((resolve) => {
+      permitAdjacentReadStarted = resolve;
+    });
+    let resolvePermitAdjacent!: (stale: boolean) => void;
+    const permitAdjacentRead = new Promise<boolean>((resolve) => {
+      resolvePermitAdjacent = resolve;
+    });
+    let background: Promise<unknown> | undefined;
+    const run = vi.fn(async <T>(read: () => Promise<T>) => {
+      background = read();
+      await permitAdjacentStarted;
+      resolvePermitAdjacent(false);
+      return undefined as T;
+    });
 
     const result = await fixture.service({
-      registry_mutation_barrier: {
-        run: async <T>(read: () => Promise<T>) => {
-          const first = await read();
-          await read();
-          return first;
+      registry_view: {
+        withCommittedView: async <T>(read: () => Promise<T>) => read(),
+        committedViewIsStale: () => {
+          staleCalls += 1;
+          if (staleCalls === 2) {
+            permitAdjacentReadStarted();
+            return permitAdjacentRead;
+          }
+          return Promise.resolve(false);
         },
       },
+      registry_mutation_barrier: untrustedBarrier(run),
+    }).evaluatePreTool(preTool(fixture.cwd));
+    await background;
+
+    expect(result).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(staleCalls).toBe(0);
+    expect(run).not.toHaveBeenCalled();
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("rejects an untrusted barrier that would enter the callback more than once", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const run = vi.fn(async <T>(read: () => Promise<T>) => {
+      const first = await read();
+      await read();
+      return first;
+    });
+
+    const result = await fixture.service({
+      registry_mutation_barrier: untrustedBarrier(run),
     }).evaluatePreTool(preTool(fixture.cwd));
 
-    expect(result).toMatchObject({ decision: "PERMIT_REQUIRED", request_id: REQUEST_ID });
-    expect(fixture.permitCalls).toBe(1);
+    expect(result).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(run).not.toHaveBeenCalled();
+    expect(fixture.permitCalls).toBe(0);
   });
 
   it.each(["before", "during"] as const)(
@@ -688,23 +824,31 @@ describe("GuardService", () => {
         else registryMoved = true;
       };
       const basePermit = fixture.permit as GuardPermitDecisionPort;
+      const registryMutationBarrier = trustedBarrier(join(fixture.root, `writer-${timing}-state`), {
+        onAcquire: () => {
+          barrierHeld = true;
+        },
+        secureDirectoryHooks: {
+          afterDirectoryOpen: (directory) => {
+            const close = directory.close.bind(directory);
+            directory.close = async () => {
+              try {
+                await close();
+              } finally {
+                barrierHeld = false;
+                if (writerQueued) registryMoved = true;
+              }
+            };
+          },
+        },
+      });
 
       const result = await fixture.service({
         registry_view: {
           withCommittedView: async <T>(read: () => Promise<T>) => read(),
           committedViewIsStale: async () => registryMoved,
         },
-        registry_mutation_barrier: {
-          run: async <T>(read: () => Promise<T>) => {
-            barrierHeld = true;
-            try {
-              return await read();
-            } finally {
-              barrierHeld = false;
-              if (writerQueued) registryMoved = true;
-            }
-          },
-        },
+        registry_mutation_barrier: registryMutationBarrier,
         authority: {
           assertKnownRequirement: async () => {
             if (timing === "before") attemptRegistryWrite();
@@ -723,6 +867,55 @@ describe("GuardService", () => {
       expect(fixture.permitCalls).toBe(1);
     },
   );
+
+  it("keeps the concrete MutationLock held for the last Registry freshness read before the permit seam", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const order: string[] = [];
+    let barrierHeld = false;
+    const basePermit = fixture.permit as GuardPermitDecisionPort;
+    const registryMutationBarrier = trustedBarrier(join(fixture.root, "freshness-order-state"), {
+      onAcquire: () => {
+        barrierHeld = true;
+      },
+      secureDirectoryHooks: {
+        afterDirectoryOpen: (directory) => {
+          const close = directory.close.bind(directory);
+          directory.close = async () => {
+            try {
+              await close();
+            } finally {
+              barrierHeld = false;
+            }
+          };
+        },
+      },
+    });
+
+    const result = await fixture.service({
+      registry_view: {
+        withCommittedView: async <T>(read: () => Promise<T>) => read(),
+        committedViewIsStale: async () => {
+          order.push(barrierHeld ? "freshness-held" : "freshness-unheld");
+          return false;
+        },
+      },
+      registry_mutation_barrier: registryMutationBarrier,
+      permit_decisions: {
+        decideMissingGrant: async (operation, missing) => {
+          order.push(barrierHeld ? "permit-held" : "permit-unheld");
+          return basePermit.decideMissingGrant(operation, missing);
+        },
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+
+    expect(result).toMatchObject({ decision: "PERMIT_REQUIRED", request_id: REQUEST_ID });
+    expect(order.slice(-2)).toEqual(["freshness-held", "permit-held"]);
+    expect(barrierHeld).toBe(false);
+    expect(fixture.permitCalls).toBe(1);
+  });
 
   it("uses only the injected lifecycle seam for an exact missing grant", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);

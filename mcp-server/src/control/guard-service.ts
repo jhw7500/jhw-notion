@@ -28,6 +28,7 @@ import {
   OperationNormalizationError,
   type NormalizeOperationContext,
 } from "./operation-normalizer.js";
+import { MutationLock } from "./process.js";
 import {
   ContractActiveClaimSchema,
   GuardDecisionSchema,
@@ -83,12 +84,48 @@ export interface GuardRegistryViewPort {
   committedViewIsStale(): Promise<boolean>;
 }
 
+const guardRegistryMutationBarrierBrand = Symbol("guard-registry-mutation-barrier");
+type GuardRegistryMutationBarrierRunner = <T>(callback: () => Promise<T>) => Promise<T>;
+const guardRegistryMutationBarrierRunners = new WeakMap<object, GuardRegistryMutationBarrierRunner>();
+
 /**
- * Task 4 must bind this to the same host MutationLock used by Registry writers.
- * Implementations must enter the callback exactly once and await its completion.
+ * Opaque authority to run one Guard evaluation under the Registry writer lock.
+ * Task 4 must create it from the same concrete host MutationLock used by
+ * Registry writers; arbitrary structural callback runners are not authority.
  */
 export interface GuardRegistryMutationBarrierPort {
-  run<T>(read: () => Promise<T>): Promise<T>;
+  readonly [guardRegistryMutationBarrierBrand]: true;
+}
+
+/**
+ * Binds Guard authority to the exact production MutationLock implementation.
+ * MutationLock's runtime and secure-directory hooks remain its unit-test seams;
+ * subclasses, overridden methods, and MutationLockPort-shaped fakes cannot be
+ * promoted into a Guard commit barrier.
+ */
+export function createGuardRegistryMutationBarrier(
+  mutationLock: MutationLock,
+): GuardRegistryMutationBarrierPort {
+  const concreteRun = MutationLock.prototype.run;
+  if (Object.getPrototypeOf(mutationLock) !== MutationLock.prototype || mutationLock.run !== concreteRun) {
+    throw new TypeError("Guard Registry barrier requires the concrete MutationLock implementation");
+  }
+  const barrier = Object.freeze({
+    [guardRegistryMutationBarrierBrand]: true,
+  }) as GuardRegistryMutationBarrierPort;
+  guardRegistryMutationBarrierRunners.set(
+    barrier,
+    <T>(callback: () => Promise<T>) => concreteRun.call(mutationLock, callback) as Promise<T>,
+  );
+  return barrier;
+}
+
+function guardRegistryMutationBarrierRunner(
+  barrier: unknown,
+): GuardRegistryMutationBarrierRunner | undefined {
+  return typeof barrier === "object" && barrier !== null
+    ? guardRegistryMutationBarrierRunners.get(barrier)
+    : undefined;
 }
 
 export interface GuardTaskServicePort {
@@ -502,32 +539,28 @@ export class GuardService {
       });
     }
 
-    if (!this.options.registry_view || !this.options.registry_mutation_barrier) {
+    const runWithinRegistryBarrier = guardRegistryMutationBarrierRunner(
+      this.options.registry_mutation_barrier,
+    );
+    if (!this.options.registry_view || !runWithinRegistryBarrier) {
       return this.deny("GUARD_UNAVAILABLE");
     }
 
-    const callbackCompletion = Symbol("guard-registry-barrier-callback-complete");
-    let callbackEntered = false;
-    let callbackDecision: GuardDecision | undefined;
     let authoritativeDecision: GuardDecision | undefined;
-    let barrierSettled = false;
-    const evaluateWithinBarrier = async (): Promise<typeof callbackCompletion> => {
-      if (callbackEntered) throw new Error("Registry mutation barrier callback entered more than once");
-      callbackEntered = true;
-      callbackDecision = await this.options.registry_view.withCommittedView(async () => {
+    const evaluateWithinBarrier = async (): Promise<GuardDecision> =>
+      this.options.registry_view.withCommittedView(async () => {
         const decision = await this.evaluatePinned(event, {
           mayCommit: async () => {
-            if (barrierSettled) return false;
             try {
               if (await this.options.registry_view.committedViewIsStale()) return false;
             } catch {
               return false;
             }
-            return !barrierSettled;
+            return true;
           },
           complete: (committedDecision) => {
-            if (barrierSettled || authoritativeDecision) {
-              throw new Error("Guard permit decision completed outside its Registry barrier");
+            if (authoritativeDecision) {
+              throw new Error("Guard permit decision completed more than once");
             }
             authoritativeDecision = committedDecision;
           },
@@ -538,25 +571,11 @@ export class GuardService {
         }
         return decision;
       });
-      return callbackCompletion;
-    };
 
     try {
-      const barrierResult = await this.options.registry_mutation_barrier.run(evaluateWithinBarrier).then(
-        (result) => {
-          barrierSettled = true;
-          return result;
-        },
-        (cause: unknown) => {
-          barrierSettled = true;
-          throw cause;
-        },
-      );
-      if (authoritativeDecision) return authoritativeDecision;
-      if (!callbackDecision || barrierResult !== callbackCompletion) return this.deny("GUARD_UNAVAILABLE");
-      return callbackDecision;
+      const callbackDecision = await runWithinRegistryBarrier(evaluateWithinBarrier);
+      return authoritativeDecision ?? callbackDecision;
     } catch {
-      barrierSettled = true;
       return authoritativeDecision ?? this.deny("GUARD_UNAVAILABLE");
     }
   }
