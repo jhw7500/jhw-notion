@@ -145,7 +145,6 @@ function findFollowing(words: readonly string[], start: number, values: Readonly
 }
 
 function scanHighRisk(command: string): { detections: Detection[]; selfApproval: boolean } {
-  const words = rawWords(command);
   const detections: Detection[] = [];
   let selfApproval = false;
   const add = (detection: Detection): void => {
@@ -156,13 +155,17 @@ function scanHighRisk(command: string): { detections: Detection[]; selfApproval:
     }
   };
   const riskCommand = command.replace(/["']/gu, "");
-  const hasWorkingDirectoryOverride = /(?:^|[;&|()\s])(?:cd|pushd|popd)(?:\s|$)|--chdir(?:=|\s|$)/u.test(riskCommand);
+  // GNU env -S accepts its split string attached to the short option. Expose
+  // only that opaque payload to the lexical risk scan; never split it as argv.
+  const riskScanCommand = riskCommand.replace(/(^|\s)(-[^-\s]*?S)(\S+)/gu, "$1$2 $3");
+  const words = rawWords(riskScanCommand);
+  const hasWorkingDirectoryOverride = /(?:^|[;&|()\s])(?:cd|pushd|popd)(?:\s|$)|--chdir(?:=|\s|$)/u.test(riskScanCommand);
   const hasGitTargetOption =
     /(?:^|\s)-C(?:\S*)|--(?:git-dir|work-tree)(?:=|\s|$)|\b(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_OBJECT_DIRECTORY|GIT_INDEX_FILE)=/u
-      .test(riskCommand) || hasWorkingDirectoryOverride;
+      .test(riskScanCommand) || hasWorkingDirectoryOverride;
   const hasGhRepositoryOption =
     /(?:^|\s)(?:--repo(?:=|\s|$)|-R(?:=|\s|$))|\b(?:GH_REPO|GH_HOST)=|--hostname(?:=|\s|$)/u
-      .test(riskCommand) || hasWorkingDirectoryOverride;
+      .test(riskScanCommand) || hasWorkingDirectoryOverride;
 
   for (let index = 0; index < words.length; index += 1) {
     const word = executableName(words[index] as string);
@@ -361,13 +364,15 @@ function executableArgv(argv: readonly string[]): string[] | undefined {
       continue;
     }
     if (
-      argument === "-C" || argument === "--chdir" || argument.startsWith("--chdir=") ||
+      argument === "-C" || /^-[^S\s]*C/u.test(argument) ||
+      argument === "--chdir" || argument.startsWith("--chdir=") ||
       argument === "-S" || argument === "--split-string" || argument.startsWith("--split-string=")
     ) {
       // These options change how the following executable or its relative
       // path is interpreted. This layer deliberately does not emulate env.
       throw new ShellClassificationError("unsafe_local_script");
     }
+    if (/^-[^-\s]*S.+/u.test(argument)) return undefined;
     if (argument.startsWith("--unset=")) {
       if (argument.length === "--unset=".length) return undefined;
       index += 1;
@@ -536,52 +541,56 @@ async function gitDetection(
 
 function ghDetection(argv: readonly string[]): Detection | undefined {
   const arguments_ = argv.slice(1);
-  let index = 0;
   let explicitRepository = false;
-  let invalidGlobalOptions = false;
-  while (index < arguments_.length && (arguments_[index] as string).startsWith("-")) {
+  let uninterpretable = false;
+  const skipped = new Set<number>();
+  for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index] as string;
-    if (argument === "--repo" || argument === "-R") {
-      explicitRepository = true;
-      const value = arguments_[index + 1];
-      if (!value || value.startsWith("-")) invalidGlobalOptions = true;
-      index += 2;
-      continue;
-    }
-    if (argument.startsWith("--repo=") || (argument.startsWith("-R") && argument !== "-R")) {
-      explicitRepository = true;
-      if (argument.endsWith("=" ) || argument === "-R") invalidGlobalOptions = true;
-      index += 1;
-      continue;
-    }
-    if (argument === "--hostname") {
-      explicitRepository = true;
-      if (arguments_[index + 1] === undefined) invalidGlobalOptions = true;
-      index += 2;
-      continue;
-    }
-    if (argument.startsWith("--hostname=")) {
-      explicitRepository = true;
-      if (argument.length === "--hostname=".length) invalidGlobalOptions = true;
-      index += 1;
-      continue;
-    }
     if (argument === "--help" || argument === "--version") {
-      index += 1;
+      skipped.add(index);
       continue;
     }
-    invalidGlobalOptions = true;
-    index += 1;
+    if (argument === "--repo" || argument === "-R" || argument === "--hostname") {
+      explicitRepository = true;
+      skipped.add(index);
+      const value = arguments_[index + 1];
+      if (!value || value.startsWith("-")) {
+        uninterpretable = true;
+      } else {
+        skipped.add(index + 1);
+        index += 1;
+      }
+      continue;
+    }
+    if (
+      argument.startsWith("--repo=") || argument.startsWith("--hostname=") ||
+      (argument.startsWith("-R") && argument !== "-R")
+    ) {
+      explicitRepository = true;
+      skipped.add(index);
+      if (argument.endsWith("=")) uninterpretable = true;
+      continue;
+    }
   }
 
-  let family: string | undefined = arguments_[index];
-  let action: string | undefined = arguments_[index + 1];
-  if (invalidGlobalOptions || !new Set(["pr", "release", "issue"]).has(family ?? "")) {
-    const familyIndex = arguments_.findIndex((argument) => argument === "pr" || argument === "release" || argument === "issue");
-    family = familyIndex >= 0 ? arguments_[familyIndex] : undefined;
-    action = familyIndex >= 0 ? arguments_[familyIndex + 1] : undefined;
-    explicitRepository = true;
-  }
+  const families = new Set(["pr", "release", "issue"]);
+  const familyIndex = arguments_.findIndex((argument, index) => !skipped.has(index) && families.has(argument));
+  if (familyIndex < 0) return undefined;
+  const family = arguments_[familyIndex] as string;
+  const actions = family === "pr"
+    ? new Set(["create", "merge"])
+    : family === "release"
+      ? new Set(["create"])
+      : new Set(["close", "edit", "comment"]);
+  const actionIndex = arguments_.findIndex((argument, index) =>
+    index > familyIndex && !skipped.has(index) && actions.has(argument));
+  if (actionIndex < 0) return undefined;
+  const action = arguments_[actionIndex] as string;
+  if (arguments_.some((_argument, index) => index < familyIndex && !skipped.has(index))) uninterpretable = true;
+  if (arguments_.some((_argument, index) =>
+    index > familyIndex && index < actionIndex && !skipped.has(index))) uninterpretable = true;
+  if (uninterpretable) explicitRepository = true;
+
   if (family === "pr" && (action === "create" || action === "merge")) {
     return {
       capability: "git.publish",
@@ -862,9 +871,15 @@ export async function classifyShell(input: string, context: ShellClassifierConte
     hasRepositoryEnvironmentOverride(classifiedArgv, commandArgv) ||
     hasExecutableResolutionOverride(classifiedArgv, commandArgv)
   );
-  const knownDetection = known.detection?.repository_target === "current" && repositoryBindingUnsafe
+  const environmentAdjustedDetection = known.detection?.repository_target === "current" && repositoryBindingUnsafe
     ? { ...known.detection, boundary: "guarded_command" as const, repository_target: "unresolved" as const }
     : known.detection;
+  const rawRequiresUnresolvedRepository = commandArgv !== undefined && executableName(commandArgv[0] as string) === "gh" &&
+    environmentAdjustedDetection !== undefined && raw.detections.some((detection) =>
+    detection.capability === environmentAdjustedDetection.capability && detection.repository_target === "unresolved");
+  const knownDetection = environmentAdjustedDetection?.repository_target === "current" && rawRequiresUnresolvedRepository
+    ? { ...environmentAdjustedDetection, boundary: "guarded_command" as const, repository_target: "unresolved" as const }
+    : environmentAdjustedDetection;
   const repositoryIsCurrent = await isCurrentRepositoryDirectory(context, context.cwd);
   const authoritativeCapability = knownDetection?.capability;
   const rawDetections = raw.detections

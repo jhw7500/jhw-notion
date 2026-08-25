@@ -245,6 +245,39 @@ describe("conservative shell classification", () => {
     expect(result.direct_high_risk).toBe(true);
   });
 
+  it.each([
+    ["gh pr --repo cli/cli create --title bounded", "git.publish", "guarded_command"],
+    ["gh issue -R cli/cli close 42", "tracker.mutate", "tracker"],
+    ["gh pr create --repo cli/cli --title bounded", "git.publish", "guarded_command"],
+    ["gh pr --hostname github.example create --title bounded", "git.publish", "guarded_command"],
+    ["gh pr create --hostname github.example --title bounded", "git.publish", "guarded_command"],
+  ] as const)("keeps persistent gh target option position in %s unresolved", async (
+    command,
+    capability,
+    boundary,
+  ) => {
+    const result = await classifyShell(command, context);
+
+    expect(result.requirements.map((requirement) => requirement.capability)).not.toContain(capability);
+    expect(result.unresolved_signals).toContainEqual({ capability, boundary });
+    expect(result.direct_high_risk).toBe(true);
+  });
+
+  it("does not let a guard wrapper override a stricter gh target detection", async () => {
+    const result = await classifyShell(
+      "jhw-control guard with --task tsk-018f21e0-7b2c-7a00-8000-000000000001 --claim clm-018f21e0-7b2c-7a00-8000-000000000002 --session codex-local --origin-adapter codex -- gh pr create --repo cli/cli --title bounded",
+      context,
+    );
+
+    expect(result.owned_wrapper).toBe("guard");
+    expect(result.requirements).not.toContainEqual({ capability: "git.publish", resource: repository });
+    expect(result.unresolved_signals).toContainEqual({
+      capability: "git.publish",
+      boundary: "guarded_command",
+    });
+    expect(result.direct_high_risk).toBe(false);
+  });
+
   it("keeps an uninterpretable known gh executable in the high-risk boundary", async () => {
     const result = await classifyShell("gh --repo pr create --title bounded", context);
 
@@ -428,6 +461,41 @@ describe("conservative shell classification", () => {
     await writeFile(script, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
     try {
       for (const option of [`-C ${outside}`, `--chdir=${outside}`]) {
+        await expect(classifyShell(`env ${option} ./outside.sh`, context)).rejects.toMatchObject({
+          name: "ShellClassificationError",
+          code: "unsafe_local_script",
+        } satisfies Partial<ShellClassificationError>);
+      }
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("retains high-risk evidence from attached GNU env split-string options", async () => {
+    const git = await classifyShell("env -SGIT_DIR=/tmp/other/.git\\ git\\ commit\\ -m\\ escaped", context);
+    const remote = await classifyShell("env -Sssh\\ target.example", context);
+    const combined = await classifyShell("env -iSssh\\ target.example", context);
+
+    expect(git.requirements).not.toContainEqual({ capability: "git.commit", resource: repository });
+    expect(git.unresolved_signals).toContainEqual({
+      capability: "git.commit",
+      boundary: "guarded_command",
+    });
+    for (const result of [remote, combined]) {
+      expect(result.unresolved_signals).toContainEqual({
+        capability: "remote.execute",
+        boundary: "guarded_command",
+      });
+      expect(result.direct_high_risk).toBe(true);
+      expect(result.script_content_sha256).toBeUndefined();
+    }
+  });
+
+  it("fails closed for attached or combined GNU env chdir before a local script", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "guard-shell-env-attached-chdir-"));
+    await writeFile(join(outside, "outside.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    try {
+      for (const option of [`-C${outside}`, `-iC${outside}`]) {
         await expect(classifyShell(`env ${option} ./outside.sh`, context)).rejects.toMatchObject({
           name: "ShellClassificationError",
           code: "unsafe_local_script",
