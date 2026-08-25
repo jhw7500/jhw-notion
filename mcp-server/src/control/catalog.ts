@@ -4,21 +4,35 @@ import { z, type ZodType } from "zod";
 
 import { RegistryRecordStore } from "./codec.js";
 import type { ControlConfig } from "./config.js";
+import { ControlContractAuthority, type ContractAuthorityPort } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
 import { newTaskId, sourceIndexKey } from "./ids.js";
 import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
+import { activeClaimRelativePath, taskRelativePath } from "./registry-paths.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
+  ChildTaskSchema,
   FormalTaskSchema,
   RepositoryRecordSchema,
+  TaskRoleSchema,
   TaskRecordSchema,
   TemporaryTaskSchema,
+  type ChildTask,
   type FormalTask,
   type RepositoryRecord,
   type TaskRecord,
   type TemporaryTask,
   type TemporaryLifecycle,
 } from "./schemas.js";
+import {
+  TaskDependencySchema,
+  WorkGrantSchema,
+  WorkContractSchema,
+  normalizeWorkContract,
+  type TaskDependency,
+  type WorkContract,
+  type WorkGrant,
+} from "./work-contract.js";
 
 const projectIdPattern = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const repositoryIdPattern = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
@@ -47,6 +61,9 @@ const RegisterFormalTaskInputSchema = z.object({
   issue_revision: z.string().datetime({ offset: true }),
   issue_url: z.string().url(),
   alias: z.string().regex(formalAliasPattern),
+  task_role: TaskRoleSchema.optional(),
+  grants: z.array(WorkGrantSchema).optional(),
+  dependencies: z.array(TaskDependencySchema).optional(),
 }).strict();
 
 const RegisterTemporaryTaskInputSchema = z.object({
@@ -56,6 +73,24 @@ const RegisterTemporaryTaskInputSchema = z.object({
   goal: z.string().min(1),
   done_conditions: z.array(z.string().min(1)).min(1),
   expected_scope: z.array(z.string().min(1)).min(1),
+  grants: z.array(WorkGrantSchema).optional(),
+  dependencies: z.array(TaskDependencySchema).optional(),
+}).strict();
+
+const RegisterChildTaskInputSchema = z.object({
+  parent_task_id: z.string().regex(taskIdPattern),
+  alias: z.string().regex(safeAliasPattern),
+  required_for_parent: z.boolean(),
+  goal: z.string().min(1),
+  done_conditions: z.array(z.string().min(1)).min(1),
+  grants: z.array(WorkGrantSchema),
+  dependencies: z.array(TaskDependencySchema),
+}).strict();
+
+const ConfigureTaskInputSchema = z.object({
+  task_id: z.string().regex(taskIdPattern),
+  task_role: TaskRoleSchema,
+  work_contract: WorkContractSchema,
 }).strict();
 
 // Derived from the schemas that actually validate these inputs. A hand-written
@@ -66,6 +101,13 @@ const RegisterTemporaryTaskInputSchema = z.object({
 export type RegisterRepositoryInput = z.input<typeof RegisterRepositoryInputSchema>;
 export type RegisterFormalTaskInput = z.input<typeof RegisterFormalTaskInputSchema>;
 export type RegisterTemporaryTaskInput = z.input<typeof RegisterTemporaryTaskInputSchema>;
+export type RegisterChildTaskInput = z.input<typeof RegisterChildTaskInputSchema>;
+
+export interface ConfigureTaskInput {
+  task_id: string;
+  task_role: "standalone" | "parent";
+  work_contract: WorkContract;
+}
 
 export interface RepositoryRegistration {
   repository: RepositoryRecord;
@@ -83,10 +125,6 @@ function repositoryRelativePath(repoId: string): string {
 
 function repositorySourceRelativePath(githubNodeId: string): string {
   return `repositories/by-source/github/${sourceIndexKey(githubNodeId)}.yaml`;
-}
-
-function taskRelativePath(taskId: string): string {
-  return `tasks/${taskId}.yaml`;
 }
 
 function taskSourceRelativePath(githubNodeId: string): string {
@@ -143,15 +181,37 @@ function sameGithubSlug(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
 }
 
+interface ContractIntent {
+  grants: WorkGrant[];
+  dependencies: TaskDependency[];
+}
+
+function requireContractIntent(input: { grants?: WorkGrant[]; dependencies?: TaskDependency[] }): ContractIntent {
+  if (input.grants === undefined || input.dependencies === undefined) {
+    throw new ControlError("TASK_CONTRACT_REQUIRED", "New Task registration requires explicit contract intent");
+  }
+  return { grants: input.grants, dependencies: input.dependencies };
+}
+
+function contractForTask(taskId: string, intent: ContractIntent): WorkContract {
+  try {
+    return normalizeWorkContract({ version: 1, task_id: taskId, ...intent });
+  } catch {
+    throw new ControlError("INVALID_WORK_CONTRACT", "Work Contract intent failed validation");
+  }
+}
+
 /** Canonical Registry catalog with source-index collision protection. */
 export class Catalog {
   readonly records: RegistryRecordStore;
   private readonly sensitiveData: SensitiveDataPolicy;
+  private readonly contractAuthority: ContractAuthorityPort;
 
   constructor(
     private readonly config: ControlConfig,
     private readonly registry: RegistryGit,
     sensitiveData?: SensitiveDataPolicy,
+    contractAuthority?: ContractAuthorityPort,
   ) {
     this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [
       config.registryDir,
@@ -159,6 +219,13 @@ export class Catalog {
       config.worktreeRoot,
     ]);
     this.records = new RegistryRecordStore(config.registryDir, registry, this.sensitiveData);
+    this.contractAuthority = contractAuthority ?? new ControlContractAuthority({
+      getRepository: (repoId) => this.getRepository(repoId),
+      getTask: (taskId) => this.getTask(taskId),
+      boardStatus: async () => {
+        throw new ControlError("RESOURCE_AUTHORITY_UNSUPPORTED", "Board authority is not wired in this composition");
+      },
+    });
   }
 
   async registerRepository(rawInput: RegisterRepositoryInput): Promise<RepositoryRegistration> {
@@ -308,13 +375,17 @@ export class Catalog {
           issue_node_id: input.issue_node_id,
           issue_revision: input.issue_revision,
           issue_url: input.issue_url,
+          task_role: input.task_role ?? "standalone",
         },
         "INVALID_FORMAL_TASK",
       );
-      await this.records.writeJson(taskRelativePath(task.id), task);
-      await this.records.writeJson(sourcePath, { task_id: task.id });
-      registration = { task, created: true };
-      return stage([taskRelativePath(task.id), taskSourceRelativePath(input.issue_node_id)]);
+      const workContract = contractForTask(task.id, requireContractIntent(input));
+      const configured = record(FormalTaskSchema, { ...task, work_contract: workContract }, "INVALID_FORMAL_TASK");
+      await this.contractAuthority.assertKnownContract(configured, workContract);
+      await this.records.writeJson(taskRelativePath(configured.id), configured);
+      await this.records.writeJson(sourcePath, { task_id: configured.id });
+      registration = { task: configured, created: true };
+      return stage([taskRelativePath(configured.id), taskSourceRelativePath(input.issue_node_id)]);
     });
 
     return requiredRegistration(registration);
@@ -357,15 +428,104 @@ export class Catalog {
           done_conditions: input.done_conditions,
           expected_scope: input.expected_scope,
           lifecycle: "active",
+          task_role: "standalone",
         },
         "INVALID_TEMPORARY_TASK",
       );
+      const workContract = contractForTask(task.id, requireContractIntent(input));
+      task = record(TemporaryTaskSchema, { ...task, work_contract: workContract }, "INVALID_TEMPORARY_TASK");
+      await this.contractAuthority.assertKnownContract(task, workContract);
       await this.records.writeJson(taskRelativePath(task.id), task);
       return stage([taskRelativePath(task.id)]);
     });
 
     if (!task) throw new Error("Temporary Task registration did not produce a record");
     return task;
+  }
+
+  async registerChildTask(rawInput: RegisterChildTaskInput): Promise<ChildTask> {
+    this.sensitiveData.assertSafe(rawInput);
+    const input = parseInput(RegisterChildTaskInputSchema, rawInput, "INVALID_CHILD_TASK");
+    let child: ChildTask | undefined;
+    await this.registry.transact(`registry: register child task ${input.alias}`, async () => {
+      await this.auditTaskSourceIndexes();
+      const parent = await this.taskAt(input.parent_task_id);
+      if (parent.kind === "child") {
+        throw new ControlError("TASK_CHILD_DEPTH_EXCEEDED", "Child Tasks cannot have children");
+      }
+      if (parent.kind !== "formal" || parent.task_role !== "parent" || parent.work_contract === undefined) {
+        throw new ControlError("TASK_PARENT_REQUIRED", "Child registration requires a configured formal parent Task");
+      }
+      await this.assertAliasAvailable(input.alias);
+      const taskId = newTaskId();
+      const workContract = contractForTask(taskId, { grants: input.grants, dependencies: input.dependencies });
+      child = record(ChildTaskSchema, {
+        id: taskId,
+        kind: "child",
+        parent_task_id: parent.id,
+        required_for_parent: input.required_for_parent,
+        project_id: parent.project_id,
+        repo_id: parent.repo_id,
+        aliases: [input.alias],
+        goal: input.goal,
+        done_conditions: input.done_conditions,
+        lifecycle: "active",
+        work_contract: workContract,
+      }, "INVALID_CHILD_TASK");
+      await this.contractAuthority.assertKnownContract(child, workContract);
+      await this.records.writeJson(taskRelativePath(child.id), child);
+      return stage([taskRelativePath(child.id)]);
+    });
+    if (!child) throw new Error("Child Task registration did not produce a record");
+    return child;
+  }
+
+  async listChildren(parentTaskId: string): Promise<ChildTask[]> {
+    assertTaskId(parentTaskId);
+    await this.auditTaskSourceIndexes();
+    const entries = await this.records.listDirectoryEntries("tasks", maximumCatalogEntries);
+    const children: ChildTask[] = [];
+    for (const entry of entries) {
+      if (entry.kind === "directory") {
+        if (entry.name !== "by-source") throw corruption("Task directory contains an unexpected subdirectory", { entry: entry.name });
+        continue;
+      }
+      const match = entry.name.match(/^(tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.yaml$/);
+      if (!match) throw corruption("Task directory contains a non-canonical record name", { entry: entry.name });
+      const task = await this.taskAt(match[1] as string);
+      if (task.kind === "child" && task.parent_task_id === parentTaskId) children.push(task);
+    }
+    return children.sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  async configureInactiveTask(rawInput: ConfigureTaskInput): Promise<TaskRecord> {
+    this.sensitiveData.assertSafe(rawInput);
+    const input = parseInput(ConfigureTaskInputSchema, rawInput, "INVALID_TASK_CONFIGURATION");
+    let configured: TaskRecord | undefined;
+    await this.registry.transact(`registry: configure task ${input.task_id}`, async () => {
+      await this.auditTaskSourceIndexes();
+      const current = await this.taskAt(input.task_id);
+      if (current.kind === "child") {
+        throw new ControlError("TASK_CHILD_ROLE_IMMUTABLE", "Child Task topology cannot be configured");
+      }
+      if (input.task_role === "parent" && current.kind !== "formal") {
+        throw new ControlError("TASK_PARENT_FORMAL_REQUIRED", "Only formal Tasks can be parents");
+      }
+      const active = await this.records.readOptionalJson(activeClaimRelativePath(current.id), z.unknown());
+      if (active !== undefined) throw new ControlError("TASK_CONTRACT_ACTIVE", "Active Tasks cannot be reconfigured");
+      if (input.work_contract.task_id !== current.id) {
+        throw new ControlError("TASK_CONTRACT_MISMATCH", "Work Contract Task ID disagrees with Task record");
+      }
+      const value = { ...current, task_role: input.task_role, work_contract: normalizeWorkContract(input.work_contract) };
+      configured = current.kind === "formal"
+        ? record(FormalTaskSchema, value, "INVALID_TASK_CONFIGURATION")
+        : record(TemporaryTaskSchema, value, "INVALID_TASK_CONFIGURATION");
+      await this.contractAuthority.assertKnownContract(configured, configured.work_contract as WorkContract);
+      await this.records.writeJson(taskRelativePath(configured.id), configured);
+      return stage([taskRelativePath(configured.id)]);
+    });
+    if (!configured) throw new Error("Task configuration did not produce a record");
+    return configured;
   }
 
   async promoteTemporaryTask(taskId: string, rawInput: RegisterFormalTaskInput): Promise<FormalTask> {
@@ -418,6 +578,10 @@ export class Catalog {
         return paths.length > 0 ? stage(paths) : noChanges();
       }
 
+      if (current.kind === "child") {
+        throw new ControlError("TASK_CHILD_ROLE_IMMUTABLE", "Child Tasks cannot be promoted");
+      }
+
       if (current.lifecycle === "completed") {
         throw new ControlError("TASK_COMPLETED", "Completed temporary Tasks cannot be promoted");
       }
@@ -445,9 +609,15 @@ export class Catalog {
           issue_node_id: input.issue_node_id,
           issue_revision: input.issue_revision,
           issue_url: input.issue_url,
+          task_role: input.task_role ?? current.task_role ?? "standalone",
+          ...(current.work_contract ? { work_contract: current.work_contract } : {}),
         },
         "INVALID_FORMAL_TASK",
       );
+      if (formal.work_contract === undefined) {
+        throw new ControlError("TASK_CONTRACT_REQUIRED", "Promotion requires an existing Work Contract");
+      }
+      await this.contractAuthority.assertKnownContract(formal, formal.work_contract);
       await this.records.writeJson(taskRelativePath(current.id), formal);
       if (!indexed) await this.records.writeJson(sourcePath, { task_id: current.id });
       promoted = formal;
@@ -482,7 +652,9 @@ export class Catalog {
       throw new ControlError("TASK_COMPLETED", "Completed temporary Tasks cannot transition or be reclaimed");
     }
     if (current.lifecycle === lifecycle) return [];
-    const updated = record(TemporaryTaskSchema, { ...current, lifecycle }, "INVALID_TEMPORARY_TASK");
+    const updated = current.kind === "child"
+      ? record(ChildTaskSchema, { ...current, lifecycle }, "INVALID_CHILD_TASK")
+      : record(TemporaryTaskSchema, { ...current, lifecycle }, "INVALID_TEMPORARY_TASK");
     await this.records.writeJson(taskRelativePath(updated.id), updated);
     return [taskRelativePath(updated.id)];
   }
@@ -731,8 +903,9 @@ export class Catalog {
         throw corruption("Formal Task record has no exact source index", { task_id: task.id });
       }
       if (task.kind === "formal") await this.assertTaskRepository(task);
-      if (task.kind === "temporary" && seenTasks.has(task.id)) {
-        throw corruption("Temporary Task is referenced by a formal source index", { task_id: task.id });
+      if (task.kind === "child") await this.assertChildParent(task);
+      if (task.kind !== "formal" && seenTasks.has(task.id)) {
+        throw corruption("Non-formal Task is referenced by a formal source index", { task_id: task.id });
       }
     }
   }
@@ -792,9 +965,15 @@ export class Catalog {
     const recordPath = join(this.config.registryDir, relativePath);
     let task: TaskRecord;
     try {
-      task = await this.records.readJson(relativePath, TaskRecordSchema, { field: "id", value: taskId });
+      const parsed = await this.records.readOptionalJson(relativePath, TaskRecordSchema, { field: "id", value: taskId });
+      if (!parsed) {
+        if (!sourceIndexPath) throw new ControlError("TASK_NOT_FOUND", "Canonical Task record does not exist", { task_id: taskId });
+        throw corruption("Task source index points to a missing record", { sourceIndexPath, recordPath, expectedRecordId: taskId });
+      }
+      task = parsed;
     } catch (cause) {
       rethrowSensitive(cause);
+      if (cause instanceof ControlError && cause.code === "TASK_NOT_FOUND") throw cause;
       throw corruption("Task record referenced by Registry is invalid or missing", {
         sourceIndexPath,
         recordPath,
@@ -826,6 +1005,18 @@ export class Catalog {
     const slug = issueRepositorySlug(task.issue_url);
     if (!repository || !slug || !sameGithubSlug(slug, repository.slug)) {
       throw corruption("Formal Task source does not belong to its referenced Repository", { task_id: task.id });
+    }
+  }
+
+  private async assertChildParent(task: ChildTask): Promise<void> {
+    const parent = await this.taskAt(task.parent_task_id);
+    if (
+      parent.kind !== "formal" ||
+      parent.task_role !== "parent" ||
+      parent.project_id !== task.project_id ||
+      parent.repo_id !== task.repo_id
+    ) {
+      throw corruption("Child Task topology disagrees with its formal parent", { task_id: task.id });
     }
   }
 }

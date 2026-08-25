@@ -8,6 +8,7 @@ import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { newClaimId } from "./ids.js";
 import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
+import { activeClaimRelativePath } from "./registry-paths.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   ActiveClaimSchema,
@@ -111,10 +112,6 @@ export interface RecoveryTakeover {
 }
 
 export type RecoveryResult = RecoveryStatus | RecoveryForceEnd | RecoveryTakeover;
-
-function activeRelativePath(taskId: string): string {
-  return `claims/active/${taskId}.yaml`;
-}
 
 function historyRelativePath(year: number | string, taskId: string, claimId: string): string {
   return `claims/history/${year}/${taskId}/${claimId}.yaml`;
@@ -224,8 +221,8 @@ export class ClaimService {
         "INVALID_CLAIM",
         "Claim record failed validation",
       );
-      await this.catalog.records.writeJson(activeRelativePath(input.task_id), claimed);
-      return stage([...lifecyclePaths, activeRelativePath(input.task_id)]);
+      await this.catalog.records.writeJson(activeClaimRelativePath(input.task_id), claimed);
+      return stage([...lifecyclePaths, activeClaimRelativePath(input.task_id)]);
     });
 
     if (!claimed) throw new Error("Claim transaction did not produce an active Claim");
@@ -253,9 +250,9 @@ export class ClaimService {
       history = this.finishHistory(active, outcome, releasedAt);
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
-      await this.catalog.records.remove(activeRelativePath(taskId));
+      await this.catalog.records.remove(activeClaimRelativePath(taskId));
       const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(taskId, outcome.status);
-      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId), ...lifecyclePaths]);
+      return stage([historyRelativePath(year, taskId, expectedClaimId), activeClaimRelativePath(taskId), ...lifecyclePaths]);
     });
 
     if (!history) throw new Error("Claim finish transaction did not produce history");
@@ -423,9 +420,9 @@ export class ClaimService {
       history = this.recoveryHistory(active, "force-ended", releasedAt);
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
-      await this.catalog.records.remove(activeRelativePath(taskId));
+      await this.catalog.records.remove(activeClaimRelativePath(taskId));
       const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(taskId, "handoff");
-      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId), ...lifecyclePaths]);
+      return stage([historyRelativePath(year, taskId, expectedClaimId), activeClaimRelativePath(taskId), ...lifecyclePaths]);
     });
     if (!history) throw new Error("Claim force-end transaction did not produce history");
     return { kind: "force-end", history };
@@ -479,9 +476,9 @@ export class ClaimService {
       history = this.takeoverHistory(active, releasedAt, replacement.claim_id);
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
-      await this.catalog.records.remove(activeRelativePath(taskId));
-      await this.catalog.records.writeJson(activeRelativePath(taskId), replacement);
-      return stage([historyRelative, activeRelativePath(taskId)]);
+      await this.catalog.records.remove(activeClaimRelativePath(taskId));
+      await this.catalog.records.writeJson(activeClaimRelativePath(taskId), replacement);
+      return stage([historyRelative, activeClaimRelativePath(taskId)]);
     });
 
     if (!history || !replacement) throw new Error("Claim takeover transaction did not produce both records");
@@ -502,7 +499,7 @@ export class ClaimService {
       });
     }
     try {
-      await this.registry.assertHeadRegularFile(activeRelativePath(task.id));
+      await this.registry.assertHeadRegularFile(activeClaimRelativePath(task.id));
     } catch (cause) {
       throw corruption("Active takeover successor is not a committed regular Registry record", {
         task_id: task.id,
@@ -620,7 +617,7 @@ export class ClaimService {
 
   private async readActive(task: TaskRecord): Promise<ActiveClaim | undefined> {
     await this.assertActivePathComponents(task.id);
-    const recordPath = activeRelativePath(task.id);
+    const recordPath = activeClaimRelativePath(task.id);
     let active: ActiveClaim | undefined;
     try {
       active = await this.catalog.records.readOptionalJson(recordPath, ActiveClaimSchema, {
@@ -717,7 +714,7 @@ export class ClaimService {
   }
 
   private async assertActivePathComponents(taskId: string): Promise<void> {
-    await this.assertRegistryPathComponents(activeRelativePath(taskId));
+    await this.assertRegistryPathComponents(activeClaimRelativePath(taskId));
   }
 
   private async assertHandoffAvailable(handoffPath: string | undefined): Promise<void> {

@@ -167,7 +167,7 @@ export class GitHubSourceService {
     issue_url: string;
     expected_issue_node_id?: string;
     expected_issue_revision?: string;
-  }): Promise<FormalTaskRegistration> {
+  } & Pick<RegisterFormalTaskInput, "task_role" | "grants" | "dependencies">): Promise<FormalTaskRegistration> {
     issueCoordinates(input.issue_url);
     const { repository_path: _repositoryPath, ...content } = input;
     this.assertCheckoutSafe(content, input.repository_path);
@@ -185,6 +185,9 @@ export class GitHubSourceService {
       project_id: input.project_id,
       repo_id: input.repo_id,
       ...issueRecord(issue),
+      ...(input.task_role !== undefined ? { task_role: input.task_role } : {}),
+      ...(input.grants !== undefined ? { grants: input.grants } : {}),
+      ...(input.dependencies !== undefined ? { dependencies: input.dependencies } : {}),
     });
   }
 
@@ -213,6 +216,11 @@ export class GitHubSourceService {
         project_id: task.project_id,
         repo_id: task.repo_id,
         ...issueRecord(issue),
+        ...(task.task_role !== undefined ? { task_role: task.task_role } : {}),
+        ...(task.work_contract !== undefined ? {
+          grants: task.work_contract.grants,
+          dependencies: task.work_contract.dependencies,
+        } : {}),
       })).task;
     }
     if (task.kind === "temporary" && task.lifecycle === "completed") {

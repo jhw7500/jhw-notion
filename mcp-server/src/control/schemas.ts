@@ -1,9 +1,12 @@
 import { z } from "zod";
 
+import { TaskIdSchema, WorkContractSchema } from "./work-contract.js";
+
+export { TaskIdSchema } from "./work-contract.js";
+
 const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm" | "hld" | "rsv") =>
   z.string().regex(new RegExp(`^${prefix}-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`));
 
-export const TaskIdSchema = canonicalId("tsk");
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
 const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
 const githubSlugPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
@@ -22,6 +25,8 @@ export const SourceTaskRevisionSchema = boundedCoordinate(256);
 export const OffsetDateTimeSchema = z.string().min(1).max(64).datetime({ offset: true });
 export const TemporaryLifecycleSchema = z.enum(["active", "handoff", "completed", "abandoned"]);
 export type TemporaryLifecycle = z.infer<typeof TemporaryLifecycleSchema>;
+export const TaskRoleSchema = z.enum(["standalone", "parent"]);
+export type TaskRole = z.infer<typeof TaskRoleSchema>;
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
   const parsed = new Date(`${value}T00:00:00.000Z`);
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
@@ -62,6 +67,11 @@ const taskBase = {
     .refine((aliases) => new Set(aliases).size === aliases.length, "Duplicate Task alias"),
 };
 
+const legacyCompatibleTaskConfiguration = {
+  task_role: TaskRoleSchema.optional(),
+  work_contract: WorkContractSchema.optional(),
+};
+
 export const FormalTaskSchema = z
   .object({
     ...taskBase,
@@ -69,6 +79,7 @@ export const FormalTaskSchema = z
     issue_node_id: GithubNodeIdSchema,
     issue_revision: OffsetDateTimeSchema,
     issue_url: z.string().max(512).url(),
+    ...legacyCompatibleTaskConfiguration,
   })
   .strict()
   .superRefine((task, context) => {
@@ -91,6 +102,9 @@ export const FormalTaskSchema = z
         message: "Historical formal Task alias disagrees with its canonical Issue number",
       });
     }
+    if (task.work_contract !== undefined && task.work_contract.task_id !== task.id) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["work_contract", "task_id"], message: "Work Contract Task ID disagrees with Task record" });
+    }
   });
 export type FormalTask = z.infer<typeof FormalTaskSchema>;
 
@@ -102,11 +116,36 @@ export const TemporaryTaskSchema = z
     done_conditions: z.array(boundedUtf8(256)).min(1).max(32),
     expected_scope: z.array(boundedUtf8(256)).min(1).max(32),
     lifecycle: TemporaryLifecycleSchema,
+    ...legacyCompatibleTaskConfiguration,
   })
-  .strict();
+  .strict()
+  .superRefine((task, context) => {
+    if (task.work_contract !== undefined && task.work_contract.task_id !== task.id) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["work_contract", "task_id"], message: "Work Contract Task ID disagrees with Task record" });
+    }
+  });
 export type TemporaryTask = z.infer<typeof TemporaryTaskSchema>;
 
-export const TaskRecordSchema = z.union([FormalTaskSchema, TemporaryTaskSchema]);
+export const ChildTaskSchema = z
+  .object({
+    ...taskBase,
+    kind: z.literal("child"),
+    parent_task_id: canonicalId("tsk"),
+    required_for_parent: z.boolean(),
+    goal: boundedUtf8(32 * 1024),
+    done_conditions: z.array(boundedUtf8(256)).min(1).max(32),
+    lifecycle: TemporaryLifecycleSchema,
+    work_contract: WorkContractSchema,
+  })
+  .strict()
+  .superRefine((task, context) => {
+    if (task.work_contract.task_id !== task.id) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["work_contract", "task_id"], message: "Work Contract Task ID disagrees with Task record" });
+    }
+  });
+export type ChildTask = z.infer<typeof ChildTaskSchema>;
+
+export const TaskRecordSchema = z.union([FormalTaskSchema, TemporaryTaskSchema, ChildTaskSchema]);
 export type TaskRecord = z.infer<typeof TaskRecordSchema>;
 
 export const ActiveClaimSchema = z
