@@ -201,6 +201,59 @@ function contractForTask(taskId: string, intent: ContractIntent): WorkContract {
   }
 }
 
+function contractForSourceReuse(taskId: string, input: {
+  grants?: WorkGrant[];
+  dependencies?: TaskDependency[];
+}): WorkContract | undefined {
+  const hasGrants = input.grants !== undefined;
+  const hasDependencies = input.dependencies !== undefined;
+  if (!hasGrants && !hasDependencies) return undefined;
+  if (!hasGrants || !hasDependencies) {
+    throw new ControlError("TASK_CONTRACT_MISMATCH", "Existing Task reuse requires complete contract intent");
+  }
+  try {
+    return normalizeWorkContract({
+      version: 1,
+      task_id: taskId,
+      grants: input.grants,
+      dependencies: input.dependencies,
+    });
+  } catch {
+    throw new ControlError("TASK_CONTRACT_MISMATCH", "Existing Task reuse contract intent is invalid");
+  }
+}
+
+function sameSemanticContract(left: WorkContract, right: WorkContract): boolean {
+  return JSON.stringify(normalizeWorkContract(left)) === JSON.stringify(normalizeWorkContract(right));
+}
+
+function assertFormalSourceReuseContract(current: FormalTask, input: RegisterFormalTaskInput): void {
+  const requestedContract = contractForSourceReuse(current.id, input);
+  const hasExplicitRole = input.task_role !== undefined;
+  if (requestedContract === undefined && !hasExplicitRole) return;
+  if (
+    requestedContract === undefined ||
+    current.task_role === undefined ||
+    current.work_contract === undefined ||
+    current.task_role !== (input.task_role ?? "standalone") ||
+    !sameSemanticContract(current.work_contract, requestedContract)
+  ) {
+    throw new ControlError("TASK_CONTRACT_MISMATCH", "Explicit Task role or Work Contract disagrees with the stored Task");
+  }
+}
+
+function assertTemporarySourceReuseContract(current: TemporaryTask, input: RegisterTemporaryTaskInput): void {
+  const requestedContract = contractForSourceReuse(current.id, input);
+  if (requestedContract === undefined) return;
+  if (
+    current.task_role !== "standalone" ||
+    current.work_contract === undefined ||
+    !sameSemanticContract(current.work_contract, requestedContract)
+  ) {
+    throw new ControlError("TASK_CONTRACT_MISMATCH", "Explicit Task role or Work Contract disagrees with the stored Task");
+  }
+}
+
 /** Canonical Registry catalog with source-index collision protection. */
 export class Catalog {
   readonly records: RegistryRecordStore;
@@ -343,6 +396,7 @@ export class Catalog {
           throw new ControlError("FORMAL_TASK_SOURCE_MISMATCH", "Formal Task immutable source coordinates disagree");
         }
         this.assertInputRepository(repository, input.issue_url);
+        assertFormalSourceReuseContract(current, input);
         const currentRevision = Date.parse(current.issue_revision);
         const requestedRevision = Date.parse(input.issue_revision);
         if (requestedRevision < currentRevision) {
@@ -416,6 +470,7 @@ export class Catalog {
         ) {
           throw new ControlError("TEMPORARY_ALIAS_CONFLICT", "Temporary Task alias already identifies different work");
         }
+        assertTemporarySourceReuseContract(existing, input);
         task = existing;
         return noChanges();
       }
@@ -486,6 +541,10 @@ export class Catalog {
   async listChildren(parentTaskId: string): Promise<ChildTask[]> {
     assertTaskId(parentTaskId);
     await this.auditTaskSourceIndexes();
+    return this.listChildrenWithin(parentTaskId);
+  }
+
+  private async listChildrenWithin(parentTaskId: string): Promise<ChildTask[]> {
     const entries = await this.records.listDirectoryEntries("tasks", maximumCatalogEntries);
     const children: ChildTask[] = [];
     for (const entry of entries) {
@@ -518,6 +577,12 @@ export class Catalog {
       if (active !== undefined) throw new ControlError("TASK_CONTRACT_ACTIVE", "Active Tasks cannot be reconfigured");
       if (input.work_contract.task_id !== current.id) {
         throw new ControlError("TASK_CONTRACT_MISMATCH", "Work Contract Task ID disagrees with Task record");
+      }
+      if (current.kind === "formal" && current.task_role === "parent" && input.task_role === "standalone") {
+        const children = await this.listChildrenWithin(current.id);
+        if (children.length > 0) {
+          throw new ControlError("PARENT_ROLE_DEMOTION_BLOCKED", "A formal parent with child Tasks cannot become standalone");
+        }
       }
       const value = { ...current, task_role: input.task_role, work_contract: normalizeWorkContract(input.work_contract) };
       configured = current.kind === "formal"

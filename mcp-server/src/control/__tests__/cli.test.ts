@@ -266,6 +266,20 @@ function formalStartArgs(): string[] {
   ];
 }
 
+function childStartArgs(): string[] {
+  return [
+    "task", "child-start",
+    "--parent", TASK_ID,
+    "--alias", "local-hardening",
+    "--repo-path", "/srv/src/wlan-package",
+    "--goal", "Harden local package changes",
+    "--done", "host tests pass",
+    "--required-for-parent", "true",
+    "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+    "--session", "codex-local-hardening",
+  ];
+}
+
 function registerArgs(): string[] {
   return [
     "project", "register",
@@ -907,6 +921,68 @@ describe("runCli", () => {
     expect(JSON.parse(result.stdout).result.task).toMatchObject({ task_id: CHILD_TASK_ID, parent_task_id: TASK_ID });
   });
 
+  it("retains the registered child coordinate alongside worktree Claim recovery coordinates", async () => {
+    const secretPath = "/private/worktree/secret";
+    const dependencies = makeCliDependencies({
+      taskService: {
+        start: vi.fn().mockRejectedValue(new ControlError("WORKTREE_PATH_EXISTS", "failed", {
+          task_id: CHILD_TASK_ID,
+          claim_id: CLAIM_ID,
+          claim_state: "released",
+          path: secretPath,
+        })),
+      },
+    });
+
+    const result = await runCli(childStartArgs(), dependencies);
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: {
+        code: "WORKTREE_PATH_EXISTS",
+        retained_claim: { task_id: CHILD_TASK_ID, claim_id: CLAIM_ID, state: "released" },
+        retained_task: { task_id: CHILD_TASK_ID },
+      },
+    });
+    expect(result.stderr).not.toContain(secretPath);
+  });
+
+  it("does not emit retained_task when child registration itself fails", async () => {
+    const dependencies = makeCliDependencies({
+      catalog: {
+        registerChildTask: vi.fn().mockRejectedValue(new ControlError("TASK_PARENT_REQUIRED", "missing parent", {
+          path: "/private/registry/task",
+          retained_task: { task_id: CHILD_TASK_ID },
+        })),
+      },
+    });
+
+    const result = await runCli(childStartArgs(), dependencies);
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "TASK_PARENT_REQUIRED" } });
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
+  it("fails closed instead of emitting an invalid retained_task coordinate", () => {
+    const result = controlErrorResult(new ControlError("TASK_SESSION_BUSY", "busy", {
+      retained_task: { task_id: "../not-a-task" },
+    }));
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "TASK_SESSION_BUSY" } });
+  });
+
+  it("does not call TaskService.start when source reuse rejects explicit contract intent", async () => {
+    const dependencies = makeCliDependencies({
+      source: {
+        registerFormalTask: vi.fn().mockRejectedValue(new ControlError("TASK_CONTRACT_MISMATCH", "stored contract differs")),
+      },
+    });
+
+    const result = await runCli(formalStartArgs(), dependencies);
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "TASK_CONTRACT_MISMATCH" } });
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
   it("defaults an omitted required-for-parent flag to true before child registration", async () => {
     const dependencies = makeCliDependencies();
     const result = await runCli([
@@ -976,6 +1052,7 @@ describe("runCli", () => {
     ], dependencies);
 
     expect(result.exitCode).toBe(2);
+    expect(JSON.parse(result.stderr)).not.toHaveProperty("error.retained_task");
     expect(dependencies.catalog.registerChildTask).not.toHaveBeenCalled();
     expect(dependencies.taskService.start).not.toHaveBeenCalled();
   });

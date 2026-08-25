@@ -80,7 +80,16 @@ jhw-control task child-start \
   [--depends observes:<tsk-id> ...] --session <child-session-id>
 ```
 
-`--required-for-parent`를 생략하면 `true`로 정규화하며, 명시할 때는 정확한 `true|false`만 받는다. child는 별도 Issue source index를 만들지 않고 parent의 Project/repository를 이어받되, Work Contract는 전달한 grant만 가진다. worktree 생성 실패 결과의 `error.retained_claim`을 확인하고 기존 recovery 규칙을 따르며 Task/Claim을 임의 삭제하지 않는다.
+`--required-for-parent`를 생략하면 `true`로 정규화하며, 명시할 때는 정확한 `true|false`만 받는다. child는 별도 Issue source index를 만들지 않고 parent의 Project/repository를 이어받되, Work Contract는 전달한 grant만 가진다.
+
+child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또는 worktree 생성이 실패하면 원래 stable `error.code`를 유지하면서 `error.retained_task.task_id`를 반환한다. 먼저 session/resource/preflight 등 원래 실패 원인을 해결한 뒤, 삭제나 재등록 없이 다음 exact 명령으로 그 저장된 child를 시작한다.
+
+```bash
+jhw-control task start --task <retained_task.task_id> \
+  --repo-path <same-path> --session <free-valid-session>
+```
+
+같은 오류에 `error.retained_claim`도 있으면 위 start보다 먼저 해당 exact Claim generation에 아래 recovery 절차를 적용한다. active/released 상태와 안전한 cleanup 여부를 확인한 뒤에만 저장된 child를 재개한다. Task/Claim 파일을 Registry에서 직접 삭제하지 않는다.
 
 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
 
@@ -122,6 +131,10 @@ jhw-control task contract --task <formal-tsk-id> --role parent \
 순서는 `finish/handoff → task contract → task start --task ...`다. active Claim의 snapshot은 Task record 수정으로 바뀌지 않으므로 `TASK_CONTRACT_ACTIVE`를 우회하거나 active Claim을 제자리 수정하지 않는다. 변경된 grant를 쓰려면 반드시 새 Claim을 획득한다. command는 새 Task ID를 만들지 않으며 source identity, alias, legacy `expected_scope`를 보존한다.
 
 `TASK_CONTRACT_REQUIRED`는 legacy Task가 새 Claim에 필요한 contract가 없다는 뜻이다. `RESOURCE_AUTHORITY_MISMATCH`는 repository/Issue 등 exact resource가 Task authority와 다르고, `RESOURCE_AUTHORITY_UNSUPPORTED`는 등록된 board처럼 검증 가능한 authority가 없거나 독립 remote/firmware/deployment resource가 아직 지원되지 않는 경우다. Board registry/state가 없거나 손상되면 fail-closed하므로 text ID로 우회하지 않는다.
+
+`TASK_CONTRACT_MISMATCH`는 기존 formal source 또는 temporary alias에 명시한 role/grant/coordination/dependency가 저장된 계약과 다르다는 뜻이다. 저장된 계약을 그대로 사용할 의도면 registration flag를 반복하지 말고 `task start --task <tsk-id>`를 사용한다. 계약을 바꿀 의도면 Claim이 inactive인지 확인하고 `task contract`로 role과 전체 contract를 교체한 뒤 `task start --task`로 새 Claim을 획득한다. 일부 grant/dependency만 보내거나 더 넓은 grant를 registration reuse에서 조용히 적용하지 않는다.
+
+`PARENT_ROLE_DEMOTION_BLOCKED`는 formal parent를 참조하는 child가 하나라도 있어 `standalone` 전환을 거부했다는 뜻이다. active/handoff/completed/abandoned 여부와 무관하다. parent role을 유지하거나, child topology를 옮기거나 제거하는 별도 지원 workflow가 완료될 때까지 전환을 멈춘다. 이 오류를 우회하려고 Registry의 child record/source index를 직접 수정·삭제하지 않는다. child가 있는 parent의 contract만 교체할 때는 role을 `parent`로 유지한다.
 
 ## Handoff 조회와 promotion
 

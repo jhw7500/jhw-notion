@@ -55,6 +55,7 @@ import {
   ProjectRecordLinkSchema,
   ProjectRecordUpdateSchema,
   RegisterProjectInputSchema,
+  RetainedTaskSummarySchema,
   SnapshotExportResultSchema,
   UpdateProjectInputSchema,
   type ActiveClaim,
@@ -66,6 +67,7 @@ import {
   type ProjectRecordLink,
   type ProjectRecordUpdate,
   type RegisterProjectInput,
+  type RetainedTaskSummary,
   type SnapshotExportResult,
   type TaskRecord,
   type UpdateProjectInput,
@@ -171,6 +173,18 @@ class ParsedCommandFailure extends Error {
     readonly flags: ParsedFlags,
   ) {
     super("Command execution failed after parsing");
+  }
+}
+
+class RetainedTaskFailure extends Error {
+  readonly retainedTask: RetainedTaskSummary;
+
+  constructor(
+    readonly originalCause: unknown,
+    taskId: string,
+  ) {
+    super("Task start failed after child registration");
+    this.retainedTask = RetainedTaskSummarySchema.parse({ task_id: taskId });
   }
 }
 
@@ -598,6 +612,11 @@ function retainedClaim(cause: unknown): Record<string, string> | undefined {
   return { task_id, claim_id, state: claim_state };
 }
 
+function retainedTask(value: unknown): RetainedTaskSummary | undefined {
+  const parsed = RetainedTaskSummarySchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
 function errorReason(cause: unknown): string | undefined {
   if (!(cause instanceof ControlError)) return undefined;
   const parsed = ErrorReasonSchema.safeParse(cause.details.reason);
@@ -623,18 +642,20 @@ function journalErrorFields(stderr: string): { error_code: string; error_reason?
   return { error_code: error.code, ...(error.reason ? { error_reason: error.reason } : {}) };
 }
 
-export function controlErrorResult(cause: unknown, command?: CommandName): CliResult {
+export function controlErrorResult(cause: unknown, command?: CommandName, retainedTaskValue?: unknown): CliResult {
   const code = errorCode(cause);
   const reason = errorReason(cause);
   const conflict = conflictingClaim(cause);
   const boardConflict = conflictingBoard(cause);
   const retained = code === "TASK_ALREADY_CLAIMED" ? undefined : retainedClaim(cause);
+  const retainedRegisteredTask = retainedTask(retainedTaskValue);
   const error = {
     code,
     ...(reason ? { reason } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),
     ...(boardConflict ? { conflicting_board: boardConflict } : {}),
     ...(retained ? { retained_claim: retained } : {}),
+    ...(retainedRegisteredTask ? { retained_task: retainedRegisteredTask } : {}),
   };
   return { exitCode: exitCode(cause, command), stdout: "", stderr: `${JSON.stringify({ error })}\n` };
 }
@@ -1080,14 +1101,19 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       dependencies: contractIntent.dependencies,
     });
     const alias = child.aliases[0] ?? usage("Child Task has no canonical alias");
-    const started = await dependencies.taskService.start({
-      task_id: child.id,
-      task_alias: alias,
-      project_id: child.project_id,
-      repo_id: child.repo_id,
-      session_id,
-      repository_path,
-    });
+    let started: Awaited<ReturnType<CliDependencies["taskService"]["start"]>>;
+    try {
+      started = await dependencies.taskService.start({
+        task_id: child.id,
+        task_alias: alias,
+        project_id: child.project_id,
+        repo_id: child.repo_id,
+        session_id,
+        repository_path,
+      });
+    } catch (cause) {
+      throw new RetainedTaskFailure(cause, child.id);
+    }
     return {
       flags,
       result: resultJson(command, {
@@ -1412,6 +1438,8 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
     if (cause instanceof ParsedCommandFailure) {
       flags = cause.flags;
       result = controlErrorResult(cause.originalCause, command);
+    } else if (cause instanceof RetainedTaskFailure) {
+      result = controlErrorResult(cause.originalCause, command, cause.retainedTask);
     } else {
       result = controlErrorResult(cause, command);
     }

@@ -398,6 +398,14 @@ function temporaryStartArgs(alias: string, sourceRepo: string, session: string):
   ];
 }
 
+function childStartArgs(parentId: string, alias: string, sourceRepo: string, session: string): string[] {
+  return [
+    "task", "child-start", "--parent", parentId, "--alias", alias, "--repo-path", sourceRepo,
+    "--goal", `execute ${alias}`, "--done", "admission succeeds",
+    "--grant", "repo.modify:repository:repo-control:shared", "--session", session,
+  ];
+}
+
 function completedFinishArgs(taskId: string, claimId: string): string[] {
   return [
     "task", "finish", "--task", taskId, "--claim", claimId, "--status", "completed", "--outcome", "verified",
@@ -607,7 +615,15 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
-    const canonical = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
+    const canonical = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      grants: [{
+        capability: "repo.modify",
+        resource: { kind: "repository", id: "repo-control" },
+        coordination: "shared",
+      }],
+      dependencies: [],
+    })).task;
     const enteredStart = deferred();
     const release = deferred();
     const coordinatedTasks = Object.create(graph.tasks) as TaskService;
@@ -761,6 +777,170 @@ describe("Phase 1A deterministic adversarial gate", () => {
       },
     });
   });
+
+  it("4d. child-start retains a persisted child when its exact session is already owned", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const sharedGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-control" },
+      coordination: "shared" as const,
+    };
+    const parent = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants: [sharedGrant],
+      dependencies: [],
+    })).task;
+    const blocker = await graph.catalog.registerTemporaryTask({
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      alias: "control:session-owner",
+      goal: "own the exact session",
+      done_conditions: ["session remains owned"],
+      expected_scope: ["src/control"],
+      grants: [sharedGrant],
+      dependencies: [],
+    });
+    await graph.tasks.start({
+      task_id: blocker.id,
+      task_alias: blocker.aliases[0]!,
+      project_id: blocker.project_id,
+      repo_id: blocker.repo_id,
+      session_id: "codex-retained-child",
+      repository_path: fixture.sourceRepo,
+    });
+
+    const result = await runCli(
+      childStartArgs(parent.id, "control:retained-session-child", fixture.sourceRepo, "codex-retained-child"),
+      cliDependencies(graph),
+    );
+    const retainedTaskId = JSON.parse(result.stderr).error.retained_task.task_id as string;
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "TASK_SESSION_BUSY", retained_task: { task_id: retainedTaskId } },
+    });
+    const [child] = await graph.catalog.listChildren(parent.id);
+    expect(child).toMatchObject({ id: retainedTaskId, aliases: ["control:retained-session-child"] });
+    await expect(graph.claims.getActive(retainedTaskId)).resolves.toBeUndefined();
+    const audit = await freshAuditClone(fixture, "retained-session-child-audit");
+    expect(JSON.parse(await readFile(join(audit, "tasks", `${retainedTaskId}.yaml`), "utf8"))).toMatchObject({
+      id: retainedTaskId,
+      parent_task_id: parent.id,
+    });
+    expect(JSON.parse(await readFile(join(
+      audit,
+      "tasks/by-source/github",
+      `${sourceIndexKey(parent.issue_node_id)}.yaml`,
+    ), "utf8"))).toEqual({ task_id: parent.id });
+  }, 20_000);
+
+  it("4e. child-start retains a persisted child after exclusive-resource admission fails", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const sharedGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-control" },
+      coordination: "shared" as const,
+    };
+    const exclusiveGrant = { ...sharedGrant, coordination: "exclusive" as const };
+    const parent = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants: [sharedGrant],
+      dependencies: [],
+    })).task;
+    const blocker = await graph.catalog.registerTemporaryTask({
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      alias: "control:exclusive-owner",
+      goal: "own the repository resource exclusively",
+      done_conditions: ["later admission is blocked"],
+      expected_scope: ["src/control"],
+      grants: [exclusiveGrant],
+      dependencies: [],
+    });
+    await graph.tasks.start({
+      task_id: blocker.id,
+      task_alias: blocker.aliases[0]!,
+      project_id: blocker.project_id,
+      repo_id: blocker.repo_id,
+      session_id: "codex-exclusive-owner",
+      repository_path: fixture.sourceRepo,
+    });
+
+    const result = await runCli(
+      childStartArgs(parent.id, "control:retained-resource-child", fixture.sourceRepo, "codex-resource-contender"),
+      cliDependencies(graph),
+    );
+    const retainedTaskId = JSON.parse(result.stderr).error.retained_task.task_id as string;
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "TASK_RESOURCE_CONFLICT", retained_task: { task_id: retainedTaskId } },
+    });
+    const [child] = await graph.catalog.listChildren(parent.id);
+    expect(child).toMatchObject({ id: retainedTaskId, aliases: ["control:retained-resource-child"] });
+    await expect(graph.claims.getActive(retainedTaskId)).resolves.toBeUndefined();
+    const audit = await freshAuditClone(fixture, "retained-resource-child-audit");
+    expect(JSON.parse(await readFile(join(audit, "tasks", `${retainedTaskId}.yaml`), "utf8"))).toMatchObject({
+      id: retainedTaskId,
+      parent_task_id: parent.id,
+    });
+  }, 20_000);
+
+  it("4f. explicit formal and temporary source contract drift stops before any Claim", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const sharedGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-control" },
+      coordination: "shared" as const,
+    };
+    const formal = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants: [sharedGrant],
+      dependencies: [],
+    })).task;
+    const formalHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+    const formalResult = await runCli([
+      "task", "start", "--project", "prj-control", "--repo-id", "repo-control",
+      "--repo-path", fixture.sourceRepo, "--issue-node-id", issueInput.issue_node_id,
+      "--issue-url", issueInput.issue_url, "--issue-revision", issueInput.issue_revision,
+      "--role", "standalone", "--grant", "repo.modify:repository:repo-control:shared",
+      "--grant", "git.commit:repository:repo-control:shared", "--session", "codex-formal-drift",
+    ], cliDependencies(graph));
+
+    expect(JSON.parse(formalResult.stderr)).toEqual({ error: { code: "TASK_CONTRACT_MISMATCH" } });
+    expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(formalHead);
+    await expect(graph.claims.getActive(formal.id)).resolves.toBeUndefined();
+
+    const temporaryInput = {
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      alias: "control:temporary-drift",
+      goal: "exercise the deterministic gate",
+      done_conditions: ["gate passes"],
+      expected_scope: ["src/control"],
+    };
+    const temporary = await graph.catalog.registerTemporaryTask({
+      ...temporaryInput,
+      grants: [sharedGrant],
+      dependencies: [],
+    });
+    const temporaryHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+    const temporaryArgs = temporaryStartArgs(temporaryInput.alias, fixture.sourceRepo, "codex-temporary-drift");
+    temporaryArgs.splice(temporaryArgs.indexOf("--session"), 0,
+      "--grant", "git.commit:repository:repo-control:shared");
+    const temporaryResult = await runCli(temporaryArgs, cliDependencies(graph));
+
+    expect(JSON.parse(temporaryResult.stderr)).toEqual({ error: { code: "TASK_CONTRACT_MISMATCH" } });
+    expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(temporaryHead);
+    await expect(graph.claims.getActive(temporary.id)).resolves.toBeUndefined();
+  }, 20_000);
 
   it("5. remote divergence fails without rebase, retry, or force", async () => {
     const fixture = await makeGateFixture();

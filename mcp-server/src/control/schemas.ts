@@ -216,6 +216,12 @@ export const ConflictingClaimSummarySchema = ActiveClaimBaseSchema.pick({
 }).strict();
 export type ConflictingClaimSummary = z.infer<typeof ConflictingClaimSummarySchema>;
 
+/** The only child-registration coordinate an error envelope may retain. */
+export const RetainedTaskSummarySchema = z.object({
+  task_id: TaskIdSchema,
+}).strict();
+export type RetainedTaskSummary = z.infer<typeof RetainedTaskSummarySchema>;
+
 /**
  * The closed vocabulary of machine-readable causes emitted next to a stable
  * error code when one code covers operator actions that differ. Emission is
