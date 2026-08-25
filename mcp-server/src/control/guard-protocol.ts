@@ -158,9 +158,27 @@ export const ClaimIdSchema = z.string().regex(
 export const RequestIdSchema = z.string().regex(
   /^req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
 );
+export const ExactGuardUnlockPromptSchema = z.string().regex(
+  /^\/jhw:unlock req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+);
 export const OperationIdSchema = z.string().regex(
   /^op-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
 );
+
+export const GuardPromptContextSchema = z.object({
+  task_id: TaskIdSchema,
+  claim_id: ClaimIdSchema,
+  task_alias: boundedCoordinate(160),
+  work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+export type GuardPromptContext = z.infer<typeof GuardPromptContextSchema>;
+
+/** Returns a request coordinate only for byte-exact reserved prompt syntax. */
+export function exactGuardUnlockRequestId(rawPrompt: string): string | undefined {
+  const parsed = ExactGuardUnlockPromptSchema.safeParse(rawPrompt);
+  if (!parsed.success) return undefined;
+  return parsed.data.slice("/jhw:unlock ".length);
+}
 
 const commonEventBase = {
   protocol_version: z.literal(GuardProtocolVersion),

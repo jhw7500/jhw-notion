@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -18,6 +18,8 @@ import {
 } from "../guard-service.js";
 import type { ControlConfig } from "../config.js";
 import type { OperationRequirement } from "../guard-protocol.js";
+import { GuardRequestStore, type GuardRequest } from "../guard-state.js";
+import type { GuardJournalEvent, GuardJournalPort } from "../guard-journal.js";
 import type { SecureStateDirectoryHooks } from "../journal.js";
 import { MutationLock, type MutationLockRuntime } from "../process.js";
 import {
@@ -151,6 +153,7 @@ function preTool(
   cwd: string,
   tool_name = "Edit",
   tool_input: unknown = { file_path: "src/file.ts", old_string: "a", new_string: "b" },
+  tool_use_id = "call-guard-1",
 ): unknown {
   return {
     protocol_version: 1,
@@ -160,8 +163,43 @@ function preTool(
     cwd,
     tool_name,
     tool_input,
-    tool_use_id: "call-guard-1",
+    tool_use_id,
   };
+}
+
+function promptEvent(prompt: string, overrides: Record<string, unknown> = {}): unknown {
+  return {
+    protocol_version: 1,
+    adapter: "codex",
+    event: "user_prompt_submit",
+    session_id: SESSION_ID,
+    prompt,
+    ...overrides,
+  };
+}
+
+function postToolEvent(
+  toolUseId: string,
+  ok: boolean,
+  overrides: Record<string, unknown> = {},
+): unknown {
+  return {
+    protocol_version: 1,
+    adapter: "codex",
+    event: "post_tool_use",
+    session_id: SESSION_ID,
+    tool_use_id: toolUseId,
+    ok,
+    ...overrides,
+  };
+}
+
+class MemoryGuardJournal implements GuardJournalPort {
+  readonly events: GuardJournalEvent[] = [];
+
+  async append(event: GuardJournalEvent): Promise<void> {
+    this.events.push(structuredClone(event));
+  }
 }
 
 interface Fixture {
@@ -178,6 +216,8 @@ interface Fixture {
   authorityCalls: number;
   authorityFailure?: Error;
   permit?: GuardPermitDecisionPort;
+  requestStore: GuardRequestStore;
+  guardJournal: MemoryGuardJournal;
   options(overrides?: Partial<GuardServiceOptions>): GuardServiceOptions;
   service(overrides?: Partial<GuardServiceOptions>): GuardService;
 }
@@ -209,6 +249,12 @@ describe("GuardService", () => {
         fixture.barrierCalls += 1;
       },
     });
+    const guardJournal = new MemoryGuardJournal();
+    const requestStore = new GuardRequestStore(lockConfig(join(root, "guard-state")), {
+      journal: guardJournal,
+      lockRuntime: { spawn: () => completedLockAcquisition() },
+      environment: {},
+    });
 
     fixture = {
       root,
@@ -222,6 +268,8 @@ describe("GuardService", () => {
       barrierCalls: 0,
       claimLookups: 0,
       authorityCalls: 0,
+      requestStore,
+      guardJournal,
       permit: {
         decideMissingGrant: async (operation, missing) => {
           fixture.permitCalls += 1;
@@ -234,6 +282,7 @@ describe("GuardService", () => {
             requirements: operation.requirements,
             missing_requirements: missing,
             operation_digest: operation.digest,
+            request_state: "PENDING",
             request_id: REQUEST_ID,
             approval_expires_at: "2026-08-25T10:10:00+09:00",
           };
@@ -254,7 +303,7 @@ describe("GuardService", () => {
           },
           tasks: {
             getTask: async (taskId) => {
-              if (taskId === TASK_ID) return fixture.currentTask;
+              if (taskId === fixture.currentTask.id) return fixture.currentTask;
               throw new Error("unknown task");
             },
             inspectForGuard: async () => {
@@ -1024,6 +1073,7 @@ describe("GuardService", () => {
           requirements: operation.requirements,
           missing_requirements: missing,
           operation_digest: operation.digest,
+          request_state: "PENDING",
           request_id: REQUEST_ID,
           approval_expires_at: "2026-08-25T10:10:00+09:00",
         }),
@@ -1059,6 +1109,7 @@ describe("GuardService", () => {
           requirements: operation.requirements,
           missing_requirements: missing,
           operation_digest: operation.digest,
+          request_state: "PENDING",
           request_id: REQUEST_ID,
           approval_expires_at: "2026-08-25T10:10:00+09:00",
           ...mutation,
@@ -1275,7 +1326,508 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
-  it("safe-parses prompt and post-tool events without changing authority before state integration", async () => {
+  describe("integrated one-time permit lifecycle", () => {
+    function missingRepositoryModify(): void {
+      fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+      fixture.currentTask = taskWith(fixture.currentContract);
+      fixture.currentClaim = activeClaim(fixture.currentContract);
+      fixture.activeClaims = [fixture.currentClaim];
+    }
+
+    function integratedService(overrides: Partial<GuardServiceOptions> = {}): GuardService {
+      return fixture.service({
+        permit_decisions: undefined,
+        guard_request_store: fixture.requestStore,
+        ...overrides,
+      });
+    }
+
+    async function storedRequests(): Promise<GuardRequest[]> {
+      const inspected = await fixture.requestStore.inspect();
+      return inspected.status === "ready" ? inspected.requests : [];
+    }
+
+    async function requestAndApprove(
+      event: unknown = preTool(fixture.cwd),
+    ): Promise<{ requestId: string; service: GuardService }> {
+      const service = integratedService();
+      const decision = await service.evaluatePreTool(event);
+      if (decision.decision !== "PERMIT_REQUIRED") throw new Error("expected a permit request");
+      await expect(service.submitUserPrompt(promptEvent(decision.approval_command))).resolves.toMatchObject({
+        status: "APPROVED",
+        request_id: decision.request_id,
+        context: {
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          task_alias: "guard-task",
+          work_contract_digest: workContractDigest(fixture.currentContract),
+        },
+        start_by: expect.any(String),
+        execution_consumes_permit: true,
+      });
+      return { requestId: decision.request_id, service };
+    }
+
+    it("creates one exact PENDING request and reuses it without consuming quota", async () => {
+      missingRepositoryModify();
+      const service = integratedService();
+
+      const first = await service.evaluatePreTool(preTool(fixture.cwd));
+      const second = await service.evaluatePreTool(preTool(fixture.cwd, "Edit", {
+        file_path: "src/file.ts", old_string: "a", new_string: "b",
+      }, "call-guard-retry"));
+
+      expect(first).toMatchObject({
+        decision: "PERMIT_REQUIRED",
+        approval_command: expect.stringMatching(/^\/jhw:unlock req-/u),
+      });
+      expect(second).toMatchObject({
+        decision: "PERMIT_REQUIRED",
+        request_id: first.decision === "PERMIT_REQUIRED" ? first.request_id : "unexpected",
+        approval_command: first.decision === "PERMIT_REQUIRED" ? first.approval_command : "unexpected",
+      });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ state: "PENDING", task_id: TASK_ID, claim_id: CLAIM_ID }),
+      ]);
+    });
+
+    it("keeps published lifecycle state authoritative while surfacing bounded journal warnings", async () => {
+      missingRepositoryModify();
+      const warningStore = new GuardRequestStore(lockConfig(join(fixture.root, "warning-state")), {
+        journal: { append: async () => { throw new Error("journal unavailable"); } },
+        lockRuntime: { spawn: () => completedLockAcquisition() },
+        environment: {},
+      });
+      const service = integratedService({ guard_request_store: warningStore });
+
+      const decision = await service.evaluatePreTool(preTool(fixture.cwd));
+      expect(decision).toMatchObject({
+        decision: "PERMIT_REQUIRED",
+        journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+      });
+      if (decision.decision !== "PERMIT_REQUIRED") throw new Error("expected a permit request");
+      await expect(service.submitUserPrompt(promptEvent(decision.approval_command))).resolves.toMatchObject({
+        status: "APPROVED",
+        journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+      });
+      await expect(service.evaluatePreTool(preTool(
+        fixture.cwd,
+        "Edit",
+        { file_path: "src/file.ts", old_string: "a", new_string: "b" },
+        "call-warning-consume",
+      ))).resolves.toMatchObject({
+        decision: "ALLOW",
+        consumed_request_id: decision.request_id,
+        journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+      });
+      await expect(warningStore.inspect()).resolves.toMatchObject({
+        status: "ready",
+        requests: [expect.objectContaining({ state: "CONSUMED" })],
+      });
+    });
+
+    it.each([
+      "ok",
+      "진행",
+      "다음",
+      "승인",
+      "`__UNLOCK__`",
+      "```\n__UNLOCK__\n```",
+      " __UNLOCK__",
+      "__UNLOCK__ ",
+      "__UNLOCK__\n",
+      "__UNLOCK__\r\n",
+      "__UNLOCK__\nsecond line",
+    ])("does not approve ordinary or decorated prompt %j", async (template) => {
+      missingRepositoryModify();
+      const service = integratedService();
+      const decision = await service.evaluatePreTool(preTool(fixture.cwd));
+      if (decision.decision !== "PERMIT_REQUIRED") throw new Error("expected a permit request");
+      const prompt = template.replace("__UNLOCK__", decision.approval_command);
+
+      await expect(service.submitUserPrompt(promptEvent(prompt))).resolves.toMatchObject({
+        status: "NO_STATE_CHANGE",
+        event: "user_prompt_submit",
+        context: {
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          task_alias: "guard-task",
+          work_contract_digest: workContractDigest(fixture.currentContract),
+        },
+      });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ request_id: decision.request_id, state: "PENDING" }),
+      ]);
+    });
+
+    it("does not let a tool-shaped event or wrong adapter/session approve the request", async () => {
+      missingRepositoryModify();
+      const service = integratedService();
+      const decision = await service.evaluatePreTool(preTool(fixture.cwd));
+      if (decision.decision !== "PERMIT_REQUIRED") throw new Error("expected a permit request");
+
+      await expect(service.submitUserPrompt(preTool(
+        fixture.cwd,
+        "Bash",
+        { command: decision.approval_command },
+      ))).resolves.toMatchObject({ status: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+      await expect(service.submitUserPrompt(promptEvent(decision.approval_command, { adapter: "claude" })))
+        .resolves.toMatchObject({ status: "DENY", code: "GUARD_PERMIT_MISMATCH" });
+      await expect(service.submitUserPrompt(promptEvent(decision.approval_command, { session_id: "other-session" })))
+        .resolves.toMatchObject({ status: "DENY", code: "GUARD_PERMIT_MISMATCH" });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ request_id: decision.request_id, state: "PENDING" }),
+      ]);
+    });
+
+    it("approves only the exact native prompt and atomically consumes the exact hook retry", async () => {
+      missingRepositoryModify();
+      const { requestId, service } = await requestAndApprove();
+
+      const retry = await service.evaluatePreTool(preTool(
+        fixture.cwd,
+        "Edit",
+        { file_path: "src/file.ts", old_string: "a", new_string: "b" },
+        "call-approved-retry",
+      ));
+
+      expect(retry).toMatchObject({
+        decision: "ALLOW",
+        execution_boundary: "hook",
+        consumed_request_id: requestId,
+      });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({
+          request_id: requestId,
+          state: "CONSUMED",
+          correlation_id: "call-approved-retry",
+        }),
+      ]);
+      await expect(service.evaluatePreTool(preTool(
+        fixture.cwd,
+        "Edit",
+        { file_path: "src/file.ts", old_string: "a", new_string: "b" },
+        "call-consumed-replay",
+      ))).resolves.toMatchObject({ decision: "DENY", code: "GUARD_PERMIT_CONSUMED" });
+    });
+
+    it.each([true, false])("closes only the exact consumed hook correlation when ok=%s", async (ok) => {
+      missingRepositoryModify();
+      const { requestId, service } = await requestAndApprove();
+      await service.evaluatePreTool(preTool(
+        fixture.cwd,
+        "Edit",
+        { file_path: "src/file.ts", old_string: "a", new_string: "b" },
+        "call-post-tool",
+      ));
+
+      for (const event of [
+        postToolEvent("call-unmatched", ok),
+        postToolEvent("call-post-tool", ok, { adapter: "claude" }),
+        postToolEvent("call-post-tool", ok, { session_id: "other-session" }),
+      ]) {
+        await expect(service.completePostTool(event)).resolves.toMatchObject({ status: "DENY" });
+      }
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ request_id: requestId, state: "CONSUMED" }),
+      ]);
+
+      await expect(service.completePostTool(postToolEvent("call-post-tool", ok))).resolves.toMatchObject({
+        status: ok ? "COMPLETED" : "FAILED",
+        request_id: requestId,
+        task_id: TASK_ID,
+        claim_id: CLAIM_ID,
+      });
+      await expect(service.completePostTool(postToolEvent("call-post-tool", ok)))
+        .resolves.toMatchObject({ status: "DENY", code: "GUARD_PERMIT_CONSUMED" });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ request_id: requestId, state: ok ? "COMPLETED" : "FAILED" }),
+      ]);
+    });
+
+    it.each(["publish", "board"] as const)(
+      "leaves an approved %s wrapper permit for execution-layer atomic start",
+      async (kind) => {
+        const resource = kind === "board" ? BOARD : REPOSITORY;
+        fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+        fixture.currentTask = taskWith(fixture.currentContract);
+        fixture.currentClaim = activeClaim(fixture.currentContract);
+        fixture.activeClaims = [fixture.currentClaim];
+        const command = kind === "publish"
+          ? `jhw-control guard with --task ${TASK_ID} --claim ${CLAIM_ID} --session ${SESSION_ID} --origin-adapter codex -- git push origin HEAD`
+          : `jhw-control board with --board ${resource.id} --mode exclusive --task ${TASK_ID} --claim ${CLAIM_ID} --session ${SESSION_ID} --origin-adapter codex --purpose bounded -- flashrom -w firmware.bin`;
+        const event = preTool(fixture.cwd, "Bash", { command });
+        const { requestId, service } = await requestAndApprove(event);
+
+        await expect(service.evaluatePreTool(preTool(
+          fixture.cwd,
+          "Bash",
+          { command },
+          "call-high-risk-retry",
+        ))).resolves.toMatchObject({
+          decision: "ALLOW",
+          execution_boundary: kind === "publish" ? "guarded_command" : "board",
+        });
+        expect(await storedRequests()).toEqual([
+          expect.objectContaining({ request_id: requestId, state: "APPROVED" }),
+        ]);
+      },
+    );
+
+    it("fails closed on corrupt request state without creating, reusing, or consuming a request", async () => {
+      missingRepositoryModify();
+      const service = integratedService();
+      const stateDir = join(fixture.root, "guard-state");
+      await mkdir(stateDir, { mode: 0o700 });
+      const statePath = join(stateDir, "guard-requests.yaml");
+      await writeFile(statePath, "{ corrupt", { mode: 0o600 });
+      const before = await readFile(statePath);
+
+      await expect(service.evaluatePreTool(preTool(fixture.cwd)))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+      expect(await readFile(statePath)).toEqual(before);
+      expect(fixture.guardJournal.events).toEqual([]);
+    });
+
+    it("never approves or completes through corrupt state and leaves its bytes untouched", async () => {
+      missingRepositoryModify();
+      const service = integratedService();
+      const stateDir = join(fixture.root, "guard-state");
+      await mkdir(stateDir, { mode: 0o700 });
+      const statePath = join(stateDir, "guard-requests.yaml");
+      await writeFile(statePath, "{ corrupt", { mode: 0o600 });
+      const before = await readFile(statePath);
+
+      await expect(service.submitUserPrompt(promptEvent(`/jhw:unlock ${REQUEST_ID}`)))
+        .resolves.toMatchObject({ status: "DENY", code: "GUARD_UNAVAILABLE" });
+      await expect(service.completePostTool(postToolEvent("call-corrupt", true)))
+        .resolves.toMatchObject({ status: "DENY", code: "GUARD_UNAVAILABLE" });
+      expect(await readFile(statePath)).toEqual(before);
+    });
+
+    it("keeps every hard policy denial ahead of real request-store mutation", async () => {
+      const scenarios: Array<{
+        name: string;
+        arrange(): void;
+        event(): unknown;
+        code: string;
+      }> = [
+        {
+          name: "protocol",
+          arrange: () => missingRepositoryModify(),
+          event: () => ({ ...preTool(fixture.cwd) as object, protocol_version: 2 }),
+          code: "GUARD_PROTOCOL_MISMATCH",
+        },
+        {
+          name: "Claim",
+          arrange: () => { fixture.currentClaim = undefined; fixture.activeClaims = []; },
+          event: () => preTool(fixture.cwd),
+          code: "GUARD_CLAIM_REQUIRED",
+        },
+        {
+          name: "worktree",
+          arrange: () => { missingRepositoryModify(); fixture.inspection = { ...fixture.inspection, branch: "other/branch" }; },
+          event: () => preTool(fixture.cwd),
+          code: "GUARD_WORKTREE_MISMATCH",
+        },
+        {
+          name: "exclusive",
+          arrange: () => {
+            missingRepositoryModify();
+            fixture.activeClaims = [
+              fixture.currentClaim as ContractActiveClaim,
+              activeClaim(contract(OTHER_TASK_ID, [grant("repo.inspect", REPOSITORY, "exclusive")])),
+            ];
+          },
+          event: () => preTool(fixture.cwd),
+          code: "GUARD_RESOURCE_OWNED",
+        },
+        {
+          name: "authority",
+          arrange: () => { missingRepositoryModify(); fixture.authorityFailure = new Error("moved"); },
+          event: () => preTool(fixture.cwd),
+          code: "GUARD_RESOURCE_AUTHORITY_UNAVAILABLE",
+        },
+        {
+          name: "wrapper",
+          arrange: () => missingRepositoryModify(),
+          event: () => preTool(fixture.cwd, "Bash", { command: "git push origin HEAD" }),
+          code: "GUARD_WRAPPER_REQUIRED",
+        },
+        {
+          name: "self approval",
+          arrange: () => missingRepositoryModify(),
+          event: () => preTool(fixture.cwd, "Bash", { command: `jhw-control guard approve ${REQUEST_ID}` }),
+          code: "GUARD_SELF_APPROVAL_DENIED",
+        },
+      ];
+
+      for (const scenario of scenarios) {
+        await rm(join(fixture.root, "guard-state"), { recursive: true, force: true });
+        fixture.inspection = {
+          ...fixture.inspection,
+          branch: "task/guard-task",
+          worktree_ref: "wt-guard-task",
+        };
+        fixture.authorityFailure = undefined;
+        scenario.arrange();
+
+        await expect(integratedService().evaluatePreTool(scenario.event()), scenario.name)
+          .resolves.toMatchObject({ decision: "DENY", code: scenario.code });
+        await expect(fixture.requestStore.inspect(), scenario.name)
+          .resolves.toEqual({ status: "not_initialized", requests: [] });
+      }
+    });
+
+    it("maps Guard-state lock contention to a registered bounded reason without mutation", async () => {
+      missingRepositoryModify();
+      const contendedStore = new GuardRequestStore(lockConfig(join(fixture.root, "contended-state")), {
+        journal: new MemoryGuardJournal(),
+        lockRuntime: { spawn: () => completedLockAcquisition(75) },
+        environment: {},
+      });
+
+      await expect(integratedService({ guard_request_store: contendedStore })
+        .evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+        decision: "DENY",
+        code: "GUARD_UNAVAILABLE",
+        reason: "guard_state_lock",
+      });
+    });
+
+    it("does not trust an instance override of the concrete request store", async () => {
+      missingRepositoryModify();
+      const forged = vi.fn(async () => ({
+        request: { state: "APPROVED" },
+        reused: true,
+      }));
+      Object.defineProperty(fixture.requestStore, "createOrReusePending", { value: forged });
+
+      await expect(fixture.service({ guard_request_store: fixture.requestStore })
+        .evaluatePreTool(preTool(fixture.cwd)))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+      expect(forged).not.toHaveBeenCalled();
+      expect(fixture.permitCalls).toBe(0);
+    });
+
+    it("keeps an approved permit bound across file, command, resource, cwd, script, Task, and Claim changes", async () => {
+      const cases: Array<{
+        name: string;
+        prepare(): Promise<{ original: unknown; changed: unknown; mutate?: () => void }>;
+      }> = [
+        {
+          name: "file",
+          prepare: async () => {
+            await writeFile(join(fixture.cwd, "other.ts"), "a\n", "utf8");
+            return {
+              original: preTool(fixture.cwd, "Edit", { file_path: "src/file.ts", old_string: "a", new_string: "b" }),
+              changed: preTool(fixture.cwd, "Edit", { file_path: "src/other.ts", old_string: "a", new_string: "b" }),
+            };
+          },
+        },
+        {
+          name: "command",
+          prepare: async () => ({
+            original: preTool(fixture.cwd, "Bash", { command: "custom-tool alpha" }),
+            changed: preTool(fixture.cwd, "Bash", { command: "custom-tool beta" }),
+          }),
+        },
+        {
+          name: "resource",
+          prepare: async () => ({
+            original: preTool(fixture.cwd, "Bash", {
+              command: `jhw-control board with --board board-alpha --mode exclusive --task ${TASK_ID} --claim ${CLAIM_ID} --session ${SESSION_ID} --origin-adapter codex --purpose bounded -- flashrom -w firmware.bin`,
+            }),
+            changed: preTool(fixture.cwd, "Bash", {
+              command: `jhw-control board with --board board-beta --mode exclusive --task ${TASK_ID} --claim ${CLAIM_ID} --session ${SESSION_ID} --origin-adapter codex --purpose bounded -- flashrom -w firmware.bin`,
+            }),
+          }),
+        },
+        {
+          name: "cwd",
+          prepare: async () => ({
+            original: preTool(fixture.root, "Bash", { command: "custom-tool stable" }),
+            changed: preTool(fixture.cwd, "Bash", { command: "custom-tool stable" }),
+          }),
+        },
+        {
+          name: "script",
+          prepare: async () => {
+            const path = join(fixture.root, "bounded-script.sh");
+            await writeFile(path, "#!/bin/sh\nprintf first\n", { mode: 0o700 });
+            await chmod(path, 0o700);
+            return {
+              original: preTool(fixture.root, "Bash", { command: "./bounded-script.sh" }),
+              changed: preTool(fixture.root, "Bash", { command: "./bounded-script.sh" }),
+              mutate: () => { void writeFile(path, "#!/bin/sh\nprintf second\n", { mode: 0o700 }); },
+            };
+          },
+        },
+        {
+          name: "Task",
+          prepare: async () => ({
+            original: preTool(fixture.cwd),
+            changed: preTool(fixture.cwd),
+            mutate: () => {
+              const nextContract = contract(OTHER_TASK_ID, [grant("repo.inspect")]);
+              fixture.currentTask = {
+                ...taskWith(nextContract),
+                id: OTHER_TASK_ID,
+                aliases: ["other-task"],
+              } as TaskRecord;
+              fixture.currentClaim = {
+                ...activeClaim(nextContract),
+                session_id: SESSION_ID,
+                branch: fixture.inspection.branch,
+                worktree_ref: fixture.inspection.worktree_ref,
+              };
+              fixture.activeClaims = [fixture.currentClaim];
+            },
+          }),
+        },
+        {
+          name: "Claim",
+          prepare: async () => ({
+            original: preTool(fixture.cwd),
+            changed: preTool(fixture.cwd),
+            mutate: () => {
+              fixture.currentClaim = {
+                ...fixture.currentClaim as ContractActiveClaim,
+                claim_id: OTHER_CLAIM_ID,
+              };
+              fixture.activeClaims = [fixture.currentClaim];
+            },
+          }),
+        },
+      ];
+
+      for (const entry of cases) {
+        await rm(join(fixture.root, "guard-state"), { recursive: true, force: true });
+        missingRepositoryModify();
+        const prepared = await entry.prepare();
+        const service = integratedService();
+        const first = await service.evaluatePreTool(prepared.original);
+        if (first.decision !== "PERMIT_REQUIRED") throw new Error(`expected ${entry.name} request`);
+        await service.submitUserPrompt(promptEvent(first.approval_command));
+        if (entry.name === "script") {
+          await writeFile(join(fixture.root, "bounded-script.sh"), "#!/bin/sh\nprintf second\n", { mode: 0o700 });
+        } else {
+          prepared.mutate?.();
+        }
+
+        const changed = await service.evaluatePreTool(prepared.changed);
+        expect(changed, entry.name).toMatchObject({ decision: "PERMIT_REQUIRED" });
+        if (changed.decision !== "PERMIT_REQUIRED") throw new Error(`expected fresh ${entry.name} request`);
+        expect(changed.request_id, entry.name).not.toBe(first.request_id);
+        expect(await storedRequests(), entry.name).toEqual(expect.arrayContaining([
+          expect.objectContaining({ request_id: first.request_id, state: "APPROVED" }),
+          expect.objectContaining({ request_id: changed.request_id, state: "PENDING" }),
+        ]));
+      }
+    });
+  });
+
+  it("fails exact approval closed but keeps PostTool inert when no request store is integrated", async () => {
     const service = fixture.service();
 
     await expect(service.submitUserPrompt({
@@ -1285,9 +1837,10 @@ describe("GuardService", () => {
       session_id: SESSION_ID,
       prompt: `/jhw:unlock ${REQUEST_ID}`,
     })).resolves.toEqual({
-      status: "NO_STATE_CHANGE",
+      status: "DENY",
       event: "user_prompt_submit",
-      summary: "Prompt permit state is not integrated",
+      code: "GUARD_UNAVAILABLE",
+      summary: "Guard state or authority is unavailable",
     });
     await expect(service.completePostTool({
       protocol_version: 1,

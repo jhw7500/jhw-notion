@@ -335,6 +335,7 @@ export type GuardEvaluationMode = z.infer<typeof GuardEvaluationModeSchema>;
 
 export const GuardSummarySchema = boundedCoordinate(512);
 export const GuardExecutionBoundarySchema = z.enum(["hook", "guarded_command", "tracker", "notion", "board"]);
+export const GuardJournalWarningSchema = z.literal("GUARD_JOURNAL_UNAVAILABLE");
 
 export const GuardRequestLifecycleSchema = z.enum([
   "PENDING",
@@ -458,6 +459,7 @@ const GuardAllowDecisionSchema = z.object({
   execution_boundary: GuardExecutionBoundarySchema,
   consumed_request_id: RequestIdSchema.optional(),
   observed_decision: z.enum(["PERMIT_REQUIRED", "DENY"]).optional(),
+  journal_warning: GuardJournalWarningSchema.optional(),
 }).strict();
 
 const GuardPermitRequiredDecisionSchema = z.object({
@@ -467,6 +469,7 @@ const GuardPermitRequiredDecisionSchema = z.object({
   summary: GuardSummarySchema,
   approval_command: z.string().min(1).max(96),
   approval_expires_at: OffsetDateTimeSchema,
+  journal_warning: GuardJournalWarningSchema.optional(),
 }).strict();
 
 const GuardDenyDecisionSchema = z.object({
@@ -476,6 +479,7 @@ const GuardDenyDecisionSchema = z.object({
   task_id: TaskIdSchema.optional(),
   claim_id: canonicalId("clm").optional(),
   summary: GuardSummarySchema,
+  journal_warning: GuardJournalWarningSchema.optional(),
 }).strict();
 
 export const GuardDecisionSchema = z.discriminatedUnion("decision", [

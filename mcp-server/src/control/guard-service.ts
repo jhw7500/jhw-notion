@@ -7,16 +7,20 @@ import { z } from "zod";
 
 import {
   ClaimIdSchema,
+  exactGuardUnlockRequestId,
   GuardAdapterSchema,
+  GuardPromptContextSchema,
   GuardSessionSchema,
   GuardWorktreeRefSchema,
   OperationRequirementSchema,
   RequestIdSchema,
   type CanonicalOperation,
   type GuardAdapter,
+  type GuardPromptContext,
   type OperationRequirement,
   type PreToolUseEvent,
 } from "./guard-protocol.js";
+import { ControlError } from "./errors.js";
 import {
   GuardCommonEventSchema,
   PostToolUseEventSchema,
@@ -30,16 +34,29 @@ import {
 } from "./operation-normalizer.js";
 import { isDirectMutationLock, MutationLock } from "./process.js";
 import {
+  GuardRequestStore,
+  type GuardCompleteResult,
+  type GuardConsumeResult,
+  type GuardPendingResult,
+  type GuardPromptApprovalResult,
+  type GuardRequest,
+  type GuardRequestInspection,
+} from "./guard-state.js";
+import {
   ContractActiveClaimSchema,
   GuardDecisionSchema,
   GuardDenyCodeSchema,
+  ErrorReasonSchema,
   GuardEvaluationModeSchema,
+  GuardJournalWarningSchema,
   OffsetDateTimeSchema,
   GuardSummarySchema,
   type ActiveClaim,
+  type ContractActiveClaim,
   type GuardDecision,
   type GuardDenyCode,
   type GuardEvaluationMode,
+  type ErrorReason,
   type TaskRecord,
 } from "./schemas.js";
 import {
@@ -50,7 +67,7 @@ import {
   type ShellClassification,
 } from "./shell-classifier.js";
 import type { GuardTaskInspection } from "./task-service.js";
-import type { WorkGrant } from "./work-contract.js";
+import { TaskIdSchema, type WorkGrant } from "./work-contract.js";
 
 export { GuardDecisionSchema } from "./schemas.js";
 export type { GuardDecision } from "./schemas.js";
@@ -61,14 +78,77 @@ export const GuardSideEventResultSchema = z.discriminatedUnion("status", [
     status: z.literal("NO_STATE_CHANGE"),
     event: SideEventKindSchema,
     summary: GuardSummarySchema,
+    context: GuardPromptContextSchema.optional(),
+  }).strict(),
+  z.object({
+    status: z.literal("APPROVED"),
+    event: z.literal("user_prompt_submit"),
+    request_id: RequestIdSchema,
+    context: GuardPromptContextSchema,
+    start_by: OffsetDateTimeSchema,
+    execution_consumes_permit: z.literal(true),
+    summary: GuardSummarySchema,
+    journal_warning: GuardJournalWarningSchema.optional(),
+  }).strict(),
+  z.object({
+    status: z.enum(["COMPLETED", "FAILED"]),
+    event: z.literal("post_tool_use"),
+    request_id: RequestIdSchema,
+    task_id: TaskIdSchema,
+    claim_id: ClaimIdSchema,
+    summary: GuardSummarySchema,
+    journal_warning: GuardJournalWarningSchema.optional(),
   }).strict(),
   z.object({
     status: z.literal("DENY"),
-    code: z.literal("GUARD_PROTOCOL_MISMATCH"),
+    code: GuardDenyCodeSchema,
+    event: SideEventKindSchema.optional(),
     summary: GuardSummarySchema,
+    context: GuardPromptContextSchema.optional(),
+    journal_warning: GuardJournalWarningSchema.optional(),
+    reason: ErrorReasonSchema.optional(),
   }).strict(),
 ]);
 export type GuardSideEventResult = z.infer<typeof GuardSideEventResultSchema>;
+
+interface GuardRequestStoreAuthority {
+  inspect(): Promise<GuardRequestInspection>;
+  createOrReusePending(operation: CanonicalOperation): Promise<GuardPendingResult>;
+  approveFromPrompt(
+    originAdapter: GuardAdapter,
+    session: string,
+    rawPrompt: string,
+  ): Promise<GuardPromptApprovalResult>;
+  consumeMatching(operation: CanonicalOperation, correlation: string): Promise<GuardConsumeResult>;
+  complete(correlation: string, ok: boolean): Promise<GuardCompleteResult>;
+}
+
+const guardStoreInspect = GuardRequestStore.prototype.inspect;
+const guardStoreCreateOrReuse = GuardRequestStore.prototype.createOrReusePending;
+const guardStoreApprove = GuardRequestStore.prototype.approveFromPrompt;
+const guardStoreConsume = GuardRequestStore.prototype.consumeMatching;
+const guardStoreComplete = GuardRequestStore.prototype.complete;
+
+function captureGuardRequestStore(store: GuardRequestStore | undefined): GuardRequestStoreAuthority | undefined {
+  if (!store) return undefined;
+  if (
+    Object.getPrototypeOf(store) !== GuardRequestStore.prototype ||
+    store.inspect !== guardStoreInspect ||
+    store.createOrReusePending !== guardStoreCreateOrReuse ||
+    store.approveFromPrompt !== guardStoreApprove ||
+    store.consumeMatching !== guardStoreConsume ||
+    store.complete !== guardStoreComplete
+  ) {
+    return undefined;
+  }
+  return {
+    inspect: () => guardStoreInspect.call(store),
+    createOrReusePending: (operation) => guardStoreCreateOrReuse.call(store, operation),
+    approveFromPrompt: (adapter, session, prompt) => guardStoreApprove.call(store, adapter, session, prompt),
+    consumeMatching: (operation, correlation) => guardStoreConsume.call(store, operation, correlation),
+    complete: (correlation, ok) => guardStoreComplete.call(store, correlation, ok),
+  };
+}
 
 export interface GuardClaimServicePort {
   resolveSessionClaim(
@@ -87,6 +167,28 @@ export interface GuardRegistryViewPort {
 const guardRegistryMutationBarrierBrand = Symbol("guard-registry-mutation-barrier");
 type GuardRegistryMutationBarrierRunner = <T>(callback: () => Promise<T>) => Promise<T>;
 const guardRegistryMutationBarrierRunners = new WeakMap<object, GuardRegistryMutationBarrierRunner>();
+const guardRegistryMutationBarrierQueues = new WeakMap<MutationLock, Promise<void>>();
+
+async function runQueuedGuardRegistryMutation<T>(
+  mutationLock: MutationLock,
+  concreteRun: MutationLock["run"],
+  callback: () => Promise<T>,
+): Promise<T> {
+  const previous = guardRegistryMutationBarrierQueues.get(mutationLock) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => current);
+  guardRegistryMutationBarrierQueues.set(mutationLock, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await concreteRun.call(mutationLock, callback) as T;
+  } finally {
+    release();
+    if (guardRegistryMutationBarrierQueues.get(mutationLock) === tail) {
+      guardRegistryMutationBarrierQueues.delete(mutationLock);
+    }
+  }
+}
 
 /**
  * Opaque authority to run one Guard evaluation under the Registry writer lock.
@@ -119,7 +221,7 @@ export function createGuardRegistryMutationBarrier(
   }) as GuardRegistryMutationBarrierPort;
   guardRegistryMutationBarrierRunners.set(
     barrier,
-    <T>(callback: () => Promise<T>) => concreteRun.call(mutationLock, callback) as Promise<T>,
+    <T>(callback: () => Promise<T>) => runQueuedGuardRegistryMutation(mutationLock, concreteRun, callback),
   );
   return barrier;
 }
@@ -159,8 +261,10 @@ const GuardPermitBindingSchema = z.object({
   requirements: z.array(OperationRequirementSchema).min(1).max(32),
   missing_requirements: z.array(OperationRequirementSchema).min(1).max(32),
   operation_digest: z.string().regex(/^[0-9a-f]{64}$/),
+  request_state: z.enum(["PENDING", "APPROVED"]),
   request_id: RequestIdSchema,
   approval_expires_at: OffsetDateTimeSchema,
+  journal_warning: GuardJournalWarningSchema.optional(),
 }).strict();
 
 const GuardPermitStateDenySchema = z.object({
@@ -187,6 +291,7 @@ export interface GuardServiceOptions {
   registry_view: GuardRegistryViewPort;
   registry_mutation_barrier: GuardRegistryMutationBarrierPort;
   permit_decisions?: GuardPermitDecisionPort;
+  guard_request_store?: GuardRequestStore;
   mode?: GuardEvaluationMode;
   /** Strict read-only inspection seam. It must never create, clean, or lock state. */
   inspect_guard_state?: () => Promise<boolean>;
@@ -482,6 +587,16 @@ function sameRequirements(left: readonly OperationRequirement[], right: readonly
     requirement.resource.id === right[index]?.resource.id);
 }
 
+function sameRequestBinding(request: GuardRequest, operation: CanonicalOperation): boolean {
+  return request.task_id === operation.task_id &&
+    request.claim_id === operation.claim_id &&
+    request.origin_adapter === operation.origin_adapter &&
+    request.session_id === operation.session_id &&
+    request.cwd_worktree_ref === operation.cwd_worktree_ref &&
+    request.operation_digest === operation.digest &&
+    sameRequirements(request.requirements, operation.requirements);
+}
+
 function inspectionMatchesClaim(inspection: GuardTaskInspection, claim: ActiveClaim): boolean {
   const active = inspection.active;
   return active.task_id === claim.task_id &&
@@ -505,6 +620,11 @@ interface EvaluationContext {
   classification?: ShellClassification;
 }
 
+interface CurrentPromptContext {
+  claim: ContractActiveClaim;
+  context: GuardPromptContext;
+}
+
 interface PermitLifecycleBoundary {
   mayCommit(): Promise<boolean>;
   complete(decision: GuardDecision): void;
@@ -512,9 +632,13 @@ interface PermitLifecycleBoundary {
 
 export class GuardService {
   private readonly mode: GuardEvaluationMode | undefined;
+  private readonly requestStoreConfigured: boolean;
+  private readonly requestStore: GuardRequestStoreAuthority | undefined;
 
   constructor(private readonly options: GuardServiceOptions) {
     this.mode = GuardEvaluationModeSchema.safeParse(options.mode ?? "enforce").data;
+    this.requestStoreConfigured = options.guard_request_store !== undefined;
+    this.requestStore = captureGuardRequestStore(options.guard_request_store);
   }
 
   async evaluatePreTool(eventInput: unknown): Promise<GuardDecision> {
@@ -719,11 +843,14 @@ export class GuardService {
         observed_decision: "PERMIT_REQUIRED",
       });
     }
-    if (!this.options.permit_decisions) return this.deny("GUARD_UNAVAILABLE", claim, operation);
+    if ((this.requestStoreConfigured && !this.requestStore) ||
+      (!this.requestStore && !this.options.permit_decisions)) {
+      return this.deny("GUARD_UNAVAILABLE", claim, operation);
+    }
     try {
       if (!await permitLifecycle.mayCommit()) return this.deny("GUARD_UNAVAILABLE", claim, operation);
       const result = GuardPermitResultSchema.safeParse(
-        await this.options.permit_decisions.decideMissingGrant(operation, missing),
+        await this.decideMissingGrant(operation, missing),
       );
       if (!result.success) return this.deny("GUARD_UNAVAILABLE", claim, operation);
       if ("decision" in result.data) {
@@ -741,6 +868,34 @@ export class GuardService {
         !sameRequirements(result.data.requirements, operation.requirements) ||
         !sameRequirements(result.data.missing_requirements, missing)
       ) return this.deny("GUARD_UNAVAILABLE", claim, operation);
+      if (result.data.request_state === "APPROVED") {
+        if (operation.execution_boundary !== "hook") {
+          const decision = GuardDecisionSchema.parse({
+            decision: "ALLOW",
+            operation_id: operation.operation_id,
+            summary: operation.summary,
+            execution_boundary: operation.execution_boundary,
+            ...(result.data.journal_warning ? { journal_warning: result.data.journal_warning } : {}),
+          });
+          permitLifecycle.complete(decision);
+          return decision;
+        }
+        if (!this.requestStore) return this.deny("GUARD_UNAVAILABLE", claim, operation);
+        const consumed = await this.requestStore.consumeMatching(operation, event.tool_use_id);
+        if (!sameRequestBinding(consumed.request, operation)) {
+          return this.deny("GUARD_UNAVAILABLE", claim, operation);
+        }
+        const decision = GuardDecisionSchema.parse({
+          decision: "ALLOW",
+          operation_id: operation.operation_id,
+          summary: operation.summary,
+          execution_boundary: operation.execution_boundary,
+          consumed_request_id: consumed.request.request_id,
+          ...(consumed.journal_warning ? { journal_warning: consumed.journal_warning } : {}),
+        });
+        permitLifecycle.complete(decision);
+        return decision;
+      }
       const decision = GuardDecisionSchema.parse({
         decision: "PERMIT_REQUIRED",
         operation_id: operation.operation_id,
@@ -748,32 +903,310 @@ export class GuardService {
         summary: operation.summary,
         approval_command: `/jhw:unlock ${result.data.request_id}`,
         approval_expires_at: result.data.approval_expires_at,
+        ...(result.data.journal_warning ? { journal_warning: result.data.journal_warning } : {}),
       });
       permitLifecycle.complete(decision);
       return decision;
-    } catch {
-      return this.deny("GUARD_UNAVAILABLE", claim, operation);
+    } catch (cause) {
+      const decision = this.denyForStateFailure(cause, claim, operation);
+      permitLifecycle.complete(decision);
+      return decision;
     }
   }
 
   async submitUserPrompt(eventInput: unknown): Promise<GuardSideEventResult> {
     const result = this.safeVariant(UserPromptSubmitEventSchema, eventInput);
     if (!result.success) return this.sideProtocolDeny();
-    return GuardSideEventResultSchema.parse({
-      status: "NO_STATE_CHANGE",
-      event: "user_prompt_submit",
-      summary: "Prompt permit state is not integrated",
-    });
+    const event = result.data;
+    const requestId = exactGuardUnlockRequestId(event.prompt);
+    if (!requestId || this.mode === "observe") {
+      const current = await this.readCurrentPromptContext(event.adapter, event.session_id);
+      return GuardSideEventResultSchema.parse({
+        status: "NO_STATE_CHANGE",
+        event: "user_prompt_submit",
+        summary: requestId ? "Observe mode does not approve permits" : "Prompt did not change Guard authority",
+        ...(current?.context ? { context: current.context } : {}),
+      });
+    }
+    if (!this.mode || !this.requestStore) {
+      return this.sideDeny("GUARD_UNAVAILABLE", "user_prompt_submit");
+    }
+    const runWithinRegistryBarrier = guardRegistryMutationBarrierRunner(
+      this.options.registry_mutation_barrier,
+    );
+    if (!this.options.registry_view || !runWithinRegistryBarrier) {
+      return this.sideDeny("GUARD_UNAVAILABLE", "user_prompt_submit");
+    }
+
+    let authoritative: GuardSideEventResult | undefined;
+    try {
+      const callbackResult = await runWithinRegistryBarrier(async () =>
+        this.options.registry_view.withCommittedView(async () => {
+          let inspected: GuardRequestInspection;
+          try {
+            inspected = await this.requestStore!.inspect();
+          } catch (cause) {
+            return this.sideDenyForStateFailure(cause, "user_prompt_submit");
+          }
+          const request = inspected.requests.find((candidate) => candidate.request_id === requestId);
+          if (!request) return this.sideDeny("GUARD_REQUEST_NOT_FOUND", "user_prompt_submit");
+          if (request.origin_adapter !== event.adapter || request.session_id !== event.session_id) {
+            return this.sideDeny("GUARD_PERMIT_MISMATCH", "user_prompt_submit");
+          }
+          const current = await this.resolveCurrentPromptContext(event.adapter, event.session_id);
+          if ("code" in current) return this.sideDeny(current.code, "user_prompt_submit");
+          if (request.task_id !== current.claim.task_id || request.claim_id !== current.claim.claim_id) {
+            return this.sideDeny("GUARD_PERMIT_MISMATCH", "user_prompt_submit", current.context);
+          }
+          if (await this.options.registry_view.committedViewIsStale()) {
+            return this.sideDeny("GUARD_UNAVAILABLE", "user_prompt_submit", current.context);
+          }
+          try {
+            const approved = await this.requestStore!.approveFromPrompt(
+              event.adapter,
+              event.session_id,
+              event.prompt,
+            );
+            if (approved.status !== "APPROVED" || approved.request.request_id !== requestId ||
+              approved.request.task_id !== current.claim.task_id ||
+              approved.request.claim_id !== current.claim.claim_id) {
+              return this.sideDeny("GUARD_UNAVAILABLE", "user_prompt_submit", current.context);
+            }
+            const sideResult = GuardSideEventResultSchema.parse({
+              status: "APPROVED",
+              event: "user_prompt_submit",
+              request_id: approved.request.request_id,
+              context: current.context,
+              start_by: approved.request.start_by,
+              execution_consumes_permit: true,
+              summary: "One-time permit approved; execution consumes it at start",
+              ...(approved.journal_warning ? { journal_warning: approved.journal_warning } : {}),
+            });
+            authoritative = sideResult;
+            return sideResult;
+          } catch (cause) {
+            const sideResult = this.sideDenyForStateFailure(
+              cause,
+              "user_prompt_submit",
+              current.context,
+            );
+            authoritative = sideResult;
+            return sideResult;
+          }
+        }));
+      return authoritative ?? callbackResult;
+    } catch {
+      return authoritative ?? this.sideDeny("GUARD_UNAVAILABLE", "user_prompt_submit");
+    }
   }
 
   async completePostTool(eventInput: unknown): Promise<GuardSideEventResult> {
     const result = this.safeVariant(PostToolUseEventSchema, eventInput);
     if (!result.success) return this.sideProtocolDeny();
-    return GuardSideEventResultSchema.parse({
-      status: "NO_STATE_CHANGE",
-      event: "post_tool_use",
-      summary: "Tool completion state is not integrated",
-    });
+    if (!this.mode) return this.sideDeny("GUARD_UNAVAILABLE", "post_tool_use");
+    if (this.mode === "observe") {
+      return GuardSideEventResultSchema.parse({
+        status: "NO_STATE_CHANGE",
+        event: "post_tool_use",
+        summary: "Observe mode does not complete permits",
+      });
+    }
+    if (!this.requestStore) {
+      return this.requestStoreConfigured
+        ? this.sideDeny("GUARD_UNAVAILABLE", "post_tool_use")
+        : GuardSideEventResultSchema.parse({
+          status: "NO_STATE_CHANGE",
+          event: "post_tool_use",
+          summary: "Tool completion state is not integrated",
+        });
+    }
+    const event = result.data;
+    const runWithinRegistryBarrier = guardRegistryMutationBarrierRunner(
+      this.options.registry_mutation_barrier,
+    );
+    if (!runWithinRegistryBarrier) {
+      return this.sideDeny("GUARD_UNAVAILABLE", "post_tool_use");
+    }
+    let authoritative: GuardSideEventResult | undefined;
+    try {
+      const callbackResult = await runWithinRegistryBarrier(async () => {
+        const completed = await this.completePostToolPinned(event);
+        if (completed.status === "COMPLETED" || completed.status === "FAILED") {
+          authoritative = completed;
+        }
+        return completed;
+      });
+      return authoritative ?? callbackResult;
+    } catch {
+      return authoritative ?? this.sideDeny("GUARD_UNAVAILABLE", "post_tool_use");
+    }
+  }
+
+  private async completePostToolPinned(
+    event: z.infer<typeof PostToolUseEventSchema>,
+  ): Promise<GuardSideEventResult> {
+    let inspected: GuardRequestInspection;
+    try {
+      inspected = await this.requestStore!.inspect();
+    } catch (cause) {
+      return this.sideDenyForStateFailure(cause, "post_tool_use");
+    }
+    const request = inspected.requests.find((candidate) => candidate.correlation_id === event.tool_use_id);
+    if (!request) return this.sideDeny("GUARD_REQUEST_NOT_FOUND", "post_tool_use");
+    if (request.origin_adapter !== event.adapter || request.session_id !== event.session_id) {
+      return this.sideDeny("GUARD_PERMIT_MISMATCH", "post_tool_use");
+    }
+    if (request.state !== "CONSUMED") {
+      return this.sideDeny("GUARD_PERMIT_CONSUMED", "post_tool_use");
+    }
+    try {
+      const completed = await this.requestStore!.complete(event.tool_use_id, event.ok);
+      if (
+        completed.request.request_id !== request.request_id ||
+        completed.request.task_id !== request.task_id ||
+        completed.request.claim_id !== request.claim_id ||
+        completed.request.origin_adapter !== event.adapter ||
+        completed.request.session_id !== event.session_id
+      ) return this.sideDeny("GUARD_UNAVAILABLE", "post_tool_use");
+      return GuardSideEventResultSchema.parse({
+        status: completed.status,
+        event: "post_tool_use",
+        request_id: completed.request.request_id,
+        task_id: completed.request.task_id,
+        claim_id: completed.request.claim_id,
+        summary: completed.status === "COMPLETED" ? "Guarded tool completed" : "Guarded tool failed",
+        ...(completed.journal_warning ? { journal_warning: completed.journal_warning } : {}),
+      });
+    } catch (cause) {
+      return this.sideDenyForStateFailure(cause, "post_tool_use");
+    }
+  }
+
+  private async decideMissingGrant(
+    operation: CanonicalOperation,
+    missing: readonly OperationRequirement[],
+  ): Promise<unknown> {
+    if (this.requestStoreConfigured && !this.requestStore) {
+      throw new ControlError("GUARD_UNAVAILABLE", "Guard request state authority is unavailable");
+    }
+    if (!this.requestStore) {
+      return this.options.permit_decisions?.decideMissingGrant(operation, missing);
+    }
+    const result = await this.requestStore.createOrReusePending(operation);
+    const request = result.request;
+    if ((request.state !== "PENDING" && request.state !== "APPROVED") ||
+      !sameRequestBinding(request, operation)) {
+      throw new ControlError("GUARD_UNAVAILABLE", "Guard request binding is unavailable");
+    }
+    return {
+      task_id: request.task_id,
+      claim_id: request.claim_id,
+      origin_adapter: request.origin_adapter,
+      session_id: request.session_id,
+      cwd_worktree_ref: request.cwd_worktree_ref,
+      requirements: request.requirements,
+      missing_requirements: missing,
+      operation_digest: request.operation_digest,
+      request_state: request.state,
+      request_id: request.request_id,
+      approval_expires_at: request.approval_expires_at,
+      ...(result.journal_warning ? { journal_warning: result.journal_warning } : {}),
+    };
+  }
+
+  private async readCurrentPromptContext(
+    adapter: GuardAdapter,
+    sessionId: string,
+  ): Promise<CurrentPromptContext | undefined> {
+    if (!this.options.registry_view) return undefined;
+    try {
+      return await this.options.registry_view.withCommittedView(async () => {
+        const current = await this.resolveCurrentPromptContext(adapter, sessionId);
+        if ("code" in current || await this.options.registry_view.committedViewIsStale()) return undefined;
+        return current;
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async resolveCurrentPromptContext(
+    adapter: GuardAdapter,
+    sessionId: string,
+  ): Promise<CurrentPromptContext | { code: GuardDenyCode }> {
+    let activeClaims: ActiveClaim[];
+    try {
+      activeClaims = await this.options.claims.listActiveClaims();
+    } catch {
+      return { code: "GUARD_UNAVAILABLE" };
+    }
+    const exact = activeClaims.filter((candidate) =>
+      "origin_adapter" in candidate && candidate.origin_adapter === adapter &&
+      candidate.session_id === sessionId && candidate.host === this.options.host);
+    if (exact.length !== 1) {
+      if (exact.length > 1) return { code: "GUARD_UNAVAILABLE" };
+      return {
+        code: activeClaims.some((candidate) => candidate.session_id === sessionId)
+          ? "GUARD_CLAIM_MISMATCH"
+          : "GUARD_CLAIM_REQUIRED",
+      };
+    }
+    const bound = ContractActiveClaimSchema.safeParse(exact[0]);
+    if (!bound.success) return { code: "GUARD_RESOURCE_AUTHORITY_UNAVAILABLE" };
+    return {
+      claim: bound.data,
+      context: GuardPromptContextSchema.parse({
+        task_id: bound.data.task_id,
+        claim_id: bound.data.claim_id,
+        task_alias: bound.data.task_alias,
+        work_contract_digest: bound.data.work_contract_digest,
+      }),
+    };
+  }
+
+  private stateFailure(cause: unknown): {
+    code: GuardDenyCode;
+    journalWarning?: "GUARD_JOURNAL_UNAVAILABLE";
+    reason?: ErrorReason;
+  } {
+    if (cause instanceof ControlError) {
+      const code = GuardDenyCodeSchema.safeParse(cause.code);
+      const reason = ErrorReasonSchema.safeParse(cause.details.reason);
+      const journalWarning = cause.details.journal_warning === "GUARD_JOURNAL_UNAVAILABLE"
+        ? "GUARD_JOURNAL_UNAVAILABLE" as const
+        : undefined;
+      return {
+        code: code.success ? code.data : "GUARD_UNAVAILABLE",
+        ...(journalWarning ? { journalWarning } : {}),
+        ...(reason.success ? { reason: reason.data } : {}),
+      };
+    }
+    return { code: "GUARD_UNAVAILABLE" };
+  }
+
+  private denyForStateFailure(
+    cause: unknown,
+    claim?: ActiveClaim,
+    operation?: CanonicalOperation,
+  ): GuardDecision {
+    const failure = this.stateFailure(cause);
+    return this.deny(
+      failure.code,
+      claim,
+      operation,
+      "hook",
+      failure.journalWarning,
+      failure.reason,
+    );
+  }
+
+  private sideDenyForStateFailure(
+    cause: unknown,
+    event: "user_prompt_submit" | "post_tool_use",
+    context?: GuardPromptContext,
+  ): GuardSideEventResult {
+    const failure = this.stateFailure(cause);
+    return this.sideDeny(failure.code, event, context, failure.journalWarning, failure.reason);
   }
 
   private safeCommonEvent(value: unknown): ReturnType<typeof GuardCommonEventSchema.safeParse> {
@@ -867,6 +1300,8 @@ export class GuardService {
     claim?: ActiveClaim,
     operation?: Awaited<ReturnType<typeof normalizeOperation>>,
     boundary: ExecutionBoundary = "hook",
+    journalWarning?: "GUARD_JOURNAL_UNAVAILABLE",
+    reason?: ErrorReason,
   ): GuardDecision {
     const code = GuardDenyCodeSchema.parse(codeInput);
     if (this.mode === "observe" && !hardObserveCodes.has(code)) {
@@ -876,6 +1311,7 @@ export class GuardService {
         summary: operation?.summary ?? summaryByCode[code],
         execution_boundary: operation?.execution_boundary ?? boundary,
         observed_decision: "DENY",
+        ...(journalWarning ? { journal_warning: journalWarning } : {}),
       });
     }
     return GuardDecisionSchema.parse({
@@ -883,14 +1319,54 @@ export class GuardService {
       code,
       ...(claim ? { task_id: claim.task_id, claim_id: claim.claim_id } : {}),
       summary: summaryByCode[code],
+      ...(journalWarning ? { journal_warning: journalWarning } : {}),
+      ...(reason ? { reason } : {}),
+    });
+  }
+
+  private sideDeny(
+    codeInput: GuardDenyCode,
+    event?: "user_prompt_submit" | "post_tool_use",
+    context?: GuardPromptContext,
+    journalWarning?: "GUARD_JOURNAL_UNAVAILABLE",
+    reason?: ErrorReason,
+  ): GuardSideEventResult {
+    const code = GuardDenyCodeSchema.parse(codeInput);
+    return GuardSideEventResultSchema.parse({
+      status: "DENY",
+      code,
+      ...(event ? { event } : {}),
+      summary: summaryByCode[code],
+      ...(context ? { context } : {}),
+      ...(journalWarning ? { journal_warning: journalWarning } : {}),
+      ...(reason ? { reason } : {}),
     });
   }
 
   private sideProtocolDeny(): GuardSideEventResult {
-    return GuardSideEventResultSchema.parse({
-      status: "DENY",
-      code: "GUARD_PROTOCOL_MISMATCH",
-      summary: summaryByCode.GUARD_PROTOCOL_MISMATCH,
-    });
+    return this.sideDeny("GUARD_PROTOCOL_MISMATCH");
   }
+}
+
+export interface GuardServiceComposition {
+  readonly service: GuardService;
+  readonly registry_mutation_lock: MutationLock;
+}
+
+/**
+ * Production composition seam: the object returned for Registry writers is
+ * the exact concrete MutationLock whose captured run method backs Guard.
+ */
+export function createGuardServiceComposition(
+  registryMutationLock: MutationLock,
+  options: Omit<GuardServiceOptions, "registry_mutation_barrier">,
+): GuardServiceComposition {
+  const registryMutationBarrier = createGuardRegistryMutationBarrier(registryMutationLock);
+  return Object.freeze({
+    service: new GuardService({
+      ...options,
+      registry_mutation_barrier: registryMutationBarrier,
+    }),
+    registry_mutation_lock: registryMutationLock,
+  });
 }
