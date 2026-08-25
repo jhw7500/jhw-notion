@@ -23,6 +23,7 @@ function configFor(stateDir: string): ControlConfig {
     preflightProjectItemId: "PVTI_test",
     preflightRegistryIssueNumber: 1,
     stateDir,
+    guardMode: "enforce",
   };
 }
 

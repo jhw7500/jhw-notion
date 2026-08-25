@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -9,9 +9,12 @@ import { describe, expect, it, vi } from "vitest";
 import { createCliDependencies, controlErrorResult, requiresMutationLock, runCli, type CliDependencies } from "../cli.js";
 import type { ContractAuthorityPort } from "../contract-authority.js";
 import { ControlError } from "../errors.js";
+import { GuardDigestKey, GuardRequestStore, type GuardRequestInspection } from "../guard-state.js";
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { MutationLock, type MutationLockRuntime } from "../process.js";
-import type { ControlConfig } from "../config.js";
+import { loadControlConfig, type ControlConfig } from "../config.js";
+import type { ContractActiveClaim, GuardRequest, GuardRequestLifecycle } from "../schemas.js";
+import { workContractDigest } from "../work-contract.js";
 
 const TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000001";
 const CLAIM_ID = "clm-0198e748-3a00-7000-8000-000000000002";
@@ -32,6 +35,7 @@ function lockConfig(stateDir: string): ControlConfig {
     preflightProjectItemId: "PVTI_trial",
     preflightRegistryIssueNumber: 1,
     stateDir,
+    guardMode: "enforce",
   };
 }
 
@@ -135,6 +139,11 @@ type Overrides = {
   // satisfy MutationLockPort structurally. Accept either and bridge once below.
   mutationLock?: CliDependencies['mutationLock'] | { run: ReturnType<typeof vi.fn> };
   journal?: { append: ReturnType<typeof vi.fn> };
+  boardJournal?: { append: ReturnType<typeof vi.fn> };
+  guardMode?: "enforce" | "observe";
+  guardRequests?: Pick<GuardRequestStore, "inspect">;
+  guardDigestKey?: Pick<GuardDigestKey, "inspect">;
+  guardClaims?: Record<string, unknown>;
   registrationRecordWarning?: CliDependencies["registrationRecordWarning"];
 };
 
@@ -235,6 +244,11 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
   const mutationLock = (overrides.mutationLock ?? {
     run: vi.fn(async <T>(callback: () => Promise<T>) => callback()),
   }) as CliDependencies['mutationLock'];
+  const guardClaims = {
+    withCommittedView: async <T>(read: () => Promise<T>) => read(),
+    listActiveClaims: vi.fn().mockResolvedValue([]),
+    ...overrides.guardClaims,
+  };
 
   return {
     stateDir: overrides.stateDir ?? join(tmpdir(), "jhw-control-cli-state"),
@@ -247,9 +261,97 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     portfolio,
     preflight,
     mutationLock,
+    guardMode: overrides.guardMode ?? "enforce",
+    guardRequests: overrides.guardRequests ?? { inspect: vi.fn().mockResolvedValue({ status: "ready", requests: [] }) },
+    guardDigestKey: overrides.guardDigestKey ?? { inspect: vi.fn().mockResolvedValue({ status: "ready" }) },
+    guardClaims,
     ...(overrides.journal ? { journal: overrides.journal } : {}),
+    boardJournal: overrides.boardJournal ?? { append: vi.fn().mockResolvedValue(undefined) },
     ...(overrides.registrationRecordWarning ? { registrationRecordWarning: overrides.registrationRecordWarning } : {}),
   } as unknown as CliDependencies;
+}
+
+function controlEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    HOME: "/fixture/home",
+    JHW_REGISTRY_DIR: "/fixture/registry",
+    JHW_WORKTREE_ROOT: "/fixture/worktrees",
+    JHW_BUILD_HOST: "fixture-host",
+    JHW_GITHUB_OWNER: "fixture-owner",
+    JHW_PROJECT_NUMBER: "7",
+    JHW_REGISTRY_REPOSITORY: "fixture-owner/registry",
+    JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+    JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+    ...overrides,
+  };
+}
+
+const requestContract = {
+  version: 1 as const,
+  task_id: TASK_ID,
+  grants: [{
+    capability: "repo.modify" as const,
+    resource: { kind: "repository" as const, id: REPO_ID },
+    coordination: "shared" as const,
+  }],
+  dependencies: [],
+};
+
+function contractClaim(
+  sessionId: string,
+  sequence = 1,
+): ContractActiveClaim {
+  const taskId = `tsk-0198e748-3a00-7000-8000-${String(sequence).padStart(12, "0")}`;
+  const claimId = `clm-0198e748-3a00-7000-8000-${String(sequence).padStart(12, "0")}`;
+  const workContract = { ...requestContract, task_id: taskId };
+  return {
+    task_id: taskId,
+    task_alias: `guard-task-${sequence}`,
+    project_id: PROJECT_ID,
+    repo_id: REPO_ID,
+    claim_id: claimId,
+    origin_adapter: sequence % 2 === 0 ? "gemini" : "codex",
+    session_id: sessionId,
+    host: `guard-host-${sequence}`,
+    branch: `task/${sequence}-guard-task`,
+    worktree_ref: `wt-${sequence}-guard-task`,
+    source_task_revision: "2026-08-13T00:00:00Z",
+    started_at: "2026-08-13T00:00:00.000Z",
+    work_contract: workContract,
+    work_contract_digest: workContractDigest(workContract),
+  };
+}
+
+function guardRequest(state: GuardRequestLifecycle, sequence: number): GuardRequest {
+  const requestedAt = "2026-08-13T00:00:00.000Z";
+  const approvalExpiresAt = "2026-08-13T00:10:00.000Z";
+  const approvedAt = "2026-08-13T00:01:00.000Z";
+  const startBy = "2026-08-13T00:11:00.000Z";
+  const consumedAt = "2026-08-13T00:02:00.000Z";
+  const base = {
+    request_id: `req-0198e748-3a00-7000-8000-${String(sequence).padStart(12, "0")}`,
+    state,
+    origin_adapter: "codex" as const,
+    session_id: `guard-session-${sequence}`,
+    task_id: TASK_ID,
+    claim_id: CLAIM_ID,
+    cwd_worktree_ref: `wt-guard-${sequence}`,
+    requirements: [{
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: REPO_ID },
+    }],
+    operation_digest: sequence.toString(16).padStart(64, "0"),
+    summary: `bounded operation ${sequence}`,
+    requested_at: requestedAt,
+    approval_expires_at: approvalExpiresAt,
+  };
+  if (state === "PENDING") return base;
+  if (state === "EXPIRED") return { ...base, finished_at: approvalExpiresAt };
+  const approved = { ...base, approved_at: approvedAt, start_by: startBy };
+  if (state === "APPROVED") return approved;
+  const consumed = { ...approved, consumed_at: consumedAt, correlation_id: `tool-use-${sequence}` };
+  if (state === "CONSUMED") return consumed;
+  return { ...consumed, finished_at: "2026-08-13T00:03:00.000Z" };
 }
 
 function formalStartArgs(): string[] {
@@ -342,6 +444,37 @@ function nearCliLimitPortfolioSource(): ProjectSnapshotSource {
     total_count: items.length,
   };
 }
+
+describe("Guard runtime configuration", () => {
+  it.each([
+    ["missing", {}],
+    ["empty", { JHW_GUARD_MODE: "" }],
+    ["enforce", { JHW_GUARD_MODE: "enforce" }],
+  ])("defaults or accepts exact enforce mode for %s input", (_name, overrides) => {
+    expect(loadControlConfig(controlEnv(overrides)).guardMode).toBe("enforce");
+  });
+
+  it.each(["invalid", " enforce ", "OBSERVE", "true"])('rejects non-canonical mode %j', (guardMode) => {
+    expect(() => loadControlConfig(controlEnv({ JHW_GUARD_MODE: guardMode })))
+      .toThrow(expect.objectContaining({ code: "INVALID_CONFIG" }));
+  });
+
+  it.each([undefined, "", "TRUE", "true "])(
+    "rejects observe without exact opt-in %j",
+    (allowObserve) => {
+      const env = controlEnv({ JHW_GUARD_MODE: "observe" });
+      if (allowObserve !== undefined) env.JHW_GUARD_ALLOW_OBSERVE = allowObserve;
+      expect(() => loadControlConfig(env)).toThrow(expect.objectContaining({ code: "INVALID_CONFIG" }));
+    },
+  );
+
+  it("accepts observe only with exact development opt-in", () => {
+    expect(loadControlConfig(controlEnv({
+      JHW_GUARD_MODE: "observe",
+      JHW_GUARD_ALLOW_OBSERVE: "true",
+    })).guardMode).toBe("observe");
+  });
+});
 
 describe("runCli", () => {
   it("registers a Repository through verified source authority under the mutation lock", async () => {
@@ -1704,7 +1837,270 @@ describe("runCli", () => {
       "portfolio export",
       "project register",
       "preflight",
+      "guard status",
+      "guard preflight",
     ]) expect(help).toContain(command);
+  });
+
+  it("parses only the exact Guard diagnostic command surfaces", async () => {
+    const dependencies = makeCliDependencies();
+    const validStatus = await runCli(["guard", "status"], dependencies);
+    const validSessionStatus = await runCli(["guard", "status", "--session", "exact-session"], dependencies);
+    const validPreflight = await runCli(["guard", "preflight"], dependencies);
+
+    expect(validStatus.exitCode).toBe(0);
+    expect(validSessionStatus.exitCode).toBe(0);
+    expect(validPreflight.exitCode).toBe(78);
+    for (const invalid of [
+      ["guard"],
+      ["guard", "status", "--session"],
+      ["guard", "status", "--session", "first", "--session", "second"],
+      ["guard", "status", "--extra", "value"],
+      ["guard", "status", "trailing"],
+      ["guard", "status", "--session", "bad\nsession"],
+      ["guard", "preflight", "--session", "exact-session"],
+      ["guard", "preflight", "trailing"],
+    ]) {
+      expect((await runCli(invalid, dependencies)).exitCode).toBe(2);
+    }
+  });
+
+  it("keeps Guard diagnostics lock-free while preserving the top-level preflight lock", () => {
+    expect(requiresMutationLock(["guard", "status"])).toBe(false);
+    expect(requiresMutationLock(["guard", "status", "--session", "exact-session"])).toBe(false);
+    expect(requiresMutationLock(["guard", "preflight"])).toBe(false);
+    expect(requiresMutationLock(["preflight"])).toBe(true);
+  });
+
+  it("renders closed ready counts, mode, Registry availability, and fixed pending coverage", async () => {
+    const requests = (["PENDING", "APPROVED", "CONSUMED", "COMPLETED", "FAILED", "EXPIRED"] as const)
+      .map((state, index) => ({
+        ...guardRequest(state, index + 1),
+        summary: index === 0 ? "secret-token /private/raw-command --argv" : `bounded operation ${index + 1}`,
+      }));
+    const result = await runCli(["guard", "status"], makeCliDependencies({
+      guardMode: "observe",
+      guardRequests: { inspect: vi.fn().mockResolvedValue({ status: "ready", requests }) },
+      guardDigestKey: { inspect: vi.fn().mockResolvedValue({ status: "ready" }) },
+      guardClaims: { listActiveClaims: vi.fn().mockResolvedValue([]) },
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      command: "guard status",
+      result: {
+        protocol_version: 1,
+        runtime_mode: "observe",
+        request_state: {
+          safety: "ready",
+          counts: { PENDING: 1, APPROVED: 1, CONSUMED: 1, COMPLETED: 1, FAILED: 1, EXPIRED: 1, total: 6 },
+        },
+        digest_key: { safety: "ready" },
+        registry_claims: { availability: "available" },
+        adapter_coverage: {
+          claude: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          codex: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          gemini: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          opencode: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+        },
+      },
+    });
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(result.stdout).not.toContain("secret-token");
+    expect(result.stdout).not.toContain("/private/raw-command");
+    expect(result.stdout).not.toContain("--argv");
+  });
+
+  it("reports safe uninitialized state and never creates request or digest-key files", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-guard-status-uninitialized-"));
+    const before = await stat(stateDir);
+    const result = await runCli(["guard", "status"], makeCliDependencies({
+      stateDir,
+      guardRequests: new GuardRequestStore(lockConfig(stateDir), { environment: {} }),
+      guardDigestKey: new GuardDigestKey(stateDir),
+    }));
+    const after = await stat(stateDir);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).toMatchObject({
+      request_state: {
+        safety: "not_initialized",
+        counts: { PENDING: 0, APPROVED: 0, CONSUMED: 0, COMPLETED: 0, FAILED: 0, EXPIRED: 0, total: 0 },
+      },
+      digest_key: { safety: "not_initialized" },
+    });
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    await expect(readFile(join(stateDir, "guard-requests.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(stateDir, "guard-digest.key"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("counts an expired-by-clock persisted PENDING snapshot without cleanup or byte/mtime changes", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-guard-status-persisted-"));
+    const statePath = join(stateDir, "guard-requests.yaml");
+    const keyPath = join(stateDir, "guard-digest.key");
+    await writeFile(statePath, JSON.stringify({ version: 1, requests: [guardRequest("PENDING", 1)] }), { mode: 0o600 });
+    await writeFile(keyPath, Buffer.alloc(32, 0x6b), { mode: 0o600 });
+    const beforeBytes = await readFile(statePath);
+    const beforeState = await stat(statePath);
+    const beforeKey = await stat(keyPath);
+
+    const result = await runCli(["guard", "status"], makeCliDependencies({
+      stateDir,
+      guardRequests: new GuardRequestStore(lockConfig(stateDir), { environment: {} }),
+      guardDigestKey: new GuardDigestKey(stateDir),
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).toMatchObject({
+      request_state: { safety: "ready", counts: { PENDING: 1, EXPIRED: 0, total: 1 } },
+      digest_key: { safety: "ready" },
+    });
+    expect(await readFile(statePath)).toEqual(beforeBytes);
+    expect((await stat(statePath)).mtimeMs).toBe(beforeState.mtimeMs);
+    expect((await stat(keyPath)).mtimeMs).toBe(beforeKey.mtimeMs);
+    expect(result.stdout).not.toContain(Buffer.alloc(32, 0x6b).toString("hex"));
+  });
+
+  it("keeps corrupt Guard state byte-for-byte untouched, status available, and preflight fail-closed", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-guard-status-corrupt-"));
+    const statePath = join(stateDir, "guard-requests.yaml");
+    const raw = '{"raw_operation":"secret-token /private/worktree --force"}';
+    await writeFile(statePath, raw, { mode: 0o600 });
+    const before = await stat(statePath);
+    const dependencies = makeCliDependencies({
+      stateDir,
+      guardRequests: new GuardRequestStore(lockConfig(stateDir), { environment: {} }),
+      guardDigestKey: new GuardDigestKey(stateDir),
+    });
+
+    const statusResult = await runCli(["guard", "status"], dependencies);
+    const preflightResult = await runCli(["guard", "preflight"], dependencies);
+
+    expect(statusResult.exitCode).toBe(0);
+    expect(JSON.parse(statusResult.stdout).result.request_state).toEqual({ safety: "unavailable" });
+    expect(preflightResult.exitCode).toBe(78);
+    expect(JSON.parse(preflightResult.stderr)).toMatchObject({
+      command: "guard preflight",
+      result: {
+        status: "NO-GO",
+        code: "GUARD_UNAVAILABLE",
+        diagnostics: {
+          protocol_version: 1,
+          runtime_mode: "enforce",
+          request_state: { safety: "unavailable" },
+          digest_key: { safety: "not_initialized" },
+          registry_claims: { availability: "available" },
+        },
+      },
+    });
+    expect(await readFile(statePath, "utf8")).toBe(raw);
+    expect((await stat(statePath)).mtimeMs).toBe(before.mtimeMs);
+    expect(`${statusResult.stdout}${preflightResult.stderr}`).not.toContain("secret-token");
+    expect(`${statusResult.stdout}${preflightResult.stderr}`).not.toContain("/private/worktree");
+    expect(`${statusResult.stdout}${preflightResult.stderr}`).not.toContain("--force");
+  });
+
+  it("reports digest-key ready, missing, or unsafe without creation or repair", async () => {
+    for (const scenario of ["ready", "missing", "unsafe"] as const) {
+      const stateDir = await mkdtemp(join(tmpdir(), `jhw-guard-key-${scenario}-`));
+      const keyPath = join(stateDir, "guard-digest.key");
+      if (scenario !== "missing") {
+        await writeFile(keyPath, Buffer.alloc(32, 0x73), { mode: 0o600 });
+        if (scenario === "unsafe") await chmod(keyPath, 0o644);
+      }
+      const before = scenario === "missing" ? undefined : await stat(keyPath);
+      const result = await runCli(["guard", "status"], makeCliDependencies({
+        stateDir,
+        guardRequests: new GuardRequestStore(lockConfig(stateDir), { environment: {} }),
+        guardDigestKey: new GuardDigestKey(stateDir),
+      }));
+
+      expect(JSON.parse(result.stdout).result.digest_key.safety).toBe(
+        scenario === "ready" ? "ready" : scenario === "missing" ? "not_initialized" : "unavailable",
+      );
+      if (before) {
+        const after = await stat(keyPath);
+        expect(after.mode & 0o777).toBe(before.mode & 0o777);
+        expect(after.mtimeMs).toBe(before.mtimeMs);
+      } else {
+        await expect(readFile(keyPath)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      expect(result.stdout).not.toContain(Buffer.alloc(32, 0x73).toString("hex"));
+    }
+  });
+
+  it("distinguishes Registry unavailable from empty available and reports only bounded exact-session matches", async () => {
+    const empty = await runCli(["guard", "status", "--session", "missing-session"], makeCliDependencies());
+    const uniqueClaim = contractClaim("exact-session", 1);
+    const unique = await runCli(["guard", "status", "--session", "exact-session"], makeCliDependencies({
+      guardClaims: { listActiveClaims: vi.fn().mockResolvedValue([uniqueClaim]) },
+    }));
+    const ambiguous = await runCli(["guard", "status", "--session", "exact-session"], makeCliDependencies({
+      guardClaims: { listActiveClaims: vi.fn().mockResolvedValue([uniqueClaim, contractClaim("exact-session", 2)]) },
+    }));
+    const unavailable = await runCli(["guard", "status", "--session", "exact-session"], makeCliDependencies({
+      guardClaims: { withCommittedView: async () => { throw new Error("/private/registry secret-token"); } },
+    }));
+
+    expect(JSON.parse(empty.stdout).result).toMatchObject({
+      registry_claims: { availability: "available" },
+      session_claim: { match: "none" },
+    });
+    expect(JSON.parse(unique.stdout).result.session_claim).toEqual({
+      match: "unique",
+      work_contract_digest: uniqueClaim.work_contract_digest,
+    });
+    expect(JSON.parse(ambiguous.stdout).result.session_claim).toEqual({ match: "ambiguous" });
+    expect(JSON.parse(unavailable.stdout).result).toMatchObject({
+      registry_claims: { availability: "unavailable" },
+      session_claim: { match: "unavailable" },
+    });
+    expect(`${unique.stdout}${ambiguous.stdout}${unavailable.stdout}`).not.toContain("guard-host");
+    expect(`${unique.stdout}${ambiguous.stdout}${unavailable.stdout}`).not.toContain("task/");
+    expect(unavailable.stdout).not.toContain("/private/registry");
+    expect(unavailable.stdout).not.toContain("secret-token");
+  });
+
+  it("fails closed on malformed inspector values instead of exposing extra fields", async () => {
+    const result = await runCli(["guard", "status"], makeCliDependencies({
+      guardRequests: {
+        inspect: vi.fn().mockResolvedValue({
+          status: "ready",
+          requests: [],
+          raw_path: "/private/state",
+          credential: "secret-token",
+        }) as unknown as () => Promise<GuardRequestInspection>,
+      },
+      guardDigestKey: { inspect: vi.fn().mockResolvedValue({ status: "ready", key: "secret-key" }) },
+      guardClaims: { listActiveClaims: vi.fn().mockResolvedValue([{ path: "/private/claim" }]) },
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).toMatchObject({
+      request_state: { safety: "unavailable" },
+      digest_key: { safety: "unavailable" },
+      registry_claims: { availability: "unavailable" },
+    });
+    expect(result.stdout).not.toContain("/private");
+    expect(result.stdout).not.toContain("secret");
+  });
+
+  it("bypasses both Pilot and Board measurement journals for both Guard diagnostics", async () => {
+    const journal = { append: vi.fn().mockRejectedValue(new Error("pilot journal must not run")) };
+    const boardJournal = { append: vi.fn().mockRejectedValue(new Error("board journal must not run")) };
+    const mutationLock = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
+    const dependencies = makeCliDependencies({ journal, boardJournal, mutationLock });
+
+    const statusResult = await runCli(["guard", "status"], dependencies);
+    const preflightResult = await runCli(["guard", "preflight"], dependencies);
+
+    expect(statusResult.exitCode).toBe(0);
+    expect(statusResult.stdout).not.toContain("journal_warning");
+    expect(preflightResult.exitCode).toBe(78);
+    expect(preflightResult.stderr).not.toContain("journal_warning");
+    expect(mutationLock.run).not.toHaveBeenCalled();
+    expect(journal.append).not.toHaveBeenCalled();
+    expect(boardJournal.append).not.toHaveBeenCalled();
   });
 
   it("keeps concurrent read-only journal events as complete redacted lines", async () => {

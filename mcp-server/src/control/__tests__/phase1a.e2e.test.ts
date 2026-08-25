@@ -7,9 +7,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createAuthorityService } from "../authority.js";
 import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
-import { runCli, type CliDependencies } from "../cli.js";
+import { createCliDependencies, runCli, type CliDependencies } from "../cli.js";
 import type { ControlConfig } from "../config.js";
 import { ControlError } from "../errors.js";
+import { GuardDigestKey, GuardRequestStore } from "../guard-state.js";
 import { GitHubProjectClient, type GitHubRunner } from "../github-project.js";
 import { GitHubSourceService, type GitHubSourceRunner } from "../github-source.js";
 import { PilotJournal } from "../journal.js";
@@ -223,6 +224,10 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         registry_repository: "ok", registry_issue: "ok", registry_git: "ok",
       },
     }) },
+    guardMode: graph.config.guardMode,
+    guardRequests: new GuardRequestStore(graph.config),
+    guardDigestKey: new GuardDigestKey(graph.config.stateDir),
+    guardClaims: graph.claims,
     mutationLock: new MutationLock(graph.config, {}),
     journal: noopJournal(),
     // Board commands are outside the Phase 1A e2e surface; the ports only need
@@ -522,6 +527,61 @@ function rawErrorAudit(cause: unknown): RawErrorAudit {
 }
 
 describe("Phase 1A deterministic adversarial gate", () => {
+  it("0. production Guard diagnostics remain bounded, pending, and state-read-only before adapters", async () => {
+    const fixture = await makeGateFixture();
+    const beforeDirectory = await stat(fixture.stateDir);
+    const beforeEntries = await readdir(fixture.stateDir);
+    const dependencies = createCliDependencies({
+      HOME: fixture.root,
+      JHW_REGISTRY_DIR: fixture.cloneA,
+      JHW_WORKTREE_ROOT: fixture.worktreeRoot,
+      JHW_CONTROL_STATE_DIR: fixture.stateDir,
+      JHW_BUILD_HOST: "cantopsbuildserver",
+      JHW_GITHUB_OWNER: "jhw7500",
+      JHW_PROJECT_NUMBER: "7",
+      JHW_REGISTRY_REPOSITORY: "jhw7500/project-registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+      JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+    });
+
+    const statusResult = await runCli(["guard", "status"], dependencies);
+    const preflightResult = await runCli(["guard", "preflight"], dependencies);
+    const afterDirectory = await stat(fixture.stateDir);
+
+    expect(statusResult.exitCode).toBe(0);
+    expect(JSON.parse(statusResult.stdout)).toMatchObject({
+      command: "guard status",
+      result: {
+        protocol_version: 1,
+        runtime_mode: "enforce",
+        request_state: { safety: "not_initialized" },
+        digest_key: { safety: "not_initialized" },
+        registry_claims: { availability: "available" },
+        adapter_coverage: {
+          claude: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          codex: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          gemini: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          opencode: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+        },
+      },
+    });
+    expect(preflightResult.exitCode).toBe(78);
+    expect(JSON.parse(preflightResult.stderr)).toMatchObject({
+      command: "guard preflight",
+      result: {
+        status: "NO-GO",
+        code: "GUARD_UNAVAILABLE",
+        diagnostics: { protocol_version: 1, runtime_mode: "enforce" },
+      },
+    });
+    expect(Buffer.byteLength(statusResult.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(Buffer.byteLength(preflightResult.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(`${statusResult.stdout}${preflightResult.stderr}`).not.toContain("installed");
+    expect(`${statusResult.stdout}${preflightResult.stderr}`).not.toContain("ready\"");
+    expect(await readdir(fixture.stateDir)).toEqual(beforeEntries);
+    expect(afterDirectory.mtimeMs).toBe(beforeDirectory.mtimeMs);
+  });
+
   it("1. concurrent Repository registration leaves one canonical record and one source mapping", async () => {
     const fixture = await makeGateFixture();
     const leftRunner = new PushGateRunner(new ProcessRunner(), "2026-08-13T00:00:01Z");

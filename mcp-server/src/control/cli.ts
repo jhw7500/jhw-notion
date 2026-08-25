@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
-import type { ZodType } from "zod";
+import { z, type ZodType } from "zod";
 
 import { spawn } from "node:child_process";
 import { writeSync } from "node:fs";
@@ -24,6 +24,7 @@ import { loadControlConfig } from "./config.js";
 import { ControlContractAuthority } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
 import { GuardAdapterSchema, type GuardAdapter } from "./guard-protocol.js";
+import { GuardDigestKey, GuardRequestStore } from "./guard-state.js";
 import { GitHubProjectClient, type RegistrationRecordWarning } from "./github-project.js";
 import { GitHubSourceService } from "./github-source.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
@@ -47,10 +48,12 @@ import { getNotionClient } from "../notion-client.js";
 import { verifyConfiguredNotionAuthorityRoutes } from "../notion/authority-guard.js";
 import {
   AuthorityRecordSchema,
+  ActiveClaimSchema,
   BoardConflictSummarySchema,
   BoundedPortfolioPayloadSchema,
   ConflictingClaimSummarySchema,
   ClaimCoordinateSchema,
+  GuardRequestSchema,
   ErrorReasonSchema,
   PreflightResultSchema,
   ProjectRecordLinkSchema,
@@ -80,6 +83,64 @@ const PROJECT_ID = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const REPO_ID = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const MAX_CLI_OUTPUT_BYTES = 12 * 1024;
 const CLI_RESULT_BUDGET = MAX_CLI_OUTPUT_BYTES - 256;
+const maximumGuardClaims = 4_096;
+
+const GuardRequestInspectionSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("not_initialized"), requests: z.array(GuardRequestSchema).length(0) }).strict(),
+  z.object({ status: z.literal("ready"), requests: z.array(GuardRequestSchema).max(65_536) }).strict(),
+]);
+const GuardDigestKeyInspectionSchema = z.object({
+  status: z.enum(["not_initialized", "ready"]),
+}).strict();
+const GuardRequestCountsSchema = z.object({
+  PENDING: z.number().int().nonnegative(),
+  APPROVED: z.number().int().nonnegative(),
+  CONSUMED: z.number().int().nonnegative(),
+  COMPLETED: z.number().int().nonnegative(),
+  FAILED: z.number().int().nonnegative(),
+  EXPIRED: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+}).strict();
+const GuardRequestStatusSchema = z.union([
+  z.object({ safety: z.literal("unavailable") }).strict(),
+  z.object({
+    safety: z.enum(["ready", "not_initialized"]),
+    counts: GuardRequestCountsSchema,
+  }).strict(),
+]);
+const GuardAdapterCoverageEntrySchema = z.object({
+  prompt_origin: z.literal("pending"),
+  pre_tool_blocking: z.literal("pending"),
+  execution_recheck: z.literal("pending"),
+}).strict();
+const GuardAdapterCoverageSchema = z.object({
+  claude: GuardAdapterCoverageEntrySchema,
+  codex: GuardAdapterCoverageEntrySchema,
+  gemini: GuardAdapterCoverageEntrySchema,
+  opencode: GuardAdapterCoverageEntrySchema,
+}).strict();
+const GuardSessionClaimStatusSchema = z.union([
+  z.object({ match: z.enum(["none", "ambiguous", "unavailable"]) }).strict(),
+  z.object({
+    match: z.literal("unique"),
+    work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  }).strict(),
+]);
+const GuardStatusResultSchema = z.object({
+  protocol_version: z.literal(1),
+  runtime_mode: z.enum(["enforce", "observe"]),
+  request_state: GuardRequestStatusSchema,
+  digest_key: z.object({ safety: z.enum(["ready", "not_initialized", "unavailable"]) }).strict(),
+  registry_claims: z.object({ availability: z.enum(["available", "unavailable"]) }).strict(),
+  session_claim: GuardSessionClaimStatusSchema.optional(),
+  adapter_coverage: GuardAdapterCoverageSchema,
+}).strict();
+type GuardStatusResult = z.infer<typeof GuardStatusResultSchema>;
+const GuardPreflightResultSchema = z.object({
+  status: z.literal("NO-GO"),
+  code: z.literal("GUARD_UNAVAILABLE"),
+  diagnostics: GuardStatusResultSchema,
+}).strict();
 
 const commandNames = [
   "repository register",
@@ -98,6 +159,8 @@ const commandNames = [
   "project register",
   "project update",
   "preflight",
+  "guard status",
+  "guard preflight",
   "board register",
   "board update",
   "board unregister",
@@ -157,6 +220,10 @@ export interface CliDependencies {
     "registerRepository" | "registerFormalTask" | "registerTemporaryTask" | "prepareExistingTask" | "promoteTemporaryTask">;
   portfolio: PortfolioPort;
   preflight: PreflightPort;
+  guardMode: "enforce" | "observe";
+  guardRequests: Pick<GuardRequestStore, "inspect">;
+  guardDigestKey: Pick<GuardDigestKey, "inspect">;
+  guardClaims: Pick<ClaimService, "withCommittedView" | "listActiveClaims">;
   mutationLock: MutationLockPort;
   journal?: JournalPort;
   boardService: Pick<
@@ -309,6 +376,10 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
       registry,
       sensitiveData,
     }),
+    guardMode: config.guardMode,
+    guardRequests: new GuardRequestStore(config, { environment: env }),
+    guardDigestKey: new GuardDigestKey(config.stateDir),
+    guardClaims: claims,
     mutationLock: new MutationLock(config, env),
     // The board lock is a second host-global lock with its own identity: board
     // commands must never contend with registry.lock, and boards.lock waits
@@ -338,6 +409,9 @@ function commandFor(argv: readonly string[]): CommandName {
   }
   if (argv[0] === "board" && argv[1] && commandNames.includes(`board ${argv[1]}` as (typeof commandNames)[number])) {
     return `board ${argv[1]}` as CommandName;
+  }
+  if (argv[0] === "guard" && argv[1] && commandNames.includes(`guard ${argv[1]}` as (typeof commandNames)[number])) {
+    return `guard ${argv[1]}` as CommandName;
   }
   if (argv[0] === "project" && argv[1] === "register") return "project register";
   if (argv[0] === "project" && argv[1] === "update") return "project update";
@@ -555,6 +629,108 @@ function validatedPortResult<T>(schema: ZodType<T>, raw: unknown, code: string):
   const parsed = schema.safeParse(raw);
   if (!parsed.success) throw new ControlError(code, "A control port returned an invalid result");
   return parsed.data;
+}
+
+function pendingAdapterCoverage(): z.infer<typeof GuardAdapterCoverageSchema> {
+  const pending = () => ({
+    prompt_origin: "pending" as const,
+    pre_tool_blocking: "pending" as const,
+    execution_recheck: "pending" as const,
+  });
+  return {
+    claude: pending(),
+    codex: pending(),
+    gemini: pending(),
+    opencode: pending(),
+  };
+}
+
+function guardRequestCounts(requests: z.infer<typeof GuardRequestSchema>[]): z.infer<typeof GuardRequestCountsSchema> {
+  const counts = {
+    PENDING: 0,
+    APPROVED: 0,
+    CONSUMED: 0,
+    COMPLETED: 0,
+    FAILED: 0,
+    EXPIRED: 0,
+    total: requests.length,
+  };
+  for (const request of requests) counts[request.state] += 1;
+  return GuardRequestCountsSchema.parse(counts);
+}
+
+async function inspectGuardStatus(
+  dependencies: CliDependencies,
+  session?: string,
+): Promise<GuardStatusResult> {
+  let requestState: z.infer<typeof GuardRequestStatusSchema>;
+  try {
+    const inspected = GuardRequestInspectionSchema.parse(await dependencies.guardRequests.inspect());
+    requestState = {
+      safety: inspected.status,
+      counts: guardRequestCounts(inspected.requests),
+    };
+  } catch {
+    requestState = { safety: "unavailable" };
+  }
+
+  let digestKey: GuardStatusResult["digest_key"];
+  try {
+    const inspected = GuardDigestKeyInspectionSchema.parse(await dependencies.guardDigestKey.inspect());
+    digestKey = { safety: inspected.status };
+  } catch {
+    digestKey = { safety: "unavailable" };
+  }
+
+  let registryClaims: GuardStatusResult["registry_claims"];
+  let sessionClaim: GuardStatusResult["session_claim"];
+  try {
+    const rawClaims = await dependencies.guardClaims.withCommittedView(
+      () => dependencies.guardClaims.listActiveClaims(),
+    );
+    const claims = z.array(ActiveClaimSchema).max(maximumGuardClaims).parse(rawClaims);
+    registryClaims = { availability: "available" };
+    if (session !== undefined) {
+      const matches = claims.filter((claim) => claim.session_id === session);
+      if (matches.length === 0) {
+        sessionClaim = { match: "none" };
+      } else if (matches.length > 1) {
+        sessionClaim = { match: "ambiguous" };
+      } else {
+        const claim = matches[0] as ActiveClaim;
+        sessionClaim = {
+          match: "unique",
+          ...("work_contract_digest" in claim ? { work_contract_digest: claim.work_contract_digest } : {}),
+        };
+      }
+    }
+  } catch {
+    registryClaims = { availability: "unavailable" };
+    if (session !== undefined) sessionClaim = { match: "unavailable" };
+  }
+
+  return GuardStatusResultSchema.parse({
+    protocol_version: 1,
+    runtime_mode: dependencies.guardMode,
+    request_state: requestState,
+    digest_key: digestKey,
+    registry_claims: registryClaims,
+    ...(sessionClaim ? { session_claim: sessionClaim } : {}),
+    adapter_coverage: pendingAdapterCoverage(),
+  });
+}
+
+function guardPreflightNoGo(command: "guard preflight", diagnostics: GuardStatusResult): CliResult {
+  const result = GuardPreflightResultSchema.parse({
+    status: "NO-GO",
+    code: "GUARD_UNAVAILABLE",
+    diagnostics,
+  });
+  return {
+    exitCode: 78,
+    stdout: "",
+    stderr: `${JSON.stringify({ command, result })}\n`,
+  };
 }
 
 function errorCode(cause: unknown): string {
@@ -1423,6 +1599,28 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     return { flags, result: resultJson(command, updated) };
   }
 
+  if (command === "guard status") {
+    const flags = parseFlags(argv.slice(2), new Set(["--session"]));
+    assertSafeFlags(flags, dependencies);
+    const rawSession = value(flags, "--session");
+    const parsedSession = rawSession === undefined ? undefined : ClaimCoordinateSchema.safeParse(rawSession);
+    if (parsedSession !== undefined && !parsedSession.success) usage("Invalid Claim session coordinate");
+    const diagnostics = await inspectGuardStatus(
+      dependencies,
+      parsedSession === undefined ? undefined : parsedSession.data,
+    );
+    return { flags, result: resultJson(command, diagnostics) };
+  }
+
+  if (command === "guard preflight") {
+    const flags = parseFlags(argv.slice(2), new Set());
+    assertSafeFlags(flags, dependencies);
+    return {
+      flags,
+      result: guardPreflightNoGo(command, await inspectGuardStatus(dependencies)),
+    };
+  }
+
   if (command === "preflight") {
     const flags = parseFlags(argv.slice(1), new Set());
     assertSafeFlags(flags, dependencies);
@@ -1464,6 +1662,11 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
     // invoke the measurement journal.
     if (result.exitCode === 2) return result;
   }
+
+  // Guard diagnostics are operational safety probes, not Pilot/Board trial
+  // measurements. Returning here also prevents a derived journal failure from
+  // changing an already-computed bounded status or NO-GO result.
+  if (command.startsWith("guard ")) return result;
 
   // A warning here means the record is unusable, so this registration leaves no
   // coordinates to resume from — and a failure is exactly when the operator is

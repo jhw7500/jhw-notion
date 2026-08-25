@@ -85,6 +85,7 @@ export function configFor(registryDir: string): ControlConfig {
     preflightProjectItemId: "PVTI_trial",
     preflightRegistryIssueNumber: 1,
     stateDir: join(dirname(registryDir), "state"),
+    guardMode: "enforce",
   };
 }
 

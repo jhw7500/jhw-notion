@@ -250,6 +250,29 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 
 이 확인은 raw Git을 통합 enforcement하지 않는 **advisory check**라서 확인 직후 승인된 takeover와 race할 수 있다. 안전을 보장하는 wrapper로 표현하지 않는다. 실패하면 공유 동작을 하지 않는다.
 
+## Guard 판정과 1회 승인
+
+Guard 결과는 다음처럼 해석한다.
+
+- `ALLOW`: 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다.
+- `PERMIT_REQUIRED`: 소유권 충돌 없이 Work Contract 범위만 부족하다. Guard가 반환한 exact `approval_command`로 표시된 작업 한 건만 사용자 승인을 받을 수 있다.
+- `DENY`: hard-deny 또는 안전 상태를 검증할 수 없는 경우다. unlock으로 우회하지 않는다.
+
+승인의 유일한 형식은 supported native adapter가 전달한 **사용자의 exact raw prompt** 한 줄 `/jhw:unlock req-<UUIDv7>`다. Guard가 반환한 request ID를 그대로 사용한다. PENDING 요청의 승인 가능 시간 10분과 APPROVED 뒤 실행 시작 가능 시간 10분은 서로 독립이다. 실행 시작 시 `APPROVED -> CONSUMED`가 원자적으로 일어나며, 그 뒤에는 mid-operation permit expiry가 없다. spawn 실패를 포함한 replay/retry는 이미 소모한 permit을 재사용할 수 없고 새 요청·승인이 필요하다. 동시 소모는 정확히 한 실행만 이긴다.
+
+protocol/prompt origin, Claim/session/host/worktree, current authority·exclusive resource conflict, unsafe/corrupt Guard·Registry state, self-approval은 hard-deny 축이다. `ok`, `진행`, `다음`, `승인`, 승인문 인용, code fence, 대소문자·공백 변경, suffix·추가 인자, agent 응답이나 shell/tool 호출은 승인이 아니다. `/jhw:unlock`은 reserved adapter control prompt이며 일반 skill이나 shell command가 아니다. `/jhw:unlock` skill을 만들거나 모델·agent에 승인 권한을 주지 않는다.
+
+읽기 전용 진단은 Claim 없이 사용할 수 있다.
+
+```bash
+jhw-control guard status [--session <exact-session-id>]
+jhw-control guard preflight
+```
+
+`guard status`는 protocol version, `enforce|observe` runtime mode, request/key 안전 상태, persisted request 상태별 count, Registry/Claim read availability, optional exact-session match, adapter coverage만 bounded 결과로 보여준다. raw request/command/path/key는 표시하지 않으며 손상 상태를 고치거나 만료 row를 정리하지 않는다. Plan 2에서 `claude|codex|gemini|opencode`의 prompt-origin·pre-tool blocking·execution-recheck는 모두 `pending`이며 loose file만 보고 installed로 간주하지 않는다.
+
+`guard preflight`는 read-only GO/NO-GO 진단이다. key/state/Registry/protocol/mode가 안전하지 않거나 필수 adapter/execution coverage가 `pending`이면 bounded `NO-GO`와 stable `GUARD_UNAVAILABLE`(exit 78)를 반환한다. 기본 mode는 `enforce`다. `observe`는 개발·fixture에서만 exact `JHW_GUARD_MODE=observe`와 exact `JHW_GUARD_ALLOW_OBSERVE=true`를 함께 설정하며, 어떤 실패도 자동으로 observe로 강등하지 않는다.
+
 ## 결과 해석
 
 - Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
