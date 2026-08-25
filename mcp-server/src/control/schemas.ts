@@ -3,6 +3,7 @@ import { z } from "zod";
 const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm" | "hld" | "rsv") =>
   z.string().regex(new RegExp(`^${prefix}-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`));
 
+export const TaskIdSchema = canonicalId("tsk");
 const projectId = z.string().regex(/^prj-[a-z0-9][a-z0-9-]{1,62}$/);
 const repositoryId = z.string().regex(/^repo-[a-z0-9][a-z0-9-]{1,62}$/);
 const githubSlugPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
@@ -15,7 +16,7 @@ const boundedCoordinate = (maximumBytes: number) => z.string().min(1).max(maximu
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
 const taskAlias = boundedCoordinate(160);
 const claimCoordinate = boundedCoordinate(255);
-const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
+export const GithubNodeIdSchema = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 const githubApiId = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
 export const SourceTaskRevisionSchema = boundedCoordinate(256);
 export const OffsetDateTimeSchema = z.string().min(1).max(64).datetime({ offset: true });
@@ -44,7 +45,7 @@ export type AuthorityRecord = z.infer<typeof AuthorityRecordSchema>;
 export const RepositoryRecordSchema = z
   .object({
     id: repositoryId,
-    github_node_id: githubNodeId,
+    github_node_id: GithubNodeIdSchema,
     slug: z.string().regex(githubSlugPattern),
     // Explicit operator opt-in: the source repository may be public. Absent
     // means the Phase 1A private requirement stays enforced on every use.
@@ -65,7 +66,7 @@ export const FormalTaskSchema = z
   .object({
     ...taskBase,
     kind: z.literal("formal"),
-    issue_node_id: githubNodeId,
+    issue_node_id: GithubNodeIdSchema,
     issue_revision: OffsetDateTimeSchema,
     issue_url: z.string().max(512).url(),
   })
@@ -387,7 +388,7 @@ export type ProjectFieldDefinition = z.infer<typeof ProjectFieldDefinitionSchema
 export const ProjectSnapshotItemSchema = z
   .object({
     project_item_id: githubApiId,
-    source_node_id: githubNodeId,
+    source_node_id: GithubNodeIdSchema,
     project_id: projectId,
     title: z.string().min(1).max(256),
     objective: z.string().min(1).max(4096),
@@ -414,7 +415,7 @@ export const ProjectRecordLinkSchema = z
   .object({
     project_id: projectId,
     project_item_id: githubApiId,
-    source_node_id: githubNodeId,
+    source_node_id: GithubNodeIdSchema,
   })
   .strict();
 export type ProjectRecordLink = z.infer<typeof ProjectRecordLinkSchema>;
