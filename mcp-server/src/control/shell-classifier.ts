@@ -273,13 +273,18 @@ function parseSimpleArgv(command: string): ParseResult {
       } else if (character === "\\") {
         if (next === "\n") {
           index += 1;
+        } else if (next === "!") {
+          // Bash history expansion treats \! as inert inside double quotes,
+          // but unlike the other escaped characters it preserves the slash.
+          token += "\\!";
+          index += 1;
         } else if (next === "$" || next === "`" || next === '"' || next === "\\") {
           escaped = true;
         } else {
           token += character;
         }
       } else {
-        if (character === "$" || character === "`") return { ambiguous: true };
+        if (character === "$" || character === "`" || character === "!") return { ambiguous: true };
         token += character;
       }
       tokenStarted = true;
@@ -304,10 +309,12 @@ function parseSimpleArgv(command: string): ParseResult {
       tokenStarted = true;
       continue;
     }
-    if (/\s/u.test(character)) {
-      if (character === "\n" || character === "\r") return { ambiguous: true };
+    if (character === " " || character === "\t") {
       push();
       continue;
+    }
+    if (character === "\n" || character === "\r" || /\s/u.test(character) || character === "!") {
+      return { ambiguous: true };
     }
     if (
       ";&|<>()`".includes(character) || character === "$" ||

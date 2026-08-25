@@ -46,6 +46,29 @@ const HOST = "cantopsbuildserver";
 const REPOSITORY = { kind: "repository", id: "repo-guard" } as const;
 const BOARD = { kind: "board", id: "board-alpha" } as const;
 const runFile = promisify(execFile);
+const nonBashStatusWhitespace = [
+  ["vertical tab", "\u000b"],
+  ["form feed", "\u000c"],
+  ["no-break space", "\u00a0"],
+  ["ogham space mark", "\u1680"],
+  ["en quad", "\u2000"],
+  ["em quad", "\u2001"],
+  ["en space", "\u2002"],
+  ["em space", "\u2003"],
+  ["three-per-em space", "\u2004"],
+  ["four-per-em space", "\u2005"],
+  ["six-per-em space", "\u2006"],
+  ["figure space", "\u2007"],
+  ["punctuation space", "\u2008"],
+  ["thin space", "\u2009"],
+  ["hair space", "\u200a"],
+  ["line separator", "\u2028"],
+  ["paragraph separator", "\u2029"],
+  ["narrow no-break space", "\u202f"],
+  ["medium mathematical space", "\u205f"],
+  ["ideographic space", "\u3000"],
+  ["byte-order mark", "\ufeff"],
+] as const;
 
 function lockConfig(stateDir: string): ControlConfig {
   return {
@@ -414,6 +437,12 @@ describe("GuardService", () => {
       for (const command of [
         "jhw-control guard status",
         `jhw-control guard status --session ${SESSION_ID}`,
+        `jhw-control\tguard\tstatus\t--session\t${SESSION_ID}`,
+        "jhw-control guard status --session 'single!session'",
+        "jhw-control guard status --session escaped\\!session",
+        'jhw-control guard status --session "double\\!session"',
+        "jhw-control guard status --session 'quoted;session'",
+        "jhw-control guard status --session escaped\\;session",
         "jhw-control guard preflight",
       ]) {
         await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, { command })))
@@ -445,6 +474,11 @@ describe("GuardService", () => {
         ["and composition", `jhw-control guard status --session ${SESSION_ID} && git status`],
         ["pipeline composition", `jhw-control guard status --session ${SESSION_ID} | git status`],
         ["newline composition", `jhw-control guard status --session ${SESSION_ID}\ngit status`],
+        ["carriage-return composition", `jhw-control guard status --session ${SESSION_ID}\rvery-bad`],
+        ...nonBashStatusWhitespace.map(([name, separator]) => [
+          `non-Bash ${name}`,
+          `jhw-control${separator}guard status --session ${SESSION_ID}`,
+        ] as const),
         ["redirection", `jhw-control guard status --session ${SESSION_ID} > /tmp/guard-status`],
         ["command substitution", "jhw-control guard status --session $(printf codex-guard-task)"],
         ["backtick substitution", "jhw-control guard status --session `printf codex-guard-task`"],
@@ -452,6 +486,9 @@ describe("GuardService", () => {
         ["assignment prefix", `JHW_TEST=1 jhw-control guard status --session ${SESSION_ID}`],
         ["command wrapper", `command jhw-control guard status --session ${SESSION_ID}`],
         ["shell wrapper", `bash -c 'jhw-control guard status --session ${SESSION_ID}'`],
+        ["history-active unquoted bang", "jhw-control guard status --session active!missing"],
+        ["history-active double-quoted bang", 'jhw-control guard status --session "active!missing"'],
+        ["history-active double bang", "jhw-control guard status --session !!"],
         ["unterminated quote", `jhw-control guard status --session "${SESSION_ID}`],
         ["unterminated escape", `jhw-control guard status --session ${SESSION_ID}\\`],
         ["empty coordinate", 'jhw-control guard status --session ""'],
