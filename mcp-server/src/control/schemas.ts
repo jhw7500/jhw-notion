@@ -385,6 +385,10 @@ export const ClaimHistorySchema = z
     handoff_path: z.string().max(160).regex(/^handoffs\/tsk-[0-9a-f-]+\/clm-[0-9a-f-]+\.md$/).optional(),
     successor_claim_id: canonicalId("clm").optional(),
     work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+    completion_evidence_path: z.string().max(160).regex(
+      /^task-completion\/(tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/(clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.yaml$/,
+    ).optional(),
+    completion_evidence_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   })
   .strict()
   .superRefine((history, context) => {
@@ -400,6 +404,32 @@ export const ClaimHistorySchema = z
     }
     if ((history.handoff_path !== undefined) !== (history.status === "handoff")) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["handoff_path"], message: "Only Handoff history carries a Handoff pointer" });
+    }
+    if ((history.completion_evidence_path !== undefined) !== (history.completion_evidence_digest !== undefined)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["completion_evidence_path"],
+        message: "Completion evidence pointer and digest are atomic",
+      });
+    }
+    if (history.completion_evidence_path !== undefined) {
+      if (history.status !== "completed") {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["completion_evidence_path"],
+          message: "Only completed Claim history carries completion evidence",
+        });
+      }
+      const match = history.completion_evidence_path.match(
+        /^task-completion\/(tsk-[0-9a-f-]+)\/(clm-[0-9a-f-]+)\.yaml$/,
+      );
+      if (!match || match[1] !== history.task_id || match[2] !== history.claim_id) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["completion_evidence_path"],
+          message: "Completion evidence pointer disagrees with Claim history coordinates",
+        });
+      }
     }
   });
 export type ClaimHistory = z.infer<typeof ClaimHistorySchema>;

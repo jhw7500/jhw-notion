@@ -647,11 +647,18 @@ export class Catalog {
       : this.registry.headRegularBlobObjectId(taskRelativePath(task.id));
   }
 
-  /** Mutates a temporary lifecycle only inside the caller's Registry transaction. */
-  async transitionTemporaryLifecycle(taskId: string, lifecycle: TemporaryLifecycle): Promise<string[]> {
+  /** Mutates a temporary or child lifecycle only inside the caller's Registry transaction. */
+  async transitionTaskLifecycle(taskId: string, lifecycle: TemporaryLifecycle): Promise<string[]> {
     const current = await this.taskAt(taskId);
     if (current.kind === "formal") return [];
-    if (current.lifecycle === "completed" && lifecycle !== "completed") {
+    if (
+      current.kind === "child" &&
+      (current.lifecycle === "completed" || current.lifecycle === "abandoned") &&
+      lifecycle !== current.lifecycle
+    ) {
+      throw new ControlError("TASK_TERMINAL", "Terminal child Tasks cannot transition or be reclaimed");
+    }
+    if (current.kind === "temporary" && current.lifecycle === "completed" && lifecycle !== "completed") {
       throw new ControlError("TASK_COMPLETED", "Completed temporary Tasks cannot transition or be reclaimed");
     }
     if (current.lifecycle === lifecycle) return [];

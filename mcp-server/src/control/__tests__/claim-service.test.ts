@@ -9,6 +9,7 @@ import { ControlError } from "../errors.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
+import { taskCompletionEvidenceDigest } from "../task-completion.js";
 import { normalizeWorkContract, workContractDigest } from "../work-contract.js";
 import { commitFile, configFor, emptyTaskContractIntent, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
@@ -51,6 +52,34 @@ async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: S
     claims: new ClaimService(config, registry, catalog, inspection, now, sensitiveData),
     catalog,
     task,
+  };
+}
+
+async function formalClaimsFixture(taskRole: "standalone" | "parent" = "standalone") {
+  const fixture = await makeRegistryFixture();
+  fixtures.push(fixture);
+  const config = configFor(fixture.registryDir);
+  const registry = isolatedRegistryGit(config, new ProcessRunner());
+  const catalog = new Catalog(config, registry, undefined, { assertKnownContract: async () => undefined });
+  await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
+  const task = (await catalog.registerFormalTask({
+    project_id: "prj-wlan",
+    repo_id: "repo-wlan",
+    issue_node_id: "I_wlan_1",
+    issue_revision: "2026-08-25T00:00:00Z",
+    issue_url: "https://github.com/jhw7500/wlan/issues/1",
+    alias: "jhw7500/wlan#1",
+    task_role: taskRole,
+    grants: [],
+    dependencies: [],
+  })).task;
+  let clockTick = 0;
+  return {
+    fixture,
+    catalog,
+    task,
+    claims: new ClaimService(config, registry, catalog, inspection, () =>
+      new Date(fixedNow.getTime() + clockTick++ * 1_000)),
   };
 }
 
@@ -130,6 +159,211 @@ async function replaceActiveWithExternalSymlink(
 }
 
 describe("ClaimService", () => {
+  it("records immutable standalone completion evidence for the exact active owner", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    const evidence = { integration_validation: ["npm test: pass"], child_dispositions: [] };
+    const taskPath = join(fixture.registryDir, "tasks", `${task.id}.yaml`);
+    const issueBytes = await readFile(taskPath, "utf8");
+
+    const first = await claims.markCompletionReady(task.id, active.claim_id, evidence);
+    const evidencePath = join(fixture.registryDir, "task-completion", task.id, `${active.claim_id}.yaml`);
+    const bytes = await readFile(evidencePath, "utf8");
+    const head = await git(fixture.registryDir, "rev-parse", "HEAD");
+    const retry = await claims.markCompletionReady(task.id, active.claim_id, evidence);
+
+    expect(first).toEqual({
+      version: 1,
+      task_id: task.id,
+      claim_id: active.claim_id,
+      work_contract_digest: active.work_contract_digest,
+      recorded_at: new Date(fixedNow.getTime() + 1_000).toISOString(),
+      evidence,
+    });
+    expect(retry).toEqual(first);
+    expect(await readFile(evidencePath, "utf8")).toBe(bytes);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(head);
+    expect(await readFile(taskPath, "utf8")).toBe(issueBytes);
+    await expect(claims.assertOwner(task.id, active.claim_id)).resolves.toEqual(active);
+  });
+
+  it("rejects changed or non-owner evidence without any Registry write", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    await claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    });
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: changed"], child_dispositions: [],
+    })).rejects.toMatchObject({ code: "COMPLETION_EVIDENCE_CONFLICT" });
+    await expect(claims.markCompletionReady(
+      task.id,
+      "clm-018f21e0-7b2c-7a00-8000-000000000099",
+      { integration_validation: ["npm test: pass"], child_dispositions: [] },
+    )).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+  });
+
+  it("requires parent gates before writing evidence", async () => {
+    const { claims, task, catalog, fixture } = await formalClaimsFixture("parent");
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    await catalog.registerChildTask({
+      parent_task_id: task.id,
+      alias: "wlan:required-child",
+      required_for_parent: true,
+      goal: "required work",
+      done_conditions: ["done"],
+      grants: [],
+      dependencies: [],
+    });
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    })).rejects.toMatchObject({ code: "PARENT_CHILDREN_INCOMPLETE" });
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+    await expect(readFile(join(
+      fixture.registryDir, "task-completion", task.id, `${active.claim_id}.yaml`,
+    ))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses formal completion evidence on temporary and child Task flows", async () => {
+    const temporary = await claimsFixture();
+    const temporaryClaim = await temporary.claims.claimTask(claimInput(temporary.task.id));
+    const temporaryHead = await git(temporary.fixture.registryDir, "rev-parse", "HEAD");
+    await expect(temporary.claims.markCompletionReady(temporary.task.id, temporaryClaim.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    })).rejects.toMatchObject({ code: "TASK_COMPLETION_FORMAL_REQUIRED" });
+    expect(await git(temporary.fixture.registryDir, "rev-parse", "HEAD")).toBe(temporaryHead);
+
+    const formal = await formalClaimsFixture("parent");
+    const child = await formal.catalog.registerChildTask({
+      parent_task_id: formal.task.id,
+      alias: "wlan:no-formal-evidence",
+      required_for_parent: false,
+      goal: "child work",
+      done_conditions: ["done"],
+      grants: [],
+      dependencies: [],
+    });
+    const childClaim = await formal.claims.claimTask(claimInput(child.id, {
+      task_alias: child.aliases[0],
+      session_id: "codex-child-evidence",
+    }));
+    const childHead = await git(formal.fixture.registryDir, "rev-parse", "HEAD");
+    await expect(formal.claims.markCompletionReady(child.id, childClaim.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    })).rejects.toMatchObject({ code: "TASK_COMPLETION_FORMAL_REQUIRED" });
+    expect(await git(formal.fixture.registryDir, "rev-parse", "HEAD")).toBe(childHead);
+  });
+
+  it("requires exact evidence to complete a formal Claim and copies its pointer and digest only to completed history", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    const finish = {
+      status: "completed" as const,
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    };
+
+    await expect(claims.finishClaim(task.id, active.claim_id, finish)).rejects.toMatchObject({
+      code: "COMPLETION_EVIDENCE_REQUIRED",
+    });
+    await expect(claims.assertOwner(task.id, active.claim_id)).resolves.toEqual(active);
+    const record = await claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    });
+    const issueBytes = await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8");
+    const history = await claims.finishClaim(task.id, active.claim_id, finish);
+
+    expect(history).toMatchObject({
+      status: "completed",
+      completion_evidence_path: `task-completion/${task.id}/${active.claim_id}.yaml`,
+      completion_evidence_digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      work_contract_digest: record.work_contract_digest,
+    });
+    expect(history.completion_evidence_digest).toBe(taskCompletionEvidenceDigest(record));
+    expect(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8")).toBe(issueBytes);
+    await expect(claims.getActive(task.id)).resolves.toBeUndefined();
+  });
+
+  it("keeps old evidence historical but unusable after handoff and reclaim", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const first = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    const oldEvidence = await claims.markCompletionReady(task.id, first.claim_id, {
+      integration_validation: ["npm test: first"], child_dispositions: [],
+    });
+    await commitRegistryFile(fixture, handoffRelativePath(first), "# committed handoff fixture\n");
+    await claims.finishClaim(task.id, first.claim_id, {
+      status: "handoff",
+      branch: first.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["handoff prepared"],
+      handoff_path: handoffRelativePath(first),
+    });
+    const second = await claims.claimTask(claimInput(task.id, {
+      task_alias: task.aliases[0],
+      session_id: "codex-second",
+    }));
+
+    await expect(claims.getCompletionEvidence(task.id, first.claim_id)).resolves.toEqual(oldEvidence);
+    await expect(claims.finishClaim(task.id, second.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: second.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    })).rejects.toMatchObject({ code: "COMPLETION_EVIDENCE_REQUIRED" });
+    await expect(claims.assertOwner(task.id, second.claim_id)).resolves.toEqual(second);
+  });
+
+  it("moves a child through handoff, permits resume, and rejects terminal reclaim", async () => {
+    const { claims, task, catalog, fixture } = await formalClaimsFixture("parent");
+    const child = await catalog.registerChildTask({
+      parent_task_id: task.id,
+      alias: "wlan:resumable-child",
+      required_for_parent: true,
+      goal: "child work",
+      done_conditions: ["done"],
+      grants: [],
+      dependencies: [],
+    });
+    const first = await claims.claimTask(claimInput(child.id, {
+      task_alias: child.aliases[0],
+      session_id: "codex-child-first",
+    }));
+    await commitRegistryFile(fixture, handoffRelativePath(first), "# committed child handoff fixture\n");
+    await claims.finishClaim(child.id, first.claim_id, {
+      status: "handoff",
+      branch: first.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["handoff ready"],
+      handoff_path: handoffRelativePath(first),
+    });
+    expect((await catalog.getTask(child.id) as { lifecycle: string }).lifecycle).toBe("handoff");
+
+    const resumed = await claims.claimTask(claimInput(child.id, {
+      task_alias: child.aliases[0],
+      session_id: "codex-child-resumed",
+    }));
+    expect((await catalog.getTask(child.id) as { lifecycle: string }).lifecycle).toBe("active");
+    await claims.finishClaim(child.id, resumed.claim_id, {
+      status: "abandoned",
+      outcome: "not needed",
+      branch: resumed.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["parent replanned"],
+    });
+    await expect(claims.claimTask(claimInput(child.id, {
+      task_alias: child.aliases[0],
+      session_id: "codex-child-terminal",
+    }))).rejects.toMatchObject({ code: "TASK_TERMINAL" });
+  });
+
   it("refuses to claim a legacy Task without an explicit Work Contract", async () => {
     const { claims, fixture, task } = await claimsFixture();
     const taskPath = `tasks/${task.id}.yaml`;

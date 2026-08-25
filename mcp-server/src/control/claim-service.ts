@@ -11,6 +11,15 @@ import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
 import { activeClaimRelativePath, taskRelativePath } from "./registry-paths.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
+  TaskCompletionEvidenceRecordSchema,
+  TaskCompletionEvidenceSchema,
+  assertParentCompletionReady,
+  taskCompletionEvidenceDigest,
+  taskCompletionRelativePath,
+  type TaskCompletionEvidence,
+  type TaskCompletionEvidenceRecord,
+} from "./task-completion.js";
+import {
   ActiveClaimSchema,
   ClaimHistorySchema,
   ConflictingClaimSummarySchema,
@@ -219,7 +228,7 @@ export class ClaimService {
       this.assertSessionAvailable(activeClaims, input.session_id, input.host, input.task_id);
       this.assertResourcesAvailable(activeClaims, workContract, input.task_id);
       const predecessor = await this.latestReusablePredecessor(task, input);
-      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(task.id, "active");
+      const lifecyclePaths = await this.catalog.transitionTaskLifecycle(task.id, "active");
 
       const started = this.timestamp();
       claimed = parse(
@@ -281,11 +290,39 @@ export class ClaimService {
       const task = await this.catalog.getTask(taskId);
       const active = await this.requireOwner(task, expectedClaimId);
       await this.assertHandoffAvailable(outcome.handoff_path);
-      history = this.finishHistory(active, outcome, releasedAt);
+      let completionBinding: {
+        completion_evidence_path: string;
+        completion_evidence_digest: string;
+      } | undefined;
+      if (task.kind === "formal" && outcome.status === "completed") {
+        const contractActive = this.requireContractActiveClaim(active);
+        const completion = await this.completionEvidenceAt(task.id, active.claim_id);
+        if (!completion) {
+          throw new ControlError(
+            "COMPLETION_EVIDENCE_REQUIRED",
+            "Formal Claim completion requires evidence from the active generation",
+          );
+        }
+        if (
+          completion.task_id !== contractActive.task_id ||
+          completion.claim_id !== contractActive.claim_id ||
+          completion.work_contract_digest !== contractActive.work_contract_digest
+        ) {
+          throw new ControlError(
+            "COMPLETION_EVIDENCE_MISMATCH",
+            "Completion evidence does not match the active Claim and Work Contract",
+          );
+        }
+        completionBinding = {
+          completion_evidence_path: taskCompletionRelativePath(task.id, active.claim_id),
+          completion_evidence_digest: taskCompletionEvidenceDigest(completion),
+        };
+      }
+      history = this.finishHistory(active, outcome, releasedAt, completionBinding);
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
       await this.catalog.records.remove(activeClaimRelativePath(taskId));
-      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(taskId, outcome.status);
+      const lifecyclePaths = await this.catalog.transitionTaskLifecycle(taskId, outcome.status);
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeClaimRelativePath(taskId), ...lifecyclePaths]);
     });
 
@@ -321,6 +358,111 @@ export class ClaimService {
     assertClaimId(expectedClaimId);
     const task = await this.catalog.getTask(taskId);
     return this.requireOwner(task, expectedClaimId);
+  }
+
+  async markCompletionReady(
+    taskId: string,
+    expectedClaimId: string,
+    rawEvidence: TaskCompletionEvidence,
+  ): Promise<TaskCompletionEvidenceRecord> {
+    assertTaskId(taskId);
+    assertClaimId(expectedClaimId);
+    this.sensitiveData.assertSafe(rawEvidence);
+    const completionPath = taskCompletionRelativePath(taskId, expectedClaimId);
+    await this.assertRegistryPathComponents(completionPath);
+    let result: TaskCompletionEvidenceRecord | undefined;
+
+    await this.registry.transact(`registry: mark task completion ready ${expectedClaimId}`, async () => {
+      const task = await this.catalog.getTask(taskId);
+      const active = this.requireContractActiveClaim(await this.requireOwner(task, expectedClaimId));
+      if (task.kind !== "formal" || task.task_role === undefined || task.work_contract === undefined) {
+        throw new ControlError(
+          "TASK_COMPLETION_FORMAL_REQUIRED",
+          "Completion readiness requires a configured formal standalone or parent Task",
+        );
+      }
+      if (
+        task.task_role === "parent" &&
+        (!Array.isArray(rawEvidence?.integration_validation) ||
+          rawEvidence.integration_validation.length === 0 ||
+          rawEvidence.integration_validation.some((entry) => typeof entry !== "string" || !entry.trim()))
+      ) {
+        throw new ControlError(
+          "PARENT_INTEGRATION_VALIDATION_REQUIRED",
+          "Parent completion requires bounded integration validation",
+        );
+      }
+      const evidence = parse(
+        TaskCompletionEvidenceSchema,
+        rawEvidence,
+        "INVALID_COMPLETION_EVIDENCE",
+        "Completion evidence failed validation",
+      );
+      if (task.task_role === "parent") {
+        assertParentCompletionReady(task, await this.catalog.listChildren(task.id), evidence);
+      } else if (evidence.child_dispositions.length !== 0) {
+        throw new ControlError(
+          "INVALID_PARENT_COMPLETION",
+          "Standalone Task completion cannot carry child dispositions",
+        );
+      }
+
+      const existing = await this.completionEvidenceAt(taskId, expectedClaimId);
+      if (existing) {
+        if (
+          existing.task_id !== task.id ||
+          existing.claim_id !== active.claim_id ||
+          existing.work_contract_digest !== active.work_contract_digest
+        ) {
+          throw corruption("Completion evidence binding disagrees with the active Claim", {
+            task_id: task.id,
+            claim_id: active.claim_id,
+          });
+        }
+        if (JSON.stringify(existing.evidence) !== JSON.stringify(evidence)) {
+          throw new ControlError(
+            "COMPLETION_EVIDENCE_CONFLICT",
+            "Completion evidence is immutable for one Claim generation",
+          );
+        }
+        result = existing;
+        return stage([]);
+      }
+
+      result = parse(
+        TaskCompletionEvidenceRecordSchema,
+        {
+          version: 1,
+          task_id: task.id,
+          claim_id: active.claim_id,
+          work_contract_digest: active.work_contract_digest,
+          recorded_at: this.timestamp(),
+          evidence,
+        },
+        "INVALID_COMPLETION_EVIDENCE",
+        "Completion evidence record failed validation",
+      );
+      await this.catalog.records.writeJson(completionPath, result);
+      return stage([completionPath]);
+    });
+
+    if (!result) throw new Error("Completion readiness transaction did not produce evidence");
+    return result;
+  }
+
+  async getCompletionEvidence(taskId: string, claimId: string): Promise<TaskCompletionEvidenceRecord> {
+    assertTaskId(taskId);
+    assertClaimId(claimId);
+    const completionPath = taskCompletionRelativePath(taskId, claimId);
+    await this.assertRegistryPathComponents(completionPath);
+    const record = await this.completionEvidenceAt(taskId, claimId);
+    if (!record) {
+      throw new ControlError(
+        "COMPLETION_EVIDENCE_NOT_FOUND",
+        "Exact Task completion evidence does not exist",
+      );
+    }
+    return record;
   }
 
   async getClaimHistory(taskId: string, claimId: string): Promise<ClaimHistory> {
@@ -455,7 +597,7 @@ export class ClaimService {
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
       await this.catalog.records.remove(activeClaimRelativePath(taskId));
-      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(taskId, "handoff");
+      const lifecyclePaths = await this.catalog.transitionTaskLifecycle(taskId, "handoff");
       return stage([historyRelativePath(year, taskId, expectedClaimId), activeClaimRelativePath(taskId), ...lifecyclePaths]);
     });
     if (!history) throw new Error("Claim force-end transaction did not produce history");
@@ -673,6 +815,25 @@ export class ClaimService {
     this.assertActiveMatchesTask(active, task, recordPath);
     this.sensitiveData.assertSafe(active);
     return active;
+  }
+
+  private async completionEvidenceAt(
+    taskId: string,
+    claimId: string,
+  ): Promise<TaskCompletionEvidenceRecord | undefined> {
+    const record = await this.catalog.records.readOptionalJson(
+      taskCompletionRelativePath(taskId, claimId),
+      TaskCompletionEvidenceRecordSchema,
+      { field: "claim_id", value: claimId },
+    );
+    if (record && (record.task_id !== taskId || record.claim_id !== claimId)) {
+      throw corruption("Completion evidence path and embedded identity disagree", {
+        task_id: taskId,
+        claim_id: claimId,
+      });
+    }
+    if (record) this.sensitiveData.assertSafe(record);
+    return record;
   }
 
   private requireTaskContract(task: TaskRecord): WorkContract {
@@ -942,7 +1103,15 @@ export class ClaimService {
     }
   }
 
-  private finishHistory(active: ActiveClaim, outcome: FinishOutcome, releasedAt: string): ClaimHistory {
+  private finishHistory(
+    active: ActiveClaim,
+    outcome: FinishOutcome,
+    releasedAt: string,
+    completionBinding?: {
+      completion_evidence_path: string;
+      completion_evidence_digest: string;
+    },
+  ): ClaimHistory {
     return parse(
       ClaimHistorySchema,
       {
@@ -954,6 +1123,7 @@ export class ClaimService {
         status: outcome.status,
         ...(outcome.outcome ? { outcome: outcome.outcome } : {}),
         ...(outcome.handoff_path ? { handoff_path: outcome.handoff_path } : {}),
+        ...completionBinding,
       },
       "INVALID_CLAIM_HISTORY",
       "Claim history record failed validation",

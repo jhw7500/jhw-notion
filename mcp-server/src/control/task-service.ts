@@ -23,6 +23,7 @@ import {
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
 import type { ActiveClaim, ClaimHistory, ContractActiveClaim, ErrorReason } from "./schemas.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import type { TaskCompletionEvidence, TaskCompletionEvidenceRecord } from "./task-completion.js";
 import {
   worktreePlan,
   type RetainedWorktreeGeneration,
@@ -40,6 +41,12 @@ export interface ClaimServicePort {
   latestClaimHistory(taskId: string): Promise<ClaimHistory>;
   latestHandoffHistory(taskId: string): Promise<ClaimHistory>;
   getActive(taskId: string): Promise<ActiveClaim | undefined>;
+  markCompletionReady(
+    taskId: string,
+    claimId: string,
+    evidence: TaskCompletionEvidence,
+  ): Promise<TaskCompletionEvidenceRecord>;
+  getCompletionEvidence(taskId: string, claimId: string): Promise<TaskCompletionEvidenceRecord>;
 }
 
 export interface WorktreeManagerPort {
@@ -97,6 +104,13 @@ export interface TaskFinishInput {
   failures?: HandoffInput["failures"];
   next_step?: HandoffInput["next_step"];
   related_adr_and_evidence?: HandoffInput["related_adr_and_evidence"];
+}
+
+export interface TaskCompletionReadyInput {
+  task_id: string;
+  claim_id: string;
+  integration_validation: string[];
+  child_dispositions: TaskCompletionEvidence["child_dispositions"];
 }
 
 export interface TaskFinishHistory extends ClaimHistory {
@@ -449,6 +463,19 @@ export class TaskService {
 
   async assertOwner(taskId: string, claimId: string): Promise<ActiveClaim> {
     return this.claims.assertOwner(taskId, claimId);
+  }
+
+  async markCompletionReady(input: TaskCompletionReadyInput): Promise<TaskCompletionEvidenceRecord> {
+    this.sensitiveData.assertSafe(input);
+    assertNoAbsoluteHostPaths(input);
+    return this.claims.markCompletionReady(input.task_id, input.claim_id, {
+      integration_validation: input.integration_validation,
+      child_dispositions: input.child_dispositions,
+    });
+  }
+
+  async getCompletionEvidence(taskId: string, claimId: string): Promise<TaskCompletionEvidenceRecord> {
+    return this.claims.getCompletionEvidence(taskId, claimId);
   }
 
   async status(taskId: string, claimId: string): Promise<TaskStatusResult> {

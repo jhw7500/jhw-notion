@@ -40,6 +40,18 @@ const activeClaim = {
   work_contract_digest: workContractDigest(activeWorkContract),
 };
 
+const completionRecord = {
+  version: 1 as const,
+  task_id: TASK_ID,
+  claim_id: CLAIM_ID,
+  work_contract_digest: workContractDigest(activeWorkContract),
+  recorded_at: "2026-08-13T12:36:56.789Z",
+  evidence: {
+    integration_validation: ["npm test: pass"],
+    child_dispositions: [],
+  },
+};
+
 const startInput = {
   task_id: TASK_ID,
   task_alias: taskAlias,
@@ -75,6 +87,8 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     getClaimHistory: vi.fn(),
     latestClaimHistory: vi.fn().mockRejectedValue(new ControlError("CLAIM_HISTORY_NOT_FOUND", "no history")),
     latestHandoffHistory: vi.fn().mockRejectedValue(new ControlError("HANDOFF_NOT_FOUND", "no handoff")),
+    markCompletionReady: vi.fn().mockResolvedValue(completionRecord),
+    getCompletionEvidence: vi.fn().mockResolvedValue(completionRecord),
   };
   const worktrees = {
     createOrReuse: vi.fn().mockResolvedValue({
@@ -152,6 +166,23 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
 }
 
 describe("TaskService", () => {
+  it("records and retrieves structured completion evidence without inspecting or releasing work", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    const input = {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      integration_validation: ["npm test: pass"],
+      child_dispositions: [],
+    };
+
+    await expect(tasks.markCompletionReady(input)).resolves.toEqual(completionRecord);
+    await expect(tasks.getCompletionEvidence(TASK_ID, CLAIM_ID)).resolves.toEqual(completionRecord);
+    expect(claims.markCompletionReady).toHaveBeenCalledWith(TASK_ID, CLAIM_ID, completionRecord.evidence);
+    expect(claims.getCompletionEvidence).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
+    expect(worktrees.inspect).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+  });
+
   it("rejects an incoherent completed release before reading or mutating authority", async () => {
     const { tasks, claims, worktrees, registry } = await taskFixture();
 
@@ -1121,6 +1152,8 @@ describe("TaskService", () => {
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
       latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
+      markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
+      getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1238,6 +1271,8 @@ describe("TaskService", () => {
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
       latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
+      markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
+      getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1418,6 +1453,8 @@ describe("TaskService", () => {
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
       latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
+      markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
+      getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1499,6 +1536,8 @@ describe("TaskService", () => {
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
       latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
+      markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
+      getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
       finishClaim: actualClaims.finishClaim.bind(actualClaims),
     };
     const secretPath = "/srv/jhw/private/project-secret";

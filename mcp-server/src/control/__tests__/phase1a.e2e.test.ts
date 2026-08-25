@@ -1271,6 +1271,12 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-first",
     ], dependencies);
     const firstClaim = JSON.parse(first.stdout).result.claim.claim_id;
+    await graph.tasks.markCompletionReady({
+      task_id: formal.id,
+      claim_id: firstClaim,
+      integration_validation: ["focused e2e: pass"],
+      child_dispositions: [],
+    });
     expect((await runCli(completedFinishArgs(formal.id, firstClaim), dependencies)).exitCode).toBe(0);
 
     const reopened = await runCli([
