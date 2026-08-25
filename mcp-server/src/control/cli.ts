@@ -49,6 +49,7 @@ import {
   BoardConflictSummarySchema,
   BoundedPortfolioPayloadSchema,
   ConflictingClaimSummarySchema,
+  ClaimCoordinateSchema,
   ErrorReasonSchema,
   PreflightResultSchema,
   ProjectRecordLinkSchema,
@@ -393,6 +394,12 @@ function requireTaskId(flags: ParsedFlags, flag = "--task"): string {
 
 function requireClaimId(flags: ParsedFlags, flag = "--claim"): string {
   return assertPattern(required(flags, flag), CLAIM_ID);
+}
+
+function requireClaimCoordinate(flags: ParsedFlags, flag: string): string {
+  const parsed = ClaimCoordinateSchema.safeParse(required(flags, flag));
+  if (!parsed.success) usage("Invalid Claim coordinate");
+  return parsed.data;
 }
 
 function activeSummary(active: ActiveClaim): Record<string, unknown> {
@@ -925,7 +932,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
-    const session_id = required(flags, "--session");
+    const session_id = requireClaimCoordinate(flags, "--session");
     const formalFields = ["--issue-node-id", "--issue-url", "--issue-revision"];
     const temporaryFields = ["--temp-alias", "--goal", "--done", "--scope"];
     const hasFormal = formalFields.some((flag) => flags.has(flag));
@@ -1060,9 +1067,9 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const contractIntent = parseContractIntentFlags(values(flags, "--grant"), values(flags, "--depends"));
     const parent_task_id = requireTaskId(flags, "--parent");
     const aliasInput = required(flags, "--alias");
-    const required_for_parent = parseRequiredForParentFlag(required(flags, "--required-for-parent"));
+    const required_for_parent = parseRequiredForParentFlag(value(flags, "--required-for-parent"));
     const goal = required(flags, "--goal");
-    const session_id = required(flags, "--session");
+    const session_id = requireClaimCoordinate(flags, "--session");
     const child = await dependencies.catalog.registerChildTask({
       parent_task_id,
       alias: aliasInput,

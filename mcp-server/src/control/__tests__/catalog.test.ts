@@ -1068,9 +1068,14 @@ describe("Catalog Task contracts and one-level child topology", () => {
       },
     });
     expect(child.work_contract.grants).not.toContainEqual(repositoryGrant);
+    const issueSourceIndex = JSON.parse(await readFile(join(
+      fixture.registryDir,
+      "tasks/by-source/github",
+      `${sourceIndexKey(parent.issue_node_id)}.yaml`,
+    ), "utf8"));
+    expect(issueSourceIndex).toEqual({ task_id: parent.id });
+    await expect(catalog.getTask(issueSourceIndex.task_id)).resolves.toEqual(parent);
     expect((await catalog.listChildren(parent.id)).map((task) => task.id)).toEqual([child.id]);
-    expect(await git(fixture.registryDir, "ls-tree", "-r", "--name-only", "HEAD", "tasks/by-source/github"))
-      .not.toContain(child.id);
     await expect(catalog.getTask(child.id)).resolves.toEqual(child);
     await expect(catalog.configureInactiveTask({
       task_id: child.id,

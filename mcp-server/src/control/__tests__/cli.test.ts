@@ -907,9 +907,51 @@ describe("runCli", () => {
     expect(JSON.parse(result.stdout).result.task).toMatchObject({ task_id: CHILD_TASK_ID, parent_task_id: TASK_ID });
   });
 
+  it("defaults an omitted required-for-parent flag to true before child registration", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "task", "child-start",
+      "--parent", TASK_ID,
+      "--alias", "local-hardening",
+      "--repo-path", "/srv/src/wlan-package",
+      "--goal", "Harden local package changes",
+      "--done", "host tests pass",
+      "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+      "--session", "codex-local-hardening",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.catalog.registerChildTask).toHaveBeenCalledWith(expect.objectContaining({
+      required_for_parent: true,
+    }));
+  });
+
+  it.each([
+    ["256-byte", "s".repeat(256)],
+    ["multibyte-overflow", "가".repeat(86)],
+    ["control-character", "codex\u0007child"],
+  ])("rejects a %s child session before Registry or Claim mutation", async (_case, session) => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "task", "child-start",
+      "--parent", TASK_ID,
+      "--alias", "local-hardening",
+      "--repo-path", "/srv/src/wlan-package",
+      "--goal", "Harden local package changes",
+      "--done", "host tests pass",
+      "--required-for-parent", "true",
+      "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+      "--session", session,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.catalog.registerChildTask).not.toHaveBeenCalled();
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
   it("rejects missing or malformed child fields before Catalog mutation", async () => {
     for (const tail of [
-      ["--required-for-parent", "true"],
+      [],
       ["--required-for-parent", "yes", "--grant", `repo.modify:repository:${REPO_ID}:shared`],
     ]) {
       const dependencies = makeCliDependencies();

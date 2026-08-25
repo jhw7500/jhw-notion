@@ -18,7 +18,7 @@ const boundedCoordinate = (maximumBytes: number) => z.string().min(1).max(maximu
   .regex(/^[^\u0000-\u001f\u007f]+$/u)
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
 const taskAlias = boundedCoordinate(160);
-const claimCoordinate = boundedCoordinate(255);
+export const ClaimCoordinateSchema = boundedCoordinate(255);
 export const GithubNodeIdSchema = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 const githubApiId = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
 export const SourceTaskRevisionSchema = boundedCoordinate(256);
@@ -155,10 +155,10 @@ const ActiveClaimBaseSchema = z.object({
     repo_id: repositoryId,
     claim_id: canonicalId("clm"),
     predecessor_claim_id: canonicalId("clm").optional(),
-    session_id: claimCoordinate,
-    host: claimCoordinate,
-    branch: claimCoordinate,
-    worktree_ref: claimCoordinate,
+    session_id: ClaimCoordinateSchema,
+    host: ClaimCoordinateSchema,
+    branch: ClaimCoordinateSchema,
+    worktree_ref: ClaimCoordinateSchema,
     source_task_revision: SourceTaskRevisionSchema,
     started_at: OffsetDateTimeSchema,
   });
@@ -292,7 +292,7 @@ export type BoardInterface = z.infer<typeof BoardInterfaceSchema>;
 export const BoardHolderSchema = z
   .object({
     holder_id: canonicalId("hld"),
-    session: claimCoordinate,
+    session: ClaimCoordinateSchema,
     pid: z.number().int().gt(1).nullable(),
     pid_start_time: boundedCoordinate(64).nullable(),
     boot_id: boundedCoordinate(64).nullable(),
@@ -316,7 +316,7 @@ export type BoardHolder = z.infer<typeof BoardHolderSchema>;
 export const BoardReservationSchema = z
   .object({
     reservation_id: canonicalId("rsv"),
-    session: claimCoordinate,
+    session: ClaimCoordinateSchema,
     mode: BoardModeSchema,
     from: OffsetDateTimeSchema,
     to: OffsetDateTimeSchema,
@@ -371,10 +371,10 @@ export const ClaimHistorySchema = z
     repo_id: repositoryId,
     claim_id: canonicalId("clm"),
     predecessor_claim_id: canonicalId("clm").optional(),
-    session_id: claimCoordinate,
-    host: claimCoordinate,
-    branch: claimCoordinate,
-    worktree_ref: claimCoordinate,
+    session_id: ClaimCoordinateSchema,
+    host: ClaimCoordinateSchema,
+    branch: ClaimCoordinateSchema,
+    worktree_ref: ClaimCoordinateSchema,
     source_task_revision: SourceTaskRevisionSchema,
     started_at: OffsetDateTimeSchema,
     released_at: OffsetDateTimeSchema,

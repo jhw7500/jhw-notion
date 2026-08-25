@@ -1,6 +1,6 @@
 ---
 name: jhw-task
-description: "Use when the user explicitly requests a Project Control Task start, child start, contract migration, completion readiness, existing-Task resume, promotion, Handoff, finish, switch, or recovery Use when the user invokes `/jhw:task`, `$jhw-task`, or asks to run the JHW task command."
+description: "Use when the user explicitly requests a Project Control Task start, child start, contract migration, completion readiness, existing-Task resume, promotion, Handoff, finish, a finish-then-start switch, recovery, says 태스크 받아서 or 작업준비, or asks to receive or continue from a HANDOFF*.md file Use when the user invokes `/jhw:task`, `$jhw-task`, or asks to run the JHW task command."
 ---
 
 # jhw-task

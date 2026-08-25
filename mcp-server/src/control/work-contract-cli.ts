@@ -85,7 +85,8 @@ export function parseTaskRoleFlag(raw: string | undefined): TaskRole {
   return parsed.data;
 }
 
-export function parseRequiredForParentFlag(raw: string): boolean {
+export function parseRequiredForParentFlag(raw: string | undefined): boolean {
+  if (raw === undefined) return true;
   if (raw === "true") return true;
   if (raw === "false") return false;
   return invalidCli();

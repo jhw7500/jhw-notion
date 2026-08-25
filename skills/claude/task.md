@@ -1,5 +1,5 @@
 ---
-description: Use when the user explicitly requests a Project Control Task start, child start, contract migration, completion readiness, existing-Task resume, promotion, Handoff, finish, switch, or recovery
+description: Use when the user explicitly requests a Project Control Task start, child start, contract migration, completion readiness, existing-Task resume, promotion, Handoff, finish, a finish-then-start switch, recovery, says 태스크 받아서 or 작업준비, or asks to receive or continue from a HANDOFF*.md file
 argument-hint: "(start | child-start | contract | completion-ready | resume | promote | handoff | finish | switch | recover) <task-or-issue>"
 ---
 
@@ -80,7 +80,7 @@ jhw-control task child-start \
   [--depends observes:<tsk-id> ...] --session <child-session-id>
 ```
 
-`--required-for-parent`는 정확한 `true|false`만 받는다. child는 별도 Issue source index를 만들지 않고 parent의 Project/repository를 이어받되, Work Contract는 전달한 grant만 가진다. worktree 생성 실패 결과의 `error.retained_claim`을 확인하고 기존 recovery 규칙을 따르며 Task/Claim을 임의 삭제하지 않는다.
+`--required-for-parent`를 생략하면 `true`로 정규화하며, 명시할 때는 정확한 `true|false`만 받는다. child는 별도 Issue source index를 만들지 않고 parent의 Project/repository를 이어받되, Work Contract는 전달한 grant만 가진다. worktree 생성 실패 결과의 `error.retained_claim`을 확인하고 기존 recovery 규칙을 따르며 Task/Claim을 임의 삭제하지 않는다.
 
 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
 

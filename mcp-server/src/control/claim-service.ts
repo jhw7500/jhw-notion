@@ -21,6 +21,7 @@ import {
 } from "./task-completion.js";
 import {
   ActiveClaimSchema,
+  ClaimCoordinateSchema,
   ClaimHistorySchema,
   ConflictingClaimSummarySchema,
   ContractActiveClaimSchema,
@@ -54,16 +55,16 @@ const ClaimTaskInputSchema = z.object({
   task_alias: boundedCoordinate(160),
   project_id: z.string().regex(projectIdPattern),
   repo_id: z.string().regex(repositoryIdPattern),
-  session_id: boundedCoordinate(255),
-  host: boundedCoordinate(255),
-  branch: boundedCoordinate(255),
-  worktree_ref: boundedCoordinate(255),
+  session_id: ClaimCoordinateSchema,
+  host: ClaimCoordinateSchema,
+  branch: ClaimCoordinateSchema,
+  worktree_ref: ClaimCoordinateSchema,
 }).strict();
 
 const FinishOutcomeSchema = z.object({
   status: z.enum(["completed", "handoff", "abandoned"]),
   outcome: boundedText(4096).optional(),
-  branch: boundedCoordinate(255),
+  branch: ClaimCoordinateSchema,
   head_sha: boundedCoordinate(128),
   validation: z.array(boundedText(512).refine((value) => value.trim().length > 0)).min(1).max(64),
   handoff_path: z.string().max(160).regex(/^handoffs\/tsk-[0-9a-f-]+\/clm-[0-9a-f-]+\.md$/).optional(),
@@ -80,7 +81,7 @@ const RecoveryStatusActionSchema = z.object({ kind: z.literal("status") }).stric
 const RecoveryForceEndActionSchema = z.object({ kind: z.literal("force-end") }).strict();
 const RecoveryTakeoverActionSchema = z.object({
   kind: z.literal("takeover"),
-  session_id: boundedCoordinate(255),
+  session_id: ClaimCoordinateSchema,
 }).strict();
 const RecoveryActionSchema = z.discriminatedUnion("kind", [
   RecoveryStatusActionSchema,
@@ -257,7 +258,7 @@ export class ClaimService {
   async resolveSessionClaim(sessionId: string, host: string): Promise<ActiveClaim | undefined> {
     this.sensitiveData.assertSafe({ session_id: sessionId, host });
     const lookup = parse(
-      z.object({ session_id: boundedCoordinate(255), host: boundedCoordinate(255) }).strict(),
+      z.object({ session_id: ClaimCoordinateSchema, host: ClaimCoordinateSchema }).strict(),
       { session_id: sessionId, host },
       "INVALID_CLAIM",
       "Invalid Claim session lookup",

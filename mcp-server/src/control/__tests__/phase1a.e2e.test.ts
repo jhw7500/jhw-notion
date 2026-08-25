@@ -180,8 +180,8 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
           issue_url: input.issue_url,
           alias: issueInput.alias,
           ...(input.task_role !== undefined ? { task_role: input.task_role } : {}),
-          grants: input.grants ?? [],
-          dependencies: input.dependencies ?? [],
+          ...(input.grants !== undefined ? { grants: input.grants } : {}),
+          ...(input.dependencies !== undefined ? { dependencies: input.dependencies } : {}),
         });
       },
       registerTemporaryTask: async (input) => {
@@ -189,8 +189,8 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         const { repository_path: _repositoryPath, ...record } = input;
         return graph.catalog.registerTemporaryTask({
           ...record,
-          grants: input.grants ?? [],
-          dependencies: input.dependencies ?? [],
+          ...(input.grants !== undefined ? { grants: input.grants } : {}),
+          ...(input.dependencies !== undefined ? { dependencies: input.dependencies } : {}),
         });
       },
       prepareExistingTask: async (input) => {
@@ -713,6 +713,53 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(rightStart.worktree_ref).not.toBe(leftStart.worktree_ref);
     await expect(graph.claims.assertOwner(left.id, leftStart.claim.claim_id)).resolves.toEqual(leftStart.claim);
     await expect(graph.claims.assertOwner(right.id, rightStart.claim.claim_id)).resolves.toEqual(rightStart.claim);
+  });
+
+  it("4c. CLI source adapters reject omitted contract intent and preserve explicit temporary intent", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const dependencies = cliDependencies(graph);
+
+    await expect(dependencies.source.registerTemporaryTask({
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      repository_path: fixture.sourceRepo,
+      alias: "control:masked-contract",
+      goal: "prove omitted intent is not synthesized",
+      done_conditions: ["registration fails"],
+      expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_REQUIRED" });
+
+    const dependency = await graph.catalog.registerTemporaryTask({
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      alias: "control:dependency",
+      goal: "provide an exact dependency",
+      done_conditions: ["dependency exists"],
+      expected_scope: ["src/dependency"],
+      grants: [],
+      dependencies: [],
+    });
+    const started = await runCli([
+      "task", "start", "--project", "prj-control", "--repo-id", "repo-control",
+      "--repo-path", fixture.sourceRepo, "--temp-alias", "control:explicit-contract",
+      "--goal", "preserve exact CLI contract intent", "--done", "intent is stored",
+      "--scope", "src/control", "--grant", "repo.modify:repository:repo-control:shared",
+      "--depends", `observes:${dependency.id}`, "--session", "codex-explicit-contract",
+    ], dependencies);
+
+    expect(started.exitCode).toBe(0);
+    const taskId = JSON.parse(started.stdout).result.task.task_id as string;
+    await expect(graph.catalog.getTask(taskId)).resolves.toMatchObject({
+      work_contract: {
+        grants: [{
+          capability: "repo.modify",
+          resource: { kind: "repository", id: "repo-control" },
+          coordination: "shared",
+        }],
+        dependencies: [{ relation: "observes", task_id: dependency.id }],
+      },
+    });
   });
 
   it("5. remote divergence fails without rebase, retry, or force", async () => {
