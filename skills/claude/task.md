@@ -1,6 +1,6 @@
 ---
-description: Use when the user explicitly requests a Project Control Task start, existing-Task resume, promotion, Handoff, finish, a finish-then-start switch, recovery, says 태스크 받아서 or 작업준비, or asks to receive or continue from a HANDOFF*.md file
-argument-hint: "(start | resume | promote | handoff | finish | switch | recover) <task-or-issue>"
+description: Use when the user explicitly requests a Project Control Task start, child start, contract migration, completion readiness, existing-Task resume, promotion, Handoff, finish, switch, or recovery
+argument-hint: "(start | child-start | contract | completion-ready | resume | promote | handoff | finish | switch | recover) <task-or-issue>"
 ---
 
 # /jhw:task — 명시적 Task 제어
@@ -28,6 +28,12 @@ argument-hint: "(start | resume | promote | handoff | finish | switch | recover)
 
 ## 새 Task 시작
 
+Task는 repository 자체가 아니라 하나의 명시적 작업 단위다. repository는 Work Contract가 가리키는 resource이며, 같은 repository 안에서도 독립 작업은 child Task별 Claim과 worktree를 사용한다. 한 session은 동시에 하나의 active Task만 소유할 수 있고, dependency는 관찰·순서 메타데이터일 뿐 capability를 부여하지 않는다.
+
+새 formal/temporary Task에는 `--grant`가 1개 이상 필요하다. 형식은 정확히 `capability:resource-kind:resource-id:shared|exclusive`다. `shared`는 같은 canonical resource를 다른 shared Claim과 함께 사용할 수 있고, 어느 한쪽이 `exclusive`이면 동시 Claim을 막는다. byte-identical `--grant` 반복은 하나로 정규화되지만 같은 capability/resource에 coordination만 다르게 주면 오류다. `shell.unclassified`는 runtime 분류 sentinel이라 저장할 수 없다.
+
+dependency 형식은 정확히 `blocked_by|observes|integrates:tsk-...`이며 반복 가능하다. dependency를 grant처럼 해석하거나 parent의 grant를 child에 상속하지 않는다.
+
 ### Formal GitHub Issue
 
 Issue URL이 authority coordinate다. 서버가 verified repository token으로 current node ID, canonical URL, revision, `<owner>/<repo>#<number>` alias를 도출한다.
@@ -35,10 +41,13 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 ```bash
 jhw-control task start \
   --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
-  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
+  --issue-url https://github.com/<owner>/<repo>/issues/<number> \
+  --grant repo.modify:repository:<repo-id>:shared \
+  [--depends observes:<tsk-id> ...] --session <session-id>
 ```
 
 `--issue-node-id`/`--issue-revision`은 independently verified expectation이 이미 있을 때만 추가한다. caller 값을 source authority처럼 만들지 않는다.
+`--role`을 생략하면 `standalone`을 저장한다. child를 둘 formal Task만 `--role parent`로 시작한다.
 
 ### Temporary Task
 
@@ -49,8 +58,29 @@ jhw-control task start \
   --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
   --temp-alias <alias> --goal <goal> \
   --done <condition> [--done <condition> ...] \
-  --scope <scope> [--scope <scope> ...] --session <session-id>
+  --scope <scope> [--scope <scope> ...] \
+  --grant repo.modify:repository:<repo-id>:shared \
+  [--depends blocked_by:<tsk-id> ...] --session <session-id>
 ```
+
+Temporary Task도 `standalone`으로 저장한다. legacy `expected_scope`와 현재 `--scope`는 표시·migration 입력일 뿐 runtime authority가 아니다. 실제 권한은 Work Contract의 exact grant만 결정한다.
+
+### Child Task
+
+같은 repository에서 독립적인 하위 작업을 수행할 때 formal parent를 먼저 `parent` role로 구성하고 child를 등록한 즉시 Claim한다. child마다 별도 session, Claim, branch, worktree가 필요하며 parent grant는 상속되지 않는다.
+
+```bash
+jhw-control task child-start \
+  --parent <parent-tsk-id> --alias <child-alias> \
+  --repo-path <absolute-checkout-root> --goal <goal> \
+  --done <condition> [--done <condition> ...] \
+  --required-for-parent true \
+  --grant repo.modify:repository:<repo-id>:shared \
+  [--grant git.commit:repository:<repo-id>:shared ...] \
+  [--depends observes:<tsk-id> ...] --session <child-session-id>
+```
+
+`--required-for-parent`는 정확한 `true|false`만 받는다. child는 별도 Issue source index를 만들지 않고 parent의 Project/repository를 이어받되, Work Contract는 전달한 grant만 가진다. worktree 생성 실패 결과의 `error.retained_claim`을 확인하고 기존 recovery 규칙을 따르며 Task/Claim을 임의 삭제하지 않는다.
 
 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
 
@@ -65,6 +95,8 @@ jhw-control task start \
 
 성공 결과에 `latest_handoff`가 있을 때만 그것을 재개 context로 보여준다. `latest_handoff`가 없고(강제종료 등) 사용자가 컨텍스트 복구를 요청하면 repo root의 `HANDOFF.<세션>.md`를 보조 context로 읽을 수 있다 — Task 좌표·상태·증거는 command 결과만 정본이다. `TASK_COMPLETED`, `WORKTREE_CLEANUP_REQUIRED`, source/Project/repository mismatch이면 멈춘다. cleanup이 필요하면 아래 exact released-generation 절차를 먼저 승인받는다.
 
+기존 `task start --task ...`에는 registration/contract flag(`--project`, `--repo-id`, Issue/temporary 필드, `--role`, `--grant`, `--depends`)를 섞지 않는다. CLI는 이를 무시하지 않고 `INVALID_CLI_ARGUMENT`로 거부한다.
+
 활성 Claim 확인만 요청받았으면:
 
 ```bash
@@ -72,6 +104,24 @@ jhw-control task status --task <tsk-id> [--claim <active-claim-id>]
 ```
 
 owner(host/branch/worktree), dirty/ahead/behind와 current Claim을 보여준다. 다른 owner이면 작업하지 않는다.
+
+## Work Contract 구성과 migration
+
+legacy contractless Task 또는 inactive Task의 contract를 구성·교체할 때만 실행한다.
+
+```bash
+jhw-control task contract --task <tsk-id> --role standalone \
+  --grant repo.modify:repository:<repo-id>:shared \
+  [--grant test.host:repository:<repo-id>:shared ...] \
+  [--depends blocked_by:<tsk-id> ...]
+
+jhw-control task contract --task <formal-tsk-id> --role parent \
+  --grant repo.modify:repository:<repo-id>:shared
+```
+
+순서는 `finish/handoff → task contract → task start --task ...`다. active Claim의 snapshot은 Task record 수정으로 바뀌지 않으므로 `TASK_CONTRACT_ACTIVE`를 우회하거나 active Claim을 제자리 수정하지 않는다. 변경된 grant를 쓰려면 반드시 새 Claim을 획득한다. command는 새 Task ID를 만들지 않으며 source identity, alias, legacy `expected_scope`를 보존한다.
+
+`TASK_CONTRACT_REQUIRED`는 legacy Task가 새 Claim에 필요한 contract가 없다는 뜻이다. `RESOURCE_AUTHORITY_MISMATCH`는 repository/Issue 등 exact resource가 Task authority와 다르고, `RESOURCE_AUTHORITY_UNSUPPORTED`는 등록된 board처럼 검증 가능한 authority가 없거나 독립 remote/firmware/deployment resource가 아직 지원되지 않는 경우다. Board registry/state가 없거나 손상되면 fail-closed하므로 text ID로 우회하지 않는다.
 
 ## Handoff 조회와 promotion
 
@@ -97,6 +147,19 @@ jhw-control task promote --task <tsk-id> \
 
 사용자가 종료를 명시적으로 요청한 경우에만 실행한다. 모든 status에는 `--validation`이 1개 이상 필요하고 `completed`에는 `--outcome`도 필요하다.
 
+Formal standalone/parent를 completed로 끝내기 전에는 같은 active Claim에 completion evidence를 먼저 기록한다. 이 command는 Issue를 닫거나 Claim을 release하지 않는다.
+
+```bash
+jhw-control task completion-ready --task <tsk-id> --claim <current-claim-id> \
+  --integration-validation <evidence> \
+  [--integration-validation <evidence> ...] \
+  [--child-disposition <child-tsk-id>:superseded|not-required|accepted-risk ...]
+```
+
+parent의 required child는 `completed|abandoned` terminal이어야 한다. required abandoned child마다 정확히 하나의 disposition이 필요하고, completed/unknown/optional child에는 disposition을 보내지 않는다. integration validation은 실제 통합 검증을 구조화해 전달하며 `--outcome` text에서 추출하거나 생성하지 않는다. child/temporary Task에는 `completion-ready`를 사용하지 않는다.
+
+`PARENT_CHILDREN_INCOMPLETE`, `PARENT_DISPOSITION_REQUIRED`, `PARENT_INTEGRATION_VALIDATION_REQUIRED`, `INVALID_PARENT_COMPLETION`이면 증거나 child 상태를 정확히 수정한 뒤 재실행한다. `COMPLETION_EVIDENCE_CONFLICT`는 같은 Claim에 다른 evidence를 덮어쓰려는 시도다. completed formal finish의 `COMPLETION_EVIDENCE_REQUIRED|COMPLETION_EVIDENCE_MISMATCH`는 현재 Claim과 정확히 일치하는 evidence가 없다는 뜻이다. ordinary `task finish`나 다른 subcommand에 completion evidence flag를 붙이면 `INVALID_CLI_ARGUMENT`다.
+
 ```bash
 jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
   --status completed --outcome <result> \
@@ -113,7 +176,7 @@ jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
 
 Handoff는 Registry copy/history를 durable하게 만든 뒤 release하고 worktree를 유지한다. completed/abandoned의 local cleanup 실패는 이미 성공한 release를 되돌리지 않는다.
 
-Formal Task의 `--status completed`는 해당 Claim generation만 archive/release하며 GitHub Issue를 닫지 않는다. Formal lifecycle authority는 Issue의 open/closed 상태다. Issue가 open 또는 reopened이면 같은 Task ID를 검증해 새 Claim으로 재개할 수 있고, terminal 종료는 Issue authority에서 별도로 close한다.
+Formal Task의 `--status completed`는 같은 Claim에 기록된 completion evidence를 요구하고 해당 Claim generation만 archive/release하며 GitHub Issue를 닫지 않는다. live Issue-closed enforcement와 tracker mutation은 별도 tracker workflow 책임이다. Issue가 open 또는 reopened이면 같은 Task ID를 검증해 새 Claim으로 재개할 수 있다.
 
 ## 전환 (switch)
 

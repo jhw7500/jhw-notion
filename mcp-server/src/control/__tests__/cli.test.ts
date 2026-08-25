@@ -6,7 +6,8 @@ import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { controlErrorResult, requiresMutationLock, runCli, type CliDependencies } from "../cli.js";
+import { createCliDependencies, controlErrorResult, requiresMutationLock, runCli, type CliDependencies } from "../cli.js";
+import type { ContractAuthorityPort } from "../contract-authority.js";
 import { ControlError } from "../errors.js";
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { MutationLock, type MutationLockRuntime } from "../process.js";
@@ -14,6 +15,7 @@ import type { ControlConfig } from "../config.js";
 
 const TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000001";
 const CLAIM_ID = "clm-0198e748-3a00-7000-8000-000000000002";
+const CHILD_TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000003";
 const PROJECT_ID = "prj-control";
 const REPO_ID = "repo-control";
 
@@ -96,6 +98,31 @@ function temporaryTask() {
   };
 }
 
+function childTask() {
+  return {
+    id: CHILD_TASK_ID,
+    kind: "child" as const,
+    parent_task_id: TASK_ID,
+    required_for_parent: true,
+    project_id: PROJECT_ID,
+    repo_id: REPO_ID,
+    aliases: ["local-hardening"],
+    goal: "Harden local package changes",
+    done_conditions: ["host tests pass"],
+    lifecycle: "active" as const,
+    work_contract: {
+      version: 1 as const,
+      task_id: CHILD_TASK_ID,
+      grants: [{
+        capability: "repo.modify" as const,
+        resource: { kind: "repository" as const, id: REPO_ID },
+        coordination: "shared" as const,
+      }],
+      dependencies: [],
+    },
+  };
+}
+
 type Overrides = {
   stateDir?: string;
   env?: NodeJS.ProcessEnv;
@@ -140,6 +167,14 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     }),
     recover: vi.fn().mockResolvedValue({ kind: "status", active: activeClaim, process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 }),
     assertOwner: vi.fn().mockResolvedValue(activeClaim),
+    markCompletionReady: vi.fn().mockResolvedValue({
+      version: 1,
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      work_contract_digest: "a".repeat(64),
+      recorded_at: "2026-08-13T00:01:00.000Z",
+      evidence: { integration_validation: ["integration passes"], child_dispositions: [] },
+    }),
     ...overrides.taskService,
   };
   const claimService = {
@@ -148,6 +183,8 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
   const catalog = {
     registerFormalTask: vi.fn().mockResolvedValue({ task: formalTask(), created: true }),
     registerTemporaryTask: vi.fn().mockResolvedValue(temporaryTask()),
+    registerChildTask: vi.fn().mockResolvedValue(childTask()),
+    configureInactiveTask: vi.fn(async (input) => ({ ...formalTask(), task_role: input.task_role, work_contract: input.work_contract })),
     ...overrides.catalog,
   };
   const source = {
@@ -224,6 +261,7 @@ function formalStartArgs(): string[] {
     "--issue-node-id", "I_control",
     "--issue-url", "https://github.com/example/control/issues/1",
     "--issue-revision", "2026-08-13T00:00:00Z",
+    "--grant", `repo.modify:repository:${REPO_ID}:shared`,
     "--session", "codex-123",
   ];
 }
@@ -755,6 +793,13 @@ describe("runCli", () => {
       project_id: PROJECT_ID,
       repo_id: REPO_ID,
       expected_issue_node_id: "I_control",
+      task_role: "standalone",
+      grants: [{
+        capability: "repo.modify",
+        resource: { kind: "repository", id: REPO_ID },
+        coordination: "shared",
+      }],
+      dependencies: [],
     }));
     expect(dependencies.taskService.start).toHaveBeenCalledWith(expect.objectContaining({
       task_id: TASK_ID,
@@ -762,6 +807,243 @@ describe("runCli", () => {
     }));
     expect(`${result.stdout}${result.stderr}${journal}`).not.toContain("/private/source/control");
     expect(`${result.stdout}${result.stderr}${journal}`).not.toContain("I_control");
+  });
+
+  it("composes Catalog board contracts with the production BoardService authority port", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-authority-"));
+    const dependencies = createCliDependencies({
+      HOME: stateDir,
+      JHW_REGISTRY_DIR: join(stateDir, "registry"),
+      JHW_WORKTREE_ROOT: join(stateDir, "worktrees"),
+      JHW_CONTROL_STATE_DIR: join(stateDir, "state"),
+      JHW_BUILD_HOST: "build-host",
+      JHW_GITHUB_OWNER: "example",
+      JHW_PROJECT_NUMBER: "1",
+      JHW_REGISTRY_REPOSITORY: "example/registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+      JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+    });
+    await dependencies.boardService.register({
+      board_id: "wlan-target-board",
+      interfaces: [],
+      session: "codex-authority",
+    });
+    const contract = {
+      version: 1 as const,
+      task_id: TASK_ID,
+      grants: [{
+        capability: "board.execute" as const,
+        resource: { kind: "board" as const, id: "wlan-target-board" },
+        coordination: "exclusive" as const,
+      }],
+      dependencies: [],
+    };
+    const authority = (dependencies.catalog as unknown as { contractAuthority: ContractAuthorityPort }).contractAuthority;
+
+    await expect(authority.assertKnownContract({ ...formalTask(), work_contract: contract }, contract)).resolves.toBeUndefined();
+  });
+
+  it("rejects a new Task without grants before registration or Claim mutation", async () => {
+    const dependencies = makeCliDependencies();
+    const args = formalStartArgs();
+    args.splice(args.indexOf("--grant"), 2);
+
+    const result = await runCli(args, dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.source.registerFormalTask).not.toHaveBeenCalled();
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
+  it("registers a child through Catalog and immediately claims its generated identity", async () => {
+    const child = childTask();
+    const childClaim = { ...activeClaim, task_id: child.id, task_alias: child.aliases[0] };
+    const dependencies = makeCliDependencies({
+      taskService: { start: vi.fn().mockResolvedValue({ ...started, claim: childClaim }) },
+    });
+
+    const result = await runCli([
+      "task", "child-start",
+      "--parent", TASK_ID,
+      "--alias", "local-hardening",
+      "--repo-path", "/srv/src/wlan-package",
+      "--goal", "Harden local package changes",
+      "--done", "host tests pass",
+      "--required-for-parent", "true",
+      "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+      "--grant", `git.commit:repository:${REPO_ID}:shared`,
+      "--session", "codex-local-hardening",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.catalog.registerChildTask).toHaveBeenCalledWith({
+      parent_task_id: TASK_ID,
+      alias: "local-hardening",
+      required_for_parent: true,
+      goal: "Harden local package changes",
+      done_conditions: ["host tests pass"],
+      grants: [
+        {
+          capability: "git.commit",
+          resource: { kind: "repository", id: REPO_ID },
+          coordination: "shared",
+        },
+        {
+          capability: "repo.modify",
+          resource: { kind: "repository", id: REPO_ID },
+          coordination: "shared",
+        },
+      ],
+      dependencies: [],
+    });
+    expect(dependencies.taskService.start).toHaveBeenCalledWith({
+      task_id: CHILD_TASK_ID,
+      task_alias: "local-hardening",
+      project_id: PROJECT_ID,
+      repo_id: REPO_ID,
+      session_id: "codex-local-hardening",
+      repository_path: "/srv/src/wlan-package",
+    });
+    expect(JSON.parse(result.stdout).result.task).toMatchObject({ task_id: CHILD_TASK_ID, parent_task_id: TASK_ID });
+  });
+
+  it("rejects missing or malformed child fields before Catalog mutation", async () => {
+    for (const tail of [
+      ["--required-for-parent", "true"],
+      ["--required-for-parent", "yes", "--grant", `repo.modify:repository:${REPO_ID}:shared`],
+    ]) {
+      const dependencies = makeCliDependencies();
+      const result = await runCli([
+        "task", "child-start", "--parent", TASK_ID, "--alias", "local-hardening",
+        "--repo-path", "/srv/src/wlan-package", "--goal", "Harden local package changes",
+        "--done", "host tests pass", "--session", "codex-local-hardening", ...tail,
+      ], dependencies);
+      expect(result.exitCode).toBe(2);
+      expect(dependencies.catalog.registerChildTask).not.toHaveBeenCalled();
+      expect(dependencies.taskService.start).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects a missing child session before the child record is written", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "task", "child-start", "--parent", TASK_ID, "--alias", "local-hardening",
+      "--repo-path", "/srv/src/wlan-package", "--goal", "Harden local package changes",
+      "--done", "host tests pass", "--required-for-parent", "true",
+      "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.catalog.registerChildTask).not.toHaveBeenCalled();
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["--project", PROJECT_ID],
+    ["--repo-id", REPO_ID],
+    ["--issue-node-id", "I_control"],
+    ["--issue-url", "https://github.com/example/control/issues/1"],
+    ["--issue-revision", "2026-08-13T00:00:00Z"],
+    ["--temp-alias", "control-temp"],
+    ["--goal", "goal"],
+    ["--done", "done"],
+    ["--scope", "src/control"],
+    ["--role", "standalone"],
+    ["--grant", `repo.modify:repository:${REPO_ID}:shared`],
+    ["--depends", `observes:${CHILD_TASK_ID}`],
+  ])("rejects registration/contract flag %s on existing Task start", async (flag, input) => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "task", "start", "--task", TASK_ID, "--repo-path", "/srv/source/control",
+      "--session", "codex-resume", flag, input,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.source.prepareExistingTask).not.toHaveBeenCalled();
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
+  it("configures an inactive Task contract without inventing a Task identity", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "task", "contract", "--task", TASK_ID, "--role", "parent",
+      "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+      "--depends", `observes:${CHILD_TASK_ID}`,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.catalog.configureInactiveTask).toHaveBeenCalledWith({
+      task_id: TASK_ID,
+      task_role: "parent",
+      work_contract: {
+        version: 1,
+        task_id: TASK_ID,
+        grants: [{
+          capability: "repo.modify",
+          resource: { kind: "repository", id: REPO_ID },
+          coordination: "shared",
+        }],
+        dependencies: [{ relation: "observes", task_id: CHILD_TASK_ID }],
+      },
+    });
+  });
+
+  it("surfaces active-Claim contract replacement refusal without starting or releasing a Claim", async () => {
+    const dependencies = makeCliDependencies({
+      catalog: { configureInactiveTask: vi.fn().mockRejectedValue(new ControlError("TASK_CONTRACT_ACTIVE", "active")) },
+    });
+    const result = await runCli([
+      "task", "contract", "--task", TASK_ID, "--role", "standalone",
+      "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "TASK_CONTRACT_ACTIVE" } });
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+    expect(dependencies.taskService.finish).not.toHaveBeenCalled();
+  });
+
+  it("records structured completion readiness without closing or releasing the Claim", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([
+      "task", "completion-ready", "--task", TASK_ID, "--claim", CLAIM_ID,
+      "--integration-validation", "host tests pass",
+      "--integration-validation", "integration smoke passes",
+      "--child-disposition", `${CHILD_TASK_ID}:accepted-risk`,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.taskService.markCompletionReady).toHaveBeenCalledWith({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      integration_validation: ["host tests pass", "integration smoke passes"],
+      child_dispositions: [{ task_id: CHILD_TASK_ID, disposition: "accepted-risk" }],
+    });
+    expect(dependencies.taskService.finish).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["task", "finish", "--task", TASK_ID, "--claim", CLAIM_ID, "--status", "completed", "--outcome", "shipped", "--validation", "pass", "--integration-validation", "must reject"],
+    ["task", "status", "--task", TASK_ID, "--claim", CLAIM_ID, "--child-disposition", `${CHILD_TASK_ID}:superseded`],
+  ])("rejects completion evidence fields outside completion-ready", async (...args) => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli(args, dependencies);
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.taskService.markCompletionReady).not.toHaveBeenCalled();
+    expect(dependencies.taskService.finish).not.toHaveBeenCalled();
+  });
+
+  it("preserves the same-Claim completion evidence refusal from TaskService", async () => {
+    const dependencies = makeCliDependencies({
+      taskService: { finish: vi.fn().mockRejectedValue(new ControlError("COMPLETION_EVIDENCE_REQUIRED", "missing")) },
+    });
+    const result = await runCli([
+      "task", "finish", "--task", TASK_ID, "--claim", CLAIM_ID,
+      "--status", "completed", "--outcome", "shipped", "--validation", "pass",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "COMPLETION_EVIDENCE_REQUIRED" } });
   });
 
   it("resolves an omitted status Claim through ClaimService without exposing host paths", async () => {
@@ -777,6 +1059,9 @@ describe("runCli", () => {
 
   it("classifies only lifecycle mutations for host locking", () => {
     expect(requiresMutationLock(["task", "start"])).toBe(true);
+    expect(requiresMutationLock(["task", "child-start"])).toBe(true);
+    expect(requiresMutationLock(["task", "contract"])).toBe(true);
+    expect(requiresMutationLock(["task", "completion-ready"])).toBe(true);
     expect(requiresMutationLock(["task", "finish"])).toBe(true);
     expect(requiresMutationLock(["task", "recover", "--action", "takeover"])).toBe(true);
     expect(requiresMutationLock(["task", "recover", "--action", "cleanup"])).toBe(true);
@@ -1239,6 +1524,9 @@ describe("runCli", () => {
     expect(result.exitCode).toBe(0);
     for (const command of [
       "task start",
+      "task child-start",
+      "task contract",
+      "task completion-ready",
       "task status",
       "task finish",
       "task recover",

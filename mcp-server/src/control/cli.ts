@@ -21,6 +21,7 @@ import { Catalog } from "./catalog.js";
 import { RegistryRecordStore } from "./codec.js";
 import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
+import { ControlContractAuthority } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
 import { GitHubProjectClient, type RegistrationRecordWarning } from "./github-project.js";
 import { GitHubSourceService } from "./github-source.js";
@@ -33,6 +34,13 @@ import { RegistryGit } from "./registry-git.js";
 import { createSensitiveDataPolicy } from "./sensitive-data.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
+import {
+  parseContractIntentFlags,
+  parseRequiredForParentFlag,
+  parseTaskCompletionEvidenceFlags,
+  parseTaskRoleFlag,
+  parseWorkContractFlags,
+} from "./work-contract-cli.js";
 import { assertPhase1ACommittedLegacy, createAuthorityService } from "./authority.js";
 import { getNotionClient } from "../notion-client.js";
 import { verifyConfiguredNotionAuthorityRoutes } from "../notion/authority-guard.js";
@@ -72,6 +80,9 @@ const CLI_RESULT_BUDGET = MAX_CLI_OUTPUT_BYTES - 256;
 const commandNames = [
   "repository register",
   "task start",
+  "task child-start",
+  "task contract",
+  "task completion-ready",
   "task promote",
   "task handoff",
   "task status",
@@ -135,9 +146,9 @@ export interface CliDependencies {
   registrationRecordWarning?: { code?: RegistrationRecordWarning };
   env: NodeJS.ProcessEnv;
   now?: () => Date;
-  taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff">;
+  taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff" | "markCompletionReady">;
   claimService: Pick<ClaimService, "getActive">;
-  catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask">;
+  catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask" | "registerChildTask" | "configureInactiveTask">;
   source: Pick<GitHubSourceService,
     "registerRepository" | "registerFormalTask" | "registerTemporaryTask" | "prepareExistingTask" | "promoteTemporaryTask">;
   portfolio: PortfolioPort;
@@ -169,7 +180,28 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
   const runner = new ProcessRunner(env);
   const sensitiveData = createSensitiveDataPolicy(env, [config.registryDir, config.stateDir, config.worktreeRoot]);
   const registry = new RegistryGit(config, runner, sensitiveData);
-  const catalog = new Catalog(config, registry, sensitiveData);
+  const livenessProbe = createProcessLivenessProbe();
+  const boardJournal = new BoardJournal(config.stateDir, {}, sensitiveData);
+  const boardService = new BoardService(
+    config,
+    new MutationLock(config, env, undefined, {}, {
+      lockFileName: "boards.lock",
+      waitSeconds: 5,
+      contendedReason: "board_state_lock",
+    }),
+    livenessProbe,
+    () => new Date(),
+    boardJournal,
+    {},
+    sensitiveData,
+  );
+  let catalog!: Catalog;
+  const contractAuthority = new ControlContractAuthority({
+    getRepository: (repoId) => catalog.getRepository(repoId),
+    getTask: (taskId) => catalog.getTask(taskId),
+    boardStatus: (boardId) => boardService.status(boardId),
+  });
+  catalog = new Catalog(config, registry, sensitiveData, contractAuthority);
   const githubProject = new GitHubProjectClient({
     githubOwner: config.githubOwner,
     projectNumber: config.projectNumber,
@@ -216,8 +248,6 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     },
   };
   const worktrees = new WorktreeManager(config, runner);
-  const livenessProbe = createProcessLivenessProbe();
-  const boardJournal = new BoardJournal(config.stateDir, {}, sensitiveData);
   const claims = new ClaimService(config, registry, catalog, {
     async inspect(claim) {
       try {
@@ -267,19 +297,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     // The board lock is a second host-global lock with its own identity: board
     // commands must never contend with registry.lock, and boards.lock waits
     // briefly instead of failing fast because its critical sections are ms-long.
-    boardService: new BoardService(
-      config,
-      new MutationLock(config, env, undefined, {}, {
-        lockFileName: "boards.lock",
-        waitSeconds: 5,
-        contendedReason: "board_state_lock",
-      }),
-      livenessProbe,
-      () => new Date(),
-      boardJournal,
-      {},
-      sensitiveData,
-    ),
+    boardService,
     boardJournal,
     livenessProbe,
     registrationRecordWarning,
@@ -391,7 +409,18 @@ function activeSummary(active: ActiveClaim): Record<string, unknown> {
 }
 
 function taskSummary(task: TaskRecord): Record<string, unknown> {
-  return { task_id: task.id, kind: task.kind, project_id: task.project_id, repo_id: task.repo_id };
+  return {
+    task_id: task.id,
+    kind: task.kind,
+    project_id: task.project_id,
+    repo_id: task.repo_id,
+    ...(task.kind === "child" ? {
+      parent_task_id: task.parent_task_id,
+      required_for_parent: task.required_for_parent,
+    } : {
+      task_role: task.task_role,
+    }),
+  };
 }
 
 function resultJson(command: CommandName, result: unknown): CliResult {
@@ -891,8 +920,8 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const flags = parseFlags(argv.slice(2), new Set([
       "--task",
       "--project", "--repo-id", "--repo-path", "--issue-node-id", "--issue-url", "--issue-revision",
-      "--temp-alias", "--goal", "--done", "--scope", "--session",
-    ]), new Set(["--done", "--scope"]));
+      "--temp-alias", "--goal", "--done", "--scope", "--session", "--role", "--grant", "--depends",
+    ]), new Set(["--done", "--scope", "--grant", "--depends"]));
     assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
@@ -903,10 +932,18 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const hasTemporary = temporaryFields.some((flag) => flags.has(flag));
     const existingTaskId = value(flags, "--task");
     const hasExisting = existingTaskId !== undefined;
-    if (hasExisting && (hasFormal || hasTemporary || flags.has("--project") || flags.has("--repo-id"))) {
+    if (hasExisting && (
+      hasFormal || hasTemporary || flags.has("--project") || flags.has("--repo-id") ||
+      flags.has("--role") || flags.has("--grant") || flags.has("--depends")
+    )) {
       usage("Existing Task resume cannot include registration fields");
     }
     if (!hasExisting && hasFormal === hasTemporary) usage("Task start requires exactly one task source");
+
+    const contractIntent = hasExisting
+      ? undefined
+      : parseContractIntentFlags(values(flags, "--grant"), values(flags, "--depends"));
+    const taskRole = hasExisting ? undefined : parseTaskRoleFlag(value(flags, "--role"));
 
     let task: TaskRecord;
     let alias: string;
@@ -937,6 +974,9 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         repo_id,
         repository_path,
         issue_url,
+        task_role: taskRole,
+        grants: contractIntent?.grants,
+        dependencies: contractIntent?.dependencies,
         ...(value(flags, "--issue-node-id") ? { expected_issue_node_id: value(flags, "--issue-node-id") } : {}),
         ...(value(flags, "--issue-revision") ? { expected_issue_revision: value(flags, "--issue-revision") } : {}),
       });
@@ -950,8 +990,11 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       const done_conditions = values(flags, "--done").filter((entry) => isNonEmpty(entry));
       const expected_scope = values(flags, "--scope").filter((entry) => isNonEmpty(entry));
       if (done_conditions.length === 0 || expected_scope.length === 0) usage("Temporary task needs done and scope values");
+      if (taskRole !== "standalone") usage("Temporary Tasks must use the standalone role");
       task = await dependencies.source.registerTemporaryTask({
         project_id, repo_id, repository_path, alias, goal, done_conditions, expected_scope,
+        grants: contractIntent?.grants,
+        dependencies: contractIntent?.dependencies,
       });
     }
     let latestHandoff: Awaited<ReturnType<CliDependencies["taskService"]["handoff"]>> | undefined;
@@ -1001,6 +1044,96 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     return {
       flags,
       result: resultJson(command, startPayload()),
+    };
+  }
+
+  if (command === "task child-start") {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--parent", "--alias", "--repo-path", "--goal", "--done", "--required-for-parent",
+      "--grant", "--depends", "--session",
+    ]), new Set(["--done", "--grant", "--depends"]));
+    assertSafeFlags(flags, dependencies);
+    const repository_path = required(flags, "--repo-path");
+    if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
+    const done_conditions = values(flags, "--done").filter((entry) => isNonEmpty(entry));
+    if (done_conditions.length === 0) usage("Child Task needs done values");
+    const contractIntent = parseContractIntentFlags(values(flags, "--grant"), values(flags, "--depends"));
+    const parent_task_id = requireTaskId(flags, "--parent");
+    const aliasInput = required(flags, "--alias");
+    const required_for_parent = parseRequiredForParentFlag(required(flags, "--required-for-parent"));
+    const goal = required(flags, "--goal");
+    const session_id = required(flags, "--session");
+    const child = await dependencies.catalog.registerChildTask({
+      parent_task_id,
+      alias: aliasInput,
+      required_for_parent,
+      goal,
+      done_conditions,
+      grants: contractIntent.grants,
+      dependencies: contractIntent.dependencies,
+    });
+    const alias = child.aliases[0] ?? usage("Child Task has no canonical alias");
+    const started = await dependencies.taskService.start({
+      task_id: child.id,
+      task_alias: alias,
+      project_id: child.project_id,
+      repo_id: child.repo_id,
+      session_id,
+      repository_path,
+    });
+    return {
+      flags,
+      result: resultJson(command, {
+        task: taskSummary(child),
+        claim: activeSummary(started.claim),
+        branch: started.branch,
+        worktree_ref: started.worktree_ref,
+        reused: started.reused,
+      }),
+    };
+  }
+
+  if (command === "task contract") {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--task", "--role", "--grant", "--depends",
+    ]), new Set(["--grant", "--depends"]));
+    assertSafeFlags(flags, dependencies);
+    const task_id = requireTaskId(flags);
+    const configured = await dependencies.catalog.configureInactiveTask({
+      task_id,
+      task_role: parseTaskRoleFlag(required(flags, "--role")),
+      work_contract: parseWorkContractFlags(
+        task_id,
+        values(flags, "--grant"),
+        values(flags, "--depends"),
+      ),
+    });
+    return { flags, result: resultJson(command, { task: taskSummary(configured) }) };
+  }
+
+  if (command === "task completion-ready") {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--task", "--claim", "--integration-validation", "--child-disposition",
+    ]), new Set(["--integration-validation", "--child-disposition"]));
+    assertSafeFlags(flags, dependencies);
+    const evidence = parseTaskCompletionEvidenceFlags(
+      values(flags, "--integration-validation"),
+      values(flags, "--child-disposition"),
+    );
+    const recorded = await dependencies.taskService.markCompletionReady({
+      task_id: requireTaskId(flags),
+      claim_id: requireClaimId(flags),
+      integration_validation: evidence.integration_validation,
+      child_dispositions: evidence.child_dispositions,
+    });
+    return {
+      flags,
+      result: resultJson(command, {
+        task_id: recorded.task_id,
+        claim_id: recorded.claim_id,
+        work_contract_digest: recorded.work_contract_digest,
+        recorded_at: recorded.recorded_at,
+      }),
     };
   }
 
@@ -1367,7 +1500,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
 export function requiresMutationLock(argv: readonly string[]): boolean {
   if (argv.length === 1 && argv[0] === "preflight") return true;
   if (argv[0] === "repository" && argv[1] === "register") return true;
-  if (argv[0] === "task" && (argv[1] === "start" || argv[1] === "finish" || argv[1] === "promote")) return true;
+  if (argv[0] === "task" && new Set([
+    "start", "child-start", "contract", "completion-ready", "finish", "promote",
+  ]).has(argv[1] ?? "")) return true;
   if (argv[0] === "project" && (argv[1] === "register" || argv[1] === "update")) return true;
   if (argv[0] === "portfolio" && argv[1] === "export") return true;
   if (argv[0] !== "task" || argv[1] !== "recover") return false;

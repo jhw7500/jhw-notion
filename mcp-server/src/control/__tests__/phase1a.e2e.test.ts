@@ -179,13 +179,19 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
           issue_revision: input.expected_issue_revision ?? issueInput.issue_revision,
           issue_url: input.issue_url,
           alias: issueInput.alias,
-          ...emptyTaskContractIntent(),
+          ...(input.task_role !== undefined ? { task_role: input.task_role } : {}),
+          grants: input.grants ?? [],
+          dependencies: input.dependencies ?? [],
         });
       },
       registerTemporaryTask: async (input) => {
         await ensureRepository();
         const { repository_path: _repositoryPath, ...record } = input;
-        return graph.catalog.registerTemporaryTask({ ...record, ...emptyTaskContractIntent() });
+        return graph.catalog.registerTemporaryTask({
+          ...record,
+          grants: input.grants ?? [],
+          dependencies: input.dependencies ?? [],
+        });
       },
       prepareExistingTask: async (input) => {
         const task = await graph.catalog.getTask(input.task_id);
@@ -388,7 +394,7 @@ function temporaryStartArgs(alias: string, sourceRepo: string, session: string):
   return [
     "task", "start", "--project", "prj-control", "--repo-id", "repo-control", "--repo-path", sourceRepo,
     "--temp-alias", alias, "--goal", "exercise the deterministic gate", "--done", "gate passes",
-    "--scope", "src/control", "--session", session,
+    "--scope", "src/control", "--grant", "repo.modify:repository:repo-control:shared", "--session", session,
   ];
 }
 
@@ -617,7 +623,8 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const formalStartArgs = (session: string) => [
       "task", "start", "--project", issueInput.project_id, "--repo-id", issueInput.repo_id,
       "--repo-path", fixture.sourceRepo, "--issue-node-id", issueInput.issue_node_id,
-      "--issue-url", issueInput.issue_url, "--issue-revision", issueInput.issue_revision, "--session", session,
+      "--issue-url", issueInput.issue_url, "--issue-revision", issueInput.issue_revision,
+      "--grant", "repo.modify:repository:repo-control:shared", "--session", session,
     ];
     const firstPromise = runCli(formalStartArgs("codex-a"), heldDependencies);
     await enteredStart.promise;
@@ -1432,6 +1439,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "--issue-url", overrides.issueUrl ?? issueInput.issue_url,
       "--issue-node-id", overrides.issueNodeId ?? issueInput.issue_node_id,
       "--issue-revision", overrides.issueRevision ?? issueInput.issue_revision,
+      "--grant", "repo.modify:repository:repo-control:shared",
       "--session", session,
     ];
     const initialHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
