@@ -19,7 +19,7 @@ import {
 import type { ControlConfig } from "../config.js";
 import type { OperationRequirement } from "../guard-protocol.js";
 import { GuardRequestStore, type GuardRequest } from "../guard-state.js";
-import type { GuardJournalEvent, GuardJournalPort } from "../guard-journal.js";
+import { GuardJournal, type GuardJournalEvent, type GuardJournalPort } from "../guard-journal.js";
 import type { SecureStateDirectoryHooks } from "../journal.js";
 import { MutationLock, type MutationLockRuntime } from "../process.js";
 import {
@@ -351,6 +351,43 @@ describe("GuardService", () => {
     });
     expect(fixture.claimLookups).toBe(0);
     expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("journals protocol and Claim-free decisions with only legitimately known coordinates", async () => {
+    const stateDir = join(fixture.root, "early-decision-journal");
+    const service = fixture.service({
+      guard_journal: new GuardJournal(stateDir),
+    } as unknown as Partial<GuardServiceOptions>);
+    await service.evaluatePreTool({
+      ...preTool(fixture.cwd) as object,
+      protocol_version: 2,
+      raw_command: "must not be journaled",
+    });
+    fixture.currentClaim = undefined;
+    fixture.activeClaims = [];
+    await service.evaluatePreTool(preTool(fixture.cwd, "Read", { file_path: "src/file.ts" }));
+
+    const rows = (await readFile(join(stateDir, "guard-journal.jsonl"), "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as GuardJournalEvent);
+    expect(rows).toEqual([
+      {
+        protocol_version: 1,
+        evaluation_stage: "hook",
+        event: "decision",
+        occurred_at: expect.any(String),
+        decision_code: "GUARD_PROTOCOL_MISMATCH",
+      },
+      {
+        protocol_version: 1,
+        origin_adapter: "codex",
+        evaluation_stage: "hook",
+        event: "decision",
+        session_id: SESSION_ID,
+        occurred_at: expect.any(String),
+      },
+    ]);
+    expect(JSON.stringify(rows)).not.toContain("must not be journaled");
+    expect(JSON.stringify(rows)).not.toContain("src/file.ts");
   });
 
   it("allows only the closed local read and status fast path without a Claim", async () => {
@@ -1154,6 +1191,49 @@ describe("GuardService", () => {
     });
   });
 
+  it.each(["hook", "publish", "board"] as const)(
+    "never treats a legacy seam's fabricated APPROVED %s binding as persisted authority",
+    async (kind) => {
+      fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+      fixture.currentTask = taskWith(fixture.currentContract);
+      fixture.currentClaim = activeClaim(fixture.currentContract);
+      fixture.activeClaims = [fixture.currentClaim];
+      const command = kind === "publish"
+        ? `jhw-control guard with --task ${TASK_ID} --claim ${CLAIM_ID} --session ${SESSION_ID} --origin-adapter codex -- git push origin HEAD`
+        : `jhw-control board with --board ${BOARD.id} --mode exclusive --task ${TASK_ID} --claim ${CLAIM_ID} --session ${SESSION_ID} --origin-adapter codex --purpose bounded -- flashrom -w firmware.bin`;
+      const event = kind === "hook"
+        ? preTool(fixture.cwd)
+        : preTool(fixture.cwd, "Bash", { command });
+      let seamCalls = 0;
+      const service = fixture.service({
+        permit_decisions: {
+          decideMissingGrant: async (operation, missing) => {
+            seamCalls += 1;
+            return {
+              task_id: operation.task_id,
+              claim_id: operation.claim_id,
+              origin_adapter: operation.origin_adapter,
+              session_id: operation.session_id,
+              cwd_worktree_ref: operation.cwd_worktree_ref,
+              requirements: operation.requirements,
+              missing_requirements: missing,
+              operation_digest: operation.digest,
+              request_state: "APPROVED",
+              request_id: REQUEST_ID,
+              approval_expires_at: "2026-08-25T10:10:00+09:00",
+            };
+          },
+        },
+      });
+
+      await expect(service.evaluatePreTool(event)).resolves.toMatchObject({
+        decision: "DENY",
+        code: "GUARD_UNAVAILABLE",
+      });
+      expect(seamCalls).toBe(1);
+    },
+  );
+
   it("rejects invalid permit metadata rather than exposing a fake unlock", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
@@ -1398,7 +1478,12 @@ describe("GuardService", () => {
         lockRuntime: { spawn: () => completedLockAcquisition() },
         environment: {},
       });
-      const service = integratedService({ guard_request_store: warningStore });
+      const service = integratedService({
+        guard_request_store: warningStore,
+        guard_journal: new GuardJournal(join(fixture.root, "warning-state"), {
+          afterJournalSync: () => { throw new Error("decision journal unavailable"); },
+        }),
+      });
 
       const decision = await service.evaluatePreTool(preTool(fixture.cwd));
       expect(decision).toMatchObject({
@@ -1424,6 +1509,93 @@ describe("GuardService", () => {
         status: "ready",
         requests: [expect.objectContaining({ state: "CONSUMED" })],
       });
+    });
+
+    it("keeps a persisted request authoritative when decision journaling fails", async () => {
+      missingRepositoryModify();
+      const journal = new GuardJournal(join(fixture.root, "guard-state"), {
+        afterJournalSync: () => { throw new Error("decision journal unavailable"); },
+      });
+      const service = integratedService({
+        guard_journal: journal,
+      } as unknown as Partial<GuardServiceOptions>);
+
+      await expect(service.evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+        decision: "PERMIT_REQUIRED",
+        journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+      });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ state: "PENDING", task_id: TASK_ID, claim_id: CLAIM_ID }),
+      ]);
+    });
+
+    it("journals bounded authoritative decisions without raw operation material", async () => {
+      missingRepositoryModify();
+      const journalPath = join(fixture.root, "guard-state", "guard-journal.jsonl");
+      const service = integratedService({
+        guard_journal: new GuardJournal(join(fixture.root, "guard-state")),
+      } as unknown as Partial<GuardServiceOptions>);
+
+      const required = await service.evaluatePreTool(preTool(fixture.cwd));
+      if (required.decision !== "PERMIT_REQUIRED") throw new Error("expected permit request");
+      await service.submitUserPrompt(promptEvent(required.approval_command));
+      await service.evaluatePreTool(preTool(
+        fixture.cwd,
+        "Edit",
+        { file_path: "src/file.ts", old_string: "a", new_string: "b" },
+        "call-journal-consume",
+      ));
+
+      const rows = (await readFile(journalPath, "utf8")).trim().split("\n")
+        .map((line) => JSON.parse(line) as GuardJournalEvent);
+      const decisions = rows.filter((row) => row.event === "decision");
+      expect(decisions).toEqual([
+        expect.objectContaining({
+          event: "decision",
+          origin_adapter: "codex",
+          evaluation_stage: "hook",
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          session_id: SESSION_ID,
+          request_id: required.request_id,
+          operation_digest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          requirements: [{
+            capability: "repo.modify",
+            resource: { kind: "repository", id: REPOSITORY.id },
+          }],
+        }),
+        expect.objectContaining({
+          event: "decision",
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          request_id: required.request_id,
+          operation_digest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        }),
+      ]);
+      const serialized = JSON.stringify(rows);
+      for (const forbidden of [
+        "/jhw:unlock",
+        "src/file.ts",
+        fixture.cwd,
+        "old_string",
+        "new_string",
+      ]) expect(serialized).not.toContain(forbidden);
+    });
+
+    it("does not trust an overridden decision journal authority", async () => {
+      missingRepositoryModify();
+      const journal = new GuardJournal(join(fixture.root, "guard-state"));
+      const forged = vi.fn(async () => undefined);
+      Object.defineProperty(journal, "append", { value: forged });
+      const service = integratedService({
+        guard_journal: journal,
+      } as unknown as Partial<GuardServiceOptions>);
+
+      await expect(service.evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+        decision: "PERMIT_REQUIRED",
+        journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+      });
+      expect(forged).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -1511,6 +1683,20 @@ describe("GuardService", () => {
       ))).resolves.toMatchObject({ decision: "DENY", code: "GUARD_PERMIT_CONSUMED" });
     });
 
+    it("cannot execute a persisted APPROVED request after current authority becomes stale", async () => {
+      missingRepositoryModify();
+      const { requestId, service } = await requestAndApprove();
+      fixture.authorityFailure = new Error("repository authority moved");
+
+      await expect(service.evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+        decision: "DENY",
+        code: "GUARD_RESOURCE_AUTHORITY_UNAVAILABLE",
+      });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ request_id: requestId, state: "APPROVED" }),
+      ]);
+    });
+
     it.each([true, false])("closes only the exact consumed hook correlation when ok=%s", async (ok) => {
       missingRepositoryModify();
       const { requestId, service } = await requestAndApprove();
@@ -1545,6 +1731,26 @@ describe("GuardService", () => {
       ]);
     });
 
+    it("completes hook-started work after legitimate current Claim and authority changes", async () => {
+      missingRepositoryModify();
+      const { requestId, service } = await requestAndApprove();
+      await service.evaluatePreTool(preTool(
+        fixture.cwd,
+        "Edit",
+        { file_path: "src/file.ts", old_string: "a", new_string: "b" },
+        "call-post-start-change",
+      ));
+      fixture.currentClaim = undefined;
+      fixture.activeClaims = [];
+      fixture.authorityFailure = new Error("authority changed after side effect");
+
+      await expect(service.completePostTool(postToolEvent("call-post-start-change", true)))
+        .resolves.toMatchObject({ status: "COMPLETED", request_id: requestId });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ request_id: requestId, state: "COMPLETED" }),
+      ]);
+    });
+
     it.each(["publish", "board"] as const)(
       "leaves an approved %s wrapper permit for execution-layer atomic start",
       async (kind) => {
@@ -1573,6 +1779,28 @@ describe("GuardService", () => {
         ]);
       },
     );
+
+    it("never creates a PostTool correlation for a deferred non-hook permit", async () => {
+      fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+      fixture.currentTask = taskWith(fixture.currentContract);
+      fixture.currentClaim = activeClaim(fixture.currentContract);
+      fixture.activeClaims = [fixture.currentClaim];
+      const command = `jhw-control guard with --task ${TASK_ID} --claim ${CLAIM_ID} --session ${SESSION_ID} --origin-adapter codex -- git push origin HEAD`;
+      const event = preTool(fixture.cwd, "Bash", { command });
+      const { requestId, service } = await requestAndApprove(event);
+
+      await expect(service.evaluatePreTool(preTool(
+        fixture.cwd,
+        "Bash",
+        { command },
+        "call-deferred-no-correlation",
+      ))).resolves.toMatchObject({ decision: "ALLOW", execution_boundary: "guarded_command" });
+      await expect(service.completePostTool(postToolEvent("call-deferred-no-correlation", true)))
+        .resolves.toMatchObject({ status: "DENY", code: "GUARD_REQUEST_NOT_FOUND" });
+      const [stored] = await storedRequests();
+      expect(stored).toMatchObject({ request_id: requestId, state: "APPROVED" });
+      expect(stored).not.toHaveProperty("correlation_id");
+    });
 
     it("fails closed on corrupt request state without creating, reusing, or consuming a request", async () => {
       missingRepositoryModify();

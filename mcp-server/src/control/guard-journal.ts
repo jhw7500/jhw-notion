@@ -31,15 +31,16 @@ const boundedCoordinate = (maximumBytes: number) => z.string()
   .max(maximumBytes)
   .regex(/^[^\u0000-\u001f\u007f]+$/u)
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
+const directlyConstructedGuardJournals = new WeakSet<object>();
 
 export const GuardJournalEventSchema = z.object({
   protocol_version: z.literal(1),
-  origin_adapter: GuardAdapterSchema,
+  origin_adapter: GuardAdapterSchema.optional(),
   evaluation_stage: z.enum(["hook", "execution"]).optional(),
   event: z.enum(["decision", "requested", "approved", "consumed", "completed", "failed", "expired"]),
-  task_id: TaskIdSchema,
-  claim_id: claimId,
-  session_id: boundedCoordinate(255),
+  task_id: TaskIdSchema.optional(),
+  claim_id: claimId.optional(),
+  session_id: boundedCoordinate(255).optional(),
   request_id: RequestIdSchema.optional(),
   operation_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   requirements: CanonicalOperationRequirementsSchema.optional(),
@@ -52,7 +53,18 @@ export const GuardJournalEventSchema = z.object({
   finished_at: OffsetDateTimeSchema.optional(),
   decision_code: GuardDenyCodeSchema.optional(),
   error_reason: ErrorReasonSchema.optional(),
-}).strict();
+}).strict().superRefine((event, context) => {
+  if (event.event === "decision") return;
+  for (const field of ["origin_adapter", "task_id", "claim_id", "session_id"] as const) {
+    if (event[field] === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [field],
+        message: `Lifecycle journal event requires ${field}`,
+      });
+    }
+  }
+});
 export type GuardJournalEvent = z.infer<typeof GuardJournalEventSchema>;
 
 export interface GuardJournalPort {
@@ -68,6 +80,7 @@ export class GuardJournal implements GuardJournalPort {
     sensitiveData?: SensitiveDataPolicy,
   ) {
     this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [stateDir]);
+    if (new.target === GuardJournal) directlyConstructedGuardJournals.add(this);
   }
 
   async append(event: GuardJournalEvent): Promise<void> {
@@ -96,4 +109,9 @@ export class GuardJournal implements GuardJournalPort {
       throw new ControlError("GUARD_JOURNAL_UNAVAILABLE", "Guard journal append is unavailable");
     }
   }
+}
+
+/** True only for journals constructed directly by this module's concrete class. */
+export function isDirectGuardJournal(value: unknown): value is GuardJournal {
+  return typeof value === "object" && value !== null && directlyConstructedGuardJournals.has(value);
 }

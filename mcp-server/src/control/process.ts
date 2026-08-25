@@ -1,6 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { type FileHandle } from "node:fs/promises";
+import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Readable } from "node:stream";
 
@@ -15,6 +17,8 @@ const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
 const MAX_PROCESS_TIMEOUT_MS = 600_000;
 const PROCESS_STOP_GRACE_MS = 100;
 const LOCK_HELPER_TIMEOUT_MS = 5_000;
+const GUARD_REGISTRY_WAIT_SECONDS = 5;
+const GUARD_REGISTRY_ADMISSION_LIMIT = 16;
 
 export interface ProcessResult {
   command: string;
@@ -508,6 +512,30 @@ const productionLockRuntime: MutationLockRuntime = {
 
 const directlyConstructedMutationLocks = new WeakSet<object>();
 
+type GuardMutationRunner = <T>(callback: () => Promise<T>) => Promise<T>;
+
+interface DirectMutationLockAuthority {
+  coordinate: string;
+  guardEligible: boolean;
+  runGuard: GuardMutationRunner;
+}
+
+const directMutationLockAuthorities = new WeakMap<MutationLock, DirectMutationLockAuthority>();
+const guardMutationAuthorityBrand = Symbol("guard-mutation-lock-authority");
+const guardMutationAuthorityRunners = new WeakMap<object, GuardMutationRunner>();
+const activeGuardMutationCoordinates = new AsyncLocalStorage<ReadonlySet<string>>();
+
+interface GuardAdmission {
+  admitted: number;
+  tail: Promise<void>;
+}
+
+const guardAdmissions = new Map<string, GuardAdmission>();
+
+export interface GuardMutationLockAuthority {
+  readonly [guardMutationAuthorityBrand]: true;
+}
+
 /** Non-default lock identity: a second host-global lock that must not contend with registry.lock. */
 export interface MutationLockOptions {
   lockFileName?: string;
@@ -574,7 +602,16 @@ export class MutationLock implements MutationLockPort {
     private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
     private readonly options: MutationLockOptions = {},
   ) {
-    if (new.target === MutationLock) directlyConstructedMutationLocks.add(this);
+    if (new.target === MutationLock) {
+      directlyConstructedMutationLocks.add(this);
+      const lockFileName = options.lockFileName ?? "registry.lock";
+      directMutationLockAuthorities.set(this, {
+        coordinate: `${resolve(config.stateDir)}\u0000${lockFileName}`,
+        guardEligible: lockFileName === "registry.lock" && options.waitSeconds === undefined,
+        runGuard: <T>(callback: () => Promise<T>) =>
+          this.#runLocked(async () => callback(), GUARD_REGISTRY_WAIT_SECONDS),
+      });
+    }
   }
 
   async run<T>(callback: () => Promise<T>): Promise<T> {
@@ -586,7 +623,10 @@ export class MutationLock implements MutationLockPort {
     return this.#runLocked(callback);
   }
 
-  async #runLocked<T>(callback: (directory: SecureStateDirectory) => Promise<T>): Promise<T> {
+  async #runLocked<T>(
+    callback: (directory: SecureStateDirectory) => Promise<T>,
+    waitOverride?: number,
+  ): Promise<T> {
     let directory: SecureStateDirectory | undefined;
     let lockFile: FileHandle | undefined;
     try {
@@ -633,7 +673,7 @@ export class MutationLock implements MutationLockPort {
       const helperEnvironment = sanitizedChildEnvironment(this.environment);
       // The historic marker has no authority and is never passed to the helper.
       delete helperEnvironment.JHW_CONTROL_LOCK_HELD;
-      const wait = this.options.waitSeconds;
+      const wait = waitOverride ?? this.options.waitSeconds;
       if (wait !== undefined && (!Number.isSafeInteger(wait) || wait <= 0 || wait > 60)) {
         throw new ControlError("LOCK_SETUP_FAILED", "Lock wait must be a bounded positive integer");
       }
@@ -667,4 +707,78 @@ export function isDirectMutationLock(value: unknown): value is MutationLock {
   return typeof value === "object"
     && value !== null
     && directlyConstructedMutationLocks.has(value);
+}
+
+/**
+ * Creates opaque Guard-only acquisition authority for the exact direct
+ * Registry-writer lock. The writer's public run() remains non-blocking; only
+ * this captured authority uses bounded host-lock waiting.
+ */
+export function createGuardMutationLockAuthority(
+  mutationLock: MutationLock,
+): GuardMutationLockAuthority {
+  const direct = directMutationLockAuthorities.get(mutationLock);
+  if (
+    !isDirectMutationLock(mutationLock) ||
+    Object.getPrototypeOf(mutationLock) !== MutationLock.prototype ||
+    mutationLock.run !== MutationLock.prototype.run ||
+    mutationLock.runInStateDirectory !== MutationLock.prototype.runInStateDirectory ||
+    !direct?.guardEligible
+  ) {
+    throw new TypeError("Guard mutation authority requires the concrete MutationLock non-blocking Registry implementation");
+  }
+  const authority = Object.freeze({
+    [guardMutationAuthorityBrand]: true,
+  }) as GuardMutationLockAuthority;
+  guardMutationAuthorityRunners.set(authority, (callback) => runGuardAdmission(direct, callback));
+  return authority;
+}
+
+/** Runs one admitted Guard mutation without exposing its private host coordinate. */
+export function runWithGuardMutationLockAuthority<T>(
+  authority: GuardMutationLockAuthority,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const runner = guardMutationAuthorityRunners.get(authority);
+  if (!runner) {
+    return Promise.reject(new ControlError("LOCK_CONTENDED", "Guard mutation authority is unavailable"));
+  }
+  return runner(callback) as Promise<T>;
+}
+
+async function runGuardAdmission<T>(
+  direct: DirectMutationLockAuthority,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const inherited = activeGuardMutationCoordinates.getStore();
+  if (inherited?.has(direct.coordinate)) {
+    throw new ControlError("LOCK_CONTENDED", "Reentrant Guard mutation is not allowed");
+  }
+
+  let admission = guardAdmissions.get(direct.coordinate);
+  if (!admission) {
+    admission = { admitted: 0, tail: Promise.resolve() };
+    guardAdmissions.set(direct.coordinate, admission);
+  }
+  if (admission.admitted >= GUARD_REGISTRY_ADMISSION_LIMIT) {
+    throw new ControlError("LOCK_CONTENDED", "Guard mutation admission limit was reached");
+  }
+
+  admission.admitted += 1;
+  const previous = admission.tail;
+  let release!: () => void;
+  const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+  admission.tail = previous.catch(() => undefined).then(() => gate);
+  await previous.catch(() => undefined);
+  try {
+    const active = new Set(inherited ?? []);
+    active.add(direct.coordinate);
+    return await activeGuardMutationCoordinates.run(active, () => direct.runGuard(callback));
+  } finally {
+    release();
+    admission.admitted -= 1;
+    if (admission.admitted === 0 && guardAdmissions.get(direct.coordinate) === admission) {
+      guardAdmissions.delete(direct.coordinate);
+    }
+  }
 }

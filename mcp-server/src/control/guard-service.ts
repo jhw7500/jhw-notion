@@ -32,7 +32,16 @@ import {
   OperationNormalizationError,
   type NormalizeOperationContext,
 } from "./operation-normalizer.js";
-import { isDirectMutationLock, MutationLock } from "./process.js";
+import {
+  createGuardMutationLockAuthority,
+  MutationLock,
+  runWithGuardMutationLockAuthority,
+} from "./process.js";
+import {
+  GuardJournal,
+  isDirectGuardJournal,
+  type GuardJournalEvent,
+} from "./guard-journal.js";
 import {
   GuardRequestStore,
   type GuardCompleteResult,
@@ -150,6 +159,26 @@ function captureGuardRequestStore(store: GuardRequestStore | undefined): GuardRe
   };
 }
 
+interface GuardJournalAuthority {
+  append(event: GuardJournalEvent): Promise<void>;
+}
+
+const guardJournalAppend = GuardJournal.prototype.append;
+
+function captureGuardJournal(journal: GuardJournal | undefined): GuardJournalAuthority | undefined {
+  if (!journal) return undefined;
+  if (
+    !isDirectGuardJournal(journal) ||
+    Object.getPrototypeOf(journal) !== GuardJournal.prototype ||
+    journal.append !== guardJournalAppend
+  ) {
+    return undefined;
+  }
+  return {
+    append: (event) => guardJournalAppend.call(journal, event),
+  };
+}
+
 export interface GuardClaimServicePort {
   resolveSessionClaim(
     originAdapter: GuardAdapter,
@@ -167,28 +196,6 @@ export interface GuardRegistryViewPort {
 const guardRegistryMutationBarrierBrand = Symbol("guard-registry-mutation-barrier");
 type GuardRegistryMutationBarrierRunner = <T>(callback: () => Promise<T>) => Promise<T>;
 const guardRegistryMutationBarrierRunners = new WeakMap<object, GuardRegistryMutationBarrierRunner>();
-const guardRegistryMutationBarrierQueues = new WeakMap<MutationLock, Promise<void>>();
-
-async function runQueuedGuardRegistryMutation<T>(
-  mutationLock: MutationLock,
-  concreteRun: MutationLock["run"],
-  callback: () => Promise<T>,
-): Promise<T> {
-  const previous = guardRegistryMutationBarrierQueues.get(mutationLock) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => { release = resolve; });
-  const tail = previous.catch(() => undefined).then(() => current);
-  guardRegistryMutationBarrierQueues.set(mutationLock, tail);
-  await previous.catch(() => undefined);
-  try {
-    return await concreteRun.call(mutationLock, callback) as T;
-  } finally {
-    release();
-    if (guardRegistryMutationBarrierQueues.get(mutationLock) === tail) {
-      guardRegistryMutationBarrierQueues.delete(mutationLock);
-    }
-  }
-}
 
 /**
  * Opaque authority to run one Guard evaluation under the Registry writer lock.
@@ -208,20 +215,13 @@ export interface GuardRegistryMutationBarrierPort {
 export function createGuardRegistryMutationBarrier(
   mutationLock: MutationLock,
 ): GuardRegistryMutationBarrierPort {
-  const concreteRun = MutationLock.prototype.run;
-  if (
-    !isDirectMutationLock(mutationLock)
-    || Object.getPrototypeOf(mutationLock) !== MutationLock.prototype
-    || mutationLock.run !== concreteRun
-  ) {
-    throw new TypeError("Guard Registry barrier requires the concrete MutationLock implementation");
-  }
+  const mutationAuthority = createGuardMutationLockAuthority(mutationLock);
   const barrier = Object.freeze({
     [guardRegistryMutationBarrierBrand]: true,
   }) as GuardRegistryMutationBarrierPort;
   guardRegistryMutationBarrierRunners.set(
     barrier,
-    <T>(callback: () => Promise<T>) => runQueuedGuardRegistryMutation(mutationLock, concreteRun, callback),
+    <T>(callback: () => Promise<T>) => runWithGuardMutationLockAuthority(mutationAuthority, callback),
   );
   return barrier;
 }
@@ -292,6 +292,7 @@ export interface GuardServiceOptions {
   registry_mutation_barrier: GuardRegistryMutationBarrierPort;
   permit_decisions?: GuardPermitDecisionPort;
   guard_request_store?: GuardRequestStore;
+  guard_journal?: GuardJournal;
   mode?: GuardEvaluationMode;
   /** Strict read-only inspection seam. It must never create, clean, or lock state. */
   inspect_guard_state?: () => Promise<boolean>;
@@ -620,6 +621,12 @@ interface EvaluationContext {
   classification?: ShellClassification;
 }
 
+interface GuardDecisionJournalContext {
+  event?: PreToolUseEvent;
+  claim?: ActiveClaim;
+  operation?: CanonicalOperation;
+}
+
 interface CurrentPromptContext {
   claim: ContractActiveClaim;
   context: GuardPromptContext;
@@ -634,19 +641,33 @@ export class GuardService {
   private readonly mode: GuardEvaluationMode | undefined;
   private readonly requestStoreConfigured: boolean;
   private readonly requestStore: GuardRequestStoreAuthority | undefined;
+  private readonly journalConfigured: boolean;
+  private readonly decisionJournal: GuardJournalAuthority | undefined;
 
   constructor(private readonly options: GuardServiceOptions) {
     this.mode = GuardEvaluationModeSchema.safeParse(options.mode ?? "enforce").data;
     this.requestStoreConfigured = options.guard_request_store !== undefined;
     this.requestStore = captureGuardRequestStore(options.guard_request_store);
+    this.journalConfigured = options.guard_journal !== undefined;
+    this.decisionJournal = captureGuardJournal(options.guard_journal);
   }
 
   async evaluatePreTool(eventInput: unknown): Promise<GuardDecision> {
+    const journalContext: GuardDecisionJournalContext = {};
+    const decision = await this.evaluatePreToolAuthoritative(eventInput, journalContext);
+    return this.appendDecisionJournal(decision, journalContext);
+  }
+
+  private async evaluatePreToolAuthoritative(
+    eventInput: unknown,
+    journalContext: GuardDecisionJournalContext,
+  ): Promise<GuardDecision> {
     const eventResult = this.safeCommonEvent(eventInput);
     if (!eventResult.success || eventResult.data.event !== "pre_tool_use") {
       return this.deny("GUARD_PROTOCOL_MISMATCH");
     }
     const event = eventResult.data;
+    journalContext.event = event;
     if (!this.mode) return this.deny("GUARD_UNAVAILABLE");
     if (this.mode === "observe" && !await this.observeStateAvailable()) {
       return this.deny("GUARD_UNAVAILABLE");
@@ -692,7 +713,7 @@ export class GuardService {
             }
             authoritativeDecision = committedDecision;
           },
-        });
+        }, journalContext);
         if (authoritativeDecision) return authoritativeDecision;
         if (await this.options.registry_view.committedViewIsStale()) {
           return this.deny("GUARD_UNAVAILABLE");
@@ -711,6 +732,7 @@ export class GuardService {
   private async evaluatePinned(
     event: PreToolUseEvent,
     permitLifecycle: PermitLifecycleBoundary,
+    journalContext: GuardDecisionJournalContext,
   ): Promise<GuardDecision> {
     let activeClaims: ActiveClaim[];
     let claim: ActiveClaim | undefined;
@@ -728,6 +750,7 @@ export class GuardService {
       return this.deny(sameSession ? "GUARD_CLAIM_MISMATCH" : "GUARD_CLAIM_REQUIRED");
     }
     claim = exactClaims[0] as ActiveClaim;
+    journalContext.claim = claim;
 
     let inspection: GuardTaskInspection;
     let task: TaskRecord;
@@ -795,6 +818,7 @@ export class GuardService {
       }
       return this.deny("GUARD_UNAVAILABLE", claim);
     }
+    journalContext.operation = operation;
 
     const evaluation: EvaluationContext = { event, claim, task, inspection, ...(classification ? { classification } : {}) };
     const ownership = this.ownershipDecision(evaluation, operation.requirements, activeClaims);
@@ -869,6 +893,7 @@ export class GuardService {
         !sameRequirements(result.data.missing_requirements, missing)
       ) return this.deny("GUARD_UNAVAILABLE", claim, operation);
       if (result.data.request_state === "APPROVED") {
+        if (!this.requestStore) return this.deny("GUARD_UNAVAILABLE", claim, operation);
         if (operation.execution_boundary !== "hook") {
           const decision = GuardDecisionSchema.parse({
             decision: "ALLOW",
@@ -880,7 +905,6 @@ export class GuardService {
           permitLifecycle.complete(decision);
           return decision;
         }
-        if (!this.requestStore) return this.deny("GUARD_UNAVAILABLE", claim, operation);
         const consumed = await this.requestStore.consumeMatching(operation, event.tool_use_id);
         if (!sameRequestBinding(consumed.request, operation)) {
           return this.deny("GUARD_UNAVAILABLE", claim, operation);
@@ -1209,6 +1233,64 @@ export class GuardService {
     return this.sideDeny(failure.code, event, context, failure.journalWarning, failure.reason);
   }
 
+  private async appendDecisionJournal(
+    decision: GuardDecision,
+    context: GuardDecisionJournalContext,
+  ): Promise<GuardDecision> {
+    if (!this.decisionJournal) {
+      return this.journalConfigured ? this.withJournalWarning(decision) : decision;
+    }
+    const operation = context.operation;
+    const claim = context.claim;
+    const event = context.event;
+    const requestId = decision.decision === "PERMIT_REQUIRED"
+      ? decision.request_id
+      : decision.decision === "ALLOW"
+        ? decision.consumed_request_id
+        : undefined;
+    const journalEvent: GuardJournalEvent = {
+      protocol_version: 1,
+      event: "decision",
+      evaluation_stage: operation?.evaluation_stage ?? "hook",
+      occurred_at: new Date(Date.now()).toISOString(),
+      ...(operation?.origin_adapter || event?.adapter
+        ? { origin_adapter: operation?.origin_adapter ?? event!.adapter }
+        : {}),
+      ...(operation?.session_id || event?.session_id
+        ? { session_id: operation?.session_id ?? event!.session_id }
+        : {}),
+      ...(operation?.task_id || claim?.task_id || (decision.decision === "DENY" && decision.task_id)
+        ? { task_id: operation?.task_id ?? claim?.task_id ?? (decision.decision === "DENY" ? decision.task_id : undefined) }
+        : {}),
+      ...(operation?.claim_id || claim?.claim_id || (decision.decision === "DENY" && decision.claim_id)
+        ? { claim_id: operation?.claim_id ?? claim?.claim_id ?? (decision.decision === "DENY" ? decision.claim_id : undefined) }
+        : {}),
+      ...(requestId ? { request_id: requestId } : {}),
+      ...(operation ? {
+        operation_digest: operation.digest,
+        requirements: operation.requirements,
+      } : {}),
+      ...(decision.decision === "DENY" ? {
+        decision_code: decision.code,
+        ...(decision.reason ? { error_reason: decision.reason } : {}),
+      } : {}),
+    };
+    try {
+      await this.decisionJournal.append(journalEvent);
+      return decision;
+    } catch {
+      return this.withJournalWarning(decision);
+    }
+  }
+
+  private withJournalWarning(decision: GuardDecision): GuardDecision {
+    if (decision.journal_warning === "GUARD_JOURNAL_UNAVAILABLE") return decision;
+    return GuardDecisionSchema.parse({
+      ...decision,
+      journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+    });
+  }
+
   private safeCommonEvent(value: unknown): ReturnType<typeof GuardCommonEventSchema.safeParse> {
     try {
       return GuardCommonEventSchema.safeParse(value);
@@ -1359,8 +1441,13 @@ export interface GuardServiceComposition {
  */
 export function createGuardServiceComposition(
   registryMutationLock: MutationLock,
-  options: Omit<GuardServiceOptions, "registry_mutation_barrier">,
+  options: Omit<GuardServiceOptions, "registry_mutation_barrier" | "guard_journal"> & {
+    guard_journal: GuardJournal;
+  },
 ): GuardServiceComposition {
+  if (!captureGuardJournal(options.guard_journal)) {
+    throw new TypeError("Guard service composition requires the concrete GuardJournal implementation");
+  }
   const registryMutationBarrier = createGuardRegistryMutationBarrier(registryMutationLock);
   return Object.freeze({
     service: new GuardService({

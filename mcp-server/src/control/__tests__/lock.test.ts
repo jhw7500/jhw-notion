@@ -7,7 +7,13 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { MutationLock, ProcessRunner, type MutationLockRuntime } from "../process.js";
+import {
+  createGuardMutationLockAuthority,
+  MutationLock,
+  ProcessRunner,
+  runWithGuardMutationLockAuthority,
+  type MutationLockRuntime,
+} from "../process.js";
 import type { ControlConfig } from "../config.js";
 
 const execFile = promisify(execFileCallback);
@@ -95,6 +101,28 @@ describe("callback mutation lock", () => {
     expect(seen.env).not.toHaveProperty("GH_PROJECT_TOKEN");
     expect(seen.env).not.toHaveProperty("GH_REPO_TOKEN");
     expect(seen.env).not.toHaveProperty("JHW_CONTROL_LOCK_HELD");
+  });
+
+  it("keeps Registry writers nonblocking while the captured Guard authority uses bounded host waiting", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const seen: string[][] = [];
+    const runtime: MutationLockRuntime = {
+      spawn: (_command, args) => {
+        seen.push([...args]);
+        return completedAcquisition(0);
+      },
+    };
+    const lock = new MutationLock(configFor(join(root, "state")), {}, runtime);
+    const authority = createGuardMutationLockAuthority(lock);
+
+    await lock.run(async () => undefined);
+    await runWithGuardMutationLockAuthority(authority, async () => undefined);
+
+    expect(seen).toEqual([
+      ["-n", "-E", "75", "3"],
+      ["-w", "5", "-E", "75", "3"],
+    ]);
   });
 
   it("does not invoke the callback on contention, nonzero acquisition, spawn, or child error", async () => {

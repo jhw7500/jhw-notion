@@ -86,6 +86,31 @@ describe("GuardJournal", () => {
     expect(GuardJournalEventSchema.safeParse({ ...event(), error_reason: "invented_reason" }).success).toBe(false);
   });
 
+  it("accepts only legitimately known coordinates for early decisions while lifecycle rows stay fully bound", () => {
+    expect(GuardJournalEventSchema.safeParse({
+      protocol_version: 1,
+      event: "decision",
+      occurred_at: "2026-08-25T01:00:00.000Z",
+      decision_code: "GUARD_PROTOCOL_MISMATCH",
+    }).success).toBe(true);
+    expect(GuardJournalEventSchema.safeParse({
+      protocol_version: 1,
+      origin_adapter: "codex",
+      evaluation_stage: "hook",
+      event: "decision",
+      session_id: "codex-task-scope-guard",
+      occurred_at: "2026-08-25T01:00:00.000Z",
+      decision_code: "GUARD_CLAIM_REQUIRED",
+    }).success).toBe(true);
+    expect(GuardJournalEventSchema.safeParse({
+      protocol_version: 1,
+      origin_adapter: "codex",
+      evaluation_stage: "hook",
+      event: "requested",
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    }).success).toBe(false);
+  });
+
   it("rejects noncanonical or duplicate requirement lists", () => {
     const commitRequirement = {
       capability: "git.commit" as const,

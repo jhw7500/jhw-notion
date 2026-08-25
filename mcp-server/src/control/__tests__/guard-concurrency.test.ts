@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,8 +13,8 @@ import {
   type GuardServiceOptions,
 } from "../guard-service.js";
 import { GuardRequestStore } from "../guard-state.js";
-import type { GuardJournalEvent, GuardJournalPort } from "../guard-journal.js";
-import { MutationLock } from "../process.js";
+import { GuardJournal, type GuardJournalEvent, type GuardJournalPort } from "../guard-journal.js";
+import { MutationLock, type MutationLockRuntime } from "../process.js";
 import {
   ContractActiveClaimSchema,
   type ContractActiveClaim,
@@ -140,6 +141,8 @@ function postTool(toolUseId: string): unknown {
 
 async function fixture(options: {
   afterGuardStateFileSync?: () => Promise<void>;
+  afterDecisionJournalSync?: () => Promise<void>;
+  registryLockRuntime?: MutationLockRuntime;
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "jhw-guard-concurrency-"));
   roots.push(root);
@@ -149,7 +152,7 @@ async function fixture(options: {
   await writeFile(join(cwd, "file.ts"), "a\n", "utf8");
   const stateDir = join(root, "state");
   const config = configFor(stateDir);
-  const registryMutationLock = new MutationLock(config, {});
+  const registryMutationLock = new MutationLock(config, {}, options.registryLockRuntime);
   const journal = new MemoryJournal();
   const requestStore = new GuardRequestStore(config, {
     journal,
@@ -161,7 +164,14 @@ async function fixture(options: {
   const currentContract = contract();
   const currentTask = task(currentContract);
   const currentClaim = claim(currentContract);
-  const serviceOptions: Omit<GuardServiceOptions, "registry_mutation_barrier"> = {
+  const registryView = {
+    withCommittedView: async <T>(read: () => Promise<T>) => read(),
+    committedViewIsStale: async () => false,
+  };
+  const decisionJournal = new GuardJournal(stateDir, options.afterDecisionJournalSync
+    ? { afterJournalSync: options.afterDecisionJournalSync }
+    : {});
+  const serviceOptions = {
     host: HOST,
     digest_key: Buffer.alloc(32, 7),
     claims: {
@@ -187,14 +197,30 @@ async function fixture(options: {
       sourceRevisionForGuard: async () => currentClaim.source_task_revision,
     },
     authority: { assertKnownRequirement: async () => undefined },
-    registry_view: {
-      withCommittedView: async <T>(read: () => Promise<T>) => read(),
-      committedViewIsStale: async () => false,
-    },
+    registry_view: registryView,
     guard_request_store: requestStore,
-  };
+    guard_journal: decisionJournal,
+  } as Omit<GuardServiceOptions, "registry_mutation_barrier"> & { guard_journal: GuardJournal };
   const composition = createGuardServiceComposition(registryMutationLock, serviceOptions);
-  return { root, cwd, stateDir, requestStore, journal, registryMutationLock, composition };
+  return {
+    root,
+    cwd,
+    stateDir,
+    config,
+    requestStore,
+    journal,
+    decisionJournal,
+    registryView,
+    serviceOptions,
+    registryMutationLock,
+    composition,
+  };
+}
+
+function completedLockAcquisition(status = 0): ReturnType<MutationLockRuntime["spawn"]> {
+  const emitter = new EventEmitter();
+  queueMicrotask(() => emitter.emit("close", status));
+  return emitter as ReturnType<MutationLockRuntime["spawn"]>;
 }
 
 afterEach(async () => {
@@ -257,6 +283,185 @@ describe("GuardService concurrency and Registry composition", () => {
         correlation_id: expect.stringMatching(/^call-race-[ab]$/u),
       })],
     });
+  });
+
+  it("serializes exact retries across distinct concrete Registry locks and request stores on one host coordinate", async () => {
+    let blockConsume = false;
+    let consumeEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { consumeEntered = resolve; });
+    let releaseConsume!: () => void;
+    const release = new Promise<void>((resolve) => { releaseConsume = resolve; });
+    const fixtureValue = await fixture({
+      afterGuardStateFileSync: async () => {
+        if (!blockConsume) return;
+        consumeEntered();
+        await release;
+      },
+    });
+    const secondStore = new GuardRequestStore(fixtureValue.config, {
+      journal: new MemoryJournal(),
+      environment: {},
+    });
+    const secondLock = new MutationLock(fixtureValue.config, {});
+    const secondComposition = createGuardServiceComposition(secondLock, {
+      ...fixtureValue.serviceOptions,
+      guard_request_store: secondStore,
+      guard_journal: new GuardJournal(fixtureValue.stateDir),
+    });
+    const first = await fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-cross-object-request"),
+    );
+    if (first.decision !== "PERMIT_REQUIRED") throw new Error("expected permit request");
+    await fixtureValue.composition.service.submitUserPrompt(prompt(first.approval_command));
+
+    blockConsume = true;
+    const firstRetry = fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-cross-object-a"),
+    );
+    await entered;
+    const secondRetry = secondComposition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-cross-object-b"),
+    );
+    const beforeRelease = await Promise.race([
+      secondRetry.then((decision) => ({ status: "settled" as const, decision })),
+      new Promise<{ status: "waiting" }>((resolve) => setTimeout(() => resolve({ status: "waiting" }), 150)),
+    ]);
+    releaseConsume();
+    const outcomes = await Promise.all([firstRetry, secondRetry]);
+
+    expect(beforeRelease).toEqual({ status: "waiting" });
+    expect(outcomes.filter((entry) => entry.decision === "ALLOW")).toHaveLength(1);
+    expect(outcomes.filter((entry) => entry.decision === "DENY" && entry.code === "GUARD_PERMIT_CONSUMED"))
+      .toHaveLength(1);
+  });
+
+  it("fails same-async-chain Guard reentrancy before enqueue without deadlocking the outer evaluation", async () => {
+    const fixtureValue = await fixture();
+    const originalView = fixtureValue.registryView.withCommittedView;
+    let recursed = false;
+    let nestedResult: unknown;
+    let nestedCompletion: Promise<unknown> | undefined;
+    fixtureValue.registryView.withCommittedView = async <T>(read: () => Promise<T>): Promise<T> => {
+      if (!recursed) {
+        recursed = true;
+        const nested = fixtureValue.composition.service.evaluatePreTool(
+          preTool(fixtureValue.cwd, "call-reentrant-inner"),
+        );
+        nestedCompletion = nested;
+        nestedResult = await Promise.race([
+          nested,
+          new Promise((resolve) => setTimeout(() => resolve("timed-out"), 150)),
+        ]);
+      }
+      return originalView(read);
+    };
+
+    const outer = await fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-reentrant-outer"),
+    );
+    await nestedCompletion;
+
+    expect(nestedResult).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(outer).toMatchObject({ decision: "PERMIT_REQUIRED" });
+  });
+
+  it("bounds Guard waiters and cleans admission after the held evaluation drains", async () => {
+    let stateMutationEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { stateMutationEntered = resolve; });
+    let releaseStateMutation!: () => void;
+    const release = new Promise<void>((resolve) => { releaseStateMutation = resolve; });
+    const fixtureValue = await fixture({
+      afterGuardStateFileSync: async () => {
+        stateMutationEntered();
+        await release;
+      },
+    });
+    const held = fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-capacity-held"),
+    );
+    await entered;
+    const contenders = Array.from({ length: 17 }, (_, index) =>
+      fixtureValue.composition.service.evaluatePreTool(
+        preTool(fixtureValue.cwd, `call-capacity-${index}`),
+      ));
+    const overflow = await Promise.race([
+      Promise.any(contenders.map(async (result) => {
+        const decision = await result;
+        if (decision.decision === "DENY" && decision.code === "GUARD_UNAVAILABLE") return decision;
+        return new Promise<never>(() => undefined);
+      })),
+      new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 200)),
+    ]);
+
+    releaseStateMutation();
+    await Promise.all([held, ...contenders]);
+    expect(overflow).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    await expect(fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-capacity-after-drain"),
+    )).resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+  });
+
+  it("drains Guard admission after callback and acquisition failures", async () => {
+    let acquisition = 0;
+    const acquisitionStatuses = [75, 1, 0, 0, 0];
+    const fixtureValue = await fixture({
+      registryLockRuntime: {
+        spawn: () => completedLockAcquisition(acquisitionStatuses[acquisition++] ?? 0),
+      },
+    });
+
+    await expect(fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-acquire-contention"),
+    )).resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    await expect(fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-acquire-nonzero"),
+    )).resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    await expect(fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-after-acquire-failure"),
+    )).resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+
+    const originalView = fixtureValue.registryView.withCommittedView;
+    fixtureValue.registryView.withCommittedView = async () => {
+      throw new Error("callback failed");
+    };
+    await expect(fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-callback-failure"),
+    )).resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    fixtureValue.registryView.withCommittedView = originalView;
+    await expect(fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-after-callback-failure"),
+    )).resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+  });
+
+  it("appends the decision journal only after releasing the Registry writer lock", async () => {
+    let journalEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { journalEntered = resolve; });
+    let releaseJournal!: () => void;
+    const release = new Promise<void>((resolve) => { releaseJournal = resolve; });
+    const fixtureValue = await fixture({
+      afterDecisionJournalSync: async () => {
+        journalEntered();
+        await release;
+      },
+    });
+    const evaluation = fixtureValue.composition.service.evaluatePreTool(
+      preTool(fixtureValue.cwd, "call-decision-journal-order"),
+    );
+    const reachedJournal = await Promise.race([
+      entered.then(() => true),
+      evaluation.then(() => false),
+    ]);
+    let writerEntered = false;
+    if (reachedJournal) {
+      await fixtureValue.registryMutationLock.run(async () => {
+        writerEntered = true;
+      });
+      releaseJournal();
+    }
+    await evaluation;
+
+    expect(reachedJournal).toBe(true);
+    expect(writerEntered).toBe(true);
   });
 
   it("holds the Registry writer lock before completing consumed Guard state", async () => {
