@@ -75,6 +75,7 @@ import {
 import {
   classifyShell,
   detectGuardSelfApproval,
+  isClaimFreeGuardStatusCommand,
   ShellClassificationError,
   type ExecutionBoundary,
   type ShellClassification,
@@ -437,7 +438,9 @@ async function claimFreeReadSummary(
   if (!root) return undefined;
   if (exactClaimFreeShellTools.has(event.tool_name)) {
     if (!exactKeys(input, ["command"]) || typeof input.command !== "string") return undefined;
-    return claimFreeStatusCommands.has(input.command) ? "Local repository status" : undefined;
+    return claimFreeStatusCommands.has(input.command) || isClaimFreeGuardStatusCommand(input.command)
+      ? "Local repository status"
+      : undefined;
   }
   if (event.tool_name !== "Read") return undefined;
   if (!exactKeys(input, ["file_path", "offset", "limit"]) || typeof input.file_path !== "string") return undefined;

@@ -405,6 +405,77 @@ describe("GuardService", () => {
       .resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
   });
 
+  it.each(["Bash", "exec_command"] as const)(
+    "allows only the CLI-supported Guard diagnostics without a Claim through %s",
+    async (toolName) => {
+      fixture.currentClaim = undefined;
+      fixture.activeClaims = [];
+
+      for (const command of [
+        "jhw-control guard status",
+        `jhw-control guard status --session ${SESSION_ID}`,
+        "jhw-control guard preflight",
+      ]) {
+        await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, { command })))
+          .resolves.toMatchObject({
+            decision: "ALLOW",
+            execution_boundary: "hook",
+            summary: "Local repository status",
+          });
+      }
+
+      expect(fixture.claimLookups).toBe(0);
+      expect(fixture.permitCalls).toBe(0);
+    },
+  );
+
+  it.each(["Bash", "exec_command"] as const)(
+    "keeps hostile scoped Guard status shapes Claim-bound through %s",
+    async (toolName) => {
+      fixture.currentClaim = undefined;
+      fixture.activeClaims = [];
+      const hostileCommands = [
+        ["missing session", "jhw-control guard status --session"],
+        ["flag-shaped missing session", "jhw-control guard status --session --json"],
+        ["duplicate session", `jhw-control guard status --session ${SESSION_ID} --session ${SESSION_ID}`],
+        ["extra suffix", `jhw-control guard status --session ${SESSION_ID} extra`],
+        ["extra flag", `jhw-control guard status --session ${SESSION_ID} --json`],
+        ["joined flag", `jhw-control guard status --session=${SESSION_ID}`],
+        ["semicolon composition", `jhw-control guard status --session ${SESSION_ID}; git status`],
+        ["and composition", `jhw-control guard status --session ${SESSION_ID} && git status`],
+        ["pipeline composition", `jhw-control guard status --session ${SESSION_ID} | git status`],
+        ["newline composition", `jhw-control guard status --session ${SESSION_ID}\ngit status`],
+        ["redirection", `jhw-control guard status --session ${SESSION_ID} > /tmp/guard-status`],
+        ["command substitution", "jhw-control guard status --session $(printf codex-guard-task)"],
+        ["backtick substitution", "jhw-control guard status --session `printf codex-guard-task`"],
+        ["env wrapper", `env jhw-control guard status --session ${SESSION_ID}`],
+        ["assignment prefix", `JHW_TEST=1 jhw-control guard status --session ${SESSION_ID}`],
+        ["command wrapper", `command jhw-control guard status --session ${SESSION_ID}`],
+        ["shell wrapper", `bash -c 'jhw-control guard status --session ${SESSION_ID}'`],
+        ["unterminated quote", `jhw-control guard status --session "${SESSION_ID}`],
+        ["unterminated escape", `jhw-control guard status --session ${SESSION_ID}\\`],
+        ["empty coordinate", 'jhw-control guard status --session ""'],
+        ["control coordinate", "jhw-control guard status --session codex\u0007guard"],
+        ["oversize coordinate", `jhw-control guard status --session ${"x".repeat(256)}`],
+        ["oversize UTF-8 coordinate", `jhw-control guard status --session ${"é".repeat(128)}`],
+      ] as const;
+
+      for (const [label, command] of hostileCommands) {
+        const result = await fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, { command }));
+        expect(result, `${toolName}: ${label}`).toMatchObject({
+          decision: "DENY",
+          code: "GUARD_CLAIM_REQUIRED",
+        });
+      }
+
+      await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, {
+        command: `jhw-control guard status --session ${SESSION_ID}`,
+        timeout_ms: 1_000,
+      }))).resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
+      expect(fixture.permitCalls).toBe(0);
+    },
+  );
+
   it("does not treat suffix aliases, outside paths, sensitive files, or symlinks as Claim-free reads", async () => {
     fixture.currentClaim = undefined;
     fixture.activeClaims = [];

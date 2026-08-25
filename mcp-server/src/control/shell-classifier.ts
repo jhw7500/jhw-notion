@@ -4,6 +4,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { OperationRequirement } from "./guard-protocol.js";
+import { ClaimCoordinateSchema } from "./schemas.js";
 import type { ResourceRef } from "./work-contract.js";
 
 const MAX_COMMAND_BYTES = 64 * 1024;
@@ -811,6 +812,24 @@ export function detectGuardSelfApproval(input: string): boolean {
   const commandArgv = executableArgv(parsed.argv);
   return commandArgv !== undefined && executableName(commandArgv[0] as string) === "jhw-control" &&
     commandArgv[1] === "guard" && new Set(["prompt", "approve", "consume"]).has(commandArgv[2] ?? "");
+}
+
+/** Exact CLI-supported scoped Guard status form for the pre-Claim policy path. */
+export function isClaimFreeGuardStatusCommand(input: string): boolean {
+  if (typeof input !== "string" || input.length === 0 || Buffer.byteLength(input, "utf8") > MAX_COMMAND_BYTES) {
+    return false;
+  }
+  let parsed: ParseResult;
+  try {
+    parsed = parseSimpleArgv(input);
+  } catch {
+    return false;
+  }
+  if (parsed.ambiguous || !parsed.argv || parsed.argv.length !== 5) return false;
+  const [executable, family, action, flag, session] = parsed.argv;
+  return executable === "jhw-control" && family === "guard" && action === "status" &&
+    flag === "--session" && session !== undefined && !session.startsWith("--") &&
+    ClaimCoordinateSchema.safeParse(session).success;
 }
 
 export async function classifyShell(input: string, context: ShellClassifierContext): Promise<ShellClassification> {

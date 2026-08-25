@@ -21,6 +21,14 @@ const GIT_STATE_PARSE_FAMILY = [
 ] as const;
 
 describe("error reason vocabulary", () => {
+  it("documents both claim-free and Claim-bound ALLOW decisions", () => {
+    const doc = readFileSync(join(repositoryRoot, "skills", "claude", "task.md"), "utf8");
+
+    expect(doc).toContain(
+      "`ALLOW`: 명시적으로 claim-free로 분류된 로컬 read/status이거나, 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다.",
+    );
+  });
+
   it("registers every reason literal a control source sets outside the typed helper", () => {
     // handoffRetryConflict's parameter is typed to the vocabulary, so tsc pins
     // its call sites; this sweep pins the untyped `reason:` keys in details

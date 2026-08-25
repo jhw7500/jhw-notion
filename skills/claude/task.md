@@ -254,7 +254,7 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 
 Guard 결과는 다음처럼 해석한다.
 
-- `ALLOW`: 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다.
+- `ALLOW`: 명시적으로 claim-free로 분류된 로컬 read/status이거나, 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다.
 - `PERMIT_REQUIRED`: 소유권 충돌 없이 Work Contract 범위만 부족하다. Guard가 반환한 exact `approval_command`로 표시된 작업 한 건만 사용자 승인을 받을 수 있다.
 - `DENY`: hard-deny 또는 안전 상태를 검증할 수 없는 경우다. unlock으로 우회하지 않는다.
 
