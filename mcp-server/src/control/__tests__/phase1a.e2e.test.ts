@@ -21,7 +21,7 @@ import { createSensitiveDataPolicy } from "../sensitive-data.js";
 import { sourceIndexKey } from "../ids.js";
 import { TaskService } from "../task-service.js";
 import { WorktreeManager, type WorktreeStateHooks } from "../worktree.js";
-import { configFor, git, isolatedRegistryGit, makeRegistryFixture } from "./helpers.js";
+import { configFor, emptyTaskContractIntent, git, isolatedRegistryGit, makeRegistryFixture } from "./helpers.js";
 
 interface GateFixture {
   root: string;
@@ -179,12 +179,13 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
           issue_revision: input.expected_issue_revision ?? issueInput.issue_revision,
           issue_url: input.issue_url,
           alias: issueInput.alias,
+          ...emptyTaskContractIntent(),
         });
       },
       registerTemporaryTask: async (input) => {
         await ensureRepository();
         const { repository_path: _repositoryPath, ...record } = input;
-        return graph.catalog.registerTemporaryTask(record);
+        return graph.catalog.registerTemporaryTask({ ...record, ...emptyTaskContractIntent() });
       },
       prepareExistingTask: async (input) => {
         const task = await graph.catalog.getTask(input.task_id);
@@ -553,8 +554,8 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const right = new Catalog(rightConfig, isolatedRegistryGit(rightConfig, rightRunner));
 
     const results = await runDeterministicPushRace(
-      () => left.registerFormalTask(issueInput),
-      () => right.registerFormalTask(issueInput),
+      () => left.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() }),
+      () => right.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() }),
       leftRunner,
       rightRunner,
     );
@@ -579,8 +580,9 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const temporary = await graph.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:temporary", goal: "temporary",
       done_conditions: ["test"], expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
-    const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const formal = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
     const head = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
     const temporaryBytes = await readFile(join(fixture.cloneA, "tasks", `${temporary.id}.yaml`), "utf8");
     const formalBytes = await readFile(join(fixture.cloneA, "tasks", `${formal.id}.yaml`), "utf8");
@@ -599,7 +601,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
-    const canonical = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const canonical = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
     const enteredStart = deferred();
     const release = deferred();
     const coordinatedTasks = Object.create(graph.tasks) as TaskService;
@@ -735,6 +737,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const task = await graphA.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:death", goal: "recover",
       done_conditions: ["status"], expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const delegate = new ProcessRunner();
     let pushed = false;
@@ -889,6 +892,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const task = await graph.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:offline", goal: "offline",
       done_conditions: ["later"], expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const provisional = join(fixture.worktreeRoot, "offline-provisional");
     await git(fixture.sourceRepo, "worktree", "add", "-b", "provisional/offline", provisional, "HEAD");
@@ -1196,7 +1200,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
-    const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const formal = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
     const dependencies = cliDependencies(graph);
     const first = await runCli([
       "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-first",
@@ -1267,6 +1271,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       await expect(catalog.registerTemporaryTask({
         project_id: "prj-control", repo_id: "repo-control", alias: `control:rejected-${goal === secret ? "secret" : createHash("sha256").update(goal).digest("hex").slice(0, 8)}`,
         goal, done_conditions: ["reject"], expected_scope: ["src/control"],
+        ...emptyTaskContractIntent(),
       })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
     }
     expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(before);
@@ -1335,7 +1340,12 @@ describe("Phase 1A deterministic adversarial gate", () => {
         },
       },
     });
-    const dependencies = cliDependencies(graph, { source });
+    const sourceWithContractIntent = Object.create(source) as GitHubSourceService;
+    sourceWithContractIntent.registerFormalTask = (input) => source.registerFormalTask({
+      ...input,
+      ...emptyTaskContractIntent(),
+    });
+    const dependencies = cliDependencies(graph, { source: sourceWithContractIntent });
     const registered = await runCli([
       "repository", "register", "--repo-id", "repo-control", "--slug", "jhw7500/control",
       "--repo-path", fixture.sourceRepo,
@@ -1427,7 +1437,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const beforeHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
     const beforeRemote = (await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim();
 
-    await expect(graph.catalog.registerFormalTask(duplicateIssue)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    await expect(graph.catalog.registerFormalTask({ ...duplicateIssue, ...emptyTaskContractIntent() })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
 
     expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
     expect((await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim()).toBe(beforeRemote);
@@ -1755,14 +1765,14 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
-    const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const formal = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
     const secondIssue = {
       ...issueInput,
       issue_node_id: "I_phase1a_second",
       issue_url: "https://github.com/jhw7500/control/issues/2",
       alias: "jhw7500/control#2",
     };
-    const releasedBeforeRename = (await graph.catalog.registerFormalTask(secondIssue)).task;
+    const releasedBeforeRename = (await graph.catalog.registerFormalTask({ ...secondIssue, ...emptyTaskContractIntent() })).task;
     const initialDependencies = cliDependencies(graph);
     const initialStart = await runCli([
       "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-before-repository-rename",

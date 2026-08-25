@@ -13,7 +13,7 @@ import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { TaskService } from "../task-service.js";
 import { WorktreeManager, worktreePlan } from "../worktree.js";
-import { configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { configFor, emptyTaskContractIntent, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 const localPaths: string[] = [];
@@ -554,6 +554,7 @@ describe("TaskService", () => {
     const task = await catalog.registerTemporaryTask({
       project_id: "prj-wlan", repo_id: "repo-wlan", alias,
       goal: "recover a released worktree", done_conditions: ["cleanup"], expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const claims = new ClaimService(config, registry, catalog, {
       async inspect() { return { process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 }; },
@@ -1083,6 +1084,7 @@ describe("TaskService", () => {
       goal: "deliberately omitted from handoff",
       done_conditions: ["targeted test"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const inspection: ClaimInspection = {
       async inspect() {
@@ -1214,6 +1216,7 @@ describe("TaskService", () => {
       goal: "temporary ignored handoff",
       done_conditions: ["retry"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const actualClaims = new ClaimService(config, registry, catalog, {
       async inspect() {
@@ -1285,6 +1288,7 @@ describe("TaskService", () => {
       goal: "recover an exact failed Handoff successor rebind",
       done_conditions: ["same worktree is reused"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const claims = new ClaimService(config, registry, catalog, {
       async inspect() {
@@ -1366,6 +1370,7 @@ describe("TaskService", () => {
       goal: "retry a reused worktree with an existing local handoff",
       done_conditions: ["release retry succeeds"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const actualClaims = new ClaimService(config, registry, catalog, {
       async inspect() {
@@ -1468,6 +1473,7 @@ describe("TaskService", () => {
       goal: "temporary task",
       done_conditions: ["test"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const inspection: ClaimInspection = {
       async inspect() {

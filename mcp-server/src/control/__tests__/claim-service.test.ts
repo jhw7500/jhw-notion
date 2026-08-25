@@ -9,7 +9,7 @@ import { ControlError } from "../errors.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
-import { commitFile, configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { commitFile, configFor, emptyTaskContractIntent, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 const fixedNow = new Date("2026-08-13T12:34:56.789Z");
@@ -42,6 +42,7 @@ async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: S
     goal: "fix roaming regression",
     done_conditions: ["targeted test passes"],
     expected_scope: ["src/roaming.ts"],
+    ...emptyTaskContractIntent(),
   });
   return {
     fixture,

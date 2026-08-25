@@ -353,6 +353,9 @@ export class Catalog {
           registration = { task: current, created: false };
           return noChanges();
         }
+        if (current.task_role === undefined || current.work_contract === undefined) {
+          throw new ControlError("TASK_CONTRACT_REQUIRED", "Legacy Task must be configured before source refresh");
+        }
         const updated = record(FormalTaskSchema, {
           ...current,
           aliases,

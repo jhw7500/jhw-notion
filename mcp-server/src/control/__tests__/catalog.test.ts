@@ -1156,4 +1156,25 @@ describe("Catalog Task contracts and one-level child topology", () => {
       work_contract: { version: 1, task_id: parent.id, grants: [], dependencies: [] },
     })).rejects.toMatchObject({ code: "TASK_CONTRACT_ACTIVE" });
   });
+
+  it("refuses to refresh an unconfigured legacy formal Task before inactive configuration", async () => {
+    const { catalog, fixture } = await catalogFixture(undefined, false);
+    const parent = await registerParent(catalog);
+    const legacy = { ...parent } as Record<string, unknown>;
+    delete legacy.task_role;
+    delete legacy.work_contract;
+    const taskPath = `tasks/${parent.id}.yaml`;
+    await commitFile(fixture.registryDir, taskPath, `${JSON.stringify(legacy)}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeBytes = await readFile(join(fixture.registryDir, taskPath), "utf8");
+
+    await expect(catalog.registerFormalTask({
+      ...issueInput,
+      issue_revision: "2026-08-14T00:00:00Z",
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_REQUIRED" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect(await readFile(join(fixture.registryDir, taskPath), "utf8")).toBe(beforeBytes);
+  });
 });
