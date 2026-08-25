@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ControlConfig } from "../config.js";
 import {
-  createGuardServiceComposition,
+  createGuardServiceCompositionForTesting as createGuardServiceComposition,
   type GuardServiceOptions,
 } from "../guard-service.js";
 import { GuardRequestStore } from "../guard-state.js";

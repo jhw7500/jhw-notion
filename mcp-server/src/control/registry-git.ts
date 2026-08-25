@@ -201,11 +201,7 @@ export class RegistryGit {
   async committedViewIsStale(): Promise<boolean> {
     const pinned = this.committedTree?.commit;
     if (pinned === undefined) return false;
-    try {
-      return (await this.headCommit()) !== pinned;
-    } catch {
-      return false;
-    }
+    return (await this.headCommit()) !== pinned;
   }
 
   /** One recursive listing, held to the same gates a single lookup applies. */

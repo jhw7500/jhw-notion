@@ -9,14 +9,41 @@ import {
   OperationNormalizationError,
   computeOperationDigest,
   normalizeOperation,
+  normalizeResolvedOperation,
   stableCanonicalJson,
   type NormalizeOperationContext,
 } from "../operation-normalizer.js";
-import { CanonicalOperationSchema, type PreToolUseEvent } from "../guard-protocol.js";
+import { guardToolIdentityInventoryForTesting, resolveGuardTool } from "../guard-tool-resolver.js";
+import { CanonicalOperationSchema, type JsonValue, type PreToolUseEvent } from "../guard-protocol.js";
 
 const TASK_ID = "tsk-018f21e0-7b2c-7a00-8000-000000000001";
 const CLAIM_ID = "clm-018f21e0-7b2c-7a00-8000-000000000002";
 const KEY = Buffer.alloc(32, 0x42);
+const SUPPORTED_GUARD_TOOL_CASES = [
+  { adapter: "codex", raw: "Read", input: { file_path: "src/file.ts" }, tool: "file.read", capability: "repo.inspect" },
+  { adapter: "codex", raw: "Glob", input: { pattern: "**/*.ts", path: "src" }, tool: "file.read", capability: "repo.inspect" },
+  { adapter: "codex", raw: "Grep", input: { pattern: "bounded", path: "src" }, tool: "file.read", capability: "repo.inspect" },
+  { adapter: "codex", raw: "read_file", input: { path: "src/file.ts" }, tool: "file.read", capability: "repo.inspect" },
+  { adapter: "codex", raw: "mcp__filesystem__read_file", input: { path: "src/file.ts" }, tool: "file.read", capability: "repo.inspect" },
+  { adapter: "codex", raw: "Edit", input: { file_path: "src/file.ts", old_string: "a", new_string: "b" }, tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "Write", input: { file_path: "src/file.ts", content: "bounded" }, tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "NotebookEdit", input: { notebook_path: "notes.ipynb", cell_id: "one", new_source: "bounded" }, tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "edit_file", input: { path: "src/file.ts", old_string: "a", new_string: "b" }, tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "mcp__filesystem__write_file", input: { path: "src/file.ts", content: "bounded" }, tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "apply_patch", input: "*** Begin Patch\n*** Update File: src/file.ts\n*** End Patch", tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "functions.apply_patch", input: { patch: "*** Begin Patch\n*** Update File: src/file.ts\n*** End Patch" }, tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "Bash", input: { command: "git status --short" }, tool: "shell", capability: "shell.unclassified" },
+  { adapter: "codex", raw: "exec_command", input: { command: "git status --short" }, tool: "shell", capability: "shell.unclassified" },
+  { adapter: "codex", raw: "jhw_record", input: { db: "decisionLog", title: "bounded" }, tool: "notion.mutate", capability: "notion.mutate" },
+  { adapter: "codex", raw: "jhw_save", input: { db: "decisionLog", id: "page" }, tool: "notion.mutate", capability: "notion.mutate" },
+  { adapter: "codex", raw: "jhw_delete", input: { db: "decisionLog", id: "page" }, tool: "notion.mutate", capability: "notion.mutate" },
+  { adapter: "codex", raw: "jhw_note", input: { title: "bounded" }, tool: "notion.mutate", capability: "notion.mutate" },
+  { adapter: "codex", raw: "github_issue_close", input: { issue_node_id: "I_kwDOAb-123" }, tool: "tracker.mutate", capability: "tracker.mutate" },
+  { adapter: "codex", raw: "github_issue_edit", input: { issue_node_id: "I_kwDOAb-123", title: "bounded" }, tool: "tracker.mutate", capability: "tracker.mutate" },
+  { adapter: "codex", raw: "github_issue_comment", input: { issue_node_id: "I_kwDOAb-123", body: "bounded" }, tool: "tracker.mutate", capability: "tracker.mutate" },
+  { adapter: "claude", raw: "Bash", input: { command: "git status --short" }, tool: "shell", capability: "shell.unclassified" },
+  { adapter: "claude", raw: "Edit", input: { file_path: "src/file.ts", old_string: "a", new_string: "b" }, tool: "file.modify", capability: "repo.modify" },
+] as const;
 
 describe("operation normalization", () => {
   let root: string;
@@ -93,29 +120,130 @@ describe("operation normalization", () => {
   });
 
   it.each([
-    ["Read", "repo.inspect", "file.read", "low"],
-    ["Glob", "repo.inspect", "file.read", "low"],
-    ["Grep", "repo.inspect", "file.read", "low"],
-    ["read_file", "repo.inspect", "file.read", "low"],
-    ["Edit", "repo.modify", "file.modify", "medium"],
-    ["Write", "repo.modify", "file.modify", "medium"],
-    ["NotebookEdit", "repo.modify", "file.modify", "medium"],
-    ["apply_patch", "repo.modify", "file.modify", "medium"],
-    ["functions.apply_patch", "repo.modify", "file.modify", "medium"],
-    ["mcp__filesystem__read_file", "repo.inspect", "file.read", "low"],
-    ["mcp__filesystem__write_file", "repo.modify", "file.modify", "medium"],
-    ["edit_file", "repo.modify", "file.modify", "medium"],
-  ] as const)("maps central file tool %s to %s", async (tool_name, capability, tool, risk) => {
+    ["Read", { file_path: "private/file.ts" }, "repo.inspect", "file.read", "low"],
+    ["Glob", { pattern: "private/*.ts" }, "repo.inspect", "file.read", "low"],
+    ["Grep", { pattern: "credential-value" }, "repo.inspect", "file.read", "low"],
+    ["read_file", { path: "private/file.ts" }, "repo.inspect", "file.read", "low"],
+    ["Edit", { file_path: "private/file.ts", old_string: "old", new_string: "credential-value" }, "repo.modify", "file.modify", "medium"],
+    ["Write", { file_path: "private/file.ts", content: "credential-value" }, "repo.modify", "file.modify", "medium"],
+    ["NotebookEdit", { notebook_path: "private/file.ts" }, "repo.modify", "file.modify", "medium"],
+    ["apply_patch", "*** Begin Patch\n*** Update File: private/file.ts\n*** End Patch", "repo.modify", "file.modify", "medium"],
+    ["functions.apply_patch", { patch: "*** Begin Patch\n*** Update File: private/file.ts\n*** End Patch" }, "repo.modify", "file.modify", "medium"],
+    ["mcp__filesystem__read_file", { path: "private/file.ts" }, "repo.inspect", "file.read", "low"],
+    ["mcp__filesystem__write_file", { path: "private/file.ts", content: "credential-value" }, "repo.modify", "file.modify", "medium"],
+    ["edit_file", { path: "private/file.ts", old_string: "old", new_string: "credential-value" }, "repo.modify", "file.modify", "medium"],
+  ] as const)("maps central file tool %s to %s", async (tool_name, tool_input, capability, tool, risk) => {
     const operation = await normalizeOperation(event({
       tool_name,
-      tool_input: { path: "/private/worktree/file.ts", content: "credential-value" },
+      tool_input,
     }), context, KEY);
 
     expect(operation.requirements).toEqual([{ capability, resource: context.repository }]);
     expect(operation.tool).toBe(tool);
     expect(operation.risk).toBe(risk);
-    expect(JSON.stringify(operation)).not.toContain("/private/worktree/file.ts");
+    expect(JSON.stringify(operation)).not.toContain("private/file.ts");
     expect(JSON.stringify(operation)).not.toContain("credential-value");
+  });
+
+  it("keeps the table-driven supported cases exhaustive with the single production identity table", () => {
+    expect(guardToolIdentityInventoryForTesting()).toEqual(
+      SUPPORTED_GUARD_TOOL_CASES.map(({ adapter, raw }) => ({ adapter, rawToolName: raw })),
+    );
+  });
+
+  it.each(SUPPORTED_GUARD_TOOL_CASES)("preserves the explicit supported identity $adapter/$raw", async (entry) => {
+    const operationContext: NormalizeOperationContext = entry.raw === "jhw_note"
+      ? { ...context, notion_database: { kind: "notion_database" as const, id: "knowledgeBase" } }
+      : context;
+    const operation = await normalizeOperation(event({
+      adapter: entry.adapter,
+      tool_name: entry.raw,
+      tool_input: entry.input as JsonValue,
+    }), operationContext, KEY);
+
+    expect(operation.tool).toBe(entry.tool);
+    expect(operation.requirements.map((requirement) => requirement.capability)).toEqual([entry.capability]);
+  });
+
+  it.each([
+    ["gemini", "Edit", { file_path: "src/file.ts", old_string: "a", new_string: "b" }],
+    ["opencode", "Bash", { command: "git commit -m bounded" }],
+    ["claude", "exec_command", { command: "git commit -m bounded" }],
+    ["codex", "mcp__remote__Edit", { file_path: "src/file.ts", old_string: "a", new_string: "b" }],
+    ["codex", "vendor/Bash", { command: "git commit -m bounded" }],
+    ["codex", "evil:jhw_record", { db: "decisionLog", title: "bounded" }],
+    ["codex", "mcp__github__github_issue_close", { issue_node_id: "I_kwDOAb-123" }],
+  ] as const)("never grants supported suffix authority to unsupported identity %s/%s", async (adapter, raw, input) => {
+    const operation = await normalizeOperation(event({ adapter, tool_name: raw, tool_input: input }), context, KEY);
+
+    expect(operation.tool).toBe("tool.unclassified");
+    expect(operation.requirements).toEqual([{
+      capability: "shell.unclassified",
+      resource: context.repository,
+    }]);
+    expect(operation.risk).toBe("high");
+  });
+
+  it.each([
+    ["codex", "Edit", {}],
+    ["codex", "Bash", { command: 7 }],
+    ["codex", "jhw_record", { db: "unknown", title: "bounded" }],
+    ["codex", "apply_patch", { patch: 7 }],
+    ["claude", "Edit", { path: "src/file.ts", old_string: "a", new_string: "b" }],
+  ] as const)("fails closed for malformed recognized codec %s/%s", async (adapter, raw, input) => {
+    await expect(normalizeOperation(event({ adapter, tool_name: raw, tool_input: input }), context, KEY))
+      .rejects.toMatchObject({ code: "invalid_tool_input" } satisfies Partial<OperationNormalizationError>);
+  });
+
+  it("rejects replaying a genuine resolution against different raw input", async () => {
+    const original = event({ tool_input: { command: "git status --short" } });
+    const changed = event({ tool_input: { command: "git commit -m changed" } });
+    const resolved = resolveGuardTool(original.adapter, original.tool_name, original.tool_input);
+
+    await expect(normalizeResolvedOperation(changed, resolved, context, KEY)).rejects.toMatchObject({
+      code: "invalid_tool_input",
+    } satisfies Partial<OperationNormalizationError>);
+  });
+
+  it("rejects a tracker input whose target differs from the canonical Task Issue", async () => {
+    await expect(normalizeOperation(event({
+      tool_name: "github_issue_edit",
+      tool_input: { issue_node_id: "I_kwDOOther-456", title: "bounded" },
+    }), context, KEY)).rejects.toMatchObject({
+      code: "context_mismatch",
+    } satisfies Partial<OperationNormalizationError>);
+  });
+
+  it.each([
+    ["Read", { file_path: "src/file.ts", path: "../../outside" }],
+    ["Edit", { file_path: "src/file.ts", old_string: "a", new_string: "b", path: "../../outside" }],
+    ["Bash", { command: "git status --short", cwd: "/tmp/outside" }],
+    ["jhw_record", { db: "decisionLog", title: "bounded", database_id: "outside" }],
+    ["github_issue_comment", { issue_node_id: "I_kwDOAb-123", body: "bounded", repository: "other/repo" }],
+  ] as const)("rejects alternate authority coordinates in recognized %s input", async (toolName, input) => {
+    await expect(normalizeOperation(event({
+      tool_name: toolName,
+      tool_input: input as JsonValue,
+    }), context, KEY)).rejects.toMatchObject({
+      code: "invalid_tool_input",
+    } satisfies Partial<OperationNormalizationError>);
+  });
+
+  it("binds exact unknown raw tool identity even when canonical capability and input are equal", async () => {
+    const first = await normalizeOperation(event({
+      tool_name: "ThirdPartyOpaqueOne",
+      tool_input: { action: "bounded" },
+    }), context, KEY);
+    const second = await normalizeOperation(event({
+      tool_name: "ThirdPartyOpaqueTwo",
+      tool_input: { action: "bounded" },
+    }), context, KEY);
+
+    expect(first.tool).toBe("tool.unclassified");
+    expect(second.tool).toBe("tool.unclassified");
+    expect(first.digest).not.toBe(second.digest);
+    expect(JSON.stringify(first)).not.toContain("ThirdPartyOpaqueOne");
+    expect(JSON.stringify(second)).not.toContain("ThirdPartyOpaqueTwo");
   });
 
   it("does not pretend an arbitrary unknown tool is a repository read", async () => {
@@ -303,6 +431,7 @@ describe("operation normalization", () => {
     const material = {
       protocol_version: 1 as const,
       tool: "file.modify",
+      raw_tool_identity: "Edit",
       origin_adapter: "codex" as const,
       task_id: TASK_ID,
       claim_id: CLAIM_ID,

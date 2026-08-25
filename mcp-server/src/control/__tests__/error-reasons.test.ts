@@ -25,8 +25,10 @@ describe("error reason vocabulary", () => {
     const doc = readFileSync(join(repositoryRoot, "skills", "claude", "task.md"), "utf8");
 
     expect(doc).toContain(
-      "`ALLOW`: 명시적으로 claim-free로 분류된 로컬 read/status이거나, 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다.",
+      "`ALLOW`: Guard가 exact native local `Read`로 검증한 repository file read이거나, 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다. Plan 2에서는 shell command text만으로 claim-free status 권한을 주지 않는다.",
     );
+    expect(doc).toContain("TUI가 `Bash`/`exec_command`로 같은 text를 가로채 실행하는 경로는 실행 identity를 소유하지 않으므로 Plan 3 adapter가 identity-bound execution을 제공할 때까지 Claim-bound다.");
+    expect(doc).toContain("위 direct CLI 호출은 자체 read-only dispatch로 동작한다.");
   });
 
   it("registers every reason literal a control source sets outside the typed helper", () => {

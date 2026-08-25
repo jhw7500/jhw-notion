@@ -38,6 +38,7 @@ const boundedCoordinate = (maximumBytes: number) => z.string()
   .regex(/^[^\u0000-\u001f\u007f]+$/u)
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
 const directlyConstructedGuardJournals = new WeakMap<object, GuardHostCoordinateAuthority>();
+const productionGuardJournals = new WeakMap<object, GuardHostCoordinateAuthority>();
 
 export const GuardJournalEventSchema = z.object({
   protocol_version: z.literal(1),
@@ -79,15 +80,17 @@ export interface GuardJournalPort {
 
 export class GuardJournal implements GuardJournalPort {
   readonly #stateDir: string;
-  private readonly sensitiveData: SensitiveDataPolicy;
+  readonly #secureDirectoryHooks: SecureStateDirectoryHooks;
+  readonly #sensitiveData: SensitiveDataPolicy;
 
   constructor(
     stateDir: string,
-    private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
+    secureDirectoryHooks: SecureStateDirectoryHooks = {},
     sensitiveData?: SensitiveDataPolicy,
   ) {
     this.#stateDir = resolve(stateDir);
-    this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [this.#stateDir]);
+    this.#secureDirectoryHooks = secureDirectoryHooks;
+    this.#sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [this.#stateDir]);
     if (new.target === GuardJournal) {
       directlyConstructedGuardJournals.set(this, createGuardHostCoordinateAuthority(this.#stateDir));
     }
@@ -96,12 +99,12 @@ export class GuardJournal implements GuardJournalPort {
   async append(event: GuardJournalEvent): Promise<void> {
     try {
       const parsed = GuardJournalEventSchema.parse(event);
-      this.sensitiveData.assertSafe(parsed);
+      this.#sensitiveData.assertSafe(parsed);
       assertNoAbsoluteHostPaths(parsed);
       await appendBoundedJournalLine(
         this.#stateDir,
-        this.secureDirectoryHooks,
-        this.sensitiveData,
+        this.#secureDirectoryHooks,
+        this.#sensitiveData,
         GUARD_JOURNAL_FILE,
         parsed,
         {
@@ -121,6 +124,25 @@ export class GuardJournal implements GuardJournalPort {
   }
 }
 
+/** Mints the only GuardJournal provenance accepted by production composition. */
+export function createProductionGuardJournal(
+  stateDir: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): GuardJournal {
+  const stateDirSnapshot = resolve(stateDir);
+  const environmentSnapshot = Object.freeze({ ...environment });
+  const journal = new GuardJournal(
+    stateDirSnapshot,
+    Object.freeze({}),
+    createSensitiveDataPolicy(environmentSnapshot, [stateDirSnapshot]),
+  );
+  const coordinate = directlyConstructedGuardJournals.get(journal);
+  if (!coordinate) throw new TypeError("Production GuardJournal construction failed");
+  productionGuardJournals.set(journal, coordinate);
+  Object.freeze(journal);
+  return journal;
+}
+
 /** True only for journals constructed directly by this module's concrete class. */
 export function isDirectGuardJournal(value: unknown): value is GuardJournal {
   return typeof value === "object" && value !== null && directlyConstructedGuardJournals.has(value);
@@ -128,6 +150,13 @@ export function isDirectGuardJournal(value: unknown): value is GuardJournal {
 
 /** Returns no path, only the immutable coordinate proof captured at direct construction. */
 export function guardJournalHostCoordinate(
+  journal: GuardJournal,
+): GuardHostCoordinateAuthority | undefined {
+  return productionGuardJournals.get(journal);
+}
+
+/** Test-only coordinate proof; it is not accepted by production composition. */
+export function guardJournalHostCoordinateForTesting(
   journal: GuardJournal,
 ): GuardHostCoordinateAuthority | undefined {
   return directlyConstructedGuardJournals.get(journal);

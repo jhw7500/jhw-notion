@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  createGuardMutationLockAuthority,
+  createGuardMutationLockAuthorityForTesting,
   MutationLock,
   ProcessRunner,
   runWithGuardMutationLockAuthority,
@@ -115,7 +115,7 @@ describe("callback mutation lock", () => {
       },
     };
     const lock = new MutationLock(configFor(join(root, "state")), {}, runtime);
-    const authority = createGuardMutationLockAuthority(lock);
+    const authority = createGuardMutationLockAuthorityForTesting(lock);
 
     await lock.run(async () => undefined);
     await runWithGuardMutationLockAuthority(authority, async () => undefined);

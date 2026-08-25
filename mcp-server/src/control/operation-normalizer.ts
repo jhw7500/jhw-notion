@@ -7,7 +7,6 @@ import { z } from "zod";
 import {
   CanonicalOperationSchema,
   ClaimIdSchema,
-  GuardAdapterSchema,
   GuardSessionSchema,
   GuardWorktreeRefSchema,
   OperationRequirementSchema,
@@ -19,6 +18,12 @@ import {
   type OperationRequirement,
   type PreToolUseEvent,
 } from "./guard-protocol.js";
+import {
+  GuardToolResolutionError,
+  isResolvedGuardToolFor,
+  resolveGuardTool,
+  type ResolvedGuardTool,
+} from "./guard-tool-resolver.js";
 import { newOperationId } from "./ids.js";
 import {
   classifyShell,
@@ -108,6 +113,7 @@ export class OperationNormalizationError extends Error {
 export interface OperationDigestMaterial {
   protocol_version: 1;
   tool: string;
+  raw_tool_identity: string;
   origin_adapter: GuardAdapter;
   task_id: string;
   claim_id: string;
@@ -145,6 +151,7 @@ export function computeOperationDigest(input: OperationDigestMaterial, digestKey
   const material = {
     protocol_version: input.protocol_version,
     tool: input.tool,
+    raw_tool_identity: input.raw_tool_identity,
     origin_adapter: input.origin_adapter,
     task_id: input.task_id,
     claim_id: input.claim_id,
@@ -193,28 +200,9 @@ async function relativeTrustedCwd(eventCwd: string, trustedWorktreePath: string)
   return { trustedRoot, cwd, relativeCwd: relative(trustedRoot, cwd) || "." };
 }
 
-function canonicalToolAlias(toolName: string): string {
-  const namespaceTail = toolName.trim().toLowerCase().split(/__+|[.:/]+/u).filter(Boolean).at(-1) ?? "";
-  return namespaceTail.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-}
-
-const fileReadTools = new Set(["read", "read_file", "glob", "glob_files", "grep", "grep_files"]);
-const fileModifyTools = new Set([
-  "edit", "edit_file", "write", "write_file", "notebookedit", "notebook_edit", "apply_patch", "functions_apply_patch",
-]);
-const shellTools = new Set(["bash", "shell", "exec_command", "run_command", "terminal"]);
-const notionMutationTools = new Set(["jhw_record", "jhw_save", "jhw_delete", "jhw_note"]);
-const trackerMutationTools = new Set(["github_issue_close", "github_issue_edit", "github_issue_comment"]);
-
 function asObject(value: JsonValue): Record<string, JsonValue> | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value;
-}
-
-function commandFromToolInput(input: JsonValue): string {
-  const command = asObject(input)?.command;
-  if (typeof command !== "string" || command.length === 0) throw new OperationNormalizationError("invalid_tool_input");
-  return command;
 }
 
 function shellExecutionMaterial(input: JsonValue, rawCommand: string, digestArgv?: readonly string[]): JsonValue {
@@ -257,29 +245,29 @@ interface NormalizedTool {
 
 async function normalizeTool(
   event: PreToolUseEvent,
+  resolved: ResolvedGuardTool,
   context: NormalizeOperationContext,
   cwd: string,
 ): Promise<NormalizedTool> {
-  const alias = canonicalToolAlias(event.tool_name);
-  if (fileReadTools.has(alias)) {
+  if (resolved.family === "file_read") {
     return {
       tool: "file.read",
       requirements: [{ capability: "repo.inspect", resource: context.repository }],
       risk: "low",
       execution_boundary: "hook",
-      execution: event.tool_input,
+      execution: resolved.execution,
     };
   }
-  if (fileModifyTools.has(alias)) {
+  if (resolved.family === "file_modify") {
     return {
       tool: "file.modify",
       requirements: [{ capability: "repo.modify", resource: context.repository }],
       risk: "medium",
       execution_boundary: "hook",
-      execution: event.tool_input,
+      execution: resolved.execution,
     };
   }
-  if (notionMutationTools.has(alias)) {
+  if (resolved.family === "notion_mutation") {
     if (!context.notion_database) {
       throw new OperationNormalizationError("unresolved_boundary", [{ capability: "notion.mutate", boundary: "notion" }]);
     }
@@ -288,23 +276,27 @@ async function normalizeTool(
       requirements: [{ capability: "notion.mutate", resource: context.notion_database }],
       risk: "high",
       execution_boundary: "notion",
-      execution: event.tool_input,
+      execution: resolved.execution,
     };
   }
-  if (trackerMutationTools.has(alias)) {
+  if (resolved.family === "tracker_mutation") {
     if (!context.issue) {
       throw new OperationNormalizationError("unresolved_boundary", [{ capability: "tracker.mutate", boundary: "tracker" }]);
+    }
+    if (resolved.tracker_issue_node_id !== context.issue.id) {
+      throw new OperationNormalizationError("context_mismatch");
     }
     return {
       tool: "tracker.mutate",
       requirements: [{ capability: "tracker.mutate", resource: context.issue }],
       risk: "high",
       execution_boundary: "tracker",
-      execution: event.tool_input,
+      execution: resolved.execution,
     };
   }
-  if (shellTools.has(alias)) {
-    const command = commandFromToolInput(event.tool_input);
+  if (resolved.family === "shell") {
+    const command = resolved.command;
+    if (!command) throw new OperationNormalizationError("invalid_tool_input");
     const classification = await classifyShell(command, {
       trusted_worktree_path: context.trusted_worktree_path,
       cwd,
@@ -325,7 +317,7 @@ async function normalizeTool(
       requirements: classification.requirements,
       risk: classification.risk,
       execution_boundary: classification.execution_boundary,
-      execution: shellExecutionMaterial(event.tool_input, command, classification.digest_argv),
+      execution: shellExecutionMaterial(resolved.execution, command, classification.digest_argv),
       ...(classification.script_content_sha256
         ? { script_content_sha256: classification.script_content_sha256 }
         : {}),
@@ -337,31 +329,29 @@ async function normalizeTool(
     requirements: [{ capability: "shell.unclassified", resource: context.repository }],
     risk: "high",
     execution_boundary: "hook",
-    execution: event.tool_input,
+    execution: resolved.execution,
   };
 }
 
-export async function normalizeOperation(
-  eventInput: PreToolUseEvent,
-  contextInput: NormalizeOperationContext,
+async function normalizeParsedOperation(
+  event: PreToolUseEvent,
+  resolved: ResolvedGuardTool,
+  context: NormalizeOperationContext,
   digestKey: Uint8Array,
 ): Promise<CanonicalOperation> {
-  assertDigestKey(digestKey);
-  const eventResult = PreToolUseEventSchema.safeParse(eventInput);
-  if (!eventResult.success) throw new OperationNormalizationError("invalid_event");
-  const contextResult = NormalizeOperationContextSchema.safeParse(contextInput);
-  if (!contextResult.success) throw new OperationNormalizationError("invalid_context");
-  const event = eventResult.data;
-  const context = contextResult.data;
+  if (!isResolvedGuardToolFor(resolved, event.adapter, event.tool_name, event.tool_input)) {
+    throw new OperationNormalizationError("invalid_tool_input");
+  }
   if (event.session_id !== context.session_id) throw new OperationNormalizationError("context_mismatch");
 
   const cwd = await relativeTrustedCwd(event.cwd, context.trusted_worktree_path);
-  const normalizedTool = await normalizeTool(event, context, cwd.cwd);
+  const normalizedTool = await normalizeTool(event, resolved, context, cwd.cwd);
   const requirements = normalizeRequirements(normalizedTool.requirements);
   const digest = computeOperationDigest({
     protocol_version: 1,
     tool: normalizedTool.tool,
-    origin_adapter: GuardAdapterSchema.parse(event.adapter),
+    raw_tool_identity: resolved.raw_identity,
+    origin_adapter: event.adapter,
     task_id: context.task_id,
     claim_id: context.claim_id,
     session_id: context.session_id,
@@ -390,4 +380,43 @@ export async function normalizeOperation(
     summary: summaryFor(requirements),
     digest,
   });
+}
+
+export async function normalizeResolvedOperation(
+  eventInput: PreToolUseEvent,
+  resolved: ResolvedGuardTool,
+  contextInput: NormalizeOperationContext,
+  digestKey: Uint8Array,
+): Promise<CanonicalOperation> {
+  assertDigestKey(digestKey);
+  const eventResult = PreToolUseEventSchema.safeParse(eventInput);
+  if (!eventResult.success) throw new OperationNormalizationError("invalid_event");
+  const contextResult = NormalizeOperationContextSchema.safeParse(contextInput);
+  if (!contextResult.success) throw new OperationNormalizationError("invalid_context");
+  const event = eventResult.data;
+  const context = contextResult.data;
+  return normalizeParsedOperation(event, resolved, context, digestKey);
+}
+
+export async function normalizeOperation(
+  eventInput: PreToolUseEvent,
+  contextInput: NormalizeOperationContext,
+  digestKey: Uint8Array,
+): Promise<CanonicalOperation> {
+  assertDigestKey(digestKey);
+  const eventResult = PreToolUseEventSchema.safeParse(eventInput);
+  if (!eventResult.success) throw new OperationNormalizationError("invalid_event");
+  const contextResult = NormalizeOperationContextSchema.safeParse(contextInput);
+  if (!contextResult.success) throw new OperationNormalizationError("invalid_context");
+  const event = eventResult.data;
+  let resolved: ResolvedGuardTool;
+  try {
+    resolved = resolveGuardTool(event.adapter, event.tool_name, event.tool_input);
+  } catch (cause) {
+    if (cause instanceof GuardToolResolutionError) {
+      throw new OperationNormalizationError("invalid_tool_input");
+    }
+    throw cause;
+  }
+  return normalizeParsedOperation(event, resolved, contextResult.data, digestKey);
 }

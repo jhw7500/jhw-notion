@@ -62,6 +62,7 @@ const EXACT_UNLOCK =
   /^\/jhw:unlock (req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
 const concreteStateDirectoryRun = MutationLock.prototype.runInStateDirectory;
 const directlyConstructedGuardRequestStores = new WeakMap<object, GuardHostCoordinateAuthority>();
+const productionGuardRequestStores = new WeakMap<object, GuardHostCoordinateAuthority>();
 
 type GuardStateMutationRunner = <T>(callback: (directory: SecureStateDirectory) => Promise<T>) => Promise<T>;
 
@@ -394,10 +395,10 @@ function validateCorrelation(correlation: string, sensitiveData: SensitiveDataPo
 
 export class GuardRequestStore {
   readonly #stateDir: string;
-  private readonly stateHooks: GuardStateHooks;
-  private readonly secureDirectoryHooks: SecureStateDirectoryHooks;
-  private readonly sensitiveData: SensitiveDataPolicy;
-  private readonly journal: GuardJournalPort;
+  readonly #stateHooks: GuardStateHooks;
+  readonly #secureDirectoryHooks: SecureStateDirectoryHooks;
+  readonly #sensitiveData: SensitiveDataPolicy;
+  readonly #journal: GuardJournalPort;
   readonly #runStateMutation: GuardStateMutationRunner;
 
   constructor(
@@ -406,15 +407,15 @@ export class GuardRequestStore {
   ) {
     this.#stateDir = resolve(config.stateDir);
     const environment = options.environment ?? process.env;
-    this.stateHooks = options.stateHooks ?? {};
-    this.secureDirectoryHooks = options.secureDirectoryHooks ?? {};
-    this.sensitiveData = createSensitiveDataPolicy(environment, [this.#stateDir]);
-    this.journal = options.journal ?? new GuardJournal(this.#stateDir, this.secureDirectoryHooks, this.sensitiveData);
+    this.#stateHooks = options.stateHooks ?? {};
+    this.#secureDirectoryHooks = options.secureDirectoryHooks ?? {};
+    this.#sensitiveData = createSensitiveDataPolicy(environment, [this.#stateDir]);
+    this.#journal = options.journal ?? new GuardJournal(this.#stateDir, this.#secureDirectoryHooks, this.#sensitiveData);
     const lock = new MutationLock(
       { ...config, stateDir: this.#stateDir },
       environment,
       options.lockRuntime,
-      this.secureDirectoryHooks,
+      this.#secureDirectoryHooks,
       {
         lockFileName: GUARD_LOCK_FILE,
         waitSeconds: 5,
@@ -436,7 +437,7 @@ export class GuardRequestStore {
       if (inspected.status === "not_initialized") return { status: "not_initialized", requests: [] };
       directory = inspected.directory;
       await inspectExistingGuardLock(directory);
-      const loaded = await readState(directory, this.sensitiveData);
+      const loaded = await readState(directory, this.#sensitiveData);
       return loaded.initialized
         ? { status: "ready", requests: loaded.state.requests }
         : { status: "not_initialized", requests: [] };
@@ -448,7 +449,7 @@ export class GuardRequestStore {
   }
 
   async createOrReusePending(operationInput: CanonicalOperation): Promise<GuardPendingResult> {
-    const operation = validateOperation(operationInput, this.sensitiveData);
+    const operation = validateOperation(operationInput, this.#sensitiveData);
     return this.runMutation<GuardPendingResult>((state, now) => {
       const exact = state.requests.find((request) => live(request) && sameBinding(request, operation));
       if (exact?.state === "PENDING" || exact?.state === "APPROVED") {
@@ -537,8 +538,8 @@ export class GuardRequestStore {
   }
 
   async consumeMatching(operationInput: CanonicalOperation, correlationInput?: string): Promise<GuardConsumeResult> {
-    const operation = validateOperation(operationInput, this.sensitiveData);
-    const correlation = validateCorrelation(correlationInput ?? operation.operation_id, this.sensitiveData);
+    const operation = validateOperation(operationInput, this.#sensitiveData);
+    const correlation = validateCorrelation(correlationInput ?? operation.operation_id, this.#sensitiveData);
     return this.runMutation((state, now) => {
       const exactRequests = state.requests.filter((request) => sameBinding(request, operation));
       const exact = exactRequests.find(live) ?? exactRequests.at(-1);
@@ -579,7 +580,7 @@ export class GuardRequestStore {
   }
 
   async complete(correlationInput: string, ok: boolean): Promise<GuardCompleteResult> {
-    const correlation = validateCorrelation(correlationInput, this.sensitiveData);
+    const correlation = validateCorrelation(correlationInput, this.#sensitiveData);
     return this.runMutation((state, now) => {
       const request = state.requests.find((candidate) => candidate.correlation_id === correlation);
       if (!request) return { failure: { code: "GUARD_REQUEST_NOT_FOUND" }, changed: false, events: [] };
@@ -608,12 +609,12 @@ export class GuardRequestStore {
     let committed: CommittedTransition<T> | undefined;
     try {
       await this.#runStateMutation(async (directory) => {
-        const loaded = await readState(directory, this.sensitiveData);
+        const loaded = await readState(directory, this.#sensitiveData);
         const now = Date.now();
         const cleanup = cleanupState(loaded.state, now);
         const result = transition(loaded.state, now);
         if (cleanup.changed || result.changed) {
-          await writeState(directory, loaded.state, this.sensitiveData, this.stateHooks);
+          await writeState(directory, loaded.state, this.#sensitiveData, this.#stateHooks);
         }
         committed = { transition: result, events: [...cleanup.events, ...result.events] };
       });
@@ -639,7 +640,7 @@ export class GuardRequestStore {
     let warning: GuardJournalWarning | undefined;
     for (const event of events) {
       try {
-        await this.journal.append(event);
+        await this.#journal.append(event);
       } catch {
         warning = GuardJournalWarning;
       }
@@ -648,8 +649,32 @@ export class GuardRequestStore {
   }
 }
 
+/** Mints the only request-store provenance accepted by production composition. */
+export function createProductionGuardRequestStore(
+  config: ControlConfig,
+  environment: NodeJS.ProcessEnv = process.env,
+): GuardRequestStore {
+  const configSnapshot = Object.freeze({ ...config });
+  const environmentSnapshot = Object.freeze({ ...environment });
+  const store = new GuardRequestStore(configSnapshot, {
+    environment: environmentSnapshot,
+  });
+  const coordinate = directlyConstructedGuardRequestStores.get(store);
+  if (!coordinate) throw new TypeError("Production GuardRequestStore construction failed");
+  productionGuardRequestStores.set(store, coordinate);
+  Object.freeze(store);
+  return store;
+}
+
 /** Returns no path, only the immutable coordinate proof captured at direct construction. */
 export function guardRequestStoreHostCoordinate(
+  store: GuardRequestStore,
+): GuardHostCoordinateAuthority | undefined {
+  return productionGuardRequestStores.get(store);
+}
+
+/** Test-only coordinate proof; it is not accepted by production composition. */
+export function guardRequestStoreHostCoordinateForTesting(
   store: GuardRequestStore,
 ): GuardHostCoordinateAuthority | undefined {
   return directlyConstructedGuardRequestStores.get(store);

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   createGuardRegistryMutationBarrier,
+  createGuardRegistryMutationBarrierForTesting,
   GuardDecisionSchema,
   GuardService,
   GuardSideEventResultSchema,
@@ -107,7 +108,7 @@ function trustedBarrier(
       return completedLockAcquisition(options.acquisitionStatus);
     },
   };
-  return createGuardRegistryMutationBarrier(new MutationLock(
+  return createGuardRegistryMutationBarrierForTesting(new MutationLock(
     lockConfig(stateDir),
     {},
     runtime,
@@ -414,14 +415,14 @@ describe("GuardService", () => {
     expect(JSON.stringify(rows)).not.toContain("src/file.ts");
   });
 
-  it("allows only the closed local read and status fast path without a Claim", async () => {
+  it("keeps the exact local Read fast path but never treats shell status text as Claim-free", async () => {
     fixture.currentClaim = undefined;
     fixture.activeClaims = [];
 
     await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "Read", { file_path: "src/file.ts" })))
       .resolves.toMatchObject({ decision: "ALLOW", execution_boundary: "hook", summary: "Local repository read" });
     await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command: "git status --short" })))
-      .resolves.toMatchObject({ decision: "ALLOW", execution_boundary: "hook", summary: "Local repository status" });
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
     await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "WebFetch", { url: "https://example.invalid" })))
       .resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
     await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command: "ssh host cat /etc/os-release" })))
@@ -429,12 +430,15 @@ describe("GuardService", () => {
   });
 
   it.each(["Bash", "exec_command"] as const)(
-    "allows only the CLI-supported Guard diagnostics without a Claim through %s",
+    "keeps every shell-text status/diagnostic path Claim-bound through %s",
     async (toolName) => {
       fixture.currentClaim = undefined;
       fixture.activeClaims = [];
 
       for (const command of [
+        "git status",
+        "git status --short",
+        "git status --porcelain",
         "jhw-control guard status",
         `jhw-control guard status --session ${SESSION_ID}`,
         `jhw-control\tguard\tstatus\t--session\t${SESSION_ID}`,
@@ -444,19 +448,63 @@ describe("GuardService", () => {
         "jhw-control guard status --session 'quoted;session'",
         "jhw-control guard status --session escaped\\;session",
         "jhw-control guard preflight",
+        "jhw-control board list",
       ]) {
         await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, { command })))
           .resolves.toMatchObject({
-            decision: "ALLOW",
-            execution_boundary: "hook",
-            summary: "Local repository status",
+            decision: "DENY",
+            code: "GUARD_CLAIM_REQUIRED",
           });
       }
 
-      expect(fixture.claimLookups).toBe(0);
       expect(fixture.permitCalls).toBe(0);
     },
   );
+
+  it("denies identical shell text even when Bash can redirect it through functions, aliases, or PATH", async () => {
+    fixture.currentClaim = undefined;
+    fixture.activeClaims = [];
+    const exactCommand = "git status --short";
+    for (const toolName of ["Bash", "exec_command"] as const) {
+      await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, { command: exactCommand })))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
+    }
+
+    const functionMarker = join(fixture.root, "function-marker");
+    const aliasMarker = join(fixture.root, "alias-marker");
+    const pathMarker = join(fixture.root, "path-marker");
+    const bashEnv = join(fixture.root, "bash-env");
+    const shimDir = join(fixture.root, "shim-bin");
+    await mkdir(shimDir);
+    await writeFile(bashEnv, [
+      "shopt -s expand_aliases",
+      `alias git='printf alias > ${aliasMarker}'`,
+      "",
+    ].join("\n"), { mode: 0o600 });
+    await writeFile(join(shimDir, "git"), `#!/bin/sh\nprintf path > ${pathMarker}\n`, { mode: 0o700 });
+    await chmod(join(shimDir, "git"), 0o700);
+
+    await runFile("bash", ["--noprofile", "--norc", "-c", exactCommand], {
+      cwd: fixture.root,
+      env: {
+        PATH: "/usr/bin:/bin",
+        "BASH_FUNC_git%%": `() { printf function > ${functionMarker}; }`,
+      },
+    });
+    await runFile("bash", ["--noprofile", "--norc", "-c", exactCommand], {
+      cwd: fixture.root,
+      env: { PATH: "/usr/bin:/bin", BASH_ENV: bashEnv },
+    });
+    await runFile("bash", ["--noprofile", "--norc", "-c", exactCommand], {
+      cwd: fixture.root,
+      env: { PATH: `${shimDir}:/usr/bin:/bin` },
+    });
+
+    await expect(readFile(functionMarker, "utf8")).resolves.toBe("function");
+    await expect(readFile(aliasMarker, "utf8")).resolves.toBe("alias");
+    await expect(readFile(pathMarker, "utf8")).resolves.toBe("path");
+    expect(fixture.permitCalls).toBe(0);
+  });
 
   it.each(["Bash", "exec_command"] as const)(
     "keeps hostile scoped Guard status shapes Claim-bound through %s",
@@ -527,12 +575,90 @@ describe("GuardService", () => {
       preTool(fixture.cwd, "Read", { file_path: "src/linked-read.ts" }),
       preTool(fixture.cwd, "Read", { file_path: "src/file.ts", url: "https://example.invalid" }),
       preTool(fixture.cwd, "Grep", { pattern: "token", path: "../" }),
+      { ...preTool(fixture.cwd, "Read", { file_path: "src/file.ts" }) as object, adapter: "gemini" },
     ]) {
       await expect(fixture.service().evaluatePreTool(event)).resolves.toMatchObject({
         decision: "DENY",
         code: "GUARD_CLAIM_REQUIRED",
       });
     }
+  });
+
+  it.each([
+    ["mutation path", "mcp__remote__Edit", {
+      file_path: "src/file.ts",
+      old_string: "a",
+      new_string: "b",
+    }],
+    ["shell", "vendor/Bash", { command: "git commit -m bounded" }],
+    ["Notion", "evil:jhw_record", { db: "decisionLog", title: "bounded" }],
+    ["tracker", "mcp__github__github_issue_close", { issue_node_id: "I_guard_1" }],
+  ] as const)("uses one exact tool resolution for hostile %s suffix authority", async (_family, toolName, input) => {
+    const notion = { kind: "notion_database", id: "decisionLog" } as const;
+    const issue = { kind: "issue", id: "I_guard_1" } as const;
+    fixture.currentContract = contract(TASK_ID, [
+      grant("repo.inspect"),
+      grant("repo.modify"),
+      grant("git.commit"),
+      grant("notion.mutate", notion),
+      grant("tracker.mutate", issue),
+    ]);
+    fixture.currentTask = {
+      id: TASK_ID,
+      kind: "formal",
+      project_id: "prj-guard",
+      repo_id: REPOSITORY.id,
+      issue_node_id: issue.id,
+      issue_revision: fixture.currentClaim?.source_task_revision ?? "2026-08-25T00:00:00.000Z",
+      issue_url: "https://github.com/owner/repository/issues/1",
+      aliases: ["owner/repository#1"],
+      task_role: "standalone",
+      work_contract: fixture.currentContract,
+    };
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, input))).resolves.toMatchObject({
+      decision: "PERMIT_REQUIRED",
+    });
+  });
+
+  it.each([
+    ["Edit", {}],
+    ["Bash", { command: 7 }],
+    ["jhw_record", { db: "unknown", title: "bounded" }],
+    ["apply_patch", { patch: 7 }],
+    ["Edit", { file_path: "src/file.ts", old_string: "a", new_string: "b", path: "../../outside" }],
+    ["Bash", { command: "git status --short", cwd: "/tmp/outside" }],
+    ["jhw_record", { db: "decisionLog", title: "bounded", database_id: "outside" }],
+  ] as const)("hard-denies malformed recognized %s input instead of changing tool families", async (toolName, input) => {
+    await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, input)))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+  });
+
+  it("hard-denies a tracker input targeting an Issue other than the current formal Task", async () => {
+    const issue = { kind: "issue", id: "I_guard_1" } as const;
+    fixture.currentContract = contract(TASK_ID, [grant("tracker.mutate", issue)]);
+    fixture.currentTask = {
+      id: TASK_ID,
+      kind: "formal",
+      project_id: "prj-guard",
+      repo_id: REPOSITORY.id,
+      issue_node_id: issue.id,
+      issue_revision: fixture.currentClaim?.source_task_revision ?? "2026-08-25T00:00:00.000Z",
+      issue_url: "https://github.com/owner/repository/issues/1",
+      aliases: ["owner/repository#1"],
+      task_role: "standalone",
+      work_contract: fixture.currentContract,
+    };
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "github_issue_edit", {
+      issue_node_id: "I_guard_other",
+      title: "bounded",
+    }))).resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(fixture.permitCalls).toBe(0);
   });
 
   it("fails closed for unproved native Glob and Grep match sets while retaining an exact nested Read", async () => {
@@ -570,18 +696,6 @@ describe("GuardService", () => {
       "Read",
       { file_path: "nested/inside.ts" },
     ))).resolves.toMatchObject({ decision: "ALLOW", summary: "Local repository read" });
-  });
-
-  it("requires a trusted local Git cwd even for an exact Claim-free status command", async () => {
-    fixture.currentClaim = undefined;
-    fixture.activeClaims = [];
-    const outside = await mkdtemp(join(tmpdir(), "jhw-guard-untrusted-"));
-    try {
-      await expect(fixture.service().evaluatePreTool(preTool(outside, "Bash", { command: "git status --short" })))
-        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
-    } finally {
-      await rm(outside, { recursive: true, force: true });
-    }
   });
 
   it("denies mutation without an active Claim", async () => {
@@ -785,14 +899,15 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
-  it("accepts an unmodified directly constructed MutationLock as Guard barrier authority", () => {
+  it("accepts an unmodified direct MutationLock only through the test barrier", () => {
     const direct = new MutationLock(
       lockConfig(join(fixture.root, "direct-registry-state")),
       {},
       { spawn: () => completedLockAcquisition() },
     );
 
-    expect(() => createGuardRegistryMutationBarrier(direct)).not.toThrow();
+    expect(() => createGuardRegistryMutationBarrier(direct)).toThrow(TypeError);
+    expect(() => createGuardRegistryMutationBarrierForTesting(direct)).not.toThrow();
   });
 
   it("rejects a provenance-less object with the concrete MutationLock surface", () => {
@@ -2050,7 +2165,7 @@ describe("GuardService", () => {
     it("keeps an approved permit bound across file, command, resource, cwd, script, Task, and Claim changes", async () => {
       const cases: Array<{
         name: string;
-        prepare(): Promise<{ original: unknown; changed: unknown; mutate?: () => void }>;
+        prepare(): Promise<{ original: unknown; changed: unknown; mutate?: () => void | Promise<void> }>;
       }> = [
         {
           name: "file",
@@ -2096,7 +2211,67 @@ describe("GuardService", () => {
             return {
               original: preTool(fixture.root, "Bash", { command: "./bounded-script.sh" }),
               changed: preTool(fixture.root, "Bash", { command: "./bounded-script.sh" }),
-              mutate: () => { void writeFile(path, "#!/bin/sh\nprintf second\n", { mode: 0o700 }); },
+              mutate: () => writeFile(path, "#!/bin/sh\nprintf second\n", { mode: 0o700 }),
+            };
+          },
+        },
+        {
+          name: "shell-interpreter script",
+          prepare: async () => {
+            const path = join(fixture.root, "interpreted.sh");
+            await writeFile(path, "printf first\n", { mode: 0o600 });
+            return {
+              original: preTool(fixture.root, "Bash", { command: "bash ./interpreted.sh" }),
+              changed: preTool(fixture.root, "Bash", { command: "bash ./interpreted.sh" }),
+              mutate: () => writeFile(path, "printf second\n", { mode: 0o600 }),
+            };
+          },
+        },
+        {
+          name: "versioned-Python script",
+          prepare: async () => {
+            const path = join(fixture.root, "interpreted.py");
+            await writeFile(path, "print('first')\n", { mode: 0o600 });
+            return {
+              original: preTool(fixture.root, "Bash", { command: "python3.12 ./interpreted.py" }),
+              changed: preTool(fixture.root, "Bash", { command: "python3.12 ./interpreted.py" }),
+              mutate: () => writeFile(path, "print('second')\n", { mode: 0o600 }),
+            };
+          },
+        },
+        {
+          name: "Node script",
+          prepare: async () => {
+            const path = join(fixture.root, "interpreted.js");
+            await writeFile(path, "console.log('first')\n", { mode: 0o600 });
+            return {
+              original: preTool(fixture.root, "Bash", { command: "node ./interpreted.js" }),
+              changed: preTool(fixture.root, "Bash", { command: "node ./interpreted.js" }),
+              mutate: () => writeFile(path, "console.log('second')\n", { mode: 0o600 }),
+            };
+          },
+        },
+        {
+          name: "source script",
+          prepare: async () => {
+            const path = join(fixture.root, "sourced.sh");
+            await writeFile(path, "VALUE=first\n", { mode: 0o600 });
+            return {
+              original: preTool(fixture.root, "Bash", { command: "source ./sourced.sh" }),
+              changed: preTool(fixture.root, "Bash", { command: "source ./sourced.sh" }),
+              mutate: () => writeFile(path, "VALUE=second\n", { mode: 0o600 }),
+            };
+          },
+        },
+        {
+          name: "dot-source script",
+          prepare: async () => {
+            const path = join(fixture.root, "dot-sourced.sh");
+            await writeFile(path, "VALUE=first\n", { mode: 0o600 });
+            return {
+              original: preTool(fixture.root, "Bash", { command: ". ./dot-sourced.sh" }),
+              changed: preTool(fixture.root, "Bash", { command: ". ./dot-sourced.sh" }),
+              mutate: () => writeFile(path, "VALUE=second\n", { mode: 0o600 }),
             };
           },
         },
@@ -2146,11 +2321,7 @@ describe("GuardService", () => {
         const first = await service.evaluatePreTool(prepared.original);
         if (first.decision !== "PERMIT_REQUIRED") throw new Error(`expected ${entry.name} request`);
         await service.submitUserPrompt(promptEvent(first.approval_command));
-        if (entry.name === "script") {
-          await writeFile(join(fixture.root, "bounded-script.sh"), "#!/bin/sh\nprintf second\n", { mode: 0o700 });
-        } else {
-          prepared.mutate?.();
-        }
+        await prepared.mutate?.();
 
         const changed = await service.evaluatePreTool(prepared.changed);
         expect(changed, entry.name).toMatchObject({ decision: "PERMIT_REQUIRED" });

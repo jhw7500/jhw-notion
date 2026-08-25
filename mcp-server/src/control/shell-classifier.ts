@@ -4,7 +4,6 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { OperationRequirement } from "./guard-protocol.js";
-import { ClaimCoordinateSchema } from "./schemas.js";
 import type { ResourceRef } from "./work-contract.js";
 
 const MAX_COMMAND_BYTES = 64 * 1024;
@@ -251,6 +250,10 @@ function parseSimpleArgv(command: string): ParseResult {
     token = "";
     tokenStarted = false;
   };
+  const ambiguous = (): ParseResult => {
+    push();
+    return argv.length > 0 ? { argv: [...argv], ambiguous: true } : { ambiguous: true };
+  };
 
   for (let index = 0; index < command.length; index += 1) {
     const character = command[index] as string;
@@ -284,7 +287,7 @@ function parseSimpleArgv(command: string): ParseResult {
           token += character;
         }
       } else {
-        if (character === "$" || character === "`" || character === "!") return { ambiguous: true };
+        if (character === "$" || character === "`" || character === "!") return ambiguous();
         token += character;
       }
       tokenStarted = true;
@@ -314,24 +317,24 @@ function parseSimpleArgv(command: string): ParseResult {
       continue;
     }
     if (character === "\n" || character === "\r" || /\s/u.test(character) || character === "!") {
-      return { ambiguous: true };
+      return ambiguous();
     }
     if (
       ";&|<>()`".includes(character) || character === "$" ||
       "*?[{}".includes(character) || (character === "~" && !tokenStarted) ||
       (character === "<" && next === "<")
     ) {
-      return { ambiguous: true };
+      return ambiguous();
     }
     token += character;
     tokenStarted = true;
   }
-  if (quote !== undefined || escaped) return { ambiguous: true };
+  if (quote !== undefined || escaped) return ambiguous();
   push();
   if (argv.length === 0) return { ambiguous: true };
   const executable = executableName(argv[0] as string);
   if (new Set(["bash", "sh", "zsh", "dash", "ksh"]).has(executable) && argv.includes("-c")) {
-    return { ambiguous: true };
+    return { argv, ambiguous: true };
   }
   return { argv, ambiguous: false };
 }
@@ -621,39 +624,100 @@ function ghDetection(argv: readonly string[]): Detection | undefined {
   return undefined;
 }
 
-async function localScriptDigest(argv: readonly string[], context: ShellClassifierContext): Promise<string | undefined> {
+interface LiteralLocalScriptOperand {
+  rawPath: string;
+  requireExecutable: boolean;
+}
+
+interface LocalScriptInspectionHooksForTesting {
+  afterScriptPreStat?(): Promise<void> | void;
+}
+
+const bareShellInterpreters = new Set(["sh", "bash", "dash", "ksh", "zsh"]);
+const barePythonInterpreter = /^python(?:[23](?:\.[0-9]+)?)?$/u;
+
+function literalLocalScriptOperand(argv: readonly string[]): LiteralLocalScriptOperand | undefined {
   const executable = argv[0] as string;
-  if (!executable.includes("/") && !executable.includes("\\")) return undefined;
+  const interpreterName = executableName(executable);
+  const closedInterpreter = bareShellInterpreters.has(interpreterName) ||
+    barePythonInterpreter.test(interpreterName) || interpreterName === "node";
+  if (executable.includes("/") && closedInterpreter) {
+    throw new ShellClassificationError("unsafe_local_script");
+  }
+  if (executable === "source" || executable === ".") {
+    const operand = argv[1];
+    if (!operand || operand.startsWith("-") || !operand.includes("/") || operand.includes("\\")) {
+      throw new ShellClassificationError("unsafe_local_script");
+    }
+    return { rawPath: operand, requireExecutable: false };
+  }
+  if (
+    bareShellInterpreters.has(executable) ||
+    barePythonInterpreter.test(executable) ||
+    executable === "node"
+  ) {
+    const operand = argv[1];
+    if (!operand || operand.startsWith("-") || operand.includes("\\")) {
+      throw new ShellClassificationError("unsafe_local_script");
+    }
+    return { rawPath: operand, requireExecutable: false };
+  }
+  if (executable.includes("\\")) throw new ShellClassificationError("unsafe_local_script");
+  return executable.includes("/")
+    ? { rawPath: executable, requireExecutable: true }
+    : undefined;
+}
+
+async function localScriptDigest(
+  operand: LiteralLocalScriptOperand,
+  context: ShellClassifierContext,
+  hooks: LocalScriptInspectionHooksForTesting = {},
+): Promise<string> {
   const trustedRoot = await realpath(context.trusted_worktree_path).catch(() => {
     throw new ShellClassificationError("unsafe_local_script");
   });
-  const candidate = resolve(context.cwd, executable);
+  const candidate = resolve(context.cwd, operand.rawPath);
   if (!isWithin(trustedRoot, candidate)) throw new ShellClassificationError("unsafe_local_script");
 
   let handle;
   try {
     handle = await open(candidate, scriptOpenFlags);
     const before = await handle.stat({ bigint: true });
-    if (!before.isFile() || before.size > BigInt(MAX_LOCAL_SCRIPT_BYTES) || (before.mode & 0o111n) === 0n) {
+    if (
+      !before.isFile() || before.nlink !== 1n || before.size > BigInt(MAX_LOCAL_SCRIPT_BYTES) ||
+      (operand.requireExecutable && (before.mode & 0o111n) === 0n)
+    ) {
       throw new ShellClassificationError("unsafe_local_script");
     }
+    await hooks.afterScriptPreStat?.();
     const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
     if (!isWithin(trustedRoot, openedPath)) throw new ShellClassificationError("unsafe_local_script");
-    const content = await handle.readFile();
-    if (content.byteLength > MAX_LOCAL_SCRIPT_BYTES || BigInt(content.byteLength) !== before.size) {
-      throw new ShellClassificationError("unsafe_local_script");
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let total = 0;
+    while (true) {
+      const maximumRead = Math.min(buffer.byteLength, MAX_LOCAL_SCRIPT_BYTES + 1 - total);
+      if (maximumRead <= 0) throw new ShellClassificationError("unsafe_local_script");
+      const { bytesRead } = await handle.read(buffer, 0, maximumRead, total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > MAX_LOCAL_SCRIPT_BYTES) throw new ShellClassificationError("unsafe_local_script");
+      digest.update(buffer.subarray(0, bytesRead));
     }
+    if (BigInt(total) !== before.size) throw new ShellClassificationError("unsafe_local_script");
     const after = await handle.stat({ bigint: true });
     const currentPath = await lstat(candidate, { bigint: true });
     if (
       before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
-      before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs || before.mode !== after.mode ||
+      before.nlink !== after.nlink || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
+      before.mode !== after.mode ||
       currentPath.isSymbolicLink() || currentPath.dev !== after.dev || currentPath.ino !== after.ino ||
-      currentPath.size !== after.size || currentPath.mtimeNs !== after.mtimeNs || currentPath.mode !== after.mode
+      currentPath.nlink !== after.nlink || currentPath.size !== after.size ||
+      currentPath.mtimeNs !== after.mtimeNs || currentPath.ctimeNs !== after.ctimeNs || currentPath.mode !== after.mode
     ) {
       throw new ShellClassificationError("unsafe_local_script");
     }
-    return createHash("sha256").update(content).digest("hex");
+    return digest.digest("hex");
   } catch (cause) {
     if (cause instanceof ShellClassificationError) throw cause;
     throw new ShellClassificationError("unsafe_local_script");
@@ -821,25 +885,11 @@ export function detectGuardSelfApproval(input: string): boolean {
     commandArgv[1] === "guard" && new Set(["prompt", "approve", "consume"]).has(commandArgv[2] ?? "");
 }
 
-/** Exact CLI-supported scoped Guard status form for the pre-Claim policy path. */
-export function isClaimFreeGuardStatusCommand(input: string): boolean {
-  if (typeof input !== "string" || input.length === 0 || Buffer.byteLength(input, "utf8") > MAX_COMMAND_BYTES) {
-    return false;
-  }
-  let parsed: ParseResult;
-  try {
-    parsed = parseSimpleArgv(input);
-  } catch {
-    return false;
-  }
-  if (parsed.ambiguous || !parsed.argv || parsed.argv.length !== 5) return false;
-  const [executable, family, action, flag, session] = parsed.argv;
-  return executable === "jhw-control" && family === "guard" && action === "status" &&
-    flag === "--session" && session !== undefined && !session.startsWith("--") &&
-    ClaimCoordinateSchema.safeParse(session).success;
-}
-
-export async function classifyShell(input: string, context: ShellClassifierContext): Promise<ShellClassification> {
+async function classifyShellInternal(
+  input: string,
+  context: ShellClassifierContext,
+  scriptHooks: LocalScriptInspectionHooksForTesting = {},
+): Promise<ShellClassification> {
   if (typeof input !== "string" || Buffer.byteLength(input, "utf8") > MAX_COMMAND_BYTES || input.length === 0) {
     throw new ShellClassificationError("invalid_shell_input");
   }
@@ -865,6 +915,12 @@ export async function classifyShell(input: string, context: ShellClassifierConte
     risk = strongerRisk(risk, detection.risk);
     executionBoundary = strongerBoundary(executionBoundary, detection.boundary);
   };
+
+  const parsedCommandArgv = parsed.argv ? executableArgv(parsed.argv) : undefined;
+  if (parsedCommandArgv) {
+    const parsedOperand = literalLocalScriptOperand(parsedCommandArgv);
+    if (parsed.ambiguous && parsedOperand) throw new ShellClassificationError("unsafe_local_script");
+  }
 
   if (parsed.ambiguous || !parsed.argv) {
     const repositoryIsCurrent = await isCurrentRepositoryDirectory(context, context.cwd);
@@ -936,7 +992,10 @@ export async function classifyShell(input: string, context: ShellClassifierConte
     risk = strongerRisk(risk, "high");
   }
 
-  const scriptContentSha256 = commandArgv ? await localScriptDigest(commandArgv, context) : undefined;
+  const scriptOperand = commandArgv ? literalLocalScriptOperand(commandArgv) : undefined;
+  const scriptContentSha256 = scriptOperand
+    ? await localScriptDigest(scriptOperand, context, scriptHooks)
+    : undefined;
   const highRiskDetected = [...rawDetections, ...(knownDetection ? [knownDetection] : [])]
     .some((detection) => detection.risk === "high");
   return {
@@ -951,4 +1010,17 @@ export async function classifyShell(input: string, context: ShellClassifierConte
     digest_argv: [...argv],
     ...(scriptContentSha256 ? { script_content_sha256: scriptContentSha256 } : {}),
   };
+}
+
+export function classifyShell(input: string, context: ShellClassifierContext): Promise<ShellClassification> {
+  return classifyShellInternal(input, context);
+}
+
+/** Test-only deterministic seam; ordinary production classification cannot supply filesystem race hooks. */
+export function classifyShellForTesting(
+  input: string,
+  context: ShellClassifierContext,
+  hooks: LocalScriptInspectionHooksForTesting,
+): Promise<ShellClassification> {
+  return classifyShellInternal(input, context, hooks);
 }

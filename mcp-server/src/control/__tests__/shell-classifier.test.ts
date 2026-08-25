@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, mkdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,151 +10,13 @@ import {
   ShellClassificationError,
   classifyShell,
   detectGuardSelfApproval,
-  isClaimFreeGuardStatusCommand,
   type ShellClassifierContext,
 } from "../shell-classifier.js";
+import * as shellClassifierModule from "../shell-classifier.js";
 
 const repository = { kind: "repository" as const, id: "repo-wlan-package" };
 const issue = { kind: "issue" as const, id: "I_kwDOAb-123" };
 const board = { kind: "board" as const, id: "board-alpha" };
-const scopedStatusSession = "codex-guard-task";
-const argvMarker = "__JHW_BASH_ARGV__";
-const historyInjectionMarker = "__JHW_HISTORY_INJECTED__";
-
-const nonBashWhitespace = [
-  ["vertical tab", "\u000b"],
-  ["form feed", "\u000c"],
-  ["no-break space", "\u00a0"],
-  ["ogham space mark", "\u1680"],
-  ["en quad", "\u2000"],
-  ["em quad", "\u2001"],
-  ["en space", "\u2002"],
-  ["em space", "\u2003"],
-  ["three-per-em space", "\u2004"],
-  ["four-per-em space", "\u2005"],
-  ["six-per-em space", "\u2006"],
-  ["figure space", "\u2007"],
-  ["punctuation space", "\u2008"],
-  ["thin space", "\u2009"],
-  ["hair space", "\u200a"],
-  ["line separator", "\u2028"],
-  ["paragraph separator", "\u2029"],
-  ["narrow no-break space", "\u202f"],
-  ["medium mathematical space", "\u205f"],
-  ["ideographic space", "\u3000"],
-  ["byte-order mark", "\ufeff"],
-] as const;
-
-const inertHistorySources = [
-  {
-    name: "single-quoted bang",
-    source: "jhw-control guard status --session 'single!session'",
-    coordinate: "single!session",
-  },
-  {
-    name: "backslash-escaped bang",
-    source: "jhw-control guard status --session escaped\\!session",
-    coordinate: "escaped!session",
-  },
-  {
-    name: "double-quoted backslash bang",
-    source: 'jhw-control guard status --session "double\\!session"',
-    coordinate: "double\\!session",
-  },
-  {
-    name: "single-quoted semicolon",
-    source: "jhw-control guard status --session 'quoted;session'",
-    coordinate: "quoted;session",
-  },
-  {
-    name: "backslash-escaped semicolon",
-    source: "jhw-control guard status --session escaped\\;session",
-    coordinate: "escaped;session",
-  },
-] as const;
-
-const activeHistorySources = [
-  ["unquoted bang", "jhw-control guard status --session active!missing"],
-  ["double-quoted bang", 'jhw-control guard status --session "active!missing"'],
-  ["unquoted double bang", "jhw-control guard status --session !!"],
-] as const;
-
-const fixedArgvOracleSources = new Set([
-  `jhw-control guard status --session ${scopedStatusSession}`,
-  `jhw-control\tguard\tstatus\t--session\t${scopedStatusSession}`,
-  ...nonBashWhitespace.map(([, separator]) =>
-    `jhw-control${separator}guard status --session ${scopedStatusSession}`),
-  ...inertHistorySources.map(({ source }) => source),
-]);
-
-const fixedHistoryOracleSources = new Set<string>([
-  ...inertHistorySources.map(({ source }) => source),
-  ...activeHistorySources.map(([, source]) => source),
-]);
-
-function bashOracleEnvironment(directory: string, historyName: string): NodeJS.ProcessEnv {
-  return {
-    PATH: "/usr/bin:/bin",
-    LC_ALL: "C",
-    TERM: "dumb",
-    HISTFILE: join(directory, historyName),
-    HISTSIZE: "32",
-    HISTFILESIZE: "32",
-    PS1: "",
-    PS2: "",
-    PROMPT_COMMAND: "",
-  };
-}
-
-function markedArgv(stdout: string): string[] {
-  return stdout.split("\n")
-    .filter((line) => line.startsWith(argvMarker))
-    .map((line) => line.slice(argvMarker.length));
-}
-
-function runFixedBashArgvOracle(source: string, directory: string): string[] {
-  if (!fixedArgvOracleSources.has(source)) throw new Error("unreviewed Bash argv oracle source");
-  const script = [
-    `set -- ${source}`,
-    `for argument in "$@"; do printf '${argvMarker}%s\\n' "$argument"; done`,
-    "",
-  ].join("\n");
-  const result = spawnSync("bash", ["--noprofile", "--norc"], {
-    cwd: directory,
-    env: bashOracleEnvironment(directory, "argv-oracle.history"),
-    input: script,
-    encoding: "utf8",
-    timeout: 2_000,
-    maxBuffer: 16 * 1024,
-  });
-  if (result.error || result.status !== 0) throw new Error("fixed Bash argv oracle failed");
-  return markedArgv(result.stdout);
-}
-
-function runFixedHistoryOracle(
-  source: string,
-  directory: string,
-): { argv: string[]; stdout: string; stderr: string } {
-  if (!fixedHistoryOracleSources.has(source)) throw new Error("unreviewed Bash history oracle source");
-  const script = [
-    "history -c",
-    `history -s 'fixed-session; printf "${historyInjectionMarker}\\n"'`,
-    `set -- ${source}`,
-    `for argument in "$@"; do printf '${argvMarker}%s\\n' "$argument"; done`,
-    "exit",
-    "",
-  ].join("\n");
-  const result = spawnSync("bash", ["--noprofile", "--norc", "-H", "-i"], {
-    cwd: directory,
-    env: bashOracleEnvironment(directory, "history-oracle.history"),
-    input: script,
-    encoding: "utf8",
-    timeout: 2_000,
-    maxBuffer: 16 * 1024,
-  });
-  if (result.error || result.status !== 0) throw new Error("fixed Bash history oracle failed");
-  return { argv: markedArgv(result.stdout), stdout: result.stdout, stderr: result.stderr };
-}
 
 describe("conservative shell classification", () => {
   let root: string;
@@ -171,77 +33,6 @@ describe("conservative shell classification", () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
-  });
-
-  it.each([
-    ["ASCII space", " "],
-    ["ASCII tab", "\t"],
-  ] as const)("matches Bash argv for %s scoped-status separators", (_name, separator) => {
-    const source = separator === " "
-      ? `jhw-control guard status --session ${scopedStatusSession}`
-      : `jhw-control\tguard\tstatus\t--session\t${scopedStatusSession}`;
-
-    expect(runFixedBashArgvOracle(source, root)).toEqual([
-      "jhw-control",
-      "guard",
-      "status",
-      "--session",
-      scopedStatusSession,
-    ]);
-    expect(isClaimFreeGuardStatusCommand(source)).toBe(true);
-  });
-
-  it.each(nonBashWhitespace)(
-    "does not reconstruct %s as a Bash scoped-status separator",
-    (_name, separator) => {
-      const source = `jhw-control${separator}guard status --session ${scopedStatusSession}`;
-
-      expect(runFixedBashArgvOracle(source, root)).toEqual([
-        `jhw-control${separator}guard`,
-        "status",
-        "--session",
-        scopedStatusSession,
-      ]);
-      expect(isClaimFreeGuardStatusCommand(source)).toBe(false);
-    },
-  );
-
-  it.each([
-    ["newline", "\n"],
-    ["carriage return", "\r"],
-  ] as const)("keeps shell %s command boundaries ambiguous", (_name, separator) => {
-    const source = `jhw-control${separator}guard status --session ${scopedStatusSession}`;
-    expect(isClaimFreeGuardStatusCommand(source)).toBe(false);
-  });
-
-  it.each(inertHistorySources)(
-    "preserves Bash argv for an inert $name coordinate",
-    ({ source, coordinate }) => {
-      const oracle = runFixedHistoryOracle(source, root);
-
-      expect(oracle.stdout).not.toContain(historyInjectionMarker);
-      expect(oracle.argv).toEqual(["jhw-control", "guard", "status", "--session", coordinate]);
-      expect(isClaimFreeGuardStatusCommand(source)).toBe(true);
-    },
-  );
-
-  it.each(activeHistorySources.slice(0, 2))(
-    "rejects a history-active %s coordinate",
-    (_name, source) => {
-      const oracle = runFixedHistoryOracle(source, root);
-
-      expect(oracle.stderr).toContain("event not found");
-      expect(isClaimFreeGuardStatusCommand(source)).toBe(false);
-    },
-  );
-
-  it("rejects a double-bang coordinate that deterministic Bash history expands into injected source", () => {
-    const source = activeHistorySources[2][1];
-    const oracle = runFixedHistoryOracle(source, root);
-
-    expect(oracle.stdout).toContain(historyInjectionMarker);
-    expect(oracle.argv).toEqual(["jhw-control", "guard", "status", "--session", "fixed-session"]);
-    expect(isClaimFreeGuardStatusCommand(source)).toBe(false);
   });
 
   it("maps git commit to the current canonical repository", async () => {
@@ -517,24 +308,14 @@ describe("conservative shell classification", () => {
     expect(result.ambiguous).toBe(false);
   });
 
-  it("keeps every high-risk detection when shell syntax is ambiguous", async () => {
-    const result = await classifyShell(
+  it("fails closed for a shell -c form instead of guessing a literal script operand", async () => {
+    await expect(classifyShell(
       "bash -c 'git push origin HEAD; gh issue comment 42 --body ok; ssh target.example reboot'",
       context,
-    );
-
-    expect(result.ambiguous).toBe(true);
-    expect(result.requirements).toEqual([
-      { capability: "git.publish", resource: repository },
-      { capability: "shell.unclassified", resource: repository },
-    ]);
-    expect(result.unresolved_signals).toContainEqual({ capability: "tracker.mutate", boundary: "tracker" });
-    expect(result.unresolved_signals).toContainEqual({
-      capability: "remote.execute",
-      boundary: "guarded_command",
-    });
-    expect(result.execution_boundary).toBe("tracker");
-    expect(result.direct_high_risk).toBe(true);
+    )).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
   });
 
   it.each([
@@ -621,6 +402,157 @@ describe("conservative shell classification", () => {
     expect(result.digest_argv).toEqual(["./safe-script.sh", "--flag", "two words"]);
     expect(JSON.stringify(result)).not.toContain(content);
     expect(JSON.stringify(result)).not.toContain(script);
+  });
+
+  it.each([
+    ["shell", "bash ./literal.sh alpha"],
+    ["versioned Python", "python3.12 ./literal.sh alpha"],
+    ["Node", "node ./literal.sh alpha"],
+    ["source", "source ./literal.sh alpha"],
+    ["dot", ". ./literal.sh alpha"],
+  ] as const)("hashes one non-executable literal %s script operand", async (_name, command) => {
+    const script = join(cwd, "literal.sh");
+    const content = "print('first')\n";
+    await writeFile(script, content, { mode: 0o600 });
+
+    const result = await classifyShell(command, context);
+
+    expect(result.script_content_sha256).toBe(createHash("sha256").update(content).digest("hex"));
+    expect(result.digest_argv).toEqual(command.split(" "));
+    expect(JSON.stringify(result)).not.toContain(content);
+    expect(JSON.stringify(result)).not.toContain(script);
+  });
+
+  it.each([
+    "bash -c true",
+    "python -c pass",
+    "python3 -m bounded.module",
+    "node --eval bounded",
+    "node --print bounded",
+    "source literal.sh",
+    ". literal.sh",
+    "python -- ./literal.sh",
+  ])("fails closed when interpreter/source syntax cannot prove one literal local script: %s", async (command) => {
+    await writeFile(join(cwd, "literal.sh"), "print('bounded')\n", { mode: 0o600 });
+
+    await expect(classifyShell(command, context)).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
+  });
+
+  it("fails closed for interpreter operands that are symlinked, outside, non-regular, oversized, or multiply linked", async () => {
+    const safe = join(cwd, "safe.py");
+    const linked = join(cwd, "linked.py");
+    const directory = join(cwd, "directory.py");
+    const fifo = join(cwd, "fifo.py");
+    const oversized = join(cwd, "oversized.py");
+    const multiplyLinked = join(cwd, "multiply-linked.py");
+    const hardLink = join(cwd, "hard-link.py");
+    const outside = join(root, "..", `outside-${root.split("-").at(-1)}.py`);
+    await writeFile(safe, "print('safe')\n", { mode: 0o600 });
+    await symlink(safe, linked);
+    await mkdir(directory);
+    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+    await writeFile(oversized, Buffer.alloc(1024 * 1024 + 1, 0x61), { mode: 0o600 });
+    await writeFile(multiplyLinked, "print('linked')\n", { mode: 0o600 });
+    await link(multiplyLinked, hardLink);
+    await writeFile(outside, "print('outside')\n", { mode: 0o600 });
+
+    try {
+      for (const command of [
+        "python ./linked.py",
+        "python ./directory.py",
+        "python ./fifo.py",
+        "python ./oversized.py",
+        "python ./multiply-linked.py",
+        `python ${outside}`,
+      ]) {
+        await expect(classifyShell(command, context), command).rejects.toMatchObject({
+          name: "ShellClassificationError",
+          code: "unsafe_local_script",
+        } satisfies Partial<ShellClassificationError>);
+      }
+    } finally {
+      await rm(outside, { force: true });
+    }
+  });
+
+  it("fails closed when a slash-qualified local executable has an interpreter basename", async () => {
+    const interpreter = join(cwd, "python");
+    const script = join(cwd, "script.py");
+    await writeFile(interpreter, "#!/bin/sh\nexec python3 \"$@\"\n", { mode: 0o700 });
+    await writeFile(script, "print('first')\n", { mode: 0o600 });
+
+    await expect(classifyShell("./python ./script.py", context)).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
+    await writeFile(script, "print('changed')\n", { mode: 0o600 });
+    await expect(classifyShell("./python ./script.py", context)).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
+  });
+
+  it.each([
+    "bash ./script.sh && echo composed",
+    "bash $(printf ./script.sh)",
+  ])("fails closed when ambiguity hides an interpreter script operand: %s", async (command) => {
+    await writeFile(join(cwd, "script.sh"), "#!/bin/sh\necho bounded\n", { mode: 0o600 });
+
+    await expect(classifyShell(command, context)).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
+  });
+
+  it("detects a deterministic script path swap after the descriptor is inspected", async () => {
+    const script = join(cwd, "swapped.py");
+    const replacement = join(cwd, "replacement.py");
+    await writeFile(script, "print('first')\n", { mode: 0o600 });
+    await writeFile(replacement, "print('second')\n", { mode: 0o600 });
+    const classifyForTesting = (shellClassifierModule as unknown as {
+      classifyShellForTesting?: (
+        input: string,
+        classifierContext: ShellClassifierContext,
+        hooks: { afterScriptPreStat(): Promise<void> },
+      ) => Promise<unknown>;
+    }).classifyShellForTesting;
+
+    expect(classifyForTesting).toBeTypeOf("function");
+    if (!classifyForTesting) return;
+    await expect(classifyForTesting("python ./swapped.py", context, {
+      afterScriptPreStat: async () => {
+        await rename(replacement, script);
+      },
+    })).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
+  });
+
+  it("never reads beyond the one-MiB script bound when the opened file grows", async () => {
+    const script = join(cwd, "growing.py");
+    await writeFile(script, "print('small')\n", { mode: 0o600 });
+    const classifyForTesting = (shellClassifierModule as unknown as {
+      classifyShellForTesting?: (
+        input: string,
+        classifierContext: ShellClassifierContext,
+        hooks: { afterScriptPreStat(): Promise<void> },
+      ) => Promise<unknown>;
+    }).classifyShellForTesting;
+
+    expect(classifyForTesting).toBeTypeOf("function");
+    if (!classifyForTesting) return;
+    await expect(classifyForTesting("python ./growing.py", context, {
+      afterScriptPreStat: async () => {
+        await writeFile(script, Buffer.alloc(1024 * 1024 + 1, 0x62), { mode: 0o600 });
+      },
+    })).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
   });
 
   it("uses POSIX double-quote backslash rules without collapsing distinct argv", async () => {

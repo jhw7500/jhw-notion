@@ -10,11 +10,17 @@ import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { createCliDependencies, runCli, type CliDependencies } from "../cli.js";
 import type { ControlConfig } from "../config.js";
 import { ControlError } from "../errors.js";
-import { GuardDigestKey, GuardRequestStore } from "../guard-state.js";
+import { createProductionGuardRequestStore, GuardDigestKey, GuardRequestStore } from "../guard-state.js";
 import { GitHubProjectClient, type GitHubRunner } from "../github-project.js";
 import { GitHubSourceService, type GitHubSourceRunner } from "../github-source.js";
 import { PilotJournal } from "../journal.js";
-import { MutationLock, ProcessRunner, type ProcessResult, type ProcessRunOptions } from "../process.js";
+import {
+  createProductionMutationLock,
+  MutationLock,
+  ProcessRunner,
+  type ProcessResult,
+  type ProcessRunOptions,
+} from "../process.js";
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { PreflightService, type PreflightProjectPort } from "../preflight.js";
 import { RegistryGit, type ProcessRunnerLike } from "../registry-git.js";
@@ -225,10 +231,10 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
       },
     }) },
     guardMode: graph.config.guardMode,
-    guardRequests: new GuardRequestStore(graph.config),
+    guardRequests: createProductionGuardRequestStore(graph.config),
     guardDigestKey: new GuardDigestKey(graph.config.stateDir),
     guardClaims: graph.claims,
-    mutationLock: new MutationLock(graph.config, {}),
+    mutationLock: createProductionMutationLock(graph.config, {}),
     journal: noopJournal(),
     // Board commands are outside the Phase 1A e2e surface; the ports only need
     // to exist so the dependency graph typechecks.

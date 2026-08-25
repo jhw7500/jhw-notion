@@ -510,9 +510,13 @@ export interface MutationLockRuntime {
   ) => MutationLockChild;
 }
 
-const productionLockRuntime: MutationLockRuntime = {
-  spawn: (command, args, options) => spawn(command, args, options),
-};
+const productionLockRuntime: MutationLockRuntime = Object.freeze({
+  spawn: (
+    command: string,
+    args: string[],
+    options: { env: NodeJS.ProcessEnv; stdio: ["ignore", "ignore", "ignore", number] },
+  ) => spawn(command, args, options),
+});
 
 const directlyConstructedMutationLocks = new WeakSet<object>();
 
@@ -526,6 +530,7 @@ interface DirectMutationLockAuthority {
 }
 
 const directMutationLockAuthorities = new WeakMap<MutationLock, DirectMutationLockAuthority>();
+const productionMutationLockAuthorities = new WeakMap<MutationLock, DirectMutationLockAuthority>();
 const guardMutationAuthorityBrand = Symbol("guard-mutation-lock-authority");
 const guardMutationAuthorityRunners = new WeakMap<object, GuardMutationRunner>();
 const activeGuardMutationCoordinates = new AsyncLocalStorage<ReadonlySet<string>>();
@@ -601,15 +606,23 @@ function acquireLock(child: MutationLockChild, helperTimeoutMs: number, contende
  */
 export class MutationLock implements MutationLockPort {
   readonly #stateDir: string;
+  readonly #environment: NodeJS.ProcessEnv;
+  readonly #runtime: MutationLockRuntime;
+  readonly #secureDirectoryHooks: SecureStateDirectoryHooks;
+  readonly #options: MutationLockOptions;
 
   constructor(
     config: ControlConfig,
-    private readonly environment: NodeJS.ProcessEnv = process.env,
-    private readonly runtime: MutationLockRuntime = productionLockRuntime,
-    private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
-    private readonly options: MutationLockOptions = {},
+    environment: NodeJS.ProcessEnv = process.env,
+    runtime: MutationLockRuntime = productionLockRuntime,
+    secureDirectoryHooks: SecureStateDirectoryHooks = {},
+    options: MutationLockOptions = {},
   ) {
     this.#stateDir = resolve(config.stateDir);
+    this.#environment = environment;
+    this.#runtime = runtime;
+    this.#secureDirectoryHooks = secureDirectoryHooks;
+    this.#options = options;
     if (new.target === MutationLock) {
       directlyConstructedMutationLocks.add(this);
       const lockFileName = options.lockFileName ?? "registry.lock";
@@ -642,12 +655,12 @@ export class MutationLock implements MutationLockPort {
       try {
         directory = await openSecureStateDirectory(
           this.#stateDir,
-          this.secureDirectoryHooks,
-          { strictExistingMode: this.options.strictExistingStateDirectory },
+          this.#secureDirectoryHooks,
+          { strictExistingMode: this.#options.strictExistingStateDirectory },
         );
-        const lockFileName = this.options.lockFileName ?? "registry.lock";
+        const lockFileName = this.#options.lockFileName ?? "registry.lock";
         let lockCreated = false;
-        if (this.options.strictExistingLockFileMode) {
+        if (this.#options.strictExistingLockFileMode) {
           try {
             lockFile = await directory.openFile(lockFileName, strictLockCreateFlags, 0o600);
             lockCreated = true;
@@ -664,7 +677,7 @@ export class MutationLock implements MutationLockPort {
         if (!info.isFile() || info.nlink !== 1) {
           throw new ControlError("UNSAFE_STATE_PATH", "Host lock is not a private single-link regular file");
         }
-        if (this.options.strictExistingLockFileMode && !lockCreated) {
+        if (this.#options.strictExistingLockFileMode && !lockCreated) {
           if ((info.mode & 0o777) !== 0o600) {
             throw new ControlError("UNSAFE_STATE_PATH", "Host lock mode is not private");
           }
@@ -679,16 +692,16 @@ export class MutationLock implements MutationLockPort {
         throw new ControlError("LOCK_SETUP_FAILED", "Unable to prepare host mutation lock");
       }
 
-      const helperEnvironment = sanitizedChildEnvironment(this.environment);
+      const helperEnvironment = sanitizedChildEnvironment(this.#environment);
       // The historic marker has no authority and is never passed to the helper.
       delete helperEnvironment.JHW_CONTROL_LOCK_HELD;
-      const wait = waitOverride ?? this.options.waitSeconds;
+      const wait = waitOverride ?? this.#options.waitSeconds;
       if (wait !== undefined && (!Number.isSafeInteger(wait) || wait <= 0 || wait > 60)) {
         throw new ControlError("LOCK_SETUP_FAILED", "Lock wait must be a bounded positive integer");
       }
       let child: MutationLockChild;
       try {
-        child = this.runtime.spawn(
+        child = this.#runtime.spawn(
           "flock",
           wait === undefined ? ["-n", "-E", "75", "3"] : ["-w", String(wait), "-E", "75", "3"],
           { env: helperEnvironment, stdio: ["ignore", "ignore", "ignore", lockFile.fd] },
@@ -701,7 +714,7 @@ export class MutationLock implements MutationLockPort {
       await acquireLock(
         child,
         wait === undefined ? LOCK_HELPER_TIMEOUT_MS : Math.max(LOCK_HELPER_TIMEOUT_MS, (wait + 2) * 1000),
-        this.options.contendedReason,
+          this.#options.contendedReason,
       );
       return await callback(directory);
     } finally {
@@ -709,6 +722,42 @@ export class MutationLock implements MutationLockPort {
       await directory?.close();
     }
   }
+}
+
+const intrinsicMutationLockRun = MutationLock.prototype.run;
+const intrinsicMutationLockRunInStateDirectory = MutationLock.prototype.runInStateDirectory;
+
+export type ProductionMutationLockProfile = "registry" | "board";
+
+function productionMutationOptions(profile: ProductionMutationLockProfile): Readonly<MutationLockOptions> {
+  if (profile === "registry") return Object.freeze({});
+  return Object.freeze({
+    lockFileName: "boards.lock",
+    waitSeconds: 5,
+    contendedReason: "board_state_lock",
+  });
+}
+
+/** Mints the only MutationLock provenance accepted by production Guard composition. */
+export function createProductionMutationLock(
+  config: ControlConfig,
+  environment: NodeJS.ProcessEnv = process.env,
+  profile: ProductionMutationLockProfile = "registry",
+): MutationLock {
+  const configSnapshot = Object.freeze({ ...config });
+  const environmentSnapshot = Object.freeze({ ...environment });
+  const lock = new MutationLock(
+    configSnapshot,
+    environmentSnapshot,
+    productionLockRuntime,
+    Object.freeze({}),
+    productionMutationOptions(profile),
+  );
+  const direct = directMutationLockAuthorities.get(lock);
+  if (!direct) throw new TypeError("Production MutationLock construction failed");
+  productionMutationLockAuthorities.set(lock, direct);
+  Object.freeze(lock);
+  return lock;
 }
 
 /** True only for instances constructed directly by this module's base class. */
@@ -726,15 +775,36 @@ export function isDirectMutationLock(value: unknown): value is MutationLock {
 export function createGuardMutationLockAuthority(
   mutationLock: MutationLock,
 ): GuardMutationLockAuthority {
+  const direct = productionMutationLockAuthorities.get(mutationLock);
+  if (
+    !isDirectMutationLock(mutationLock) ||
+    Object.getPrototypeOf(mutationLock) !== MutationLock.prototype ||
+    mutationLock.run !== intrinsicMutationLockRun ||
+    mutationLock.runInStateDirectory !== intrinsicMutationLockRunInStateDirectory ||
+    !direct?.guardEligible
+  ) {
+    throw new TypeError("Guard mutation authority requires the concrete MutationLock non-blocking Registry implementation");
+  }
+  const authority = Object.freeze({
+    [guardMutationAuthorityBrand]: true,
+  }) as GuardMutationLockAuthority;
+  guardMutationAuthorityRunners.set(authority, (callback) => runGuardAdmission(direct, callback));
+  return authority;
+}
+
+/** Unit-fixture authority that never populates production provenance. */
+export function createGuardMutationLockAuthorityForTesting(
+  mutationLock: MutationLock,
+): GuardMutationLockAuthority {
   const direct = directMutationLockAuthorities.get(mutationLock);
   if (
     !isDirectMutationLock(mutationLock) ||
     Object.getPrototypeOf(mutationLock) !== MutationLock.prototype ||
-    mutationLock.run !== MutationLock.prototype.run ||
-    mutationLock.runInStateDirectory !== MutationLock.prototype.runInStateDirectory ||
+    mutationLock.run !== intrinsicMutationLockRun ||
+    mutationLock.runInStateDirectory !== intrinsicMutationLockRunInStateDirectory ||
     !direct?.guardEligible
   ) {
-    throw new TypeError("Guard mutation authority requires the concrete MutationLock non-blocking Registry implementation");
+    throw new TypeError("Guard test mutation authority requires the concrete MutationLock implementation");
   }
   const authority = Object.freeze({
     [guardMutationAuthorityBrand]: true,
@@ -747,11 +817,25 @@ export function createGuardMutationLockAuthority(
 export function guardMutationLockHostCoordinate(
   mutationLock: MutationLock,
 ): GuardHostCoordinateAuthority | undefined {
+  const direct = productionMutationLockAuthorities.get(mutationLock);
+  return isDirectMutationLock(mutationLock) &&
+    Object.getPrototypeOf(mutationLock) === MutationLock.prototype &&
+    mutationLock.run === intrinsicMutationLockRun &&
+    mutationLock.runInStateDirectory === intrinsicMutationLockRunInStateDirectory &&
+    direct?.guardEligible
+    ? direct.hostCoordinate
+    : undefined;
+}
+
+/** Test-only coordinate proof; it is not accepted by production composition. */
+export function guardMutationLockHostCoordinateForTesting(
+  mutationLock: MutationLock,
+): GuardHostCoordinateAuthority | undefined {
   const direct = directMutationLockAuthorities.get(mutationLock);
   return isDirectMutationLock(mutationLock) &&
     Object.getPrototypeOf(mutationLock) === MutationLock.prototype &&
-    mutationLock.run === MutationLock.prototype.run &&
-    mutationLock.runInStateDirectory === MutationLock.prototype.runInStateDirectory &&
+    mutationLock.run === intrinsicMutationLockRun &&
+    mutationLock.runInStateDirectory === intrinsicMutationLockRunInStateDirectory &&
     direct?.guardEligible
     ? direct.hostCoordinate
     : undefined;

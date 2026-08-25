@@ -24,11 +24,19 @@ import { loadControlConfig } from "./config.js";
 import { ControlContractAuthority } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
 import { GuardAdapterSchema, type GuardAdapter } from "./guard-protocol.js";
-import { GuardDigestKey, GuardRequestStore } from "./guard-state.js";
+import {
+  createProductionGuardRequestStore,
+  GuardDigestKey,
+  type GuardRequestStore,
+} from "./guard-state.js";
 import { GitHubProjectClient, type RegistrationRecordWarning } from "./github-project.js";
 import { GitHubSourceService } from "./github-source.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
-import { MutationLock, ProcessRunner, type MutationLockPort } from "./process.js";
+import {
+  createProductionMutationLock,
+  ProcessRunner,
+  type MutationLockPort,
+} from "./process.js";
 import { PortfolioService } from "./portfolio.js";
 import { PreflightService } from "./preflight.js";
 import { RegistrationHintStore } from "./registration-hint.js";
@@ -267,11 +275,7 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
   const boardJournal = new BoardJournal(config.stateDir, {}, sensitiveData);
   const boardService = new BoardService(
     config,
-    new MutationLock(config, env, undefined, {}, {
-      lockFileName: "boards.lock",
-      waitSeconds: 5,
-      contendedReason: "board_state_lock",
-    }),
+    createProductionMutationLock(config, env, "board"),
     livenessProbe,
     () => new Date(),
     boardJournal,
@@ -377,10 +381,10 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
       sensitiveData,
     }),
     guardMode: config.guardMode,
-    guardRequests: new GuardRequestStore(config, { environment: env }),
+    guardRequests: createProductionGuardRequestStore(config, env),
     guardDigestKey: new GuardDigestKey(config.stateDir),
     guardClaims: claims,
-    mutationLock: new MutationLock(config, env),
+    mutationLock: createProductionMutationLock(config, env),
     // The board lock is a second host-global lock with its own identity: board
     // commands must never contend with registry.lock, and boards.lock waits
     // briefly instead of failing fast because its critical sections are ms-long.

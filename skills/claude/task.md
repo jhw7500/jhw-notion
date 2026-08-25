@@ -254,7 +254,7 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 
 Guard 결과는 다음처럼 해석한다.
 
-- `ALLOW`: 명시적으로 claim-free로 분류된 로컬 read/status이거나, 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다.
+- `ALLOW`: Guard가 exact native local `Read`로 검증한 repository file read이거나, 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다. Plan 2에서는 shell command text만으로 claim-free status 권한을 주지 않는다.
 - `PERMIT_REQUIRED`: 소유권 충돌 없이 Work Contract 범위만 부족하다. Guard가 반환한 exact `approval_command`로 표시된 작업 한 건만 사용자 승인을 받을 수 있다.
 - `DENY`: hard-deny 또는 안전 상태를 검증할 수 없는 경우다. unlock으로 우회하지 않는다.
 
@@ -268,6 +268,8 @@ protocol/prompt origin, Claim/session/host/worktree, current authority·exclusiv
 jhw-control guard status [--session <exact-session-id>]
 jhw-control guard preflight
 ```
+
+위 direct CLI 호출은 자체 read-only dispatch로 동작한다. TUI가 `Bash`/`exec_command`로 같은 text를 가로채 실행하는 경로는 실행 identity를 소유하지 않으므로 Plan 3 adapter가 identity-bound execution을 제공할 때까지 Claim-bound다. shell text, ambient `PATH`, alias/function, 또는 absolute-path 관례로 이 경계를 우회하지 않는다.
 
 `guard status`는 protocol version, `enforce|observe` runtime mode, request/key 안전 상태, persisted request 상태별 count, Registry/Claim read availability, optional exact-session match, adapter coverage만 bounded 결과로 보여준다. raw request/command/path/key는 표시하지 않으며 손상 상태를 고치거나 만료 row를 정리하지 않는다. Plan 2에서 `claude|codex|gemini|opencode`의 prompt-origin·pre-tool blocking·execution-recheck는 모두 `pending`이며 loose file만 보고 installed로 간주하지 않는다.
 

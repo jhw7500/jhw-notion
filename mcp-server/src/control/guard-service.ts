@@ -28,25 +28,33 @@ import {
 } from "./guard-protocol.js";
 import { newOperationId } from "./ids.js";
 import {
-  normalizeOperation,
+  normalizeResolvedOperation,
   OperationNormalizationError,
   type NormalizeOperationContext,
 } from "./operation-normalizer.js";
 import {
+  resolveGuardTool,
+  type ResolvedGuardTool,
+} from "./guard-tool-resolver.js";
+import {
   createGuardMutationLockAuthority,
+  createGuardMutationLockAuthorityForTesting,
   guardMutationLockHostCoordinate,
+  guardMutationLockHostCoordinateForTesting,
   MutationLock,
   runWithGuardMutationLockAuthority,
 } from "./process.js";
 import {
   GuardJournal,
   guardJournalHostCoordinate,
+  guardJournalHostCoordinateForTesting,
   isDirectGuardJournal,
   type GuardJournalEvent,
 } from "./guard-journal.js";
 import {
   GuardRequestStore,
   guardRequestStoreHostCoordinate,
+  guardRequestStoreHostCoordinateForTesting,
   type GuardCompleteResult,
   type GuardConsumeResult,
   type GuardPendingResult,
@@ -75,7 +83,6 @@ import {
 import {
   classifyShell,
   detectGuardSelfApproval,
-  isClaimFreeGuardStatusCommand,
   ShellClassificationError,
   type ExecutionBoundary,
   type ShellClassification,
@@ -231,6 +238,21 @@ export function createGuardRegistryMutationBarrier(
   return barrier;
 }
 
+/** Unit-fixture barrier that never populates or satisfies production provenance. */
+export function createGuardRegistryMutationBarrierForTesting(
+  mutationLock: MutationLock,
+): GuardRegistryMutationBarrierPort {
+  const mutationAuthority = createGuardMutationLockAuthorityForTesting(mutationLock);
+  const barrier = Object.freeze({
+    [guardRegistryMutationBarrierBrand]: true,
+  }) as GuardRegistryMutationBarrierPort;
+  guardRegistryMutationBarrierRunners.set(
+    barrier,
+    <T>(callback: () => Promise<T>) => runWithGuardMutationLockAuthority(mutationAuthority, callback),
+  );
+  return barrier;
+}
+
 function guardRegistryMutationBarrierRunner(
   barrier: unknown,
 ): GuardRegistryMutationBarrierRunner | undefined {
@@ -327,55 +349,8 @@ const hardObserveCodes = new Set<GuardDenyCode>([
   "GUARD_SELF_APPROVAL_DENIED",
 ]);
 
-const fileModifyTools = new Set([
-  "edit", "edit_file", "write", "write_file", "notebookedit", "notebook_edit", "apply_patch", "functions_apply_patch",
-]);
-const shellTools = new Set(["bash", "shell", "exec_command", "run_command", "terminal"]);
-const directHighRiskTools = new Set([
-  "jhw_record", "jhw_save", "jhw_delete", "jhw_note",
-  "github_issue_close", "github_issue_edit", "github_issue_comment",
-]);
-const notionDatabaseIds = new Set(["decisionLog", "preferences", "projects", "references", "knowledgeBase"]);
-const claimFreeStatusCommands = new Set([
-  "git status",
-  "git status --short",
-  "git status --porcelain",
-  "jhw-control guard status",
-  "jhw-control guard preflight",
-  "jhw-control board list",
-]);
-
-function canonicalToolAlias(toolName: string): string {
-  const tail = toolName.trim().toLowerCase().split(/__+|[.:/]+/u).filter(Boolean).at(-1) ?? "";
-  return tail.replace(/[^a-z0-9]+/gu, "_").replace(/^_+|_+$/gu, "");
-}
-
-function asObject(value: unknown): Record<string, unknown> | undefined {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
-}
-
-function commandFrom(event: PreToolUseEvent): string | undefined {
-  const command = asObject(event.tool_input)?.command;
-  return typeof command === "string" && command.length > 0 ? command : undefined;
-}
-
-function notionDatabaseFrom(event: PreToolUseEvent): NormalizeOperationContext["notion_database"] | undefined {
-  const alias = canonicalToolAlias(event.tool_name);
-  if (!new Set(["jhw_record", "jhw_save", "jhw_delete", "jhw_note"]).has(alias)) return undefined;
-  const db = alias === "jhw_note" ? "knowledgeBase" : asObject(event.tool_input)?.db;
-  return typeof db === "string" && notionDatabaseIds.has(db)
-    ? { kind: "notion_database", id: db as "decisionLog" | "preferences" | "projects" | "references" | "knowledgeBase" }
-    : undefined;
-}
-
-const exactClaimFreeShellTools = new Set(["Bash", "exec_command"]);
 const runFile = promisify(execFile);
 const sensitiveReadComponent = /^(?:\.env(?:\..*)?|\.git|\.netrc|\.npmrc|\.pypirc|credentials?|secrets?|tokens?|id_rsa|id_ed25519)$/iu;
-
-function exactKeys(input: Record<string, unknown>, allowed: readonly string[]): boolean {
-  return Object.keys(input).every((key) => allowed.includes(key));
-}
 
 function safeLocalRelativePath(raw: string, allowDot = false): boolean {
   if (!raw || isAbsolute(raw) || raw.includes("\\") || /[\u0000\r\n]/u.test(raw)) return false;
@@ -431,21 +406,12 @@ async function noFollowEntry(root: string, rawPath: string): Promise<{ path: str
 
 async function claimFreeReadSummary(
   event: PreToolUseEvent,
-): Promise<"Local repository read" | "Local repository status" | undefined> {
-  const input = asObject(event.tool_input);
+  resolvedTool: ResolvedGuardTool,
+): Promise<"Local repository read" | undefined> {
+  const input = resolvedTool.claim_free_read;
   if (!input) return undefined;
   const root = await trustedRepositoryRoot(event.cwd);
   if (!root) return undefined;
-  if (exactClaimFreeShellTools.has(event.tool_name)) {
-    if (!exactKeys(input, ["command"]) || typeof input.command !== "string") return undefined;
-    return claimFreeStatusCommands.has(input.command) || isClaimFreeGuardStatusCommand(input.command)
-      ? "Local repository status"
-      : undefined;
-  }
-  if (event.tool_name !== "Read") return undefined;
-  if (!exactKeys(input, ["file_path", "offset", "limit"]) || typeof input.file_path !== "string") return undefined;
-  if (input.offset !== undefined && (!Number.isSafeInteger(input.offset) || (input.offset as number) < 1)) return undefined;
-  if (input.limit !== undefined && (!Number.isSafeInteger(input.limit) || (input.limit as number) < 1 || (input.limit as number) > 100_000)) return undefined;
   return (await noFollowEntry(root, input.file_path))?.kind === "file" ? "Local repository read" : undefined;
 }
 
@@ -498,33 +464,12 @@ async function safeMutationTarget(root: string, cwd: string, rawPath: string): P
   return false;
 }
 
-function patchTargets(input: unknown): string[] | undefined {
-  const patch = typeof input === "string" ? input : asObject(input)?.patch;
-  if (typeof patch !== "string") return undefined;
-  const targets: string[] = [];
-  for (const line of patch.split("\n")) {
-    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/u) ??
-      line.match(/^\*\*\* Move to: (.+)$/u);
-    if (match?.[1]) targets.push(match[1]);
-  }
-  return targets.length > 0 ? targets : undefined;
-}
-
-function mutationTargets(event: PreToolUseEvent): string[] | undefined {
-  const alias = canonicalToolAlias(event.tool_name);
-  if (!fileModifyTools.has(alias)) return [];
-  if (alias === "apply_patch" || alias === "functions_apply_patch") return patchTargets(event.tool_input);
-  const input = asObject(event.tool_input);
-  if (!input) return undefined;
-  const targets = [input.file_path, input.path, input.notebook_path]
-    .filter((value): value is string => typeof value === "string");
-  return targets.length > 0 ? [...new Set(targets)] : undefined;
-}
-
-async function mutationPathsAreSafe(event: PreToolUseEvent, worktreePath: string): Promise<boolean> {
-  const targets = mutationTargets(event);
-  if (targets === undefined) return false;
-  for (const target of targets) {
+async function mutationPathsAreSafe(
+  event: PreToolUseEvent,
+  resolvedTool: ResolvedGuardTool,
+  worktreePath: string,
+): Promise<boolean> {
+  for (const target of resolvedTool.mutation_targets) {
     if (!await safeMutationTarget(worktreePath, event.cwd, target)) return false;
   }
   return true;
@@ -675,17 +620,23 @@ export class GuardService {
     }
     const event = eventResult.data;
     journalContext.event = event;
+    let resolvedTool: ResolvedGuardTool;
+    try {
+      resolvedTool = resolveGuardTool(event.adapter, event.tool_name, event.tool_input);
+    } catch {
+      return this.deny("GUARD_UNAVAILABLE");
+    }
     if (!this.mode) return this.deny("GUARD_UNAVAILABLE");
     if (this.mode === "observe" && !await this.observeStateAvailable()) {
       return this.deny("GUARD_UNAVAILABLE");
     }
 
-    const earlyCommand = commandFrom(event);
+    const earlyCommand = resolvedTool.self_approval_command;
     if (earlyCommand && detectGuardSelfApproval(earlyCommand)) {
       return this.deny("GUARD_SELF_APPROVAL_DENIED");
     }
 
-    const claimFree = await claimFreeReadSummary(event);
+    const claimFree = await claimFreeReadSummary(event, resolvedTool);
     if (claimFree) {
       return GuardDecisionSchema.parse({
         decision: "ALLOW",
@@ -705,7 +656,7 @@ export class GuardService {
     let authoritativeDecision: GuardDecision | undefined;
     const evaluateWithinBarrier = async (): Promise<GuardDecision> =>
       this.options.registry_view.withCommittedView(async () => {
-        const decision = await this.evaluatePinned(event, {
+        const decision = await this.evaluatePinned(event, resolvedTool, {
           mayCommit: async () => {
             try {
               if (await this.options.registry_view.committedViewIsStale()) return false;
@@ -738,6 +689,7 @@ export class GuardService {
 
   private async evaluatePinned(
     event: PreToolUseEvent,
+    resolvedTool: ResolvedGuardTool,
     permitLifecycle: PermitLifecycleBoundary,
     journalContext: GuardDecisionJournalContext,
   ): Promise<GuardDecision> {
@@ -780,17 +732,17 @@ export class GuardService {
       JSON.stringify(task.work_contract) !== JSON.stringify(boundClaim.data.work_contract)) {
       return this.deny("GUARD_RESOURCE_AUTHORITY_UNAVAILABLE", claim);
     }
-    if (!await mutationPathsAreSafe(event, inspection.worktree.path)) {
+    if (!await mutationPathsAreSafe(event, resolvedTool, inspection.worktree.path)) {
       return this.deny("GUARD_WORKTREE_MISMATCH", claim);
     }
 
-    const context = await this.normalizationContext(event, claim, task, inspection);
+    const context = await this.normalizationContext(resolvedTool, claim, task, inspection);
     if (!context) return this.deny("GUARD_UNAVAILABLE", claim);
 
     let classification: ShellClassification | undefined;
     let directHighRisk = false;
-    const command = commandFrom(event);
-    if (shellTools.has(canonicalToolAlias(event.tool_name))) {
+    const command = resolvedTool.command;
+    if (resolvedTool.family === "shell") {
       if (!command) return this.deny("GUARD_WRAPPER_REQUIRED", claim);
       try {
         classification = await classifyShell(command, {
@@ -810,13 +762,13 @@ export class GuardService {
       if (classification.unresolved_signals.length > 0) {
         return this.deny("GUARD_WRAPPER_REQUIRED", claim, undefined, classification.execution_boundary);
       }
-    } else if (directHighRiskTools.has(canonicalToolAlias(event.tool_name))) {
+    } else if (resolvedTool.family === "notion_mutation" || resolvedTool.family === "tracker_mutation") {
       directHighRisk = true;
     }
 
-    let operation: Awaited<ReturnType<typeof normalizeOperation>>;
+    let operation: CanonicalOperation;
     try {
-      operation = await normalizeOperation(event, context, this.options.digest_key);
+      operation = await normalizeResolvedOperation(event, resolvedTool, context, this.options.digest_key);
     } catch (cause) {
       if (cause instanceof OperationNormalizationError) {
         if (cause.code === "self_approval") return this.deny("GUARD_SELF_APPROVAL_DENIED", claim);
@@ -1324,7 +1276,7 @@ export class GuardService {
   }
 
   private async normalizationContext(
-    event: PreToolUseEvent,
+    resolvedTool: ResolvedGuardTool,
     claim: ActiveClaim,
     task: TaskRecord,
     inspection: GuardTaskInspection,
@@ -1342,9 +1294,11 @@ export class GuardService {
       if (parent.kind !== "formal" || parent.task_role !== "parent") return undefined;
       issue = { kind: "issue", id: parent.issue_node_id };
     }
-    const command = commandFrom(event);
+    const command = resolvedTool.command;
     const board = command ? boardFromOwnedWrapper(command) : undefined;
-    const notionDatabase = notionDatabaseFrom(event);
+    const notionDatabase = resolvedTool.notion_database_id
+      ? { kind: "notion_database" as const, id: resolvedTool.notion_database_id }
+      : undefined;
     return {
       evaluation_stage: "hook",
       task_id: claim.task_id,
@@ -1387,7 +1341,7 @@ export class GuardService {
   private deny(
     codeInput: GuardDenyCode,
     claim?: ActiveClaim,
-    operation?: Awaited<ReturnType<typeof normalizeOperation>>,
+    operation?: CanonicalOperation,
     boundary: ExecutionBoundary = "hook",
     journalWarning?: "GUARD_JOURNAL_UNAVAILABLE",
     reason?: ErrorReason,
@@ -1452,17 +1406,43 @@ export function createGuardServiceComposition(
     guard_journal: GuardJournal;
   },
 ): GuardServiceComposition {
+  return composeGuardService(registryMutationLock, options, false);
+}
+
+/** Unit-fixture composition that cannot satisfy production provenance checks. */
+export function createGuardServiceCompositionForTesting(
+  registryMutationLock: MutationLock,
+  options: Omit<GuardServiceOptions, "registry_mutation_barrier" | "guard_journal"> & {
+    guard_journal: GuardJournal;
+  },
+): GuardServiceComposition {
+  return composeGuardService(registryMutationLock, options, true);
+}
+
+function composeGuardService(
+  registryMutationLock: MutationLock,
+  options: Omit<GuardServiceOptions, "registry_mutation_barrier" | "guard_journal"> & {
+    guard_journal: GuardJournal;
+  },
+  forTesting: boolean,
+): GuardServiceComposition {
   const {
     guard_journal: guardJournal,
     guard_request_store: guardRequestStore,
     ...serviceOptions
   } = options;
   const journalAuthority = captureGuardJournal(guardJournal);
-  const journalCoordinate = guardJournalHostCoordinate(guardJournal);
-  const registryCoordinate = guardMutationLockHostCoordinate(registryMutationLock);
+  const journalCoordinate = forTesting
+    ? guardJournalHostCoordinateForTesting(guardJournal)
+    : guardJournalHostCoordinate(guardJournal);
+  const registryCoordinate = forTesting
+    ? guardMutationLockHostCoordinateForTesting(registryMutationLock)
+    : guardMutationLockHostCoordinate(registryMutationLock);
   const requestStoreAuthority = captureGuardRequestStore(guardRequestStore);
   const requestStoreCoordinate = guardRequestStore
-    ? guardRequestStoreHostCoordinate(guardRequestStore)
+    ? forTesting
+      ? guardRequestStoreHostCoordinateForTesting(guardRequestStore)
+      : guardRequestStoreHostCoordinate(guardRequestStore)
     : undefined;
   if (!journalAuthority || !journalCoordinate) {
     throw new TypeError("Guard service composition requires the concrete GuardJournal implementation");
@@ -1475,7 +1455,9 @@ export function createGuardServiceComposition(
       !sameGuardHostCoordinate(registryCoordinate, requestStoreCoordinate))) {
     throw new TypeError("Guard service composition requires concrete request state at the host coordinate");
   }
-  const registryMutationBarrier = createGuardRegistryMutationBarrier(registryMutationLock);
+  const registryMutationBarrier = forTesting
+    ? createGuardRegistryMutationBarrierForTesting(registryMutationLock)
+    : createGuardRegistryMutationBarrier(registryMutationLock);
   return Object.freeze({
     service: new GuardService({
       ...serviceOptions,
