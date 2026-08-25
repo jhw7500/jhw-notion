@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { GithubNodeIdSchema, TaskIdSchema } from "./schemas.js";
+import { TaskIdSchema } from "./schemas.js";
 
 export const CAPABILITIES = [
   "repo.inspect", "repo.modify", "git.commit", "git.publish",
@@ -32,10 +32,13 @@ export type ResourceKind = z.infer<typeof ResourceKindSchema>;
 const resourceId = (prefix?: string) => z.string().regex(
   new RegExp(`^${prefix ?? ""}[a-z0-9][a-z0-9-]{1,62}$`),
 );
+// Work-contract Issue resources must be canonical Issue node identities, not
+// the deliberately broad schema used to preserve existing Registry records.
+const githubIssueNodeId = z.string().max(128).regex(/^I_[A-Za-z0-9_-]+$/);
 
 export const ResourceRefSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("repository"), id: resourceId("repo-") }).strict(),
-  z.object({ kind: z.literal("issue"), id: GithubNodeIdSchema }).strict(),
+  z.object({ kind: z.literal("issue"), id: githubIssueNodeId }).strict(),
   z.object({ kind: z.literal("notion_database"), id: z.enum(["decisionLog", "preferences", "projects", "references", "knowledgeBase"]) }).strict(),
   z.object({ kind: z.literal("board"), id: resourceId() }).strict(),
   z.object({ kind: z.literal("remote_host"), id: resourceId("rhost-") }).strict(),

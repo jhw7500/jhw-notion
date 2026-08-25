@@ -116,6 +116,19 @@ describe("work contracts", () => {
     expect(ResourceRefSchema.safeParse({ kind: "notion_database", id: "project" }).success).toBe(false);
   });
 
+  it("rejects non-identity issue resource aliases and host coordinates", () => {
+    const invalidIssueIds = ["/tmp/x", "I_/tmp/x", "127.0.0.1", "COM3", "wlan-package#42"];
+    for (const id of invalidIssueIds) {
+      expect(WorkContractSchema.safeParse({
+        version: 1,
+        task_id: taskId,
+        grants: [{ capability: "tracker.mutate", resource: { kind: "issue", id }, coordination: "shared" }],
+        dependencies: [],
+      }).success).toBe(false);
+    }
+    expect(ResourceRefSchema.safeParse({ kind: "issue", id: "I_kwDOAb-123" }).success).toBe(true);
+  });
+
   it("rejects duplicate grants even when coordination differs and rejects self-dependencies", () => {
     expect(WorkContractSchema.safeParse({
       version: 1,
