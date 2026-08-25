@@ -1,8 +1,10 @@
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   GuardDecisionSchema,
@@ -35,6 +37,7 @@ const SESSION_ID = "codex-guard-task";
 const HOST = "cantopsbuildserver";
 const REPOSITORY = { kind: "repository", id: "repo-guard" } as const;
 const BOARD = { kind: "board", id: "board-alpha" } as const;
+const runFile = promisify(execFile);
 
 function contract(taskId: string, grants: WorkGrant[]): WorkContract {
   return normalizeWorkContract({ version: 1, task_id: taskId, grants, dependencies: [] });
@@ -71,6 +74,7 @@ function activeClaim(workContract: WorkContract): ContractActiveClaim {
     project_id: "prj-guard",
     repo_id: REPOSITORY.id,
     claim_id: workContract.task_id === TASK_ID ? CLAIM_ID : OTHER_CLAIM_ID,
+    origin_adapter: "codex",
     session_id: workContract.task_id === TASK_ID ? SESSION_ID : "codex-other-task",
     host: HOST,
     branch: workContract.task_id === TASK_ID ? "task/guard-task" : "task/other-task",
@@ -129,7 +133,7 @@ describe("GuardService", () => {
   beforeEach(async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-guard-service-"));
     const cwd = join(root, "src");
-    await mkdir(join(root, ".git"));
+    await runFile("git", ["init", "--quiet", root]);
     await mkdir(cwd);
     await writeFile(join(cwd, "file.ts"), "a\n", "utf8");
     const currentContract = contract(TASK_ID, [grant("repo.inspect"), grant("repo.modify")]);
@@ -158,14 +162,18 @@ describe("GuardService", () => {
       claimLookups: 0,
       authorityCalls: 0,
       permit: {
-        decideMissingGrant: async (operation) => {
+        decideMissingGrant: async (operation, missing) => {
           fixture.permitCalls += 1;
           return {
-            decision: "PERMIT_REQUIRED",
-            operation_id: operation.operation_id,
+            task_id: operation.task_id,
+            claim_id: operation.claim_id,
+            origin_adapter: operation.origin_adapter,
+            session_id: operation.session_id,
+            cwd_worktree_ref: operation.cwd_worktree_ref,
+            requirements: operation.requirements,
+            missing_requirements: missing,
+            operation_digest: operation.digest,
             request_id: REQUEST_ID,
-            summary: operation.summary,
-            approval_command: `/jhw:unlock ${REQUEST_ID}`,
             approval_expires_at: "2026-08-25T10:10:00+09:00",
           };
         },
@@ -192,6 +200,7 @@ describe("GuardService", () => {
               if (!fixture.currentClaim) throw new Error("claim disappeared");
               return { active: fixture.currentClaim, worktree: fixture.inspection };
             },
+            sourceRevisionForGuard: async () => fixture.currentClaim?.source_task_revision ?? "missing",
           },
           authority: {
             assertKnownRequirement: async (_task, _requirement) => {
@@ -200,6 +209,10 @@ describe("GuardService", () => {
             },
           },
           permit_decisions: fixture.permit,
+          registry_view: {
+            withCommittedView: async <T>(read: () => Promise<T>) => read(),
+            committedViewIsStale: async () => false,
+          },
         };
         return { ...base, ...overrides };
       },
@@ -241,6 +254,40 @@ describe("GuardService", () => {
       .resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
     await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command: "ssh host cat /etc/os-release" })))
       .resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
+  });
+
+  it("does not treat suffix aliases, outside paths, sensitive files, or symlinks as Claim-free reads", async () => {
+    fixture.currentClaim = undefined;
+    fixture.activeClaims = [];
+    await writeFile(join(fixture.root, ".env"), "bounded fixture\n", "utf8");
+    await symlink(join(fixture.cwd, "file.ts"), join(fixture.cwd, "linked-read.ts"));
+
+    for (const event of [
+      preTool(fixture.cwd, "mcp__remote__read", { file_path: "src/file.ts" }),
+      preTool(fixture.cwd, "Read", { file_path: "/etc/shadow" }),
+      preTool(fixture.cwd, "Read", { file_path: "../outside" }),
+      preTool(fixture.cwd, "Read", { file_path: ".env" }),
+      preTool(fixture.cwd, "Read", { file_path: "src/linked-read.ts" }),
+      preTool(fixture.cwd, "Read", { file_path: "src/file.ts", url: "https://example.invalid" }),
+      preTool(fixture.cwd, "Grep", { pattern: "token", path: "../" }),
+    ]) {
+      await expect(fixture.service().evaluatePreTool(event)).resolves.toMatchObject({
+        decision: "DENY",
+        code: "GUARD_CLAIM_REQUIRED",
+      });
+    }
+  });
+
+  it("requires a trusted local Git cwd even for an exact Claim-free status command", async () => {
+    fixture.currentClaim = undefined;
+    fixture.activeClaims = [];
+    const outside = await mkdtemp(join(tmpdir(), "jhw-guard-untrusted-"));
+    try {
+      await expect(fixture.service().evaluatePreTool(preTool(outside, "Bash", { command: "git status --short" })))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_CLAIM_REQUIRED" });
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   it("denies mutation without an active Claim", async () => {
@@ -363,6 +410,75 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
+  it("rejects a resolved Claim that is absent from the pinned active-Claim set", async () => {
+    fixture.activeClaims = [];
+
+    await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+      decision: "DENY",
+      code: "GUARD_CLAIM_REQUIRED",
+    });
+    expect(fixture.authorityCalls).toBe(0);
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("rejects a takeover replacement that no longer matches the audited active generation", async () => {
+    const replacement = {
+      ...fixture.currentClaim as ContractActiveClaim,
+      claim_id: OTHER_CLAIM_ID,
+    };
+    fixture.activeClaims = [replacement];
+
+    await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+      decision: "DENY",
+      code: "GUARD_WORKTREE_MISMATCH",
+    });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it.each([
+    ["inactive lifecycle", { task: { lifecycle: "handoff" }, revision: undefined }],
+    ["moved source generation", { task: {}, revision: "b".repeat(40) }],
+  ])("rejects %s before normalization or permit policy", async (_name, mutation) => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = { ...taskWith(fixture.currentContract), ...mutation.task } as TaskRecord;
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const options = fixture.options({
+      tasks: {
+        ...fixture.options().tasks,
+        sourceRevisionForGuard: async () => mutation.revision ?? fixture.currentClaim?.source_task_revision ?? "missing",
+      },
+    });
+
+    await expect(new GuardService(options).evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+      decision: "DENY",
+      code: "GUARD_UNAVAILABLE",
+    });
+    expect(fixture.authorityCalls).toBe(0);
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("rejects a Registry view that moves after host inspection and never reaches the permit seam", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const withCommittedView = vi.fn(async <T>(read: () => Promise<T>) => read());
+    const committedViewIsStale = vi.fn().mockResolvedValue(true);
+    const options = {
+      ...fixture.options(),
+      registry_view: { withCommittedView, committedViewIsStale },
+    } as GuardServiceOptions;
+
+    await expect(new GuardService(options).evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+      decision: "DENY",
+      code: "GUARD_UNAVAILABLE",
+    });
+    expect(withCommittedView).toHaveBeenCalledTimes(1);
+    expect(committedViewIsStale).toHaveBeenCalled();
+    expect(fixture.permitCalls).toBe(0);
+  });
+
   it("uses only the injected lifecycle seam for an exact missing grant", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
@@ -379,6 +495,68 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(1);
   });
 
+  it("accepts only an exact private permit binding and constructs public metadata itself", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    const result = await fixture.service({
+      permit_decisions: {
+        decideMissingGrant: async (operation, missing) => ({
+          task_id: operation.task_id,
+          claim_id: operation.claim_id,
+          origin_adapter: operation.origin_adapter,
+          session_id: operation.session_id,
+          cwd_worktree_ref: operation.cwd_worktree_ref,
+          requirements: operation.requirements,
+          missing_requirements: missing,
+          operation_digest: operation.digest,
+          request_id: REQUEST_ID,
+          approval_expires_at: "2026-08-25T10:10:00+09:00",
+        }),
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+
+    expect(result).toMatchObject({
+      decision: "PERMIT_REQUIRED",
+      request_id: REQUEST_ID,
+      approval_command: `/jhw:unlock ${REQUEST_ID}`,
+    });
+  });
+
+  it.each([
+    ["task", { task_id: OTHER_TASK_ID }],
+    ["adapter", { origin_adapter: "claude" }],
+    ["digest", { operation_digest: "f".repeat(64) }],
+    ["extra field", { private_note: "must not pass" }],
+  ])("fails closed for a permit binding with wrong %s", async (_name, mutation) => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    const result = await fixture.service({
+      permit_decisions: {
+        decideMissingGrant: async (operation, missing) => ({
+          task_id: operation.task_id,
+          claim_id: operation.claim_id,
+          origin_adapter: operation.origin_adapter,
+          session_id: operation.session_id,
+          cwd_worktree_ref: operation.cwd_worktree_ref,
+          requirements: operation.requirements,
+          missing_requirements: missing,
+          operation_digest: operation.digest,
+          request_id: REQUEST_ID,
+          approval_expires_at: "2026-08-25T10:10:00+09:00",
+          ...mutation,
+        }),
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+
+    expect(result).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+  });
+
   it("fails closed instead of minting a request when the permit seam is absent", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
@@ -388,6 +566,29 @@ describe("GuardService", () => {
     await expect(fixture.service({ permit_decisions: undefined }).evaluatePreTool(preTool(fixture.cwd)))
       .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
     expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("preserves the permit lifecycle state-limit denial without exposing seam metadata", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    await expect(fixture.service({
+      permit_decisions: {
+        decideMissingGrant: async () => ({
+          decision: "DENY",
+          code: "GUARD_STATE_LIMIT",
+          summary: "bounded lifecycle result",
+        }),
+      },
+    }).evaluatePreTool(preTool(fixture.cwd))).resolves.toEqual({
+      decision: "DENY",
+      code: "GUARD_STATE_LIMIT",
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      summary: "Guard request state limit was reached",
+    });
   });
 
   it("rejects invalid permit metadata rather than exposing a fake unlock", async () => {
@@ -539,6 +740,26 @@ describe("GuardService", () => {
       decision: "DENY",
       code: kind === "self approval" ? "GUARD_SELF_APPROVAL_DENIED" : "GUARD_UNAVAILABLE",
     });
+  });
+
+  it("hard-denies quote-composed self approval before Claim lookup in enforce and observe modes", async () => {
+    fixture.currentClaim = undefined;
+    fixture.activeClaims = [];
+    const event = preTool(fixture.cwd, "Bash", {
+      command: `jhw-control g'u'ard approve ${REQUEST_ID}`,
+    });
+
+    for (const service of [
+      fixture.service(),
+      fixture.service({ mode: "observe", inspect_guard_state: async () => true }),
+    ]) {
+      await expect(service.evaluatePreTool(event)).resolves.toMatchObject({
+        decision: "DENY",
+        code: "GUARD_SELF_APPROVAL_DENIED",
+      });
+    }
+    expect(fixture.claimLookups).toBe(0);
+    expect(fixture.permitCalls).toBe(0);
   });
 
   it("safe-parses prompt and post-tool events without changing authority before state integration", async () => {

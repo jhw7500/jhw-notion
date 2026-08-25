@@ -262,6 +262,7 @@ function formalStartArgs(): string[] {
     "--issue-url", "https://github.com/example/control/issues/1",
     "--issue-revision", "2026-08-13T00:00:00Z",
     "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+    "--origin-adapter", "codex",
     "--session", "codex-123",
   ];
 }
@@ -276,6 +277,7 @@ function childStartArgs(): string[] {
     "--done", "host tests pass",
     "--required-for-parent", "true",
     "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+    "--origin-adapter", "codex",
     "--session", "codex-local-hardening",
   ];
 }
@@ -398,7 +400,7 @@ describe("runCli", () => {
   it("resumes an existing immutable Task only after source context validation", async () => {
     const dependencies = makeCliDependencies();
     const result = await runCli([
-      "task", "start", "--task", TASK_ID, "--repo-path", "/srv/source/control", "--session", "codex-resume",
+      "task", "start", "--task", TASK_ID, "--repo-path", "/srv/source/control", "--session", "codex-resume", "--origin-adapter", "codex",
     ], dependencies);
 
     expect(result.exitCode).toBe(0);
@@ -412,6 +414,43 @@ describe("runCli", () => {
     expect(dependencies.source.registerTemporaryTask).not.toHaveBeenCalled();
   });
 
+  it("requires and forwards an exact origin adapter for start, child-start, and takeover", async () => {
+    const startDependencies = makeCliDependencies();
+    const missing = await runCli([
+      "task", "start", "--task", TASK_ID, "--repo-path", "/srv/source/control", "--session", "shared-session",
+    ], startDependencies);
+    const started = await runCli([
+      "task", "start", "--task", TASK_ID, "--repo-path", "/srv/source/control",
+      "--session", "shared-session", "--origin-adapter", "codex",
+    ], startDependencies);
+    const childDependencies = makeCliDependencies();
+    const childArgs = childStartArgs();
+    childArgs[childArgs.indexOf("--origin-adapter") + 1] = "claude";
+    const child = await runCli(childArgs, childDependencies);
+    const recoverDependencies = makeCliDependencies();
+    const takeover = await runCli([
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "takeover",
+      "--session", "shared-session", "--origin-adapter", "gemini",
+    ], recoverDependencies);
+
+    expect(missing.exitCode).toBe(2);
+    expect(started.exitCode).toBe(0);
+    expect(startDependencies.taskService.start).toHaveBeenLastCalledWith(expect.objectContaining({
+      origin_adapter: "codex",
+      session_id: "shared-session",
+    }));
+    expect(child.exitCode).toBe(0);
+    expect(childDependencies.taskService.start).toHaveBeenLastCalledWith(expect.objectContaining({
+      origin_adapter: "claude",
+    }));
+    expect(takeover.exitCode).toBe(0);
+    expect(recoverDependencies.taskService.recover).toHaveBeenLastCalledWith({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      action: { kind: "takeover", origin_adapter: "gemini", session_id: "shared-session" },
+    });
+  });
+
   it("validates the latest Handoff before an existing Task can acquire a Claim", async () => {
     const dependencies = makeCliDependencies({
       taskService: {
@@ -420,7 +459,7 @@ describe("runCli", () => {
     });
 
     const result = await runCli([
-      "task", "start", "--task", TASK_ID, "--repo-path", "/fixture/private-source/control", "--session", "codex-resume",
+      "task", "start", "--task", TASK_ID, "--repo-path", "/fixture/private-source/control", "--session", "codex-resume", "--origin-adapter", "codex",
     ], dependencies);
 
     expect(result.exitCode).toBe(1);
@@ -479,7 +518,7 @@ describe("runCli", () => {
     });
     const argv = kind === "handoff"
       ? ["task", "handoff", "--task", TASK_ID, "--claim", CLAIM_ID]
-      : ["task", "start", "--task", TASK_ID, "--repo-path", "/fixture/private-source/control", "--session", "codex-resume"];
+      : ["task", "start", "--task", TASK_ID, "--repo-path", "/fixture/private-source/control", "--session", "codex-resume", "--origin-adapter", "codex"];
 
     const result = await runCli(argv, dependencies);
     const payload = JSON.parse(result.stdout);
@@ -886,6 +925,7 @@ describe("runCli", () => {
       "--required-for-parent", "true",
       "--grant", `repo.modify:repository:${REPO_ID}:shared`,
       "--grant", `git.commit:repository:${REPO_ID}:shared`,
+      "--origin-adapter", "codex",
       "--session", "codex-local-hardening",
     ], dependencies);
 
@@ -915,6 +955,7 @@ describe("runCli", () => {
       task_alias: "local-hardening",
       project_id: PROJECT_ID,
       repo_id: REPO_ID,
+      origin_adapter: "codex",
       session_id: "codex-local-hardening",
       repository_path: "/srv/src/wlan-package",
     });
@@ -993,6 +1034,7 @@ describe("runCli", () => {
       "--goal", "Harden local package changes",
       "--done", "host tests pass",
       "--grant", `repo.modify:repository:${REPO_ID}:shared`,
+      "--origin-adapter", "codex",
       "--session", "codex-local-hardening",
     ], dependencies);
 
@@ -1515,7 +1557,10 @@ describe("runCli", () => {
 
     const status = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "status", "--session", "optional-session"], dependencies);
     const forceEnd = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "force-end", "--session", "optional-session"], dependencies);
-    const takeover = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "takeover", "--session", "codex-new"], dependencies);
+    const takeover = await runCli([
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "takeover",
+      "--session", "codex-new", "--origin-adapter", "codex",
+    ], dependencies);
     const newClaim = JSON.parse(takeover.stdout).result.active.claim_id;
     const owner = await runCli(["task", "assert-owner", "--task", TASK_ID, "--claim", newClaim], dependencies);
 
@@ -1524,6 +1569,11 @@ describe("runCli", () => {
     expect(takeover.exitCode).toBe(0);
     expect(dependencies.taskService.recover).toHaveBeenNthCalledWith(1, { task_id: TASK_ID, claim_id: CLAIM_ID, action: { kind: "status" } });
     expect(dependencies.taskService.recover).toHaveBeenNthCalledWith(2, { task_id: TASK_ID, claim_id: CLAIM_ID, action: { kind: "force-end" } });
+    expect(dependencies.taskService.recover).toHaveBeenNthCalledWith(3, {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      action: { kind: "takeover", origin_adapter: "codex", session_id: "codex-new" },
+    });
     expect(JSON.parse(takeover.stdout)).toMatchObject({
       result: { kind: "takeover", active: { task_id: TASK_ID, claim_id: replacement.claim_id } },
     });

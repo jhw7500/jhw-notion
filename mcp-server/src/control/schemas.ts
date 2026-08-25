@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { OperationIdSchema, RequestIdSchema } from "./guard-protocol.js";
+import { GuardAdapterSchema, OperationIdSchema, RequestIdSchema } from "./guard-protocol.js";
 import { normalizeWorkContract, TaskIdSchema, WorkContractSchema, workContractDigest } from "./work-contract.js";
 
 export { TaskIdSchema } from "./work-contract.js";
@@ -165,10 +165,17 @@ const ActiveClaimBaseSchema = z.object({
   });
 
 export const LegacyActiveClaimSchema = ActiveClaimBaseSchema.strict();
-export const ContractActiveClaimSchema = ActiveClaimBaseSchema.extend({
+export const AdapterLegacyActiveClaimSchema = ActiveClaimBaseSchema.extend({
+  origin_adapter: GuardAdapterSchema,
+}).strict();
+const contractClaimFields = {
   work_contract: WorkContractSchema,
   work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/),
-}).strict().superRefine((claim, context) => {
+};
+function validateContractClaim(
+  claim: z.infer<typeof ActiveClaimBaseSchema> & z.infer<z.ZodObject<typeof contractClaimFields>>,
+  context: z.RefinementCtx,
+): void {
   if (claim.work_contract.task_id !== claim.task_id) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
@@ -191,13 +198,25 @@ export const ContractActiveClaimSchema = ActiveClaimBaseSchema.extend({
       message: "Active Claim Work Contract digest disagrees with its snapshot",
     });
   }
-});
+}
+
+/** Pre-adapter contract Claims stay readable for recovery, never Guard authority. */
+export const LegacyContractActiveClaimSchema = ActiveClaimBaseSchema.extend(contractClaimFields)
+  .strict()
+  .superRefine(validateContractClaim);
+export const ContractActiveClaimSchema = ActiveClaimBaseSchema.extend({
+  origin_adapter: GuardAdapterSchema,
+  ...contractClaimFields,
+}).strict().superRefine(validateContractClaim);
 export const ActiveClaimSchema = z.union([
   ContractActiveClaimSchema,
+  LegacyContractActiveClaimSchema,
+  AdapterLegacyActiveClaimSchema,
   LegacyActiveClaimSchema,
 ]);
 export type ActiveClaim = z.infer<typeof ActiveClaimSchema>;
 export type ContractActiveClaim = z.infer<typeof ContractActiveClaimSchema>;
+export type LegacyContractActiveClaim = z.infer<typeof LegacyContractActiveClaimSchema>;
 
 const safeClaimConflictText = z.string().min(1).max(255).regex(/^[^\u0000-\u001f\u007f]+$/u);
 
@@ -449,6 +468,7 @@ export const ClaimHistorySchema = z
     repo_id: repositoryId,
     claim_id: canonicalId("clm"),
     predecessor_claim_id: canonicalId("clm").optional(),
+    origin_adapter: GuardAdapterSchema.optional(),
     session_id: ClaimCoordinateSchema,
     host: ClaimCoordinateSchema,
     branch: ClaimCoordinateSchema,

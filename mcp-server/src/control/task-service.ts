@@ -9,6 +9,7 @@ import type {
 import type { ControlConfig } from "./config.js";
 import { RegistryRecordStore, type RegistryDirectoryEntry } from "./codec.js";
 import { ControlError } from "./errors.js";
+import type { GuardAdapter } from "./guard-protocol.js";
 import {
   buildHandoff,
   canonicalHandoffPath,
@@ -21,7 +22,8 @@ import {
   type HandoffInput,
 } from "./handoff.js";
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
-import type { ActiveClaim, ClaimHistory, ContractActiveClaim, ErrorReason } from "./schemas.js";
+import { taskRelativePath } from "./registry-paths.js";
+import type { ActiveClaim, ClaimHistory, ContractActiveClaim, ErrorReason, TaskRecord } from "./schemas.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import type { TaskCompletionEvidence, TaskCompletionEvidenceRecord } from "./task-completion.js";
 import {
@@ -70,6 +72,7 @@ export interface RegistryGitPort {
   readHeadRegularBlob(relativePath: string): Promise<Buffer>;
   listHeadDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]>;
   readHeadRegularFile(relativePath: string): Promise<string>;
+  headRegularBlobObjectId(relativePath: string): Promise<string>;
 }
 
 export interface TaskStartInput {
@@ -77,6 +80,7 @@ export interface TaskStartInput {
   task_alias: string;
   project_id: string;
   repo_id: string;
+  origin_adapter: GuardAdapter;
   session_id: string;
   repository_path: string;
 }
@@ -411,7 +415,8 @@ export class TaskService {
       taskAlias,
       retained,
     );
-    const reusingCurrentClaim = currentActive?.session_id === input.session_id;
+    const reusingCurrentClaim = currentActive?.session_id === input.session_id &&
+      "origin_adapter" in currentActive && currentActive.origin_adapter === input.origin_adapter;
     const claim = reusingCurrentClaim
       ? currentActive
       : await this.claims.claimTask({
@@ -419,6 +424,7 @@ export class TaskService {
           task_alias: taskAlias,
           project_id: input.project_id,
           repo_id: input.repo_id,
+          origin_adapter: input.origin_adapter,
           session_id: input.session_id,
           host: this.config.buildHost,
           branch: plan.branch,
@@ -466,6 +472,13 @@ export class TaskService {
       branch: owner.branch,
       reused: created.reused,
     };
+  }
+
+  /** Immutable source generation used only inside Guard's committed view. */
+  async sourceRevisionForGuard(task: TaskRecord): Promise<string> {
+    return task.kind === "formal"
+      ? task.issue_revision
+      : this.registry.headRegularBlobObjectId(taskRelativePath(task.id));
   }
 
   async assertOwner(taskId: string, claimId: string): Promise<ActiveClaim> {

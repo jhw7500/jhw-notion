@@ -30,6 +30,8 @@ argument-hint: "(start | child-start | contract | completion-ready | resume | pr
 
 Task는 repository 자체가 아니라 하나의 명시적 작업 단위다. repository는 Work Contract가 가리키는 resource이며, 같은 repository 안에서도 독립 작업은 child Task별 Claim과 worktree를 사용한다. 한 session은 동시에 하나의 active Task만 소유할 수 있고, dependency는 관찰·순서 메타데이터일 뿐 capability를 부여하지 않는다.
 
+새 Claim을 만드는 `task start`/`task child-start`와 takeover에는 호출 TUI를 정확히 나타내는 `--origin-adapter claude|codex|gemini|opencode`가 필수다. session 문자열이나 환경에서 adapter를 추론하지 않는다. Claim 소유권은 `(origin_adapter, session_id, host)` exact tuple로 판정하므로 같은 host/session 문자열도 adapter가 다르면 별도 소유권이 될 수 있다.
+
 새 formal/temporary Task에는 `--grant`가 1개 이상 필요하다. 형식은 정확히 `capability:resource-kind:resource-id:shared|exclusive`다. `shared`는 같은 canonical resource를 다른 shared Claim과 함께 사용할 수 있고, 어느 한쪽이 `exclusive`이면 동시 Claim을 막는다. byte-identical `--grant` 반복은 하나로 정규화되지만 같은 capability/resource에 coordination만 다르게 주면 오류다. `shell.unclassified`는 runtime 분류 sentinel이라 저장할 수 없다.
 
 dependency 형식은 정확히 `blocked_by|observes|integrates:tsk-...`이며 반복 가능하다. dependency를 grant처럼 해석하거나 parent의 grant를 child에 상속하지 않는다.
@@ -43,7 +45,8 @@ jhw-control task start \
   --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
   --issue-url https://github.com/<owner>/<repo>/issues/<number> \
   --grant repo.modify:repository:<repo-id>:shared \
-  [--depends observes:<tsk-id> ...] --session <session-id>
+  [--depends observes:<tsk-id> ...] \
+  --origin-adapter <claude|codex|gemini|opencode> --session <session-id>
 ```
 
 `--issue-node-id`/`--issue-revision`은 independently verified expectation이 이미 있을 때만 추가한다. caller 값을 source authority처럼 만들지 않는다.
@@ -60,7 +63,8 @@ jhw-control task start \
   --done <condition> [--done <condition> ...] \
   --scope <scope> [--scope <scope> ...] \
   --grant repo.modify:repository:<repo-id>:shared \
-  [--depends blocked_by:<tsk-id> ...] --session <session-id>
+  [--depends blocked_by:<tsk-id> ...] \
+  --origin-adapter <claude|codex|gemini|opencode> --session <session-id>
 ```
 
 Temporary Task도 `standalone`으로 저장한다. legacy `expected_scope`와 현재 `--scope`는 표시·migration 입력일 뿐 runtime authority가 아니다. 실제 권한은 Work Contract의 exact grant만 결정한다.
@@ -77,7 +81,8 @@ jhw-control task child-start \
   --required-for-parent true \
   --grant repo.modify:repository:<repo-id>:shared \
   [--grant git.commit:repository:<repo-id>:shared ...] \
-  [--depends observes:<tsk-id> ...] --session <child-session-id>
+  [--depends observes:<tsk-id> ...] \
+  --origin-adapter <claude|codex|gemini|opencode> --session <child-session-id>
 ```
 
 `--required-for-parent`를 생략하면 `true`로 정규화하며, 명시할 때는 정확한 `true|false`만 받는다. child는 별도 Issue source index를 만들지 않고 parent의 Project/repository를 이어받되, Work Contract는 전달한 grant만 가진다.
@@ -86,7 +91,8 @@ child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또�
 
 ```bash
 jhw-control task start --task <retained_task.task_id> \
-  --repo-path <same-path> --session <free-valid-session>
+  --repo-path <same-path> --origin-adapter <claude|codex|gemini|opencode> \
+  --session <free-valid-session>
 ```
 
 같은 오류에 `error.retained_claim`도 있으면 위 start보다 먼저 해당 exact Claim generation에 아래 recovery 절차를 적용한다. active/released 상태와 안전한 cleanup 여부를 확인한 뒤에만 저장된 child를 재개한다. Task/Claim 파일을 Registry에서 직접 삭제하지 않는다.
@@ -99,7 +105,8 @@ jhw-control task start --task <retained_task.task_id> \
 
 ```bash
 jhw-control task start \
-  --task <tsk-id> --repo-path <absolute-checkout-root> --session <session-id>
+  --task <tsk-id> --repo-path <absolute-checkout-root> \
+  --origin-adapter <claude|codex|gemini|opencode> --session <session-id>
 ```
 
 성공 결과에 `latest_handoff`가 있을 때만 그것을 재개 context로 보여준다. `latest_handoff`가 없고(강제종료 등) 사용자가 컨텍스트 복구를 요청하면 repo root의 `HANDOFF.<세션>.md`를 보조 context로 읽을 수 있다 — Task 좌표·상태·증거는 command 결과만 정본이다. `TASK_COMPLETED`, `WORKTREE_CLEANUP_REQUIRED`, source/Project/repository mismatch이면 멈춘다. cleanup이 필요하면 아래 exact released-generation 절차를 먼저 승인받는다.
@@ -129,6 +136,8 @@ jhw-control task contract --task <formal-tsk-id> --role parent \
 ```
 
 순서는 `finish/handoff → task contract → task start --task ...`다. active Claim의 snapshot은 Task record 수정으로 바뀌지 않으므로 `TASK_CONTRACT_ACTIVE`를 우회하거나 active Claim을 제자리 수정하지 않는다. 변경된 grant를 쓰려면 반드시 새 Claim을 획득한다. command는 새 Task ID를 만들지 않으며 source identity, alias, legacy `expected_scope`를 보존한다.
+
+adapter 필드가 없던 legacy active Claim/history는 lifecycle 조회와 recovery를 위해 계속 파싱되지만 Guard authority로는 사용할 수 없다. 같은 host/session의 legacy active Claim이 있으면 새 adapter tuple을 임의로 추정하거나 겹쳐 Claim하지 않는다. `recover --action status`로 exact generation을 확인하고, 사용자가 별도 승인한 `takeover --origin-adapter ... --session ...`으로 adapter-bound successor를 만들거나 `force-end` 후 필수 adapter를 넣어 `task start --task ...`를 실행한다. Registry record에 `origin_adapter`를 직접 덧붙이지 않는다.
 
 `TASK_CONTRACT_REQUIRED`는 legacy Task가 새 Claim에 필요한 contract가 없다는 뜻이다. `RESOURCE_AUTHORITY_MISMATCH`는 repository/Issue 등 exact resource가 Task authority와 다르고, `RESOURCE_AUTHORITY_UNSUPPORTED`는 등록된 board처럼 검증 가능한 authority가 없거나 독립 remote/firmware/deployment resource가 아직 지원되지 않는 경우다. Board registry/state가 없거나 손상되면 fail-closed하므로 text ID로 우회하지 않는다.
 
@@ -199,7 +208,7 @@ Formal Task의 `--status completed`는 같은 Claim에 기록된 completion evid
 2. **대상 좌표를 추측하지 않는다.** 대상 repo-id/project가 불확실하면 `jhw-control portfolio status` 결과의 `repositories` 배열로 확인한다. 미등록 저장소면 멈추고 repository 등록을 먼저 안내한다. `--repo-path`는 대상 checkout의 절대경로를 존재 확인 후 사용한다.
 3. **(필요 시) Issue를 먼저 만든다.** 대상 Issue가 아직 없으면 사용자 제공 제목·본문으로 `gh issue create --repo <owner>/<repo>`를 실행하고, 반환된 URL만 authority coordinate로 사용한다. Issue 생성이 실패하면 finish 전이므로 아무것도 변하지 않은 상태다 — 멈추고 보고한다.
 4. **finish를 먼저 실행한다** (위 종료 규격 그대로). `--status handoff`로 넘기는 경우 `--next-step`에 대상 Issue URL 또는 Task 좌표를 남겨 체인을 기록한다. finish가 nonzero면 **start를 실행하지 않고** 멈춘다.
-5. **start를 실행한다** (위 새 Task 시작 또는 재개 규격 그대로). `--session`은 finish에 쓴 것과 같은 session-id를 승계한다.
+5. **start를 실행한다** (위 새 Task 시작 또는 재개 규격 그대로). `--session`은 finish에 쓴 것과 같은 session-id를 승계하고, 현재 TUI의 exact `--origin-adapter`를 반드시 함께 전달한다.
 6. **finish 성공 후 start 실패는 정상 상태다** — 현재 Task는 이미 종료됐고 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. start 재시도는 finish를 반복하지 않고 start만 다시 실행한다.
 7. **결과를 함께 보고한다.** 종료한 Task(tsk-id, status, released claim)와 시작한 Task(tsk-id, 새 claim_id, branch, worktree_ref)를 한 번에 보여준다.
 
@@ -217,7 +226,8 @@ stale을 추정하지 않는다. `force-end`/`takeover`는 결과를 보여준 �
 
 ```bash
 jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action force-end
-jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action takeover --session <new-session-id>
+jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action takeover \
+  --origin-adapter <claude|codex|gemini|opencode> --session <new-session-id>
 ```
 
 Takeover 성공 시 반환된 새 `claim_id`로 `task status`를 다시 확인한다. old ID를 재사용하지 않는다.

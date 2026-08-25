@@ -23,6 +23,7 @@ import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
 import { ControlContractAuthority } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
+import { GuardAdapterSchema, type GuardAdapter } from "./guard-protocol.js";
 import { GitHubProjectClient, type RegistrationRecordWarning } from "./github-project.js";
 import { GitHubSourceService } from "./github-source.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
@@ -413,6 +414,12 @@ function requireClaimId(flags: ParsedFlags, flag = "--claim"): string {
 function requireClaimCoordinate(flags: ParsedFlags, flag: string): string {
   const parsed = ClaimCoordinateSchema.safeParse(required(flags, flag));
   if (!parsed.success) usage("Invalid Claim coordinate");
+  return parsed.data;
+}
+
+function requireOriginAdapter(flags: ParsedFlags): GuardAdapter {
+  const parsed = GuardAdapterSchema.safeParse(required(flags, "--origin-adapter"));
+  if (!parsed.success) usage("Invalid origin adapter");
   return parsed.data;
 }
 
@@ -949,11 +956,13 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       "--task",
       "--project", "--repo-id", "--repo-path", "--issue-node-id", "--issue-url", "--issue-revision",
       "--temp-alias", "--goal", "--done", "--scope", "--session", "--role", "--grant", "--depends",
+      "--origin-adapter",
     ]), new Set(["--done", "--scope", "--grant", "--depends"]));
     assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
     const session_id = requireClaimCoordinate(flags, "--session");
+      const origin_adapter = requireOriginAdapter(flags);
     const formalFields = ["--issue-node-id", "--issue-url", "--issue-revision"];
     const temporaryFields = ["--temp-alias", "--goal", "--done", "--scope"];
     const hasFormal = formalFields.some((flag) => flags.has(flag));
@@ -1040,6 +1049,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       task_alias: alias,
       project_id,
       repo_id,
+      origin_adapter,
       session_id,
       repository_path,
     });
@@ -1079,6 +1089,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const flags = parseFlags(argv.slice(2), new Set([
       "--parent", "--alias", "--repo-path", "--goal", "--done", "--required-for-parent",
       "--grant", "--depends", "--session",
+      "--origin-adapter",
     ]), new Set(["--done", "--grant", "--depends"]));
     assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
@@ -1091,6 +1102,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const required_for_parent = parseRequiredForParentFlag(value(flags, "--required-for-parent"));
     const goal = required(flags, "--goal");
     const session_id = requireClaimCoordinate(flags, "--session");
+    const origin_adapter = requireOriginAdapter(flags);
     const child = await dependencies.catalog.registerChildTask({
       parent_task_id,
       alias: aliasInput,
@@ -1108,6 +1120,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         task_alias: alias,
         project_id: child.project_id,
         repo_id: child.repo_id,
+        origin_adapter,
         session_id,
         repository_path,
       });
@@ -1274,7 +1287,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task recover") {
-    const flags = parseFlags(argv.slice(2), new Set(["--task", "--expect", "--action", "--session"]));
+    const flags = parseFlags(argv.slice(2), new Set(["--task", "--expect", "--action", "--session", "--origin-adapter"]));
     assertSafeFlags(flags, dependencies);
     const task_id = requireTaskId(flags);
     const claim_id = requireClaimId(flags, "--expect");
@@ -1284,7 +1297,11 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       // The documented session is advisory for non-takeover recovery.
       action = { kind: actionName };
     } else if (actionName === "takeover") {
-      action = { kind: "takeover", session_id: required(flags, "--session") };
+      action = {
+        kind: "takeover",
+        origin_adapter: requireOriginAdapter(flags),
+        session_id: requireClaimCoordinate(flags, "--session"),
+      };
     } else {
       usage("Invalid recovery action");
     }

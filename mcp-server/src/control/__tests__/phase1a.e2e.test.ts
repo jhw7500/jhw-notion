@@ -394,7 +394,8 @@ function temporaryStartArgs(alias: string, sourceRepo: string, session: string):
   return [
     "task", "start", "--project", "prj-control", "--repo-id", "repo-control", "--repo-path", sourceRepo,
     "--temp-alias", alias, "--goal", "exercise the deterministic gate", "--done", "gate passes",
-    "--scope", "src/control", "--grant", "repo.modify:repository:repo-control:shared", "--session", session,
+    "--scope", "src/control", "--grant", "repo.modify:repository:repo-control:shared",
+    "--origin-adapter", "codex", "--session", session,
   ];
 }
 
@@ -402,7 +403,7 @@ function childStartArgs(parentId: string, alias: string, sourceRepo: string, ses
   return [
     "task", "child-start", "--parent", parentId, "--alias", alias, "--repo-path", sourceRepo,
     "--goal", `execute ${alias}`, "--done", "admission succeeds",
-    "--grant", "repo.modify:repository:repo-control:shared", "--session", session,
+    "--grant", "repo.modify:repository:repo-control:shared", "--origin-adapter", "codex", "--session", session,
   ];
 }
 
@@ -640,7 +641,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "task", "start", "--project", issueInput.project_id, "--repo-id", issueInput.repo_id,
       "--repo-path", fixture.sourceRepo, "--issue-node-id", issueInput.issue_node_id,
       "--issue-url", issueInput.issue_url, "--issue-revision", issueInput.issue_revision,
-      "--grant", "repo.modify:repository:repo-control:shared", "--session", session,
+      "--grant", "repo.modify:repository:repo-control:shared", "--origin-adapter", "codex", "--session", session,
     ];
     const firstPromise = runCli(formalStartArgs("codex-a"), heldDependencies);
     await enteredStart.promise;
@@ -705,6 +706,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       task_alias: left.aliases[0]!,
       project_id: left.project_id,
       repo_id: left.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-child-left",
       repository_path: fixture.sourceRepo,
     });
@@ -713,6 +715,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       task_alias: right.aliases[0]!,
       project_id: right.project_id,
       repo_id: right.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-child-right",
       repository_path: fixture.sourceRepo,
     });
@@ -761,7 +764,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "--repo-path", fixture.sourceRepo, "--temp-alias", "control:explicit-contract",
       "--goal", "preserve exact CLI contract intent", "--done", "intent is stored",
       "--scope", "src/control", "--grant", "repo.modify:repository:repo-control:shared",
-      "--depends", `observes:${dependency.id}`, "--session", "codex-explicit-contract",
+      "--depends", `observes:${dependency.id}`, "--origin-adapter", "codex", "--session", "codex-explicit-contract",
     ], dependencies);
 
     expect(started.exitCode).toBe(0);
@@ -808,6 +811,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       task_alias: blocker.aliases[0]!,
       project_id: blocker.project_id,
       repo_id: blocker.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-retained-child",
       repository_path: fixture.sourceRepo,
     });
@@ -867,6 +871,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       task_alias: blocker.aliases[0]!,
       project_id: blocker.project_id,
       repo_id: blocker.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-exclusive-owner",
       repository_path: fixture.sourceRepo,
     });
@@ -911,7 +916,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "--repo-path", fixture.sourceRepo, "--issue-node-id", issueInput.issue_node_id,
       "--issue-url", issueInput.issue_url, "--issue-revision", issueInput.issue_revision,
       "--role", "standalone", "--grant", "repo.modify:repository:repo-control:shared",
-      "--grant", "git.commit:repository:repo-control:shared", "--session", "codex-formal-drift",
+      "--grant", "git.commit:repository:repo-control:shared", "--origin-adapter", "codex", "--session", "codex-formal-drift",
     ], cliDependencies(graph));
 
     expect(JSON.parse(formalResult.stderr)).toEqual({ error: { code: "TASK_CONTRACT_MISMATCH" } });
@@ -1064,6 +1069,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const planAlias = task.aliases[0]!;
     await expect(dying.tasks.start({
       task_id: task.id, task_alias: planAlias, project_id: task.project_id, repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-dead", repository_path: fixture.sourceRepo,
     })).rejects.toMatchObject({ code: "REMOTE_VERIFY_FAILED" });
 
@@ -1114,7 +1120,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const taskId = task.task_id as string;
     const fullOldClaim = await graph.claims.getActive(taskId);
     expect(fullOldClaim).toBeDefined();
-    const firstTakeoverArgs = ["task", "recover", "--task", taskId, "--expect", oldClaim.claim_id, "--action", "takeover", "--session", "codex-new"];
+    const firstTakeoverArgs = ["task", "recover", "--task", taskId, "--expect", oldClaim.claim_id, "--action", "takeover", "--session", "codex-new", "--origin-adapter", "codex"];
     armPostPushFetchFailure = true;
     const postPushFailure = await runCli(firstTakeoverArgs, dependencies);
     expect(postPushFailure).toMatchObject({ exitCode: 75 });
@@ -1131,7 +1137,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(firstSuccessorId).toBe(firstSuccessor?.claim_id);
 
     failBeforeSave = true;
-    const secondTakeoverArgs = ["task", "recover", "--task", taskId, "--expect", firstSuccessorId, "--action", "takeover", "--session", "codex-final"];
+    const secondTakeoverArgs = ["task", "recover", "--task", taskId, "--expect", firstSuccessorId, "--action", "takeover", "--session", "codex-final", "--origin-adapter", "codex"];
     const stateFailure = await runCli(secondTakeoverArgs, dependencies);
     expect(stateFailure).toMatchObject({ exitCode: 1 });
     const secondRemoteHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
@@ -1480,7 +1486,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
     const resumed = await runCli([
       "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo,
-      "--session", "codex-after-handoff",
+      "--session", "codex-after-handoff", "--origin-adapter", "codex",
     ], dependencies);
 
     expect(resumed.exitCode).toBe(0);
@@ -1502,7 +1508,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const formal = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
     const dependencies = cliDependencies(graph);
     const first = await runCli([
-      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-first",
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-first", "--origin-adapter", "codex",
     ], dependencies);
     const firstClaim = JSON.parse(first.stdout).result.claim.claim_id;
     await graph.tasks.markCompletionReady({
@@ -1514,7 +1520,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect((await runCli(completedFinishArgs(formal.id, firstClaim), dependencies)).exitCode).toBe(0);
 
     const reopened = await runCli([
-      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-open",
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-open", "--origin-adapter", "codex",
     ], dependencies);
 
     expect(reopened.exitCode).toBe(0);
@@ -1540,7 +1546,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(JSON.parse(abandoned.stdout).result.worktree_removed).toBe(false);
 
     const blocked = await runCli([
-      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-blocked",
+      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-blocked", "--origin-adapter", "codex",
     ], dependencies);
     expect(blocked.exitCode).toBe(1);
     expect(JSON.parse(blocked.stderr)).toEqual({ error: { code: "WORKTREE_CLEANUP_REQUIRED" } });
@@ -1555,7 +1561,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
       .worktrees[first.claim.worktree_ref]).toMatchObject({ lifecycle: "removed" });
     const resumed = await runCli([
-      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-recovered",
+      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-recovered", "--origin-adapter", "codex",
     ], dependencies);
     expect(resumed.exitCode).toBe(0);
   }, 15_000);
@@ -1667,6 +1673,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "--issue-node-id", overrides.issueNodeId ?? issueInput.issue_node_id,
       "--issue-revision", overrides.issueRevision ?? issueInput.issue_revision,
       "--grant", "repo.modify:repository:repo-control:shared",
+      "--origin-adapter", "codex",
       "--session", session,
     ];
     const initialHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
@@ -1902,7 +1909,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       expect(JSON.parse(finished.stdout).result.worktree_removed, boundary).toBe(false);
       expect(await graph.claims.getActive(first.task.task_id), boundary).toBeUndefined();
       const blocked = await runCli([
-        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `blocked-${boundary}`,
+        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `blocked-${boundary}`, "--origin-adapter", "codex",
       ], dependencies);
       expect(JSON.parse(blocked.stderr), boundary).toEqual({ error: { code: "WORKTREE_CLEANUP_REQUIRED" } });
       expect(await graph.claims.getActive(first.task.task_id), boundary).toBeUndefined();
@@ -1911,7 +1918,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       ], dependencies);
       expect(recovered.exitCode, boundary).toBe(0);
       const successor = await runCli([
-        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `recovered-${boundary}`,
+        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `recovered-${boundary}`, "--origin-adapter", "codex",
       ], dependencies);
       expect(successor.exitCode, boundary).toBe(0);
     }
@@ -2081,13 +2088,13 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const releasedBeforeRename = (await graph.catalog.registerFormalTask({ ...secondIssue, ...emptyTaskContractIntent() })).task;
     const initialDependencies = cliDependencies(graph);
     const initialStart = await runCli([
-      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-before-repository-rename",
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-before-repository-rename", "--origin-adapter", "codex",
     ], initialDependencies);
     expect(initialStart.exitCode).toBe(0);
     const initialClaimId = JSON.parse(initialStart.stdout).result.claim.claim_id as string;
     const releasedStart = await runCli([
       "task", "start", "--task", releasedBeforeRename.id, "--repo-path", fixture.sourceRepo,
-      "--session", "codex-released-before-repository-rename",
+      "--session", "codex-released-before-repository-rename", "--origin-adapter", "codex",
     ], initialDependencies);
     expect(releasedStart.exitCode).toBe(0);
     const releasedClaimId = JSON.parse(releasedStart.stdout).result.claim.claim_id as string;
@@ -2176,7 +2183,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     ], renamedDependencies)).exitCode).toBe(0);
 
     const resumed = await runCli([
-      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-after-repository-rename",
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-after-repository-rename", "--origin-adapter", "codex",
     ], renamedDependencies);
     expect(resumed.exitCode).toBe(0);
     expect(JSON.parse(resumed.stdout).result).toMatchObject({
@@ -2189,7 +2196,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     });
     const resumedReleased = await runCli([
       "task", "start", "--task", releasedBeforeRename.id, "--repo-path", fixture.sourceRepo,
-      "--session", "codex-after-pre-rename-handoff",
+      "--session", "codex-after-pre-rename-handoff", "--origin-adapter", "codex",
     ], renamedDependencies);
     expect(resumedReleased.exitCode).toBe(0);
     await expect(graph.claims.getActive(releasedBeforeRename.id)).resolves.toMatchObject({

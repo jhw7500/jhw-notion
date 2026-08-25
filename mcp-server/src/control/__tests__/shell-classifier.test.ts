@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ShellClassificationError,
   classifyShell,
+  detectGuardSelfApproval,
   type ShellClassifierContext,
 } from "../shell-classifier.js";
 
@@ -229,6 +230,14 @@ describe("conservative shell classification", () => {
     });
     expect(remote.direct_high_risk).toBe(true);
     expect(selfApproval.self_approval).toBe(true);
+  });
+
+  it("exposes the bounded central lexical self-approval detector without filesystem context", () => {
+    expect(detectGuardSelfApproval(
+      "jhw-control g'u'ard consume req-018f21e0-7b2c-7a00-8000-000000000003",
+    )).toBe(true);
+    expect(detectGuardSelfApproval("git status --short")).toBe(false);
+    expect(detectGuardSelfApproval("x".repeat(70 * 1024))).toBe(false);
   });
 
   it.each([

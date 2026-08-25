@@ -1,9 +1,22 @@
-import { lstat, realpath } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 
 import { z } from "zod";
 
-import type { CanonicalOperation, GuardAdapter, OperationRequirement, PreToolUseEvent } from "./guard-protocol.js";
+import {
+  ClaimIdSchema,
+  GuardAdapterSchema,
+  GuardSessionSchema,
+  GuardWorktreeRefSchema,
+  OperationRequirementSchema,
+  RequestIdSchema,
+  type CanonicalOperation,
+  type GuardAdapter,
+  type OperationRequirement,
+  type PreToolUseEvent,
+} from "./guard-protocol.js";
 import {
   GuardCommonEventSchema,
   PostToolUseEventSchema,
@@ -20,6 +33,7 @@ import {
   GuardDecisionSchema,
   GuardDenyCodeSchema,
   GuardEvaluationModeSchema,
+  OffsetDateTimeSchema,
   GuardSummarySchema,
   type ActiveClaim,
   type GuardDecision,
@@ -29,6 +43,7 @@ import {
 } from "./schemas.js";
 import {
   classifyShell,
+  detectGuardSelfApproval,
   ShellClassificationError,
   type ExecutionBoundary,
   type ShellClassification,
@@ -63,9 +78,15 @@ export interface GuardClaimServicePort {
   listActiveClaims(): Promise<ActiveClaim[]>;
 }
 
+export interface GuardRegistryViewPort {
+  withCommittedView<T>(read: () => Promise<T>): Promise<T>;
+  committedViewIsStale(): Promise<boolean>;
+}
+
 export interface GuardTaskServicePort {
   getTask(taskId: string): Promise<TaskRecord>;
   inspectForGuard(taskId: string, claimId: string): Promise<GuardTaskInspection>;
+  sourceRevisionForGuard(task: TaskRecord): Promise<string>;
 }
 
 export interface GuardContractAuthorityPort {
@@ -80,12 +101,41 @@ export interface GuardPermitDecisionPort {
   ): Promise<unknown>;
 }
 
+const GuardPermitBindingSchema = z.object({
+  task_id: z.string().regex(/^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
+  claim_id: ClaimIdSchema,
+  origin_adapter: GuardAdapterSchema,
+  session_id: GuardSessionSchema,
+  cwd_worktree_ref: GuardWorktreeRefSchema,
+  requirements: z.array(OperationRequirementSchema).min(1).max(32),
+  missing_requirements: z.array(OperationRequirementSchema).min(1).max(32),
+  operation_digest: z.string().regex(/^[0-9a-f]{64}$/),
+  request_id: RequestIdSchema,
+  approval_expires_at: OffsetDateTimeSchema,
+}).strict();
+
+const GuardPermitStateDenySchema = z.object({
+  decision: z.literal("DENY"),
+  code: z.enum(["GUARD_STATE_LIMIT", "GUARD_UNAVAILABLE"]),
+}).strict();
+
+const GuardPermitPublicStateDenySchema = GuardPermitStateDenySchema.extend({
+  summary: GuardSummarySchema,
+}).strict();
+
+const GuardPermitResultSchema = z.union([
+  GuardPermitBindingSchema,
+  GuardPermitStateDenySchema,
+  GuardPermitPublicStateDenySchema,
+]);
+
 export interface GuardServiceOptions {
   host: string;
   digest_key: Uint8Array;
   claims: GuardClaimServicePort;
   tasks: GuardTaskServicePort;
   authority: GuardContractAuthorityPort;
+  registry_view: GuardRegistryViewPort;
   permit_decisions?: GuardPermitDecisionPort;
   mode?: GuardEvaluationMode;
   /** Strict read-only inspection seam. It must never create, clean, or lock state. */
@@ -116,7 +166,7 @@ const hardObserveCodes = new Set<GuardDenyCode>([
   "GUARD_SELF_APPROVAL_DENIED",
 ]);
 
-const fileReadTools = new Set(["read", "read_file", "glob", "glob_files", "grep", "grep_files"]);
+const exactClaimFreeFileTools = new Set(["Read", "Glob", "Grep"]);
 const fileModifyTools = new Set([
   "edit", "edit_file", "write", "write_file", "notebookedit", "notebook_edit", "apply_patch", "functions_apply_patch",
 ]);
@@ -159,13 +209,155 @@ function notionDatabaseFrom(event: PreToolUseEvent): NormalizeOperationContext["
     : undefined;
 }
 
-function isClaimFreeRead(event: PreToolUseEvent): "Local repository read" | "Local repository status" | undefined {
-  const alias = canonicalToolAlias(event.tool_name);
-  if (fileReadTools.has(alias)) return "Local repository read";
-  if (!shellTools.has(alias)) return undefined;
+const exactClaimFreeShellTools = new Set(["Bash", "exec_command"]);
+const runFile = promisify(execFile);
+const sensitiveReadComponent = /^(?:\.env(?:\..*)?|\.git|\.netrc|\.npmrc|\.pypirc|credentials?|secrets?|tokens?|id_rsa|id_ed25519)$/iu;
+const maximumClaimFreeEntries = 10_000;
+
+function exactKeys(input: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(input).every((key) => allowed.includes(key));
+}
+
+function safeLocalRelativePath(raw: string, allowDot = false): boolean {
+  if (!raw || isAbsolute(raw) || raw.includes("\\") || /[\u0000\r\n]/u.test(raw)) return false;
+  const components = raw.split("/");
+  if (components.some((component) => !component || component === ".." || (!allowDot && component === "."))) return false;
+  return components.every((component) => component === "." || !sensitiveReadComponent.test(component));
+}
+
+async function trustedRepositoryRoot(cwd: string): Promise<string | undefined> {
+  try {
+    const trustedCwd = await realpath(cwd);
+    const result = await runFile("git", ["-C", trustedCwd, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      maxBuffer: 8 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    const rawRoot = result.stdout.trim();
+    if (!rawRoot || !isAbsolute(rawRoot)) return undefined;
+    const root = await realpath(rawRoot);
+    return isWithin(root, trustedCwd) ? root : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function noFollowEntry(root: string, rawPath: string): Promise<{ path: string; kind: "file" | "directory" } | undefined> {
+  if (!safeLocalRelativePath(rawPath, rawPath === ".")) return undefined;
+  let current = root;
+  for (const component of rawPath.split("/")) {
+    if (component === ".") continue;
+    current = resolve(current, component);
+    if (!isWithin(root, current)) return undefined;
+    try {
+      const entry = await lstat(current);
+      if (entry.isSymbolicLink()) return undefined;
+      if (!entry.isDirectory() && !entry.isFile()) return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const entry = await lstat(current);
+    if (entry.isSymbolicLink()) return undefined;
+    const resolved = await realpath(current);
+    if (!isWithin(root, resolved)) return undefined;
+    if (entry.isFile()) return { path: resolved, kind: "file" };
+    if (entry.isDirectory()) return { path: resolved, kind: "directory" };
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function boundedGlobPattern(pattern: unknown): pattern is string {
+  return typeof pattern === "string" && pattern.length > 0 && Buffer.byteLength(pattern, "utf8") <= 512 &&
+    !isAbsolute(pattern) && !pattern.includes("\\") && !/[\u0000\r\n{}[\]]/u.test(pattern) &&
+    !pattern.split("/").some((component) => !component || component === "." || component === ".." ||
+      (!/[?*]/u.test(component) && sensitiveReadComponent.test(component)));
+}
+
+function globPatternRegex(pattern: string): RegExp | undefined {
+  let encoded = "^";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index] as string;
+    if (character === "*") {
+      if (pattern[index + 1] === "*") {
+        encoded += ".*";
+        index += 1;
+      } else encoded += "[^/]*";
+    } else if (character === "?") encoded += "[^/]";
+    else encoded += character.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  }
+  try {
+    return new RegExp(`${encoded}$`, "u");
+  } catch {
+    return undefined;
+  }
+}
+
+async function safeTree(root: string, pattern?: RegExp): Promise<boolean> {
+  const pending: Array<{ absolute: string; relative: string }> = [{ absolute: root, relative: "" }];
+  let inspected = 0;
+  while (pending.length > 0) {
+    const current = pending.pop() as { absolute: string; relative: string };
+    let entries;
+    try {
+      entries = await readdir(current.absolute, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      if (++inspected > maximumClaimFreeEntries) return false;
+      const childRelative = current.relative ? `${current.relative}/${entry.name}` : entry.name;
+      const selected = pattern === undefined || pattern.test(childRelative);
+      if (selected && (entry.isSymbolicLink() || sensitiveReadComponent.test(entry.name))) return false;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        if (sensitiveReadComponent.test(entry.name)) {
+          if (selected || pattern === undefined) return false;
+          continue;
+        }
+        pending.push({ absolute: resolve(current.absolute, entry.name), relative: childRelative });
+      } else if (!entry.isFile() && selected) return false;
+    }
+  }
+  return true;
+}
+
+async function claimFreeReadSummary(
+  event: PreToolUseEvent,
+): Promise<"Local repository read" | "Local repository status" | undefined> {
   const input = asObject(event.tool_input);
-  if (!input || Object.keys(input).length !== 1 || typeof input.command !== "string") return undefined;
-  return claimFreeStatusCommands.has(input.command) ? "Local repository status" : undefined;
+  if (!input) return undefined;
+  const root = await trustedRepositoryRoot(event.cwd);
+  if (!root) return undefined;
+  if (exactClaimFreeShellTools.has(event.tool_name)) {
+    if (!exactKeys(input, ["command"]) || typeof input.command !== "string") return undefined;
+    return claimFreeStatusCommands.has(input.command) ? "Local repository status" : undefined;
+  }
+  if (!exactClaimFreeFileTools.has(event.tool_name)) return undefined;
+  if (event.tool_name === "Read") {
+    if (!exactKeys(input, ["file_path", "offset", "limit"]) || typeof input.file_path !== "string") return undefined;
+    if (input.offset !== undefined && (!Number.isSafeInteger(input.offset) || (input.offset as number) < 1)) return undefined;
+    if (input.limit !== undefined && (!Number.isSafeInteger(input.limit) || (input.limit as number) < 1 || (input.limit as number) > 100_000)) return undefined;
+    return (await noFollowEntry(root, input.file_path))?.kind === "file" ? "Local repository read" : undefined;
+  }
+  if (event.tool_name === "Glob") {
+    if (!exactKeys(input, ["pattern", "path"]) || !boundedGlobPattern(input.pattern)) return undefined;
+    const rawPath = input.path === undefined ? "." : input.path;
+    if (typeof rawPath !== "string") return undefined;
+    const target = await noFollowEntry(root, rawPath);
+    const pattern = globPatternRegex(input.pattern);
+    return target?.kind === "directory" && pattern && await safeTree(target.path, pattern)
+      ? "Local repository read" : undefined;
+  }
+  if (!exactKeys(input, ["pattern", "path"]) || typeof input.pattern !== "string" ||
+    input.pattern.length === 0 || Buffer.byteLength(input.pattern, "utf8") > 4_096 || typeof input.path !== "string") {
+    return undefined;
+  }
+  const target = await noFollowEntry(root, input.path);
+  if (!target) return undefined;
+  return target.kind === "file" || await safeTree(target.path) ? "Local repository read" : undefined;
 }
 
 function isWithin(root: string, target: string): boolean {
@@ -307,10 +499,19 @@ function sameResource(left: WorkGrant["resource"], right: OperationRequirement["
   return left.kind === right.kind && left.id === right.id;
 }
 
+function sameRequirements(left: readonly OperationRequirement[], right: readonly OperationRequirement[]): boolean {
+  return left.length === right.length && left.every((requirement, index) =>
+    requirement.capability === right[index]?.capability &&
+    requirement.resource.kind === right[index]?.resource.kind &&
+    requirement.resource.id === right[index]?.resource.id);
+}
+
 function inspectionMatchesClaim(inspection: GuardTaskInspection, claim: ActiveClaim): boolean {
   const active = inspection.active;
   return active.task_id === claim.task_id &&
     active.claim_id === claim.claim_id &&
+    ("origin_adapter" in active) === ("origin_adapter" in claim) &&
+    (!("origin_adapter" in active) || !("origin_adapter" in claim) || active.origin_adapter === claim.origin_adapter) &&
     active.session_id === claim.session_id &&
     active.host === claim.host &&
     active.branch === claim.branch &&
@@ -346,7 +547,12 @@ export class GuardService {
       return this.deny("GUARD_UNAVAILABLE");
     }
 
-    const claimFree = isClaimFreeRead(event);
+    const earlyCommand = commandFrom(event);
+    if (earlyCommand && detectGuardSelfApproval(earlyCommand)) {
+      return this.deny("GUARD_SELF_APPROVAL_DENIED");
+    }
+
+    const claimFree = await claimFreeReadSummary(event);
     if (claimFree) {
       return GuardDecisionSchema.parse({
         decision: "ALLOW",
@@ -356,29 +562,59 @@ export class GuardService {
       });
     }
 
-    let activeClaims: ActiveClaim[] | undefined;
-    let claim: ActiveClaim | undefined;
+    if (!this.options.registry_view) return this.deny("GUARD_UNAVAILABLE");
     try {
-      claim = await this.options.claims.resolveSessionClaim(event.adapter, event.session_id, this.options.host);
-      if (!claim) {
-        activeClaims = await this.options.claims.listActiveClaims();
-        const sameSession = activeClaims.some((candidate) => candidate.session_id === event.session_id);
-        return this.deny(sameSession ? "GUARD_CLAIM_MISMATCH" : "GUARD_CLAIM_REQUIRED");
-      }
+      return await this.options.registry_view.withCommittedView(async () => {
+        const decision = await this.evaluatePinned(event);
+        if (await this.options.registry_view.committedViewIsStale()) {
+          return this.deny("GUARD_UNAVAILABLE");
+        }
+        return decision;
+      });
     } catch {
       return this.deny("GUARD_UNAVAILABLE");
     }
+  }
+
+  private async evaluatePinned(event: PreToolUseEvent): Promise<GuardDecision> {
+    let activeClaims: ActiveClaim[];
+    let claim: ActiveClaim | undefined;
+    try {
+      activeClaims = await this.options.claims.listActiveClaims();
+    } catch {
+      return this.deny("GUARD_UNAVAILABLE");
+    }
+    const exactClaims = activeClaims.filter((candidate) =>
+      "origin_adapter" in candidate && candidate.origin_adapter === event.adapter &&
+      candidate.session_id === event.session_id && candidate.host === this.options.host);
+    if (exactClaims.length !== 1) {
+      if (exactClaims.length > 1) return this.deny("GUARD_UNAVAILABLE");
+      const sameSession = activeClaims.some((candidate) => candidate.session_id === event.session_id);
+      return this.deny(sameSession ? "GUARD_CLAIM_MISMATCH" : "GUARD_CLAIM_REQUIRED");
+    }
+    claim = exactClaims[0] as ActiveClaim;
 
     let inspection: GuardTaskInspection;
     let task: TaskRecord;
+    let sourceTaskRevision: string;
     try {
       inspection = await this.options.tasks.inspectForGuard(claim.task_id, claim.claim_id);
       task = await this.options.tasks.getTask(claim.task_id);
+      sourceTaskRevision = await this.options.tasks.sourceRevisionForGuard(task);
     } catch {
       return this.deny("GUARD_UNAVAILABLE", claim);
     }
     if (!inspectionMatchesClaim(inspection, claim)) return this.deny("GUARD_WORKTREE_MISMATCH", claim);
     if (task.id !== claim.task_id || task.repo_id !== claim.repo_id) return this.deny("GUARD_UNAVAILABLE", claim);
+    if ((task.kind === "temporary" || task.kind === "child") && task.lifecycle !== "active") {
+      return this.deny("GUARD_UNAVAILABLE", claim);
+    }
+    if (sourceTaskRevision !== claim.source_task_revision) return this.deny("GUARD_UNAVAILABLE", claim);
+    const boundClaim = ContractActiveClaimSchema.safeParse(claim);
+    if (!boundClaim.success || task.work_contract === undefined ||
+      JSON.stringify(task.work_contract) !== JSON.stringify(boundClaim.data.work_contract)) {
+      return this.deny("GUARD_RESOURCE_AUTHORITY_UNAVAILABLE", claim);
+    }
     if (!await mutationPathsAreSafe(event, inspection.worktree.path)) {
       return this.deny("GUARD_WORKTREE_MISMATCH", claim);
     }
@@ -426,13 +662,6 @@ export class GuardService {
     }
 
     const evaluation: EvaluationContext = { event, claim, task, inspection, ...(classification ? { classification } : {}) };
-    if (activeClaims === undefined) {
-      try {
-        activeClaims = await this.options.claims.listActiveClaims();
-      } catch {
-        return this.deny("GUARD_UNAVAILABLE", claim, operation);
-      }
-    }
     const ownership = this.ownershipDecision(evaluation, operation.requirements, activeClaims);
     if (ownership) return this.deny(ownership, claim, operation);
 
@@ -442,6 +671,10 @@ export class GuardService {
       } catch {
         return this.deny("GUARD_RESOURCE_AUTHORITY_UNAVAILABLE", claim, operation);
       }
+    }
+
+    if (await this.options.registry_view.committedViewIsStale()) {
+      return this.deny("GUARD_UNAVAILABLE", claim, operation);
     }
 
     if (classification?.direct_high_risk || directHighRisk) {
@@ -477,24 +710,31 @@ export class GuardService {
     }
     if (!this.options.permit_decisions) return this.deny("GUARD_UNAVAILABLE", claim, operation);
     try {
-      const result = GuardDecisionSchema.safeParse(
+      const result = GuardPermitResultSchema.safeParse(
         await this.options.permit_decisions.decideMissingGrant(operation, missing),
       );
       if (!result.success) return this.deny("GUARD_UNAVAILABLE", claim, operation);
-      if (
-        result.data.decision === "PERMIT_REQUIRED" &&
-        result.data.operation_id === operation.operation_id &&
-        result.data.summary === operation.summary
-      ) {
-        return result.data;
-      }
-      if (
-        result.data.decision === "DENY" &&
-        (result.data.code === "GUARD_STATE_LIMIT" || result.data.code === "GUARD_UNAVAILABLE")
-      ) {
+      if ("decision" in result.data) {
         return this.deny(result.data.code, claim, operation);
       }
-      return this.deny("GUARD_UNAVAILABLE", claim, operation);
+      if (
+        result.data.task_id !== operation.task_id ||
+        result.data.claim_id !== operation.claim_id ||
+        result.data.origin_adapter !== operation.origin_adapter ||
+        result.data.session_id !== operation.session_id ||
+        result.data.cwd_worktree_ref !== operation.cwd_worktree_ref ||
+        result.data.operation_digest !== operation.digest ||
+        !sameRequirements(result.data.requirements, operation.requirements) ||
+        !sameRequirements(result.data.missing_requirements, missing)
+      ) return this.deny("GUARD_UNAVAILABLE", claim, operation);
+      return GuardDecisionSchema.parse({
+        decision: "PERMIT_REQUIRED",
+        operation_id: operation.operation_id,
+        request_id: result.data.request_id,
+        summary: operation.summary,
+        approval_command: `/jhw:unlock ${result.data.request_id}`,
+        approval_expires_at: result.data.approval_expires_at,
+      });
     } catch {
       return this.deny("GUARD_UNAVAILABLE", claim, operation);
     }

@@ -799,11 +799,26 @@ async function simpleKnownDetection(
   return { selfApproval };
 }
 
+/** Bounded, context-free detector shared by pre-Claim Guard policy and classification. */
+export function detectGuardSelfApproval(input: string): boolean {
+  if (typeof input !== "string" || input.length === 0 || Buffer.byteLength(input, "utf8") > MAX_COMMAND_BYTES) {
+    return false;
+  }
+  const raw = scanHighRisk(input);
+  if (raw.selfApproval) return true;
+  const parsed = parseSimpleArgv(input);
+  if (parsed.ambiguous || !parsed.argv) return false;
+  const commandArgv = executableArgv(parsed.argv);
+  return commandArgv !== undefined && executableName(commandArgv[0] as string) === "jhw-control" &&
+    commandArgv[1] === "guard" && new Set(["prompt", "approve", "consume"]).has(commandArgv[2] ?? "");
+}
+
 export async function classifyShell(input: string, context: ShellClassifierContext): Promise<ShellClassification> {
   if (typeof input !== "string" || Buffer.byteLength(input, "utf8") > MAX_COMMAND_BYTES || input.length === 0) {
     throw new ShellClassificationError("invalid_shell_input");
   }
   const raw = scanHighRisk(input);
+  const selfApproval = detectGuardSelfApproval(input);
   const parsed = parseSimpleArgv(input);
   const guardWrapper = parsed.argv ? exactGuardWrapper(parsed.argv) : undefined;
   const boardWrapper = parsed.argv ? exactBoardWrapper(parsed.argv) : undefined;
@@ -841,7 +856,7 @@ export async function classifyShell(input: string, context: ShellClassifierConte
       execution_boundary: executionBoundary,
       ambiguous: true,
       direct_high_risk: raw.detections.some((detection) => detection.risk === "high"),
-      self_approval: raw.selfApproval,
+      self_approval: selfApproval,
     };
   }
 
@@ -905,7 +920,7 @@ export async function classifyShell(input: string, context: ShellClassifierConte
     execution_boundary: executionBoundary,
     ambiguous: false,
     direct_high_risk: ownedWrapper === undefined && highRiskDetected,
-    self_approval: raw.selfApproval || known.selfApproval,
+    self_approval: selfApproval,
     ...(ownedWrapper ? { owned_wrapper: ownedWrapper } : {}),
     digest_argv: [...argv],
     ...(scriptContentSha256 ? { script_content_sha256: scriptContentSha256 } : {}),
