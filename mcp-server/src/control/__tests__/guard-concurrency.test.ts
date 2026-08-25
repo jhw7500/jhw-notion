@@ -261,6 +261,69 @@ describe("GuardService concurrency and Registry composition", () => {
     })).toThrow(TypeError);
   });
 
+  it("captures an accessor-backed decision journal once and writes only through that verified identity", async () => {
+    const fixtureValue = await fixture();
+    const unrelatedStateDir = join(fixtureValue.root, "accessor-journal-state");
+    const unrelatedJournal = new GuardJournal(unrelatedStateDir);
+    let journalAccesses = 0;
+    const options = new Proxy(fixtureValue.serviceOptions, {
+      get(target, property, receiver) {
+        if (property !== "guard_journal") return Reflect.get(target, property, receiver);
+        journalAccesses += 1;
+        return journalAccesses <= 2 ? fixtureValue.decisionJournal : unrelatedJournal;
+      },
+    });
+
+    const composition = createGuardServiceComposition(
+      fixtureValue.registryMutationLock,
+      options,
+    );
+    await expect(composition.service.evaluatePreTool({ protocol_version: 2 }))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+
+    expect(journalAccesses).toBe(1);
+    await expect(readFile(join(fixtureValue.stateDir, "guard-journal.jsonl"), "utf8"))
+      .resolves.toContain('"decision_code":"GUARD_PROTOCOL_MISMATCH"');
+    await expect(readFile(join(unrelatedStateDir, "guard-journal.jsonl"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("captures an accessor-backed request store once and mutates only that verified identity", async () => {
+    const fixtureValue = await fixture();
+    const unrelatedStateDir = join(fixtureValue.root, "accessor-request-state");
+    const unrelatedStore = new GuardRequestStore(configFor(unrelatedStateDir), {
+      journal: new MemoryJournal(),
+      environment: {},
+    });
+    let storeAccesses = 0;
+    const options = { ...fixtureValue.serviceOptions };
+    Object.defineProperty(options, "guard_request_store", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        storeAccesses += 1;
+        return storeAccesses <= 4 ? fixtureValue.requestStore : unrelatedStore;
+      },
+    });
+
+    const composition = createGuardServiceComposition(
+      fixtureValue.registryMutationLock,
+      options,
+    );
+    await expect(composition.service.evaluatePreTool(preTool(
+      fixtureValue.cwd,
+      "call-single-store-identity",
+    ))).resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+
+    expect(storeAccesses).toBe(1);
+    const state = JSON.parse(
+      await readFile(join(fixtureValue.stateDir, "guard-requests.yaml"), "utf8"),
+    ) as { requests: Array<{ state: string }> };
+    expect(state.requests).toEqual([expect.objectContaining({ state: "PENDING" })]);
+    await expect(readFile(join(unrelatedStateDir, "guard-requests.yaml"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("composes exact matching coordinates and writes the decision journal at that coordinate", async () => {
     const fixtureValue = await fixture();
 

@@ -1449,12 +1449,17 @@ export function createGuardServiceComposition(
     guard_journal: GuardJournal;
   },
 ): GuardServiceComposition {
-  const journalAuthority = captureGuardJournal(options.guard_journal);
-  const journalCoordinate = guardJournalHostCoordinate(options.guard_journal);
+  const {
+    guard_journal: guardJournal,
+    guard_request_store: guardRequestStore,
+    ...serviceOptions
+  } = options;
+  const journalAuthority = captureGuardJournal(guardJournal);
+  const journalCoordinate = guardJournalHostCoordinate(guardJournal);
   const registryCoordinate = guardMutationLockHostCoordinate(registryMutationLock);
-  const requestStoreAuthority = captureGuardRequestStore(options.guard_request_store);
-  const requestStoreCoordinate = options.guard_request_store
-    ? guardRequestStoreHostCoordinate(options.guard_request_store)
+  const requestStoreAuthority = captureGuardRequestStore(guardRequestStore);
+  const requestStoreCoordinate = guardRequestStore
+    ? guardRequestStoreHostCoordinate(guardRequestStore)
     : undefined;
   if (!journalAuthority || !journalCoordinate) {
     throw new TypeError("Guard service composition requires the concrete GuardJournal implementation");
@@ -1462,7 +1467,7 @@ export function createGuardServiceComposition(
   if (!registryCoordinate || !sameGuardHostCoordinate(registryCoordinate, journalCoordinate)) {
     throw new TypeError("Guard service composition requires one normalized host state coordinate");
   }
-  if (options.guard_request_store &&
+  if (guardRequestStore &&
     (!requestStoreAuthority || !requestStoreCoordinate ||
       !sameGuardHostCoordinate(registryCoordinate, requestStoreCoordinate))) {
     throw new TypeError("Guard service composition requires concrete request state at the host coordinate");
@@ -1470,7 +1475,9 @@ export function createGuardServiceComposition(
   const registryMutationBarrier = createGuardRegistryMutationBarrier(registryMutationLock);
   return Object.freeze({
     service: new GuardService({
-      ...options,
+      ...serviceOptions,
+      guard_journal: guardJournal,
+      guard_request_store: guardRequestStore,
       registry_mutation_barrier: registryMutationBarrier,
     }),
     registry_mutation_lock: registryMutationLock,
