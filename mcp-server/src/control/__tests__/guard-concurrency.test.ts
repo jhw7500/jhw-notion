@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -233,6 +233,138 @@ describe("GuardService concurrency and Registry composition", () => {
     const { registryMutationLock, composition } = await fixture();
 
     expect(composition.registry_mutation_lock).toBe(registryMutationLock);
+  });
+
+  it("rejects a genuine decision journal on a different host state coordinate before it can write there", async () => {
+    const fixtureValue = await fixture();
+    const unrelatedStateDir = join(fixtureValue.root, "unrelated-state");
+
+    expect(() => createGuardServiceComposition(fixtureValue.registryMutationLock, {
+      ...fixtureValue.serviceOptions,
+      guard_journal: new GuardJournal(unrelatedStateDir),
+    })).toThrow(TypeError);
+    await expect(readFile(join(unrelatedStateDir, "guard-journal.jsonl"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects genuine request state on a different host coordinate from Registry and decision journal", async () => {
+    const fixtureValue = await fixture();
+    const unrelatedConfig = configFor(join(fixtureValue.root, "unrelated-request-state"));
+    const unrelatedStore = new GuardRequestStore(unrelatedConfig, {
+      journal: new MemoryJournal(),
+      environment: {},
+    });
+
+    expect(() => createGuardServiceComposition(fixtureValue.registryMutationLock, {
+      ...fixtureValue.serviceOptions,
+      guard_request_store: unrelatedStore,
+    })).toThrow(TypeError);
+  });
+
+  it("composes exact matching coordinates and writes the decision journal at that coordinate", async () => {
+    const fixtureValue = await fixture();
+
+    await expect(fixtureValue.composition.service.evaluatePreTool({ protocol_version: 2 }))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+    const rows = (await readFile(join(fixtureValue.stateDir, "guard-journal.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line) as GuardJournalEvent);
+    expect(rows).toEqual([
+      expect.objectContaining({ event: "decision", decision_code: "GUARD_PROTOCOL_MISMATCH" }),
+    ]);
+  });
+
+  it("normalizes equivalent host coordinate spellings before composing all three authorities", async () => {
+    const fixtureValue = await fixture();
+    const spellingDirectory = join(fixtureValue.root, "coordinate-spelling");
+    await mkdir(spellingDirectory);
+    const equivalentStateDir = `${spellingDirectory}/../state`;
+    const equivalentStore = new GuardRequestStore(configFor(equivalentStateDir), {
+      journal: new MemoryJournal(),
+      environment: {},
+    });
+    const composition = createGuardServiceComposition(fixtureValue.registryMutationLock, {
+      ...fixtureValue.serviceOptions,
+      guard_request_store: equivalentStore,
+      guard_journal: new GuardJournal(equivalentStateDir),
+    });
+
+    await expect(composition.service.evaluatePreTool(preTool(
+      fixtureValue.cwd,
+      "call-normalized-coordinate",
+    ))).resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+    await expect(readFile(join(fixtureValue.stateDir, "guard-journal.jsonl"), "utf8"))
+      .resolves.toContain('"event":"decision"');
+  });
+
+  it("does not treat a symlink spelling as matching host coordinate authority", async () => {
+    const fixtureValue = await fixture();
+    const aliasStateDir = join(fixtureValue.root, "state-alias");
+    await symlink(fixtureValue.stateDir, aliasStateDir, "dir");
+
+    expect(() => createGuardServiceComposition(fixtureValue.registryMutationLock, {
+      ...fixtureValue.serviceOptions,
+      guard_journal: new GuardJournal(aliasStateDir),
+    })).toThrow(TypeError);
+  });
+
+  it("pins Registry and request-state I/O against post-construction config retargeting", async () => {
+    const fixtureValue = await fixture();
+    const retargetedStateDir = join(fixtureValue.root, "retargeted-state");
+    fixtureValue.config.stateDir = retargetedStateDir;
+
+    await expect(fixtureValue.composition.service.evaluatePreTool(preTool(
+      fixtureValue.cwd,
+      "call-config-retarget",
+    ))).resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+    const state = JSON.parse(
+      await readFile(join(fixtureValue.stateDir, "guard-requests.yaml"), "utf8"),
+    ) as { requests: Array<{ state: string }> };
+    expect(state.requests).toEqual([expect.objectContaining({ state: "PENDING" })]);
+    await expect(readFile(join(retargetedStateDir, "guard-requests.yaml"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("pins decision-journal I/O against a public-property retarget attempt", async () => {
+    const fixtureValue = await fixture();
+    const retargetedStateDir = join(fixtureValue.root, "retargeted-journal");
+    (fixtureValue.decisionJournal as unknown as { stateDir: string }).stateDir = retargetedStateDir;
+
+    await expect(fixtureValue.composition.service.evaluatePreTool({ protocol_version: 2 }))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+    await expect(readFile(join(fixtureValue.stateDir, "guard-journal.jsonl"), "utf8"))
+      .resolves.toContain('"decision_code":"GUARD_PROTOCOL_MISMATCH"');
+    await expect(readFile(join(retargetedStateDir, "guard-journal.jsonl"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects derived, overridden, and provenance-less journal authorities at composition", async () => {
+    const fixtureValue = await fixture();
+    class DerivedGuardJournal extends GuardJournal {}
+    const overridden = new GuardJournal(fixtureValue.stateDir);
+    Object.defineProperty(overridden, "append", { value: vi.fn(async () => undefined) });
+    const provenanceLess = Object.create(GuardJournal.prototype) as GuardJournal;
+    const candidates = [
+      new DerivedGuardJournal(fixtureValue.stateDir),
+      overridden,
+      provenanceLess,
+    ];
+
+    for (const guardJournal of candidates) {
+      expect(() => createGuardServiceComposition(fixtureValue.registryMutationLock, {
+        ...fixtureValue.serviceOptions,
+        guard_journal: guardJournal,
+      })).toThrow(TypeError);
+    }
+  });
+
+  it("rejects a provenance-less request store at composition", async () => {
+    const fixtureValue = await fixture();
+    const provenanceLess = Object.create(GuardRequestStore.prototype) as GuardRequestStore;
+
+    expect(() => createGuardServiceComposition(fixtureValue.registryMutationLock, {
+      ...fixtureValue.serviceOptions,
+      guard_request_store: provenanceLess,
+    })).toThrow(TypeError);
   });
 
   it("holds the Registry writer lock before entering the independent Guard state mutation", async () => {

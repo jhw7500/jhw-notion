@@ -8,6 +8,10 @@ import type { Readable } from "node:stream";
 
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import {
+  createGuardHostCoordinateAuthority,
+  type GuardHostCoordinateAuthority,
+} from "./guard-coordinate.js";
 import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
 import type { ErrorReason } from "./schemas.js";
 import { isSensitiveEnvironmentKey } from "./sensitive-data.js";
@@ -516,6 +520,7 @@ type GuardMutationRunner = <T>(callback: () => Promise<T>) => Promise<T>;
 
 interface DirectMutationLockAuthority {
   coordinate: string;
+  hostCoordinate: GuardHostCoordinateAuthority;
   guardEligible: boolean;
   runGuard: GuardMutationRunner;
 }
@@ -595,18 +600,22 @@ function acquireLock(child: MutationLockChild, helperTimeoutMs: number, contende
  * until the parent finally closes its descriptor after the callback completes.
  */
 export class MutationLock implements MutationLockPort {
+  readonly #stateDir: string;
+
   constructor(
-    private readonly config: ControlConfig,
+    config: ControlConfig,
     private readonly environment: NodeJS.ProcessEnv = process.env,
     private readonly runtime: MutationLockRuntime = productionLockRuntime,
     private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
     private readonly options: MutationLockOptions = {},
   ) {
+    this.#stateDir = resolve(config.stateDir);
     if (new.target === MutationLock) {
       directlyConstructedMutationLocks.add(this);
       const lockFileName = options.lockFileName ?? "registry.lock";
       directMutationLockAuthorities.set(this, {
-        coordinate: `${resolve(config.stateDir)}\u0000${lockFileName}`,
+        coordinate: `${resolve(this.#stateDir)}\u0000${lockFileName}`,
+        hostCoordinate: createGuardHostCoordinateAuthority(this.#stateDir),
         guardEligible: lockFileName === "registry.lock" && options.waitSeconds === undefined,
         runGuard: <T>(callback: () => Promise<T>) =>
           this.#runLocked(async () => callback(), GUARD_REGISTRY_WAIT_SECONDS),
@@ -632,7 +641,7 @@ export class MutationLock implements MutationLockPort {
     try {
       try {
         directory = await openSecureStateDirectory(
-          this.config.stateDir,
+          this.#stateDir,
           this.secureDirectoryHooks,
           { strictExistingMode: this.options.strictExistingStateDirectory },
         );
@@ -732,6 +741,20 @@ export function createGuardMutationLockAuthority(
   }) as GuardMutationLockAuthority;
   guardMutationAuthorityRunners.set(authority, (callback) => runGuardAdmission(direct, callback));
   return authority;
+}
+
+/** Returns no path, only the immutable coordinate proof captured by a genuine lock. */
+export function guardMutationLockHostCoordinate(
+  mutationLock: MutationLock,
+): GuardHostCoordinateAuthority | undefined {
+  const direct = directMutationLockAuthorities.get(mutationLock);
+  return isDirectMutationLock(mutationLock) &&
+    Object.getPrototypeOf(mutationLock) === MutationLock.prototype &&
+    mutationLock.run === MutationLock.prototype.run &&
+    mutationLock.runInStateDirectory === MutationLock.prototype.runInStateDirectory &&
+    direct?.guardEligible
+    ? direct.hostCoordinate
+    : undefined;
 }
 
 /** Runs one admitted Guard mutation without exposing its private host coordinate. */

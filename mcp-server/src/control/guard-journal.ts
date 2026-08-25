@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 import { z } from "zod";
 
 import {
@@ -21,6 +23,10 @@ import {
   type SensitiveDataPolicy,
 } from "./sensitive-data.js";
 import { ControlError } from "./errors.js";
+import {
+  createGuardHostCoordinateAuthority,
+  type GuardHostCoordinateAuthority,
+} from "./guard-coordinate.js";
 
 const GUARD_JOURNAL_FILE = "guard-journal.jsonl";
 // The schema-maximum event is pinned at 7,843 bytes in guard-journal.test.ts.
@@ -31,7 +37,7 @@ const boundedCoordinate = (maximumBytes: number) => z.string()
   .max(maximumBytes)
   .regex(/^[^\u0000-\u001f\u007f]+$/u)
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
-const directlyConstructedGuardJournals = new WeakSet<object>();
+const directlyConstructedGuardJournals = new WeakMap<object, GuardHostCoordinateAuthority>();
 
 export const GuardJournalEventSchema = z.object({
   protocol_version: z.literal(1),
@@ -72,15 +78,19 @@ export interface GuardJournalPort {
 }
 
 export class GuardJournal implements GuardJournalPort {
+  readonly #stateDir: string;
   private readonly sensitiveData: SensitiveDataPolicy;
 
   constructor(
-    private readonly stateDir: string,
+    stateDir: string,
     private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
     sensitiveData?: SensitiveDataPolicy,
   ) {
-    this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [stateDir]);
-    if (new.target === GuardJournal) directlyConstructedGuardJournals.add(this);
+    this.#stateDir = resolve(stateDir);
+    this.sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [this.#stateDir]);
+    if (new.target === GuardJournal) {
+      directlyConstructedGuardJournals.set(this, createGuardHostCoordinateAuthority(this.#stateDir));
+    }
   }
 
   async append(event: GuardJournalEvent): Promise<void> {
@@ -89,7 +99,7 @@ export class GuardJournal implements GuardJournalPort {
       this.sensitiveData.assertSafe(parsed);
       assertNoAbsoluteHostPaths(parsed);
       await appendBoundedJournalLine(
-        this.stateDir,
+        this.#stateDir,
         this.secureDirectoryHooks,
         this.sensitiveData,
         GUARD_JOURNAL_FILE,
@@ -114,4 +124,11 @@ export class GuardJournal implements GuardJournalPort {
 /** True only for journals constructed directly by this module's concrete class. */
 export function isDirectGuardJournal(value: unknown): value is GuardJournal {
   return typeof value === "object" && value !== null && directlyConstructedGuardJournals.has(value);
+}
+
+/** Returns no path, only the immutable coordinate proof captured at direct construction. */
+export function guardJournalHostCoordinate(
+  journal: GuardJournal,
+): GuardHostCoordinateAuthority | undefined {
+  return directlyConstructedGuardJournals.get(journal);
 }

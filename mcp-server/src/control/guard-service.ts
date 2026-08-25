@@ -34,16 +34,19 @@ import {
 } from "./operation-normalizer.js";
 import {
   createGuardMutationLockAuthority,
+  guardMutationLockHostCoordinate,
   MutationLock,
   runWithGuardMutationLockAuthority,
 } from "./process.js";
 import {
   GuardJournal,
+  guardJournalHostCoordinate,
   isDirectGuardJournal,
   type GuardJournalEvent,
 } from "./guard-journal.js";
 import {
   GuardRequestStore,
+  guardRequestStoreHostCoordinate,
   type GuardCompleteResult,
   type GuardConsumeResult,
   type GuardPendingResult,
@@ -51,6 +54,7 @@ import {
   type GuardRequest,
   type GuardRequestInspection,
 } from "./guard-state.js";
+import { sameGuardHostCoordinate } from "./guard-coordinate.js";
 import {
   ContractActiveClaimSchema,
   GuardDecisionSchema,
@@ -1445,8 +1449,23 @@ export function createGuardServiceComposition(
     guard_journal: GuardJournal;
   },
 ): GuardServiceComposition {
-  if (!captureGuardJournal(options.guard_journal)) {
+  const journalAuthority = captureGuardJournal(options.guard_journal);
+  const journalCoordinate = guardJournalHostCoordinate(options.guard_journal);
+  const registryCoordinate = guardMutationLockHostCoordinate(registryMutationLock);
+  const requestStoreAuthority = captureGuardRequestStore(options.guard_request_store);
+  const requestStoreCoordinate = options.guard_request_store
+    ? guardRequestStoreHostCoordinate(options.guard_request_store)
+    : undefined;
+  if (!journalAuthority || !journalCoordinate) {
     throw new TypeError("Guard service composition requires the concrete GuardJournal implementation");
+  }
+  if (!registryCoordinate || !sameGuardHostCoordinate(registryCoordinate, journalCoordinate)) {
+    throw new TypeError("Guard service composition requires one normalized host state coordinate");
+  }
+  if (options.guard_request_store &&
+    (!requestStoreAuthority || !requestStoreCoordinate ||
+      !sameGuardHostCoordinate(registryCoordinate, requestStoreCoordinate))) {
+    throw new TypeError("Guard service composition requires concrete request state at the host coordinate");
   }
   const registryMutationBarrier = createGuardRegistryMutationBarrier(registryMutationLock);
   return Object.freeze({

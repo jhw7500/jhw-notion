@@ -1,9 +1,14 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import {
+  createGuardHostCoordinateAuthority,
+  type GuardHostCoordinateAuthority,
+} from "./guard-coordinate.js";
 import {
   CanonicalOperationSchema,
   GuardAdapterSchema,
@@ -56,6 +61,7 @@ const keyCreateFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
 const EXACT_UNLOCK =
   /^\/jhw:unlock (req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
 const concreteStateDirectoryRun = MutationLock.prototype.runInStateDirectory;
+const directlyConstructedGuardRequestStores = new WeakMap<object, GuardHostCoordinateAuthority>();
 
 type GuardStateMutationRunner = <T>(callback: (directory: SecureStateDirectory) => Promise<T>) => Promise<T>;
 
@@ -387,6 +393,7 @@ function validateCorrelation(correlation: string, sensitiveData: SensitiveDataPo
 }
 
 export class GuardRequestStore {
+  readonly #stateDir: string;
   private readonly stateHooks: GuardStateHooks;
   private readonly secureDirectoryHooks: SecureStateDirectoryHooks;
   private readonly sensitiveData: SensitiveDataPolicy;
@@ -394,16 +401,17 @@ export class GuardRequestStore {
   readonly #runStateMutation: GuardStateMutationRunner;
 
   constructor(
-    private readonly config: ControlConfig,
+    config: ControlConfig,
     options: GuardRequestStoreOptions = {},
   ) {
+    this.#stateDir = resolve(config.stateDir);
     const environment = options.environment ?? process.env;
     this.stateHooks = options.stateHooks ?? {};
     this.secureDirectoryHooks = options.secureDirectoryHooks ?? {};
-    this.sensitiveData = createSensitiveDataPolicy(environment, [config.stateDir]);
-    this.journal = options.journal ?? new GuardJournal(config.stateDir, this.secureDirectoryHooks, this.sensitiveData);
+    this.sensitiveData = createSensitiveDataPolicy(environment, [this.#stateDir]);
+    this.journal = options.journal ?? new GuardJournal(this.#stateDir, this.secureDirectoryHooks, this.sensitiveData);
     const lock = new MutationLock(
-      config,
+      { ...config, stateDir: this.#stateDir },
       environment,
       options.lockRuntime,
       this.secureDirectoryHooks,
@@ -416,12 +424,15 @@ export class GuardRequestStore {
       },
     );
     this.#runStateMutation = captureGuardStateMutationRunner(lock);
+    if (new.target === GuardRequestStore) {
+      directlyConstructedGuardRequestStores.set(this, createGuardHostCoordinateAuthority(this.#stateDir));
+    }
   }
 
   async inspect(): Promise<GuardRequestInspection> {
     let directory: SecureStateDirectory | undefined;
     try {
-      const inspected = await inspectSecureStateDirectory(this.config.stateDir);
+      const inspected = await inspectSecureStateDirectory(this.#stateDir);
       if (inspected.status === "not_initialized") return { status: "not_initialized", requests: [] };
       directory = inspected.directory;
       await inspectExistingGuardLock(directory);
@@ -635,6 +646,13 @@ export class GuardRequestStore {
     }
     return warning;
   }
+}
+
+/** Returns no path, only the immutable coordinate proof captured at direct construction. */
+export function guardRequestStoreHostCoordinate(
+  store: GuardRequestStore,
+): GuardHostCoordinateAuthority | undefined {
+  return directlyConstructedGuardRequestStores.get(store);
 }
 
 async function readKey(directory: SecureStateDirectory): Promise<Buffer> {
