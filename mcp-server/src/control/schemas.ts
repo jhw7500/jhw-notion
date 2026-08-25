@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { OperationIdSchema, RequestIdSchema } from "./guard-protocol.js";
 import { normalizeWorkContract, TaskIdSchema, WorkContractSchema, workContractDigest } from "./work-contract.js";
 
 export { TaskIdSchema } from "./work-contract.js";
@@ -279,6 +280,77 @@ export const ERROR_REASONS = [
 ] as const;
 export const ErrorReasonSchema = z.enum(ERROR_REASONS);
 export type ErrorReason = z.infer<typeof ErrorReasonSchema>;
+
+/** Stable, closed Guard policy codes. Normal denials use this schema, not exceptions. */
+export const GuardDenyCodeSchema = z.enum([
+  "GUARD_CLAIM_REQUIRED",
+  "GUARD_CLAIM_MISMATCH",
+  "GUARD_WORKTREE_MISMATCH",
+  "GUARD_RESOURCE_OWNED",
+  "GUARD_REQUEST_NOT_FOUND",
+  "GUARD_REQUEST_EXPIRED",
+  "GUARD_PERMIT_MISMATCH",
+  "GUARD_PERMIT_CONSUMED",
+  "GUARD_PROMPT_ORIGIN_UNSUPPORTED",
+  "GUARD_UNAVAILABLE",
+  "GUARD_PROTOCOL_MISMATCH",
+  "GUARD_RESOURCE_AUTHORITY_UNAVAILABLE",
+  "GUARD_WRAPPER_REQUIRED",
+  "GUARD_SELF_APPROVAL_DENIED",
+  "GUARD_STATE_LIMIT",
+]);
+export type GuardDenyCode = z.infer<typeof GuardDenyCodeSchema>;
+
+export const GuardEvaluationModeSchema = z.enum(["enforce", "observe"]);
+export type GuardEvaluationMode = z.infer<typeof GuardEvaluationModeSchema>;
+
+export const GuardSummarySchema = boundedCoordinate(512);
+export const GuardExecutionBoundarySchema = z.enum(["hook", "guarded_command", "tracker", "notion", "board"]);
+
+const GuardAllowDecisionSchema = z.object({
+  decision: z.literal("ALLOW"),
+  operation_id: OperationIdSchema,
+  summary: GuardSummarySchema,
+  execution_boundary: GuardExecutionBoundarySchema,
+  consumed_request_id: RequestIdSchema.optional(),
+  observed_decision: z.enum(["PERMIT_REQUIRED", "DENY"]).optional(),
+}).strict();
+
+const GuardPermitRequiredDecisionSchema = z.object({
+  decision: z.literal("PERMIT_REQUIRED"),
+  operation_id: OperationIdSchema,
+  request_id: RequestIdSchema,
+  summary: GuardSummarySchema,
+  approval_command: z.string().min(1).max(96),
+  approval_expires_at: OffsetDateTimeSchema,
+}).strict();
+
+const GuardDenyDecisionSchema = z.object({
+  decision: z.literal("DENY"),
+  code: GuardDenyCodeSchema,
+  reason: ErrorReasonSchema.optional(),
+  task_id: TaskIdSchema.optional(),
+  claim_id: canonicalId("clm").optional(),
+  summary: GuardSummarySchema,
+}).strict();
+
+export const GuardDecisionSchema = z.discriminatedUnion("decision", [
+  GuardAllowDecisionSchema,
+  GuardPermitRequiredDecisionSchema,
+  GuardDenyDecisionSchema,
+]).superRefine((decision, context) => {
+  if (
+    decision.decision === "PERMIT_REQUIRED" &&
+    decision.approval_command !== `/jhw:unlock ${decision.request_id}`
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["approval_command"],
+      message: "Approval command must exactly identify its request",
+    });
+  }
+});
+export type GuardDecision = z.infer<typeof GuardDecisionSchema>;
 
 export const BoardIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}$/);
 export const BoardModeSchema = z.enum(["exclusive", "shared"]);

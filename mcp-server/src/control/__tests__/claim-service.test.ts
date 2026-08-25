@@ -36,7 +36,10 @@ async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: S
   fixtures.push(fixture);
   const config = configFor(fixture.registryDir);
   const registry = isolatedRegistryGit(config, new ProcessRunner());
-  const catalog = new Catalog(config, registry, undefined, { assertKnownContract: async () => undefined });
+  const catalog = new Catalog(config, registry, undefined, {
+    assertKnownContract: async () => undefined,
+    assertKnownRequirement: async () => undefined,
+  });
   await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
   const task = await catalog.registerTemporaryTask({
     project_id: "prj-wlan",
@@ -60,7 +63,10 @@ async function formalClaimsFixture(taskRole: "standalone" | "parent" = "standalo
   fixtures.push(fixture);
   const config = configFor(fixture.registryDir);
   const registry = isolatedRegistryGit(config, new ProcessRunner());
-  const catalog = new Catalog(config, registry, undefined, { assertKnownContract: async () => undefined });
+  const catalog = new Catalog(config, registry, undefined, {
+    assertKnownContract: async () => undefined,
+    assertKnownRequirement: async () => undefined,
+  });
   await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
   const task = (await catalog.registerFormalTask({
     project_id: "prj-wlan",
@@ -634,9 +640,9 @@ describe("ClaimService", () => {
     const { claims, catalog, fixture, task } = await claimsFixture();
     const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-resolve" }));
 
-    await expect(claims.resolveSessionClaim("codex-resolve", "cantopsbuildserver")).resolves.toEqual(first);
-    await expect(claims.resolveSessionClaim("codex-resolve", "other-host")).resolves.toBeUndefined();
-    await expect(claims.resolveSessionClaim("codex-missing", "cantopsbuildserver")).resolves.toBeUndefined();
+    await expect(claims.resolveSessionClaim("codex", "codex-resolve", "cantopsbuildserver")).resolves.toEqual(first);
+    await expect(claims.resolveSessionClaim("codex", "codex-resolve", "other-host")).resolves.toBeUndefined();
+    await expect(claims.resolveSessionClaim("codex", "codex-missing", "cantopsbuildserver")).resolves.toBeUndefined();
 
     const other = await catalog.registerTemporaryTask({
       project_id: task.project_id,
@@ -659,8 +665,30 @@ describe("ClaimService", () => {
     duplicate.host = first.host;
     await commitRegistryFile(fixture, secondPath, `${JSON.stringify(duplicate)}\n`);
 
-    await expect(claims.resolveSessionClaim(first.session_id, first.host)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    await expect(claims.resolveSessionClaim("codex", first.session_id, first.host)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     expect(second.claim_id).not.toBe(first.claim_id);
+  });
+
+  it("lists every validated active Claim through a bounded read-only audit", async () => {
+    const { claims, catalog, task } = await claimsFixture();
+    const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-list-first" }));
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-list-second",
+      goal: "list a second active owner",
+      done_conditions: ["both owners are visible"],
+      expected_scope: ["src/list.ts"],
+      ...emptyTaskContractIntent(),
+    });
+    const second = await claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: "codex-list-second",
+      branch: "task/wlan-list-second",
+      worktree_ref: "wt-wlan-list-second",
+    }));
+
+    await expect(claims.listActiveClaims()).resolves.toEqual([first, second]);
   });
 
   it("copies the active Work Contract digest into newly released history", async () => {

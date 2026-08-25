@@ -6,6 +6,7 @@ import { z, type ZodType } from "zod";
 import { Catalog } from "./catalog.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import { GuardAdapterSchema, type GuardAdapter } from "./guard-protocol.js";
 import { newClaimId } from "./ids.js";
 import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
 import { activeClaimRelativePath, taskRelativePath } from "./registry-paths.js";
@@ -254,12 +255,16 @@ export class ClaimService {
     return this.requireContractActiveClaim(await this.assertOwner(input.task_id, claimed.claim_id));
   }
 
-  /** Resolves exact host/session ownership without inferring aliases or prefixes. */
-  async resolveSessionClaim(sessionId: string, host: string): Promise<ActiveClaim | undefined> {
-    this.sensitiveData.assertSafe({ session_id: sessionId, host });
+  /** Resolves exact adapter/session/host ownership without aliases or prefixes. */
+  async resolveSessionClaim(originAdapter: GuardAdapter, sessionId: string, host: string): Promise<ActiveClaim | undefined> {
+    this.sensitiveData.assertSafe({ origin_adapter: originAdapter, session_id: sessionId, host });
     const lookup = parse(
-      z.object({ session_id: ClaimCoordinateSchema, host: ClaimCoordinateSchema }).strict(),
-      { session_id: sessionId, host },
+      z.object({
+        origin_adapter: GuardAdapterSchema,
+        session_id: ClaimCoordinateSchema,
+        host: ClaimCoordinateSchema,
+      }).strict(),
+      { origin_adapter: originAdapter, session_id: sessionId, host },
       "INVALID_CLAIM",
       "Invalid Claim session lookup",
     );
@@ -271,6 +276,11 @@ export class ClaimService {
       });
     }
     return matches[0];
+  }
+
+  /** Bounded read-only enumeration used by Guard ownership conflict audits. */
+  async listActiveClaims(): Promise<ActiveClaim[]> {
+    return this.readAllActiveClaims();
   }
 
   async finishClaim(taskId: string, expectedClaimId: string, rawOutcome: FinishOutcome): Promise<ClaimHistory> {

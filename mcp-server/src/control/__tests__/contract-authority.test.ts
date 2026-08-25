@@ -64,6 +64,37 @@ function fixture(tasks: TaskRecord[] = [parent, child]) {
 }
 
 describe("ControlContractAuthority", () => {
+  it("revalidates one canonical operation requirement without consulting dependencies", async () => {
+    const { authority, resolvedBoards } = fixture();
+
+    await expect(authority.assertKnownRequirement(parent, {
+      capability: "repo.modify",
+      resource: { kind: "repository", id: "repo-wlan" },
+    })).resolves.toBeUndefined();
+    await expect(authority.assertKnownRequirement(parent, {
+      capability: "board.execute",
+      resource: { kind: "board", id: "wlan-board" },
+    })).resolves.toBeUndefined();
+    expect(resolvedBoards).toEqual(["wlan-board"]);
+  });
+
+  it("rejects noncanonical, moved, and unsupported operation resources", async () => {
+    const { authority } = fixture();
+
+    await expect(authority.assertKnownRequirement(parent, {
+      capability: "repo.modify",
+      resource: { kind: "repository", id: "repo-other" },
+    })).rejects.toMatchObject({ code: "RESOURCE_AUTHORITY_MISMATCH" });
+    await expect(authority.assertKnownRequirement(parent, {
+      capability: "remote.execute",
+      resource: { kind: "remote_host", id: "rhost-lab" },
+    })).rejects.toMatchObject({ code: "RESOURCE_AUTHORITY_UNSUPPORTED" });
+    await expect(authority.assertKnownRequirement(parent, {
+      capability: "repo.modify",
+      resource: { kind: "repository", id: "repo-wlan", alias: "wlan" },
+    } as never)).rejects.toMatchObject({ code: "RESOURCE_AUTHORITY_MISMATCH" });
+  });
+
   it("accepts only the exact repository and formal Issue identities in Task authority", async () => {
     const { authority } = fixture();
     await expect(authority.assertKnownContract(parent, contract(parent.id, [

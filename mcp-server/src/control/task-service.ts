@@ -93,6 +93,13 @@ export interface TaskStatusResult {
   worktree: Omit<WorktreeInspection, "path" | "repository_path">;
 }
 
+/** Internal read-only Guard view. Host paths must never enter a decision envelope. */
+export interface GuardTaskInspection {
+  active: ActiveClaim;
+  worktree: WorktreeInspection;
+}
+
+
 export interface TaskFinishInput {
   task_id: string;
   claim_id: string;
@@ -463,6 +470,12 @@ export class TaskService {
 
   async assertOwner(taskId: string, claimId: string): Promise<ActiveClaim> {
     return this.claims.assertOwner(taskId, claimId);
+  }
+
+  /** Reuses the owner and audited worktree path without exposing it through CLI status. */
+  async inspectForGuard(taskId: string, claimId: string): Promise<GuardTaskInspection> {
+    const active = await this.claims.assertOwner(taskId, claimId);
+    return { active, worktree: await this.worktrees.inspect(active) };
   }
 
   async markCompletionReady(input: TaskCompletionReadyInput): Promise<TaskCompletionEvidenceRecord> {

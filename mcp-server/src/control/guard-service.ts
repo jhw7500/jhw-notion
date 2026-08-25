@@ -1,0 +1,640 @@
+import { lstat, realpath } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+
+import { z } from "zod";
+
+import type { CanonicalOperation, GuardAdapter, OperationRequirement, PreToolUseEvent } from "./guard-protocol.js";
+import {
+  GuardCommonEventSchema,
+  PostToolUseEventSchema,
+  UserPromptSubmitEventSchema,
+} from "./guard-protocol.js";
+import { newOperationId } from "./ids.js";
+import {
+  normalizeOperation,
+  OperationNormalizationError,
+  type NormalizeOperationContext,
+} from "./operation-normalizer.js";
+import {
+  ContractActiveClaimSchema,
+  GuardDecisionSchema,
+  GuardDenyCodeSchema,
+  GuardEvaluationModeSchema,
+  GuardSummarySchema,
+  type ActiveClaim,
+  type GuardDecision,
+  type GuardDenyCode,
+  type GuardEvaluationMode,
+  type TaskRecord,
+} from "./schemas.js";
+import {
+  classifyShell,
+  ShellClassificationError,
+  type ExecutionBoundary,
+  type ShellClassification,
+} from "./shell-classifier.js";
+import type { GuardTaskInspection } from "./task-service.js";
+import type { WorkGrant } from "./work-contract.js";
+
+export { GuardDecisionSchema } from "./schemas.js";
+export type { GuardDecision } from "./schemas.js";
+
+const SideEventKindSchema = z.enum(["user_prompt_submit", "post_tool_use"]);
+export const GuardSideEventResultSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("NO_STATE_CHANGE"),
+    event: SideEventKindSchema,
+    summary: GuardSummarySchema,
+  }).strict(),
+  z.object({
+    status: z.literal("DENY"),
+    code: z.literal("GUARD_PROTOCOL_MISMATCH"),
+    summary: GuardSummarySchema,
+  }).strict(),
+]);
+export type GuardSideEventResult = z.infer<typeof GuardSideEventResultSchema>;
+
+export interface GuardClaimServicePort {
+  resolveSessionClaim(
+    originAdapter: GuardAdapter,
+    sessionId: string,
+    host: string,
+  ): Promise<ActiveClaim | undefined>;
+  listActiveClaims(): Promise<ActiveClaim[]>;
+}
+
+export interface GuardTaskServicePort {
+  getTask(taskId: string): Promise<TaskRecord>;
+  inspectForGuard(taskId: string, claimId: string): Promise<GuardTaskInspection>;
+}
+
+export interface GuardContractAuthorityPort {
+  assertKnownRequirement(task: TaskRecord, requirement: OperationRequirement): Promise<void>;
+}
+
+/** Task 3/4 supplies this boundary. Task 2 deliberately cannot create a request. */
+export interface GuardPermitDecisionPort {
+  decideMissingGrant(
+    operation: CanonicalOperation,
+    missingRequirements: readonly OperationRequirement[],
+  ): Promise<unknown>;
+}
+
+export interface GuardServiceOptions {
+  host: string;
+  digest_key: Uint8Array;
+  claims: GuardClaimServicePort;
+  tasks: GuardTaskServicePort;
+  authority: GuardContractAuthorityPort;
+  permit_decisions?: GuardPermitDecisionPort;
+  mode?: GuardEvaluationMode;
+  /** Strict read-only inspection seam. It must never create, clean, or lock state. */
+  inspect_guard_state?: () => Promise<boolean>;
+}
+
+const summaryByCode: Record<GuardDenyCode, string> = {
+  GUARD_CLAIM_REQUIRED: "An active Claim is required",
+  GUARD_CLAIM_MISMATCH: "Claim session identity does not match",
+  GUARD_WORKTREE_MISMATCH: "Worktree identity does not match",
+  GUARD_RESOURCE_OWNED: "Another active Task owns the resource",
+  GUARD_REQUEST_NOT_FOUND: "Guard request was not found",
+  GUARD_REQUEST_EXPIRED: "Guard request has expired",
+  GUARD_PERMIT_MISMATCH: "Guard permit binding does not match",
+  GUARD_PERMIT_CONSUMED: "Guard permit was already consumed",
+  GUARD_PROMPT_ORIGIN_UNSUPPORTED: "Prompt origin is unsupported",
+  GUARD_UNAVAILABLE: "Guard state or authority is unavailable",
+  GUARD_PROTOCOL_MISMATCH: "Guard protocol input is invalid",
+  GUARD_RESOURCE_AUTHORITY_UNAVAILABLE: "Resource authority is unavailable",
+  GUARD_WRAPPER_REQUIRED: "A guarded execution wrapper is required",
+  GUARD_SELF_APPROVAL_DENIED: "Agent-origin permit approval is denied",
+  GUARD_STATE_LIMIT: "Guard request state limit was reached",
+};
+
+const hardObserveCodes = new Set<GuardDenyCode>([
+  "GUARD_PROTOCOL_MISMATCH",
+  "GUARD_UNAVAILABLE",
+  "GUARD_SELF_APPROVAL_DENIED",
+]);
+
+const fileReadTools = new Set(["read", "read_file", "glob", "glob_files", "grep", "grep_files"]);
+const fileModifyTools = new Set([
+  "edit", "edit_file", "write", "write_file", "notebookedit", "notebook_edit", "apply_patch", "functions_apply_patch",
+]);
+const shellTools = new Set(["bash", "shell", "exec_command", "run_command", "terminal"]);
+const directHighRiskTools = new Set([
+  "jhw_record", "jhw_save", "jhw_delete", "jhw_note",
+  "github_issue_close", "github_issue_edit", "github_issue_comment",
+]);
+const notionDatabaseIds = new Set(["decisionLog", "preferences", "projects", "references", "knowledgeBase"]);
+const claimFreeStatusCommands = new Set([
+  "git status",
+  "git status --short",
+  "git status --porcelain",
+  "jhw-control guard status",
+  "jhw-control guard preflight",
+  "jhw-control board list",
+]);
+
+function canonicalToolAlias(toolName: string): string {
+  const tail = toolName.trim().toLowerCase().split(/__+|[.:/]+/u).filter(Boolean).at(-1) ?? "";
+  return tail.replace(/[^a-z0-9]+/gu, "_").replace(/^_+|_+$/gu, "");
+}
+
+function asObject(value: unknown): Record<string, unknown> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function commandFrom(event: PreToolUseEvent): string | undefined {
+  const command = asObject(event.tool_input)?.command;
+  return typeof command === "string" && command.length > 0 ? command : undefined;
+}
+
+function notionDatabaseFrom(event: PreToolUseEvent): NormalizeOperationContext["notion_database"] | undefined {
+  const alias = canonicalToolAlias(event.tool_name);
+  if (!new Set(["jhw_record", "jhw_save", "jhw_delete", "jhw_note"]).has(alias)) return undefined;
+  const db = alias === "jhw_note" ? "knowledgeBase" : asObject(event.tool_input)?.db;
+  return typeof db === "string" && notionDatabaseIds.has(db)
+    ? { kind: "notion_database", id: db as "decisionLog" | "preferences" | "projects" | "references" | "knowledgeBase" }
+    : undefined;
+}
+
+function isClaimFreeRead(event: PreToolUseEvent): "Local repository read" | "Local repository status" | undefined {
+  const alias = canonicalToolAlias(event.tool_name);
+  if (fileReadTools.has(alias)) return "Local repository read";
+  if (!shellTools.has(alias)) return undefined;
+  const input = asObject(event.tool_input);
+  if (!input || Object.keys(input).length !== 1 || typeof input.command !== "string") return undefined;
+  return claimFreeStatusCommands.has(input.command) ? "Local repository status" : undefined;
+}
+
+function isWithin(root: string, target: string): boolean {
+  const path = relative(root, target);
+  return path === "" || (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`));
+}
+
+function notFound(cause: unknown): boolean {
+  return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
+}
+
+async function safeMutationTarget(root: string, cwd: string, rawPath: string): Promise<boolean> {
+  if (!rawPath || /[\u0000\r\n]/u.test(rawPath)) return false;
+  let trustedRoot: string;
+  try {
+    trustedRoot = await realpath(root);
+  } catch {
+    return false;
+  }
+
+  const candidates = isAbsolute(rawPath)
+    ? [resolve(rawPath)]
+    : [resolve(cwd, rawPath), resolve(trustedRoot, rawPath)];
+  const uniqueCandidates = [...new Set(candidates)];
+  for (const candidate of uniqueCandidates) {
+    let targetStat;
+    try {
+      targetStat = await lstat(candidate);
+    } catch (cause) {
+      if (!notFound(cause)) return false;
+      let parent: string;
+      try {
+        parent = await realpath(dirname(candidate));
+      } catch {
+        continue;
+      }
+      if (isWithin(trustedRoot, parent)) return true;
+      continue;
+    }
+    if (targetStat.isSymbolicLink() || !targetStat.isFile()) return false;
+    let resolvedTarget: string;
+    try {
+      resolvedTarget = await realpath(candidate);
+    } catch {
+      return false;
+    }
+    return isWithin(trustedRoot, resolvedTarget);
+  }
+  return false;
+}
+
+function patchTargets(input: unknown): string[] | undefined {
+  const patch = typeof input === "string" ? input : asObject(input)?.patch;
+  if (typeof patch !== "string") return undefined;
+  const targets: string[] = [];
+  for (const line of patch.split("\n")) {
+    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/u) ??
+      line.match(/^\*\*\* Move to: (.+)$/u);
+    if (match?.[1]) targets.push(match[1]);
+  }
+  return targets.length > 0 ? targets : undefined;
+}
+
+function mutationTargets(event: PreToolUseEvent): string[] | undefined {
+  const alias = canonicalToolAlias(event.tool_name);
+  if (!fileModifyTools.has(alias)) return [];
+  if (alias === "apply_patch" || alias === "functions_apply_patch") return patchTargets(event.tool_input);
+  const input = asObject(event.tool_input);
+  if (!input) return undefined;
+  const targets = [input.file_path, input.path, input.notebook_path]
+    .filter((value): value is string => typeof value === "string");
+  return targets.length > 0 ? [...new Set(targets)] : undefined;
+}
+
+async function mutationPathsAreSafe(event: PreToolUseEvent, worktreePath: string): Promise<boolean> {
+  const targets = mutationTargets(event);
+  if (targets === undefined) return false;
+  for (const target of targets) {
+    if (!await safeMutationTarget(worktreePath, event.cwd, target)) return false;
+  }
+  return true;
+}
+
+interface WrapperCoordinates {
+  task?: string;
+  claim?: string;
+  session?: string;
+  adapter?: string;
+  board?: string;
+}
+
+function optionValue(command: string, option: string): string | undefined {
+  const escaped = option.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const matches = [...command.matchAll(new RegExp(`(?:^|\\s)${escaped}\\s+([^\\s]+)`, "gu"))];
+  return matches.length === 1 ? matches[0]?.[1] : undefined;
+}
+
+function wrapperCoordinates(command: string): WrapperCoordinates {
+  const separator = command.search(/\s--\s/u);
+  const wrapperPrefix = separator >= 0 ? command.slice(0, separator) : command;
+  return {
+    task: optionValue(wrapperPrefix, "--task"),
+    claim: optionValue(wrapperPrefix, "--claim"),
+    session: optionValue(wrapperPrefix, "--session"),
+    adapter: optionValue(wrapperPrefix, "--origin-adapter"),
+    board: optionValue(wrapperPrefix, "--board"),
+  };
+}
+
+function wrapperMatches(
+  classification: ShellClassification,
+  command: string,
+  event: PreToolUseEvent,
+  claim: ActiveClaim,
+): boolean {
+  if (!classification.owned_wrapper) return true;
+  const coordinates = wrapperCoordinates(command);
+  return coordinates.task === claim.task_id &&
+    coordinates.claim === claim.claim_id &&
+    coordinates.session === event.session_id &&
+    coordinates.adapter === event.adapter &&
+    (classification.owned_wrapper !== "board" || coordinates.board !== undefined);
+}
+
+function boardFromOwnedWrapper(command: string): NormalizeOperationContext["board"] | undefined {
+  const board = wrapperCoordinates(command).board;
+  return board && /^[a-z0-9][a-z0-9-]{1,62}$/u.test(board)
+    ? { kind: "board", id: board }
+    : undefined;
+}
+
+function exactRequirement(left: Pick<WorkGrant, "capability" | "resource">, right: OperationRequirement): boolean {
+  return left.capability === right.capability &&
+    left.resource.kind === right.resource.kind &&
+    left.resource.id === right.resource.id;
+}
+
+function sameResource(left: WorkGrant["resource"], right: OperationRequirement["resource"]): boolean {
+  return left.kind === right.kind && left.id === right.id;
+}
+
+function inspectionMatchesClaim(inspection: GuardTaskInspection, claim: ActiveClaim): boolean {
+  const active = inspection.active;
+  return active.task_id === claim.task_id &&
+    active.claim_id === claim.claim_id &&
+    active.session_id === claim.session_id &&
+    active.host === claim.host &&
+    active.branch === claim.branch &&
+    active.worktree_ref === claim.worktree_ref &&
+    active.repo_id === claim.repo_id &&
+    inspection.worktree.branch === claim.branch &&
+    inspection.worktree.worktree_ref === claim.worktree_ref;
+}
+
+interface EvaluationContext {
+  event: PreToolUseEvent;
+  claim: ActiveClaim;
+  task: TaskRecord;
+  inspection: GuardTaskInspection;
+  classification?: ShellClassification;
+}
+
+export class GuardService {
+  private readonly mode: GuardEvaluationMode | undefined;
+
+  constructor(private readonly options: GuardServiceOptions) {
+    this.mode = GuardEvaluationModeSchema.safeParse(options.mode ?? "enforce").data;
+  }
+
+  async evaluatePreTool(eventInput: unknown): Promise<GuardDecision> {
+    const eventResult = this.safeCommonEvent(eventInput);
+    if (!eventResult.success || eventResult.data.event !== "pre_tool_use") {
+      return this.deny("GUARD_PROTOCOL_MISMATCH");
+    }
+    const event = eventResult.data;
+    if (!this.mode) return this.deny("GUARD_UNAVAILABLE");
+    if (this.mode === "observe" && !await this.observeStateAvailable()) {
+      return this.deny("GUARD_UNAVAILABLE");
+    }
+
+    const claimFree = isClaimFreeRead(event);
+    if (claimFree) {
+      return GuardDecisionSchema.parse({
+        decision: "ALLOW",
+        operation_id: newOperationId(),
+        summary: claimFree,
+        execution_boundary: "hook",
+      });
+    }
+
+    let activeClaims: ActiveClaim[] | undefined;
+    let claim: ActiveClaim | undefined;
+    try {
+      claim = await this.options.claims.resolveSessionClaim(event.adapter, event.session_id, this.options.host);
+      if (!claim) {
+        activeClaims = await this.options.claims.listActiveClaims();
+        const sameSession = activeClaims.some((candidate) => candidate.session_id === event.session_id);
+        return this.deny(sameSession ? "GUARD_CLAIM_MISMATCH" : "GUARD_CLAIM_REQUIRED");
+      }
+    } catch {
+      return this.deny("GUARD_UNAVAILABLE");
+    }
+
+    let inspection: GuardTaskInspection;
+    let task: TaskRecord;
+    try {
+      inspection = await this.options.tasks.inspectForGuard(claim.task_id, claim.claim_id);
+      task = await this.options.tasks.getTask(claim.task_id);
+    } catch {
+      return this.deny("GUARD_UNAVAILABLE", claim);
+    }
+    if (!inspectionMatchesClaim(inspection, claim)) return this.deny("GUARD_WORKTREE_MISMATCH", claim);
+    if (task.id !== claim.task_id || task.repo_id !== claim.repo_id) return this.deny("GUARD_UNAVAILABLE", claim);
+    if (!await mutationPathsAreSafe(event, inspection.worktree.path)) {
+      return this.deny("GUARD_WORKTREE_MISMATCH", claim);
+    }
+
+    const context = await this.normalizationContext(event, claim, task, inspection);
+    if (!context) return this.deny("GUARD_UNAVAILABLE", claim);
+
+    let classification: ShellClassification | undefined;
+    let directHighRisk = false;
+    const command = commandFrom(event);
+    if (shellTools.has(canonicalToolAlias(event.tool_name))) {
+      if (!command) return this.deny("GUARD_WRAPPER_REQUIRED", claim);
+      try {
+        classification = await classifyShell(command, {
+          trusted_worktree_path: inspection.worktree.path,
+          cwd: event.cwd,
+          repository: context.repository,
+          ...(context.issue ? { issue: context.issue } : {}),
+          ...(context.board ? { board: context.board } : {}),
+        });
+      } catch (cause) {
+        return this.deny(cause instanceof ShellClassificationError && cause.code === "unsafe_local_script"
+          ? "GUARD_WORKTREE_MISMATCH"
+          : "GUARD_WRAPPER_REQUIRED", claim);
+      }
+      if (classification.self_approval) return this.deny("GUARD_SELF_APPROVAL_DENIED", claim);
+      if (!wrapperMatches(classification, command, event, claim)) return this.deny("GUARD_CLAIM_MISMATCH", claim);
+      if (classification.unresolved_signals.length > 0) {
+        return this.deny("GUARD_WRAPPER_REQUIRED", claim, undefined, classification.execution_boundary);
+      }
+    } else if (directHighRiskTools.has(canonicalToolAlias(event.tool_name))) {
+      directHighRisk = true;
+    }
+
+    let operation: Awaited<ReturnType<typeof normalizeOperation>>;
+    try {
+      operation = await normalizeOperation(event, context, this.options.digest_key);
+    } catch (cause) {
+      if (cause instanceof OperationNormalizationError) {
+        if (cause.code === "self_approval") return this.deny("GUARD_SELF_APPROVAL_DENIED", claim);
+        if (cause.code === "cwd_outside_worktree") return this.deny("GUARD_WORKTREE_MISMATCH", claim);
+        if (cause.code === "unresolved_boundary") return this.deny("GUARD_WRAPPER_REQUIRED", claim);
+      }
+      return this.deny("GUARD_UNAVAILABLE", claim);
+    }
+
+    const evaluation: EvaluationContext = { event, claim, task, inspection, ...(classification ? { classification } : {}) };
+    if (activeClaims === undefined) {
+      try {
+        activeClaims = await this.options.claims.listActiveClaims();
+      } catch {
+        return this.deny("GUARD_UNAVAILABLE", claim, operation);
+      }
+    }
+    const ownership = this.ownershipDecision(evaluation, operation.requirements, activeClaims);
+    if (ownership) return this.deny(ownership, claim, operation);
+
+    for (const requirement of operation.requirements) {
+      try {
+        await this.options.authority.assertKnownRequirement(task, requirement);
+      } catch {
+        return this.deny("GUARD_RESOURCE_AUTHORITY_UNAVAILABLE", claim, operation);
+      }
+    }
+
+    if (classification?.direct_high_risk || directHighRisk) {
+      return this.deny(
+        "GUARD_WRAPPER_REQUIRED",
+        claim,
+        operation,
+        classification?.execution_boundary ?? operation.execution_boundary,
+      );
+    }
+
+    const contractClaim = ContractActiveClaimSchema.safeParse(claim);
+    if (!contractClaim.success) return this.deny("GUARD_RESOURCE_AUTHORITY_UNAVAILABLE", claim, operation);
+    const missing = operation.requirements.filter((requirement) =>
+      !contractClaim.data.work_contract.grants.some((candidate) => exactRequirement(candidate, requirement)));
+    if (missing.length === 0) {
+      return GuardDecisionSchema.parse({
+        decision: "ALLOW",
+        operation_id: operation.operation_id,
+        summary: operation.summary,
+        execution_boundary: operation.execution_boundary,
+      });
+    }
+
+    if (this.mode === "observe") {
+      return GuardDecisionSchema.parse({
+        decision: "ALLOW",
+        operation_id: operation.operation_id,
+        summary: operation.summary,
+        execution_boundary: operation.execution_boundary,
+        observed_decision: "PERMIT_REQUIRED",
+      });
+    }
+    if (!this.options.permit_decisions) return this.deny("GUARD_UNAVAILABLE", claim, operation);
+    try {
+      const result = GuardDecisionSchema.safeParse(
+        await this.options.permit_decisions.decideMissingGrant(operation, missing),
+      );
+      if (!result.success) return this.deny("GUARD_UNAVAILABLE", claim, operation);
+      if (
+        result.data.decision === "PERMIT_REQUIRED" &&
+        result.data.operation_id === operation.operation_id &&
+        result.data.summary === operation.summary
+      ) {
+        return result.data;
+      }
+      if (
+        result.data.decision === "DENY" &&
+        (result.data.code === "GUARD_STATE_LIMIT" || result.data.code === "GUARD_UNAVAILABLE")
+      ) {
+        return this.deny(result.data.code, claim, operation);
+      }
+      return this.deny("GUARD_UNAVAILABLE", claim, operation);
+    } catch {
+      return this.deny("GUARD_UNAVAILABLE", claim, operation);
+    }
+  }
+
+  async submitUserPrompt(eventInput: unknown): Promise<GuardSideEventResult> {
+    const result = this.safeVariant(UserPromptSubmitEventSchema, eventInput);
+    if (!result.success) return this.sideProtocolDeny();
+    return GuardSideEventResultSchema.parse({
+      status: "NO_STATE_CHANGE",
+      event: "user_prompt_submit",
+      summary: "Prompt permit state is not integrated",
+    });
+  }
+
+  async completePostTool(eventInput: unknown): Promise<GuardSideEventResult> {
+    const result = this.safeVariant(PostToolUseEventSchema, eventInput);
+    if (!result.success) return this.sideProtocolDeny();
+    return GuardSideEventResultSchema.parse({
+      status: "NO_STATE_CHANGE",
+      event: "post_tool_use",
+      summary: "Tool completion state is not integrated",
+    });
+  }
+
+  private safeCommonEvent(value: unknown): ReturnType<typeof GuardCommonEventSchema.safeParse> {
+    try {
+      return GuardCommonEventSchema.safeParse(value);
+    } catch {
+      return GuardCommonEventSchema.safeParse(null);
+    }
+  }
+
+  private safeVariant<T extends z.ZodTypeAny>(schema: T, value: unknown): ReturnType<T["safeParse"]> {
+    try {
+      return schema.safeParse(value) as ReturnType<T["safeParse"]>;
+    } catch {
+      return schema.safeParse(null) as ReturnType<T["safeParse"]>;
+    }
+  }
+
+  private async observeStateAvailable(): Promise<boolean> {
+    if (!this.options.inspect_guard_state) return false;
+    try {
+      return await this.options.inspect_guard_state() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async normalizationContext(
+    event: PreToolUseEvent,
+    claim: ActiveClaim,
+    task: TaskRecord,
+    inspection: GuardTaskInspection,
+  ): Promise<NormalizeOperationContext | undefined> {
+    let issue: NormalizeOperationContext["issue"];
+    if (task.kind === "formal") {
+      issue = { kind: "issue", id: task.issue_node_id };
+    } else if (task.kind === "child") {
+      let parent: TaskRecord;
+      try {
+        parent = await this.options.tasks.getTask(task.parent_task_id);
+      } catch {
+        return undefined;
+      }
+      if (parent.kind !== "formal" || parent.task_role !== "parent") return undefined;
+      issue = { kind: "issue", id: parent.issue_node_id };
+    }
+    const command = commandFrom(event);
+    const board = command ? boardFromOwnedWrapper(command) : undefined;
+    const notionDatabase = notionDatabaseFrom(event);
+    return {
+      evaluation_stage: "hook",
+      task_id: claim.task_id,
+      claim_id: claim.claim_id,
+      session_id: claim.session_id,
+      cwd_worktree_ref: claim.worktree_ref,
+      trusted_worktree_path: inspection.worktree.path,
+      repository: { kind: "repository", id: claim.repo_id },
+      ...(issue ? { issue } : {}),
+      ...(notionDatabase ? { notion_database: notionDatabase } : {}),
+      ...(board ? { board } : {}),
+    };
+  }
+
+  private ownershipDecision(
+    context: EvaluationContext,
+    requirements: readonly OperationRequirement[],
+    activeClaims: readonly ActiveClaim[],
+  ): GuardDenyCode | undefined {
+    const current = ContractActiveClaimSchema.safeParse(context.claim);
+    if (!current.success) return "GUARD_RESOURCE_AUTHORITY_UNAVAILABLE";
+    for (const candidate of activeClaims) {
+      const candidateContract = ContractActiveClaimSchema.safeParse(candidate);
+      if (!candidateContract.success) return "GUARD_RESOURCE_AUTHORITY_UNAVAILABLE";
+      if (candidate.claim_id === context.claim.claim_id) continue;
+      for (const requirement of requirements) {
+        const otherOwns = candidateContract.data.work_contract.grants
+          .filter((entry) => sameResource(entry.resource, requirement.resource));
+        if (otherOwns.length === 0) continue;
+        const currentExclusive = current.data.work_contract.grants.some((entry) =>
+          sameResource(entry.resource, requirement.resource) && entry.coordination === "exclusive");
+        if (currentExclusive || otherOwns.some((entry) => entry.coordination === "exclusive")) {
+          return "GUARD_RESOURCE_OWNED";
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private deny(
+    codeInput: GuardDenyCode,
+    claim?: ActiveClaim,
+    operation?: Awaited<ReturnType<typeof normalizeOperation>>,
+    boundary: ExecutionBoundary = "hook",
+  ): GuardDecision {
+    const code = GuardDenyCodeSchema.parse(codeInput);
+    if (this.mode === "observe" && !hardObserveCodes.has(code)) {
+      return GuardDecisionSchema.parse({
+        decision: "ALLOW",
+        operation_id: operation?.operation_id ?? newOperationId(),
+        summary: operation?.summary ?? summaryByCode[code],
+        execution_boundary: operation?.execution_boundary ?? boundary,
+        observed_decision: "DENY",
+      });
+    }
+    return GuardDecisionSchema.parse({
+      decision: "DENY",
+      code,
+      ...(claim ? { task_id: claim.task_id, claim_id: claim.claim_id } : {}),
+      summary: summaryByCode[code],
+    });
+  }
+
+  private sideProtocolDeny(): GuardSideEventResult {
+    return GuardSideEventResultSchema.parse({
+      status: "DENY",
+      code: "GUARD_PROTOCOL_MISMATCH",
+      summary: summaryByCode.GUARD_PROTOCOL_MISMATCH,
+    });
+  }
+}

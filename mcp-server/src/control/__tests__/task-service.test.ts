@@ -166,6 +166,27 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
 }
 
 describe("TaskService", () => {
+  it("returns the exact current owner and audited private worktree view for Guard policy", async () => {
+    const { tasks, claims, worktrees, worktreePath } = await taskFixture();
+
+    await expect(tasks.inspectForGuard(TASK_ID, CLAIM_ID)).resolves.toEqual({
+      active: activeClaim,
+      worktree: {
+        path: worktreePath,
+        repository_path: startInput.repository_path,
+        worktree_ref: plan.worktree_ref,
+        branch: plan.branch,
+        head_sha: "0123456789abcdef",
+        dirty: false,
+        dirty_files: [],
+        ahead: 0,
+        behind: 0,
+      },
+    });
+    expect(claims.assertOwner).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
+    expect(worktrees.inspect).toHaveBeenCalledWith(activeClaim);
+  });
+
   it("records and retrieves structured completion evidence without inspecting or releasing work", async () => {
     const { tasks, claims, worktrees } = await taskFixture();
     const input = {
