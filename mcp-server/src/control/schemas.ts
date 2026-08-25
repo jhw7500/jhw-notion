@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { TaskIdSchema, WorkContractSchema } from "./work-contract.js";
+import { normalizeWorkContract, TaskIdSchema, WorkContractSchema, workContractDigest } from "./work-contract.js";
 
 export { TaskIdSchema } from "./work-contract.js";
 
@@ -167,7 +167,30 @@ export const LegacyActiveClaimSchema = ActiveClaimBaseSchema.strict();
 export const ContractActiveClaimSchema = ActiveClaimBaseSchema.extend({
   work_contract: WorkContractSchema,
   work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/),
-}).strict();
+}).strict().superRefine((claim, context) => {
+  if (claim.work_contract.task_id !== claim.task_id) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["work_contract", "task_id"],
+      message: "Claim Work Contract Task ID disagrees with active Claim",
+    });
+  }
+  const normalized = normalizeWorkContract(claim.work_contract);
+  if (JSON.stringify(normalized) !== JSON.stringify(claim.work_contract)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["work_contract"],
+      message: "Active Claim Work Contract snapshot is not canonical",
+    });
+  }
+  if (workContractDigest(normalized) !== claim.work_contract_digest) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["work_contract_digest"],
+      message: "Active Claim Work Contract digest disagrees with its snapshot",
+    });
+  }
+});
 export const ActiveClaimSchema = z.union([
   ContractActiveClaimSchema,
   LegacyActiveClaimSchema,

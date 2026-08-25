@@ -487,11 +487,12 @@ export class ClaimService {
           build_host: this.config.buildHost,
         });
       }
-      this.requireContractActiveClaim(active);
+      const contractActive = this.requireContractActiveClaim(active);
       const activeClaims = await this.readAllActiveClaims(task.id);
       this.assertSessionAvailable(activeClaims, sessionId, this.config.buildHost, task.id);
+      this.assertResourcesAvailable(activeClaims, contractActive.work_contract, task.id);
       const started = this.timestamp();
-      const { predecessor_claim_id: _allocationPredecessor, ...takeoverBase } = active;
+      const { predecessor_claim_id: _allocationPredecessor, ...takeoverBase } = contractActive;
       replacement = parse(
         ContractActiveClaimSchema,
         {
@@ -510,7 +511,7 @@ export class ClaimService {
           claim_id: expectedClaimId,
         });
       }
-      history = this.takeoverHistory(active, releasedAt, replacement.claim_id);
+      history = this.takeoverHistory(contractActive, releasedAt, replacement.claim_id);
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
       await this.catalog.records.remove(activeClaimRelativePath(taskId));
@@ -759,14 +760,18 @@ export class ClaimService {
 
   private requireContractActiveClaim(active: ActiveClaim): ContractActiveClaim {
     const parsed = ContractActiveClaimSchema.safeParse(active);
-    if (!parsed.success) {
+    if (parsed.success) return parsed.data;
+    if (ActiveClaimSchema.safeParse(active).success) {
       throw new ControlError(
         "ACTIVE_CLAIM_CONTRACT_REQUIRED",
         "Active Claim lacks the immutable Work Contract snapshot required for acquisition",
         { task_id: active.task_id, claim_id: active.claim_id },
       );
     }
-    return parsed.data;
+    throw corruption("Active Claim Work Contract integrity validation failed", {
+      task_id: active.task_id,
+      claim_id: active.claim_id,
+    });
   }
 
   private async requireOwner(task: TaskRecord, expectedClaimId: string): Promise<ActiveClaim> {
