@@ -28,7 +28,7 @@ import {
   OperationNormalizationError,
   type NormalizeOperationContext,
 } from "./operation-normalizer.js";
-import { MutationLock } from "./process.js";
+import { isDirectMutationLock, MutationLock } from "./process.js";
 import {
   ContractActiveClaimSchema,
   GuardDecisionSchema,
@@ -90,8 +90,8 @@ const guardRegistryMutationBarrierRunners = new WeakMap<object, GuardRegistryMut
 
 /**
  * Opaque authority to run one Guard evaluation under the Registry writer lock.
- * Task 4 must create it from the same concrete host MutationLock used by
- * Registry writers; arbitrary structural callback runners are not authority.
+ * Task 4 must create it from the exact same concrete host MutationLock object
+ * used by Registry writers; arbitrary structural callback runners are not authority.
  */
 export interface GuardRegistryMutationBarrierPort {
   readonly [guardRegistryMutationBarrierBrand]: true;
@@ -107,7 +107,11 @@ export function createGuardRegistryMutationBarrier(
   mutationLock: MutationLock,
 ): GuardRegistryMutationBarrierPort {
   const concreteRun = MutationLock.prototype.run;
-  if (Object.getPrototypeOf(mutationLock) !== MutationLock.prototype || mutationLock.run !== concreteRun) {
+  if (
+    !isDirectMutationLock(mutationLock)
+    || Object.getPrototypeOf(mutationLock) !== MutationLock.prototype
+    || mutationLock.run !== concreteRun
+  ) {
     throw new TypeError("Guard Registry barrier requires the concrete MutationLock implementation");
   }
   const barrier = Object.freeze({

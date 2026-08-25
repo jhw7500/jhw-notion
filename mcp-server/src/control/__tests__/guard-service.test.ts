@@ -590,7 +590,44 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
-  it("mints Guard barrier authority only from an unmodified concrete MutationLock", () => {
+  it("accepts an unmodified directly constructed MutationLock as Guard barrier authority", () => {
+    const direct = new MutationLock(
+      lockConfig(join(fixture.root, "direct-registry-state")),
+      {},
+      { spawn: () => completedLockAcquisition() },
+    );
+
+    expect(() => createGuardRegistryMutationBarrier(direct)).not.toThrow();
+  });
+
+  it("rejects a provenance-less object with the concrete MutationLock surface", () => {
+    const provenanceLess = Object.create(MutationLock.prototype) as MutationLock;
+
+    expect(Object.getPrototypeOf(provenanceLess)).toBe(MutationLock.prototype);
+    expect(provenanceLess.run).toBe(MutationLock.prototype.run);
+    expect(() => createGuardRegistryMutationBarrier(provenanceLess)).toThrow("concrete MutationLock");
+  });
+
+  it("rejects a subclass even after its instance is made prototype-compatible", () => {
+    class DerivedMutationLock extends MutationLock {
+      constructor() {
+        super(
+          lockConfig(join(fixture.root, "derived-registry-state")),
+          {},
+          { spawn: () => completedLockAcquisition() },
+        );
+      }
+    }
+
+    const derived = new DerivedMutationLock();
+    Object.setPrototypeOf(derived, MutationLock.prototype);
+
+    expect(Object.getPrototypeOf(derived)).toBe(MutationLock.prototype);
+    expect(derived.run).toBe(MutationLock.prototype.run);
+    expect(() => createGuardRegistryMutationBarrier(derived)).toThrow("concrete MutationLock");
+  });
+
+  it("rejects structural and instance-overridden MutationLock candidates", () => {
     const structuralFake = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
     const overridden = new MutationLock(
       lockConfig(join(fixture.root, "overridden-registry-state")),
@@ -605,6 +642,42 @@ describe("GuardService", () => {
       .toThrow("concrete MutationLock");
     expect(() => createGuardRegistryMutationBarrier(overridden)).toThrow("concrete MutationLock");
     expect(structuralFake.run).not.toHaveBeenCalled();
+  });
+
+  it("awaits an accepted concrete MutationLock callback before publishing its decision", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const basePermit = fixture.permit as GuardPermitDecisionPort;
+    let entered!: () => void;
+    const permitEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const permitGate = new Promise<void>((resolve) => { release = resolve; });
+
+    const evaluation = fixture.service({
+      permit_decisions: {
+        decideMissingGrant: async (operation, missing) => {
+          entered();
+          await permitGate;
+          return basePermit.decideMissingGrant(operation, missing);
+        },
+      },
+    }).evaluatePreTool(preTool(fixture.cwd));
+
+    await permitEntered;
+    const stateBeforeRelease = await Promise.race([
+      evaluation.then(() => "settled" as const),
+      new Promise<"pending">((resolve) => setImmediate(() => resolve("pending"))),
+    ]);
+    expect(stateBeforeRelease).toBe("pending");
+
+    release();
+    await expect(evaluation).resolves.toMatchObject({
+      decision: "PERMIT_REQUIRED",
+      request_id: REQUEST_ID,
+    });
+    expect(fixture.permitCalls).toBe(1);
   });
 
   it("fails closed before permit evaluation when concrete MutationLock acquisition fails", async () => {

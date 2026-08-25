@@ -504,6 +504,8 @@ const productionLockRuntime: MutationLockRuntime = {
   spawn: (command, args, options) => spawn(command, args, options),
 };
 
+const directlyConstructedMutationLocks = new WeakSet<object>();
+
 /** Non-default lock identity: a second host-global lock that must not contend with registry.lock. */
 export interface MutationLockOptions {
   lockFileName?: string;
@@ -565,7 +567,9 @@ export class MutationLock implements MutationLockPort {
     private readonly runtime: MutationLockRuntime = productionLockRuntime,
     private readonly secureDirectoryHooks: SecureStateDirectoryHooks = {},
     private readonly options: MutationLockOptions = {},
-  ) {}
+  ) {
+    if (new.target === MutationLock) directlyConstructedMutationLocks.add(this);
+  }
 
   async run<T>(callback: () => Promise<T>): Promise<T> {
     let directory: SecureStateDirectory | undefined;
@@ -617,4 +621,11 @@ export class MutationLock implements MutationLockPort {
       await directory?.close();
     }
   }
+}
+
+/** True only for instances constructed directly by this module's base class. */
+export function isDirectMutationLock(value: unknown): value is MutationLock {
+  return typeof value === "object"
+    && value !== null
+    && directlyConstructedMutationLocks.has(value);
 }
