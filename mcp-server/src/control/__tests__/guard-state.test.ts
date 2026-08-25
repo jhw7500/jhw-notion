@@ -15,7 +15,8 @@ import {
   type GuardStateHooks,
 } from "../guard-state.js";
 import { GuardJournal, type GuardJournalEvent, type GuardJournalPort } from "../guard-journal.js";
-import type { MutationLockRuntime } from "../process.js";
+import { openSecureStateDirectory, type SecureStateDirectory } from "../journal.js";
+import { MutationLock, type MutationLockRuntime } from "../process.js";
 
 const TASK_ID = "tsk-018f21e0-7b2c-7a00-8000-000000000001";
 const CLAIM_ID = "clm-018f21e0-7b2c-7a00-8000-000000000002";
@@ -121,8 +122,21 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
+
+async function runAgainstDirectory<T>(
+  stateDir: string,
+  callback: (directory: SecureStateDirectory) => Promise<T>,
+): Promise<T> {
+  const directory = await openSecureStateDirectory(stateDir);
+  try {
+    return await callback(directory);
+  } finally {
+    await directory.close();
+  }
+}
 
 describe("Guard request deadlines", () => {
   it("approves PENDING at 9:59.999 and starts a fresh independent ten-minute window", async () => {
@@ -495,6 +509,66 @@ describe("secure request state", () => {
     await expect(lstat(join(stateDir, "guard-requests.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("rejects an existing non-private Guard lock without repairing or publishing state", async () => {
+    const { stateDir, store } = await fixture();
+    await mkdir(stateDir, { mode: 0o700 });
+    const lockPath = join(stateDir, "guard-requests.lock");
+    await writeFile(lockPath, "", { mode: 0o600 });
+    await chmod(lockPath, 0o644);
+
+    await expect(store.createOrReusePending(operation())).rejects.toMatchObject({ code: "GUARD_UNAVAILABLE" });
+    expect((await lstat(lockPath)).mode & 0o777).toBe(0o644);
+    await expect(lstat(join(stateDir, "guard-requests.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps Guard state on the configured flock directory despite an instance method override", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-lock-authority-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const decoyDir = join(root, "decoy");
+    const runtime: MutationLockRuntime = { spawn: vi.fn(() => completedAcquisition()) };
+    const store = new GuardRequestStore(configFor(stateDir), {
+      journal: new MemoryJournal(),
+      lockRuntime: runtime,
+    });
+    const redirect = async <T>(callback: (directory: SecureStateDirectory) => Promise<T>): Promise<T> =>
+      runAgainstDirectory(decoyDir, callback);
+    Object.defineProperty(store, "lock", {
+      configurable: true,
+      value: { runInStateDirectory: redirect },
+    });
+
+    await store.createOrReusePending(operation());
+
+    expect(runtime.spawn).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(await readFile(join(stateDir, "guard-requests.yaml"), "utf8")))
+      .toMatchObject({ requests: [expect.objectContaining({ state: "PENDING" })] });
+    await expect(lstat(join(decoyDir, "guard-requests.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps Guard state on the configured flock directory despite a prototype method override", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-lock-authority-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const decoyDir = join(root, "decoy");
+    const runtime: MutationLockRuntime = { spawn: vi.fn(() => completedAcquisition()) };
+    const redirect = async <T>(callback: (directory: SecureStateDirectory) => Promise<T>): Promise<T> =>
+      runAgainstDirectory(decoyDir, callback);
+    vi.spyOn(MutationLock.prototype, "runInStateDirectory")
+      .mockImplementation(redirect as MutationLock["runInStateDirectory"]);
+    const store = new GuardRequestStore(configFor(stateDir), {
+      journal: new MemoryJournal(),
+      lockRuntime: runtime,
+    });
+
+    await store.createOrReusePending(operation());
+
+    expect(runtime.spawn).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(await readFile(join(stateDir, "guard-requests.yaml"), "utf8")))
+      .toMatchObject({ requests: [expect.objectContaining({ state: "PENDING" })] });
+    await expect(lstat(join(decoyDir, "guard-requests.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("mutates the same retained state-directory inode that owns guard-requests.lock", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-guard-anchor-"));
     roots.push(root);
@@ -600,6 +674,53 @@ describe("secure request state", () => {
       status: "ready",
       requests: [expect.objectContaining({ state: "PENDING" })],
     });
+  });
+
+  it.each(["symlink", "directory", "hardlink", "unsafe-mode"])(
+    "rejects an existing unsafe %s Guard lock during read-only inspection without changing metadata",
+    async (variant) => {
+      const { root, stateDir, store } = await fixture();
+      await mkdir(stateDir, { mode: 0o700 });
+      const lockPath = join(stateDir, "guard-requests.lock");
+      const external = join(root, "external-lock");
+      if (variant === "symlink") {
+        await writeFile(external, "outside", { mode: 0o600 });
+        await symlink(external, lockPath);
+      } else if (variant === "directory") {
+        await mkdir(lockPath, { mode: 0o700 });
+      } else if (variant === "hardlink") {
+        await writeFile(external, "outside", { mode: 0o600 });
+        await link(external, lockPath);
+      } else {
+        await writeFile(lockPath, "", { mode: 0o600 });
+        await chmod(lockPath, 0o644);
+      }
+      const directoryBefore = await lstat(stateDir);
+      const lockBefore = await lstat(lockPath);
+
+      await expect(store.inspect()).rejects.toMatchObject({ code: "GUARD_UNAVAILABLE" });
+
+      const directoryAfter = await lstat(stateDir);
+      const lockAfter = await lstat(lockPath);
+      expect(directoryAfter.mtimeMs).toBe(directoryBefore.mtimeMs);
+      expect(lockAfter.mtimeMs).toBe(lockBefore.mtimeMs);
+      expect(lockAfter.mode).toBe(lockBefore.mode);
+      if (variant === "symlink" || variant === "hardlink") {
+        expect(await readFile(external, "utf8")).toBe("outside");
+      }
+      await expect(lstat(join(stateDir, "guard-requests.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it("keeps a safe empty Guard namespace not_initialized during read-only inspection", async () => {
+    const { stateDir, store } = await fixture();
+    await mkdir(stateDir, { mode: 0o700 });
+    const before = await lstat(stateDir);
+
+    await expect(store.inspect()).resolves.toEqual({ status: "not_initialized", requests: [] });
+
+    expect((await lstat(stateDir)).mtimeMs).toBe(before.mtimeMs);
+    await expect(lstat(join(stateDir, "guard-requests.lock"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 

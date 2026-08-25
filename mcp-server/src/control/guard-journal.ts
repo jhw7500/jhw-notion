@@ -23,6 +23,8 @@ import {
 import { ControlError } from "./errors.js";
 
 const GUARD_JOURNAL_FILE = "guard-journal.jsonl";
+// The schema-maximum event is pinned at 7,843 bytes in guard-journal.test.ts.
+const MAX_GUARD_JOURNAL_LINE_BYTES = 8 * 1024;
 const claimId = z.string().regex(/^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const boundedCoordinate = (maximumBytes: number) => z.string()
   .min(1)
@@ -83,6 +85,11 @@ export class GuardJournal implements GuardJournalPort {
           tooLarge: "Guard journal event exceeds the atomic append boundary",
           incomplete: "Guard journal append was incomplete",
           failed: "Unable to append the Guard journal",
+        },
+        {
+          maximumLineBytes: MAX_GUARD_JOURNAL_LINE_BYTES,
+          strictExistingStateDirectory: true,
+          strictExistingFileMode: true,
         },
       );
     } catch {

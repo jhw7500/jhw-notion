@@ -6,10 +6,13 @@ import { ControlError } from "./errors.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 const MAX_JOURNAL_LINE_BYTES = 4096;
+const MAX_CONFIGURABLE_JOURNAL_LINE_BYTES = 64 * 1024;
 const JOURNAL_FILE = "pilot-journal.jsonl";
 const directoryOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-const journalOpenFlags = constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY |
+const journalBaseOpenFlags = constants.O_APPEND | constants.O_WRONLY |
   constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const journalOpenFlags = journalBaseOpenFlags | constants.O_CREAT;
+const strictJournalCreateFlags = journalBaseOpenFlags | constants.O_CREAT | constants.O_EXCL;
 
 export interface JournalEvent {
   command: string;
@@ -61,6 +64,10 @@ export type SecureStateDirectoryInspection =
 
 function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
+}
+
+function isAlreadyExists(cause: unknown): cause is NodeJS.ErrnoException {
+  return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "EEXIST";
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -245,6 +252,12 @@ export interface JournalLineLabels {
   failed: string;
 }
 
+export interface BoundedJournalAppendOptions {
+  maximumLineBytes?: number;
+  strictExistingStateDirectory?: boolean;
+  strictExistingFileMode?: boolean;
+}
+
 /**
  * The one bounded, hardened append used by every journal stream. Streams
  * differ only in file name and message labels; the safety mechanics — line
@@ -259,21 +272,48 @@ export async function appendBoundedJournalLine(
   fileName: string,
   event: unknown,
   labels: JournalLineLabels,
+  options: BoundedJournalAppendOptions = {},
 ): Promise<void> {
   sensitiveData.assertSafe(event);
   const line = `${JSON.stringify(event)}\n`;
-  if (Buffer.byteLength(line, "utf8") > MAX_JOURNAL_LINE_BYTES) {
+  const maximumLineBytes = options.maximumLineBytes ?? MAX_JOURNAL_LINE_BYTES;
+  if (
+    !Number.isSafeInteger(maximumLineBytes)
+    || maximumLineBytes <= 0
+    || maximumLineBytes > MAX_CONFIGURABLE_JOURNAL_LINE_BYTES
+    || Buffer.byteLength(line, "utf8") > maximumLineBytes
+  ) {
     throw new ControlError("JOURNAL_EVENT_TOO_LARGE", labels.tooLarge);
   }
 
   let directory: SecureStateDirectory | undefined;
   try {
-    directory = await openSecureStateDirectory(stateDir, hooks);
-    const file = await directory.openFile(fileName, journalOpenFlags, 0o600);
+    directory = await openSecureStateDirectory(
+      stateDir,
+      hooks,
+      { strictExistingMode: options.strictExistingStateDirectory },
+    );
+    let created = false;
+    let file: FileHandle;
+    if (options.strictExistingFileMode) {
+      try {
+        file = await directory.openFile(fileName, strictJournalCreateFlags, 0o600);
+        created = true;
+      } catch (cause) {
+        if (!isAlreadyExists(cause)) throw cause;
+        file = await directory.openFile(fileName, journalBaseOpenFlags);
+      }
+    } else {
+      file = await directory.openFile(fileName, journalOpenFlags, 0o600);
+    }
     try {
       const info = await file.stat();
       if (!info.isFile() || info.nlink !== 1) throw unsafeStatePath();
-      await file.chmod(0o600);
+      if (options.strictExistingFileMode && !created) {
+        if ((info.mode & 0o777) !== 0o600) throw unsafeStatePath();
+      } else {
+        await file.chmod(0o600);
+      }
       // One bounded write on an O_APPEND descriptor preserves a complete
       // event line across concurrently finishing read-only invocations.
       const bytes = Buffer.from(line, "utf8");

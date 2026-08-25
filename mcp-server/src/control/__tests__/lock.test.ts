@@ -208,6 +208,22 @@ describe("callback mutation lock", () => {
     expect(seen.env).not.toHaveProperty("GH_REPO_TOKEN");
   });
 
+  it("preserves legacy Registry lock mode repair for an existing plain file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const lockPath = join(stateDir, "registry.lock");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(lockPath, "", { mode: 0o600 });
+    await chmod(lockPath, 0o644);
+    const runtime: MutationLockRuntime = { spawn: vi.fn(() => completedAcquisition(0)) };
+
+    await new MutationLock(configFor(stateDir), {}, runtime).run(async () => undefined);
+
+    expect((await lstat(lockPath)).mode & 0o777).toBe(0o600);
+    expect(runtime.spawn).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps registry.lock on the opened state-directory inode after an ancestor swap", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);

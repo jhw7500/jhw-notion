@@ -482,6 +482,8 @@ export class ProcessRunner {
 }
 
 const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW;
+const strictLockCreateFlags = lockOpenFlags | constants.O_EXCL;
+const existingLockOpenFlags = constants.O_RDWR | constants.O_NOFOLLOW;
 
 export interface MutationLockPort {
   run<T>(callback: () => Promise<T>): Promise<T>;
@@ -521,6 +523,8 @@ export interface MutationLockOptions {
   contendedReason?: ErrorReason;
   /** Refuse, rather than chmod-repair, an already-existing non-0700 state directory. */
   strictExistingStateDirectory?: boolean;
+  /** Refuse, rather than chmod-repair, an already-existing non-0600 lock file. */
+  strictExistingLockFileMode?: boolean;
 }
 
 function acquisitionFailure(status: number | null, contendedReason?: string): ControlError {
@@ -592,12 +596,32 @@ export class MutationLock implements MutationLockPort {
           this.secureDirectoryHooks,
           { strictExistingMode: this.options.strictExistingStateDirectory },
         );
-        lockFile = await directory.openFile(this.options.lockFileName ?? "registry.lock", lockOpenFlags, 0o600);
+        const lockFileName = this.options.lockFileName ?? "registry.lock";
+        let lockCreated = false;
+        if (this.options.strictExistingLockFileMode) {
+          try {
+            lockFile = await directory.openFile(lockFileName, strictLockCreateFlags, 0o600);
+            lockCreated = true;
+          } catch (cause) {
+            if (!(typeof cause === "object" && cause !== null && "code" in cause && cause.code === "EEXIST")) {
+              throw cause;
+            }
+            lockFile = await directory.openFile(lockFileName, existingLockOpenFlags);
+          }
+        } else {
+          lockFile = await directory.openFile(lockFileName, lockOpenFlags, 0o600);
+        }
         const info = await lockFile.stat();
         if (!info.isFile() || info.nlink !== 1) {
           throw new ControlError("UNSAFE_STATE_PATH", "Host lock is not a private single-link regular file");
         }
-        await lockFile.chmod(0o600);
+        if (this.options.strictExistingLockFileMode && !lockCreated) {
+          if ((info.mode & 0o777) !== 0o600) {
+            throw new ControlError("UNSAFE_STATE_PATH", "Host lock mode is not private");
+          }
+        } else {
+          await lockFile.chmod(0o600);
+        }
       } catch (cause) {
         if (cause instanceof ControlError && cause.code === "UNSAFE_STATE_PATH") throw cause;
         if (typeof cause === "object" && cause !== null && "code" in cause && (cause.code === "ELOOP" || cause.code === "ENOTDIR")) {

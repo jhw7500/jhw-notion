@@ -25,7 +25,7 @@ import {
   type SecureStateDirectory,
   type SecureStateDirectoryHooks,
 } from "./journal.js";
-import { MutationLock, type MutationLockRuntime } from "./process.js";
+import { isDirectMutationLock, MutationLock, type MutationLockRuntime } from "./process.js";
 import {
   GuardRequestSchema,
   GuardRequestStateSchema,
@@ -55,6 +55,17 @@ const keyCreateFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
   constants.O_NOFOLLOW;
 const EXACT_UNLOCK =
   /^\/jhw:unlock (req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
+const concreteStateDirectoryRun = MutationLock.prototype.runInStateDirectory;
+
+type GuardStateMutationRunner = <T>(callback: (directory: SecureStateDirectory) => Promise<T>) => Promise<T>;
+
+function captureGuardStateMutationRunner(lock: MutationLock): GuardStateMutationRunner {
+  if (!isDirectMutationLock(lock) || Object.getPrototypeOf(lock) !== MutationLock.prototype) {
+    throw new TypeError("Guard request state requires the concrete MutationLock implementation");
+  }
+  return <T>(callback: (directory: SecureStateDirectory) => Promise<T>) =>
+    concreteStateDirectoryRun.call(lock, callback) as Promise<T>;
+}
 
 export const GuardJournalWarning = "GUARD_JOURNAL_UNAVAILABLE" as const;
 export type GuardJournalWarning = typeof GuardJournalWarning;
@@ -277,6 +288,27 @@ async function readState(
   }
 }
 
+async function inspectExistingGuardLock(directory: SecureStateDirectory): Promise<void> {
+  let file: FileHandle | undefined;
+  try {
+    try {
+      file = await directory.openFile(GUARD_LOCK_FILE, readFlags);
+    } catch (cause) {
+      if (isErrno(cause, "ENOENT")) return;
+      throw cause;
+    }
+    const info = await file.stat();
+    if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o777) !== 0o600) {
+      throw unavailable();
+    }
+  } catch (cause) {
+    if (cause instanceof ControlError && cause.code === "GUARD_UNAVAILABLE") throw cause;
+    throw unavailable();
+  } finally {
+    await file?.close().catch(() => undefined);
+  }
+}
+
 async function writeState(
   directory: SecureStateDirectory,
   state: GuardRequestState,
@@ -359,7 +391,7 @@ export class GuardRequestStore {
   private readonly secureDirectoryHooks: SecureStateDirectoryHooks;
   private readonly sensitiveData: SensitiveDataPolicy;
   private readonly journal: GuardJournalPort;
-  private readonly lock: MutationLock;
+  readonly #runStateMutation: GuardStateMutationRunner;
 
   constructor(
     private readonly config: ControlConfig,
@@ -370,7 +402,7 @@ export class GuardRequestStore {
     this.secureDirectoryHooks = options.secureDirectoryHooks ?? {};
     this.sensitiveData = createSensitiveDataPolicy(environment, [config.stateDir]);
     this.journal = options.journal ?? new GuardJournal(config.stateDir, this.secureDirectoryHooks, this.sensitiveData);
-    this.lock = new MutationLock(
+    const lock = new MutationLock(
       config,
       environment,
       options.lockRuntime,
@@ -380,8 +412,10 @@ export class GuardRequestStore {
         waitSeconds: 5,
         contendedReason: "guard_state_lock",
         strictExistingStateDirectory: true,
+        strictExistingLockFileMode: true,
       },
     );
+    this.#runStateMutation = captureGuardStateMutationRunner(lock);
   }
 
   async inspect(): Promise<GuardRequestInspection> {
@@ -390,6 +424,7 @@ export class GuardRequestStore {
       const inspected = await inspectSecureStateDirectory(this.config.stateDir);
       if (inspected.status === "not_initialized") return { status: "not_initialized", requests: [] };
       directory = inspected.directory;
+      await inspectExistingGuardLock(directory);
       const loaded = await readState(directory, this.sensitiveData);
       return loaded.initialized
         ? { status: "ready", requests: loaded.state.requests }
@@ -561,7 +596,7 @@ export class GuardRequestStore {
   ): Promise<T & { journal_warning?: GuardJournalWarning }> {
     let committed: CommittedTransition<T> | undefined;
     try {
-      await this.lock.runInStateDirectory(async (directory) => {
+      await this.#runStateMutation(async (directory) => {
         const loaded = await readState(directory, this.sensitiveData);
         const now = Date.now();
         const cleanup = cleanupState(loaded.state, now);

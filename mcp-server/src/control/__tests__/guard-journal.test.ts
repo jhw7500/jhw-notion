@@ -1,4 +1,4 @@
-import { link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -38,6 +38,37 @@ function event(overrides: Partial<GuardJournalEvent> = {}): GuardJournalEvent {
     approval_expires_at: "2026-08-25T01:10:00.000Z",
     ...overrides,
   };
+}
+
+function maximumEvent(): GuardJournalEvent {
+  const maximumTimestamp = `2026-08-25T01:00:00.${"0".repeat(38)}+00:00`;
+  const requirements: NonNullable<GuardJournalEvent["requirements"]> = Array.from(
+    { length: 32 },
+    (_, index) => ({
+      capability: "tracker.mutate" as const,
+      resource: {
+        kind: "issue" as const,
+        id: `I_${"a".repeat(124)}${index.toString(16).padStart(2, "0")}`,
+      },
+    }),
+  );
+  return event({
+    origin_adapter: "opencode",
+    evaluation_stage: "execution",
+    event: "completed",
+    session_id: "\\".repeat(255),
+    operation_digest: "f".repeat(64),
+    requirements,
+    occurred_at: maximumTimestamp,
+    requested_at: maximumTimestamp,
+    approval_expires_at: maximumTimestamp,
+    approved_at: maximumTimestamp,
+    start_by: maximumTimestamp,
+    consumed_at: maximumTimestamp,
+    finished_at: maximumTimestamp,
+    decision_code: "GUARD_RESOURCE_AUTHORITY_UNAVAILABLE",
+    error_reason: "legacy_dirty_evidence_ambiguous",
+  });
 }
 
 describe("GuardJournal", () => {
@@ -84,6 +115,58 @@ describe("GuardJournal", () => {
     const path = join(stateDir, "guard-journal.jsonl");
     expect((await lstat(path)).mode & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(event());
+  });
+
+  it("appends the finite schema-valid maximum event without dropping canonical requirements", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const maximum = maximumEvent();
+
+    expect(GuardJournalEventSchema.safeParse(maximum).success).toBe(true);
+    expect(Buffer.byteLength(`${JSON.stringify(maximum)}\n`, "utf8")).toBe(7_843);
+    await expect(new GuardJournal(stateDir).append(maximum)).resolves.toBeUndefined();
+
+    const persisted = JSON.parse(await readFile(join(stateDir, "guard-journal.jsonl"), "utf8")) as GuardJournalEvent;
+    expect(persisted.requirements).toHaveLength(32);
+    expect(persisted).toEqual(maximum);
+  });
+
+  it("rejects an existing unsafe Guard journal directory without repairing its mode", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    await mkdir(stateDir, { mode: 0o700 });
+    await chmod(stateDir, 0o755);
+
+    await expect(new GuardJournal(stateDir).append(event())).rejects.toMatchObject({
+      code: "GUARD_JOURNAL_UNAVAILABLE",
+    });
+
+    expect((await lstat(stateDir)).mode & 0o777).toBe(0o755);
+    await expect(lstat(join(stateDir, "guard-journal.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects an existing unsafe Guard journal file without chmod, append, or sync", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const journalPath = join(stateDir, "guard-journal.jsonl");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(journalPath, "existing\n", { mode: 0o600 });
+    await chmod(journalPath, 0o644);
+    const before = await lstat(journalPath);
+    let synced = false;
+
+    await expect(new GuardJournal(stateDir, {
+      afterJournalSync: () => { synced = true; },
+    }).append(event())).rejects.toMatchObject({ code: "GUARD_JOURNAL_UNAVAILABLE" });
+
+    const after = await lstat(journalPath);
+    expect(after.mode & 0o777).toBe(0o644);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(await readFile(journalPath, "utf8")).toBe("existing\n");
+    expect(synced).toBe(false);
   });
 
   it.each([

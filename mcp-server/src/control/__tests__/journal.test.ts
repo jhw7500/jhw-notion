@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { PilotJournal } from "../journal.js";
+import { appendBoundedJournalLine, PilotJournal } from "../journal.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const roots: string[] = [];
@@ -53,6 +53,62 @@ describe("PilotJournal", () => {
 
     expect((await lstat(stateDir)).mode & 0o777).toBe(0o700);
     expect((await lstat(join(stateDir, "pilot-journal.jsonl"))).mode & 0o777).toBe(0o600);
+  });
+
+  it("preserves legacy Pilot journal mode repair for an existing plain file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const journalPath = join(stateDir, "pilot-journal.jsonl");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(journalPath, `${JSON.stringify(event())}\n`, { mode: 0o600 });
+    await chmod(journalPath, 0o644);
+
+    await new PilotJournal(stateDir).append(event());
+
+    expect((await lstat(journalPath)).mode & 0o777).toBe(0o600);
+    expect((await readFile(journalPath, "utf8")).trim().split("\n")).toHaveLength(2);
+  });
+
+  it("keeps the legacy 4096-byte default while allowing a finite caller-specific journal bound", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-journal-bound-"));
+    roots.push(root);
+    const defaultState = join(root, "default-state");
+    const widerState = join(root, "wider-state");
+    const oversizedForLegacy = { value: "x".repeat(5_000) };
+    const labels = { tooLarge: "too large", incomplete: "incomplete", failed: "failed" };
+    const policy = createSensitiveDataPolicy({});
+
+    await expect(appendBoundedJournalLine(
+      defaultState,
+      {},
+      policy,
+      "default.jsonl",
+      oversizedForLegacy,
+      labels,
+    )).rejects.toMatchObject({ code: "JOURNAL_EVENT_TOO_LARGE" });
+    await expect(appendBoundedJournalLine(
+      widerState,
+      {},
+      policy,
+      "wider.jsonl",
+      oversizedForLegacy,
+      labels,
+      { maximumLineBytes: 8 * 1_024 },
+    )).resolves.toBeUndefined();
+    await expect(appendBoundedJournalLine(
+      join(root, "above-state"),
+      {},
+      policy,
+      "above.jsonl",
+      { value: "x".repeat(8 * 1_024) },
+      labels,
+      { maximumLineBytes: 8 * 1_024 },
+    )).rejects.toMatchObject({ code: "JOURNAL_EVENT_TOO_LARGE" });
+
+    await expect(lstat(defaultState)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(JSON.parse(await readFile(join(widerState, "wider.jsonl"), "utf8")))
+      .toEqual(oversizedForLegacy);
   });
 
   it("rejects a symbolic-link state directory ancestor without touching its target", async () => {
