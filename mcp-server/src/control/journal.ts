@@ -55,6 +55,10 @@ export interface SecureStateDirectory {
   close(): Promise<void>;
 }
 
+export type SecureStateDirectoryInspection =
+  | { status: "not_initialized" }
+  | { status: "ready"; directory: SecureStateDirectory };
+
 function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
 }
@@ -72,14 +76,16 @@ function safeStateFileName(name: string): boolean {
   return name.length > 0 && name !== "." && name !== ".." && !name.includes("/") && !name.includes("\\");
 }
 
-async function secureDirectoryAt(path: string): Promise<void> {
+async function secureDirectoryAt(path: string): Promise<boolean> {
   let info;
+  let created = false;
   try {
     info = await lstat(path);
   } catch (cause) {
     if (!isNotFound(cause)) throw cause;
     try {
       await mkdir(path, { mode: 0o700 });
+      created = true;
     } catch (mkdirCause) {
       if (!isNotFound(mkdirCause) && !(typeof mkdirCause === "object" && mkdirCause !== null && "code" in mkdirCause && mkdirCause.code === "EEXIST")) {
         throw mkdirCause;
@@ -88,6 +94,19 @@ async function secureDirectoryAt(path: string): Promise<void> {
     info = await lstat(path);
   }
   if (info.isSymbolicLink() || !info.isDirectory()) throw unsafeStatePath();
+  return created;
+}
+
+async function existingDirectoryAt(path: string): Promise<"ready" | "not_initialized"> {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (cause) {
+    if (isNotFound(cause)) return "not_initialized";
+    throw unsafeStatePath();
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) throw unsafeStatePath();
+  return "ready";
 }
 
 class AnchoredStateDirectory implements SecureStateDirectory {
@@ -135,6 +154,7 @@ class AnchoredStateDirectory implements SecureStateDirectory {
 export async function openSecureStateDirectory(
   stateDir: string,
   hooks: SecureStateDirectoryHooks = {},
+  options: { strictExistingMode?: boolean } = {},
 ): Promise<SecureStateDirectory> {
   if (!isAbsolute(stateDir)) throw unsafeStatePath();
   const root = parse(resolve(stateDir)).root;
@@ -144,9 +164,11 @@ export async function openSecureStateDirectory(
   if (target === root) throw unsafeStatePath();
   const components = relative(root, target).split(sep).filter(Boolean);
   let current = root;
+  let targetCreated = false;
   for (const component of components) {
     current = join(current, component);
-    await secureDirectoryAt(current);
+    const created = await secureDirectoryAt(current);
+    if (current === target) targetCreated = created;
   }
   if (!isWithin(target, join(target, JOURNAL_FILE))) throw unsafeStatePath();
 
@@ -159,12 +181,59 @@ export async function openSecureStateDirectory(
   try {
     const info = await handle.stat();
     if (!info.isDirectory()) throw unsafeStatePath();
-    await handle.chmod(0o700);
+    if (options.strictExistingMode && !targetCreated) {
+      if ((info.mode & 0o777) !== 0o700) throw unsafeStatePath();
+    } else {
+      await handle.chmod(0o700);
+    }
     const directory = new AnchoredStateDirectory(target, handle);
     await hooks.afterDirectoryOpen?.(directory);
     return directory;
   } catch (cause) {
     await handle.close();
+    if (cause instanceof ControlError) throw cause;
+    throw unsafeStatePath();
+  }
+}
+
+/**
+ * Strict diagnostic counterpart to `openSecureStateDirectory`. It opens an
+ * already-initialized private directory through the same retained descriptor,
+ * but never creates a component, chmods it, acquires a lock, or rewrites state.
+ * Missing state is a safe bootstrap condition; an existing unsafe path is not.
+ */
+export async function inspectSecureStateDirectory(
+  stateDir: string,
+  hooks: SecureStateDirectoryHooks = {},
+): Promise<SecureStateDirectoryInspection> {
+  if (!isAbsolute(stateDir)) throw unsafeStatePath();
+  const root = parse(resolve(stateDir)).root;
+  const target = resolve(stateDir);
+  if (target === root) throw unsafeStatePath();
+  const components = relative(root, target).split(sep).filter(Boolean);
+  let current = root;
+  for (const component of components) {
+    current = join(current, component);
+    if (await existingDirectoryAt(current) === "not_initialized") {
+      return { status: "not_initialized" };
+    }
+  }
+
+  let handle: FileHandle;
+  try {
+    handle = await open(target, directoryOpenFlags);
+  } catch (cause) {
+    if (isNotFound(cause)) return { status: "not_initialized" };
+    throw unsafeStatePath();
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isDirectory() || (info.mode & 0o777) !== 0o700) throw unsafeStatePath();
+    const directory = new AnchoredStateDirectory(target, handle);
+    await hooks.afterDirectoryOpen?.(directory);
+    return { status: "ready", directory };
+  } catch (cause) {
+    await handle.close().catch(() => undefined);
     if (cause instanceof ControlError) throw cause;
     throw unsafeStatePath();
   }

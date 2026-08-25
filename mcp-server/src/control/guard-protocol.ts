@@ -228,6 +228,20 @@ export type OperationRequirement = z.output<typeof OperationRequirementSchema>;
 const requirementKey = (requirement: OperationRequirement): string =>
   `${requirement.capability}\u0000${requirement.resource.kind}\u0000${requirement.resource.id}`;
 
+export const CanonicalOperationRequirementsSchema = z.array(OperationRequirementSchema)
+  .min(1)
+  .max(32)
+  .superRefine((requirements, context) => {
+    const keys = requirements.map(requirementKey);
+    if (new Set(keys).size !== keys.length) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Duplicate operation requirement" });
+    }
+    const sorted = [...keys].sort();
+    if (keys.some((key, index) => key !== sorted[index])) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Operation requirements are not canonical" });
+    }
+  });
+
 export const CanonicalOperationSchema = z.object({
   protocol_version: z.literal(GuardProtocolVersion),
   operation_id: OperationIdSchema,
@@ -238,20 +252,11 @@ export const CanonicalOperationSchema = z.object({
   claim_id: ClaimIdSchema,
   cwd_worktree_ref: GuardWorktreeRefSchema,
   tool: z.string().min(1).max(64).regex(/^[a-z][a-z0-9._-]{0,63}$/),
-  requirements: z.array(OperationRequirementSchema).min(1).max(32),
+  requirements: CanonicalOperationRequirementsSchema,
   risk: z.enum(["low", "medium", "high"]),
   execution_boundary: z.enum(["hook", "guarded_command", "tracker", "notion", "board"]),
   summary: boundedCoordinate(512),
   digest: z.string().regex(/^[0-9a-f]{64}$/),
-}).strict().superRefine((operation, context) => {
-  const keys = operation.requirements.map(requirementKey);
-  if (new Set(keys).size !== keys.length) {
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ["requirements"], message: "Duplicate operation requirement" });
-  }
-  const sorted = [...keys].sort();
-  if (keys.some((key, index) => key !== sorted[index])) {
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ["requirements"], message: "Operation requirements are not canonical" });
-  }
-});
+}).strict();
 export type CanonicalOperationInput = z.input<typeof CanonicalOperationSchema>;
 export type CanonicalOperation = z.output<typeof CanonicalOperationSchema>;

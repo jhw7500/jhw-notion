@@ -1,6 +1,14 @@
 import { z } from "zod";
 
-import { GuardAdapterSchema, OperationIdSchema, RequestIdSchema } from "./guard-protocol.js";
+import {
+  ClaimIdSchema,
+  GuardAdapterSchema,
+  GuardSessionSchema,
+  GuardWorktreeRefSchema,
+  OperationIdSchema,
+  CanonicalOperationRequirementsSchema,
+  RequestIdSchema,
+} from "./guard-protocol.js";
 import { normalizeWorkContract, TaskIdSchema, WorkContractSchema, workContractDigest } from "./work-contract.js";
 
 export { TaskIdSchema } from "./work-contract.js";
@@ -296,6 +304,8 @@ export const ERROR_REASONS = [
   "live_pid_recorded",
   // LOCK_CONTENDED — boards.lock, distinguished from registry.lock contention.
   "board_state_lock",
+  // LOCK_CONTENDED — the independent one-time Guard request state lock.
+  "guard_state_lock",
 ] as const;
 export const ErrorReasonSchema = z.enum(ERROR_REASONS);
 export type ErrorReason = z.infer<typeof ErrorReasonSchema>;
@@ -325,6 +335,121 @@ export type GuardEvaluationMode = z.infer<typeof GuardEvaluationModeSchema>;
 
 export const GuardSummarySchema = boundedCoordinate(512);
 export const GuardExecutionBoundarySchema = z.enum(["hook", "guarded_command", "tracker", "notion", "board"]);
+
+export const GuardRequestLifecycleSchema = z.enum([
+  "PENDING",
+  "APPROVED",
+  "CONSUMED",
+  "COMPLETED",
+  "FAILED",
+  "EXPIRED",
+]);
+export type GuardRequestLifecycle = z.infer<typeof GuardRequestLifecycleSchema>;
+export const GUARD_REQUEST_TTL_MS = 10 * 60 * 1_000;
+
+/** Exact private permit binding and lifecycle metadata; no transport payloads. */
+export const GuardRequestSchema = z.object({
+  request_id: RequestIdSchema,
+  state: GuardRequestLifecycleSchema,
+  origin_adapter: GuardAdapterSchema,
+  session_id: GuardSessionSchema,
+  task_id: TaskIdSchema,
+  claim_id: ClaimIdSchema,
+  cwd_worktree_ref: GuardWorktreeRefSchema,
+  requirements: CanonicalOperationRequirementsSchema,
+  operation_digest: z.string().regex(/^[0-9a-f]{64}$/),
+  summary: GuardSummarySchema,
+  requested_at: OffsetDateTimeSchema,
+  approval_expires_at: OffsetDateTimeSchema,
+  approved_at: OffsetDateTimeSchema.optional(),
+  start_by: OffsetDateTimeSchema.optional(),
+  consumed_at: OffsetDateTimeSchema.optional(),
+  finished_at: OffsetDateTimeSchema.optional(),
+  correlation_id: boundedCoordinate(255).optional(),
+}).strict().superRefine((request, context) => {
+  const requestedAt = Date.parse(request.requested_at);
+  const approvalExpiresAt = Date.parse(request.approval_expires_at);
+  if (approvalExpiresAt !== requestedAt + GUARD_REQUEST_TTL_MS) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["approval_expires_at"], message: "Approval deadline is not exactly ten minutes" });
+  }
+  const approved = request.approved_at !== undefined && request.start_by !== undefined;
+  if ((request.approved_at !== undefined) !== (request.start_by !== undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["approved_at"], message: "Approval timestamps are atomic" });
+  }
+  if (["APPROVED", "CONSUMED", "COMPLETED", "FAILED"].includes(request.state) && !approved) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["approved_at"], message: "Approved lifecycle requires approval timestamps" });
+  }
+  if (approved) {
+    const approvedAt = Date.parse(request.approved_at as string);
+    const startBy = Date.parse(request.start_by as string);
+    if (approvedAt < requestedAt || approvedAt >= approvalExpiresAt) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["approved_at"], message: "Approval timestamp is outside its pending window" });
+    }
+    if (startBy !== approvedAt + GUARD_REQUEST_TTL_MS) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["start_by"], message: "Start deadline is not exactly ten minutes" });
+    }
+  }
+  const consumed = request.consumed_at !== undefined && request.correlation_id !== undefined;
+  if ((request.consumed_at !== undefined) !== (request.correlation_id !== undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["consumed_at"], message: "Consumption coordinates are atomic" });
+  }
+  if (["CONSUMED", "COMPLETED", "FAILED"].includes(request.state) && !consumed) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["consumed_at"], message: "Consumed lifecycle requires correlation" });
+  }
+  if (consumed && approved) {
+    const consumedAt = Date.parse(request.consumed_at as string);
+    if (consumedAt < Date.parse(request.approved_at as string) || consumedAt >= Date.parse(request.start_by as string)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["consumed_at"], message: "Consumption timestamp is outside its approved window" });
+    }
+  }
+  if (["COMPLETED", "FAILED", "EXPIRED"].includes(request.state) !== (request.finished_at !== undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["finished_at"], message: "Terminal lifecycle requires one finish timestamp" });
+  }
+  if (request.state === "PENDING" && (approved || consumed)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["state"], message: "Pending request carries later lifecycle fields" });
+  }
+  if (request.state === "APPROVED" && consumed) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["state"], message: "Approved request carries consumption fields" });
+  }
+  if (request.state === "EXPIRED" && consumed) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["state"], message: "Expired request carries consumption fields" });
+  }
+  if (request.finished_at !== undefined) {
+    const finishedAt = Date.parse(request.finished_at);
+    const earliest = request.state === "EXPIRED"
+      ? Date.parse(request.start_by ?? request.approval_expires_at)
+      : Date.parse(request.consumed_at as string);
+    if (finishedAt < earliest) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["finished_at"], message: "Finish timestamp precedes its terminal boundary" });
+    }
+  }
+});
+export type GuardRequest = z.infer<typeof GuardRequestSchema>;
+
+export const GuardRequestStateSchema = z.object({
+  version: z.literal(1),
+  requests: z.array(GuardRequestSchema)
+    .refine((requests) => new Set(requests.map((request) => request.request_id)).size === requests.length, "Duplicate Guard request ID")
+    .refine((requests) => {
+      const correlations = requests.flatMap((request) => request.correlation_id === undefined ? [] : [request.correlation_id]);
+      return new Set(correlations).size === correlations.length;
+    }, "Duplicate Guard correlation ID")
+    .refine((requests) => {
+      const liveBindings = requests
+        .filter((request) => request.state === "PENDING" || request.state === "APPROVED" || request.state === "CONSUMED")
+        .map((request) => JSON.stringify([
+          request.task_id,
+          request.claim_id,
+          request.origin_adapter,
+          request.session_id,
+          request.cwd_worktree_ref,
+          request.requirements,
+          request.operation_digest,
+        ]));
+      return new Set(liveBindings).size === liveBindings.length;
+    }, "Duplicate live Guard operation binding"),
+}).strict();
+export type GuardRequestState = z.infer<typeof GuardRequestStateSchema>;
 
 const GuardAllowDecisionSchema = z.object({
   decision: z.literal("ALLOW"),

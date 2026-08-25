@@ -519,6 +519,8 @@ export interface MutationLockOptions {
    * emission — exactly the regression the vocabulary closure exists to block.
    */
   contendedReason?: ErrorReason;
+  /** Refuse, rather than chmod-repair, an already-existing non-0700 state directory. */
+  strictExistingStateDirectory?: boolean;
 }
 
 function acquisitionFailure(status: number | null, contendedReason?: string): ControlError {
@@ -572,11 +574,24 @@ export class MutationLock implements MutationLockPort {
   }
 
   async run<T>(callback: () => Promise<T>): Promise<T> {
+    return this.#runLocked(async () => callback());
+  }
+
+  /** Runs against the exact retained directory inode whose child lock FD is flocked. */
+  async runInStateDirectory<T>(callback: (directory: SecureStateDirectory) => Promise<T>): Promise<T> {
+    return this.#runLocked(callback);
+  }
+
+  async #runLocked<T>(callback: (directory: SecureStateDirectory) => Promise<T>): Promise<T> {
     let directory: SecureStateDirectory | undefined;
     let lockFile: FileHandle | undefined;
     try {
       try {
-        directory = await openSecureStateDirectory(this.config.stateDir, this.secureDirectoryHooks);
+        directory = await openSecureStateDirectory(
+          this.config.stateDir,
+          this.secureDirectoryHooks,
+          { strictExistingMode: this.options.strictExistingStateDirectory },
+        );
         lockFile = await directory.openFile(this.options.lockFileName ?? "registry.lock", lockOpenFlags, 0o600);
         const info = await lockFile.stat();
         if (!info.isFile() || info.nlink !== 1) {
@@ -615,7 +630,7 @@ export class MutationLock implements MutationLockPort {
         wait === undefined ? LOCK_HELPER_TIMEOUT_MS : Math.max(LOCK_HELPER_TIMEOUT_MS, (wait + 2) * 1000),
         this.options.contendedReason,
       );
-      return await callback();
+      return await callback(directory);
     } finally {
       await lockFile?.close();
       await directory?.close();

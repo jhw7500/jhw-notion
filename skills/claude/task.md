@@ -252,6 +252,7 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 
 ## 결과 해석
 
+- Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
 - exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.
 - exit `75`: Registry dirty/diverged 또는 lock contention/acquisition timeout. stop; 자동 retry/rebase/force 금지. Lock helper spawn/setup/acquire 실패는 일반 command `1`, preflight NO-GO `78`이다.

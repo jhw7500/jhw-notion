@@ -55,6 +55,20 @@ afterEach(async () => {
 });
 
 describe("callback mutation lock", () => {
+  it("keeps the verified run path independent of an instance override of the Guard directory callback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const runtime: MutationLockRuntime = { spawn: vi.fn(() => completedAcquisition(0)) };
+    const lock = new MutationLock(configFor(join(root, "state")), {}, runtime);
+    (lock as unknown as { runInStateDirectory: (callback: () => Promise<string>) => Promise<string> })
+      .runInStateDirectory = vi.fn(async () => "forged");
+    const callback = vi.fn(async () => "authoritative");
+
+    await expect(lock.run(callback)).resolves.toBe("authoritative");
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(runtime.spawn).toHaveBeenCalledTimes(1);
+  });
+
   it("runs the callback only after one credential-free acquisition and ignores a caller marker", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);

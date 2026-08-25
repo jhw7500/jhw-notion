@@ -38,6 +38,15 @@ describe("error reason vocabulary", () => {
     for (const literal of found) expect(ERROR_REASONS).toContain(literal);
   });
 
+  it("binds the Guard state-lock source literal to vocabulary and operator documentation", () => {
+    const source = readFileSync(join(controlDir, "guard-state.ts"), "utf8");
+    const doc = readFileSync(join(repositoryRoot, "skills", "claude", "task.md"), "utf8");
+
+    expect(source).toContain('contendedReason: "guard_state_lock"');
+    expect(ERROR_REASONS).toContain("guard_state_lock");
+    expect(doc).toContain("`guard_state_lock`");
+  });
+
   it("documents every registered reason where the operator is told to read it", () => {
     // The operator docs are the skill files; every axis must be named in at
     // least one of them, not necessarily in task.md specifically.
