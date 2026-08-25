@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, readdir, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -83,6 +83,11 @@ export interface GuardRegistryViewPort {
   committedViewIsStale(): Promise<boolean>;
 }
 
+/** Task 4 must bind this to the same host MutationLock used by Registry writers. */
+export interface GuardRegistryMutationBarrierPort {
+  run<T>(read: () => Promise<T>): Promise<T>;
+}
+
 export interface GuardTaskServicePort {
   getTask(taskId: string): Promise<TaskRecord>;
   inspectForGuard(taskId: string, claimId: string): Promise<GuardTaskInspection>;
@@ -136,6 +141,7 @@ export interface GuardServiceOptions {
   tasks: GuardTaskServicePort;
   authority: GuardContractAuthorityPort;
   registry_view: GuardRegistryViewPort;
+  registry_mutation_barrier: GuardRegistryMutationBarrierPort;
   permit_decisions?: GuardPermitDecisionPort;
   mode?: GuardEvaluationMode;
   /** Strict read-only inspection seam. It must never create, clean, or lock state. */
@@ -166,7 +172,6 @@ const hardObserveCodes = new Set<GuardDenyCode>([
   "GUARD_SELF_APPROVAL_DENIED",
 ]);
 
-const exactClaimFreeFileTools = new Set(["Read", "Glob", "Grep"]);
 const fileModifyTools = new Set([
   "edit", "edit_file", "write", "write_file", "notebookedit", "notebook_edit", "apply_patch", "functions_apply_patch",
 ]);
@@ -212,7 +217,6 @@ function notionDatabaseFrom(event: PreToolUseEvent): NormalizeOperationContext["
 const exactClaimFreeShellTools = new Set(["Bash", "exec_command"]);
 const runFile = promisify(execFile);
 const sensitiveReadComponent = /^(?:\.env(?:\..*)?|\.git|\.netrc|\.npmrc|\.pypirc|credentials?|secrets?|tokens?|id_rsa|id_ed25519)$/iu;
-const maximumClaimFreeEntries = 10_000;
 
 function exactKeys(input: Record<string, unknown>, allowed: readonly string[]): boolean {
   return Object.keys(input).every((key) => allowed.includes(key));
@@ -270,60 +274,6 @@ async function noFollowEntry(root: string, rawPath: string): Promise<{ path: str
   return undefined;
 }
 
-function boundedGlobPattern(pattern: unknown): pattern is string {
-  return typeof pattern === "string" && pattern.length > 0 && Buffer.byteLength(pattern, "utf8") <= 512 &&
-    !isAbsolute(pattern) && !pattern.includes("\\") && !/[\u0000\r\n{}[\]]/u.test(pattern) &&
-    !pattern.split("/").some((component) => !component || component === "." || component === ".." ||
-      (!/[?*]/u.test(component) && sensitiveReadComponent.test(component)));
-}
-
-function globPatternRegex(pattern: string): RegExp | undefined {
-  let encoded = "^";
-  for (let index = 0; index < pattern.length; index += 1) {
-    const character = pattern[index] as string;
-    if (character === "*") {
-      if (pattern[index + 1] === "*") {
-        encoded += ".*";
-        index += 1;
-      } else encoded += "[^/]*";
-    } else if (character === "?") encoded += "[^/]";
-    else encoded += character.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  }
-  try {
-    return new RegExp(`${encoded}$`, "u");
-  } catch {
-    return undefined;
-  }
-}
-
-async function safeTree(root: string, pattern?: RegExp): Promise<boolean> {
-  const pending: Array<{ absolute: string; relative: string }> = [{ absolute: root, relative: "" }];
-  let inspected = 0;
-  while (pending.length > 0) {
-    const current = pending.pop() as { absolute: string; relative: string };
-    let entries;
-    try {
-      entries = await readdir(current.absolute, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    for (const entry of entries) {
-      if (++inspected > maximumClaimFreeEntries) return false;
-      const childRelative = current.relative ? `${current.relative}/${entry.name}` : entry.name;
-      const selected = pattern === undefined || pattern.test(childRelative);
-      if (selected && (entry.isSymbolicLink() || sensitiveReadComponent.test(entry.name))) return false;
-      if (entry.isDirectory() && !entry.isSymbolicLink()) {
-        if (sensitiveReadComponent.test(entry.name)) {
-          if (selected || pattern === undefined) return false;
-          continue;
-        }
-        pending.push({ absolute: resolve(current.absolute, entry.name), relative: childRelative });
-      } else if (!entry.isFile() && selected) return false;
-    }
-  }
-  return true;
-}
-
 async function claimFreeReadSummary(
   event: PreToolUseEvent,
 ): Promise<"Local repository read" | "Local repository status" | undefined> {
@@ -335,29 +285,11 @@ async function claimFreeReadSummary(
     if (!exactKeys(input, ["command"]) || typeof input.command !== "string") return undefined;
     return claimFreeStatusCommands.has(input.command) ? "Local repository status" : undefined;
   }
-  if (!exactClaimFreeFileTools.has(event.tool_name)) return undefined;
-  if (event.tool_name === "Read") {
-    if (!exactKeys(input, ["file_path", "offset", "limit"]) || typeof input.file_path !== "string") return undefined;
-    if (input.offset !== undefined && (!Number.isSafeInteger(input.offset) || (input.offset as number) < 1)) return undefined;
-    if (input.limit !== undefined && (!Number.isSafeInteger(input.limit) || (input.limit as number) < 1 || (input.limit as number) > 100_000)) return undefined;
-    return (await noFollowEntry(root, input.file_path))?.kind === "file" ? "Local repository read" : undefined;
-  }
-  if (event.tool_name === "Glob") {
-    if (!exactKeys(input, ["pattern", "path"]) || !boundedGlobPattern(input.pattern)) return undefined;
-    const rawPath = input.path === undefined ? "." : input.path;
-    if (typeof rawPath !== "string") return undefined;
-    const target = await noFollowEntry(root, rawPath);
-    const pattern = globPatternRegex(input.pattern);
-    return target?.kind === "directory" && pattern && await safeTree(target.path, pattern)
-      ? "Local repository read" : undefined;
-  }
-  if (!exactKeys(input, ["pattern", "path"]) || typeof input.pattern !== "string" ||
-    input.pattern.length === 0 || Buffer.byteLength(input.pattern, "utf8") > 4_096 || typeof input.path !== "string") {
-    return undefined;
-  }
-  const target = await noFollowEntry(root, input.path);
-  if (!target) return undefined;
-  return target.kind === "file" || await safeTree(target.path) ? "Local repository read" : undefined;
+  if (event.tool_name !== "Read") return undefined;
+  if (!exactKeys(input, ["file_path", "offset", "limit"]) || typeof input.file_path !== "string") return undefined;
+  if (input.offset !== undefined && (!Number.isSafeInteger(input.offset) || (input.offset as number) < 1)) return undefined;
+  if (input.limit !== undefined && (!Number.isSafeInteger(input.limit) || (input.limit as number) < 1 || (input.limit as number) > 100_000)) return undefined;
+  return (await noFollowEntry(root, input.file_path))?.kind === "file" ? "Local repository read" : undefined;
 }
 
 function isWithin(root: string, target: string): boolean {
@@ -562,15 +494,18 @@ export class GuardService {
       });
     }
 
-    if (!this.options.registry_view) return this.deny("GUARD_UNAVAILABLE");
+    if (!this.options.registry_view || !this.options.registry_mutation_barrier) {
+      return this.deny("GUARD_UNAVAILABLE");
+    }
     try {
-      return await this.options.registry_view.withCommittedView(async () => {
-        const decision = await this.evaluatePinned(event);
-        if (await this.options.registry_view.committedViewIsStale()) {
-          return this.deny("GUARD_UNAVAILABLE");
-        }
-        return decision;
-      });
+      return await this.options.registry_mutation_barrier.run(() =>
+        this.options.registry_view.withCommittedView(async () => {
+          const decision = await this.evaluatePinned(event);
+          if (await this.options.registry_view.committedViewIsStale()) {
+            return this.deny("GUARD_UNAVAILABLE");
+          }
+          return decision;
+        }));
     } catch {
       return this.deny("GUARD_UNAVAILABLE");
     }

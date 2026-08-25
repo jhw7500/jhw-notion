@@ -119,6 +119,7 @@ interface Fixture {
   activeClaims: ActiveClaim[];
   inspection: WorktreeInspection;
   permitCalls: number;
+  barrierCalls: number;
   claimLookups: number;
   authorityCalls: number;
   authorityFailure?: Error;
@@ -159,6 +160,7 @@ describe("GuardService", () => {
       activeClaims: [currentClaim],
       inspection,
       permitCalls: 0,
+      barrierCalls: 0,
       claimLookups: 0,
       authorityCalls: 0,
       permit: {
@@ -212,6 +214,12 @@ describe("GuardService", () => {
           registry_view: {
             withCommittedView: async <T>(read: () => Promise<T>) => read(),
             committedViewIsStale: async () => false,
+          },
+          registry_mutation_barrier: {
+            run: async <T>(read: () => Promise<T>) => {
+              fixture.barrierCalls += 1;
+              return read();
+            },
           },
         };
         return { ...base, ...overrides };
@@ -276,6 +284,43 @@ describe("GuardService", () => {
         code: "GUARD_CLAIM_REQUIRED",
       });
     }
+  });
+
+  it("fails closed for unproved native Glob and Grep match sets while retaining an exact nested Read", async () => {
+    fixture.currentClaim = undefined;
+    fixture.activeClaims = [];
+    await writeFile(join(fixture.root, ".env"), "bounded fixture\n", "utf8");
+    await writeFile(join(fixture.root, "credentials"), "bounded fixture\n", "utf8");
+    await writeFile(join(fixture.root, ".notes"), "bounded fixture\n", "utf8");
+    await mkdir(join(fixture.root, "nested"));
+    await writeFile(join(fixture.root, "nested", "inside.ts"), "safe\n", "utf8");
+    await symlink(join(fixture.cwd, "file.ts"), join(fixture.root, "root-link"));
+
+    for (const event of [
+      preTool(fixture.cwd, "Glob", { pattern: "**/*", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: "root-link", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: ".env", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: "credentials", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: ".*", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: "nested/*.ts", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: "*.ts", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: "{src,nested}/*.ts", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: "@(src|nested)/*.ts", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: "[a-z]*.ts", path: "." }),
+      preTool(fixture.cwd, "Glob", { pattern: "nested\\*.ts", path: "." }),
+      preTool(fixture.cwd, "Grep", { pattern: "safe", path: "nested" }),
+    ]) {
+      await expect(fixture.service().evaluatePreTool(event)).resolves.toMatchObject({
+        decision: "DENY",
+        code: "GUARD_CLAIM_REQUIRED",
+      });
+    }
+
+    await expect(fixture.service().evaluatePreTool(preTool(
+      fixture.cwd,
+      "Read",
+      { file_path: "nested/inside.ts" },
+    ))).resolves.toMatchObject({ decision: "ALLOW", summary: "Local repository read" });
   });
 
   it("requires a trusted local Git cwd even for an exact Claim-free status command", async () => {
@@ -479,6 +524,84 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
+  it("fails closed before permit evaluation when the Registry mutation barrier is absent", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const { registry_mutation_barrier: _barrier, ...withoutBarrier } = fixture.options();
+
+    await expect(new GuardService(withoutBarrier as GuardServiceOptions).evaluatePreTool(preTool(fixture.cwd)))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("fails closed before permit evaluation when the Registry mutation barrier throws", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    await expect(fixture.service({
+      registry_mutation_barrier: {
+        run: async () => { throw new Error("bounded barrier failure"); },
+      },
+    }).evaluatePreTool(preTool(fixture.cwd)))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it.each(["before", "during"] as const)(
+    "queues a cooperating Registry writer %s the permit seam until the decision is stable",
+    async (timing) => {
+      fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+      fixture.currentTask = taskWith(fixture.currentContract);
+      fixture.currentClaim = activeClaim(fixture.currentContract);
+      fixture.activeClaims = [fixture.currentClaim];
+      let barrierHeld = false;
+      let writerQueued = false;
+      let registryMoved = false;
+      const attemptRegistryWrite = (): void => {
+        if (barrierHeld) writerQueued = true;
+        else registryMoved = true;
+      };
+      const basePermit = fixture.permit as GuardPermitDecisionPort;
+
+      const result = await fixture.service({
+        registry_view: {
+          withCommittedView: async <T>(read: () => Promise<T>) => read(),
+          committedViewIsStale: async () => registryMoved,
+        },
+        registry_mutation_barrier: {
+          run: async <T>(read: () => Promise<T>) => {
+            barrierHeld = true;
+            try {
+              return await read();
+            } finally {
+              barrierHeld = false;
+              if (writerQueued) registryMoved = true;
+            }
+          },
+        },
+        authority: {
+          assertKnownRequirement: async () => {
+            if (timing === "before") attemptRegistryWrite();
+          },
+        },
+        permit_decisions: {
+          decideMissingGrant: async (operation, missing) => {
+            if (timing === "during") attemptRegistryWrite();
+            return basePermit.decideMissingGrant(operation, missing);
+          },
+        },
+      }).evaluatePreTool(preTool(fixture.cwd));
+
+      expect(result).toMatchObject({ decision: "PERMIT_REQUIRED", request_id: REQUEST_ID });
+      expect(registryMoved).toBe(true);
+      expect(fixture.permitCalls).toBe(1);
+    },
+  );
+
   it("uses only the injected lifecycle seam for an exact missing grant", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
@@ -493,6 +616,7 @@ describe("GuardService", () => {
       approval_command: `/jhw:unlock ${REQUEST_ID}`,
     });
     expect(fixture.permitCalls).toBe(1);
+    expect(fixture.barrierCalls).toBe(1);
   });
 
   it("accepts only an exact private permit binding and constructs public metadata itself", async () => {
@@ -724,6 +848,7 @@ describe("GuardService", () => {
       observed_decision: "PERMIT_REQUIRED",
     });
     expect(fixture.permitCalls).toBe(0);
+    expect(fixture.barrierCalls).toBe(1);
   });
 
   it.each([
