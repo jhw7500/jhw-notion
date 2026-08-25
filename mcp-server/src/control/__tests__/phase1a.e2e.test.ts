@@ -643,6 +643,71 @@ describe("Phase 1A deterministic adversarial gate", () => {
     });
   });
 
+  it("4b. sibling child Tasks share one repository through isolated Claims and worktrees", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const sharedRepositoryGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-control" },
+      coordination: "shared" as const,
+    };
+    const parent = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants: [sharedRepositoryGrant],
+      dependencies: [],
+    })).task;
+    const left = await graph.catalog.registerChildTask({
+      parent_task_id: parent.id,
+      alias: "control:child-left",
+      required_for_parent: true,
+      goal: "change the left subsystem",
+      done_conditions: ["left tests pass"],
+      grants: [sharedRepositoryGrant],
+      dependencies: [],
+    });
+    const right = await graph.catalog.registerChildTask({
+      parent_task_id: parent.id,
+      alias: "control:child-right",
+      required_for_parent: true,
+      goal: "change the right subsystem",
+      done_conditions: ["right tests pass"],
+      grants: [sharedRepositoryGrant],
+      dependencies: [],
+    });
+
+    const leftStart = await graph.tasks.start({
+      task_id: left.id,
+      task_alias: left.aliases[0]!,
+      project_id: left.project_id,
+      repo_id: left.repo_id,
+      session_id: "codex-child-left",
+      repository_path: fixture.sourceRepo,
+    });
+    const rightStart = await graph.tasks.start({
+      task_id: right.id,
+      task_alias: right.aliases[0]!,
+      project_id: right.project_id,
+      repo_id: right.repo_id,
+      session_id: "codex-child-right",
+      repository_path: fixture.sourceRepo,
+    });
+
+    expect(leftStart.claim).toMatchObject({
+      work_contract: left.work_contract,
+      work_contract_digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(rightStart.claim).toMatchObject({
+      work_contract: right.work_contract,
+      work_contract_digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(rightStart.branch).not.toBe(leftStart.branch);
+    expect(rightStart.worktree_ref).not.toBe(leftStart.worktree_ref);
+    await expect(graph.claims.assertOwner(left.id, leftStart.claim.claim_id)).resolves.toEqual(leftStart.claim);
+    await expect(graph.claims.assertOwner(right.id, rightStart.claim.claim_id)).resolves.toEqual(rightStart.claim);
+  });
+
   it("5. remote divergence fails without rebase, retry, or force", async () => {
     const fixture = await makeGateFixture();
     await writeFile(join(fixture.cloneB, "winner.json"), "{}\n", "utf8");

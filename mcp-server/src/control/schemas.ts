@@ -148,8 +148,7 @@ export type ChildTask = z.infer<typeof ChildTaskSchema>;
 export const TaskRecordSchema = z.union([FormalTaskSchema, TemporaryTaskSchema, ChildTaskSchema]);
 export type TaskRecord = z.infer<typeof TaskRecordSchema>;
 
-export const ActiveClaimSchema = z
-  .object({
+const ActiveClaimBaseSchema = z.object({
     task_id: canonicalId("tsk"),
     task_alias: taskAlias,
     project_id: projectId,
@@ -162,14 +161,24 @@ export const ActiveClaimSchema = z
     worktree_ref: claimCoordinate,
     source_task_revision: SourceTaskRevisionSchema,
     started_at: OffsetDateTimeSchema,
-  })
-  .strict();
+  });
+
+export const LegacyActiveClaimSchema = ActiveClaimBaseSchema.strict();
+export const ContractActiveClaimSchema = ActiveClaimBaseSchema.extend({
+  work_contract: WorkContractSchema,
+  work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+export const ActiveClaimSchema = z.union([
+  ContractActiveClaimSchema,
+  LegacyActiveClaimSchema,
+]);
 export type ActiveClaim = z.infer<typeof ActiveClaimSchema>;
+export type ContractActiveClaim = z.infer<typeof ContractActiveClaimSchema>;
 
 const safeClaimConflictText = z.string().min(1).max(255).regex(/^[^\u0000-\u001f\u007f]+$/u);
 
 /** Deliberately bounded public coordinates for an already-owned Task. */
-export const ConflictingClaimSummarySchema = ActiveClaimSchema.pick({
+export const ConflictingClaimSummarySchema = ActiveClaimBaseSchema.pick({
   task_id: true,
   claim_id: true,
   host: true,
@@ -352,6 +361,7 @@ export const ClaimHistorySchema = z
     validation_summary: boundedUtf8(33 * 1024).optional(),
     handoff_path: z.string().max(160).regex(/^handoffs\/tsk-[0-9a-f-]+\/clm-[0-9a-f-]+\.md$/).optional(),
     successor_claim_id: canonicalId("clm").optional(),
+    work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   })
   .strict()
   .superRefine((history, context) => {

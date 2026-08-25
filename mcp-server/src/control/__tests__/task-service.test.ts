@@ -12,6 +12,7 @@ import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { TaskService } from "../task-service.js";
+import { workContractDigest } from "../work-contract.js";
 import { WorktreeManager, worktreePlan } from "../worktree.js";
 import { configFor, emptyTaskContractIntent, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
@@ -21,6 +22,7 @@ const TASK_ID = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const taskAlias = "wlan:tmp-20260813-01-fix";
 const plan = worktreePlan(TASK_ID, taskAlias);
+const activeWorkContract = { version: 1 as const, task_id: TASK_ID, grants: [], dependencies: [] };
 
 const activeClaim = {
   task_id: TASK_ID,
@@ -34,6 +36,8 @@ const activeClaim = {
   worktree_ref: plan.worktree_ref,
   source_task_revision: "issue-revision-7",
   started_at: "2026-08-13T12:34:56.789Z",
+  work_contract: activeWorkContract,
+  work_contract_digest: workContractDigest(activeWorkContract),
 };
 
 const startInput = {
@@ -67,6 +71,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     }),
     recoverClaim: vi.fn(),
     getActive: vi.fn().mockResolvedValue(undefined),
+    resolveSessionClaim: vi.fn().mockResolvedValue(undefined),
     getClaimHistory: vi.fn(),
     latestClaimHistory: vi.fn().mockRejectedValue(new ControlError("CLAIM_HISTORY_NOT_FOUND", "no history")),
     latestHandoffHistory: vi.fn().mockRejectedValue(new ControlError("HANDOFF_NOT_FOUND", "no handoff")),

@@ -21,7 +21,7 @@ import {
   type HandoffInput,
 } from "./handoff.js";
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
-import type { ActiveClaim, ClaimHistory, ErrorReason } from "./schemas.js";
+import type { ActiveClaim, ClaimHistory, ContractActiveClaim, ErrorReason } from "./schemas.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
   worktreePlan,
@@ -32,7 +32,7 @@ import {
 } from "./worktree.js";
 
 export interface ClaimServicePort {
-  claimTask(input: ClaimTaskInput): Promise<ActiveClaim>;
+  claimTask(input: ClaimTaskInput): Promise<ContractActiveClaim>;
   finishClaim(taskId: string, claimId: string, outcome: FinishOutcome): Promise<ClaimHistory>;
   recoverClaim(taskId: string, claimId: string, action: RecoveryAction): Promise<RecoveryResult>;
   assertOwner(taskId: string, claimId: string): Promise<ActiveClaim>;
