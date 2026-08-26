@@ -7,13 +7,20 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createAuthorityService } from "../authority.js";
 import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
-import { runCli, type CliDependencies } from "../cli.js";
+import { createCliDependencies, runCli, type CliDependencies } from "../cli.js";
 import type { ControlConfig } from "../config.js";
 import { ControlError } from "../errors.js";
+import { createProductionGuardRequestStore, GuardDigestKey, GuardRequestStore } from "../guard-state.js";
 import { GitHubProjectClient, type GitHubRunner } from "../github-project.js";
 import { GitHubSourceService, type GitHubSourceRunner } from "../github-source.js";
 import { PilotJournal } from "../journal.js";
-import { MutationLock, ProcessRunner, type ProcessResult, type ProcessRunOptions } from "../process.js";
+import {
+  createProductionMutationLock,
+  MutationLock,
+  ProcessRunner,
+  type ProcessResult,
+  type ProcessRunOptions,
+} from "../process.js";
 import { PortfolioService, type ProjectSnapshotSource } from "../portfolio.js";
 import { PreflightService, type PreflightProjectPort } from "../preflight.js";
 import { RegistryGit, type ProcessRunnerLike } from "../registry-git.js";
@@ -21,7 +28,7 @@ import { createSensitiveDataPolicy } from "../sensitive-data.js";
 import { sourceIndexKey } from "../ids.js";
 import { TaskService } from "../task-service.js";
 import { WorktreeManager, type WorktreeStateHooks } from "../worktree.js";
-import { configFor, git, isolatedRegistryGit, makeRegistryFixture } from "./helpers.js";
+import { configFor, emptyTaskContractIntent, git, isolatedRegistryGit, makeRegistryFixture } from "./helpers.js";
 
 interface GateFixture {
   root: string;
@@ -179,12 +186,19 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
           issue_revision: input.expected_issue_revision ?? issueInput.issue_revision,
           issue_url: input.issue_url,
           alias: issueInput.alias,
+          ...(input.task_role !== undefined ? { task_role: input.task_role } : {}),
+          ...(input.grants !== undefined ? { grants: input.grants } : {}),
+          ...(input.dependencies !== undefined ? { dependencies: input.dependencies } : {}),
         });
       },
       registerTemporaryTask: async (input) => {
         await ensureRepository();
         const { repository_path: _repositoryPath, ...record } = input;
-        return graph.catalog.registerTemporaryTask(record);
+        return graph.catalog.registerTemporaryTask({
+          ...record,
+          ...(input.grants !== undefined ? { grants: input.grants } : {}),
+          ...(input.dependencies !== undefined ? { dependencies: input.dependencies } : {}),
+        });
       },
       prepareExistingTask: async (input) => {
         const task = await graph.catalog.getTask(input.task_id);
@@ -216,7 +230,11 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         registry_repository: "ok", registry_issue: "ok", registry_git: "ok",
       },
     }) },
-    mutationLock: new MutationLock(graph.config, {}),
+    guardMode: graph.config.guardMode,
+    guardRequests: createProductionGuardRequestStore(graph.config),
+    guardDigestKey: new GuardDigestKey(graph.config.stateDir),
+    guardClaims: graph.claims,
+    mutationLock: createProductionMutationLock(graph.config, {}),
     journal: noopJournal(),
     // Board commands are outside the Phase 1A e2e surface; the ports only need
     // to exist so the dependency graph typechecks.
@@ -387,7 +405,16 @@ function temporaryStartArgs(alias: string, sourceRepo: string, session: string):
   return [
     "task", "start", "--project", "prj-control", "--repo-id", "repo-control", "--repo-path", sourceRepo,
     "--temp-alias", alias, "--goal", "exercise the deterministic gate", "--done", "gate passes",
-    "--scope", "src/control", "--session", session,
+    "--scope", "src/control", "--grant", "repo.modify:repository:repo-control:shared",
+    "--origin-adapter", "codex", "--session", session,
+  ];
+}
+
+function childStartArgs(parentId: string, alias: string, sourceRepo: string, session: string): string[] {
+  return [
+    "task", "child-start", "--parent", parentId, "--alias", alias, "--repo-path", sourceRepo,
+    "--goal", `execute ${alias}`, "--done", "admission succeeds",
+    "--grant", "repo.modify:repository:repo-control:shared", "--origin-adapter", "codex", "--session", session,
   ];
 }
 
@@ -506,6 +533,61 @@ function rawErrorAudit(cause: unknown): RawErrorAudit {
 }
 
 describe("Phase 1A deterministic adversarial gate", () => {
+  it("0. production Guard diagnostics remain bounded, pending, and state-read-only before adapters", async () => {
+    const fixture = await makeGateFixture();
+    const beforeDirectory = await stat(fixture.stateDir);
+    const beforeEntries = await readdir(fixture.stateDir);
+    const dependencies = createCliDependencies({
+      HOME: fixture.root,
+      JHW_REGISTRY_DIR: fixture.cloneA,
+      JHW_WORKTREE_ROOT: fixture.worktreeRoot,
+      JHW_CONTROL_STATE_DIR: fixture.stateDir,
+      JHW_BUILD_HOST: "cantopsbuildserver",
+      JHW_GITHUB_OWNER: "jhw7500",
+      JHW_PROJECT_NUMBER: "7",
+      JHW_REGISTRY_REPOSITORY: "jhw7500/project-registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+      JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+    });
+
+    const statusResult = await runCli(["guard", "status"], dependencies);
+    const preflightResult = await runCli(["guard", "preflight"], dependencies);
+    const afterDirectory = await stat(fixture.stateDir);
+
+    expect(statusResult.exitCode).toBe(0);
+    expect(JSON.parse(statusResult.stdout)).toMatchObject({
+      command: "guard status",
+      result: {
+        protocol_version: 1,
+        runtime_mode: "enforce",
+        request_state: { safety: "not_initialized" },
+        digest_key: { safety: "not_initialized" },
+        registry_claims: { availability: "available" },
+        adapter_coverage: {
+          claude: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          codex: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          gemini: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+          opencode: { prompt_origin: "pending", pre_tool_blocking: "pending", execution_recheck: "pending" },
+        },
+      },
+    });
+    expect(preflightResult.exitCode).toBe(78);
+    expect(JSON.parse(preflightResult.stderr)).toMatchObject({
+      command: "guard preflight",
+      result: {
+        status: "NO-GO",
+        code: "GUARD_UNAVAILABLE",
+        diagnostics: { protocol_version: 1, runtime_mode: "enforce" },
+      },
+    });
+    expect(Buffer.byteLength(statusResult.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(Buffer.byteLength(preflightResult.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(`${statusResult.stdout}${preflightResult.stderr}`).not.toContain("installed");
+    expect(`${statusResult.stdout}${preflightResult.stderr}`).not.toContain("ready\"");
+    expect(await readdir(fixture.stateDir)).toEqual(beforeEntries);
+    expect(afterDirectory.mtimeMs).toBe(beforeDirectory.mtimeMs);
+  });
+
   it("1. concurrent Repository registration leaves one canonical record and one source mapping", async () => {
     const fixture = await makeGateFixture();
     const leftRunner = new PushGateRunner(new ProcessRunner(), "2026-08-13T00:00:01Z");
@@ -553,8 +635,8 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const right = new Catalog(rightConfig, isolatedRegistryGit(rightConfig, rightRunner));
 
     const results = await runDeterministicPushRace(
-      () => left.registerFormalTask(issueInput),
-      () => right.registerFormalTask(issueInput),
+      () => left.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() }),
+      () => right.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() }),
       leftRunner,
       rightRunner,
     );
@@ -579,8 +661,9 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const temporary = await graph.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:temporary", goal: "temporary",
       done_conditions: ["test"], expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
-    const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const formal = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
     const head = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
     const temporaryBytes = await readFile(join(fixture.cloneA, "tasks", `${temporary.id}.yaml`), "utf8");
     const formalBytes = await readFile(join(fixture.cloneA, "tasks", `${formal.id}.yaml`), "utf8");
@@ -599,7 +682,15 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
-    const canonical = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const canonical = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      grants: [{
+        capability: "repo.modify",
+        resource: { kind: "repository", id: "repo-control" },
+        coordination: "shared",
+      }],
+      dependencies: [],
+    })).task;
     const enteredStart = deferred();
     const release = deferred();
     const coordinatedTasks = Object.create(graph.tasks) as TaskService;
@@ -615,7 +706,8 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const formalStartArgs = (session: string) => [
       "task", "start", "--project", issueInput.project_id, "--repo-id", issueInput.repo_id,
       "--repo-path", fixture.sourceRepo, "--issue-node-id", issueInput.issue_node_id,
-      "--issue-url", issueInput.issue_url, "--issue-revision", issueInput.issue_revision, "--session", session,
+      "--issue-url", issueInput.issue_url, "--issue-revision", issueInput.issue_revision,
+      "--grant", "repo.modify:repository:repo-control:shared", "--origin-adapter", "codex", "--session", session,
     ];
     const firstPromise = runCli(formalStartArgs("codex-a"), heldDependencies);
     await enteredStart.promise;
@@ -640,6 +732,286 @@ describe("Phase 1A deterministic adversarial gate", () => {
       session_id: "codex-a",
     });
   });
+
+  it("4b. sibling child Tasks share one repository through isolated Claims and worktrees", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const sharedRepositoryGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-control" },
+      coordination: "shared" as const,
+    };
+    const parent = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants: [sharedRepositoryGrant],
+      dependencies: [],
+    })).task;
+    const left = await graph.catalog.registerChildTask({
+      parent_task_id: parent.id,
+      alias: "control:child-left",
+      required_for_parent: true,
+      goal: "change the left subsystem",
+      done_conditions: ["left tests pass"],
+      grants: [sharedRepositoryGrant],
+      dependencies: [],
+    });
+    const right = await graph.catalog.registerChildTask({
+      parent_task_id: parent.id,
+      alias: "control:child-right",
+      required_for_parent: true,
+      goal: "change the right subsystem",
+      done_conditions: ["right tests pass"],
+      grants: [sharedRepositoryGrant],
+      dependencies: [],
+    });
+
+    const leftStart = await graph.tasks.start({
+      task_id: left.id,
+      task_alias: left.aliases[0]!,
+      project_id: left.project_id,
+      repo_id: left.repo_id,
+      origin_adapter: "codex",
+      session_id: "codex-child-left",
+      repository_path: fixture.sourceRepo,
+    });
+    const rightStart = await graph.tasks.start({
+      task_id: right.id,
+      task_alias: right.aliases[0]!,
+      project_id: right.project_id,
+      repo_id: right.repo_id,
+      origin_adapter: "codex",
+      session_id: "codex-child-right",
+      repository_path: fixture.sourceRepo,
+    });
+
+    expect(leftStart.claim).toMatchObject({
+      work_contract: left.work_contract,
+      work_contract_digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(rightStart.claim).toMatchObject({
+      work_contract: right.work_contract,
+      work_contract_digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(rightStart.branch).not.toBe(leftStart.branch);
+    expect(rightStart.worktree_ref).not.toBe(leftStart.worktree_ref);
+    await expect(graph.claims.assertOwner(left.id, leftStart.claim.claim_id)).resolves.toEqual(leftStart.claim);
+    await expect(graph.claims.assertOwner(right.id, rightStart.claim.claim_id)).resolves.toEqual(rightStart.claim);
+  });
+
+  it("4c. CLI source adapters reject omitted contract intent and preserve explicit temporary intent", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const dependencies = cliDependencies(graph);
+
+    await expect(dependencies.source.registerTemporaryTask({
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      repository_path: fixture.sourceRepo,
+      alias: "control:masked-contract",
+      goal: "prove omitted intent is not synthesized",
+      done_conditions: ["registration fails"],
+      expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_REQUIRED" });
+
+    const dependency = await graph.catalog.registerTemporaryTask({
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      alias: "control:dependency",
+      goal: "provide an exact dependency",
+      done_conditions: ["dependency exists"],
+      expected_scope: ["src/dependency"],
+      grants: [],
+      dependencies: [],
+    });
+    const started = await runCli([
+      "task", "start", "--project", "prj-control", "--repo-id", "repo-control",
+      "--repo-path", fixture.sourceRepo, "--temp-alias", "control:explicit-contract",
+      "--goal", "preserve exact CLI contract intent", "--done", "intent is stored",
+      "--scope", "src/control", "--grant", "repo.modify:repository:repo-control:shared",
+      "--depends", `observes:${dependency.id}`, "--origin-adapter", "codex", "--session", "codex-explicit-contract",
+    ], dependencies);
+
+    expect(started.exitCode).toBe(0);
+    const taskId = JSON.parse(started.stdout).result.task.task_id as string;
+    await expect(graph.catalog.getTask(taskId)).resolves.toMatchObject({
+      work_contract: {
+        grants: [{
+          capability: "repo.modify",
+          resource: { kind: "repository", id: "repo-control" },
+          coordination: "shared",
+        }],
+        dependencies: [{ relation: "observes", task_id: dependency.id }],
+      },
+    });
+  });
+
+  it("4d. child-start retains a persisted child when its exact session is already owned", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const sharedGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-control" },
+      coordination: "shared" as const,
+    };
+    const parent = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants: [sharedGrant],
+      dependencies: [],
+    })).task;
+    const blocker = await graph.catalog.registerTemporaryTask({
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      alias: "control:session-owner",
+      goal: "own the exact session",
+      done_conditions: ["session remains owned"],
+      expected_scope: ["src/control"],
+      grants: [sharedGrant],
+      dependencies: [],
+    });
+    await graph.tasks.start({
+      task_id: blocker.id,
+      task_alias: blocker.aliases[0]!,
+      project_id: blocker.project_id,
+      repo_id: blocker.repo_id,
+      origin_adapter: "codex",
+      session_id: "codex-retained-child",
+      repository_path: fixture.sourceRepo,
+    });
+
+    const result = await runCli(
+      childStartArgs(parent.id, "control:retained-session-child", fixture.sourceRepo, "codex-retained-child"),
+      cliDependencies(graph),
+    );
+    const retainedTaskId = JSON.parse(result.stderr).error.retained_task.task_id as string;
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "TASK_SESSION_BUSY", retained_task: { task_id: retainedTaskId } },
+    });
+    const [child] = await graph.catalog.listChildren(parent.id);
+    expect(child).toMatchObject({ id: retainedTaskId, aliases: ["control:retained-session-child"] });
+    await expect(graph.claims.getActive(retainedTaskId)).resolves.toBeUndefined();
+    const audit = await freshAuditClone(fixture, "retained-session-child-audit");
+    expect(JSON.parse(await readFile(join(audit, "tasks", `${retainedTaskId}.yaml`), "utf8"))).toMatchObject({
+      id: retainedTaskId,
+      parent_task_id: parent.id,
+    });
+    expect(JSON.parse(await readFile(join(
+      audit,
+      "tasks/by-source/github",
+      `${sourceIndexKey(parent.issue_node_id)}.yaml`,
+    ), "utf8"))).toEqual({ task_id: parent.id });
+  }, 20_000);
+
+  it("4e. child-start retains a persisted child after exclusive-resource admission fails", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const sharedGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-control" },
+      coordination: "shared" as const,
+    };
+    const exclusiveGrant = { ...sharedGrant, coordination: "exclusive" as const };
+    const parent = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants: [sharedGrant],
+      dependencies: [],
+    })).task;
+    const blocker = await graph.catalog.registerTemporaryTask({
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      alias: "control:exclusive-owner",
+      goal: "own the repository resource exclusively",
+      done_conditions: ["later admission is blocked"],
+      expected_scope: ["src/control"],
+      grants: [exclusiveGrant],
+      dependencies: [],
+    });
+    await graph.tasks.start({
+      task_id: blocker.id,
+      task_alias: blocker.aliases[0]!,
+      project_id: blocker.project_id,
+      repo_id: blocker.repo_id,
+      origin_adapter: "codex",
+      session_id: "codex-exclusive-owner",
+      repository_path: fixture.sourceRepo,
+    });
+
+    const result = await runCli(
+      childStartArgs(parent.id, "control:retained-resource-child", fixture.sourceRepo, "codex-resource-contender"),
+      cliDependencies(graph),
+    );
+    const retainedTaskId = JSON.parse(result.stderr).error.retained_task.task_id as string;
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "TASK_RESOURCE_CONFLICT", retained_task: { task_id: retainedTaskId } },
+    });
+    const [child] = await graph.catalog.listChildren(parent.id);
+    expect(child).toMatchObject({ id: retainedTaskId, aliases: ["control:retained-resource-child"] });
+    await expect(graph.claims.getActive(retainedTaskId)).resolves.toBeUndefined();
+    const audit = await freshAuditClone(fixture, "retained-resource-child-audit");
+    expect(JSON.parse(await readFile(join(audit, "tasks", `${retainedTaskId}.yaml`), "utf8"))).toMatchObject({
+      id: retainedTaskId,
+      parent_task_id: parent.id,
+    });
+  }, 20_000);
+
+  it("4f. explicit formal and temporary source contract drift stops before any Claim", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const sharedGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-control" },
+      coordination: "shared" as const,
+    };
+    const formal = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants: [sharedGrant],
+      dependencies: [],
+    })).task;
+    const formalHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+    const formalResult = await runCli([
+      "task", "start", "--project", "prj-control", "--repo-id", "repo-control",
+      "--repo-path", fixture.sourceRepo, "--issue-node-id", issueInput.issue_node_id,
+      "--issue-url", issueInput.issue_url, "--issue-revision", issueInput.issue_revision,
+      "--role", "standalone", "--grant", "repo.modify:repository:repo-control:shared",
+      "--grant", "git.commit:repository:repo-control:shared", "--origin-adapter", "codex", "--session", "codex-formal-drift",
+    ], cliDependencies(graph));
+
+    expect(JSON.parse(formalResult.stderr)).toEqual({ error: { code: "TASK_CONTRACT_MISMATCH" } });
+    expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(formalHead);
+    await expect(graph.claims.getActive(formal.id)).resolves.toBeUndefined();
+
+    const temporaryInput = {
+      project_id: "prj-control",
+      repo_id: "repo-control",
+      alias: "control:temporary-drift",
+      goal: "exercise the deterministic gate",
+      done_conditions: ["gate passes"],
+      expected_scope: ["src/control"],
+    };
+    const temporary = await graph.catalog.registerTemporaryTask({
+      ...temporaryInput,
+      grants: [sharedGrant],
+      dependencies: [],
+    });
+    const temporaryHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
+    const temporaryArgs = temporaryStartArgs(temporaryInput.alias, fixture.sourceRepo, "codex-temporary-drift");
+    temporaryArgs.splice(temporaryArgs.indexOf("--session"), 0,
+      "--grant", "git.commit:repository:repo-control:shared");
+    const temporaryResult = await runCli(temporaryArgs, cliDependencies(graph));
+
+    expect(JSON.parse(temporaryResult.stderr)).toEqual({ error: { code: "TASK_CONTRACT_MISMATCH" } });
+    expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(temporaryHead);
+    await expect(graph.claims.getActive(temporary.id)).resolves.toBeUndefined();
+  }, 20_000);
 
   it("5. remote divergence fails without rebase, retry, or force", async () => {
     const fixture = await makeGateFixture();
@@ -735,6 +1107,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const task = await graphA.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:death", goal: "recover",
       done_conditions: ["status"], expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const delegate = new ProcessRunner();
     let pushed = false;
@@ -762,6 +1135,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const planAlias = task.aliases[0]!;
     await expect(dying.tasks.start({
       task_id: task.id, task_alias: planAlias, project_id: task.project_id, repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-dead", repository_path: fixture.sourceRepo,
     })).rejects.toMatchObject({ code: "REMOTE_VERIFY_FAILED" });
 
@@ -812,7 +1186,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const taskId = task.task_id as string;
     const fullOldClaim = await graph.claims.getActive(taskId);
     expect(fullOldClaim).toBeDefined();
-    const firstTakeoverArgs = ["task", "recover", "--task", taskId, "--expect", oldClaim.claim_id, "--action", "takeover", "--session", "codex-new"];
+    const firstTakeoverArgs = ["task", "recover", "--task", taskId, "--expect", oldClaim.claim_id, "--action", "takeover", "--session", "codex-new", "--origin-adapter", "codex"];
     armPostPushFetchFailure = true;
     const postPushFailure = await runCli(firstTakeoverArgs, dependencies);
     expect(postPushFailure).toMatchObject({ exitCode: 75 });
@@ -829,7 +1203,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(firstSuccessorId).toBe(firstSuccessor?.claim_id);
 
     failBeforeSave = true;
-    const secondTakeoverArgs = ["task", "recover", "--task", taskId, "--expect", firstSuccessorId, "--action", "takeover", "--session", "codex-final"];
+    const secondTakeoverArgs = ["task", "recover", "--task", taskId, "--expect", firstSuccessorId, "--action", "takeover", "--session", "codex-final", "--origin-adapter", "codex"];
     const stateFailure = await runCli(secondTakeoverArgs, dependencies);
     expect(stateFailure).toMatchObject({ exitCode: 1 });
     const secondRemoteHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
@@ -889,6 +1263,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const task = await graph.catalog.registerTemporaryTask({
       project_id: "prj-control", repo_id: "repo-control", alias: "control:offline", goal: "offline",
       done_conditions: ["later"], expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const provisional = join(fixture.worktreeRoot, "offline-provisional");
     await git(fixture.sourceRepo, "worktree", "add", "-b", "provisional/offline", provisional, "HEAD");
@@ -1177,7 +1552,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
     const resumed = await runCli([
       "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo,
-      "--session", "codex-after-handoff",
+      "--session", "codex-after-handoff", "--origin-adapter", "codex",
     ], dependencies);
 
     expect(resumed.exitCode).toBe(0);
@@ -1196,16 +1571,22 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
-    const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const formal = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
     const dependencies = cliDependencies(graph);
     const first = await runCli([
-      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-first",
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-first", "--origin-adapter", "codex",
     ], dependencies);
     const firstClaim = JSON.parse(first.stdout).result.claim.claim_id;
+    await graph.tasks.markCompletionReady({
+      task_id: formal.id,
+      claim_id: firstClaim,
+      integration_validation: ["focused e2e: pass"],
+      child_dispositions: [],
+    });
     expect((await runCli(completedFinishArgs(formal.id, firstClaim), dependencies)).exitCode).toBe(0);
 
     const reopened = await runCli([
-      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-open",
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-formal-open", "--origin-adapter", "codex",
     ], dependencies);
 
     expect(reopened.exitCode).toBe(0);
@@ -1231,7 +1612,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(JSON.parse(abandoned.stdout).result.worktree_removed).toBe(false);
 
     const blocked = await runCli([
-      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-blocked",
+      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-blocked", "--origin-adapter", "codex",
     ], dependencies);
     expect(blocked.exitCode).toBe(1);
     expect(JSON.parse(blocked.stderr)).toEqual({ error: { code: "WORKTREE_CLEANUP_REQUIRED" } });
@@ -1246,7 +1627,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
       .worktrees[first.claim.worktree_ref]).toMatchObject({ lifecycle: "removed" });
     const resumed = await runCli([
-      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-recovered",
+      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", "codex-cleanup-recovered", "--origin-adapter", "codex",
     ], dependencies);
     expect(resumed.exitCode).toBe(0);
   }, 15_000);
@@ -1267,6 +1648,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       await expect(catalog.registerTemporaryTask({
         project_id: "prj-control", repo_id: "repo-control", alias: `control:rejected-${goal === secret ? "secret" : createHash("sha256").update(goal).digest("hex").slice(0, 8)}`,
         goal, done_conditions: ["reject"], expected_scope: ["src/control"],
+        ...emptyTaskContractIntent(),
       })).rejects.toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
     }
     expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(before);
@@ -1335,7 +1717,12 @@ describe("Phase 1A deterministic adversarial gate", () => {
         },
       },
     });
-    const dependencies = cliDependencies(graph, { source });
+    const sourceWithContractIntent = Object.create(source) as GitHubSourceService;
+    sourceWithContractIntent.registerFormalTask = (input) => source.registerFormalTask({
+      ...input,
+      ...emptyTaskContractIntent(),
+    });
+    const dependencies = cliDependencies(graph, { source: sourceWithContractIntent });
     const registered = await runCli([
       "repository", "register", "--repo-id", "repo-control", "--slug", "jhw7500/control",
       "--repo-path", fixture.sourceRepo,
@@ -1351,6 +1738,8 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "--issue-url", overrides.issueUrl ?? issueInput.issue_url,
       "--issue-node-id", overrides.issueNodeId ?? issueInput.issue_node_id,
       "--issue-revision", overrides.issueRevision ?? issueInput.issue_revision,
+      "--grant", "repo.modify:repository:repo-control:shared",
+      "--origin-adapter", "codex",
       "--session", session,
     ];
     const initialHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
@@ -1427,7 +1816,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const beforeHead = (await git(fixture.cloneA, "rev-parse", "HEAD")).trim();
     const beforeRemote = (await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim();
 
-    await expect(graph.catalog.registerFormalTask(duplicateIssue)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    await expect(graph.catalog.registerFormalTask({ ...duplicateIssue, ...emptyTaskContractIntent() })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
 
     expect((await git(fixture.cloneA, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
     expect((await git(fixture.root, "ls-remote", fixture.remoteDir, "refs/heads/main")).trim()).toBe(beforeRemote);
@@ -1586,7 +1975,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       expect(JSON.parse(finished.stdout).result.worktree_removed, boundary).toBe(false);
       expect(await graph.claims.getActive(first.task.task_id), boundary).toBeUndefined();
       const blocked = await runCli([
-        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `blocked-${boundary}`,
+        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `blocked-${boundary}`, "--origin-adapter", "codex",
       ], dependencies);
       expect(JSON.parse(blocked.stderr), boundary).toEqual({ error: { code: "WORKTREE_CLEANUP_REQUIRED" } });
       expect(await graph.claims.getActive(first.task.task_id), boundary).toBeUndefined();
@@ -1595,7 +1984,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       ], dependencies);
       expect(recovered.exitCode, boundary).toBe(0);
       const successor = await runCli([
-        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `recovered-${boundary}`,
+        "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo, "--session", `recovered-${boundary}`, "--origin-adapter", "codex",
       ], dependencies);
       expect(successor.exitCode, boundary).toBe(0);
     }
@@ -1755,23 +2144,23 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
-    const formal = (await graph.catalog.registerFormalTask(issueInput)).task;
+    const formal = (await graph.catalog.registerFormalTask({ ...issueInput, ...emptyTaskContractIntent() })).task;
     const secondIssue = {
       ...issueInput,
       issue_node_id: "I_phase1a_second",
       issue_url: "https://github.com/jhw7500/control/issues/2",
       alias: "jhw7500/control#2",
     };
-    const releasedBeforeRename = (await graph.catalog.registerFormalTask(secondIssue)).task;
+    const releasedBeforeRename = (await graph.catalog.registerFormalTask({ ...secondIssue, ...emptyTaskContractIntent() })).task;
     const initialDependencies = cliDependencies(graph);
     const initialStart = await runCli([
-      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-before-repository-rename",
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-before-repository-rename", "--origin-adapter", "codex",
     ], initialDependencies);
     expect(initialStart.exitCode).toBe(0);
     const initialClaimId = JSON.parse(initialStart.stdout).result.claim.claim_id as string;
     const releasedStart = await runCli([
       "task", "start", "--task", releasedBeforeRename.id, "--repo-path", fixture.sourceRepo,
-      "--session", "codex-released-before-repository-rename",
+      "--session", "codex-released-before-repository-rename", "--origin-adapter", "codex",
     ], initialDependencies);
     expect(releasedStart.exitCode).toBe(0);
     const releasedClaimId = JSON.parse(releasedStart.stdout).result.claim.claim_id as string;
@@ -1860,7 +2249,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     ], renamedDependencies)).exitCode).toBe(0);
 
     const resumed = await runCli([
-      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-after-repository-rename",
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo, "--session", "codex-after-repository-rename", "--origin-adapter", "codex",
     ], renamedDependencies);
     expect(resumed.exitCode).toBe(0);
     expect(JSON.parse(resumed.stdout).result).toMatchObject({
@@ -1873,7 +2262,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
     });
     const resumedReleased = await runCli([
       "task", "start", "--task", releasedBeforeRename.id, "--repo-path", fixture.sourceRepo,
-      "--session", "codex-after-pre-rename-handoff",
+      "--session", "codex-after-pre-rename-handoff", "--origin-adapter", "codex",
     ], renamedDependencies);
     expect(resumedReleased.exitCode).toBe(0);
     await expect(graph.claims.getActive(releasedBeforeRename.id)).resolves.toMatchObject({

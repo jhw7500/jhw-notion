@@ -6,10 +6,13 @@ import { ControlError } from "./errors.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 const MAX_JOURNAL_LINE_BYTES = 4096;
+const MAX_CONFIGURABLE_JOURNAL_LINE_BYTES = 64 * 1024;
 const JOURNAL_FILE = "pilot-journal.jsonl";
 const directoryOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
-const journalOpenFlags = constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY |
+const journalBaseOpenFlags = constants.O_APPEND | constants.O_WRONLY |
   constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const journalOpenFlags = journalBaseOpenFlags | constants.O_CREAT;
+const strictJournalCreateFlags = journalBaseOpenFlags | constants.O_CREAT | constants.O_EXCL;
 
 export interface JournalEvent {
   command: string;
@@ -55,8 +58,16 @@ export interface SecureStateDirectory {
   close(): Promise<void>;
 }
 
+export type SecureStateDirectoryInspection =
+  | { status: "not_initialized" }
+  | { status: "ready"; directory: SecureStateDirectory };
+
 function isNotFound(cause: unknown): cause is NodeJS.ErrnoException {
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT";
+}
+
+function isAlreadyExists(cause: unknown): cause is NodeJS.ErrnoException {
+  return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "EEXIST";
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -72,14 +83,16 @@ function safeStateFileName(name: string): boolean {
   return name.length > 0 && name !== "." && name !== ".." && !name.includes("/") && !name.includes("\\");
 }
 
-async function secureDirectoryAt(path: string): Promise<void> {
+async function secureDirectoryAt(path: string): Promise<boolean> {
   let info;
+  let created = false;
   try {
     info = await lstat(path);
   } catch (cause) {
     if (!isNotFound(cause)) throw cause;
     try {
       await mkdir(path, { mode: 0o700 });
+      created = true;
     } catch (mkdirCause) {
       if (!isNotFound(mkdirCause) && !(typeof mkdirCause === "object" && mkdirCause !== null && "code" in mkdirCause && mkdirCause.code === "EEXIST")) {
         throw mkdirCause;
@@ -88,6 +101,19 @@ async function secureDirectoryAt(path: string): Promise<void> {
     info = await lstat(path);
   }
   if (info.isSymbolicLink() || !info.isDirectory()) throw unsafeStatePath();
+  return created;
+}
+
+async function existingDirectoryAt(path: string): Promise<"ready" | "not_initialized"> {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (cause) {
+    if (isNotFound(cause)) return "not_initialized";
+    throw unsafeStatePath();
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) throw unsafeStatePath();
+  return "ready";
 }
 
 class AnchoredStateDirectory implements SecureStateDirectory {
@@ -135,6 +161,7 @@ class AnchoredStateDirectory implements SecureStateDirectory {
 export async function openSecureStateDirectory(
   stateDir: string,
   hooks: SecureStateDirectoryHooks = {},
+  options: { strictExistingMode?: boolean } = {},
 ): Promise<SecureStateDirectory> {
   if (!isAbsolute(stateDir)) throw unsafeStatePath();
   const root = parse(resolve(stateDir)).root;
@@ -144,9 +171,11 @@ export async function openSecureStateDirectory(
   if (target === root) throw unsafeStatePath();
   const components = relative(root, target).split(sep).filter(Boolean);
   let current = root;
+  let targetCreated = false;
   for (const component of components) {
     current = join(current, component);
-    await secureDirectoryAt(current);
+    const created = await secureDirectoryAt(current);
+    if (current === target) targetCreated = created;
   }
   if (!isWithin(target, join(target, JOURNAL_FILE))) throw unsafeStatePath();
 
@@ -159,7 +188,11 @@ export async function openSecureStateDirectory(
   try {
     const info = await handle.stat();
     if (!info.isDirectory()) throw unsafeStatePath();
-    await handle.chmod(0o700);
+    if (options.strictExistingMode && !targetCreated) {
+      if ((info.mode & 0o777) !== 0o700) throw unsafeStatePath();
+    } else {
+      await handle.chmod(0o700);
+    }
     const directory = new AnchoredStateDirectory(target, handle);
     await hooks.afterDirectoryOpen?.(directory);
     return directory;
@@ -170,10 +203,59 @@ export async function openSecureStateDirectory(
   }
 }
 
+/**
+ * Strict diagnostic counterpart to `openSecureStateDirectory`. It opens an
+ * already-initialized private directory through the same retained descriptor,
+ * but never creates a component, chmods it, acquires a lock, or rewrites state.
+ * Missing state is a safe bootstrap condition; an existing unsafe path is not.
+ */
+export async function inspectSecureStateDirectory(
+  stateDir: string,
+  hooks: SecureStateDirectoryHooks = {},
+): Promise<SecureStateDirectoryInspection> {
+  if (!isAbsolute(stateDir)) throw unsafeStatePath();
+  const root = parse(resolve(stateDir)).root;
+  const target = resolve(stateDir);
+  if (target === root) throw unsafeStatePath();
+  const components = relative(root, target).split(sep).filter(Boolean);
+  let current = root;
+  for (const component of components) {
+    current = join(current, component);
+    if (await existingDirectoryAt(current) === "not_initialized") {
+      return { status: "not_initialized" };
+    }
+  }
+
+  let handle: FileHandle;
+  try {
+    handle = await open(target, directoryOpenFlags);
+  } catch (cause) {
+    if (isNotFound(cause)) return { status: "not_initialized" };
+    throw unsafeStatePath();
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isDirectory() || (info.mode & 0o777) !== 0o700) throw unsafeStatePath();
+    const directory = new AnchoredStateDirectory(target, handle);
+    await hooks.afterDirectoryOpen?.(directory);
+    return { status: "ready", directory };
+  } catch (cause) {
+    await handle.close().catch(() => undefined);
+    if (cause instanceof ControlError) throw cause;
+    throw unsafeStatePath();
+  }
+}
+
 export interface JournalLineLabels {
   tooLarge: string;
   incomplete: string;
   failed: string;
+}
+
+export interface BoundedJournalAppendOptions {
+  maximumLineBytes?: number;
+  strictExistingStateDirectory?: boolean;
+  strictExistingFileMode?: boolean;
 }
 
 /**
@@ -190,21 +272,48 @@ export async function appendBoundedJournalLine(
   fileName: string,
   event: unknown,
   labels: JournalLineLabels,
+  options: BoundedJournalAppendOptions = {},
 ): Promise<void> {
   sensitiveData.assertSafe(event);
   const line = `${JSON.stringify(event)}\n`;
-  if (Buffer.byteLength(line, "utf8") > MAX_JOURNAL_LINE_BYTES) {
+  const maximumLineBytes = options.maximumLineBytes ?? MAX_JOURNAL_LINE_BYTES;
+  if (
+    !Number.isSafeInteger(maximumLineBytes)
+    || maximumLineBytes <= 0
+    || maximumLineBytes > MAX_CONFIGURABLE_JOURNAL_LINE_BYTES
+    || Buffer.byteLength(line, "utf8") > maximumLineBytes
+  ) {
     throw new ControlError("JOURNAL_EVENT_TOO_LARGE", labels.tooLarge);
   }
 
   let directory: SecureStateDirectory | undefined;
   try {
-    directory = await openSecureStateDirectory(stateDir, hooks);
-    const file = await directory.openFile(fileName, journalOpenFlags, 0o600);
+    directory = await openSecureStateDirectory(
+      stateDir,
+      hooks,
+      { strictExistingMode: options.strictExistingStateDirectory },
+    );
+    let created = false;
+    let file: FileHandle;
+    if (options.strictExistingFileMode) {
+      try {
+        file = await directory.openFile(fileName, strictJournalCreateFlags, 0o600);
+        created = true;
+      } catch (cause) {
+        if (!isAlreadyExists(cause)) throw cause;
+        file = await directory.openFile(fileName, journalBaseOpenFlags);
+      }
+    } else {
+      file = await directory.openFile(fileName, journalOpenFlags, 0o600);
+    }
     try {
       const info = await file.stat();
       if (!info.isFile() || info.nlink !== 1) throw unsafeStatePath();
-      await file.chmod(0o600);
+      if (options.strictExistingFileMode && !created) {
+        if ((info.mode & 0o777) !== 0o600) throw unsafeStatePath();
+      } else {
+        await file.chmod(0o600);
+      }
       // One bounded write on an O_APPEND descriptor preserves a complete
       // event line across concurrently finishing read-only invocations.
       const bytes = Buffer.from(line, "utf8");

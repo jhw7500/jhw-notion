@@ -1,5 +1,5 @@
-import { isAbsolute, normalize, sep } from "node:path";
-import { realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
+import { isAbsolute, join, normalize, sep } from "node:path";
 
 import type { ControlConfig } from "./config.js";
 import { MAX_REGISTRY_RECORD_BYTES, type RegistryDirectoryEntry } from "./codec.js";
@@ -12,6 +12,8 @@ import { githubSlugFromRemote } from "./github-source.js";
 export interface RegistryMutationResult {
   /** Exact registry-relative paths that this mutation changed and must stage. */
   paths: readonly string[];
+  /** Regular blobs whose exact Git object IDs must survive staging and commit. */
+  expectedRegularBlobs?: readonly { path: string; objectId: string }[];
 }
 
 export type RegistryMutation = () => Promise<RegistryMutationResult>;
@@ -27,6 +29,7 @@ interface RawProcessRunnerLike extends ProcessRunnerLike {
 
 const MAX_HEAD_DIRECTORY_ENTRIES = 10_000;
 const MAX_HEAD_TREE_ROW_BYTES = 384;
+const gitObjectIdPattern = /^[0-9a-f]{40,64}$/;
 
 export interface RegistryTransactionResult {
   commit: string;
@@ -112,6 +115,44 @@ export class RegistryGit {
   /** Reads the exact regular blob object ID selected by HEAD tree metadata. */
   async headRegularBlobObjectId(relativePath: string): Promise<string> {
     return (await this.headRegularBlobEntry(relativePath)).objectId;
+  }
+
+  /** Hashes one current regular worktree file with Git's path and object-format semantics. */
+  async worktreeRegularBlobObjectId(relativePath: string): Promise<string> {
+    if (!isSafeRegistryRelativePath(relativePath)) {
+      throw new ControlError("INVALID_REGISTRY_PATH", "Registry file path must be a safe relative path");
+    }
+
+    const absolutePath = join(this.config.registryDir, relativePath);
+    try {
+      const [registryRoot, resolvedPath, metadata] = await Promise.all([
+        realpath(this.config.registryDir),
+        realpath(absolutePath),
+        lstat(absolutePath),
+      ]);
+      if (!metadata.isFile() || !resolvedPath.startsWith(`${registryRoot}${sep}`)) {
+        throw new Error("Registry worktree path is not a contained regular file");
+      }
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to hash a regular Registry worktree file");
+    }
+
+    let output: string;
+    try {
+      output = (await this.git([
+        "hash-object",
+        `--path=${relativePath}`,
+        "--",
+        relativePath,
+      ])).stdout;
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to hash a regular Registry worktree file");
+    }
+    const objectId = output.endsWith("\n") ? output.slice(0, -1) : output;
+    if (!gitObjectIdPattern.test(objectId)) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry worktree hash is not one object name");
+    }
+    return objectId;
   }
 
   /**
@@ -201,11 +242,7 @@ export class RegistryGit {
   async committedViewIsStale(): Promise<boolean> {
     const pinned = this.committedTree?.commit;
     if (pinned === undefined) return false;
-    try {
-      return (await this.headCommit()) !== pinned;
-    } catch {
-      return false;
-    }
+    return (await this.headCommit()) !== pinned;
   }
 
   /** One recursive listing, held to the same gates a single lookup applies. */
@@ -438,14 +475,29 @@ export class RegistryGit {
         throw new ControlError("INVALID_MUTATION_PATH", "Registry mutations must return safe relative paths");
       }
     }
+    const expectedRegularBlobs = [...(mutation.expectedRegularBlobs ?? [])];
+    const expectedPaths = expectedRegularBlobs.map((expected) => expected.path);
+    const stagedPathSet = new Set(stagedPaths);
+    if (
+      expectedRegularBlobs.length > MAX_HEAD_DIRECTORY_ENTRIES ||
+      new Set(expectedPaths).size !== expectedPaths.length ||
+      expectedRegularBlobs.some((expected) =>
+        !isSafeRegistryRelativePath(expected.path) ||
+        !stagedPathSet.has(expected.path) ||
+        !gitObjectIdPattern.test(expected.objectId))
+    ) {
+      throw new ControlError("INVALID_MUTATION_PATH", "Registry expected blobs must be unique declared regular paths");
+    }
 
     await this.assertVisibleIndex();
     const changed = (await this.registryStatus()).map((entry) => entry.path);
     if (changed.length === 0) {
+      if (expectedRegularBlobs.length > 0) {
+        throw new ControlError("MUTATION_PATH_MISMATCH", "Registry expected blobs require a staged mutation");
+      }
       return { commit: initialHead, changed: false };
     }
 
-    const stagedPathSet = new Set(stagedPaths);
     const unreported = changed.filter((path) => !stagedPathSet.has(path));
     if (stagedPaths.length === 0 || unreported.length > 0) {
       throw new ControlError(
@@ -469,8 +521,18 @@ export class RegistryGit {
     if (remainingUnreported.length > 0) {
       throw new ControlError("MUTATION_PATH_MISMATCH", "Registry mutation left an unreported working-tree path");
     }
+    for (const expected of expectedRegularBlobs) {
+      if (await this.stagedRegularBlobObjectId(expected.path) !== expected.objectId) {
+        throw new ControlError("MUTATION_PATH_MISMATCH", "Registry staged blob differs from the mutation expectation");
+      }
+    }
     await this.git(["commit", "-m", message]);
     const commit = await this.revision("HEAD");
+    for (const expected of expectedRegularBlobs) {
+      if (await this.explicitCommitRegularBlobObjectId(commit, expected.path) !== expected.objectId) {
+        throw new ControlError("MUTATION_PATH_MISMATCH", "Registry committed blob differs from the mutation expectation");
+      }
+    }
 
     try {
       await this.assertRemoteIdentity();
@@ -635,6 +697,60 @@ export class RegistryGit {
       throw new ControlError("MUTATION_PATH_MISMATCH", "Registry staged path audit is invalid");
     }
     return rows;
+  }
+
+  private async stagedRegularBlobObjectId(relativePath: string): Promise<string> {
+    let rows: string[];
+    try {
+      rows = this.decodeNulRows(await this.rawGit(
+        ["ls-files", "--stage", "-z", "--", relativePath],
+        Buffer.byteLength(relativePath, "utf8") + 128,
+      ));
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect the staged Registry blob");
+    }
+    if (rows.length !== 1) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry index returned an ambiguous expected blob");
+    }
+    const row = rows[0] as string;
+    const tab = row.indexOf("\t");
+    const metadata = tab >= 0 ? row.slice(0, tab).split(" ") : [];
+    const [mode, objectId, stage, extra] = metadata;
+    const path = tab >= 0 ? row.slice(tab + 1) : "";
+    if (
+      (mode !== "100644" && mode !== "100755") ||
+      !gitObjectIdPattern.test(objectId ?? "") ||
+      stage !== "0" ||
+      extra !== undefined ||
+      path !== relativePath
+    ) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry index expected blob is not one stage-zero regular file");
+    }
+    return objectId as string;
+  }
+
+  /** Reads one path from the explicit new commit, never from a held committedTree revision. */
+  private async explicitCommitRegularBlobObjectId(commit: string, relativePath: string): Promise<string> {
+    if (!gitObjectIdPattern.test(commit) || !isSafeRegistryRelativePath(relativePath)) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry commit blob coordinates are invalid");
+    }
+    let rows: string[];
+    try {
+      rows = this.decodeNulRows(await this.rawGit(
+        ["ls-tree", "-l", "-z", commit, "--", relativePath],
+        Buffer.byteLength(relativePath, "utf8") + MAX_HEAD_TREE_ROW_BYTES,
+      ));
+    } catch {
+      throw new ControlError("REGISTRY_CORRUPT", "Unable to inspect the new Registry commit blob");
+    }
+    if (rows.length !== 1) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry commit returned an ambiguous expected blob");
+    }
+    const parsed = parseHeadTreeRow(rows[0] as string);
+    if (!parsed || parsed.path !== relativePath) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry commit expected blob is not one regular file");
+    }
+    return parsed.objectId;
   }
 
   private async git(args: string[]): Promise<ProcessResult> {

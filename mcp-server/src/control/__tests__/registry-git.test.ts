@@ -517,6 +517,25 @@ describe("RegistryGit", () => {
     expect(outcome).toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
   });
 
+  it("propagates a later HEAD-resolution failure instead of reporting a fresh committed view", async () => {
+    const { registryDir } = await fixture();
+    const runner = new ProcessRunner();
+    let headCalls = 0;
+    const registry = fixtureRegistryGit(configFor(registryDir), {
+      run: async (command: string, args: string[], options?: Parameters<ProcessRunner["run"]>[2]) => {
+        if (args[0] === "rev-parse" && args[1] === "HEAD" && ++headCalls > 1) {
+          throw new ControlError("COMMAND_FAILED", "injected later HEAD failure");
+        }
+        return runner.run(command, args, options);
+      },
+      runRaw: runner.runRaw.bind(runner),
+    });
+
+    await expect(registry.withCommittedTree(["tasks"], () => registry.committedViewIsStale()))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(headCalls).toBe(2);
+  });
+
   // The record comparison has the same skew as the directory one and needs its
   // own guard: removing only this branch left the whole suite green.
   it("reports a moved HEAD as stale when a record disagrees, not just a directory", async () => {

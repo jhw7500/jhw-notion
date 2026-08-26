@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
-import type { ZodType } from "zod";
+import { z, type ZodType } from "zod";
 
 import { spawn } from "node:child_process";
 import { writeSync } from "node:fs";
@@ -21,11 +21,22 @@ import { Catalog } from "./catalog.js";
 import { RegistryRecordStore } from "./codec.js";
 import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
+import { ControlContractAuthority } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
+import { GuardAdapterSchema, type GuardAdapter } from "./guard-protocol.js";
+import {
+  createProductionGuardRequestStore,
+  GuardDigestKey,
+  type GuardRequestStore,
+} from "./guard-state.js";
 import { GitHubProjectClient, type RegistrationRecordWarning } from "./github-project.js";
 import { GitHubSourceService } from "./github-source.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
-import { MutationLock, ProcessRunner, type MutationLockPort } from "./process.js";
+import {
+  createProductionMutationLock,
+  ProcessRunner,
+  type MutationLockPort,
+} from "./process.js";
 import { PortfolioService } from "./portfolio.js";
 import { PreflightService } from "./preflight.js";
 import { RegistrationHintStore } from "./registration-hint.js";
@@ -33,19 +44,30 @@ import { RegistryGit } from "./registry-git.js";
 import { createSensitiveDataPolicy } from "./sensitive-data.js";
 import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
+import {
+  parseContractIntentFlags,
+  parseRequiredForParentFlag,
+  parseTaskCompletionEvidenceFlags,
+  parseTaskRoleFlag,
+  parseWorkContractFlags,
+} from "./work-contract-cli.js";
 import { assertPhase1ACommittedLegacy, createAuthorityService } from "./authority.js";
 import { getNotionClient } from "../notion-client.js";
 import { verifyConfiguredNotionAuthorityRoutes } from "../notion/authority-guard.js";
 import {
   AuthorityRecordSchema,
+  ActiveClaimSchema,
   BoardConflictSummarySchema,
   BoundedPortfolioPayloadSchema,
   ConflictingClaimSummarySchema,
+  ClaimCoordinateSchema,
+  GuardRequestSchema,
   ErrorReasonSchema,
   PreflightResultSchema,
   ProjectRecordLinkSchema,
   ProjectRecordUpdateSchema,
   RegisterProjectInputSchema,
+  RetainedTaskSummarySchema,
   SnapshotExportResultSchema,
   UpdateProjectInputSchema,
   type ActiveClaim,
@@ -57,6 +79,7 @@ import {
   type ProjectRecordLink,
   type ProjectRecordUpdate,
   type RegisterProjectInput,
+  type RetainedTaskSummary,
   type SnapshotExportResult,
   type TaskRecord,
   type UpdateProjectInput,
@@ -68,10 +91,71 @@ const PROJECT_ID = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const REPO_ID = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const MAX_CLI_OUTPUT_BYTES = 12 * 1024;
 const CLI_RESULT_BUDGET = MAX_CLI_OUTPUT_BYTES - 256;
+const maximumGuardClaims = 4_096;
+
+const GuardRequestInspectionSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("not_initialized"), requests: z.array(GuardRequestSchema).length(0) }).strict(),
+  z.object({ status: z.literal("ready"), requests: z.array(GuardRequestSchema).max(65_536) }).strict(),
+]);
+const GuardDigestKeyInspectionSchema = z.object({
+  status: z.enum(["not_initialized", "ready"]),
+}).strict();
+const GuardRequestCountsSchema = z.object({
+  PENDING: z.number().int().nonnegative(),
+  APPROVED: z.number().int().nonnegative(),
+  CONSUMED: z.number().int().nonnegative(),
+  COMPLETED: z.number().int().nonnegative(),
+  FAILED: z.number().int().nonnegative(),
+  EXPIRED: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+}).strict();
+const GuardRequestStatusSchema = z.union([
+  z.object({ safety: z.literal("unavailable") }).strict(),
+  z.object({
+    safety: z.enum(["ready", "not_initialized"]),
+    counts: GuardRequestCountsSchema,
+  }).strict(),
+]);
+const GuardAdapterCoverageEntrySchema = z.object({
+  prompt_origin: z.literal("pending"),
+  pre_tool_blocking: z.literal("pending"),
+  execution_recheck: z.literal("pending"),
+}).strict();
+const GuardAdapterCoverageSchema = z.object({
+  claude: GuardAdapterCoverageEntrySchema,
+  codex: GuardAdapterCoverageEntrySchema,
+  gemini: GuardAdapterCoverageEntrySchema,
+  opencode: GuardAdapterCoverageEntrySchema,
+}).strict();
+const GuardSessionClaimStatusSchema = z.union([
+  z.object({ match: z.enum(["none", "ambiguous", "unavailable"]) }).strict(),
+  z.object({
+    match: z.literal("unique"),
+    work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  }).strict(),
+]);
+const GuardStatusResultSchema = z.object({
+  protocol_version: z.literal(1),
+  runtime_mode: z.enum(["enforce", "observe"]),
+  request_state: GuardRequestStatusSchema,
+  digest_key: z.object({ safety: z.enum(["ready", "not_initialized", "unavailable"]) }).strict(),
+  registry_claims: z.object({ availability: z.enum(["available", "unavailable"]) }).strict(),
+  session_claim: GuardSessionClaimStatusSchema.optional(),
+  adapter_coverage: GuardAdapterCoverageSchema,
+}).strict();
+type GuardStatusResult = z.infer<typeof GuardStatusResultSchema>;
+const GuardPreflightResultSchema = z.object({
+  status: z.literal("NO-GO"),
+  code: z.literal("GUARD_UNAVAILABLE"),
+  diagnostics: GuardStatusResultSchema,
+}).strict();
 
 const commandNames = [
   "repository register",
   "task start",
+  "task child-start",
+  "task contract",
+  "task completion-ready",
   "task promote",
   "task handoff",
   "task status",
@@ -83,6 +167,8 @@ const commandNames = [
   "project register",
   "project update",
   "preflight",
+  "guard status",
+  "guard preflight",
   "board register",
   "board update",
   "board unregister",
@@ -135,13 +221,17 @@ export interface CliDependencies {
   registrationRecordWarning?: { code?: RegistrationRecordWarning };
   env: NodeJS.ProcessEnv;
   now?: () => Date;
-  taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff">;
+  taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff" | "markCompletionReady">;
   claimService: Pick<ClaimService, "getActive">;
-  catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask">;
+  catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask" | "registerChildTask" | "configureInactiveTask">;
   source: Pick<GitHubSourceService,
     "registerRepository" | "registerFormalTask" | "registerTemporaryTask" | "prepareExistingTask" | "promoteTemporaryTask">;
   portfolio: PortfolioPort;
   preflight: PreflightPort;
+  guardMode: "enforce" | "observe";
+  guardRequests: Pick<GuardRequestStore, "inspect">;
+  guardDigestKey: Pick<GuardDigestKey, "inspect">;
+  guardClaims: Pick<ClaimService, "withCommittedView" | "listActiveClaims">;
   mutationLock: MutationLockPort;
   journal?: JournalPort;
   boardService: Pick<
@@ -162,6 +252,18 @@ class ParsedCommandFailure extends Error {
   }
 }
 
+class RetainedTaskFailure extends Error {
+  readonly retainedTask: RetainedTaskSummary;
+
+  constructor(
+    readonly originalCause: unknown,
+    taskId: string,
+  ) {
+    super("Task start failed after child registration");
+    this.retainedTask = RetainedTaskSummarySchema.parse({ task_id: taskId });
+  }
+}
+
 /** Builds the production graph while retaining explicitly injectable future ports. */
 export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): CliDependencies {
   const config = loadControlConfig(env);
@@ -169,7 +271,24 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
   const runner = new ProcessRunner(env);
   const sensitiveData = createSensitiveDataPolicy(env, [config.registryDir, config.stateDir, config.worktreeRoot]);
   const registry = new RegistryGit(config, runner, sensitiveData);
-  const catalog = new Catalog(config, registry, sensitiveData);
+  const livenessProbe = createProcessLivenessProbe();
+  const boardJournal = new BoardJournal(config.stateDir, {}, sensitiveData);
+  const boardService = new BoardService(
+    config,
+    createProductionMutationLock(config, env, "board"),
+    livenessProbe,
+    () => new Date(),
+    boardJournal,
+    {},
+    sensitiveData,
+  );
+  let catalog!: Catalog;
+  const contractAuthority = new ControlContractAuthority({
+    getRepository: (repoId) => catalog.getRepository(repoId),
+    getTask: (taskId) => catalog.getTask(taskId),
+    boardStatus: (boardId) => boardService.status(boardId),
+  });
+  catalog = new Catalog(config, registry, sensitiveData, contractAuthority);
   const githubProject = new GitHubProjectClient({
     githubOwner: config.githubOwner,
     projectNumber: config.projectNumber,
@@ -216,8 +335,6 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     },
   };
   const worktrees = new WorktreeManager(config, runner);
-  const livenessProbe = createProcessLivenessProbe();
-  const boardJournal = new BoardJournal(config.stateDir, {}, sensitiveData);
   const claims = new ClaimService(config, registry, catalog, {
     async inspect(claim) {
       try {
@@ -263,23 +380,15 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
       registry,
       sensitiveData,
     }),
-    mutationLock: new MutationLock(config, env),
+    guardMode: config.guardMode,
+    guardRequests: createProductionGuardRequestStore(config, env),
+    guardDigestKey: new GuardDigestKey(config.stateDir),
+    guardClaims: claims,
+    mutationLock: createProductionMutationLock(config, env),
     // The board lock is a second host-global lock with its own identity: board
     // commands must never contend with registry.lock, and boards.lock waits
     // briefly instead of failing fast because its critical sections are ms-long.
-    boardService: new BoardService(
-      config,
-      new MutationLock(config, env, undefined, {}, {
-        lockFileName: "boards.lock",
-        waitSeconds: 5,
-        contendedReason: "board_state_lock",
-      }),
-      livenessProbe,
-      () => new Date(),
-      boardJournal,
-      {},
-      sensitiveData,
-    ),
+    boardService,
     boardJournal,
     livenessProbe,
     registrationRecordWarning,
@@ -304,6 +413,9 @@ function commandFor(argv: readonly string[]): CommandName {
   }
   if (argv[0] === "board" && argv[1] && commandNames.includes(`board ${argv[1]}` as (typeof commandNames)[number])) {
     return `board ${argv[1]}` as CommandName;
+  }
+  if (argv[0] === "guard" && argv[1] && commandNames.includes(`guard ${argv[1]}` as (typeof commandNames)[number])) {
+    return `guard ${argv[1]}` as CommandName;
   }
   if (argv[0] === "project" && argv[1] === "register") return "project register";
   if (argv[0] === "project" && argv[1] === "update") return "project update";
@@ -377,6 +489,18 @@ function requireClaimId(flags: ParsedFlags, flag = "--claim"): string {
   return assertPattern(required(flags, flag), CLAIM_ID);
 }
 
+function requireClaimCoordinate(flags: ParsedFlags, flag: string): string {
+  const parsed = ClaimCoordinateSchema.safeParse(required(flags, flag));
+  if (!parsed.success) usage("Invalid Claim coordinate");
+  return parsed.data;
+}
+
+function requireOriginAdapter(flags: ParsedFlags): GuardAdapter {
+  const parsed = GuardAdapterSchema.safeParse(required(flags, "--origin-adapter"));
+  if (!parsed.success) usage("Invalid origin adapter");
+  return parsed.data;
+}
+
 function activeSummary(active: ActiveClaim): Record<string, unknown> {
   return {
     task_id: active.task_id,
@@ -391,7 +515,18 @@ function activeSummary(active: ActiveClaim): Record<string, unknown> {
 }
 
 function taskSummary(task: TaskRecord): Record<string, unknown> {
-  return { task_id: task.id, kind: task.kind, project_id: task.project_id, repo_id: task.repo_id };
+  return {
+    task_id: task.id,
+    kind: task.kind,
+    project_id: task.project_id,
+    repo_id: task.repo_id,
+    ...(task.kind === "child" ? {
+      parent_task_id: task.parent_task_id,
+      required_for_parent: task.required_for_parent,
+    } : {
+      task_role: task.task_role,
+    }),
+  };
 }
 
 function resultJson(command: CommandName, result: unknown): CliResult {
@@ -500,6 +635,108 @@ function validatedPortResult<T>(schema: ZodType<T>, raw: unknown, code: string):
   return parsed.data;
 }
 
+function pendingAdapterCoverage(): z.infer<typeof GuardAdapterCoverageSchema> {
+  const pending = () => ({
+    prompt_origin: "pending" as const,
+    pre_tool_blocking: "pending" as const,
+    execution_recheck: "pending" as const,
+  });
+  return {
+    claude: pending(),
+    codex: pending(),
+    gemini: pending(),
+    opencode: pending(),
+  };
+}
+
+function guardRequestCounts(requests: z.infer<typeof GuardRequestSchema>[]): z.infer<typeof GuardRequestCountsSchema> {
+  const counts = {
+    PENDING: 0,
+    APPROVED: 0,
+    CONSUMED: 0,
+    COMPLETED: 0,
+    FAILED: 0,
+    EXPIRED: 0,
+    total: requests.length,
+  };
+  for (const request of requests) counts[request.state] += 1;
+  return GuardRequestCountsSchema.parse(counts);
+}
+
+async function inspectGuardStatus(
+  dependencies: CliDependencies,
+  session?: string,
+): Promise<GuardStatusResult> {
+  let requestState: z.infer<typeof GuardRequestStatusSchema>;
+  try {
+    const inspected = GuardRequestInspectionSchema.parse(await dependencies.guardRequests.inspect());
+    requestState = {
+      safety: inspected.status,
+      counts: guardRequestCounts(inspected.requests),
+    };
+  } catch {
+    requestState = { safety: "unavailable" };
+  }
+
+  let digestKey: GuardStatusResult["digest_key"];
+  try {
+    const inspected = GuardDigestKeyInspectionSchema.parse(await dependencies.guardDigestKey.inspect());
+    digestKey = { safety: inspected.status };
+  } catch {
+    digestKey = { safety: "unavailable" };
+  }
+
+  let registryClaims: GuardStatusResult["registry_claims"];
+  let sessionClaim: GuardStatusResult["session_claim"];
+  try {
+    const rawClaims = await dependencies.guardClaims.withCommittedView(
+      () => dependencies.guardClaims.listActiveClaims(),
+    );
+    const claims = z.array(ActiveClaimSchema).max(maximumGuardClaims).parse(rawClaims);
+    registryClaims = { availability: "available" };
+    if (session !== undefined) {
+      const matches = claims.filter((claim) => claim.session_id === session);
+      if (matches.length === 0) {
+        sessionClaim = { match: "none" };
+      } else if (matches.length > 1) {
+        sessionClaim = { match: "ambiguous" };
+      } else {
+        const claim = matches[0] as ActiveClaim;
+        sessionClaim = {
+          match: "unique",
+          ...("work_contract_digest" in claim ? { work_contract_digest: claim.work_contract_digest } : {}),
+        };
+      }
+    }
+  } catch {
+    registryClaims = { availability: "unavailable" };
+    if (session !== undefined) sessionClaim = { match: "unavailable" };
+  }
+
+  return GuardStatusResultSchema.parse({
+    protocol_version: 1,
+    runtime_mode: dependencies.guardMode,
+    request_state: requestState,
+    digest_key: digestKey,
+    registry_claims: registryClaims,
+    ...(sessionClaim ? { session_claim: sessionClaim } : {}),
+    adapter_coverage: pendingAdapterCoverage(),
+  });
+}
+
+function guardPreflightNoGo(command: "guard preflight", diagnostics: GuardStatusResult): CliResult {
+  const result = GuardPreflightResultSchema.parse({
+    status: "NO-GO",
+    code: "GUARD_UNAVAILABLE",
+    diagnostics,
+  });
+  return {
+    exitCode: 78,
+    stdout: "",
+    stderr: `${JSON.stringify({ command, result })}\n`,
+  };
+}
+
 function errorCode(cause: unknown): string {
   if (!(cause instanceof ControlError) || !/^[A-Z][A-Z0-9_]{1,63}$/.test(cause.code)) return "UNEXPECTED";
   return cause.code;
@@ -562,6 +799,11 @@ function retainedClaim(cause: unknown): Record<string, string> | undefined {
   return { task_id, claim_id, state: claim_state };
 }
 
+function retainedTask(value: unknown): RetainedTaskSummary | undefined {
+  const parsed = RetainedTaskSummarySchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
 function errorReason(cause: unknown): string | undefined {
   if (!(cause instanceof ControlError)) return undefined;
   const parsed = ErrorReasonSchema.safeParse(cause.details.reason);
@@ -587,18 +829,20 @@ function journalErrorFields(stderr: string): { error_code: string; error_reason?
   return { error_code: error.code, ...(error.reason ? { error_reason: error.reason } : {}) };
 }
 
-export function controlErrorResult(cause: unknown, command?: CommandName): CliResult {
+export function controlErrorResult(cause: unknown, command?: CommandName, retainedTaskValue?: unknown): CliResult {
   const code = errorCode(cause);
   const reason = errorReason(cause);
   const conflict = conflictingClaim(cause);
   const boardConflict = conflictingBoard(cause);
   const retained = code === "TASK_ALREADY_CLAIMED" ? undefined : retainedClaim(cause);
+  const retainedRegisteredTask = retainedTask(retainedTaskValue);
   const error = {
     code,
     ...(reason ? { reason } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),
     ...(boardConflict ? { conflicting_board: boardConflict } : {}),
     ...(retained ? { retained_claim: retained } : {}),
+    ...(retainedRegisteredTask ? { retained_task: retainedRegisteredTask } : {}),
   };
   return { exitCode: exitCode(cause, command), stdout: "", stderr: `${JSON.stringify({ error })}\n` };
 }
@@ -891,22 +1135,32 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const flags = parseFlags(argv.slice(2), new Set([
       "--task",
       "--project", "--repo-id", "--repo-path", "--issue-node-id", "--issue-url", "--issue-revision",
-      "--temp-alias", "--goal", "--done", "--scope", "--session",
-    ]), new Set(["--done", "--scope"]));
+      "--temp-alias", "--goal", "--done", "--scope", "--session", "--role", "--grant", "--depends",
+      "--origin-adapter",
+    ]), new Set(["--done", "--scope", "--grant", "--depends"]));
     assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
-    const session_id = required(flags, "--session");
+    const session_id = requireClaimCoordinate(flags, "--session");
+      const origin_adapter = requireOriginAdapter(flags);
     const formalFields = ["--issue-node-id", "--issue-url", "--issue-revision"];
     const temporaryFields = ["--temp-alias", "--goal", "--done", "--scope"];
     const hasFormal = formalFields.some((flag) => flags.has(flag));
     const hasTemporary = temporaryFields.some((flag) => flags.has(flag));
     const existingTaskId = value(flags, "--task");
     const hasExisting = existingTaskId !== undefined;
-    if (hasExisting && (hasFormal || hasTemporary || flags.has("--project") || flags.has("--repo-id"))) {
+    if (hasExisting && (
+      hasFormal || hasTemporary || flags.has("--project") || flags.has("--repo-id") ||
+      flags.has("--role") || flags.has("--grant") || flags.has("--depends")
+    )) {
       usage("Existing Task resume cannot include registration fields");
     }
     if (!hasExisting && hasFormal === hasTemporary) usage("Task start requires exactly one task source");
+
+    const contractIntent = hasExisting
+      ? undefined
+      : parseContractIntentFlags(values(flags, "--grant"), values(flags, "--depends"));
+    const taskRole = hasExisting ? undefined : parseTaskRoleFlag(value(flags, "--role"));
 
     let task: TaskRecord;
     let alias: string;
@@ -937,6 +1191,9 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         repo_id,
         repository_path,
         issue_url,
+        task_role: taskRole,
+        grants: contractIntent?.grants,
+        dependencies: contractIntent?.dependencies,
         ...(value(flags, "--issue-node-id") ? { expected_issue_node_id: value(flags, "--issue-node-id") } : {}),
         ...(value(flags, "--issue-revision") ? { expected_issue_revision: value(flags, "--issue-revision") } : {}),
       });
@@ -950,8 +1207,11 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       const done_conditions = values(flags, "--done").filter((entry) => isNonEmpty(entry));
       const expected_scope = values(flags, "--scope").filter((entry) => isNonEmpty(entry));
       if (done_conditions.length === 0 || expected_scope.length === 0) usage("Temporary task needs done and scope values");
+      if (taskRole !== "standalone") usage("Temporary Tasks must use the standalone role");
       task = await dependencies.source.registerTemporaryTask({
         project_id, repo_id, repository_path, alias, goal, done_conditions, expected_scope,
+        grants: contractIntent?.grants,
+        dependencies: contractIntent?.dependencies,
       });
     }
     let latestHandoff: Awaited<ReturnType<CliDependencies["taskService"]["handoff"]>> | undefined;
@@ -969,6 +1229,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       task_alias: alias,
       project_id,
       repo_id,
+      origin_adapter,
       session_id,
       repository_path,
     });
@@ -1001,6 +1262,104 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     return {
       flags,
       result: resultJson(command, startPayload()),
+    };
+  }
+
+  if (command === "task child-start") {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--parent", "--alias", "--repo-path", "--goal", "--done", "--required-for-parent",
+      "--grant", "--depends", "--session",
+      "--origin-adapter",
+    ]), new Set(["--done", "--grant", "--depends"]));
+    assertSafeFlags(flags, dependencies);
+    const repository_path = required(flags, "--repo-path");
+    if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
+    const done_conditions = values(flags, "--done").filter((entry) => isNonEmpty(entry));
+    if (done_conditions.length === 0) usage("Child Task needs done values");
+    const contractIntent = parseContractIntentFlags(values(flags, "--grant"), values(flags, "--depends"));
+    const parent_task_id = requireTaskId(flags, "--parent");
+    const aliasInput = required(flags, "--alias");
+    const required_for_parent = parseRequiredForParentFlag(value(flags, "--required-for-parent"));
+    const goal = required(flags, "--goal");
+    const session_id = requireClaimCoordinate(flags, "--session");
+    const origin_adapter = requireOriginAdapter(flags);
+    const child = await dependencies.catalog.registerChildTask({
+      parent_task_id,
+      alias: aliasInput,
+      required_for_parent,
+      goal,
+      done_conditions,
+      grants: contractIntent.grants,
+      dependencies: contractIntent.dependencies,
+    });
+    const alias = child.aliases[0] ?? usage("Child Task has no canonical alias");
+    let started: Awaited<ReturnType<CliDependencies["taskService"]["start"]>>;
+    try {
+      started = await dependencies.taskService.start({
+        task_id: child.id,
+        task_alias: alias,
+        project_id: child.project_id,
+        repo_id: child.repo_id,
+        origin_adapter,
+        session_id,
+        repository_path,
+      });
+    } catch (cause) {
+      throw new RetainedTaskFailure(cause, child.id);
+    }
+    return {
+      flags,
+      result: resultJson(command, {
+        task: taskSummary(child),
+        claim: activeSummary(started.claim),
+        branch: started.branch,
+        worktree_ref: started.worktree_ref,
+        reused: started.reused,
+      }),
+    };
+  }
+
+  if (command === "task contract") {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--task", "--role", "--grant", "--depends",
+    ]), new Set(["--grant", "--depends"]));
+    assertSafeFlags(flags, dependencies);
+    const task_id = requireTaskId(flags);
+    const configured = await dependencies.catalog.configureInactiveTask({
+      task_id,
+      task_role: parseTaskRoleFlag(required(flags, "--role")),
+      work_contract: parseWorkContractFlags(
+        task_id,
+        values(flags, "--grant"),
+        values(flags, "--depends"),
+      ),
+    });
+    return { flags, result: resultJson(command, { task: taskSummary(configured) }) };
+  }
+
+  if (command === "task completion-ready") {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--task", "--claim", "--integration-validation", "--child-disposition",
+    ]), new Set(["--integration-validation", "--child-disposition"]));
+    assertSafeFlags(flags, dependencies);
+    const evidence = parseTaskCompletionEvidenceFlags(
+      values(flags, "--integration-validation"),
+      values(flags, "--child-disposition"),
+    );
+    const recorded = await dependencies.taskService.markCompletionReady({
+      task_id: requireTaskId(flags),
+      claim_id: requireClaimId(flags),
+      integration_validation: evidence.integration_validation,
+      child_dispositions: evidence.child_dispositions,
+    });
+    return {
+      flags,
+      result: resultJson(command, {
+        task_id: recorded.task_id,
+        claim_id: recorded.claim_id,
+        work_contract_digest: recorded.work_contract_digest,
+        recorded_at: recorded.recorded_at,
+      }),
     };
   }
 
@@ -1108,7 +1467,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task recover") {
-    const flags = parseFlags(argv.slice(2), new Set(["--task", "--expect", "--action", "--session"]));
+    const flags = parseFlags(argv.slice(2), new Set(["--task", "--expect", "--action", "--session", "--origin-adapter"]));
     assertSafeFlags(flags, dependencies);
     const task_id = requireTaskId(flags);
     const claim_id = requireClaimId(flags, "--expect");
@@ -1118,7 +1477,11 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       // The documented session is advisory for non-takeover recovery.
       action = { kind: actionName };
     } else if (actionName === "takeover") {
-      action = { kind: "takeover", session_id: required(flags, "--session") };
+      action = {
+        kind: "takeover",
+        origin_adapter: requireOriginAdapter(flags),
+        session_id: requireClaimCoordinate(flags, "--session"),
+      };
     } else {
       usage("Invalid recovery action");
     }
@@ -1240,6 +1603,28 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     return { flags, result: resultJson(command, updated) };
   }
 
+  if (command === "guard status") {
+    const flags = parseFlags(argv.slice(2), new Set(["--session"]));
+    assertSafeFlags(flags, dependencies);
+    const rawSession = value(flags, "--session");
+    const parsedSession = rawSession === undefined ? undefined : ClaimCoordinateSchema.safeParse(rawSession);
+    if (parsedSession !== undefined && !parsedSession.success) usage("Invalid Claim session coordinate");
+    const diagnostics = await inspectGuardStatus(
+      dependencies,
+      parsedSession === undefined ? undefined : parsedSession.data,
+    );
+    return { flags, result: resultJson(command, diagnostics) };
+  }
+
+  if (command === "guard preflight") {
+    const flags = parseFlags(argv.slice(2), new Set());
+    assertSafeFlags(flags, dependencies);
+    return {
+      flags,
+      result: guardPreflightNoGo(command, await inspectGuardStatus(dependencies)),
+    };
+  }
+
   if (command === "preflight") {
     const flags = parseFlags(argv.slice(1), new Set());
     assertSafeFlags(flags, dependencies);
@@ -1272,6 +1657,8 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
     if (cause instanceof ParsedCommandFailure) {
       flags = cause.flags;
       result = controlErrorResult(cause.originalCause, command);
+    } else if (cause instanceof RetainedTaskFailure) {
+      result = controlErrorResult(cause.originalCause, command, cause.retainedTask);
     } else {
       result = controlErrorResult(cause, command);
     }
@@ -1279,6 +1666,11 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
     // invoke the measurement journal.
     if (result.exitCode === 2) return result;
   }
+
+  // Guard diagnostics are operational safety probes, not Pilot/Board trial
+  // measurements. Returning here also prevents a derived journal failure from
+  // changing an already-computed bounded status or NO-GO result.
+  if (command.startsWith("guard ")) return result;
 
   // A warning here means the record is unusable, so this registration leaves no
   // coordinates to resume from — and a failure is exactly when the operator is
@@ -1367,7 +1759,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
 export function requiresMutationLock(argv: readonly string[]): boolean {
   if (argv.length === 1 && argv[0] === "preflight") return true;
   if (argv[0] === "repository" && argv[1] === "register") return true;
-  if (argv[0] === "task" && (argv[1] === "start" || argv[1] === "finish" || argv[1] === "promote")) return true;
+  if (argv[0] === "task" && new Set([
+    "start", "child-start", "contract", "completion-ready", "finish", "promote",
+  ]).has(argv[1] ?? "")) return true;
   if (argv[0] === "project" && (argv[1] === "register" || argv[1] === "update")) return true;
   if (argv[0] === "portfolio" && argv[1] === "export") return true;
   if (argv[0] !== "task" || argv[1] !== "recover") return false;

@@ -8,7 +8,15 @@ import { sourceIndexKey } from "../ids.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
-import { commitFile, configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import {
+  commitFile,
+  configFor,
+  emptyTaskContractIntent,
+  git,
+  isolatedRegistryGit,
+  makeRegistryFixture,
+  type RegistryFixture,
+} from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 
@@ -16,13 +24,28 @@ afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
 });
 
-async function catalogFixture(sensitiveData?: SensitiveDataPolicy): Promise<{ fixture: RegistryFixture; catalog: Catalog }> {
+async function catalogFixture(
+  sensitiveData?: SensitiveDataPolicy,
+  adaptLegacyCallers = true,
+): Promise<{ fixture: RegistryFixture; catalog: Catalog }> {
   const fixture = await makeRegistryFixture();
   fixtures.push(fixture);
   const config = configFor(fixture.registryDir);
+  const rawCatalog = new Catalog(config, isolatedRegistryGit(config, new ProcessRunner()), sensitiveData);
+  const catalog = adaptLegacyCallers
+    ? new Proxy(rawCatalog, {
+      get(target, property, receiver) {
+        if (property === "registerFormalTask" || property === "registerTemporaryTask") {
+          return (input: Record<string, unknown>) => Reflect.apply(target[property], target, [{ ...emptyTaskContractIntent(), ...input }]);
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    })
+    : rawCatalog;
   return {
     fixture,
-    catalog: new Catalog(config, isolatedRegistryGit(config, new ProcessRunner()), sensitiveData),
+    catalog,
   };
 }
 
@@ -317,6 +340,85 @@ describe("Catalog", () => {
     });
   });
 
+  it("blocks an active formal source revision advance without moving Registry authority", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const taskPath = `tasks/${formal.id}.yaml`;
+    await commitFile(fixture.registryDir, `claims/active/${formal.id}.yaml`, "{}\n");
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeTaskRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+
+    await expect(catalog.registerFormalTask({
+      ...issueInput,
+      issue_revision: "2026-08-14T00:00:00Z",
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_ACTIVE" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim()).toBe(beforeTaskRevision);
+  });
+
+  it("keeps an active formal source revision retry idempotent at the same revision", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const taskPath = `tasks/${formal.id}.yaml`;
+    await commitFile(fixture.registryDir, `claims/active/${formal.id}.yaml`, "{}\n");
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeTaskRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+
+    await expect(catalog.registerFormalTask(issueInput)).resolves.toMatchObject({
+      task: formal,
+      created: false,
+    });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim()).toBe(beforeTaskRevision);
+  });
+
+  it("preserves active formal source identity during an equal-instant alias update", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const alternateRevision = "2026-08-13T01:00:00+01:00";
+    const historicalAlias = "jhw7500/wlan-legacy#1";
+    const taskPath = `tasks/${formal.id}.yaml`;
+    const activePath = `claims/active/${formal.id}.yaml`;
+    await commitFile(fixture.registryDir, activePath, `${JSON.stringify({
+      source_task_revision: issueInput.issue_revision,
+    })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeTaskRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+    const beforeActiveRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${activePath}`)).trim();
+    const beforeActiveBytes = await readFile(join(fixture.registryDir, activePath), "utf8");
+    expect(alternateRevision).not.toBe(issueInput.issue_revision);
+    expect(Date.parse(alternateRevision)).toBe(Date.parse(issueInput.issue_revision));
+
+    const updated = await catalog.registerFormalTask({
+      ...issueInput,
+      alias: historicalAlias,
+      issue_revision: alternateRevision,
+    });
+
+    const afterHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const afterTaskRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+    const stored = JSON.parse(await readFile(join(fixture.registryDir, taskPath), "utf8"));
+    const storedActive = JSON.parse(await readFile(join(fixture.registryDir, activePath), "utf8"));
+    expect(updated.created).toBe(false);
+    expect(updated.task.aliases).toEqual([issueInput.alias, historicalAlias]);
+    expect(afterHead).not.toBe(beforeHead);
+    expect(afterTaskRevision).not.toBe(beforeTaskRevision);
+    expect(updated.task.issue_revision).toBe(issueInput.issue_revision);
+    expect(stored.issue_revision).toBe(issueInput.issue_revision);
+    expect(stored.aliases).toEqual([issueInput.alias, historicalAlias]);
+    expect(await readFile(join(fixture.registryDir, activePath), "utf8")).toBe(beforeActiveBytes);
+    expect(storedActive.source_task_revision).toBe(issueInput.issue_revision);
+    expect((await git(fixture.registryDir, "rev-parse", `HEAD:${activePath}`)).trim()).toBe(beforeActiveRevision);
+  });
+
   it("makes a bounded temporary alias idempotent and rejects conflicting reuse", async () => {
     const { catalog } = await catalogFixture();
     await catalog.registerRepository(repositoryInput);
@@ -424,6 +526,8 @@ describe("Catalog", () => {
       issue_node_id: "I_kwDOExample",
       issue_revision: "2026-08-13T00:00:00Z",
       issue_url: "https://github.com/jhw7500/wlan/issues/1",
+      task_role: "standalone",
+      work_contract: { version: 1, task_id: task.id, grants: [], dependencies: [] },
     });
   });
 
@@ -515,6 +619,8 @@ describe("Catalog", () => {
       issue_node_id: "I_kwDOExample",
       issue_revision: "2026-08-13T00:00:00Z",
       issue_url: "https://github.com/jhw7500/wlan/issues/1",
+      task_role: "standalone",
+      work_contract: { version: 1, task_id: temp.id, grants: [], dependencies: [] },
     });
     expect(JSON.parse(await readFile(sourcePath, "utf8"))).toEqual({ task_id: temp.id });
     await expect(catalog.promoteTemporaryTask(temp.id, issueInput)).resolves.toEqual(promoted);
@@ -963,5 +1069,422 @@ describe("Catalog Registry integrity and public input boundaries", () => {
       details: expect.objectContaining({ repo_id: "repo-wlan" }),
     });
     expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+  });
+});
+
+describe("Catalog Task contracts and one-level child topology", () => {
+  const repositoryGrant = {
+    capability: "repo.modify" as const,
+    resource: { kind: "repository" as const, id: "repo-wlan" },
+    coordination: "exclusive" as const,
+  };
+  const notionGrant = {
+    capability: "notion.mutate" as const,
+    resource: { kind: "notion_database" as const, id: "projects" as const },
+    coordination: "shared" as const,
+  };
+  const contractIntent = { grants: [repositoryGrant], dependencies: [] };
+
+  async function registerParent(catalog: Catalog) {
+    await catalog.registerRepository(repositoryInput);
+    return (await catalog.registerFormalTask({
+      ...issueInput,
+      ...contractIntent,
+      task_role: "parent",
+    })).task;
+  }
+
+  it("requires explicit contract intent and stores new formal and temporary Tasks as standalone", async () => {
+    const { catalog } = await catalogFixture(undefined, false);
+    await catalog.registerRepository(repositoryInput);
+
+    await expect(catalog.registerFormalTask(issueInput)).rejects.toMatchObject({ code: "TASK_CONTRACT_REQUIRED" });
+    await expect(catalog.registerTemporaryTask({
+      project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:no-contract",
+      goal: "missing contract", done_conditions: ["rejected"], expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_REQUIRED" });
+
+    const formal = (await catalog.registerFormalTask({ ...issueInput, ...contractIntent })).task;
+    const temporary = await catalog.registerTemporaryTask({
+      project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:contracted",
+      goal: "bounded work", done_conditions: ["done"], expected_scope: ["src/control"],
+      ...contractIntent,
+    });
+
+    expect(formal).toMatchObject({ task_role: "standalone", work_contract: { version: 1, task_id: formal.id, ...contractIntent } });
+    expect(temporary).toMatchObject({ task_role: "standalone", work_contract: { version: 1, task_id: temporary.id, ...contractIntent } });
+  });
+
+  it("creates a child from a formal parent without a source index or inherited grants", async () => {
+    const { catalog, fixture } = await catalogFixture(undefined, false);
+    const parent = await registerParent(catalog);
+    const child = await catalog.registerChildTask({
+      parent_task_id: parent.id,
+      alias: "wlan:child-contract-tests",
+      required_for_parent: true,
+      goal: "implement contract tests",
+      done_conditions: ["tests pass"],
+      grants: [notionGrant],
+      dependencies: [{ task_id: parent.id, relation: "observes" }],
+    });
+
+    expect(child).toEqual({
+      id: child.id,
+      kind: "child",
+      parent_task_id: parent.id,
+      required_for_parent: true,
+      project_id: parent.project_id,
+      repo_id: parent.repo_id,
+      aliases: ["wlan:child-contract-tests"],
+      goal: "implement contract tests",
+      done_conditions: ["tests pass"],
+      lifecycle: "active",
+      work_contract: {
+        version: 1,
+        task_id: child.id,
+        grants: [notionGrant],
+        dependencies: [{ task_id: parent.id, relation: "observes" }],
+      },
+    });
+    expect(child.work_contract.grants).not.toContainEqual(repositoryGrant);
+    const issueSourceIndex = JSON.parse(await readFile(join(
+      fixture.registryDir,
+      "tasks/by-source/github",
+      `${sourceIndexKey(parent.issue_node_id)}.yaml`,
+    ), "utf8"));
+    expect(issueSourceIndex).toEqual({ task_id: parent.id });
+    await expect(catalog.getTask(issueSourceIndex.task_id)).resolves.toEqual(parent);
+    expect((await catalog.listChildren(parent.id)).map((task) => task.id)).toEqual([child.id]);
+    await expect(catalog.getTask(child.id)).resolves.toEqual(child);
+    await expect(catalog.configureInactiveTask({
+      task_id: child.id,
+      task_role: "standalone",
+      work_contract: child.work_contract,
+    })).rejects.toMatchObject({ code: "TASK_CHILD_ROLE_IMMUTABLE" });
+  });
+
+  it.each(["active", "completed"] as const)(
+    "rejects parent demotion while a %s child still references it without changing Registry authority",
+    async (lifecycle) => {
+      const { catalog, fixture } = await catalogFixture(undefined, false);
+      const parent = await registerParent(catalog);
+      const child = await catalog.registerChildTask({
+        parent_task_id: parent.id,
+        alias: `wlan:${lifecycle}-demotion-child`,
+        required_for_parent: true,
+        goal: "keep the formal parent topology valid",
+        done_conditions: ["parent role remains parent"],
+        grants: [notionGrant],
+        dependencies: [],
+      });
+      if (lifecycle === "completed") {
+        await commitFile(
+          fixture.registryDir,
+          `tasks/${child.id}.yaml`,
+          `${JSON.stringify({ ...child, lifecycle })}\n`,
+        );
+        await git(fixture.registryDir, "push", "origin", "main");
+      }
+      const taskPath = join(fixture.registryDir, "tasks", `${parent.id}.yaml`);
+      const sourcePath = join(
+        fixture.registryDir,
+        "tasks/by-source/github",
+        `${sourceIndexKey(parent.issue_node_id)}.yaml`,
+      );
+      const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+      const beforeTask = await readFile(taskPath, "utf8");
+      const beforeSource = await readFile(sourcePath, "utf8");
+
+      await expect(catalog.configureInactiveTask({
+        task_id: parent.id,
+        task_role: "standalone",
+        work_contract: { version: 1, task_id: parent.id, grants: [notionGrant], dependencies: [] },
+      })).rejects.toMatchObject({ code: "PARENT_ROLE_DEMOTION_BLOCKED" });
+
+      expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+      expect(await readFile(taskPath, "utf8")).toBe(beforeTask);
+      expect(await readFile(sourcePath, "utf8")).toBe(beforeSource);
+      expect(JSON.parse(beforeSource)).toEqual({ task_id: parent.id });
+      const config = configFor(fixture.registryDir);
+      const freshCatalog = new Catalog(config, isolatedRegistryGit(config, new ProcessRunner()));
+      await expect(freshCatalog.getTask(parent.id)).resolves.toMatchObject({ task_role: "parent" });
+      await expect(freshCatalog.getTask(child.id)).resolves.toMatchObject({ parent_task_id: parent.id, lifecycle });
+    },
+  );
+
+  it("still permits parent contract replacement and standalone-to-parent promotion", async () => {
+    const { catalog } = await catalogFixture(undefined, false);
+    const parent = await registerParent(catalog);
+    await catalog.registerChildTask({
+      parent_task_id: parent.id,
+      alias: "wlan:replacement-child",
+      required_for_parent: true,
+      goal: "keep topology while replacing the parent contract",
+      done_conditions: ["replacement succeeds"],
+      grants: [],
+      dependencies: [],
+    });
+
+    await expect(catalog.configureInactiveTask({
+      task_id: parent.id,
+      task_role: "parent",
+      work_contract: { version: 1, task_id: parent.id, grants: [notionGrant], dependencies: [] },
+    })).resolves.toMatchObject({ task_role: "parent", work_contract: { grants: [notionGrant] } });
+
+    const standalone = (await catalog.registerFormalTask({
+      ...issueInput,
+      issue_node_id: "I_kwDOSecond",
+      issue_url: "https://github.com/jhw7500/wlan/issues/2",
+      alias: "jhw7500/wlan#2",
+      ...contractIntent,
+    })).task;
+    await expect(catalog.configureInactiveTask({
+      task_id: standalone.id,
+      task_role: "parent",
+      work_contract: standalone.work_contract!,
+    })).resolves.toMatchObject({ task_role: "parent" });
+  });
+
+  it("rejects children of children and unknown or self dependencies", async () => {
+    const { catalog } = await catalogFixture(undefined, false);
+    const parent = await registerParent(catalog);
+    const child = await catalog.registerChildTask({
+      parent_task_id: parent.id, alias: "wlan:first-child", required_for_parent: true,
+      goal: "first child", done_conditions: ["done"], grants: [], dependencies: [],
+    });
+
+    await expect(catalog.registerChildTask({
+      parent_task_id: child.id, alias: "wlan:grandchild", required_for_parent: true,
+      goal: "too deep", done_conditions: ["rejected"], grants: [], dependencies: [],
+    })).rejects.toMatchObject({ code: "TASK_CHILD_DEPTH_EXCEEDED" });
+    await expect(catalog.registerChildTask({
+      parent_task_id: parent.id, alias: "wlan:unknown-dependency", required_for_parent: true,
+      goal: "unknown dependency", done_conditions: ["rejected"], grants: [],
+      dependencies: [{ task_id: "tsk-0181f8f0-0000-7000-8000-000000000002", relation: "blocked_by" }],
+    })).rejects.toMatchObject({ code: "TASK_NOT_FOUND" });
+  });
+
+  it("configures a legacy inactive Task while preserving source fields and refuses active Claims", async () => {
+    const { catalog, fixture } = await catalogFixture(undefined, false);
+    const parent = await registerParent(catalog);
+    const legacy = { ...parent } as Record<string, unknown>;
+    delete legacy.task_role;
+    delete legacy.work_contract;
+    await commitFile(fixture.registryDir, `tasks/${parent.id}.yaml`, `${JSON.stringify(legacy)}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    const sourcePath = `tasks/by-source/github/${sourceIndexKey(issueInput.issue_node_id)}.yaml`;
+    const sourceIndexBefore = await readFile(join(fixture.registryDir, sourcePath), "utf8");
+
+    await expect(catalog.getTask(parent.id)).resolves.toEqual(legacy);
+    const configured = await catalog.configureInactiveTask({
+      task_id: parent.id,
+      task_role: "parent",
+      work_contract: { version: 1, task_id: parent.id, ...contractIntent },
+    });
+    expect(configured).toEqual({ ...legacy, task_role: "parent", work_contract: { version: 1, task_id: parent.id, ...contractIntent } });
+    expect(await readFile(join(fixture.registryDir, sourcePath), "utf8")).toBe(sourceIndexBefore);
+
+    const legacyTemporaryId = "tsk-0181f8f0-0000-7000-8000-000000000005";
+    const legacyTemporary = {
+      id: legacyTemporaryId,
+      kind: "temporary",
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      aliases: ["wlan:legacy-temporary"],
+      goal: "preserve legacy temporary work",
+      done_conditions: ["configured"],
+      expected_scope: ["src/legacy"],
+      lifecycle: "handoff",
+    };
+    await commitFile(fixture.registryDir, `tasks/${legacyTemporaryId}.yaml`, `${JSON.stringify(legacyTemporary)}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    await expect(catalog.getTask(legacyTemporaryId)).resolves.toEqual(legacyTemporary);
+    await expect(catalog.configureInactiveTask({
+      task_id: legacyTemporaryId,
+      task_role: "standalone",
+      work_contract: { version: 1, task_id: legacyTemporaryId, grants: [], dependencies: [] },
+    })).resolves.toEqual({
+      ...legacyTemporary,
+      task_role: "standalone",
+      work_contract: { version: 1, task_id: legacyTemporaryId, grants: [], dependencies: [] },
+    });
+    await expect(catalog.configureInactiveTask({
+      task_id: legacyTemporaryId,
+      task_role: "parent",
+      work_contract: { version: 1, task_id: legacyTemporaryId, grants: [], dependencies: [] },
+    })).rejects.toMatchObject({ code: "TASK_PARENT_FORMAL_REQUIRED" });
+
+    await commitFile(fixture.registryDir, `claims/active/${parent.id}.yaml`, "{}\n");
+    await git(fixture.registryDir, "push", "origin", "main");
+    await expect(catalog.configureInactiveTask({
+      task_id: parent.id,
+      task_role: "standalone",
+      work_contract: { version: 1, task_id: parent.id, grants: [], dependencies: [] },
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_ACTIVE" });
+  });
+
+  it("preserves TASK_CONTRACT_REQUIRED before an active formal source revision refresh", async () => {
+    const { catalog, fixture } = await catalogFixture(undefined, false);
+    const parent = await registerParent(catalog);
+    const legacy = { ...parent } as Record<string, unknown>;
+    delete legacy.task_role;
+    delete legacy.work_contract;
+    const taskPath = `tasks/${parent.id}.yaml`;
+    await commitFile(fixture.registryDir, taskPath, `${JSON.stringify(legacy)}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    await commitFile(fixture.registryDir, `claims/active/${parent.id}.yaml`, "{}\n");
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeBytes = await readFile(join(fixture.registryDir, taskPath), "utf8");
+
+    await expect(catalog.registerFormalTask(issueInput)).resolves.toMatchObject({
+      task: legacy,
+      created: false,
+    });
+    await expect(catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      ...contractIntent,
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_MISMATCH" });
+
+    await expect(catalog.registerFormalTask({
+      ...issueInput,
+      issue_revision: "2026-08-14T00:00:00Z",
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_REQUIRED" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect(await readFile(join(fixture.registryDir, taskPath), "utf8")).toBe(beforeBytes);
+  });
+
+  it("rejects explicit formal source contract drift before source refresh or Claim acquisition", async () => {
+    const { catalog, fixture } = await catalogFixture(undefined, false);
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      ...contractIntent,
+    })).task;
+    const taskPath = join(fixture.registryDir, "tasks", `${formal.id}.yaml`);
+    const sourcePath = join(
+      fixture.registryDir,
+      "tasks/by-source/github",
+      `${sourceIndexKey(formal.issue_node_id)}.yaml`,
+    );
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeTask = await readFile(taskPath, "utf8");
+    const beforeSource = await readFile(sourcePath, "utf8");
+
+    await expect(catalog.registerFormalTask({
+      ...issueInput,
+      issue_revision: "2026-08-14T00:00:00Z",
+      task_role: "standalone",
+      grants: [repositoryGrant, notionGrant],
+      dependencies: [],
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_MISMATCH" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect(await readFile(taskPath, "utf8")).toBe(beforeTask);
+    expect(await readFile(sourcePath, "utf8")).toBe(beforeSource);
+    expect(await readdir(join(fixture.registryDir, "claims", "active")).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT") return [];
+      throw cause;
+    })).toEqual([]);
+  });
+
+  it("rejects explicit temporary alias contract drift without changing Task bytes or Registry HEAD", async () => {
+    const { catalog, fixture } = await catalogFixture(undefined, false);
+    await catalog.registerRepository(repositoryInput);
+    const input = {
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: "wlan:contract-reuse",
+      goal: "reuse only the stored semantic contract",
+      done_conditions: ["contract matches"],
+      expected_scope: ["src/control"],
+    };
+    const temporary = await catalog.registerTemporaryTask({ ...input, ...contractIntent });
+    const taskPath = join(fixture.registryDir, "tasks", `${temporary.id}.yaml`);
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeTask = await readFile(taskPath, "utf8");
+
+    await expect(catalog.registerTemporaryTask({
+      ...input,
+      grants: [{ ...repositoryGrant, coordination: "shared" }],
+      dependencies: [],
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_MISMATCH" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect(await readFile(taskPath, "utf8")).toBe(beforeTask);
+    expect(await readdir(join(fixture.registryDir, "claims", "active")).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT") return [];
+      throw cause;
+    })).toEqual([]);
+  });
+
+  it("accepts explicit source reuse when differently ordered contract intent normalizes identically", async () => {
+    const { catalog } = await catalogFixture(undefined, false);
+    await catalog.registerRepository(repositoryInput);
+    const grants = [repositoryGrant, notionGrant];
+    const formal = (await catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "parent",
+      grants,
+      dependencies: [],
+    })).task;
+    const temporaryInput = {
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: "wlan:normalized-reuse",
+      goal: "accept normalized equality",
+      done_conditions: ["reuse succeeds"],
+      expected_scope: ["src/control"],
+    };
+    const temporary = await catalog.registerTemporaryTask({
+      ...temporaryInput,
+      grants,
+      dependencies: [],
+    });
+
+    await expect(catalog.registerFormalTask({
+      ...issueInput,
+      issue_revision: "2026-08-14T00:00:00Z",
+      task_role: "parent",
+      grants: [...grants].reverse(),
+      dependencies: [],
+    })).resolves.toMatchObject({
+      created: false,
+      task: { id: formal.id, issue_revision: "2026-08-14T00:00:00Z" },
+    });
+    await expect(catalog.registerTemporaryTask({
+      ...temporaryInput,
+      grants: [...grants].reverse(),
+      dependencies: [],
+    })).resolves.toEqual(temporary);
+  });
+
+  it("rejects partial explicit contract intent on existing source reuse", async () => {
+    const { catalog, fixture } = await catalogFixture(undefined, false);
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask({ ...issueInput, ...contractIntent })).task;
+    const temporaryInput = {
+      project_id: "prj-wlan", repo_id: "repo-wlan", alias: "wlan:partial-contract",
+      goal: "reject half an intent", done_conditions: ["rejected"], expected_scope: ["src/control"],
+    };
+    const temporary = await catalog.registerTemporaryTask({ ...temporaryInput, ...contractIntent });
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(catalog.registerFormalTask({
+      ...issueInput,
+      task_role: "standalone",
+      grants: contractIntent.grants,
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_MISMATCH" });
+    await expect(catalog.registerTemporaryTask({
+      ...temporaryInput,
+      dependencies: [],
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_MISMATCH" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    await expect(catalog.getTask(formal.id)).resolves.toEqual(formal);
+    await expect(catalog.getTask(temporary.id)).resolves.toEqual(temporary);
   });
 });

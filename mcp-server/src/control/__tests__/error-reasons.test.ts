@@ -21,6 +21,16 @@ const GIT_STATE_PARSE_FAMILY = [
 ] as const;
 
 describe("error reason vocabulary", () => {
+  it("documents both claim-free and Claim-bound ALLOW decisions", () => {
+    const doc = readFileSync(join(repositoryRoot, "skills", "claude", "task.md"), "utf8");
+
+    expect(doc).toContain(
+      "`ALLOW`: Guard가 exact native local `Read`로 검증한 repository file read이거나, 현재 Claim·authority·Work Contract가 정확한 작업을 허용한다. Plan 2에서는 shell command text만으로 claim-free status 권한을 주지 않는다.",
+    );
+    expect(doc).toContain("TUI가 `Bash`/`exec_command`로 같은 text를 가로채 실행하는 경로는 실행 identity를 소유하지 않으므로 Plan 3 adapter가 identity-bound execution을 제공할 때까지 Claim-bound다.");
+    expect(doc).toContain("위 direct CLI 호출은 자체 read-only dispatch로 동작한다.");
+  });
+
   it("registers every reason literal a control source sets outside the typed helper", () => {
     // handoffRetryConflict's parameter is typed to the vocabulary, so tsc pins
     // its call sites; this sweep pins the untyped `reason:` keys in details
@@ -36,6 +46,15 @@ describe("error reason vocabulary", () => {
     expect(found).toContain("handoff_copy_not_plain_file");
     expect(found).toContain("duplicate_dirty_files");
     for (const literal of found) expect(ERROR_REASONS).toContain(literal);
+  });
+
+  it("binds the Guard state-lock source literal to vocabulary and operator documentation", () => {
+    const source = readFileSync(join(controlDir, "guard-state.ts"), "utf8");
+    const doc = readFileSync(join(repositoryRoot, "skills", "claude", "task.md"), "utf8");
+
+    expect(source).toContain('contendedReason: "guard_state_lock"');
+    expect(ERROR_REASONS).toContain("guard_state_lock");
+    expect(doc).toContain("`guard_state_lock`");
   });
 
   it("documents every registered reason where the operator is told to read it", () => {

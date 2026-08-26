@@ -12,8 +12,9 @@ import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { TaskService } from "../task-service.js";
+import { workContractDigest } from "../work-contract.js";
 import { WorktreeManager, worktreePlan } from "../worktree.js";
-import { configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { configFor, emptyTaskContractIntent, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 const localPaths: string[] = [];
@@ -21,6 +22,7 @@ const TASK_ID = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const taskAlias = "wlan:tmp-20260813-01-fix";
 const plan = worktreePlan(TASK_ID, taskAlias);
+const activeWorkContract = { version: 1 as const, task_id: TASK_ID, grants: [], dependencies: [] };
 
 const activeClaim = {
   task_id: TASK_ID,
@@ -28,12 +30,27 @@ const activeClaim = {
   project_id: "prj-wlan",
   repo_id: "repo-wlan",
   claim_id: CLAIM_ID,
+  origin_adapter: "codex" as const,
   session_id: "codex-a",
   host: "cantopsbuildserver",
   branch: plan.branch,
   worktree_ref: plan.worktree_ref,
   source_task_revision: "issue-revision-7",
   started_at: "2026-08-13T12:34:56.789Z",
+  work_contract: activeWorkContract,
+  work_contract_digest: workContractDigest(activeWorkContract),
+};
+
+const completionRecord = {
+  version: 1 as const,
+  task_id: TASK_ID,
+  claim_id: CLAIM_ID,
+  work_contract_digest: workContractDigest(activeWorkContract),
+  recorded_at: "2026-08-13T12:36:56.789Z",
+  evidence: {
+    integration_validation: ["npm test: pass"],
+    child_dispositions: [],
+  },
 };
 
 const startInput = {
@@ -41,6 +58,7 @@ const startInput = {
   task_alias: taskAlias,
   project_id: "prj-wlan",
   repo_id: "repo-wlan",
+  origin_adapter: "codex" as const,
   session_id: "codex-a",
   repository_path: "/srv/jhw/source-repository",
 };
@@ -67,9 +85,12 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     }),
     recoverClaim: vi.fn(),
     getActive: vi.fn().mockResolvedValue(undefined),
+    resolveSessionClaim: vi.fn().mockResolvedValue(undefined),
     getClaimHistory: vi.fn(),
     latestClaimHistory: vi.fn().mockRejectedValue(new ControlError("CLAIM_HISTORY_NOT_FOUND", "no history")),
     latestHandoffHistory: vi.fn().mockRejectedValue(new ControlError("HANDOFF_NOT_FOUND", "no handoff")),
+    markCompletionReady: vi.fn().mockResolvedValue(completionRecord),
+    getCompletionEvidence: vi.fn().mockResolvedValue(completionRecord),
   };
   const worktrees = {
     createOrReuse: vi.fn().mockResolvedValue({
@@ -97,6 +118,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     rebindTakeover: vi.fn().mockResolvedValue({ changed: true }),
   };
   const registry = {
+    headRegularBlobObjectId: vi.fn().mockResolvedValue(activeClaim.source_task_revision),
     transact: vi.fn(async (_message: string, mutate: () => Promise<{ paths: readonly string[] }>) => {
       await mutate();
       return { commit: "registry-commit", changed: true };
@@ -147,6 +169,44 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
 }
 
 describe("TaskService", () => {
+  it("returns the exact current owner and audited private worktree view for Guard policy", async () => {
+    const { tasks, claims, worktrees, worktreePath } = await taskFixture();
+
+    await expect(tasks.inspectForGuard(TASK_ID, CLAIM_ID)).resolves.toEqual({
+      active: activeClaim,
+      worktree: {
+        path: worktreePath,
+        repository_path: startInput.repository_path,
+        worktree_ref: plan.worktree_ref,
+        branch: plan.branch,
+        head_sha: "0123456789abcdef",
+        dirty: false,
+        dirty_files: [],
+        ahead: 0,
+        behind: 0,
+      },
+    });
+    expect(claims.assertOwner).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
+    expect(worktrees.inspect).toHaveBeenCalledWith(activeClaim);
+  });
+
+  it("records and retrieves structured completion evidence without inspecting or releasing work", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    const input = {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      integration_validation: ["npm test: pass"],
+      child_dispositions: [],
+    };
+
+    await expect(tasks.markCompletionReady(input)).resolves.toEqual(completionRecord);
+    await expect(tasks.getCompletionEvidence(TASK_ID, CLAIM_ID)).resolves.toEqual(completionRecord);
+    expect(claims.markCompletionReady).toHaveBeenCalledWith(TASK_ID, CLAIM_ID, completionRecord.evidence);
+    expect(claims.getCompletionEvidence).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
+    expect(worktrees.inspect).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+  });
+
   it("rejects an incoherent completed release before reading or mutating authority", async () => {
     const { tasks, claims, worktrees, registry } = await taskFixture();
 
@@ -259,6 +319,19 @@ describe("TaskService", () => {
     expect(claims.getActive).toHaveBeenCalledBefore(worktrees.assertStartReady);
     expect(worktrees.assertStartReady).toHaveBeenCalledWith(startInput.task_id, startInput.task_alias, undefined);
     expect(worktrees.assertStartReady).toHaveBeenCalledBefore(claims.claimTask);
+  });
+
+  it("forwards exact adapter authority and does not reuse a current Claim from another adapter", async () => {
+    const { tasks, claims } = await taskFixture();
+    claims.getActive.mockResolvedValueOnce({ ...activeClaim, origin_adapter: "claude" });
+
+    await tasks.start(startInput);
+
+    expect(claims.claimTask).toHaveBeenCalledWith(expect.objectContaining({
+      origin_adapter: "codex",
+      session_id: startInput.session_id,
+      host: "cantopsbuildserver",
+    }));
   });
 
   it("passes the exact current Claim to the cleanup barrier without creating successor ownership", async () => {
@@ -411,7 +484,7 @@ describe("TaskService", () => {
     await expect(tasks.recover({
       task_id: activeClaim.task_id,
       claim_id: activeClaim.claim_id,
-      action: { kind: "takeover", session_id: successor.session_id },
+      action: { kind: "takeover", origin_adapter: "codex", session_id: successor.session_id },
     })).resolves.toEqual({ kind: "takeover", active: successor, history });
 
     expect(claims.assertOwner).toHaveBeenCalledBefore(worktrees.assertTakeoverEligible);
@@ -436,7 +509,7 @@ describe("TaskService", () => {
     await expect(tasks.recover({
       task_id: activeClaim.task_id,
       claim_id: activeClaim.claim_id,
-      action: { kind: "takeover", session_id: successor.session_id },
+      action: { kind: "takeover", origin_adapter: "codex", session_id: successor.session_id },
     })).resolves.toMatchObject({ kind: "takeover", active: successor });
 
     expect(worktrees.assertTakeoverEligible).not.toHaveBeenCalled();
@@ -453,7 +526,7 @@ describe("TaskService", () => {
       await expect(tasks.recover({
         task_id: activeClaim.task_id,
         claim_id: activeClaim.claim_id,
-        action: { kind: "takeover", session_id: "codex-new" },
+        action: { kind: "takeover", origin_adapter: "codex", session_id: "codex-new" },
       })).rejects.toMatchObject({ code });
 
       expect(claims.recoverClaim).not.toHaveBeenCalled();
@@ -468,7 +541,7 @@ describe("TaskService", () => {
     await expect(tasks.recover({
       task_id: activeClaim.task_id,
       claim_id: activeClaim.claim_id,
-      action: { kind: "takeover", session_id: "codex-new" },
+      action: { kind: "takeover", origin_adapter: "codex", session_id: "codex-new" },
     })).rejects.toMatchObject({ code: "WORKTREE_LIFECYCLE_MISMATCH" });
 
     expect(claims.recoverClaim).not.toHaveBeenCalled();
@@ -554,6 +627,7 @@ describe("TaskService", () => {
     const task = await catalog.registerTemporaryTask({
       project_id: "prj-wlan", repo_id: "repo-wlan", alias,
       goal: "recover a released worktree", done_conditions: ["cleanup"], expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const claims = new ClaimService(config, registry, catalog, {
       async inspect() { return { process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 }; },
@@ -579,6 +653,7 @@ describe("TaskService", () => {
     const tasks = new TaskService(config, claims, taskWorktrees, registry);
     const input = {
       task_id: task.id, task_alias: alias, project_id: task.project_id, repo_id: task.repo_id,
+      origin_adapter: "codex" as const,
       session_id: "codex-release-crash", repository_path: source,
     };
     const started = await tasks.start(input);
@@ -1083,6 +1158,7 @@ describe("TaskService", () => {
       goal: "deliberately omitted from handoff",
       done_conditions: ["targeted test"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const inspection: ClaimInspection = {
       async inspect() {
@@ -1114,6 +1190,8 @@ describe("TaskService", () => {
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
       latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
+      markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
+      getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1132,6 +1210,7 @@ describe("TaskService", () => {
       task_alias: taskAlias,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-integration",
       repository_path: source,
     });
@@ -1187,6 +1266,7 @@ describe("TaskService", () => {
       task_alias: formalAlias,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-resume",
       repository_path: source,
     })).resolves.toMatchObject({ reused: true, claim: { task_alias: taskAlias } });
@@ -1214,6 +1294,7 @@ describe("TaskService", () => {
       goal: "temporary ignored handoff",
       done_conditions: ["retry"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const actualClaims = new ClaimService(config, registry, catalog, {
       async inspect() {
@@ -1230,6 +1311,8 @@ describe("TaskService", () => {
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
       latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
+      markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
+      getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1244,6 +1327,7 @@ describe("TaskService", () => {
       task_alias: `${taskAlias}-ignored`,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-ignored-ai",
       repository_path: source,
     });
@@ -1285,6 +1369,7 @@ describe("TaskService", () => {
       goal: "recover an exact failed Handoff successor rebind",
       done_conditions: ["same worktree is reused"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const claims = new ClaimService(config, registry, catalog, {
       async inspect() {
@@ -1298,6 +1383,7 @@ describe("TaskService", () => {
       task_alias: alias,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-rebind-first",
       repository_path: source,
     });
@@ -1319,6 +1405,7 @@ describe("TaskService", () => {
       task_alias: alias,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-rebind-failed",
       repository_path: source,
     })).rejects.toMatchObject({ code: "STATE_PERSIST_FAILED" });
@@ -1334,6 +1421,7 @@ describe("TaskService", () => {
       task_alias: alias,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-rebind-recovered",
       repository_path: source,
     });
@@ -1366,6 +1454,7 @@ describe("TaskService", () => {
       goal: "retry a reused worktree with an existing local handoff",
       done_conditions: ["release retry succeeds"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const actualClaims = new ClaimService(config, registry, catalog, {
       async inspect() {
@@ -1379,6 +1468,7 @@ describe("TaskService", () => {
       task_alias: alias,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-prior",
       host: config.buildHost,
       branch: coordinates.branch,
@@ -1408,6 +1498,8 @@ describe("TaskService", () => {
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
       latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
+      markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
+      getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1422,6 +1514,7 @@ describe("TaskService", () => {
       task_alias: alias,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-reused",
       repository_path: source,
     });
@@ -1468,6 +1561,7 @@ describe("TaskService", () => {
       goal: "temporary task",
       done_conditions: ["test"],
       expected_scope: ["src/control"],
+      ...emptyTaskContractIntent(),
     });
     const inspection: ClaimInspection = {
       async inspect() {
@@ -1488,6 +1582,8 @@ describe("TaskService", () => {
       getClaimHistory: actualClaims.getClaimHistory.bind(actualClaims),
       latestClaimHistory: actualClaims.latestClaimHistory.bind(actualClaims),
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
+      markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
+      getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
       finishClaim: actualClaims.finishClaim.bind(actualClaims),
     };
     const secretPath = "/srv/jhw/private/project-secret";
@@ -1510,6 +1606,7 @@ describe("TaskService", () => {
       task_alias: taskAlias,
       project_id: task.project_id,
       repo_id: task.repo_id,
+      origin_adapter: "codex",
       session_id: "codex-history",
       repository_path: secretPath,
     })).rejects.toMatchObject({ code: "COMMAND_FAILED" });

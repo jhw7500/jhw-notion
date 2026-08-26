@@ -85,7 +85,13 @@ export function configFor(registryDir: string): ControlConfig {
     preflightProjectItemId: "PVTI_trial",
     preflightRegistryIssueNumber: 1,
     stateDir: join(dirname(registryDir), "state"),
+    guardMode: "enforce",
   };
+}
+
+/** Explicit empty intent for tests whose subject is not Task contract policy. */
+export function emptyTaskContractIntent(): { grants: []; dependencies: [] } {
+  return { grants: [], dependencies: [] };
 }
 
 /** Explicit local-bare-remote identity injection for isolated unit fixtures only. */
