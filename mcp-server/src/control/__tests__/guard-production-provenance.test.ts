@@ -1,7 +1,8 @@
 import { EventEmitter } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -83,9 +84,76 @@ function serviceOptions(
 }
 
 interface ProductionFactories {
-  lock(config: ControlConfig, env?: NodeJS.ProcessEnv): MutationLock;
+  lock(config: ControlConfig, env?: NodeJS.ProcessEnv, profile?: "registry" | "board"): MutationLock;
   journal(stateDir: string, env?: NodeJS.ProcessEnv): GuardJournal;
   store(config: ControlConfig, env?: NodeJS.ProcessEnv): GuardRequestStore;
+}
+
+interface HostileEnvironmentFixture {
+  environment: NodeJS.ProcessEnv;
+  shimMarker: string;
+  shellMarker: string;
+}
+
+async function hostileEnvironment(root: string): Promise<HostileEnvironmentFixture> {
+  const shimDir = join(root, "hostile-bin");
+  const shimMarker = join(root, "hostile-flock-ran");
+  const shellMarker = join(root, "hostile-shell-control-ran");
+  const shellControl = join(root, "hostile-shell-control.sh");
+  await mkdir(shimDir);
+  await writeFile(shellControl, `printf shell-control > "${shellMarker}"\n`, { mode: 0o600 });
+  await writeFile(
+    join(shimDir, "flock"),
+    `#!/bin/bash\nprintf redirected > "${shimMarker}"\nexit 0\n`,
+    { mode: 0o700 },
+  );
+  await chmod(join(shimDir, "flock"), 0o700);
+  return {
+    environment: {
+      ...process.env,
+      PATH: shimDir,
+      LD_PRELOAD: join(root, "hostile-preload.so"),
+      LD_LIBRARY_PATH: shimDir,
+      BASH_ENV: shellControl,
+      ENV: shellControl,
+    },
+    shimMarker,
+    shellMarker,
+  };
+}
+
+async function directChildPids(): Promise<Set<number>> {
+  const taskRoot = `/proc/${process.pid}/task`;
+  const taskIds = await readdir(taskRoot);
+  const childLists = await Promise.all(taskIds.map(async (taskId) =>
+    readFile(join(taskRoot, taskId, "children"), "utf8").catch(() => "")));
+  return new Set(childLists.flatMap((children) => children.trim().split(/\s+/u))
+    .filter(Boolean)
+    .map(Number)
+    .filter(Number.isSafeInteger));
+}
+
+type HelperObservation =
+  | { status: "helper"; pid: number }
+  | { status: "callback_entered" }
+  | { status: "timeout" };
+
+async function observeContendedProductionHelper(
+  baseline: ReadonlySet<number>,
+  callbackEntered: () => boolean,
+  timeoutMs = 2_000,
+): Promise<HelperObservation> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (callbackEntered()) return { status: "callback_entered" };
+    for (const pid of await directChildPids()) {
+      if (baseline.has(pid)) continue;
+      const executable = await readlink(`/proc/${pid}/exe`).catch(() => undefined);
+      if (executable === "/usr/bin/flock") return { status: "helper", pid };
+    }
+    await delay(10);
+  }
+  return { status: "timeout" };
 }
 
 function productionFactories(): ProductionFactories | undefined {
@@ -190,24 +258,56 @@ describe("Guard production provenance", () => {
     expect(Object.isFrozen(composition)).toBe(true);
   });
 
-  it("snapshots the production environment before a caller can redirect the real lock helper", async () => {
-    const root = await mkdtemp(join(tmpdir(), "guard-production-env-"));
+  it("pins the production helper path and environment under a hostile initial environment", async () => {
+    const root = await mkdtemp(join(tmpdir(), "guard-production-hostile-lock-"));
     roots.push(root);
-    const shimDir = join(root, "shim");
-    const stateDir = join(root, "state");
-    const marker = join(root, "shim-ran");
-    await mkdir(shimDir);
-    await writeFile(join(shimDir, "flock"), `#!/bin/sh\nprintf redirected > ${marker}\nexit 0\n`, { mode: 0o700 });
-    await chmod(join(shimDir, "flock"), 0o700);
-    const env: NodeJS.ProcessEnv = { ...process.env, PATH: "/usr/bin:/bin" };
+    const hostile = await hostileEnvironment(root);
     const factories = productionFactories();
 
     expect(factories).toBeDefined();
     if (!factories) return;
-    const lock = factories.lock(configFor(stateDir), env);
-    env.PATH = shimDir;
-    await expect(lock.run(async () => "locked")).resolves.toBe("locked");
-    await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    const config = configFor(join(root, "state"));
+    const first = factories.lock(config, hostile.environment, "board");
+    const second = factories.lock(config, hostile.environment, "board");
+    let releaseFirst: () => void = () => undefined;
+    let markFirstEntered: () => void = () => undefined;
+    const firstEntered = new Promise<void>((resolve) => { markFirstEntered = resolve; });
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const held = first.run(async () => {
+      markFirstEntered();
+      await firstGate;
+    });
+    await firstEntered;
+    const baseline = await directChildPids();
+    let secondEntered = false;
+    const competing = second.run(async () => {
+      secondEntered = true;
+    });
+
+    try {
+      const observation = await observeContendedProductionHelper(baseline, () => secondEntered);
+      expect(observation.status).toBe("helper");
+      if (observation.status !== "helper") return;
+      expect(await readlink(`/proc/${observation.pid}/exe`)).toBe("/usr/bin/flock");
+      const helperEnvironment = (await readFile(`/proc/${observation.pid}/environ`, "utf8"))
+        .split("\0")
+        .filter(Boolean)
+        .sort();
+      expect(helperEnvironment).toEqual(["LC_ALL=C"]);
+      for (const key of ["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV"]) {
+        expect(helperEnvironment.some((entry) => entry.startsWith(`${key}=`))).toBe(false);
+      }
+      expect(secondEntered).toBe(false);
+
+      releaseFirst();
+      await Promise.all([held, competing]);
+      expect(secondEntered).toBe(true);
+      await expect(readFile(hostile.shimMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(hostile.shellMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseFirst();
+      await Promise.allSettled([held, competing]);
+    }
   });
 
   it("snapshots caller config so later stateDir mutation cannot retarget I/O or host coordinates", async () => {
@@ -282,4 +382,36 @@ describe("Guard production provenance", () => {
     expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
     expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
   });
+
+  it("keeps exactly-one consume under a hostile initial environment", async () => {
+    const root = await mkdtemp(join(tmpdir(), "guard-production-hostile-store-"));
+    roots.push(root);
+    const hostile = await hostileEnvironment(root);
+    const factories = productionFactories();
+
+    expect(factories).toBeDefined();
+    if (!factories) return;
+    for (let round = 0; round < 8; round += 1) {
+      const config = configFor(join(root, `state-${round}`));
+      const firstStore = factories.store(config, hostile.environment);
+      const secondStore = factories.store(config, hostile.environment);
+      const pending = await firstStore.createOrReusePending(operation());
+      await firstStore.approveFromPrompt(
+        "codex",
+        operation().session_id,
+        `/jhw:unlock ${pending.request.request_id}`,
+      );
+
+      const outcomes = await Promise.allSettled([
+        firstStore.consumeMatching(operation(), `call-hostile-one-${round}`),
+        secondStore.consumeMatching(operation(), `call-hostile-two-${round}`),
+      ]);
+      expect(outcomes.filter((outcome) => outcome.status === "fulfilled"), `round ${round}`).toHaveLength(1);
+      const rejected = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+      expect(rejected, `round ${round}`).toBeDefined();
+      expect(rejected?.reason, `round ${round}`).toMatchObject({ code: "GUARD_PERMIT_CONSUMED" });
+    }
+    await expect(readFile(hostile.shimMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(hostile.shellMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  }, 20_000);
 });

@@ -510,12 +510,17 @@ export interface MutationLockRuntime {
   ) => MutationLockChild;
 }
 
+const PRODUCTION_LOCK_HELPER = "/usr/bin/flock";
+
 const productionLockRuntime: MutationLockRuntime = Object.freeze({
   spawn: (
-    command: string,
+    _command: string,
     args: string[],
     options: { env: NodeJS.ProcessEnv; stdio: ["ignore", "ignore", "ignore", number] },
-  ) => spawn(command, args, options),
+  ) => spawn(PRODUCTION_LOCK_HELPER, args, {
+    env: { LC_ALL: "C" },
+    stdio: options.stdio,
+  }),
 });
 
 const directlyConstructedMutationLocks = new WeakSet<object>();

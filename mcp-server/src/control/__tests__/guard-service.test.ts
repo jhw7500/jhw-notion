@@ -18,7 +18,7 @@ import {
   type GuardServiceOptions,
 } from "../guard-service.js";
 import type { ControlConfig } from "../config.js";
-import type { OperationRequirement } from "../guard-protocol.js";
+import type { CanonicalOperation, OperationRequirement } from "../guard-protocol.js";
 import { GuardRequestStore, type GuardRequest } from "../guard-state.js";
 import { GuardJournal, type GuardJournalEvent, type GuardJournalPort } from "../guard-journal.js";
 import type { SecureStateDirectoryHooks } from "../journal.js";
@@ -46,6 +46,20 @@ const SESSION_ID = "codex-guard-task";
 const HOST = "cantopsbuildserver";
 const REPOSITORY = { kind: "repository", id: "repo-guard" } as const;
 const BOARD = { kind: "board", id: "board-alpha" } as const;
+// Deliberate migration fixtures captured from the pre-fix no-script-hash
+// normalizer. These literals represent already-persisted approvals; the test
+// never asks the current classifier to manufacture the legacy authority.
+const legacyUnsupportedEnvPermitFixtures = [
+  ["env -Sbash ./unsupported-env.sh", "49a7bfdc98f63d289422aa465f00078667df89780da50cd684451c37f563f82b"],
+  ["env -uPATH bash ./unsupported-env.sh", "0029c89f760be38ccb1bde80aef38d8257d23b165798672af2876785edba918c"],
+  ["env --debug bash ./unsupported-env.sh", "672b348c9fb572d062d128c91dae2d51ca4b9bd5cb2b864a8ac9f64071f5ed98"],
+  ["env -v bash ./unsupported-env.sh", "2264c5760791113ff39861ab15726548eb24052f2e81bf2c301f8441d34253aa"],
+  ["env --block-signal=PIPE bash ./unsupported-env.sh", "f24d8dbdc58c8fa73b64d58d42b7c89bc98001e2aa68150507d1ad100798eccb"],
+  ["env -iv bash ./unsupported-env.sh", "815567f5a60e62c5b3d9731d871257acd7149497f03d3736221074e51a96d436"],
+  ["env - bash ./unsupported-env.sh", "8d1dfedc1765caa41a1b170b6a9742bdf6b47118e6e62bde7a54d0c37b906e92"],
+  ["env --definitely-unsupported bash ./unsupported-env.sh", "3875e32ef61ac7c59694b9fd2ffb0fa74b9c606a14891ef6904c6d5bab8952db"],
+  ["env --unset= bash ./unsupported-env.sh", "1de629ce503d6aa6bf50329fb5dd895034bce8d96f5b5e1526e02bf9aed35e67"],
+] as const;
 const runFile = promisify(execFile);
 const nonBashStatusWhitespace = [
   ["vertical tab", "\u000b"],
@@ -2333,6 +2347,56 @@ describe("GuardService", () => {
         ]));
       }
     });
+
+    it.each(legacyUnsupportedEnvPermitFixtures)(
+      "keeps a legacy env permit approved when unsupported grammar is retried after script bytes change: %s",
+      async (command, legacyDigest) => {
+        missingRepositoryModify();
+        const script = join(fixture.root, "unsupported-env.sh");
+        await writeFile(script, "printf first\n", { mode: 0o600 });
+        const legacyOperation: CanonicalOperation = {
+          protocol_version: 1,
+          operation_id: "op-018f21e0-7b2c-7a00-8000-000000000006",
+          origin_adapter: "codex",
+          evaluation_stage: "hook",
+          session_id: SESSION_ID,
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          cwd_worktree_ref: "wt-guard-task",
+          tool: "shell",
+          requirements: [{ capability: "shell.unclassified", resource: REPOSITORY }],
+          risk: "high",
+          execution_boundary: "hook",
+          summary: "shell.unclassified repository:repo-guard",
+          digest: legacyDigest,
+        };
+        const pending = await fixture.requestStore.createOrReusePending(legacyOperation);
+        await expect(fixture.requestStore.approveFromPrompt(
+          "codex",
+          SESSION_ID,
+          `/jhw:unlock ${pending.request.request_id}`,
+        )).resolves.toMatchObject({ status: "APPROVED" });
+        await writeFile(script, "printf second\n", { mode: 0o600 });
+
+        await expect(integratedService().evaluatePreTool(preTool(
+          fixture.root,
+          "Bash",
+          { command },
+          "call-unsupported-env-retry",
+        ))).resolves.toMatchObject({
+          decision: "DENY",
+          code: "GUARD_WORKTREE_MISMATCH",
+        });
+
+        const requests = await storedRequests();
+        expect(requests).toHaveLength(1);
+        expect(requests[0]).toMatchObject({
+          request_id: pending.request.request_id,
+          state: "APPROVED",
+        });
+        expect(requests[0]).not.toHaveProperty("correlation_id");
+      },
+    );
   });
 
   it("fails exact approval closed but keeps PostTool inert when no request store is integrated", async () => {

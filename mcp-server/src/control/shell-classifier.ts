@@ -383,13 +383,19 @@ function executableArgv(argv: readonly string[]): string[] | undefined {
       // path is interpreted. This layer deliberately does not emulate env.
       throw new ShellClassificationError("unsafe_local_script");
     }
-    if (/^-[^-\s]*S.+/u.test(argument)) return undefined;
+    if (/^-[^-\s]*S.+/u.test(argument)) {
+      throw new ShellClassificationError("unsafe_local_script");
+    }
     if (argument.startsWith("--unset=")) {
-      if (argument.length === "--unset=".length) return undefined;
+      if (argument.length === "--unset=".length) {
+        throw new ShellClassificationError("unsafe_local_script");
+      }
       index += 1;
       continue;
     }
-    if (argument.startsWith("-")) return undefined;
+    if (argument.startsWith("-")) {
+      throw new ShellClassificationError("unsafe_local_script");
+    }
     break;
   }
   return index < argv.length ? argv.slice(index) : undefined;
@@ -880,7 +886,13 @@ export function detectGuardSelfApproval(input: string): boolean {
   if (raw.selfApproval) return true;
   const parsed = parseSimpleArgv(input);
   if (parsed.ambiguous || !parsed.argv) return false;
-  const commandArgv = executableArgv(parsed.argv);
+  let commandArgv: string[] | undefined;
+  try {
+    commandArgv = executableArgv(parsed.argv);
+  } catch (cause) {
+    if (cause instanceof ShellClassificationError) return false;
+    throw cause;
+  }
   return commandArgv !== undefined && executableName(commandArgv[0] as string) === "jhw-control" &&
     commandArgv[1] === "guard" && new Set(["prompt", "approve", "consume"]).has(commandArgv[2] ?? "");
 }

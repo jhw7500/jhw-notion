@@ -44,6 +44,17 @@ const SUPPORTED_GUARD_TOOL_CASES = [
   { adapter: "claude", raw: "Bash", input: { command: "git status --short" }, tool: "shell", capability: "shell.unclassified" },
   { adapter: "claude", raw: "Edit", input: { file_path: "src/file.ts", old_string: "a", new_string: "b" }, tool: "file.modify", capability: "repo.modify" },
 ] as const;
+const unsupportedEnvCommands = [
+  "env -Sbash ./unsupported-env.sh",
+  "env -uPATH bash ./unsupported-env.sh",
+  "env --debug bash ./unsupported-env.sh",
+  "env -v bash ./unsupported-env.sh",
+  "env --block-signal=PIPE bash ./unsupported-env.sh",
+  "env -iv bash ./unsupported-env.sh",
+  "env - bash ./unsupported-env.sh",
+  "env --definitely-unsupported bash ./unsupported-env.sh",
+  "env --unset= bash ./unsupported-env.sh",
+] as const;
 
 describe("operation normalization", () => {
   let root: string;
@@ -426,6 +437,31 @@ describe("operation normalization", () => {
     expect(JSON.stringify(first)).not.toContain("echo first");
     expect(JSON.stringify(second)).not.toContain("echo second");
   });
+
+  it.each(unsupportedEnvCommands)(
+    "rejects unsupported executable-producing GNU env grammar before canonical output: %s",
+    async (command) => {
+      const script = join(root, "unsupported-env.sh");
+      await writeFile(script, "printf first\n", { mode: 0o600 });
+      const [first] = await Promise.allSettled([
+        normalizeOperation(event({ tool_input: { command } }), context, KEY),
+      ]);
+      await writeFile(script, "printf second\n", { mode: 0o600 });
+      const [second] = await Promise.allSettled([
+        normalizeOperation(event({ tool_input: { command } }), context, KEY),
+      ]);
+
+      for (const attempt of [first, second]) {
+        expect(attempt).toMatchObject({
+          status: "rejected",
+          reason: {
+            name: "ShellClassificationError",
+            code: "unsafe_local_script",
+          },
+        });
+      }
+    },
+  );
 
   it("excludes operation, correlation, stage, and summary metadata from explicit digest material", () => {
     const material = {

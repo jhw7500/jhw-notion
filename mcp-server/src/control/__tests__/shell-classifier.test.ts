@@ -17,6 +17,48 @@ import * as shellClassifierModule from "../shell-classifier.js";
 const repository = { kind: "repository" as const, id: "repo-wlan-package" };
 const issue = { kind: "issue" as const, id: "I_kwDOAb-123" };
 const board = { kind: "board" as const, id: "board-alpha" };
+const unsupportedExecutingEnvCases = [
+  {
+    name: "attached split string",
+    command: "env -Sbash ./unsupported-env.sh",
+    argv: ["-Sbash", "./unsupported-env.sh"],
+  },
+  {
+    name: "attached unset",
+    command: "env -uPATH bash ./unsupported-env.sh",
+    argv: ["-uPATH", "bash", "./unsupported-env.sh"],
+  },
+  {
+    name: "debug",
+    command: "env --debug bash ./unsupported-env.sh",
+    argv: ["--debug", "bash", "./unsupported-env.sh"],
+  },
+  {
+    name: "verbose",
+    command: "env -v bash ./unsupported-env.sh",
+    argv: ["-v", "bash", "./unsupported-env.sh"],
+  },
+  {
+    name: "signal handling",
+    command: "env --block-signal=PIPE bash ./unsupported-env.sh",
+    argv: ["--block-signal=PIPE", "bash", "./unsupported-env.sh"],
+  },
+  {
+    name: "combined short options",
+    command: "env -iv bash ./unsupported-env.sh",
+    argv: ["-iv", "bash", "./unsupported-env.sh"],
+  },
+  {
+    name: "legacy bare dash",
+    command: "env - bash ./unsupported-env.sh",
+    argv: ["-", "bash", "./unsupported-env.sh"],
+  },
+] as const;
+
+const unsupportedNonExecutingEnvCases = [
+  "env --definitely-unsupported bash ./unsupported-env.sh",
+  "env --unset= bash ./unsupported-env.sh",
+] as const;
 
 describe("conservative shell classification", () => {
   let root: string;
@@ -587,9 +629,14 @@ describe("conservative shell classification", () => {
 
     for (const command of [
       "MODE=safe ./prefixed.sh",
+      "MODE=safe env SECOND=safe ./prefixed.sh",
       "env MODE=safe ./prefixed.sh",
+      "env MODE=safe -- ./prefixed.sh",
       "env -i MODE=safe ./prefixed.sh",
+      "env --ignore-environment MODE=safe ./prefixed.sh",
+      "env -u UNUSED MODE=safe ./prefixed.sh",
       "env --unset UNUSED MODE=safe ./prefixed.sh",
+      "env --unset=UNUSED MODE=safe ./prefixed.sh",
     ]) {
       const result = await classifyShell(command, context);
       expect(result.script_content_sha256).toBe(expected);
@@ -623,25 +670,53 @@ describe("conservative shell classification", () => {
     }
   });
 
-  it("retains high-risk evidence from attached GNU env split-string options", async () => {
-    const git = await classifyShell("env -SGIT_DIR=/tmp/other/.git\\ git\\ commit\\ -m\\ escaped", context);
-    const remote = await classifyShell("env -Sssh\\ target.example", context);
-    const combined = await classifyShell("env -iSssh\\ target.example", context);
-
-    expect(git.requirements).not.toContainEqual({ capability: "git.commit", resource: repository });
-    expect(git.unresolved_signals).toContainEqual({
-      capability: "git.commit",
-      boundary: "guarded_command",
-    });
-    for (const result of [remote, combined]) {
-      expect(result.unresolved_signals).toContainEqual({
-        capability: "remote.execute",
-        boundary: "guarded_command",
-      });
-      expect(result.direct_high_risk).toBe(true);
-      expect(result.script_content_sha256).toBeUndefined();
-    }
+  it.each([
+    "env -SGIT_DIR=/tmp/other/.git\\ git\\ commit\\ -m\\ escaped",
+    "env -Sssh\\ target.example",
+    "env -iSssh\\ target.example",
+  ])("fails closed for attached GNU env split strings carrying high-risk payloads: %s", async (command) => {
+    await expect(classifyShell(command, context)).rejects.toMatchObject({
+      name: "ShellClassificationError",
+      code: "unsafe_local_script",
+    } satisfies Partial<ShellClassificationError>);
   });
+
+  it.each(unsupportedExecutingEnvCases)(
+    "rejects unsupported executable-producing GNU env $name grammar after proving it reaches a script",
+    async ({ command, argv }) => {
+      const script = join(cwd, "unsupported-env.sh");
+      await writeFile(script, "exit 47\n", { mode: 0o600 });
+      const oracle = spawnSync("/usr/bin/env", argv, {
+        cwd,
+        env: { ...process.env },
+        stdio: "ignore",
+      });
+
+      expect(oracle.status).toBe(47);
+      await expect(classifyShell(command, context)).rejects.toMatchObject({
+        name: "ShellClassificationError",
+        code: "unsafe_local_script",
+      } satisfies Partial<ShellClassificationError>);
+
+      await writeFile(script, "exit 48\n", { mode: 0o600 });
+      await expect(classifyShell(command, context)).rejects.toMatchObject({
+        name: "ShellClassificationError",
+        code: "unsafe_local_script",
+      } satisfies Partial<ShellClassificationError>);
+    },
+  );
+
+  it.each(unsupportedNonExecutingEnvCases)(
+    "rejects an unsupported GNU env option token before the unclassified fallback: %s",
+    async (command) => {
+      await writeFile(join(cwd, "unsupported-env.sh"), "exit 49\n", { mode: 0o600 });
+
+      await expect(classifyShell(command, context)).rejects.toMatchObject({
+        name: "ShellClassificationError",
+        code: "unsafe_local_script",
+      } satisfies Partial<ShellClassificationError>);
+    },
+  );
 
   it("fails closed for attached or combined GNU env chdir before a local script", async () => {
     const outside = await mkdtemp(join(tmpdir(), "guard-shell-env-attached-chdir-"));
