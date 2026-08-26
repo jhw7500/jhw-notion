@@ -29,7 +29,7 @@ test -n "$REPOSITORY_PATH" || exit 1
 ```
 <!-- task-start-contract: gate:end -->
 
-`task start` 성공 결과에서 immutable `task_id`, 새 `claim_id`, `branch`, `worktree_ref`만 보고하고 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
+`task start` 성공 시 launcher result에서 오직 `task_id`, `claim_id`, `branch`, `worktree_ref` 네 필드만 사용자에게 보고하고 다른 result 필드는 보고하거나 출력하지 않는다. 이 네 immutable 좌표만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
 
 `PROJECT_REPOSITORY_NOT_FOUND`이면 올바른 Project Record에 Repository를 등록한 뒤 새 요청으로 다시 시작한다. `PROJECT_REPOSITORY_AMBIGUOUS`이면 Repository의 Project association을 하나로 줄인 뒤 새 요청으로 다시 시작한다. `PROJECT_REPOSITORY_NOT_FOUND`와 `PROJECT_REPOSITORY_AMBIGUOUS` 모두 추측, 임의 선택, 자동 재시도, explicit mode fallback을 금지한다.
 
@@ -55,7 +55,8 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 "$HOME/.local/bin/jhw-control-host" task start \
   --resolve-from-checkout true \
   --repo-path "$REPOSITORY_PATH" \
-  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
+  --issue-url 'https://github.com/<owner>/<repo>/issues/<number>' \
+  --session '<session-id>'
 ```
 <!-- task-start-contract: formal:end -->
 
@@ -65,16 +66,17 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 
 `--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다.
 
-위 authorization gate를 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다. Project/Repository association을 caller가 고르거나 명시하지 않는다.
+위 authorization gate를 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다. Project/Repository association을 caller가 고르거나 명시하지 않는다. alias, goal, 각 done, 각 scope, session과 source 값은 shell-safe quoting으로 각각 정확히 한 argv argument가 되게 serialize한다. bracket notation을 명령에 그대로 넣지 않는다.
 
 <!-- task-start-contract: temporary:begin -->
 ```bash
 "$HOME/.local/bin/jhw-control-host" task start \
   --resolve-from-checkout true \
   --repo-path "$REPOSITORY_PATH" \
-  --temp-alias <alias> --goal <goal> \
-  --done <condition> [--done <condition> ...] \
-  --scope <scope> [--scope <scope> ...] --session <session-id>
+  --temp-alias '<alias>' --goal '<goal>' \
+  --done '<condition-1>' --done '<condition-2>' \
+  --scope '<scope-1>' --scope '<scope-2>' \
+  --session '<session-id>'
 ```
 <!-- task-start-contract: temporary:end -->
 
@@ -87,7 +89,7 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 <!-- task-start-contract: resume:begin -->
 ```bash
 "$HOME/.local/bin/jhw-control-host" task start \
-  --task <tsk-id> --repo-path "$REPOSITORY_PATH" --session <session-id>
+  --task '<tsk-id>' --repo-path "$REPOSITORY_PATH" --session '<session-id>'
 ```
 <!-- task-start-contract: resume:end -->
 
@@ -166,12 +168,12 @@ if [ "$rc" -ne 0 ]; then exit "$rc"; fi
 
 "$HOME/.local/bin/jhw-control-host" task start \
   --resolve-from-checkout true --repo-path "$REPOSITORY_PATH" \
-  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
+  --issue-url 'https://github.com/<owner>/<repo>/issues/<number>' --session '<session-id>'
 ```
 <!-- task-start-contract: switch:end -->
 
 5. **start를 실행한다** (위 새 Task 시작 또는 재개 규격의 authorization gate 포함). `--session`은 finish에 쓴 것과 같은 session-id를 승계한다.
-6. **finish 성공 후 start 실패는 정상 상태다** — 현재 Task는 이미 종료됐고 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. start 재시도는 finish를 반복하지 않고 start만 다시 실행한다.
+6. **finish 성공 후 start 실패는 정상 상태다** — 현재 Task는 이미 종료됐고 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. finish는 절대 반복하지 않는다. 이후 start는 별도 사용자 승인을 받고 해당 error의 결과 해석 규칙이 허용할 때만 새로 실행하며, `REGISTRY_MOVED_DURING_READ`는 자동 retry나 explicit-mode fallback을 허용하지 않는다.
 7. **결과를 함께 보고한다.** 종료한 Task(tsk-id, status, released claim)와 시작한 Task(tsk-id, 새 claim_id, branch, worktree_ref)를 한 번에 보여준다.
 
 completed 전환이어도 이전 worktree는 병합 여부 판정에 따라 남을 수 있다. 전환이 cleanup을 대신하지 않으며, 정리는 아래 recovery의 released-generation cleanup 절차를 따른다.
