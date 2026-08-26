@@ -171,6 +171,9 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         ...(input.allow_public === true ? { allow_public: true as const } : {}),
       }),
       registerFormalTask: async (input) => {
+        if (input.resolve_from_checkout === true) {
+          throw new ControlError("PROJECT_REPOSITORY_NOT_FOUND", "resolved mode is not exercised by this CLI fixture");
+        }
         await ensureRepository();
         return graph.catalog.registerFormalTask({
           project_id: input.project_id,
@@ -182,8 +185,15 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         });
       },
       registerTemporaryTask: async (input) => {
+        if (input.resolve_from_checkout === true) {
+          throw new ControlError("PROJECT_REPOSITORY_NOT_FOUND", "resolved mode is not exercised by this CLI fixture");
+        }
         await ensureRepository();
-        const { repository_path: _repositoryPath, ...record } = input;
+        const {
+          repository_path: _repositoryPath,
+          resolve_from_checkout: _resolveFromCheckout,
+          ...record
+        } = input;
         return graph.catalog.registerTemporaryTask(record);
       },
       prepareExistingTask: async (input) => {
@@ -1333,6 +1343,12 @@ describe("Phase 1A deterministic adversarial gate", () => {
           membershipCalls.push([projectId, repoId]);
           if (membershipFailure) throw new ControlError(membershipFailure, "injected membership refusal");
         },
+        async resolveUniqueProjectForRepository() {
+          throw new ControlError(
+            "PROJECT_REPOSITORY_NOT_FOUND",
+            "resolved mode is not exercised by this explicit-flow fixture",
+          );
+        },
       },
     });
     const dependencies = cliDependencies(graph, { source });
@@ -1823,7 +1839,15 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const source = new GitHubSourceService({
       runner: sourceRunner,
       catalog: graph.catalog,
-      projects: { requireProjectRepository: async () => undefined },
+      projects: {
+        requireProjectRepository: async () => undefined,
+        resolveUniqueProjectForRepository: async () => {
+          throw new ControlError(
+            "PROJECT_REPOSITORY_NOT_FOUND",
+            "resolved mode is not exercised by this repository-registration fixture",
+          );
+        },
+      },
     });
 
     await expect(source.registerRepository({
