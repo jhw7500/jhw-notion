@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -u
+
+fallback_event="PreToolUse"
+if [[ "${3-}" == "--event" ]]; then
+  case "${4-}" in
+    UserPromptSubmit|PreToolUse|PostToolUse) fallback_event="${4}" ;;
+  esac
+fi
+
+render_failure() {
+  local code="$1"
+  case "$fallback_event" in
+    UserPromptSubmit)
+      printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"},"systemMessage":"%s"}\n' "$code" "$code"
+      ;;
+    PostToolUse)
+      printf '{"systemMessage":"%s"}\n' "$code"
+      ;;
+    *)
+      printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"},"systemMessage":"%s"}\n' "$code" "$code"
+      ;;
+  esac
+}
+
+if [[ "$#" -ne 4 || "${1-}" != "--adapter" || "${2-}" != "claude" && "${2-}" != "codex" || "${3-}" != "--event" ]]; then
+  render_failure "GUARD_PROTOCOL_MISMATCH"
+  exit 0
+fi
+case "${4-}" in
+  UserPromptSubmit|PreToolUse|PostToolUse) ;;
+  *)
+    render_failure "GUARD_PROTOCOL_MISMATCH"
+    exit 0
+    ;;
+esac
+
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+  link_target=$(/usr/bin/readlink -- "$source_path") || {
+    render_failure "GUARD_UNAVAILABLE"
+    exit 0
+  }
+  if [[ "$link_target" == /* ]]; then
+    source_path="$link_target"
+  else
+    source_path="${source_path%/*}/$link_target"
+  fi
+done
+source_dir="${source_path%/*}"
+script_dir=$(cd -- "$source_dir" 2>/dev/null && pwd -P) || {
+  render_failure "GUARD_UNAVAILABLE"
+  exit 0
+}
+repository_root="${script_dir%/*}"
+core="${repository_root}/mcp-server/dist/control/hook-adapter.js"
+timeout_command=$(command -v timeout 2>/dev/null || true)
+node_command=$(command -v node 2>/dev/null || true)
+if [[ -z "$timeout_command" || -z "$node_command" || ! -f "$core" || ! -x "$core" ]]; then
+  render_failure "GUARD_UNAVAILABLE"
+  exit 0
+fi
+
+capture_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/jhw-control-hook.XXXXXX" 2>/dev/null) || {
+  render_failure "GUARD_UNAVAILABLE"
+  exit 0
+}
+capture_file="${capture_dir}/core-output"
+cleanup() {
+  /usr/bin/rm -f -- "$capture_file"
+  /usr/bin/rmdir -- "$capture_dir" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+set +e
+"$timeout_command" --foreground 8 "$core" "$@" | /usr/bin/head -c 12289 > "$capture_file"
+pipeline_status=("${PIPESTATUS[@]}")
+set -e
+if [[ "${pipeline_status[0]-1}" -ne 0 || "${pipeline_status[1]-1}" -ne 0 ]]; then
+  render_failure "GUARD_UNAVAILABLE"
+  exit 0
+fi
+
+if "$node_command" -e '
+const fs = require("node:fs");
+try {
+  const bytes = fs.readFileSync(process.argv[1]);
+  if (bytes.length === 0 || bytes.length > 12 * 1024) process.exit(1);
+  const text = bytes.toString("utf8");
+  const value = JSON.parse(text);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) process.exit(1);
+  const line = `${JSON.stringify(value)}\n`;
+  if (Buffer.byteLength(line, "utf8") > 12 * 1024) process.exit(1);
+  process.stdout.write(line);
+} catch {
+  process.exit(1);
+}
+' "$capture_file"; then
+  exit 0
+fi
+
+render_failure "GUARD_UNAVAILABLE"
+exit 0
