@@ -419,7 +419,7 @@ export class Catalog {
         const updated = record(FormalTaskSchema, {
           ...current,
           aliases,
-          issue_revision: input.issue_revision,
+          issue_revision: requestedRevision === currentRevision ? current.issue_revision : input.issue_revision,
         }, "INVALID_FORMAL_TASK");
         await this.records.writeJson(taskRelativePath(updated.id), updated);
         registration = { task: updated, created: false };

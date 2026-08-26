@@ -378,6 +378,47 @@ describe("Catalog", () => {
     expect((await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim()).toBe(beforeTaskRevision);
   });
 
+  it("preserves active formal source identity during an equal-instant alias update", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const alternateRevision = "2026-08-13T01:00:00+01:00";
+    const historicalAlias = "jhw7500/wlan-legacy#1";
+    const taskPath = `tasks/${formal.id}.yaml`;
+    const activePath = `claims/active/${formal.id}.yaml`;
+    await commitFile(fixture.registryDir, activePath, `${JSON.stringify({
+      source_task_revision: issueInput.issue_revision,
+    })}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeTaskRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+    const beforeActiveRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${activePath}`)).trim();
+    const beforeActiveBytes = await readFile(join(fixture.registryDir, activePath), "utf8");
+    expect(alternateRevision).not.toBe(issueInput.issue_revision);
+    expect(Date.parse(alternateRevision)).toBe(Date.parse(issueInput.issue_revision));
+
+    const updated = await catalog.registerFormalTask({
+      ...issueInput,
+      alias: historicalAlias,
+      issue_revision: alternateRevision,
+    });
+
+    const afterHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const afterTaskRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+    const stored = JSON.parse(await readFile(join(fixture.registryDir, taskPath), "utf8"));
+    const storedActive = JSON.parse(await readFile(join(fixture.registryDir, activePath), "utf8"));
+    expect(updated.created).toBe(false);
+    expect(updated.task.aliases).toEqual([issueInput.alias, historicalAlias]);
+    expect(afterHead).not.toBe(beforeHead);
+    expect(afterTaskRevision).not.toBe(beforeTaskRevision);
+    expect(updated.task.issue_revision).toBe(issueInput.issue_revision);
+    expect(stored.issue_revision).toBe(issueInput.issue_revision);
+    expect(stored.aliases).toEqual([issueInput.alias, historicalAlias]);
+    expect(await readFile(join(fixture.registryDir, activePath), "utf8")).toBe(beforeActiveBytes);
+    expect(storedActive.source_task_revision).toBe(issueInput.issue_revision);
+    expect((await git(fixture.registryDir, "rev-parse", `HEAD:${activePath}`)).trim()).toBe(beforeActiveRevision);
+  });
+
   it("makes a bounded temporary alias idempotent and rejects conflicting reuse", async () => {
     const { catalog } = await catalogFixture();
     await catalog.registerRepository(repositoryInput);
