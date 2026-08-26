@@ -23,38 +23,153 @@ argument-hint: "(start | resume | promote | handoff | finish | switch | recover)
 
 <!-- task-start-contract: gate:begin -->
 ```bash
-"$HOME/.local/bin/jhw-control-host" preflight
-rc=$?
-if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+verified_checkout_slug() {
+  node - "$1" <<'NODE'
+const { execFileSync } = require("node:child_process");
+const root = process.argv[2];
+const urls = (arguments_) => {
+  let output;
+  try {
+    output = execFileSync("git", arguments_, {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    throw new Error("origin is unavailable");
+  }
+  const values = output.split("\n").filter(Boolean);
+  if (values.length !== 1) throw new Error("origin URL is ambiguous");
+  return values[0];
+};
+const fetchUrl = urls(["remote", "get-url", "--all", "origin"]);
+const pushUrl = urls(["remote", "get-url", "--all", "--push", "origin"]);
+if (fetchUrl !== pushUrl) throw new Error("origin fetch/push mismatch");
+const prefix = ["https://github.com/", "git@github.com:", "ssh://git@github.com/"]
+  .find((value) => fetchUrl.startsWith(value));
+if (!prefix) throw new Error("origin is not GitHub");
+const parts = fetchUrl.slice(prefix.length).split("/");
+if (parts.length !== 2) throw new Error("origin path is invalid");
+const [owner, rawRepository] = parts;
+const repository = rawRepository.endsWith(".git") ? rawRepository.slice(0, -4) : rawRepository;
+if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(owner) ||
+    !/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$/.test(repository)) {
+  throw new Error("origin slug is invalid");
+}
+process.stdout.write(`${owner}/${repository}`);
+NODE
+}
 
-portfolio_json="$("$HOME/.local/bin/jhw-control-host" portfolio status)"
-rc=$?
-if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+prepare_task_start_gate() {
+  if [ "$#" -gt 1 ]; then return 64; fi
+  if [ "$#" -eq 1 ]; then
+    task_start_checkout="$1"
+    case "$task_start_checkout" in /*) ;; *) return 64;; esac
+  else
+    task_start_checkout='.'
+  fi
 
-checkout_root="$(git rev-parse --show-toplevel)"
-rc=$?
-if [ "$rc" -ne 0 ]; then exit "$rc"; fi
-case "$checkout_root" in /*) ;; *) exit 1;; esac
-git -C "$checkout_root" rev-parse --is-inside-work-tree >/dev/null || exit $?
+  "$HOME/.local/bin/jhw-control-host" preflight >/dev/null
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+
+  checkout_root="$(git -C "$task_start_checkout" rev-parse --show-toplevel)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  case "$checkout_root" in /*) ;; *) return 1;; esac
+  git -C "$checkout_root" rev-parse --is-inside-work-tree >/dev/null || return $?
+  expected_repository_slug="$(verified_checkout_slug "$checkout_root")" || return $?
+
+portfolio_state='{"pages":[],"total_items":null,"item_count":0,"projects":{},"repositories":{},"next_page_id":"page-1"}'
+while :; do
+  requested_page_id="$(node -e 'const state=JSON.parse(process.argv[1]); if (state.next_page_id) process.stdout.write(state.next_page_id);' "$portfolio_state")" || return $?
+  [ -n "$requested_page_id" ] || break
+  if [ "$requested_page_id" = "page-1" ]; then
+    portfolio_json="$("$HOME/.local/bin/jhw-control-host" portfolio status)"
+  else
+    portfolio_json="$("$HOME/.local/bin/jhw-control-host" portfolio status --page "$requested_page_id")"
+  fi
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  portfolio_state="$(node - "$portfolio_state" "$portfolio_json" "$requested_page_id" <<'NODE'
+const [rawState, rawEnvelope, requestedPageId] = process.argv.slice(2);
+const id = (value, prefix) => typeof value === "string" &&
+  new RegExp(`^${prefix}-[a-z0-9][a-z0-9-]{1,62}$`).test(value);
+const slug = (value) => typeof value === "string" &&
+  /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/.test(value);
+const exact = (value, keys) => value && typeof value === "object" && !Array.isArray(value) &&
+  Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+const state = JSON.parse(rawState);
+const envelope = JSON.parse(rawEnvelope);
+if (!exact(envelope, ["command", "result"]) || envelope.command !== "portfolio status") {
+  throw new Error("portfolio envelope invalid");
+}
+const result = envelope.result;
+const required = ["page_id", "items", "repositories", "truncated", "total_items"];
+const allowed = result && typeof result === "object" && !Array.isArray(result) &&
+  required.every((key) => Object.hasOwn(result, key)) &&
+  Object.keys(result).every((key) => required.includes(key) || key === "next_page_id");
+if (!allowed || typeof result.page_id !== "string" || result.page_id !== requestedPageId ||
+    !Array.isArray(result.items) || result.items.length > 20 ||
+    !Array.isArray(result.repositories) || typeof result.truncated !== "boolean" ||
+    !Number.isInteger(result.total_items) || result.total_items < 0 ||
+    result.truncated !== Object.hasOwn(result, "next_page_id")) throw new Error("portfolio page invalid");
+const expectedPageId = `page-${state.pages.length + 1}`;
+if (requestedPageId !== expectedPageId || state.pages.includes(result.page_id)) throw new Error("portfolio page sequence invalid");
+if (result.truncated && result.next_page_id !== `page-${state.pages.length + 2}`) throw new Error("portfolio next page invalid");
+if (state.total_items !== null && state.total_items !== result.total_items) throw new Error("portfolio count changed");
+if (result.total_items === 0 ? (state.pages.length !== 0 || result.items.length !== 0 || result.truncated) : result.items.length === 0) {
+  throw new Error("portfolio page count invalid");
+}
+const nextItemCount = state.item_count + result.items.length;
+const nextPageCount = state.pages.length + 1;
+if (nextItemCount > result.total_items || nextPageCount > Math.max(result.total_items, 1) ||
+    (result.truncated && nextItemCount >= result.total_items) || (!result.truncated && nextItemCount !== result.total_items)) {
+  throw new Error("portfolio bounded count invalid");
+}
+for (const item of result.items) {
+  const itemKeys = ["project_id", "title", "repo_ids"];
+  if (!exact(item, itemKeys) || !id(item.project_id, "prj") || typeof item.title !== "string" ||
+      Buffer.byteLength(item.title, "utf8") > 256 || !Array.isArray(item.repo_ids) ||
+      item.repo_ids.length === 0 || item.repo_ids.length > 64 || !item.repo_ids.every((repoId) => id(repoId, "repo")) ||
+      new Set(item.repo_ids).size !== item.repo_ids.length || Object.hasOwn(state.projects, item.project_id)) {
+    throw new Error("portfolio item invalid");
+  }
+  state.projects[item.project_id] = item.repo_ids;
+}
+for (const repository of result.repositories) {
+  if (!exact(repository, ["repo_id", "slug", "allow_public"]) || !id(repository.repo_id, "repo") ||
+      !slug(repository.slug) || typeof repository.allow_public !== "boolean") throw new Error("portfolio repository invalid");
+  const next = JSON.stringify([repository.slug, repository.allow_public]);
+  if (Object.hasOwn(state.repositories, repository.repo_id) && state.repositories[repository.repo_id] !== next) {
+    throw new Error("portfolio repository changed");
+  }
+  state.repositories[repository.repo_id] = next;
+}
+state.pages.push(result.page_id);
+state.total_items = result.total_items;
+state.item_count = nextItemCount;
+state.next_page_id = result.truncated ? result.next_page_id : null;
+process.stdout.write(JSON.stringify(state));
+NODE
+)" || return $?
+done
+}
 
 resolve_portfolio_coordinates() {
-  node - "$portfolio_json" "$1" <<'NODE'
-const [portfolioJson, expectedSlug] = process.argv.slice(2);
-const portfolio = JSON.parse(portfolioJson);
-const result = portfolio?.result;
-if (!result || !Array.isArray(result.items) || !Array.isArray(result.repositories)) {
-  throw new Error("portfolio coordinates unavailable");
-}
-const repositoryIds = result.repositories
-  .filter((repository) => repository && repository.slug === expectedSlug &&
-    typeof repository.repo_id === "string")
-  .map((repository) => repository.repo_id);
+  node - "$portfolio_state" "$1" <<'NODE'
+const [rawState, expectedSlug] = process.argv.slice(2);
+const state = JSON.parse(rawState);
+if (!Array.isArray(state.pages) || state.next_page_id !== null || state.item_count !== state.total_items ||
+    !state.projects || !state.repositories) throw new Error("portfolio coordinates unavailable");
+const repositoryIds = Object.entries(state.repositories)
+  .filter(([, value]) => JSON.parse(value)[0] === expectedSlug)
+  .map(([repositoryId]) => repositoryId);
 if (repositoryIds.length !== 1) throw new Error("portfolio repository is missing or ambiguous");
 const [repositoryId] = repositoryIds;
-const projectIds = result.items
-  .filter((item) => item && typeof item.project_id === "string" &&
-    Array.isArray(item.repo_ids) && item.repo_ids.includes(repositoryId))
-  .map((item) => item.project_id);
+const projectIds = Object.entries(state.projects)
+  .filter(([, repoIds]) => Array.isArray(repoIds) && repoIds.includes(repositoryId))
+  .map(([projectId]) => projectId);
 if (projectIds.length !== 1) throw new Error("portfolio project is missing or ambiguous");
 process.stdout.write(`${projectIds[0]}\t${repositoryId}`);
 NODE
@@ -90,6 +205,8 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 
 <!-- task-start-contract: formal:begin -->
 ```bash
+prepare_task_start_gate || exit $?
+[ "$expected_repository_slug" = "<owner>/<repo>" ] || exit 1
 bind_portfolio_coordinates "<owner>/<repo>" || exit $?
 "$HOME/.local/bin/jhw-control-host" task start \
   --project "$project_id" --repo-id "$repo_id" --repo-path "$checkout_root" \
@@ -108,7 +225,8 @@ bind_portfolio_coordinates "<owner>/<repo>" || exit $?
 
 <!-- task-start-contract: temporary:begin -->
 ```bash
-bind_portfolio_coordinates "<expected-repository-slug>" || exit $?
+prepare_task_start_gate || exit $?
+bind_portfolio_coordinates "$expected_repository_slug" || exit $?
 "$HOME/.local/bin/jhw-control-host" task start \
   --project "$project_id" --repo-id "$repo_id" --repo-path "$checkout_root" \
   --temp-alias <alias> --goal <goal> \
@@ -126,7 +244,8 @@ bind_portfolio_coordinates "<expected-repository-slug>" || exit $?
 
 <!-- task-start-contract: resume:begin -->
 ```bash
-bind_portfolio_coordinates "<expected-repository-slug>" || exit $?
+prepare_task_start_gate || exit $?
+bind_portfolio_coordinates "$expected_repository_slug" || exit $?
 "$HOME/.local/bin/jhw-control-host" task start \
   --task <tsk-id> --repo-path "$checkout_root" --session <session-id>
 ```
@@ -191,7 +310,26 @@ Formal Task의 `--status completed`는 해당 Claim generation만 archive/releas
 1. **입력을 한 번에 수집한다.** 현재 Task의 종료 status(completed면 `--outcome` 포함)와 validation 1개 이상, 그리고 대상 좌표 — 기존 Task 재개면 `<tsk-id>`, 신규면 project/repo-id/repo-path와 Issue URL 또는 temporary 등록 필드. validation은 세션에서 실제 수행된 검증 근거만 사용하고 자동 생성하지 않는다.
 2. **대상 좌표를 추측하지 않는다.** 대상 start는 authorization gate의 launcher `portfolio status` 결과의 `repositories` 배열로 확인한다. 미등록 저장소면 멈추고 repository 등록을 먼저 안내한다. `--repo-path`는 대상 checkout의 절대경로를 존재 확인 후 사용한다.
 3. **(필요 시) Issue를 먼저 만든다.** 대상 Issue가 아직 없으면 사용자 제공 제목·본문으로 `gh issue create --repo <owner>/<repo>`를 실행하고, 반환된 URL만 authority coordinate로 사용한다. Issue 생성이 실패하면 finish 전이므로 아무것도 변하지 않은 상태다 — 멈추고 보고한다.
-4. **finish를 먼저 실행한다** (위 종료 규격 그대로). `--status handoff`로 넘기는 경우 `--next-step`에 대상 Issue URL 또는 Task 좌표를 남겨 체인을 기록한다. finish가 nonzero면 **start를 실행하지 않고** 멈춘다.
+4. **대상 gate를 finish 전에 실행하고, 그 검증 결과를 보존한 뒤 finish를 실행한다.** target checkout의 absolute root는 `prepare_task_start_gate <absolute-target-checkout-root>`가 현재 checkout 직접 사실과 origin fetch/push identity로 검증해 `checkout_root`에 보존한다. 그 gate의 portfolio association도 finish 전에 검증한다. gate가 nonzero이면 finish/start 모두 실행하지 않는다. 아래 formal target의 executable sequencing contract처럼 finish가 nonzero이면 **start를 실행하지 않고** 멈춘다. Temporary/resume target도 같은 retained `checkout_root`와 verified coordinates를 사용하며, finish 뒤에 gate를 다시 실행하지 않는다.
+
+<!-- task-start-contract: switch:begin -->
+```bash
+target_checkout_root="<absolute-target-checkout-root>"
+prepare_task_start_gate "$target_checkout_root" || exit $?
+[ "$expected_repository_slug" = "<owner>/<repo>" ] || exit 1
+bind_portfolio_coordinates "$expected_repository_slug" || exit $?
+
+jhw-control task finish --task <tsk-id> --claim <claim-id> \
+  --status handoff --validation <validation>
+rc=$?
+if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+
+"$HOME/.local/bin/jhw-control-host" task start \
+  --project "$project_id" --repo-id "$repo_id" --repo-path "$checkout_root" \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
+```
+<!-- task-start-contract: switch:end -->
+
 5. **start를 실행한다** (위 새 Task 시작 또는 재개 규격의 authorization gate 포함). `--session`은 finish에 쓴 것과 같은 session-id를 승계한다.
 6. **finish 성공 후 start 실패는 정상 상태다** — 현재 Task는 이미 종료됐고 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. start 재시도는 finish를 반복하지 않고 start만 다시 실행한다.
 7. **결과를 함께 보고한다.** 종료한 Task(tsk-id, status, released claim)와 시작한 Task(tsk-id, 새 claim_id, branch, worktree_ref)를 한 번에 보여준다.
