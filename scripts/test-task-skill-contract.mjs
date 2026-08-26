@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,8 +14,10 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const canonicalTask = join(repoRoot, "skills", "claude", "task.md");
 const codexReference = join(repoRoot, "skills", "codex", "jhw-task", "references", "task.md");
-const taskId = "tsk-018f1234-5678-7abc-8def-0123456789ab";
-const claimId = "clm-018f1234-5678-7abc-8def-0123456789ac";
+const currentTaskId = "tsk-018f1234-5678-7abc-8def-0123456789ab";
+const targetTaskId = "tsk-028f1234-5678-7abc-8def-0123456789ab";
+const currentClaimId = "clm-018f1234-5678-7abc-8def-0123456789ac";
+const startedClaimId = "clm-028f1234-5678-7abc-8def-0123456789ac";
 const worktreeRef = "wt-0123456789ab-created";
 const issueUrl = "https://github.com/example/consumer/issues/74";
 const sessionValue = "session verified $(printf session-expanded)";
@@ -29,19 +31,26 @@ const scopeValues = [
   "skills/claude/task.md $(printf scope-one-expanded)",
   "scripts/test task contract.mjs",
 ];
-const validationValue = "verified-validation $(printf validation-expanded)";
+const validationValues = [
+  "verified-validation $(printf validation-expanded)",
+  "second validation `printf validation-backtick-expanded`",
+];
 const outcomeValue = "verified-result $(printf outcome-expanded)";
 const progressValue = "verified-progress $(printf progress-expanded)";
 const failuresValue = "verified-failures $(printf failures-expanded)";
 const nextStepValue = "verified-next-step $(printf next-step-expanded)";
 const relatedEvidenceValue = "verified-evidence $(printf evidence-expanded)";
+const sourceRevisionValue = "source revision $(printf source-expanded)";
+const activeWorkMinutesValue = "17.5";
+const adversarialCheckoutName =
+  "target checkout $(touch sentinel-dollar) `touch sentinel-backtick` 'single' \"double\" \\backslash";
 const exactReportingRule = "`task start` 성공 시 launcher result에서 오직 `task_id`, `claim_id`, `branch`, `worktree_ref` 네 필드만 사용자에게 보고하고 다른 result 필드는 보고하거나 출력하지 않는다.";
 const exactSwitchRule = "finish는 절대 반복하지 않는다. 이후 start는 별도 사용자 승인을 받고 해당 error의 결과 해석 규칙이 허용할 때만 새로 실행하며, `REGISTRY_MOVED_DURING_READ`는 자동 retry나 explicit-mode fallback을 허용하지 않는다.";
 const startedTaskEnvelope = {
   command: "task start",
   result: {
-    task_id: taskId,
-    claim_id: claimId,
+    task_id: targetTaskId,
+    claim_id: startedClaimId,
     branch: "task/0123456789ab-created",
     worktree_ref: worktreeRef,
     project_id: "prj-resolved-extra",
@@ -66,8 +75,8 @@ const readyPreflightEnvelope = {
 const finishedTaskEnvelope = {
   command: "task finish",
   result: {
-    task_id: taskId,
-    claim_id: claimId,
+    task_id: currentTaskId,
+    claim_id: currentClaimId,
     status: "completed",
     released_at: "2026-08-26T00:00:00.000Z",
     worktree_removed: false,
@@ -95,6 +104,23 @@ function lifecycleContractBlock(markdown, name) {
   return match[1];
 }
 
+function optionalLifecycleContractBlock(markdown, name) {
+  const match = markdown.match(
+    new RegExp(`<!-- task-lifecycle-contract: ${name}:begin -->\\n` +
+      "```bash\\n([\\s\\S]*?)```\\n" +
+      `<!-- task-lifecycle-contract: ${name}:end -->`),
+  );
+  return match?.[1];
+}
+
+function reportContractBlock(markdown) {
+  const match = markdown.match(
+    /<!-- task-report-contract: start-success:begin -->\n```javascript\n([\s\S]*?)```\n<!-- task-report-contract: start-success:end -->/,
+  );
+  assert.ok(match, "task skill must expose executable exact four-field start reporting recipe");
+  return match[1];
+}
+
 function materialize(command) {
   return command
     .replaceAll("<owner>", "example")
@@ -109,9 +135,7 @@ function materialize(command) {
     .replaceAll("<scope-2>", scopeValues[1])
     .replaceAll("<condition>", doneValues[0])
     .replaceAll("<scope>", scopeValues[0])
-    .replaceAll("<tsk-id>", taskId)
-    .replaceAll("<claim-id>", claimId)
-    .replaceAll("<validation>", validationValue)
+    .replaceAll("<tsk-id>", targetTaskId)
     .replaceAll("<result>", outcomeValue)
     .replaceAll("<progress>", progressValue)
     .replaceAll("<failures>", failuresValue)
@@ -120,8 +144,26 @@ function materialize(command) {
     .replaceAll("<session-id>", sessionValue);
 }
 
-function materializeLifecycle(command, { status, checkoutRoot = "" }) {
-  return materialize(command)
+function materializeLegacyLifecycle(command, { status, checkoutRoot = "", finishInput }) {
+  return command
+    .replaceAll("<owner>", "example")
+    .replaceAll("<repo>", "consumer")
+    .replaceAll("<number>", "74")
+    .replaceAll("<temp-alias>", tempAlias)
+    .replaceAll("<goal>", tempGoal)
+    .replaceAll("<condition-1>", doneValues[0])
+    .replaceAll("<condition-2>", doneValues[1])
+    .replaceAll("<scope-1>", scopeValues[0])
+    .replaceAll("<scope-2>", scopeValues[1])
+    .replaceAll("<tsk-id>", currentTaskId)
+    .replaceAll("<claim-id>", currentClaimId)
+    .replaceAll("<validation>", finishInput.validations[0] ?? "")
+    .replaceAll("<result>", finishInput.outcome)
+    .replaceAll("<progress>", finishInput.progress)
+    .replaceAll("<failures>", finishInput.failures)
+    .replaceAll("<next-step>", finishInput.nextStep)
+    .replaceAll("<related-adr-and-evidence>", finishInput.relatedEvidence)
+    .replaceAll("<session-id>", sessionValue)
     .replaceAll("<finish-status>", status)
     .replaceAll("<absolute-target-checkout-root>", checkoutRoot);
 }
@@ -142,24 +184,42 @@ function expectedStartArgs(route, checkoutRoot) {
       "--session", sessionValue,
     ];
   }
-  return ["task", "start", "--task", taskId, "--repo-path", checkoutRoot, "--session", sessionValue];
+  return ["task", "start", "--task", targetTaskId, "--repo-path", checkoutRoot, "--session", sessionValue];
 }
 
-function expectedFinishArgs(status) {
-  const base = ["task", "finish", "--task", taskId, "--claim", claimId, "--status", status];
-  if (status === "completed") {
-    return [...base, "--outcome", outcomeValue, "--validation", validationValue];
+function makeFinishInput(status, overrides = {}) {
+  return {
+    status,
+    outcome: status === "completed" ? outcomeValue : "",
+    sourceRevision: "",
+    activeWorkMinutes: "",
+    progress: "",
+    failures: "",
+    nextStep: "",
+    relatedEvidence: "",
+    validations: [validationValues[0]],
+    ...overrides,
+  };
+}
+
+function expectedFinishArgs(input) {
+  const base = [
+    "task", "finish", "--task", currentTaskId, "--claim", currentClaimId,
+    "--status", input.status,
+  ];
+  if (input.status === "completed") {
+    base.push("--outcome", input.outcome);
   }
-  if (status === "handoff") {
-    return [
-      ...base, "--validation", validationValue,
-      "--progress", progressValue,
-      "--failures", failuresValue,
-      "--next-step", nextStepValue,
-      "--related-adr-and-evidence", relatedEvidenceValue,
-    ];
+  if (input.status === "handoff") {
+    if (input.progress) base.push("--progress", input.progress);
+    if (input.failures) base.push("--failures", input.failures);
+    if (input.nextStep) base.push("--next-step", input.nextStep);
+    if (input.relatedEvidence) base.push("--related-adr-and-evidence", input.relatedEvidence);
   }
-  return [...base, "--validation", validationValue];
+  if (input.sourceRevision) base.push("--source-task-revision", input.sourceRevision);
+  if (input.activeWorkMinutes) base.push("--active-work-minutes", input.activeWorkMinutes);
+  for (const validation of input.validations) base.push("--validation", validation);
+  return base;
 }
 
 const fakeLauncherSource = String.raw`#!/usr/bin/node
@@ -217,8 +277,8 @@ const fakeRawControlBashEnv = String.raw`jhw-control() {
 export -f jhw-control
 `;
 
-async function createCheckout(root) {
-  const checkout = join(root, "checkout");
+async function createCheckout(root, name = "checkout") {
+  const checkout = join(root, name);
   await mkdir(checkout, { recursive: true });
   await execFileAsync("git", ["init", "--quiet"], { cwd: checkout });
   return checkout;
@@ -249,6 +309,8 @@ function launcherEnv({
   taskStartExit = 0,
   taskStartError = "",
   finishExit = 0,
+  finishInput = makeFinishInput("handoff"),
+  targetCheckout = checkoutRoot,
 }) {
   return {
     HOME: home,
@@ -264,12 +326,51 @@ function launcherEnv({
     JHW_TASK_CONTRACT_VALID_STARTS: JSON.stringify(routes.map(({ name }) => expectedStartArgs(name, checkoutRoot))),
     JHW_TASK_CONTRACT_FINISH_EXIT: String(finishExit),
     JHW_TASK_CONTRACT_FINISH_PAYLOAD: JSON.stringify(finishedTaskEnvelope),
-    JHW_TASK_CONTRACT_VALID_FINISHES: JSON.stringify([
-      expectedFinishArgs("completed"),
-      expectedFinishArgs("handoff"),
-      expectedFinishArgs("abandoned"),
-    ]),
+    JHW_TASK_CONTRACT_VALID_FINISHES: JSON.stringify([expectedFinishArgs(finishInput)]),
+    JHW_FINISH_STATUS: finishInput.status,
+    JHW_CURRENT_TASK_ID: currentTaskId,
+    JHW_CURRENT_CLAIM_ID: currentClaimId,
+    JHW_FINISH_OUTCOME: finishInput.outcome,
+    JHW_SOURCE_TASK_REVISION: finishInput.sourceRevision,
+    JHW_ACTIVE_WORK_MINUTES: finishInput.activeWorkMinutes,
+    JHW_HANDOFF_PROGRESS: finishInput.progress,
+    JHW_HANDOFF_FAILURES: finishInput.failures,
+    JHW_HANDOFF_NEXT_STEP: finishInput.nextStep,
+    JHW_HANDOFF_RELATED_EVIDENCE: finishInput.relatedEvidence,
+    JHW_TARGET_CHECKOUT: targetCheckout,
+    JHW_TARGET_TASK_ID: targetTaskId,
+    JHW_TARGET_ISSUE_URL: issueUrl,
+    JHW_SESSION_VALUE: sessionValue,
+    JHW_TEMP_ALIAS: tempAlias,
+    JHW_TEMP_GOAL: tempGoal,
+    JHW_DONE_ONE: doneValues[0],
+    JHW_DONE_TWO: doneValues[1],
+    JHW_SCOPE_ONE: scopeValues[0],
+    JHW_SCOPE_TWO: scopeValues[1],
   };
+}
+
+async function pathExists(path) {
+  return access(path).then(() => true, (error) => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  });
+}
+
+function composedFinishCommand(markdown) {
+  return optionalLifecycleContractBlock(markdown, "finish") ??
+    lifecycleContractBlock(markdown, "finish-standalone");
+}
+
+function composedSwitchCommand(markdown, target, legacyValues) {
+  const finish = optionalLifecycleContractBlock(markdown, "finish");
+  const targetRoot = optionalLifecycleContractBlock(markdown, "switch-target-root");
+  const start = optionalLifecycleContractBlock(markdown, `switch-${target}-start`);
+  if (finish && targetRoot && start) return `${targetRoot}\n${finish}\n${start}`;
+  return materializeLegacyLifecycle(
+    lifecycleContractBlock(markdown, `switch-${target}`),
+    legacyValues,
+  );
 }
 
 async function readCalls(path) {
@@ -318,7 +419,17 @@ async function runWorkflow(markdown, route, {
   }
 }
 
-async function runFinishWorkflow(markdown, { status, finishExit = 0 }) {
+async function runStartReportingRecipe(markdown) {
+  const result = await execFileAsync(process.execPath, ["-e", reportContractBlock(markdown)], {
+    env: {
+      PATH: "/usr/bin:/bin",
+      JHW_TASK_START_ENVELOPE: JSON.stringify(startedTaskEnvelope),
+    },
+  });
+  return JSON.parse(result.stdout);
+}
+
+async function runFinishWorkflow(markdown, { finishInput, finishExit = 0 }) {
   const root = await mkdtemp(join(tmpdir(), "jhw-task-finish-contract-"));
   try {
     const log = join(root, "launcher.log");
@@ -326,10 +437,14 @@ async function runFinishWorkflow(markdown, { status, finishExit = 0 }) {
     const checkoutRoot = await createCheckout(root);
     const { home } = await installFakeLauncher(root);
     const bashEnv = await installFakeRawControl(root);
-    const command = materializeLifecycle(lifecycleContractBlock(markdown, "finish-standalone"), { status });
-    const result = await execFileAsync("bash", ["-c", command], {
+    const canonical = optionalLifecycleContractBlock(markdown, "finish");
+    const command = canonical ?? materializeLegacyLifecycle(
+      lifecycleContractBlock(markdown, "finish-standalone"),
+      { status: finishInput.status, finishInput },
+    );
+    const result = await execFileAsync("bash", ["-c", command, "task-finish-contract", ...finishInput.validations], {
       cwd: checkoutRoot,
-      env: launcherEnv({ home, log, rawLog, bashEnv, checkoutRoot, finishExit }),
+      env: launcherEnv({ home, log, rawLog, bashEnv, checkoutRoot, finishExit, finishInput }),
     }).then(
       ({ stdout, stderr }) => ({ exitCode: 0, stdout, stderr }),
       (error) => ({ exitCode: error.code, stdout: error.stdout ?? "", stderr: error.stderr ?? "" }),
@@ -351,25 +466,44 @@ async function runSwitchWorkflow(markdown, {
   taskStartExit = 0,
   taskStartError = "",
   invalidTargetRoot = false,
+  adversarialTargetRoot = false,
+  finishInput = makeFinishInput(status),
 }) {
   const root = await mkdtemp(join(tmpdir(), "jhw-task-switch-contract-"));
   try {
     const log = join(root, "launcher.log");
     const rawLog = join(root, "raw-control.log");
-    const checkoutRoot = await createCheckout(root);
+    const checkoutRoot = await createCheckout(
+      root,
+      adversarialTargetRoot ? adversarialCheckoutName : "checkout",
+    );
     const { home } = await installFakeLauncher(root);
     const bashEnv = await installFakeRawControl(root);
     const targetValue = invalidTargetRoot ? "relative-target" : checkoutRoot;
-    const command = materializeLifecycle(lifecycleContractBlock(markdown, `switch-${target}`), {
+    const command = composedSwitchCommand(markdown, target, {
       status,
       checkoutRoot: targetValue,
+      finishInput,
     });
-    const result = await execFileAsync("bash", ["-c", command], {
+    const result = await execFileAsync(
+      "bash",
+      ["-c", command, "task-switch-contract", ...finishInput.validations],
+      {
       cwd: root,
       env: launcherEnv({
-        home, log, rawLog, bashEnv, checkoutRoot, finishExit, taskStartExit, taskStartError,
+        home,
+        log,
+        rawLog,
+        bashEnv,
+        checkoutRoot,
+        finishExit,
+        taskStartExit,
+        taskStartError,
+        finishInput,
+        targetCheckout: targetValue,
       }),
-    }).then(
+      },
+    ).then(
       ({ stdout, stderr }) => ({ exitCode: 0, stdout, stderr }),
       (error) => ({ exitCode: error.code, stdout: error.stdout ?? "", stderr: error.stderr ?? "" }),
     );
@@ -378,6 +512,10 @@ async function runSwitchWorkflow(markdown, {
       calls: await readCalls(log),
       rawCalls: await readRawCalls(rawLog),
       checkoutRoot,
+      sentinelExecuted: await Promise.all([
+        pathExists(join(root, "sentinel-dollar")),
+        pathExists(join(root, "sentinel-backtick")),
+      ]).then((values) => values.some(Boolean)),
     };
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -401,7 +539,7 @@ async function assertStrictLauncherOracle() {
     const validResume = expectedStartArgs("resume", checkoutRoot);
     const invalidStarts = [
       validFormal.slice(0, -2),
-      [...validFormal, "--task", taskId],
+      [...validFormal, "--task", targetTaskId],
       [...validFormal, "--project", "prj-forbidden", "--repo-id", "repo-forbidden"],
       validTemporary.filter((value, index) => !([10, 11, 12, 13].includes(index))),
       [...validTemporary, "--issue-url", issueUrl],
@@ -419,16 +557,18 @@ async function assertStrictLauncherOracle() {
         `strict fake launcher must reject invalid argv: ${JSON.stringify(argv)}; stderr=${result.stderr}`);
       assert.deepEqual(JSON.parse(result.stderr), { error: { code: "INVALID_TEST_ARGV" } });
     }
-    const validCompleted = expectedFinishArgs("completed");
+    const completedInput = makeFinishInput("completed");
+    const handoffInput = makeFinishInput("handoff");
+    const validCompleted = expectedFinishArgs(completedInput);
     const invalidFinishes = [
-      validCompleted.slice(0, -2),
-      validCompleted.filter((value) => value !== outcomeValue),
-      [...validCompleted, "--progress", progressValue],
-      [...expectedFinishArgs("handoff"), "--outcome", outcomeValue],
+      { argv: validCompleted.slice(0, -2), input: completedInput },
+      { argv: validCompleted.filter((value) => value !== outcomeValue), input: completedInput },
+      { argv: [...validCompleted, "--progress", progressValue], input: completedInput },
+      { argv: [...expectedFinishArgs(handoffInput), "--outcome", outcomeValue], input: handoffInput },
     ];
-    for (const argv of invalidFinishes) {
+    for (const { argv, input } of invalidFinishes) {
       const result = await execFileAsync(launcher, argv, {
-        env: launcherEnv({ home, log, rawLog, bashEnv, checkoutRoot }),
+        env: launcherEnv({ home, log, rawLog, bashEnv, checkoutRoot, finishInput: input }),
       }).then(
         () => ({ exitCode: 0, stderr: "" }),
         (error) => ({ exitCode: error.code, stderr: error.stderr ?? "" }),
@@ -454,6 +594,10 @@ function assertLauncherV3Fixtures() {
     /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.match(startedTaskEnvelope.result.worktree_ref, /^wt-[a-z0-9][a-z0-9-]{1,120}$/);
   assert.equal(startedTaskEnvelope.result.branch, `task/${startedTaskEnvelope.result.worktree_ref.slice(3)}`);
+  assert.notEqual(currentTaskId, targetTaskId,
+    "strict oracle must distinguish the released Task from the resumed target Task");
+  assert.notEqual(currentClaimId, startedClaimId,
+    "strict oracle must distinguish the released Claim from the new Claim");
   assert.equal(finishedTaskEnvelope.command, "task finish");
   assert.deepEqual(Object.keys(finishedTaskEnvelope.result), [
     "task_id", "claim_id", "status", "released_at", "worktree_removed",
@@ -482,16 +626,27 @@ function assertStaticStartContract(label, markdown) {
 
 function assertStaticFinishContract(label, markdown) {
   const lifecycleBlocks = [
-    lifecycleContractBlock(markdown, "finish-standalone"),
-    lifecycleContractBlock(markdown, "switch-formal"),
-    lifecycleContractBlock(markdown, "switch-temporary"),
-    lifecycleContractBlock(markdown, "switch-resume"),
+    lifecycleContractBlock(markdown, "finish"),
+    lifecycleContractBlock(markdown, "switch-target-root"),
+    lifecycleContractBlock(markdown, "switch-formal-start"),
+    lifecycleContractBlock(markdown, "switch-temporary-start"),
+    lifecycleContractBlock(markdown, "switch-resume-start"),
   ];
   for (const block of lifecycleBlocks) {
     assert.doesNotMatch(block, /(^|[^-])jhw-control task finish/m,
       `${label}: releases must never call raw jhw-control`);
     assert.doesNotMatch(block, /jhw-control-host" preflight|portfolio status|\.env|source [^\n]*/,
       `${label}: lifecycle blocks rely only on launcher hidden preflight`);
+  }
+  assert.equal(markdown.match(/finish_args=\(task finish/g)?.length, 1,
+    `${label}: task finish argv builder must have one canonical executable source`);
+  assert.equal(markdown.match(/jhw-control-host" "\$\{finish_args\[@\]\}"/g)?.length, 1,
+    `${label}: absolute host finish invocation must have one canonical executable source`);
+  assert.equal(markdown.match(/case "\$finish_status" in/g)?.length, 1,
+    `${label}: status dispatch must exist only in the canonical finish block`);
+  for (const removedMarker of ["finish-standalone", "switch-formal", "switch-temporary", "switch-resume"]) {
+    assert.doesNotMatch(markdown, new RegExp(`task-lifecycle-contract: ${removedMarker}:begin`),
+      `${label}: copied lifecycle block ${removedMarker} must stay removed`);
   }
   assert.doesNotMatch(markdown, /(^|[^-])jhw-control task finish/m);
   assert.match(markdown, /이전 Claim은 이미 release/,
@@ -543,42 +698,121 @@ function assertStaticFinishContract(label, markdown) {
     `${label}: duplicate inspection entries need their own recovery action`);
 }
 
+async function assertReviewFixes(label, markdown) {
+  const checks = [
+    {
+      name: "minimal and optional/repeated Handoff argv",
+      run: async () => {
+        for (const finishInput of [
+          makeFinishInput("handoff"),
+          makeFinishInput("handoff", { progress: progressValue }),
+          makeFinishInput("handoff", { failures: failuresValue }),
+          makeFinishInput("handoff", { nextStep: nextStepValue }),
+          makeFinishInput("handoff", { relatedEvidence: relatedEvidenceValue }),
+          makeFinishInput("handoff", { validations: validationValues }),
+          makeFinishInput("handoff", { sourceRevision: sourceRevisionValue }),
+          makeFinishInput("handoff", { activeWorkMinutes: activeWorkMinutesValue }),
+          makeFinishInput("handoff", {
+            progress: progressValue,
+            failures: failuresValue,
+            nextStep: nextStepValue,
+            relatedEvidence: relatedEvidenceValue,
+            sourceRevision: sourceRevisionValue,
+            activeWorkMinutes: activeWorkMinutesValue,
+            validations: validationValues,
+          }),
+        ]) {
+          const result = await runFinishWorkflow(markdown, { finishInput });
+          assert.equal(result.exitCode, 0);
+          assert.deepEqual(result.calls, [expectedFinishArgs(finishInput)]);
+          assert.deepEqual(result.rawCalls, []);
+        }
+      },
+    },
+    {
+      name: "distinct current and resumed target Task IDs",
+      run: async () => {
+        const finishInput = makeFinishInput("completed");
+        const result = await runSwitchWorkflow(markdown, {
+          status: "completed", target: "resume", finishInput,
+        });
+        assert.equal(result.exitCode, 0);
+        assert.deepEqual(result.calls, [
+          expectedFinishArgs(finishInput),
+          expectedStartArgs("resume", result.checkoutRoot),
+        ]);
+        assert.equal(result.calls[0][3], currentTaskId);
+        assert.equal(result.calls[1][3], targetTaskId);
+        assert.notEqual(result.calls[0][3], result.calls[1][3]);
+      },
+    },
+    {
+      name: "adversarial target checkout argv boundary",
+      run: async () => {
+        const finishInput = makeFinishInput("handoff");
+        const result = await runSwitchWorkflow(markdown, {
+          status: "handoff",
+          target: "formal",
+          finishInput,
+          adversarialTargetRoot: true,
+        });
+        assert.equal(result.exitCode, 0);
+        assert.equal(result.sentinelExecuted, false, "target root text must never execute shell substitutions");
+        assert.deepEqual(result.calls[1], expectedStartArgs("formal", result.checkoutRoot),
+          "adversarial target root must remain one exact --repo-path argv value");
+      },
+    },
+    {
+      name: "single-source composed finish contract",
+      run: async () => assertStaticFinishContract(label, markdown),
+    },
+  ];
+  const results = await Promise.allSettled(checks.map(({ run }) => run()));
+  const failures = results.flatMap((result, index) => result.status === "rejected"
+    ? [`${checks[index].name}: ${result.reason?.message ?? result.reason}`]
+    : []);
+  assert.deepEqual(failures, [], `${label}: review-fix contract failures:\n${failures.join("\n")}`);
+}
+
 async function assertFinishConsumerContract(label, markdown) {
+  await assertReviewFixes(label, markdown);
+
   for (const status of ["completed", "handoff", "abandoned"]) {
-    const result = await runFinishWorkflow(markdown, { status });
+    const finishInput = makeFinishInput(status);
+    const result = await runFinishWorkflow(markdown, { finishInput });
     assert.equal(result.exitCode, 0, `${label} standalone ${status}: finish argv must pass`);
-    assert.deepEqual(result.calls, [expectedFinishArgs(status)]);
+    assert.deepEqual(result.calls, [expectedFinishArgs(finishInput)]);
     assert.deepEqual(result.rawCalls, [], `${label} standalone ${status}: raw control must not run`);
   }
 
   const switchCases = [
     { status: "completed", target: "formal", start: /--resolve-from-checkout true.*--issue-url/ },
     { status: "completed", target: "temporary", start: /--resolve-from-checkout true.*--temp-alias/ },
-    { status: "completed", target: "resume", start: new RegExp(`--task ${taskId}`) },
+    { status: "completed", target: "resume", start: new RegExp(`--task ${targetTaskId}`) },
     { status: "handoff", target: "formal", start: /--resolve-from-checkout true.*--issue-url/ },
     { status: "handoff", target: "temporary", start: /--resolve-from-checkout true.*--temp-alias/ },
-    { status: "handoff", target: "resume", start: new RegExp(`--task ${taskId}`) },
+    { status: "handoff", target: "resume", start: new RegExp(`--task ${targetTaskId}`) },
     { status: "abandoned", target: "formal", start: /--resolve-from-checkout true.*--issue-url/ },
     { status: "abandoned", target: "temporary", start: /--resolve-from-checkout true.*--temp-alias/ },
-    { status: "abandoned", target: "resume", start: new RegExp(`--task ${taskId}`) },
+    { status: "abandoned", target: "resume", start: new RegExp(`--task ${targetTaskId}`) },
   ];
 
   for (const testCase of switchCases) {
-    const result = await runSwitchWorkflow(markdown, testCase);
+    const finishInput = makeFinishInput(testCase.status);
+    const result = await runSwitchWorkflow(markdown, { ...testCase, finishInput });
     assert.equal(result.exitCode, 0, `${label} switch ${testCase.status}/${testCase.target}: route must pass`);
     assert.deepEqual(result.calls.map(commandName), ["task finish", "task start"]);
     assert.deepEqual(result.rawCalls, [], `${label} switch must not invoke raw control`);
     assert.match(result.calls[0].join(" "), new RegExp(`--status ${testCase.status}`));
     assert.match(result.calls[0].join(" "), /--validation verified-validation/);
     assert.equal(result.calls[0].includes("--outcome"), testCase.status === "completed");
-    if (testCase.status === "handoff") assert.match(result.calls[0].join(" "), /--progress verified-progress/);
     assert.match(result.calls[1].join(" "), testCase.start);
     if (testCase.target === "resume") {
       assert.doesNotMatch(result.calls[1].join(" "), /--resolve-from-checkout|--project|--repo-id/);
     } else {
       assert.doesNotMatch(result.calls[1].join(" "), /--project|--repo-id/);
     }
-    assert.deepEqual(result.calls[0], expectedFinishArgs(testCase.status));
+    assert.deepEqual(result.calls[0], expectedFinishArgs(finishInput));
     assert.deepEqual(result.calls[1], expectedStartArgs(testCase.target, result.checkoutRoot));
   }
 
@@ -614,8 +848,6 @@ async function assertFinishConsumerContract(label, markdown) {
     assert.deepEqual(JSON.parse(associationFailure.stderr), { error: { code } });
     assert.equal(associationFailure.calls.filter((call) => commandName(call) === "task finish").length, 1);
   }
-
-  assertStaticFinishContract(label, markdown);
 }
 
 async function assertConsumerContract(label, taskPath) {
@@ -650,6 +882,12 @@ async function assertConsumerContract(label, taskPath) {
   assert.deepEqual(JSON.parse(moved.stderr), { error: { code: "REGISTRY_MOVED_DURING_READ" } });
   assert.doesNotMatch(moved.calls.flat().join("\n"), /portfolio status|--project|--repo-id/);
   await assertFinishConsumerContract(label, markdown);
+  assert.deepEqual(await runStartReportingRecipe(markdown), {
+    task_id: targetTaskId,
+    claim_id: startedClaimId,
+    branch: startedTaskEnvelope.result.branch,
+    worktree_ref: worktreeRef,
+  }, `${label}: executable reporting recipe must project exactly four fields and discard producer extras`);
 }
 
 async function main() {
