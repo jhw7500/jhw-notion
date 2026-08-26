@@ -19,25 +19,55 @@ argument-hint: "(start | resume | promote | handoff | finish | switch | recover)
 
 새 Task 등록·기존 Task 재개·Handoff에서의 재개·switch의 후속 start는 사용자가 명시적으로 요청하거나 승인했을 때만 실행한다. 그 요청/승인은 이 흐름의 승인이다. 이미 명시적으로 승인했다면 두 번째 승인을 묻지 않는다. 승인되지 않았다면 start 전에 한 번만 승인을 받는다.
 
-모든 `task start`는 아래 순서로 실행한다. raw config·`.env`를 source/read하지 않고, raw `jhw-control`을 호출하지 않는다. `preflight`가 nonzero이면 그 exit로 즉시 멈춘다. 그 뒤 `portfolio status` 또는 `task start`를 실행하거나 Task·Claim·worktree mutation을 시도하지 않는다. `portfolio status`의 반환값으로만 project/repository ID와 checkout 좌표를 검증하며 이름·이전 로그·추측으로 대체하지 않는다.
+모든 `task start`는 아래 순서로 실행한다. raw config·`.env`를 source/read하지 않고, raw `jhw-control`을 호출하지 않는다. `preflight`가 nonzero이면 그 exit로 즉시 멈춘다. 그 뒤 `portfolio status` 또는 `task start`를 실행하거나 Task·Claim·worktree mutation을 시도하지 않는다. `portfolio status`의 반환값만으로 project/repository ID와 그 association을 검증하며 이름·이전 로그·추측으로 대체하지 않는다. checkout root는 portfolio에 없는 필드이므로 현재 checkout의 직접 `git rev-parse --show-toplevel` 사실로만 검증한다.
 
-<!-- task-start-contract: begin -->
+<!-- task-start-contract: gate:begin -->
 ```bash
 "$HOME/.local/bin/jhw-control-host" preflight
 rc=$?
 if [ "$rc" -ne 0 ]; then exit "$rc"; fi
 
-"$HOME/.local/bin/jhw-control-host" portfolio status
+portfolio_json="$("$HOME/.local/bin/jhw-control-host" portfolio status)"
 rc=$?
 if [ "$rc" -ne 0 ]; then exit "$rc"; fi
-# Verify the returned canonical project ID, repository ID, and absolute checkout root.
 
-"$HOME/.local/bin/jhw-control-host" task start \
-  --project <verified-project-id> --repo-id <verified-repo-id> \
-  --repo-path <absolute-checkout-root> \
-  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
+checkout_root="$(git rev-parse --show-toplevel)"
+rc=$?
+if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+case "$checkout_root" in /*) ;; *) exit 1;; esac
+git -C "$checkout_root" rev-parse --is-inside-work-tree >/dev/null || exit $?
+
+resolve_portfolio_coordinates() {
+  node - "$portfolio_json" "$1" <<'NODE'
+const [portfolioJson, expectedSlug] = process.argv.slice(2);
+const portfolio = JSON.parse(portfolioJson);
+const result = portfolio?.result;
+if (!result || !Array.isArray(result.items) || !Array.isArray(result.repositories)) {
+  throw new Error("portfolio coordinates unavailable");
+}
+const repositoryIds = result.repositories
+  .filter((repository) => repository && repository.slug === expectedSlug &&
+    typeof repository.repo_id === "string")
+  .map((repository) => repository.repo_id);
+if (repositoryIds.length !== 1) throw new Error("portfolio repository is missing or ambiguous");
+const [repositoryId] = repositoryIds;
+const projectIds = result.items
+  .filter((item) => item && typeof item.project_id === "string" &&
+    Array.isArray(item.repo_ids) && item.repo_ids.includes(repositoryId))
+  .map((item) => item.project_id);
+if (projectIds.length !== 1) throw new Error("portfolio project is missing or ambiguous");
+process.stdout.write(`${projectIds[0]}\t${repositoryId}`);
+NODE
+}
+
+bind_portfolio_coordinates() {
+  coordinates="$(resolve_portfolio_coordinates "$1")" || return $?
+  project_id="${coordinates%%$'\t'*}"
+  repo_id="${coordinates#*$'\t'}"
+  [ "$project_id" != "$coordinates" ] && [ -n "$repo_id" ]
+}
 ```
-<!-- task-start-contract: end -->
+<!-- task-start-contract: gate:end -->
 
 `task start` 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 보고하고 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
 
@@ -56,7 +86,16 @@ if [ "$rc" -ne 0 ]; then exit "$rc"; fi
 
 ### Formal GitHub Issue
 
-Issue URL이 authority coordinate다. 서버가 verified repository token으로 current node ID, canonical URL, revision, `<owner>/<repo>#<number>` alias를 도출한다. 위 authorization gate의 formal Issue form을 사용한다.
+Issue URL이 authority coordinate다. 서버가 verified repository token으로 current node ID, canonical URL, revision, `<owner>/<repo>#<number>` alias를 도출한다. 위 authorization gate 뒤에 **한 번만** 다음 formal start를 실행한다.
+
+<!-- task-start-contract: formal:begin -->
+```bash
+bind_portfolio_coordinates "<owner>/<repo>" || exit $?
+"$HOME/.local/bin/jhw-control-host" task start \
+  --project "$project_id" --repo-id "$repo_id" --repo-path "$checkout_root" \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
+```
+<!-- task-start-contract: formal:end -->
 
 `--issue-node-id`/`--issue-revision`은 independently verified expectation이 이미 있을 때만 추가한다. caller 값을 source authority처럼 만들지 않는다.
 
@@ -65,25 +104,33 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 `--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다.
 
 위 authorization gate의 preflight와 portfolio coordinate verification을 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다.
+`<expected-repository-slug>`는 current checkout의 verified Git remote identity에서 얻은 canonical `<owner>/<repo>`이며, `repo_id`·이전 로그·추측으로 대체하지 않는다. 확인할 수 없으면 멈춘다.
 
+<!-- task-start-contract: temporary:begin -->
 ```bash
+bind_portfolio_coordinates "<expected-repository-slug>" || exit $?
 "$HOME/.local/bin/jhw-control-host" task start \
-  --project <verified-project-id> --repo-id <verified-repo-id> --repo-path <absolute-checkout-root> \
+  --project "$project_id" --repo-id "$repo_id" --repo-path "$checkout_root" \
   --temp-alias <alias> --goal <goal> \
   --done <condition> [--done <condition> ...] \
   --scope <scope> [--scope <scope> ...] --session <session-id>
 ```
+<!-- task-start-contract: temporary:end -->
 
 ## 기존 Task 재개
 
 재개는 `status`가 아니라 같은 persistent Task를 다시 claim하는 명시적 start다. registration field를 섞지 않는다.
 
 위 authorization gate의 preflight와 portfolio coordinate verification을 통과한 뒤에만 launcher로 재개한다.
+`<expected-repository-slug>`는 current checkout의 verified Git remote identity에서 얻은 canonical `<owner>/<repo>`이며, 확인할 수 없으면 멈춘다.
 
+<!-- task-start-contract: resume:begin -->
 ```bash
+bind_portfolio_coordinates "<expected-repository-slug>" || exit $?
 "$HOME/.local/bin/jhw-control-host" task start \
-  --task <tsk-id> --repo-path <absolute-checkout-root> --session <session-id>
+  --task <tsk-id> --repo-path "$checkout_root" --session <session-id>
 ```
+<!-- task-start-contract: resume:end -->
 
 성공 결과에 `latest_handoff`가 있을 때만 그것을 재개 context로 보여준다. `latest_handoff`가 없고(강제종료 등) 사용자가 컨텍스트 복구를 요청하면 repo root의 `HANDOFF.<세션>.md`를 보조 context로 읽을 수 있다 — Task 좌표·상태·증거는 command 결과만 정본이다. `TASK_COMPLETED`, `WORKTREE_CLEANUP_REQUIRED`, source/Project/repository mismatch이면 멈춘다. cleanup이 필요하면 아래 exact released-generation 절차를 먼저 승인받는다.
 
