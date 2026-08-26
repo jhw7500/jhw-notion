@@ -129,6 +129,20 @@ function remoteLines(result: ProcessResult): string[] {
   return result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
 }
 
+function assertTaskCoordinateShape(coordinates: TaskCoordinateInput): void {
+  const hasResolver = "resolve_from_checkout" in coordinates;
+  const hasProject = "project_id" in coordinates;
+  const hasRepository = "repo_id" in coordinates;
+  const resolved = hasResolver
+    && coordinates.resolve_from_checkout === true
+    && !hasProject
+    && !hasRepository;
+  const explicit = !hasResolver && hasProject && hasRepository;
+  if (!resolved && !explicit) {
+    throw new ControlError("INVALID_TASK_SCOPE", "Task coordinates must select exactly one mode");
+  }
+}
+
 /** Parses only canonical GitHub checkout remotes and returns owner/name. */
 export function githubSlugFromRemote(remote: string, sshOnly = false): string {
   const value = remote.trim();
@@ -196,6 +210,7 @@ export class GitHubSourceService {
     const { repository_path: repositoryPath, ...formalRequest } = input;
     issueCoordinates(formalRequest.issue_url);
     this.assertCheckoutSafe(formalRequest, repositoryPath);
+    assertTaskCoordinateShape(formalRequest);
     const context = await this.requireContext(formalRequest, repositoryPath);
     const issue = await this.resolveIssue(context.repository, formalRequest.issue_url);
     this.assertCheckoutSafe(issue, repositoryPath);
@@ -216,6 +231,7 @@ export class GitHubSourceService {
   async registerTemporaryTask(input: RegisterTemporaryTaskFromSourceInput): Promise<TemporaryTask> {
     const { repository_path: repositoryPath, ...temporaryRequest } = input;
     this.assertCheckoutSafe(temporaryRequest, repositoryPath);
+    assertTaskCoordinateShape(temporaryRequest);
     const context = await this.requireContext(temporaryRequest, repositoryPath);
     const {
       project_id: _projectId,

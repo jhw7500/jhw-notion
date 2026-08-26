@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { ControlError } from "../errors.js";
-import { GitHubSourceService } from "../github-source.js";
+import { GitHubSourceService, type TaskCoordinateInput } from "../github-source.js";
 import type { RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
@@ -17,6 +17,22 @@ const formal = {
   issue_revision: "2026-08-14T00:00:00Z",
   issue_url: "https://github.com/jhw7500/wlan/issues/7",
 };
+
+if (false) {
+  const acceptCoordinates = (_coordinates: TaskCoordinateInput): void => undefined;
+  acceptCoordinates({ project_id: "prj-wlan", repo_id: "repo-wlan" });
+  acceptCoordinates({ resolve_from_checkout: true });
+  // @ts-expect-error mixed resolved and explicit coordinates are forbidden
+  acceptCoordinates({ resolve_from_checkout: true, project_id: "prj-wlan", repo_id: "repo-wlan" });
+  // @ts-expect-error false is not a supported resolver discriminant
+  acceptCoordinates({ resolve_from_checkout: false, project_id: "prj-wlan", repo_id: "repo-wlan" });
+  // @ts-expect-error one coordinate mode is required
+  acceptCoordinates({});
+  // @ts-expect-error explicit mode requires both Project and Repository coordinates
+  acceptCoordinates({ project_id: "prj-wlan" });
+  // @ts-expect-error explicit mode requires both Project and Repository coordinates
+  acceptCoordinates({ repo_id: "repo-wlan" });
+}
 
 function fixture(overrides: {
   remote?: string;
@@ -306,6 +322,51 @@ describe("GitHubSourceService", () => {
       expected_scope: ["src/control"],
     });
   });
+
+  for (const kind of ["formal", "temporary"] as const) {
+    it.each([
+      ["mixed resolved and explicit coordinates", {
+        resolve_from_checkout: true,
+        project_id: "prj-forged",
+        repo_id: "repo-forged",
+      }],
+      ["a false resolver discriminant", {
+        resolve_from_checkout: false,
+        project_id: "prj-wlan",
+        repo_id: "repo-wlan",
+      }],
+      ["no coordinates", {}],
+      ["a missing Repository coordinate", { project_id: "prj-wlan" }],
+      ["a missing Project coordinate", { repo_id: "repo-wlan" }],
+    ])(`rejects %s at the ${kind} runtime coordinate boundary`, async (_label, coordinates) => {
+      const { service, catalog, pinnedRepositoryLookup, projects, runner } = fixture();
+
+      const operation = kind === "formal"
+        ? service.registerFormalTask({
+          ...coordinates,
+          repository_path: checkout,
+          issue_url: "https://github.com/jhw7500/wlan/issues/7",
+        } as never)
+        : service.registerTemporaryTask({
+          ...coordinates,
+          repository_path: checkout,
+          alias: "wlan:tmp-20260826-13-invalid-coordinates",
+          goal: "verify exact runtime coordinates",
+          done_conditions: ["ambiguous coordinates rejected"],
+          expected_scope: ["src/control"],
+        } as never);
+
+      await expect(operation).rejects.toMatchObject({ code: "INVALID_TASK_SCOPE" });
+      expect(catalog.getRepository).not.toHaveBeenCalled();
+      expect(pinnedRepositoryLookup).not.toHaveBeenCalled();
+      expect(projects.requireProjectRepository).not.toHaveBeenCalled();
+      expect(projects.resolveUniqueProjectForRepository).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(runner.runGh).not.toHaveBeenCalled();
+      expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+      expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+    });
+  }
 
   it.each(["formal", "temporary"] as const)(
     "does not mutate %s Task registration when unique Project resolution fails",
