@@ -7,7 +7,13 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { MutationLock, ProcessRunner, type MutationLockRuntime } from "../process.js";
+import {
+  createGuardMutationLockAuthorityForTesting,
+  MutationLock,
+  ProcessRunner,
+  runWithGuardMutationLockAuthority,
+  type MutationLockRuntime,
+} from "../process.js";
 import type { ControlConfig } from "../config.js";
 
 const execFile = promisify(execFileCallback);
@@ -26,6 +32,7 @@ function configFor(stateDir: string): ControlConfig {
     preflightProjectItemId: "PVTI_trial",
     preflightRegistryIssueNumber: 1,
     stateDir,
+    guardMode: "enforce",
   };
 }
 
@@ -55,6 +62,20 @@ afterEach(async () => {
 });
 
 describe("callback mutation lock", () => {
+  it("keeps the verified run path independent of an instance override of the Guard directory callback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const runtime: MutationLockRuntime = { spawn: vi.fn(() => completedAcquisition(0)) };
+    const lock = new MutationLock(configFor(join(root, "state")), {}, runtime);
+    (lock as unknown as { runInStateDirectory: (callback: () => Promise<string>) => Promise<string> })
+      .runInStateDirectory = vi.fn(async () => "forged");
+    const callback = vi.fn(async () => "authoritative");
+
+    await expect(lock.run(callback)).resolves.toBe("authoritative");
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(runtime.spawn).toHaveBeenCalledTimes(1);
+  });
+
   it("runs the callback only after one credential-free acquisition and ignores a caller marker", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
@@ -81,6 +102,28 @@ describe("callback mutation lock", () => {
     expect(seen.env).not.toHaveProperty("GH_PROJECT_TOKEN");
     expect(seen.env).not.toHaveProperty("GH_REPO_TOKEN");
     expect(seen.env).not.toHaveProperty("JHW_CONTROL_LOCK_HELD");
+  });
+
+  it("keeps Registry writers nonblocking while the captured Guard authority uses bounded host waiting", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const seen: string[][] = [];
+    const runtime: MutationLockRuntime = {
+      spawn: (_command, args) => {
+        seen.push([...args]);
+        return completedAcquisition(0);
+      },
+    };
+    const lock = new MutationLock(configFor(join(root, "state")), {}, runtime);
+    const authority = createGuardMutationLockAuthorityForTesting(lock);
+
+    await lock.run(async () => undefined);
+    await runWithGuardMutationLockAuthority(authority, async () => undefined);
+
+    expect(seen).toEqual([
+      ["-n", "-E", "75", "3"],
+      ["-w", "5", "-E", "75", "3"],
+    ]);
   });
 
   it("does not invoke the callback on contention, nonzero acquisition, spawn, or child error", async () => {
@@ -192,6 +235,22 @@ describe("callback mutation lock", () => {
     expect(output).toBe("credential-seen");
     expect(seen.env).not.toHaveProperty("GH_PROJECT_TOKEN");
     expect(seen.env).not.toHaveProperty("GH_REPO_TOKEN");
+  });
+
+  it("preserves legacy Registry lock mode repair for an existing plain file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const lockPath = join(stateDir, "registry.lock");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(lockPath, "", { mode: 0o600 });
+    await chmod(lockPath, 0o644);
+    const runtime: MutationLockRuntime = { spawn: vi.fn(() => completedAcquisition(0)) };
+
+    await new MutationLock(configFor(stateDir), {}, runtime).run(async () => undefined);
+
+    expect((await lstat(lockPath)).mode & 0o777).toBe(0o600);
+    expect(runtime.spawn).toHaveBeenCalledTimes(1);
   });
 
   it("keeps registry.lock on the opened state-directory inode after an ancestor swap", async () => {

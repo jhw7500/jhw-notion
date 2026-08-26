@@ -15,6 +15,7 @@ export interface ControlConfig {
   preflightProjectItemId: string;
   preflightRegistryIssueNumber: number;
   stateDir: string;
+  guardMode: "enforce" | "observe";
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -100,6 +101,15 @@ function registryBranch(env: NodeJS.ProcessEnv): string {
   return value;
 }
 
+function guardMode(env: NodeJS.ProcessEnv): ControlConfig["guardMode"] {
+  const value = env.JHW_GUARD_MODE;
+  if (value === undefined || value === "" || value === "enforce") return "enforce";
+  if (value === "observe" && env.JHW_GUARD_ALLOW_OBSERVE === "true") return "observe";
+  throw new ControlError("INVALID_CONFIG", "Guard runtime mode requires exact enforce or opted-in observe", {
+    key: value === "observe" ? "JHW_GUARD_ALLOW_OBSERVE" : "JHW_GUARD_MODE",
+  });
+}
+
 /**
  * Loads only non-secret host-control configuration. Credential tokens deliberately
  * remain in the process environment until a `gh` child environment is constructed.
@@ -138,5 +148,6 @@ export function loadControlConfig(env: NodeJS.ProcessEnv = process.env): Control
     ), "JHW_PREFLIGHT_PROJECT_ITEM_ID"),
     preflightRegistryIssueNumber: positiveInteger(env, "JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER"),
     stateDir,
+    guardMode: guardMode(env),
   };
 }

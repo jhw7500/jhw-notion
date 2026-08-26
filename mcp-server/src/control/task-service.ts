@@ -9,6 +9,7 @@ import type {
 import type { ControlConfig } from "./config.js";
 import { RegistryRecordStore, type RegistryDirectoryEntry } from "./codec.js";
 import { ControlError } from "./errors.js";
+import type { GuardAdapter } from "./guard-protocol.js";
 import {
   buildHandoff,
   canonicalHandoffPath,
@@ -21,8 +22,10 @@ import {
   type HandoffInput,
 } from "./handoff.js";
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
-import type { ActiveClaim, ClaimHistory, ErrorReason } from "./schemas.js";
+import { taskRelativePath } from "./registry-paths.js";
+import type { ActiveClaim, ClaimHistory, ContractActiveClaim, ErrorReason, TaskRecord } from "./schemas.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import type { TaskCompletionEvidence, TaskCompletionEvidenceRecord } from "./task-completion.js";
 import {
   worktreePlan,
   type RetainedWorktreeGeneration,
@@ -32,7 +35,7 @@ import {
 } from "./worktree.js";
 
 export interface ClaimServicePort {
-  claimTask(input: ClaimTaskInput): Promise<ActiveClaim>;
+  claimTask(input: ClaimTaskInput): Promise<ContractActiveClaim>;
   finishClaim(taskId: string, claimId: string, outcome: FinishOutcome): Promise<ClaimHistory>;
   recoverClaim(taskId: string, claimId: string, action: RecoveryAction): Promise<RecoveryResult>;
   assertOwner(taskId: string, claimId: string): Promise<ActiveClaim>;
@@ -40,6 +43,12 @@ export interface ClaimServicePort {
   latestClaimHistory(taskId: string): Promise<ClaimHistory>;
   latestHandoffHistory(taskId: string): Promise<ClaimHistory>;
   getActive(taskId: string): Promise<ActiveClaim | undefined>;
+  markCompletionReady(
+    taskId: string,
+    claimId: string,
+    evidence: TaskCompletionEvidence,
+  ): Promise<TaskCompletionEvidenceRecord>;
+  getCompletionEvidence(taskId: string, claimId: string): Promise<TaskCompletionEvidenceRecord>;
 }
 
 export interface WorktreeManagerPort {
@@ -63,6 +72,7 @@ export interface RegistryGitPort {
   readHeadRegularBlob(relativePath: string): Promise<Buffer>;
   listHeadDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]>;
   readHeadRegularFile(relativePath: string): Promise<string>;
+  headRegularBlobObjectId(relativePath: string): Promise<string>;
 }
 
 export interface TaskStartInput {
@@ -70,6 +80,7 @@ export interface TaskStartInput {
   task_alias: string;
   project_id: string;
   repo_id: string;
+  origin_adapter: GuardAdapter;
   session_id: string;
   repository_path: string;
 }
@@ -86,6 +97,13 @@ export interface TaskStatusResult {
   worktree: Omit<WorktreeInspection, "path" | "repository_path">;
 }
 
+/** Internal read-only Guard view. Host paths must never enter a decision envelope. */
+export interface GuardTaskInspection {
+  active: ActiveClaim;
+  worktree: WorktreeInspection;
+}
+
+
 export interface TaskFinishInput {
   task_id: string;
   claim_id: string;
@@ -97,6 +115,13 @@ export interface TaskFinishInput {
   failures?: HandoffInput["failures"];
   next_step?: HandoffInput["next_step"];
   related_adr_and_evidence?: HandoffInput["related_adr_and_evidence"];
+}
+
+export interface TaskCompletionReadyInput {
+  task_id: string;
+  claim_id: string;
+  integration_validation: string[];
+  child_dispositions: TaskCompletionEvidence["child_dispositions"];
 }
 
 export interface TaskFinishHistory extends ClaimHistory {
@@ -390,7 +415,8 @@ export class TaskService {
       taskAlias,
       retained,
     );
-    const reusingCurrentClaim = currentActive?.session_id === input.session_id;
+    const reusingCurrentClaim = currentActive?.session_id === input.session_id &&
+      "origin_adapter" in currentActive && currentActive.origin_adapter === input.origin_adapter;
     const claim = reusingCurrentClaim
       ? currentActive
       : await this.claims.claimTask({
@@ -398,6 +424,7 @@ export class TaskService {
           task_alias: taskAlias,
           project_id: input.project_id,
           repo_id: input.repo_id,
+          origin_adapter: input.origin_adapter,
           session_id: input.session_id,
           host: this.config.buildHost,
           branch: plan.branch,
@@ -447,8 +474,34 @@ export class TaskService {
     };
   }
 
+  /** Immutable source generation used only inside Guard's committed view. */
+  async sourceRevisionForGuard(task: TaskRecord): Promise<string> {
+    return task.kind === "formal"
+      ? task.issue_revision
+      : this.registry.headRegularBlobObjectId(taskRelativePath(task.id));
+  }
+
   async assertOwner(taskId: string, claimId: string): Promise<ActiveClaim> {
     return this.claims.assertOwner(taskId, claimId);
+  }
+
+  /** Reuses the owner and audited worktree path without exposing it through CLI status. */
+  async inspectForGuard(taskId: string, claimId: string): Promise<GuardTaskInspection> {
+    const active = await this.claims.assertOwner(taskId, claimId);
+    return { active, worktree: await this.worktrees.inspect(active) };
+  }
+
+  async markCompletionReady(input: TaskCompletionReadyInput): Promise<TaskCompletionEvidenceRecord> {
+    this.sensitiveData.assertSafe(input);
+    assertNoAbsoluteHostPaths(input);
+    return this.claims.markCompletionReady(input.task_id, input.claim_id, {
+      integration_validation: input.integration_validation,
+      child_dispositions: input.child_dispositions,
+    });
+  }
+
+  async getCompletionEvidence(taskId: string, claimId: string): Promise<TaskCompletionEvidenceRecord> {
+    return this.claims.getCompletionEvidence(taskId, claimId);
   }
 
   async status(taskId: string, claimId: string): Promise<TaskStatusResult> {

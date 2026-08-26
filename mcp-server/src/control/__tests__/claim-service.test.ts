@@ -1,4 +1,4 @@
-import { link, mkdir, readFile, rename, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { appendFile, link, mkdir, readFile, rename, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,9 +7,11 @@ import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { ControlError } from "../errors.js";
 import { ProcessRunner } from "../process.js";
-import { RegistryGit } from "../registry-git.js";
+import { RegistryGit, type ProcessRunnerLike } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
-import { commitFile, configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
+import { taskCompletionEvidenceDigest } from "../task-completion.js";
+import { normalizeWorkContract, workContractDigest } from "../work-contract.js";
+import { commitFile, configFor, emptyTaskContractIntent, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
 const fixedNow = new Date("2026-08-13T12:34:56.789Z");
@@ -24,16 +26,24 @@ afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
 });
 
-async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: SensitiveDataPolicy): Promise<{
+async function claimsFixture(
+  now: () => Date = () => fixedNow,
+  sensitiveData?: SensitiveDataPolicy,
+  runnerFactory: (fixture: RegistryFixture) => ProcessRunnerLike = () => new ProcessRunner(),
+): Promise<{
   fixture: RegistryFixture;
   claims: ClaimService;
+  catalog: Catalog;
   task: Awaited<ReturnType<Catalog["registerTemporaryTask"]>>;
 }> {
   const fixture = await makeRegistryFixture();
   fixtures.push(fixture);
   const config = configFor(fixture.registryDir);
-  const registry = isolatedRegistryGit(config, new ProcessRunner());
-  const catalog = new Catalog(config, registry);
+  const registry = isolatedRegistryGit(config, runnerFactory(fixture));
+  const catalog = new Catalog(config, registry, undefined, {
+    assertKnownContract: async () => undefined,
+    assertKnownRequirement: async () => undefined,
+  });
   await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
   const task = await catalog.registerTemporaryTask({
     project_id: "prj-wlan",
@@ -42,17 +52,54 @@ async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: S
     goal: "fix roaming regression",
     done_conditions: ["targeted test passes"],
     expected_scope: ["src/roaming.ts"],
+    ...emptyTaskContractIntent(),
   });
   return {
     fixture,
     claims: new ClaimService(config, registry, catalog, inspection, now, sensitiveData),
+    catalog,
     task,
+  };
+}
+
+async function formalClaimsFixture(taskRole: "standalone" | "parent" = "standalone") {
+  const fixture = await makeRegistryFixture();
+  fixtures.push(fixture);
+  const config = configFor(fixture.registryDir);
+  const registry = isolatedRegistryGit(config, new ProcessRunner());
+  const catalog = new Catalog(config, registry, undefined, {
+    assertKnownContract: async () => undefined,
+    assertKnownRequirement: async () => undefined,
+  });
+  await catalog.registerRepository({ repo_id: "repo-wlan", github_node_id: "R_wlan", slug: "jhw7500/wlan" });
+  const task = (await catalog.registerFormalTask({
+    project_id: "prj-wlan",
+    repo_id: "repo-wlan",
+    issue_node_id: "I_wlan_1",
+    issue_revision: "2026-08-25T00:00:00Z",
+    issue_url: "https://github.com/jhw7500/wlan/issues/1",
+    alias: "jhw7500/wlan#1",
+    task_role: taskRole,
+    grants: [],
+    dependencies: [],
+  })).task;
+  let clockTick = 0;
+  return {
+    fixture,
+    catalog,
+    task,
+    claims: new ClaimService(config, registry, catalog, inspection, () =>
+      new Date(fixedNow.getTime() + clockTick++ * 1_000)),
   };
 }
 
 function claimInput(
   taskId: string,
   overrides: Partial<{
+    origin_adapter: "claude" | "codex" | "gemini" | "opencode";
+    task_alias: string;
+    project_id: string;
+    repo_id: string;
     session_id: string;
     host: string;
     branch: string;
@@ -64,6 +111,7 @@ function claimInput(
     task_alias: "wlan:tmp-20260813-01-fix",
     project_id: "prj-wlan",
     repo_id: "repo-wlan",
+    origin_adapter: "codex" as const,
     host: "cantopsbuildserver",
     branch: "task/wlan-roaming-fix",
     worktree_ref: "/srv/jhw/worktrees/wlan-roaming-fix",
@@ -123,6 +171,896 @@ async function replaceActiveWithExternalSymlink(
 }
 
 describe("ClaimService", () => {
+  it("records immutable standalone completion evidence for the exact active owner", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    const evidence = { integration_validation: ["npm test: pass"], child_dispositions: [] };
+    const taskPath = join(fixture.registryDir, "tasks", `${task.id}.yaml`);
+    const issueBytes = await readFile(taskPath, "utf8");
+
+    const first = await claims.markCompletionReady(task.id, active.claim_id, evidence);
+    const evidencePath = join(fixture.registryDir, "task-completion", task.id, `${active.claim_id}.yaml`);
+    const bytes = await readFile(evidencePath, "utf8");
+    const head = await git(fixture.registryDir, "rev-parse", "HEAD");
+    const retry = await claims.markCompletionReady(task.id, active.claim_id, evidence);
+
+    expect(first).toEqual({
+      version: 1,
+      task_id: task.id,
+      claim_id: active.claim_id,
+      work_contract_digest: active.work_contract_digest,
+      recorded_at: new Date(fixedNow.getTime() + 1_000).toISOString(),
+      evidence,
+    });
+    expect(retry).toEqual(first);
+    expect(await readFile(evidencePath, "utf8")).toBe(bytes);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(head);
+    expect(await readFile(taskPath, "utf8")).toBe(issueBytes);
+    await expect(claims.assertOwner(task.id, active.claim_id)).resolves.toEqual(active);
+  });
+
+  it("rejects changed or non-owner evidence without any Registry write", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    await claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    });
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: changed"], child_dispositions: [],
+    })).rejects.toMatchObject({ code: "COMPLETION_EVIDENCE_CONFLICT" });
+    await expect(claims.markCompletionReady(
+      task.id,
+      "clm-018f21e0-7b2c-7a00-8000-000000000099",
+      { integration_validation: ["npm test: pass"], child_dispositions: [] },
+    )).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+  });
+
+  it("requires parent gates before writing evidence", async () => {
+    const { claims, task, catalog, fixture } = await formalClaimsFixture("parent");
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    await catalog.registerChildTask({
+      parent_task_id: task.id,
+      alias: "wlan:required-child",
+      required_for_parent: true,
+      goal: "required work",
+      done_conditions: ["done"],
+      grants: [],
+      dependencies: [],
+    });
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    })).rejects.toMatchObject({ code: "PARENT_CHILDREN_INCOMPLETE" });
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+    await expect(readFile(join(
+      fixture.registryDir, "task-completion", task.id, `${active.claim_id}.yaml`,
+    ))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("revalidates parent readiness at completed release after a new required child is registered", async () => {
+    const { claims, task, catalog, fixture } = await formalClaimsFixture("parent");
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    await claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"],
+      child_dispositions: [],
+    });
+    await catalog.registerChildTask({
+      parent_task_id: task.id,
+      alias: "wlan:late-required-child",
+      required_for_parent: true,
+      goal: "late required work",
+      done_conditions: ["done"],
+      grants: [],
+      dependencies: [],
+    });
+    const activePath = join(fixture.registryDir, "claims", "active", `${task.id}.yaml`);
+    const evidencePath = join(fixture.registryDir, "task-completion", task.id, `${active.claim_id}.yaml`);
+    const activeBytes = await readFile(activePath, "utf8");
+    const evidenceBytes = await readFile(evidencePath, "utf8");
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.finishClaim(task.id, active.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    })).rejects.toMatchObject({ code: "PARENT_CHILDREN_INCOMPLETE" });
+
+    expect(await readFile(activePath, "utf8")).toBe(activeBytes);
+    expect(await readFile(evidencePath, "utf8")).toBe(evidenceBytes);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+    await expect(readFile(join(fixture.registryDir, historyRelativePath(active))))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("revalidates standalone empty dispositions at completed release", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    const evidence = await claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"],
+      child_dispositions: [],
+    });
+    const evidenceRelative = `task-completion/${task.id}/${active.claim_id}.yaml`;
+    await commitRegistryFile(fixture, evidenceRelative, `${JSON.stringify({
+      ...evidence,
+      evidence: {
+        ...evidence.evidence,
+        child_dispositions: [{
+          task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000099",
+          disposition: "accepted-risk",
+        }],
+      },
+    }, null, 2)}\n`);
+    const activePath = join(fixture.registryDir, "claims", "active", `${task.id}.yaml`);
+    const evidencePath = join(fixture.registryDir, evidenceRelative);
+    const activeBytes = await readFile(activePath, "utf8");
+    const evidenceBytes = await readFile(evidencePath, "utf8");
+    const before = await git(fixture.registryDir, "rev-parse", "HEAD");
+
+    await expect(claims.finishClaim(task.id, active.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    })).rejects.toMatchObject({ code: "INVALID_PARENT_COMPLETION" });
+
+    expect(await readFile(activePath, "utf8")).toBe(activeBytes);
+    expect(await readFile(evidencePath, "utf8")).toBe(evidenceBytes);
+    expect(await git(fixture.registryDir, "rev-parse", "HEAD")).toBe(before);
+    await expect(readFile(join(fixture.registryDir, historyRelativePath(active))))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses formal completion evidence on temporary and child Task flows", async () => {
+    const temporary = await claimsFixture();
+    const temporaryClaim = await temporary.claims.claimTask(claimInput(temporary.task.id));
+    const temporaryHead = await git(temporary.fixture.registryDir, "rev-parse", "HEAD");
+    await expect(temporary.claims.markCompletionReady(temporary.task.id, temporaryClaim.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    })).rejects.toMatchObject({ code: "TASK_COMPLETION_FORMAL_REQUIRED" });
+    expect(await git(temporary.fixture.registryDir, "rev-parse", "HEAD")).toBe(temporaryHead);
+
+    const formal = await formalClaimsFixture("parent");
+    const child = await formal.catalog.registerChildTask({
+      parent_task_id: formal.task.id,
+      alias: "wlan:no-formal-evidence",
+      required_for_parent: false,
+      goal: "child work",
+      done_conditions: ["done"],
+      grants: [],
+      dependencies: [],
+    });
+    const childClaim = await formal.claims.claimTask(claimInput(child.id, {
+      task_alias: child.aliases[0],
+      session_id: "codex-child-evidence",
+    }));
+    const childHead = await git(formal.fixture.registryDir, "rev-parse", "HEAD");
+    await expect(formal.claims.markCompletionReady(child.id, childClaim.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    })).rejects.toMatchObject({ code: "TASK_COMPLETION_FORMAL_REQUIRED" });
+    expect(await git(formal.fixture.registryDir, "rev-parse", "HEAD")).toBe(childHead);
+  });
+
+  it("requires exact evidence to complete a formal Claim and copies its pointer and digest only to completed history", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const active = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    const finish = {
+      status: "completed" as const,
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    };
+
+    await expect(claims.finishClaim(task.id, active.claim_id, finish)).rejects.toMatchObject({
+      code: "COMPLETION_EVIDENCE_REQUIRED",
+    });
+    await expect(claims.assertOwner(task.id, active.claim_id)).resolves.toEqual(active);
+    const record = await claims.markCompletionReady(task.id, active.claim_id, {
+      integration_validation: ["npm test: pass"], child_dispositions: [],
+    });
+    const issueBytes = await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8");
+    const history = await claims.finishClaim(task.id, active.claim_id, finish);
+
+    expect(history).toMatchObject({
+      status: "completed",
+      completion_evidence_path: `task-completion/${task.id}/${active.claim_id}.yaml`,
+      completion_evidence_digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      work_contract_digest: record.work_contract_digest,
+    });
+    expect(history.completion_evidence_digest).toBe(taskCompletionEvidenceDigest(record));
+    expect(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8")).toBe(issueBytes);
+    await expect(claims.getActive(task.id)).resolves.toBeUndefined();
+  });
+
+  it("keeps old evidence historical but unusable after handoff and reclaim", async () => {
+    const { claims, task, fixture } = await formalClaimsFixture();
+    const first = await claims.claimTask(claimInput(task.id, { task_alias: task.aliases[0] }));
+    const oldEvidence = await claims.markCompletionReady(task.id, first.claim_id, {
+      integration_validation: ["npm test: first"], child_dispositions: [],
+    });
+    await commitRegistryFile(fixture, handoffRelativePath(first), "# committed handoff fixture\n");
+    await claims.finishClaim(task.id, first.claim_id, {
+      status: "handoff",
+      branch: first.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["handoff prepared"],
+      handoff_path: handoffRelativePath(first),
+    });
+    const second = await claims.claimTask(claimInput(task.id, {
+      task_alias: task.aliases[0],
+      session_id: "codex-second",
+    }));
+
+    await expect(claims.getCompletionEvidence(task.id, first.claim_id)).resolves.toEqual(oldEvidence);
+    await expect(claims.finishClaim(task.id, second.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: second.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    })).rejects.toMatchObject({ code: "COMPLETION_EVIDENCE_REQUIRED" });
+    await expect(claims.assertOwner(task.id, second.claim_id)).resolves.toEqual(second);
+  });
+
+  it("moves a child through handoff with the committed resumed Task revision and rejects terminal reclaim", async () => {
+    const { claims, task, catalog, fixture } = await formalClaimsFixture("parent");
+    const child = await catalog.registerChildTask({
+      parent_task_id: task.id,
+      alias: "wlan:resumable-child",
+      required_for_parent: true,
+      goal: "child work",
+      done_conditions: ["done"],
+      grants: [],
+      dependencies: [],
+    });
+    const first = await claims.claimTask(claimInput(child.id, {
+      task_alias: child.aliases[0],
+      session_id: "codex-child-first",
+    }));
+    await commitRegistryFile(fixture, handoffRelativePath(first), "# committed child handoff fixture\n");
+    await claims.finishClaim(child.id, first.claim_id, {
+      status: "handoff",
+      branch: first.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["handoff ready"],
+      handoff_path: handoffRelativePath(first),
+    });
+    expect((await catalog.getTask(child.id) as { lifecycle: string }).lifecycle).toBe("handoff");
+
+    const resumed = await claims.claimTask(claimInput(child.id, {
+      task_alias: child.aliases[0],
+      session_id: "codex-child-resumed",
+    }));
+    const persisted = JSON.parse(await readFile(
+      join(fixture.registryDir, "claims", "active", `${child.id}.yaml`),
+      "utf8",
+    ));
+    const committedTaskRevision = (await git(
+      fixture.registryDir,
+      "rev-parse",
+      `HEAD:tasks/${child.id}.yaml`,
+    )).trim();
+    expect(resumed.source_task_revision).toBe(committedTaskRevision);
+    expect(persisted.source_task_revision).toBe(committedTaskRevision);
+    expect((await catalog.getTask(child.id) as { lifecycle: string }).lifecycle).toBe("active");
+    await claims.finishClaim(child.id, resumed.claim_id, {
+      status: "abandoned",
+      outcome: "not needed",
+      branch: resumed.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["parent replanned"],
+    });
+    await expect(claims.claimTask(claimInput(child.id, {
+      task_alias: child.aliases[0],
+      session_id: "codex-child-terminal",
+    }))).rejects.toMatchObject({ code: "TASK_TERMINAL" });
+  });
+
+  it("refuses to claim a legacy Task without an explicit Work Contract", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const taskPath = `tasks/${task.id}.yaml`;
+    const legacy = JSON.parse(await readFile(join(fixture.registryDir, taskPath), "utf8"));
+    delete legacy.task_role;
+    delete legacy.work_contract;
+    await commitRegistryFile(fixture, taskPath, `${JSON.stringify(legacy)}\n`);
+
+    await expect(claims.claimTask(claimInput(task.id))).rejects.toMatchObject({
+      code: "TASK_CONTRACT_REQUIRED",
+    });
+    await expect(claims.getActive(task.id)).resolves.toBeUndefined();
+  });
+
+  it("freezes the normalized Task Work Contract and digest in the active Claim", async () => {
+    const { claims, catalog, task } = await claimsFixture();
+    const configured = await catalog.configureInactiveTask({
+      task_id: task.id,
+      task_role: "standalone",
+      work_contract: {
+        version: 1,
+        task_id: task.id,
+        grants: [
+          { capability: "test.host", resource: { kind: "repository", id: "repo-wlan" }, coordination: "shared" },
+          { capability: "repo.modify", resource: { kind: "repository", id: "repo-wlan" }, coordination: "shared" },
+        ],
+        dependencies: [],
+      },
+    });
+
+    const active = await claims.claimTask(claimInput(task.id));
+    const expected = normalizeWorkContract(configured.work_contract);
+
+    expect(active.work_contract).toEqual(expected);
+    expect(active.work_contract_digest).toBe(workContractDigest(expected));
+    expect(active.work_contract_digest).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("keeps the active Claim snapshot unchanged when the Task record changes later", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const originalContract = normalizeWorkContract(task.work_contract);
+    const taskPath = `tasks/${task.id}.yaml`;
+    const changed = JSON.parse(await readFile(join(fixture.registryDir, taskPath), "utf8"));
+    changed.work_contract = {
+      version: 1,
+      task_id: task.id,
+      grants: [{
+        capability: "repo.inspect",
+        resource: { kind: "repository", id: "repo-wlan" },
+        coordination: "shared",
+      }],
+      dependencies: [],
+    };
+    await commitRegistryFile(fixture, taskPath, `${JSON.stringify(changed)}\n`);
+
+    const reread = await claims.getActive(task.id);
+    expect(active.work_contract).toEqual(originalContract);
+    expect(reread).toMatchObject({
+      work_contract: originalContract,
+      work_contract_digest: workContractDigest(originalContract),
+    });
+  });
+
+  it("rejects a different Task owned by the same exact host session", async () => {
+    const { claims, catalog, task } = await claimsFixture();
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-02-fix",
+      goal: "fix another regression",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/other.ts"],
+      ...emptyTaskContractIntent(),
+    });
+    const owner = await claims.claimTask(claimInput(task.id));
+
+    await expect(claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      branch: "task/wlan-other-fix",
+      worktree_ref: "wt-wlan-other-fix",
+    }))).rejects.toMatchObject({ code: "TASK_SESSION_BUSY" });
+    await expect(claims.assertOwner(task.id, owner.claim_id)).resolves.toEqual(owner);
+    await expect(claims.getActive(other.id)).resolves.toBeUndefined();
+  });
+
+  it("allows shared repository grants in different Tasks and worktrees", async () => {
+    const { claims, catalog, task } = await claimsFixture();
+    const sharedGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-wlan" },
+      coordination: "shared" as const,
+    };
+    await catalog.configureInactiveTask({
+      task_id: task.id,
+      task_role: "standalone",
+      work_contract: { version: 1, task_id: task.id, grants: [sharedGrant], dependencies: [] },
+    });
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-03-fix",
+      goal: "fix a parallel regression",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/parallel.ts"],
+      grants: [sharedGrant],
+      dependencies: [],
+    });
+
+    const first = await claims.claimTask(claimInput(task.id, {
+      session_id: "codex-shared-a",
+      branch: "task/wlan-shared-a",
+      worktree_ref: "wt-wlan-shared-a",
+    }));
+    const second = await claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: "codex-shared-b",
+      branch: "task/wlan-shared-b",
+      worktree_ref: "wt-wlan-shared-b",
+    }));
+
+    expect(second.worktree_ref).not.toBe(first.worktree_ref);
+    await expect(claims.assertOwner(first.task_id, first.claim_id)).resolves.toEqual(first);
+    await expect(claims.assertOwner(second.task_id, second.claim_id)).resolves.toEqual(second);
+  });
+
+  it.each([
+    ["existing", "exclusive", "shared"],
+    ["requested", "shared", "exclusive"],
+  ] as const)("rejects an exact board resource made exclusive by the %s contract", async (_side, firstCoordination, secondCoordination) => {
+    const { claims, catalog, task } = await claimsFixture();
+    const boardGrant = (coordination: "exclusive" | "shared") => ({
+      capability: "board.execute" as const,
+      resource: { kind: "board" as const, id: "wlan-target-board" },
+      coordination,
+    });
+    await catalog.configureInactiveTask({
+      task_id: task.id,
+      task_role: "standalone",
+      work_contract: { version: 1, task_id: task.id, grants: [boardGrant(firstCoordination)], dependencies: [] },
+    });
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: `wlan:tmp-20260813-${firstCoordination}-board`,
+      goal: "exercise the target board",
+      done_conditions: ["board test passes"],
+      expected_scope: ["board"],
+      grants: [boardGrant(secondCoordination)],
+      dependencies: [],
+    });
+    const owner = await claims.claimTask(claimInput(task.id, { session_id: `codex-board-${firstCoordination}` }));
+
+    await expect(claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: `codex-board-${secondCoordination}`,
+      branch: `task/wlan-board-${secondCoordination}`,
+      worktree_ref: `wt-wlan-board-${secondCoordination}`,
+    }))).rejects.toMatchObject({ code: "TASK_RESOURCE_CONFLICT" });
+    await expect(claims.assertOwner(owner.task_id, owner.claim_id)).resolves.toEqual(owner);
+    await expect(claims.getActive(other.id)).resolves.toBeUndefined();
+  });
+
+  it("fails closed when any existing active Claim lacks a contract snapshot", async () => {
+    const { claims, catalog, fixture, task } = await claimsFixture();
+    const legacyOwner = await claims.claimTask(claimInput(task.id, { session_id: "codex-legacy-owner" }));
+    const activePath = `claims/active/${task.id}.yaml`;
+    const legacy = JSON.parse(await readFile(join(fixture.registryDir, activePath), "utf8"));
+    delete legacy.work_contract;
+    delete legacy.work_contract_digest;
+    await commitRegistryFile(fixture, activePath, `${JSON.stringify(legacy)}\n`);
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-legacy-collision",
+      goal: "continue after a legacy owner",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/legacy.ts"],
+      ...emptyTaskContractIntent(),
+    });
+
+    await expect(claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: "codex-new-owner",
+      branch: "task/wlan-new-owner",
+      worktree_ref: "wt-wlan-new-owner",
+    }))).rejects.toMatchObject({ code: "ACTIVE_CLAIM_CONTRACT_REQUIRED" });
+    await expect(claims.assertOwner(task.id, legacyOwner.claim_id)).resolves.toMatchObject({ claim_id: legacyOwner.claim_id });
+  });
+
+  it("resolves one exact host session, returns undefined for none, and rejects duplicate ownership", async () => {
+    const { claims, catalog, fixture, task } = await claimsFixture();
+    const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-resolve" }));
+
+    await expect(claims.resolveSessionClaim("codex", "codex-resolve", "cantopsbuildserver")).resolves.toEqual(first);
+    await expect(claims.resolveSessionClaim("codex", "codex-resolve", "other-host")).resolves.toBeUndefined();
+    await expect(claims.resolveSessionClaim("codex", "codex-missing", "cantopsbuildserver")).resolves.toBeUndefined();
+
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-duplicate-session",
+      goal: "create a duplicate fixture",
+      done_conditions: ["fixture is committed"],
+      expected_scope: ["src/duplicate.ts"],
+      ...emptyTaskContractIntent(),
+    });
+    const second = await claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: "codex-distinct",
+      branch: "task/wlan-distinct",
+      worktree_ref: "wt-wlan-distinct",
+    }));
+    const secondPath = `claims/active/${other.id}.yaml`;
+    const duplicate = JSON.parse(await readFile(join(fixture.registryDir, secondPath), "utf8"));
+    duplicate.session_id = first.session_id;
+    duplicate.host = first.host;
+    await commitRegistryFile(fixture, secondPath, `${JSON.stringify(duplicate)}\n`);
+
+    await expect(claims.resolveSessionClaim("codex", first.session_id, first.host)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(second.claim_id).not.toBe(first.claim_id);
+  });
+
+  it("persists and resolves the exact adapter/session/host tuple without inferring the adapter", async () => {
+    const { claims, catalog, task } = await claimsFixture();
+    const codex = await claims.claimTask(claimInput(task.id, {
+      origin_adapter: "codex",
+      session_id: "shared-session",
+    }));
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-adapter-distinct",
+      goal: "prove exact adapter binding",
+      done_conditions: ["adapter tuple is exact"],
+      expected_scope: ["src/adapter.ts"],
+      ...emptyTaskContractIntent(),
+    });
+    const claude = await claims.claimTask(claimInput(other.id, {
+      origin_adapter: "claude",
+      task_alias: other.aliases[0],
+      session_id: "shared-session",
+      branch: "task/wlan-adapter-distinct",
+      worktree_ref: "wt-wlan-adapter-distinct",
+    }));
+
+    expect(codex.origin_adapter).toBe("codex");
+    expect(claude.origin_adapter).toBe("claude");
+    await expect(claims.resolveSessionClaim("codex", "shared-session", codex.host)).resolves.toEqual(codex);
+    await expect(claims.resolveSessionClaim("claude", "shared-session", claude.host)).resolves.toEqual(claude);
+    await expect(claims.resolveSessionClaim("gemini", "shared-session", codex.host)).resolves.toBeUndefined();
+  });
+
+  it("keeps an adapter-missing active Claim parseable but fails closed on same-session acquisition", async () => {
+    const { claims, catalog, fixture, task } = await claimsFixture();
+    const owner = await claims.claimTask(claimInput(task.id, {
+      origin_adapter: "codex",
+      session_id: "legacy-adapter-session",
+    }));
+    const activePath = `claims/active/${task.id}.yaml`;
+    const legacy = JSON.parse(await readFile(join(fixture.registryDir, activePath), "utf8"));
+    delete legacy.origin_adapter;
+    await commitRegistryFile(fixture, activePath, `${JSON.stringify(legacy)}\n`);
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-legacy-adapter",
+      goal: "avoid ambiguous legacy ownership",
+      done_conditions: ["collision fails closed"],
+      expected_scope: ["src/legacy-adapter.ts"],
+      ...emptyTaskContractIntent(),
+    });
+
+    await expect(claims.resolveSessionClaim("codex", owner.session_id, owner.host)).resolves.toBeUndefined();
+    await expect(claims.claimTask(claimInput(other.id, {
+      origin_adapter: "claude",
+      task_alias: other.aliases[0],
+      session_id: owner.session_id,
+      branch: "task/wlan-legacy-adapter",
+      worktree_ref: "wt-wlan-legacy-adapter",
+    }))).rejects.toMatchObject({ code: "TASK_SESSION_BUSY" });
+  });
+
+  it("preserves the predecessor adapter in history and binds takeover to the requested successor adapter", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const first = await claims.claimTask(claimInput(task.id, {
+      origin_adapter: "codex",
+      session_id: "adapter-takeover-first",
+    }));
+
+    const recovered = await claims.recoverClaim(task.id, first.claim_id, {
+      kind: "takeover",
+      origin_adapter: "claude",
+      session_id: "adapter-takeover-next",
+    });
+
+    expect(recovered.history.origin_adapter).toBe("codex");
+    expect(recovered.active.origin_adapter).toBe("claude");
+    await expect(claims.resolveSessionClaim("claude", recovered.active.session_id, recovered.active.host))
+      .resolves.toEqual(recovered.active);
+    await expect(claims.resolveSessionClaim("codex", recovered.active.session_id, recovered.active.host))
+      .resolves.toBeUndefined();
+  });
+
+  it("lists every validated active Claim through a bounded read-only audit", async () => {
+    const { claims, catalog, task } = await claimsFixture();
+    const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-list-first" }));
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-list-second",
+      goal: "list a second active owner",
+      done_conditions: ["both owners are visible"],
+      expected_scope: ["src/list.ts"],
+      ...emptyTaskContractIntent(),
+    });
+    const second = await claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: "codex-list-second",
+      branch: "task/wlan-list-second",
+      worktree_ref: "wt-wlan-list-second",
+    }));
+
+    await expect(claims.listActiveClaims()).resolves.toEqual([first, second]);
+  });
+
+  it("copies the active Work Contract digest into newly released history", async () => {
+    const { claims, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+
+    const history = await claims.finishClaim(task.id, active.claim_id, {
+      status: "completed",
+      outcome: "done",
+      branch: active.branch,
+      head_sha: "0123456789abcdef",
+      validation: ["targeted test passes"],
+    });
+
+    expect(history.work_contract_digest).toBe(active.work_contract_digest);
+    expect(history.work_contract_digest).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("does not let takeover move a Claim into another Task's exact host session", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, catalog, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-takeover-session",
+      goal: "own the takeover target session",
+      done_conditions: ["ownership remains exact"],
+      expected_scope: ["src/takeover.ts"],
+      ...emptyTaskContractIntent(),
+    });
+    const first = await claims.claimTask(claimInput(task.id, { session_id: "codex-takeover-source" }));
+    await claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: "codex-takeover-target",
+      branch: "task/wlan-takeover-target",
+      worktree_ref: "wt-wlan-takeover-target",
+    }));
+
+    await expect(claims.recoverClaim(task.id, first.claim_id, {
+      kind: "takeover",
+      origin_adapter: "codex",
+      session_id: "codex-takeover-target",
+    })).rejects.toMatchObject({ code: "TASK_SESSION_BUSY" });
+    await expect(claims.assertOwner(task.id, first.claim_id)).resolves.toEqual(first);
+  });
+
+  it("does not mint a replacement generation from a legacy active Claim", async () => {
+    const { claims, fixture, task } = await claimsFixture();
+    const active = await claims.claimTask(claimInput(task.id));
+    const activePath = `claims/active/${task.id}.yaml`;
+    const legacy = JSON.parse(await readFile(join(fixture.registryDir, activePath), "utf8"));
+    delete legacy.work_contract;
+    delete legacy.work_contract_digest;
+    await commitRegistryFile(fixture, activePath, `${JSON.stringify(legacy)}\n`);
+
+    await expect(claims.recoverClaim(task.id, active.claim_id, {
+      kind: "takeover",
+      origin_adapter: "codex",
+      session_id: "codex-takeover",
+    })).rejects.toMatchObject({ code: "ACTIVE_CLAIM_CONTRACT_REQUIRED" });
+    await expect(claims.assertOwner(task.id, active.claim_id)).resolves.toMatchObject({ claim_id: active.claim_id });
+  });
+
+  it("blocks takeover when another active Claim is legacy and preserves the original generation", async () => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, catalog, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-takeover-legacy-other",
+      goal: "provide legacy conflicting ownership",
+      done_conditions: ["takeover remains blocked"],
+      expected_scope: ["src/legacy-other.ts"],
+      ...emptyTaskContractIntent(),
+    });
+    const requested = await claims.claimTask(claimInput(task.id, { session_id: "codex-takeover-requested" }));
+    const legacyOwner = await claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: "codex-takeover-legacy-other",
+      branch: "task/wlan-takeover-legacy-other",
+      worktree_ref: "wt-wlan-takeover-legacy-other",
+    }));
+    const legacyPath = `claims/active/${other.id}.yaml`;
+    const legacy = JSON.parse(await readFile(join(fixture.registryDir, legacyPath), "utf8"));
+    delete legacy.work_contract;
+    delete legacy.work_contract_digest;
+    await commitRegistryFile(fixture, legacyPath, `${JSON.stringify(legacy)}\n`);
+    const requestedPath = join(fixture.registryDir, "claims", "active", `${task.id}.yaml`);
+    const beforeBytes = await readFile(requestedPath, "utf8");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(claims.recoverClaim(task.id, requested.claim_id, {
+      kind: "takeover",
+      origin_adapter: "codex",
+      session_id: "codex-takeover-successor",
+    })).rejects.toMatchObject({ code: "ACTIVE_CLAIM_CONTRACT_REQUIRED" });
+
+    expect(await readFile(requestedPath, "utf8")).toBe(beforeBytes);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect(await exists(join(fixture.registryDir, historyRelativePath(requested)))).toBe(false);
+    await expect(claims.assertOwner(other.id, legacyOwner.claim_id)).resolves.toMatchObject({ claim_id: legacyOwner.claim_id });
+  });
+
+  it.each([
+    ["requested", 0],
+    ["existing", 1],
+  ] as const)("blocks takeover when the %s Claim makes an exact resource exclusive", async (_side, exclusiveIndex) => {
+    const times = [
+      new Date("2026-08-13T12:34:56.789Z"),
+      new Date("2026-08-13T12:34:57.789Z"),
+      new Date("2026-08-13T12:34:58.789Z"),
+    ];
+    const { claims, catalog, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
+    const sharedGrant = {
+      capability: "repo.modify" as const,
+      resource: { kind: "repository" as const, id: "repo-wlan" },
+      coordination: "shared" as const,
+    };
+    await catalog.configureInactiveTask({
+      task_id: task.id,
+      task_role: "standalone",
+      work_contract: { version: 1, task_id: task.id, grants: [sharedGrant], dependencies: [] },
+    });
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: `wlan:tmp-20260813-takeover-exclusive-${exclusiveIndex}`,
+      goal: "provide a symmetric resource conflict",
+      done_conditions: ["takeover remains blocked"],
+      expected_scope: ["src/exclusive.ts"],
+      grants: [sharedGrant],
+      dependencies: [],
+    });
+    const requested = await claims.claimTask(claimInput(task.id, { session_id: "codex-takeover-resource" }));
+    const existing = await claims.claimTask(claimInput(other.id, {
+      task_alias: other.aliases[0],
+      session_id: "codex-takeover-resource-other",
+      branch: "task/wlan-takeover-resource-other",
+      worktree_ref: "wt-wlan-takeover-resource-other",
+    }));
+    const activeClaims = [requested, existing];
+    const exclusive = activeClaims[exclusiveIndex];
+    const exclusivePath = `claims/active/${exclusive.task_id}.yaml`;
+    const injected = JSON.parse(await readFile(join(fixture.registryDir, exclusivePath), "utf8"));
+    injected.work_contract.grants[0].coordination = "exclusive";
+    injected.work_contract_digest = workContractDigest(injected.work_contract);
+    await commitRegistryFile(fixture, exclusivePath, `${JSON.stringify(injected)}\n`);
+    const requestedPath = join(fixture.registryDir, "claims", "active", `${task.id}.yaml`);
+    const beforeBytes = await readFile(requestedPath, "utf8");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    await expect(claims.recoverClaim(task.id, requested.claim_id, {
+      kind: "takeover",
+      origin_adapter: "codex",
+      session_id: "codex-takeover-resource-successor",
+    })).rejects.toMatchObject({ code: "TASK_RESOURCE_CONFLICT" });
+
+    expect(await readFile(requestedPath, "utf8")).toBe(beforeBytes);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect(await exists(join(fixture.registryDir, historyRelativePath(requested)))).toBe(false);
+  });
+
+  it.each(["wrong-task-id", "non-normalized", "digest"] as const)(
+    "rejects %s corruption in an active Claim before another Task acquisition",
+    async (variant) => {
+      const { claims, catalog, fixture, task } = await claimsFixture();
+      await catalog.configureInactiveTask({
+        task_id: task.id,
+        task_role: "standalone",
+        work_contract: {
+          version: 1,
+          task_id: task.id,
+          grants: [
+            { capability: "test.host", resource: { kind: "repository", id: "repo-wlan" }, coordination: "shared" },
+            { capability: "repo.modify", resource: { kind: "repository", id: "repo-wlan" }, coordination: "shared" },
+          ],
+          dependencies: [],
+        },
+      });
+      const owner = await claims.claimTask(claimInput(task.id, { session_id: "codex-corrupt-owner" }));
+      const ownerPath = `claims/active/${task.id}.yaml`;
+      const corrupted = JSON.parse(await readFile(join(fixture.registryDir, ownerPath), "utf8"));
+      if (variant === "wrong-task-id") {
+        corrupted.work_contract.task_id = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ff";
+        corrupted.work_contract_digest = workContractDigest(corrupted.work_contract);
+      } else if (variant === "non-normalized") {
+        corrupted.work_contract.grants.reverse();
+      } else {
+        corrupted.work_contract_digest = "f".repeat(64);
+      }
+      await commitRegistryFile(fixture, ownerPath, `${JSON.stringify(corrupted)}\n`);
+      const other = await catalog.registerTemporaryTask({
+        project_id: task.project_id,
+        repo_id: task.repo_id,
+        alias: `wlan:tmp-20260813-corrupt-acquire-${variant}`,
+        goal: "attempt acquisition around corruption",
+        done_conditions: ["acquisition fails closed"],
+        expected_scope: ["src/corrupt-acquire.ts"],
+        ...emptyTaskContractIntent(),
+      });
+      const beforeBytes = await readFile(join(fixture.registryDir, ownerPath), "utf8");
+      const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+      await expect(claims.claimTask(claimInput(other.id, {
+        task_alias: other.aliases[0],
+        session_id: `codex-corrupt-acquire-${variant}`,
+        branch: `task/wlan-corrupt-acquire-${variant}`,
+        worktree_ref: `wt-wlan-corrupt-acquire-${variant}`,
+      }))).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+      expect(await readFile(join(fixture.registryDir, ownerPath), "utf8")).toBe(beforeBytes);
+      expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+      await expect(claims.getActive(other.id)).resolves.toBeUndefined();
+      expect(owner.claim_id).toBe(corrupted.claim_id);
+    },
+  );
+
+  it.each(["wrong-task-id", "non-normalized", "digest"] as const)(
+    "rejects %s corruption before takeover writes replacement or history",
+    async (variant) => {
+      const { claims, catalog, fixture, task } = await claimsFixture();
+      await catalog.configureInactiveTask({
+        task_id: task.id,
+        task_role: "standalone",
+        work_contract: {
+          version: 1,
+          task_id: task.id,
+          grants: [
+            { capability: "test.host", resource: { kind: "repository", id: "repo-wlan" }, coordination: "shared" },
+            { capability: "repo.modify", resource: { kind: "repository", id: "repo-wlan" }, coordination: "shared" },
+          ],
+          dependencies: [],
+        },
+      });
+      const active = await claims.claimTask(claimInput(task.id, { session_id: "codex-corrupt-takeover" }));
+      const activePath = `claims/active/${task.id}.yaml`;
+      const corrupted = JSON.parse(await readFile(join(fixture.registryDir, activePath), "utf8"));
+      if (variant === "wrong-task-id") {
+        corrupted.work_contract.task_id = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ff";
+        corrupted.work_contract_digest = workContractDigest(corrupted.work_contract);
+      } else if (variant === "non-normalized") {
+        corrupted.work_contract.grants.reverse();
+      } else {
+        corrupted.work_contract_digest = "f".repeat(64);
+      }
+      await commitRegistryFile(fixture, activePath, `${JSON.stringify(corrupted)}\n`);
+      const beforeBytes = await readFile(join(fixture.registryDir, activePath), "utf8");
+      const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+      await expect(claims.recoverClaim(task.id, active.claim_id, {
+        kind: "takeover",
+        origin_adapter: "codex",
+        session_id: `codex-corrupt-takeover-${variant}`,
+      })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+      expect(await readFile(join(fixture.registryDir, activePath), "utf8")).toBe(beforeBytes);
+      expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+      expect(await exists(join(fixture.registryDir, historyRelativePath(active)))).toBe(false);
+    },
+  );
+
   it.each([
     ["completed release without an outcome", { status: "completed" }],
     ["Handoff release without a pointer", { status: "handoff" }],
@@ -210,7 +1148,7 @@ describe("ClaimService", () => {
     });
   });
 
-  it("marks force-ended temporary work resumable as handoff", async () => {
+  it("marks force-ended temporary work resumable with the committed resumed Task revision", async () => {
     const { claims, task, fixture } = await claimsFixture();
     const active = await claims.claimTask(claimInput(task.id));
 
@@ -218,13 +1156,164 @@ describe("ClaimService", () => {
 
     const record = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
     expect(record.lifecycle).toBe("handoff");
-    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-resume" }))).resolves.toMatchObject({
+    const returned = await claims.claimTask(claimInput(task.id, { session_id: "codex-resume" }));
+    expect(returned).toMatchObject({
       task_id: task.id,
       session_id: "codex-resume",
       predecessor_claim_id: active.claim_id,
     });
     const resumed = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
+    const persisted = JSON.parse(await readFile(
+      join(fixture.registryDir, "claims", "active", `${task.id}.yaml`),
+      "utf8",
+    ));
+    const committedTaskRevision = (await git(
+      fixture.registryDir,
+      "rev-parse",
+      `HEAD:tasks/${task.id}.yaml`,
+    )).trim();
     expect(resumed.lifecycle).toBe("active");
+    expect(returned.source_task_revision).toBe(committedTaskRevision);
+    expect(persisted.source_task_revision).toBe(committedTaskRevision);
+  });
+
+  it("rejects an ambiguous post-transition blob before publishing resumed ownership", async () => {
+    let hashInvoked = false;
+    const { claims, task, fixture } = await claimsFixture(
+      () => fixedNow,
+      undefined,
+      (): ProcessRunnerLike => {
+        const delegate = new ProcessRunner();
+        return {
+          async run(command, args, options) {
+            if (command === "git" && args[0] === "hash-object") {
+              hashInvoked = true;
+              return {
+                command,
+                args,
+                stdout: `${"a".repeat(40)}\n${"b".repeat(40)}\n`,
+                stderr: "",
+                exitCode: 0,
+              };
+            }
+            return delegate.run(command, args, options);
+          },
+          runRaw: (command, args, options, maximumBytes) =>
+            delegate.runRaw(command, args, options, maximumBytes),
+        };
+      },
+    );
+    const first = await claims.claimTask(claimInput(task.id));
+    await claims.recoverClaim(task.id, first.claim_id, { kind: "force-end" });
+    const activePath = `claims/active/${task.id}.yaml`;
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeRemoteHead = (await git(fixture.remoteDir, "rev-parse", "main")).trim();
+
+    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-ambiguous-resume" })))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    expect(hashInvoked).toBe(true);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.remoteDir, "rev-parse", "main")).trim()).toBe(beforeRemoteHead);
+    expect((await git(fixture.registryDir, "ls-tree", "--name-only", "HEAD", "--", activePath)).trim()).toBe("");
+  });
+
+  it("rejects a changed post-transition blob before committing resumed ownership", async () => {
+    let alteredAfterHash = false;
+    const { claims, task, fixture } = await claimsFixture(
+      () => fixedNow,
+      undefined,
+      (createdFixture): ProcessRunnerLike => {
+        const delegate = new ProcessRunner();
+        return {
+          async run(command, args, options) {
+            if (command === "git" && args[0] === "hash-object" && !alteredAfterHash) {
+              const result = await delegate.run(command, args, options);
+              const relativePath = args.at(-1);
+              if (!relativePath) throw new Error("hash-object test invocation omitted its path");
+              await appendFile(join(createdFixture.registryDir, relativePath), " ", "utf8");
+              alteredAfterHash = true;
+              return result;
+            }
+            return delegate.run(command, args, options);
+          },
+          runRaw: (command, args, options, maximumBytes) =>
+            delegate.runRaw(command, args, options, maximumBytes),
+        };
+      },
+    );
+    const first = await claims.claimTask(claimInput(task.id));
+    await claims.recoverClaim(task.id, first.claim_id, { kind: "force-end" });
+    const activePath = `claims/active/${task.id}.yaml`;
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeRemoteHead = (await git(fixture.remoteDir, "rev-parse", "main")).trim();
+
+    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-stage-race-resume" })))
+      .rejects.toMatchObject({ code: "MUTATION_PATH_MISMATCH" });
+
+    expect(alteredAfterHash).toBe(true);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.remoteDir, "rev-parse", "main")).trim()).toBe(beforeRemoteHead);
+    expect((await git(fixture.remoteDir, "ls-tree", "--name-only", "main", "--", activePath)).trim()).toBe("");
+  });
+
+  it("rejects a commit-time changed blob before pushing resumed ownership", async () => {
+    let armCommitMutation = false;
+    let mutatedAtCommit = false;
+    let expectedTaskBlob: string | undefined;
+    let taskPath = "";
+    const { claims, task, fixture } = await claimsFixture(
+      () => fixedNow,
+      undefined,
+      (createdFixture): ProcessRunnerLike => {
+        const delegate = new ProcessRunner();
+        return {
+          async run(command, args, options) {
+            if (command === "git" && args[0] === "hash-object") {
+              const result = await delegate.run(command, args, options);
+              expectedTaskBlob = result.stdout.trim();
+              return result;
+            }
+            if (command === "git" && args[0] === "commit" && armCommitMutation) {
+              armCommitMutation = false;
+              await appendFile(join(createdFixture.registryDir, taskPath), " ", "utf8");
+              await delegate.run("git", ["add", "-f", "--", taskPath], options);
+              mutatedAtCommit = true;
+              return delegate.run(command, args, options);
+            }
+            return delegate.run(command, args, options);
+          },
+          runRaw: (command, args, options, maximumBytes) =>
+            delegate.runRaw(command, args, options, maximumBytes),
+        };
+      },
+    );
+    taskPath = `tasks/${task.id}.yaml`;
+    const first = await claims.claimTask(claimInput(task.id));
+    await claims.recoverClaim(task.id, first.claim_id, { kind: "force-end" });
+    const activePath = `claims/active/${task.id}.yaml`;
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeRemoteHead = (await git(fixture.remoteDir, "rev-parse", "main")).trim();
+    armCommitMutation = true;
+
+    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-commit-race-resume" })))
+      .rejects.toMatchObject({ code: "MUTATION_PATH_MISMATCH" });
+
+    const committedTaskBlob = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+    const changedWorktreeBlob = (await git(
+      fixture.registryDir,
+      "hash-object",
+      `--path=${taskPath}`,
+      "--",
+      taskPath,
+    )).trim();
+    expect(mutatedAtCommit).toBe(true);
+    expect(expectedTaskBlob).toMatch(/^[0-9a-f]{40,64}$/);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).not.toBe(beforeHead);
+    expect(committedTaskBlob).toBe(changedWorktreeBlob);
+    expect(committedTaskBlob).not.toBe(expectedTaskBlob);
+    expect((await git(fixture.remoteDir, "rev-parse", "main")).trim()).toBe(beforeRemoteHead);
+    expect((await git(fixture.remoteDir, "ls-tree", "--name-only", "main", "--", activePath)).trim()).toBe("");
   });
 
   it("rejects a caller-supplied predecessor instead of trusting a forged recovery link", async () => {
@@ -346,6 +1435,7 @@ describe("ClaimService", () => {
 
     const recovered = await claims.recoverClaim(first.task_id, first.claim_id, {
       kind: "takeover",
+      origin_adapter: "codex",
       session_id: "codex-new",
     });
 
@@ -381,6 +1471,7 @@ describe("ClaimService", () => {
 
     const takeover = await claims.recoverClaim(task.id, resumed.claim_id, {
       kind: "takeover",
+      origin_adapter: "codex",
       session_id: "codex-takeover",
     });
 
@@ -396,7 +1487,7 @@ describe("ClaimService", () => {
     ];
     const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
     const first = await claims.claimTask(claimInput(task.id));
-    const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+    const takeover = { kind: "takeover" as const, origin_adapter: "codex" as const, session_id: "codex-new" };
     const recovered = await claims.recoverClaim(first.task_id, first.claim_id, takeover);
     const head = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
 
@@ -413,10 +1504,13 @@ describe("ClaimService", () => {
     ];
     const { claims, task } = await claimsFixture(() => times.shift() ?? fixedNow);
     const first = await claims.claimTask(claimInput(task.id));
-    await claims.recoverClaim(first.task_id, first.claim_id, { kind: "takeover", session_id: "codex-new" });
+    await claims.recoverClaim(first.task_id, first.claim_id, {
+      kind: "takeover", origin_adapter: "codex", session_id: "codex-new",
+    });
 
     await expect(claims.recoverClaim(first.task_id, first.claim_id, {
       kind: "takeover",
+      origin_adapter: "codex",
       session_id: "codex-other",
     })).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
   });
@@ -431,7 +1525,7 @@ describe("ClaimService", () => {
       ];
       const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
       const first = await claims.claimTask(claimInput(task.id));
-      const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+      const takeover = { kind: "takeover" as const, origin_adapter: "codex" as const, session_id: "codex-new" };
       await claims.recoverClaim(first.task_id, first.claim_id, takeover);
       const relative = historyRelativePath(first);
       const path = join(fixture.registryDir, relative);
@@ -460,15 +1554,18 @@ describe("ClaimService", () => {
     const first = await claims.claimTask(claimInput(task.id));
     const second = await claims.recoverClaim(first.task_id, first.claim_id, {
       kind: "takeover",
+      origin_adapter: "codex",
       session_id: "codex-second",
     });
     await claims.recoverClaim(second.active.task_id, second.active.claim_id, {
       kind: "takeover",
+      origin_adapter: "codex",
       session_id: "codex-third",
     });
 
     await expect(claims.recoverClaim(first.task_id, first.claim_id, {
       kind: "takeover",
+      origin_adapter: "codex",
       session_id: "codex-second",
     })).rejects.toMatchObject({ code: "CLAIM_MISMATCH" });
   });
@@ -482,7 +1579,7 @@ describe("ClaimService", () => {
     ];
     const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? new Date("2027-01-01T00:00:02.000Z"));
     const first = await claims.claimTask(claimInput(task.id));
-    const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+    const takeover = { kind: "takeover" as const, origin_adapter: "codex" as const, session_id: "codex-new" };
     const recovered = await claims.recoverClaim(first.task_id, first.claim_id, takeover);
     const head = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
 
@@ -500,7 +1597,7 @@ describe("ClaimService", () => {
     ];
     const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
     const first = await claims.claimTask(claimInput(task.id));
-    const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+    const takeover = { kind: "takeover" as const, origin_adapter: "codex" as const, session_id: "codex-new" };
     await claims.recoverClaim(first.task_id, first.claim_id, takeover);
     const canonical = join(fixture.registryDir, historyRelativePath(first));
     const misplacedRelative = `claims/history/2025/${first.task_id}/${first.claim_id}.yaml`;
@@ -526,7 +1623,7 @@ describe("ClaimService", () => {
     ];
     const { claims, fixture, task } = await claimsFixture(() => times.shift() ?? fixedNow);
     const first = await claims.claimTask(claimInput(task.id));
-    const takeover = { kind: "takeover" as const, session_id: "codex-new" };
+    const takeover = { kind: "takeover" as const, origin_adapter: "codex" as const, session_id: "codex-new" };
     await claims.recoverClaim(first.task_id, first.claim_id, takeover);
     const duplicate = `claims/history/2025/${first.task_id}/${first.claim_id}.yaml`;
     await commitRegistryFile(fixture, duplicate, await readFile(join(fixture.registryDir, historyRelativePath(first)), "utf8"));
@@ -543,6 +1640,7 @@ describe("ClaimService", () => {
 
     await expect(claims.recoverClaim(first.task_id, first.claim_id, {
       kind: "takeover",
+      origin_adapter: "codex",
       session_id: "codex-new",
     })).rejects.toMatchObject({ code: "HOST_MISMATCH" });
     await expect(claims.assertOwner(first.task_id, first.claim_id)).resolves.toEqual(first);
@@ -587,7 +1685,9 @@ describe("ClaimService", () => {
     const { externalDir, externalPath } = await replaceActiveWithExternalSymlink(fixture, active, content);
 
     await expect(
-      claims.recoverClaim(active.task_id, active.claim_id, { kind: "takeover", session_id: "codex-new" }),
+      claims.recoverClaim(active.task_id, active.claim_id, {
+        kind: "takeover", origin_adapter: "codex", session_id: "codex-new",
+      }),
     ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     expect(await readFile(externalPath, "utf8")).toBe(content);
     expect(await exists(join(externalDir, `${active.claim_id}.yaml`))).toBe(false);
@@ -758,7 +1858,9 @@ describe("ClaimService", () => {
     await commitRegistryFile(fixture, `${historyRelativePath(active)}/marker`, "directory entry\n");
 
     await expect(
-      claims.recoverClaim(active.task_id, active.claim_id, { kind: "takeover", session_id: "codex-new" }),
+      claims.recoverClaim(active.task_id, active.claim_id, {
+        kind: "takeover", origin_adapter: "codex", session_id: "codex-new",
+      }),
     ).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
     expect(await claims.getActive(active.task_id)).toEqual(active);
   });

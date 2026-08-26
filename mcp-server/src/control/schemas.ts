@@ -1,5 +1,18 @@
 import { z } from "zod";
 
+import {
+  ClaimIdSchema,
+  GuardAdapterSchema,
+  GuardSessionSchema,
+  GuardWorktreeRefSchema,
+  OperationIdSchema,
+  CanonicalOperationRequirementsSchema,
+  RequestIdSchema,
+} from "./guard-protocol.js";
+import { normalizeWorkContract, TaskIdSchema, WorkContractSchema, workContractDigest } from "./work-contract.js";
+
+export { TaskIdSchema } from "./work-contract.js";
+
 const canonicalId = (prefix: "prj" | "repo" | "tsk" | "clm" | "hld" | "rsv") =>
   z.string().regex(new RegExp(`^${prefix}-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`));
 
@@ -14,13 +27,15 @@ const boundedCoordinate = (maximumBytes: number) => z.string().min(1).max(maximu
   .regex(/^[^\u0000-\u001f\u007f]+$/u)
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
 const taskAlias = boundedCoordinate(160);
-const claimCoordinate = boundedCoordinate(255);
-const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
+export const ClaimCoordinateSchema = boundedCoordinate(255);
+export const GithubNodeIdSchema = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 const githubApiId = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
 export const SourceTaskRevisionSchema = boundedCoordinate(256);
 export const OffsetDateTimeSchema = z.string().min(1).max(64).datetime({ offset: true });
 export const TemporaryLifecycleSchema = z.enum(["active", "handoff", "completed", "abandoned"]);
 export type TemporaryLifecycle = z.infer<typeof TemporaryLifecycleSchema>;
+export const TaskRoleSchema = z.enum(["standalone", "parent"]);
+export type TaskRole = z.infer<typeof TaskRoleSchema>;
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
   const parsed = new Date(`${value}T00:00:00.000Z`);
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
@@ -44,7 +59,7 @@ export type AuthorityRecord = z.infer<typeof AuthorityRecordSchema>;
 export const RepositoryRecordSchema = z
   .object({
     id: repositoryId,
-    github_node_id: githubNodeId,
+    github_node_id: GithubNodeIdSchema,
     slug: z.string().regex(githubSlugPattern),
     // Explicit operator opt-in: the source repository may be public. Absent
     // means the Phase 1A private requirement stays enforced on every use.
@@ -61,13 +76,19 @@ const taskBase = {
     .refine((aliases) => new Set(aliases).size === aliases.length, "Duplicate Task alias"),
 };
 
+const legacyCompatibleTaskConfiguration = {
+  task_role: TaskRoleSchema.optional(),
+  work_contract: WorkContractSchema.optional(),
+};
+
 export const FormalTaskSchema = z
   .object({
     ...taskBase,
     kind: z.literal("formal"),
-    issue_node_id: githubNodeId,
+    issue_node_id: GithubNodeIdSchema,
     issue_revision: OffsetDateTimeSchema,
     issue_url: z.string().max(512).url(),
+    ...legacyCompatibleTaskConfiguration,
   })
   .strict()
   .superRefine((task, context) => {
@@ -90,6 +111,9 @@ export const FormalTaskSchema = z
         message: "Historical formal Task alias disagrees with its canonical Issue number",
       });
     }
+    if (task.work_contract !== undefined && task.work_contract.task_id !== task.id) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["work_contract", "task_id"], message: "Work Contract Task ID disagrees with Task record" });
+    }
   });
 export type FormalTask = z.infer<typeof FormalTaskSchema>;
 
@@ -101,35 +125,111 @@ export const TemporaryTaskSchema = z
     done_conditions: z.array(boundedUtf8(256)).min(1).max(32),
     expected_scope: z.array(boundedUtf8(256)).min(1).max(32),
     lifecycle: TemporaryLifecycleSchema,
+    ...legacyCompatibleTaskConfiguration,
   })
-  .strict();
+  .strict()
+  .superRefine((task, context) => {
+    if (task.work_contract !== undefined && task.work_contract.task_id !== task.id) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["work_contract", "task_id"], message: "Work Contract Task ID disagrees with Task record" });
+    }
+  });
 export type TemporaryTask = z.infer<typeof TemporaryTaskSchema>;
 
-export const TaskRecordSchema = z.union([FormalTaskSchema, TemporaryTaskSchema]);
+export const ChildTaskSchema = z
+  .object({
+    ...taskBase,
+    kind: z.literal("child"),
+    parent_task_id: canonicalId("tsk"),
+    required_for_parent: z.boolean(),
+    goal: boundedUtf8(32 * 1024),
+    done_conditions: z.array(boundedUtf8(256)).min(1).max(32),
+    lifecycle: TemporaryLifecycleSchema,
+    work_contract: WorkContractSchema,
+  })
+  .strict()
+  .superRefine((task, context) => {
+    if (task.work_contract.task_id !== task.id) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["work_contract", "task_id"], message: "Work Contract Task ID disagrees with Task record" });
+    }
+  });
+export type ChildTask = z.infer<typeof ChildTaskSchema>;
+
+export const TaskRecordSchema = z.union([FormalTaskSchema, TemporaryTaskSchema, ChildTaskSchema]);
 export type TaskRecord = z.infer<typeof TaskRecordSchema>;
 
-export const ActiveClaimSchema = z
-  .object({
+const ActiveClaimBaseSchema = z.object({
     task_id: canonicalId("tsk"),
     task_alias: taskAlias,
     project_id: projectId,
     repo_id: repositoryId,
     claim_id: canonicalId("clm"),
     predecessor_claim_id: canonicalId("clm").optional(),
-    session_id: claimCoordinate,
-    host: claimCoordinate,
-    branch: claimCoordinate,
-    worktree_ref: claimCoordinate,
+    session_id: ClaimCoordinateSchema,
+    host: ClaimCoordinateSchema,
+    branch: ClaimCoordinateSchema,
+    worktree_ref: ClaimCoordinateSchema,
     source_task_revision: SourceTaskRevisionSchema,
     started_at: OffsetDateTimeSchema,
-  })
-  .strict();
+  });
+
+export const LegacyActiveClaimSchema = ActiveClaimBaseSchema.strict();
+export const AdapterLegacyActiveClaimSchema = ActiveClaimBaseSchema.extend({
+  origin_adapter: GuardAdapterSchema,
+}).strict();
+const contractClaimFields = {
+  work_contract: WorkContractSchema,
+  work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/),
+};
+function validateContractClaim(
+  claim: z.infer<typeof ActiveClaimBaseSchema> & z.infer<z.ZodObject<typeof contractClaimFields>>,
+  context: z.RefinementCtx,
+): void {
+  if (claim.work_contract.task_id !== claim.task_id) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["work_contract", "task_id"],
+      message: "Claim Work Contract Task ID disagrees with active Claim",
+    });
+  }
+  const normalized = normalizeWorkContract(claim.work_contract);
+  if (JSON.stringify(normalized) !== JSON.stringify(claim.work_contract)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["work_contract"],
+      message: "Active Claim Work Contract snapshot is not canonical",
+    });
+  }
+  if (workContractDigest(normalized) !== claim.work_contract_digest) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["work_contract_digest"],
+      message: "Active Claim Work Contract digest disagrees with its snapshot",
+    });
+  }
+}
+
+/** Pre-adapter contract Claims stay readable for recovery, never Guard authority. */
+export const LegacyContractActiveClaimSchema = ActiveClaimBaseSchema.extend(contractClaimFields)
+  .strict()
+  .superRefine(validateContractClaim);
+export const ContractActiveClaimSchema = ActiveClaimBaseSchema.extend({
+  origin_adapter: GuardAdapterSchema,
+  ...contractClaimFields,
+}).strict().superRefine(validateContractClaim);
+export const ActiveClaimSchema = z.union([
+  ContractActiveClaimSchema,
+  LegacyContractActiveClaimSchema,
+  AdapterLegacyActiveClaimSchema,
+  LegacyActiveClaimSchema,
+]);
 export type ActiveClaim = z.infer<typeof ActiveClaimSchema>;
+export type ContractActiveClaim = z.infer<typeof ContractActiveClaimSchema>;
+export type LegacyContractActiveClaim = z.infer<typeof LegacyContractActiveClaimSchema>;
 
 const safeClaimConflictText = z.string().min(1).max(255).regex(/^[^\u0000-\u001f\u007f]+$/u);
 
 /** Deliberately bounded public coordinates for an already-owned Task. */
-export const ConflictingClaimSummarySchema = ActiveClaimSchema.pick({
+export const ConflictingClaimSummarySchema = ActiveClaimBaseSchema.pick({
   task_id: true,
   claim_id: true,
   host: true,
@@ -143,6 +243,12 @@ export const ConflictingClaimSummarySchema = ActiveClaimSchema.pick({
   started_at: OffsetDateTimeSchema,
 }).strict();
 export type ConflictingClaimSummary = z.infer<typeof ConflictingClaimSummarySchema>;
+
+/** The only child-registration coordinate an error envelope may retain. */
+export const RetainedTaskSummarySchema = z.object({
+  task_id: TaskIdSchema,
+}).strict();
+export type RetainedTaskSummary = z.infer<typeof RetainedTaskSummarySchema>;
 
 /**
  * The closed vocabulary of machine-readable causes emitted next to a stable
@@ -198,9 +304,201 @@ export const ERROR_REASONS = [
   "live_pid_recorded",
   // LOCK_CONTENDED — boards.lock, distinguished from registry.lock contention.
   "board_state_lock",
+  // LOCK_CONTENDED — the independent one-time Guard request state lock.
+  "guard_state_lock",
 ] as const;
 export const ErrorReasonSchema = z.enum(ERROR_REASONS);
 export type ErrorReason = z.infer<typeof ErrorReasonSchema>;
+
+/** Stable, closed Guard policy codes. Normal denials use this schema, not exceptions. */
+export const GuardDenyCodeSchema = z.enum([
+  "GUARD_CLAIM_REQUIRED",
+  "GUARD_CLAIM_MISMATCH",
+  "GUARD_WORKTREE_MISMATCH",
+  "GUARD_RESOURCE_OWNED",
+  "GUARD_REQUEST_NOT_FOUND",
+  "GUARD_REQUEST_EXPIRED",
+  "GUARD_PERMIT_MISMATCH",
+  "GUARD_PERMIT_CONSUMED",
+  "GUARD_PROMPT_ORIGIN_UNSUPPORTED",
+  "GUARD_UNAVAILABLE",
+  "GUARD_PROTOCOL_MISMATCH",
+  "GUARD_RESOURCE_AUTHORITY_UNAVAILABLE",
+  "GUARD_WRAPPER_REQUIRED",
+  "GUARD_SELF_APPROVAL_DENIED",
+  "GUARD_STATE_LIMIT",
+]);
+export type GuardDenyCode = z.infer<typeof GuardDenyCodeSchema>;
+
+export const GuardEvaluationModeSchema = z.enum(["enforce", "observe"]);
+export type GuardEvaluationMode = z.infer<typeof GuardEvaluationModeSchema>;
+
+export const GuardSummarySchema = boundedCoordinate(512);
+export const GuardExecutionBoundarySchema = z.enum(["hook", "guarded_command", "tracker", "notion", "board"]);
+export const GuardJournalWarningSchema = z.literal("GUARD_JOURNAL_UNAVAILABLE");
+
+export const GuardRequestLifecycleSchema = z.enum([
+  "PENDING",
+  "APPROVED",
+  "CONSUMED",
+  "COMPLETED",
+  "FAILED",
+  "EXPIRED",
+]);
+export type GuardRequestLifecycle = z.infer<typeof GuardRequestLifecycleSchema>;
+export const GUARD_REQUEST_TTL_MS = 10 * 60 * 1_000;
+
+/** Exact private permit binding and lifecycle metadata; no transport payloads. */
+export const GuardRequestSchema = z.object({
+  request_id: RequestIdSchema,
+  state: GuardRequestLifecycleSchema,
+  origin_adapter: GuardAdapterSchema,
+  session_id: GuardSessionSchema,
+  task_id: TaskIdSchema,
+  claim_id: ClaimIdSchema,
+  cwd_worktree_ref: GuardWorktreeRefSchema,
+  requirements: CanonicalOperationRequirementsSchema,
+  operation_digest: z.string().regex(/^[0-9a-f]{64}$/),
+  summary: GuardSummarySchema,
+  requested_at: OffsetDateTimeSchema,
+  approval_expires_at: OffsetDateTimeSchema,
+  approved_at: OffsetDateTimeSchema.optional(),
+  start_by: OffsetDateTimeSchema.optional(),
+  consumed_at: OffsetDateTimeSchema.optional(),
+  finished_at: OffsetDateTimeSchema.optional(),
+  correlation_id: boundedCoordinate(255).optional(),
+}).strict().superRefine((request, context) => {
+  const requestedAt = Date.parse(request.requested_at);
+  const approvalExpiresAt = Date.parse(request.approval_expires_at);
+  if (approvalExpiresAt !== requestedAt + GUARD_REQUEST_TTL_MS) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["approval_expires_at"], message: "Approval deadline is not exactly ten minutes" });
+  }
+  const approved = request.approved_at !== undefined && request.start_by !== undefined;
+  if ((request.approved_at !== undefined) !== (request.start_by !== undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["approved_at"], message: "Approval timestamps are atomic" });
+  }
+  if (["APPROVED", "CONSUMED", "COMPLETED", "FAILED"].includes(request.state) && !approved) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["approved_at"], message: "Approved lifecycle requires approval timestamps" });
+  }
+  if (approved) {
+    const approvedAt = Date.parse(request.approved_at as string);
+    const startBy = Date.parse(request.start_by as string);
+    if (approvedAt < requestedAt || approvedAt >= approvalExpiresAt) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["approved_at"], message: "Approval timestamp is outside its pending window" });
+    }
+    if (startBy !== approvedAt + GUARD_REQUEST_TTL_MS) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["start_by"], message: "Start deadline is not exactly ten minutes" });
+    }
+  }
+  const consumed = request.consumed_at !== undefined && request.correlation_id !== undefined;
+  if ((request.consumed_at !== undefined) !== (request.correlation_id !== undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["consumed_at"], message: "Consumption coordinates are atomic" });
+  }
+  if (["CONSUMED", "COMPLETED", "FAILED"].includes(request.state) && !consumed) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["consumed_at"], message: "Consumed lifecycle requires correlation" });
+  }
+  if (consumed && approved) {
+    const consumedAt = Date.parse(request.consumed_at as string);
+    if (consumedAt < Date.parse(request.approved_at as string) || consumedAt >= Date.parse(request.start_by as string)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["consumed_at"], message: "Consumption timestamp is outside its approved window" });
+    }
+  }
+  if (["COMPLETED", "FAILED", "EXPIRED"].includes(request.state) !== (request.finished_at !== undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["finished_at"], message: "Terminal lifecycle requires one finish timestamp" });
+  }
+  if (request.state === "PENDING" && (approved || consumed)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["state"], message: "Pending request carries later lifecycle fields" });
+  }
+  if (request.state === "APPROVED" && consumed) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["state"], message: "Approved request carries consumption fields" });
+  }
+  if (request.state === "EXPIRED" && consumed) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["state"], message: "Expired request carries consumption fields" });
+  }
+  if (request.finished_at !== undefined) {
+    const finishedAt = Date.parse(request.finished_at);
+    const earliest = request.state === "EXPIRED"
+      ? Date.parse(request.start_by ?? request.approval_expires_at)
+      : Date.parse(request.consumed_at as string);
+    if (finishedAt < earliest) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["finished_at"], message: "Finish timestamp precedes its terminal boundary" });
+    }
+  }
+});
+export type GuardRequest = z.infer<typeof GuardRequestSchema>;
+
+export const GuardRequestStateSchema = z.object({
+  version: z.literal(1),
+  requests: z.array(GuardRequestSchema)
+    .refine((requests) => new Set(requests.map((request) => request.request_id)).size === requests.length, "Duplicate Guard request ID")
+    .refine((requests) => {
+      const correlations = requests.flatMap((request) => request.correlation_id === undefined ? [] : [request.correlation_id]);
+      return new Set(correlations).size === correlations.length;
+    }, "Duplicate Guard correlation ID")
+    .refine((requests) => {
+      const liveBindings = requests
+        .filter((request) => request.state === "PENDING" || request.state === "APPROVED" || request.state === "CONSUMED")
+        .map((request) => JSON.stringify([
+          request.task_id,
+          request.claim_id,
+          request.origin_adapter,
+          request.session_id,
+          request.cwd_worktree_ref,
+          request.requirements,
+          request.operation_digest,
+        ]));
+      return new Set(liveBindings).size === liveBindings.length;
+    }, "Duplicate live Guard operation binding"),
+}).strict();
+export type GuardRequestState = z.infer<typeof GuardRequestStateSchema>;
+
+const GuardAllowDecisionSchema = z.object({
+  decision: z.literal("ALLOW"),
+  operation_id: OperationIdSchema,
+  summary: GuardSummarySchema,
+  execution_boundary: GuardExecutionBoundarySchema,
+  consumed_request_id: RequestIdSchema.optional(),
+  observed_decision: z.enum(["PERMIT_REQUIRED", "DENY"]).optional(),
+  journal_warning: GuardJournalWarningSchema.optional(),
+}).strict();
+
+const GuardPermitRequiredDecisionSchema = z.object({
+  decision: z.literal("PERMIT_REQUIRED"),
+  operation_id: OperationIdSchema,
+  request_id: RequestIdSchema,
+  summary: GuardSummarySchema,
+  approval_command: z.string().min(1).max(96),
+  approval_expires_at: OffsetDateTimeSchema,
+  journal_warning: GuardJournalWarningSchema.optional(),
+}).strict();
+
+const GuardDenyDecisionSchema = z.object({
+  decision: z.literal("DENY"),
+  code: GuardDenyCodeSchema,
+  reason: ErrorReasonSchema.optional(),
+  task_id: TaskIdSchema.optional(),
+  claim_id: canonicalId("clm").optional(),
+  summary: GuardSummarySchema,
+  journal_warning: GuardJournalWarningSchema.optional(),
+}).strict();
+
+export const GuardDecisionSchema = z.discriminatedUnion("decision", [
+  GuardAllowDecisionSchema,
+  GuardPermitRequiredDecisionSchema,
+  GuardDenyDecisionSchema,
+]).superRefine((decision, context) => {
+  if (
+    decision.decision === "PERMIT_REQUIRED" &&
+    decision.approval_command !== `/jhw:unlock ${decision.request_id}`
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["approval_command"],
+      message: "Approval command must exactly identify its request",
+    });
+  }
+});
+export type GuardDecision = z.infer<typeof GuardDecisionSchema>;
 
 export const BoardIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}$/);
 export const BoardModeSchema = z.enum(["exclusive", "shared"]);
@@ -220,7 +518,7 @@ export type BoardInterface = z.infer<typeof BoardInterfaceSchema>;
 export const BoardHolderSchema = z
   .object({
     holder_id: canonicalId("hld"),
-    session: claimCoordinate,
+    session: ClaimCoordinateSchema,
     pid: z.number().int().gt(1).nullable(),
     pid_start_time: boundedCoordinate(64).nullable(),
     boot_id: boundedCoordinate(64).nullable(),
@@ -244,7 +542,7 @@ export type BoardHolder = z.infer<typeof BoardHolderSchema>;
 export const BoardReservationSchema = z
   .object({
     reservation_id: canonicalId("rsv"),
-    session: claimCoordinate,
+    session: ClaimCoordinateSchema,
     mode: BoardModeSchema,
     from: OffsetDateTimeSchema,
     to: OffsetDateTimeSchema,
@@ -299,10 +597,11 @@ export const ClaimHistorySchema = z
     repo_id: repositoryId,
     claim_id: canonicalId("clm"),
     predecessor_claim_id: canonicalId("clm").optional(),
-    session_id: claimCoordinate,
-    host: claimCoordinate,
-    branch: claimCoordinate,
-    worktree_ref: claimCoordinate,
+    origin_adapter: GuardAdapterSchema.optional(),
+    session_id: ClaimCoordinateSchema,
+    host: ClaimCoordinateSchema,
+    branch: ClaimCoordinateSchema,
+    worktree_ref: ClaimCoordinateSchema,
     source_task_revision: SourceTaskRevisionSchema,
     started_at: OffsetDateTimeSchema,
     released_at: OffsetDateTimeSchema,
@@ -312,6 +611,11 @@ export const ClaimHistorySchema = z
     validation_summary: boundedUtf8(33 * 1024).optional(),
     handoff_path: z.string().max(160).regex(/^handoffs\/tsk-[0-9a-f-]+\/clm-[0-9a-f-]+\.md$/).optional(),
     successor_claim_id: canonicalId("clm").optional(),
+    work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+    completion_evidence_path: z.string().max(160).regex(
+      /^task-completion\/(tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/(clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.yaml$/,
+    ).optional(),
+    completion_evidence_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   })
   .strict()
   .superRefine((history, context) => {
@@ -327,6 +631,32 @@ export const ClaimHistorySchema = z
     }
     if ((history.handoff_path !== undefined) !== (history.status === "handoff")) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["handoff_path"], message: "Only Handoff history carries a Handoff pointer" });
+    }
+    if ((history.completion_evidence_path !== undefined) !== (history.completion_evidence_digest !== undefined)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["completion_evidence_path"],
+        message: "Completion evidence pointer and digest are atomic",
+      });
+    }
+    if (history.completion_evidence_path !== undefined) {
+      if (history.status !== "completed") {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["completion_evidence_path"],
+          message: "Only completed Claim history carries completion evidence",
+        });
+      }
+      const match = history.completion_evidence_path.match(
+        /^task-completion\/(tsk-[0-9a-f-]+)\/(clm-[0-9a-f-]+)\.yaml$/,
+      );
+      if (!match || match[1] !== history.task_id || match[2] !== history.claim_id) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["completion_evidence_path"],
+          message: "Completion evidence pointer disagrees with Claim history coordinates",
+        });
+      }
     }
   });
 export type ClaimHistory = z.infer<typeof ClaimHistorySchema>;
@@ -387,7 +717,7 @@ export type ProjectFieldDefinition = z.infer<typeof ProjectFieldDefinitionSchema
 export const ProjectSnapshotItemSchema = z
   .object({
     project_item_id: githubApiId,
-    source_node_id: githubNodeId,
+    source_node_id: GithubNodeIdSchema,
     project_id: projectId,
     title: z.string().min(1).max(256),
     objective: z.string().min(1).max(4096),
@@ -414,7 +744,7 @@ export const ProjectRecordLinkSchema = z
   .object({
     project_id: projectId,
     project_item_id: githubApiId,
-    source_node_id: githubNodeId,
+    source_node_id: GithubNodeIdSchema,
   })
   .strict();
 export type ProjectRecordLink = z.infer<typeof ProjectRecordLinkSchema>;

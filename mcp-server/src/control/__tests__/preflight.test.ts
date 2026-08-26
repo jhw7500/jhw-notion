@@ -27,6 +27,7 @@ function config(): ControlConfig {
     preflightProjectItemId: "PVTI_trial",
     preflightRegistryIssueNumber: 9,
     stateDir: "/srv/state",
+    guardMode: "enforce",
   };
 }
 

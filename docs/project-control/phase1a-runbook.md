@@ -4,7 +4,7 @@ Phase 1A는 별도 private Registry와 개인 private GitHub Project를 이용�
 
 ## 1. 경계와 사전조건
 
-- 한 대의 Linux build server, Node.js 20, `git`, `gh`, `flock`, 설치된 `jhw-control`
+- 한 대의 Linux build server, Node.js 20, `git`, `gh`, 실행 가능한 `/usr/bin/flock`, 설치된 `jhw-control`
 - 이 저장소와 분리된 private Registry 저장소/checkout
 - 등록할 private source repository의 정확한 checkout
 - 개인 계정 소유 private GitHub Project와 정확히 다섯 필드: `Status`, `Priority`, `Health`, `Next Action`, `Last Reviewed`
@@ -12,7 +12,9 @@ Phase 1A는 별도 private Registry와 개인 private GitHub Project를 이용�
 - clean, fast-forward 가능한 Registry checkout과 canonical GitHub SSH remote
 
 ```bash
-command -v git gh flock node jhw-control
+command -v git gh node jhw-control
+test -x /usr/bin/flock
+/usr/bin/flock --version
 node --version
 jhw-control --help
 ```

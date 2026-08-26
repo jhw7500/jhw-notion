@@ -77,7 +77,7 @@ export type RegisterFormalTaskFromSourceInput = TaskCoordinateInput & {
   issue_url: string;
   expected_issue_node_id?: string;
   expected_issue_revision?: string;
-};
+} & Pick<RegisterFormalTaskInput, "task_role" | "grants" | "dependencies">;
 
 export type RegisterTemporaryTaskFromSourceInput = TaskCoordinateInput
   & Omit<RegisterTemporaryTaskInput, "project_id" | "repo_id">
@@ -221,10 +221,20 @@ export class GitHubSourceService {
     if (formalRequest.expected_issue_revision !== undefined && formalRequest.expected_issue_revision !== issue.issue_revision) {
       throw new ControlError("ISSUE_REVISION_MISMATCH", "Caller Issue revision disagrees with the verified Issue");
     }
+    const grants = formalRequest.grants ?? (formalRequest.resolve_from_checkout === true
+      ? [{
+          capability: "repo.modify" as const,
+          resource: { kind: "repository" as const, id: context.repo_id },
+          coordination: "shared" as const,
+        }]
+      : undefined);
     return this.options.catalog.registerFormalTask({
       project_id: context.project_id,
       repo_id: context.repo_id,
       ...issueRecord(issue),
+      ...(input.task_role !== undefined ? { task_role: input.task_role } : {}),
+      ...(grants !== undefined ? { grants } : {}),
+      ...(input.dependencies !== undefined ? { dependencies: input.dependencies } : {}),
     });
   }
 
@@ -239,10 +249,18 @@ export class GitHubSourceService {
       resolve_from_checkout: _resolve,
       ...temporary
     } = temporaryRequest;
+    const grants = temporary.grants ?? (temporaryRequest.resolve_from_checkout === true
+      ? [{
+          capability: "repo.modify" as const,
+          resource: { kind: "repository" as const, id: context.repo_id },
+          coordination: "shared" as const,
+        }]
+      : undefined);
     return this.options.catalog.registerTemporaryTask({
       ...temporary,
       project_id: context.project_id,
       repo_id: context.repo_id,
+      ...(grants !== undefined ? { grants } : {}),
     });
   }
 
@@ -267,6 +285,11 @@ export class GitHubSourceService {
         project_id: task.project_id,
         repo_id: task.repo_id,
         ...issueRecord(issue),
+        ...(task.task_role !== undefined ? { task_role: task.task_role } : {}),
+        ...(task.work_contract !== undefined ? {
+          grants: task.work_contract.grants,
+          dependencies: task.work_contract.dependencies,
+        } : {}),
       })).task;
     }
     if (task.kind === "temporary" && task.lifecycle === "completed") {

@@ -20,6 +20,7 @@ const currentClaimId = "clm-018f1234-5678-7abc-8def-0123456789ac";
 const startedClaimId = "clm-028f1234-5678-7abc-8def-0123456789ac";
 const worktreeRef = "wt-0123456789ab-created";
 const issueUrl = "https://github.com/example/consumer/issues/74";
+const originAdapter = "codex";
 const sessionValue = "session verified $(printf session-expanded)";
 const tempAlias = "temporary alias $(printf alias-expanded)";
 const tempGoal = "goal with spaces $(printf goal-expanded)";
@@ -141,6 +142,7 @@ function materialize(command) {
     .replaceAll("<failures>", failuresValue)
     .replaceAll("<next-step>", nextStepValue)
     .replaceAll("<related-adr-and-evidence>", relatedEvidenceValue)
+    .replaceAll("<claude|codex|gemini|opencode>", originAdapter)
     .replaceAll("<session-id>", sessionValue);
 }
 
@@ -172,7 +174,7 @@ function expectedStartArgs(route, checkoutRoot) {
   if (route === "formal") {
     return [
       "task", "start", "--resolve-from-checkout", "true", "--repo-path", checkoutRoot,
-      "--issue-url", issueUrl, "--session", sessionValue,
+      "--issue-url", issueUrl, "--origin-adapter", originAdapter, "--session", sessionValue,
     ];
   }
   if (route === "temporary") {
@@ -181,10 +183,13 @@ function expectedStartArgs(route, checkoutRoot) {
       "--temp-alias", tempAlias, "--goal", tempGoal,
       "--done", doneValues[0], "--done", doneValues[1],
       "--scope", scopeValues[0], "--scope", scopeValues[1],
-      "--session", sessionValue,
+      "--origin-adapter", originAdapter, "--session", sessionValue,
     ];
   }
-  return ["task", "start", "--task", targetTaskId, "--repo-path", checkoutRoot, "--session", sessionValue];
+  return [
+    "task", "start", "--task", targetTaskId, "--repo-path", checkoutRoot,
+    "--origin-adapter", originAdapter, "--session", sessionValue,
+  ];
 }
 
 function makeFinishInput(status, overrides = {}) {
@@ -342,6 +347,7 @@ function launcherEnv({
     JHW_TARGET_CHECKOUT: targetCheckout,
     JHW_TARGET_TASK_ID: targetTaskId,
     JHW_TARGET_ISSUE_URL: issueUrl,
+    JHW_ORIGIN_ADAPTER: originAdapter,
     JHW_SESSION_VALUE: sessionValue,
     JHW_TEMP_ALIAS: tempAlias,
     JHW_TEMP_GOAL: tempGoal,

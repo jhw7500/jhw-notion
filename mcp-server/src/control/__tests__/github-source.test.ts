@@ -44,6 +44,7 @@ function fixture(overrides: {
   repository?: RepositoryRecord;
   issueState?: "open" | "closed";
   finalFenceError?: string;
+  issueRevision?: string;
 } = {}) {
   const repositoryRecord = overrides.repository ?? repository;
   const pinnedRepositoryLookup = vi.fn();
@@ -95,7 +96,7 @@ function fixture(overrides: {
           node_id: "I_wlan_7",
           number: 7,
           html_url: "https://github.com/jhw7500/wlan/issues/7",
-          updated_at: "2026-08-14T00:00:00Z",
+          updated_at: overrides.issueRevision ?? "2026-08-14T00:00:00Z",
           state: overrides.issueState ?? "open",
         })}\n`,
       stderr: "", exitCode: 0,
@@ -295,6 +296,11 @@ describe("GitHubSourceService", () => {
     expect(catalog.registerFormalTask).toHaveBeenCalledWith(expect.objectContaining({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",
+      grants: [{
+        capability: "repo.modify",
+        resource: { kind: "repository", id: "repo-wlan" },
+        coordination: "shared",
+      }],
     }));
   });
 
@@ -320,6 +326,11 @@ describe("GitHubSourceService", () => {
       goal: "verify checkout resolution",
       done_conditions: ["resolved source tests pass"],
       expected_scope: ["src/control"],
+      grants: [{
+        capability: "repo.modify",
+        resource: { kind: "repository", id: "repo-wlan" },
+        coordination: "shared",
+      }],
     });
   });
 
@@ -655,6 +666,20 @@ describe("GitHubSourceService", () => {
       source_task_revision: "2026-08-14T00:00:00Z",
     });
     expect(projects.requireProjectRepository).toHaveBeenCalledWith("prj-wlan", "repo-wlan");
+  });
+
+  it("propagates active source refresh refusal from prepareExistingTask", async () => {
+    const issueRevision = "2026-08-15T00:00:00Z";
+    const { service, catalog } = fixture({ issueRevision });
+    catalog.registerFormalTask.mockRejectedValueOnce(
+      new ControlError("TASK_CONTRACT_ACTIVE", "Active ownership freezes the formal source revision"),
+    );
+
+    await expect(service.prepareExistingTask({ task_id: formal.id, repository_path: checkout }))
+      .rejects.toMatchObject({ code: "TASK_CONTRACT_ACTIVE" });
+
+    expect(catalog.registerFormalTask).toHaveBeenCalledWith(expect.objectContaining({ issue_revision: issueRevision }));
+    expect(catalog.getTaskSourceRevision).not.toHaveBeenCalled();
   });
 
   it("selects the exact verified formal alias instead of a preserved temporary lookalike", async () => {

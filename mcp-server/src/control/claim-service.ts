@@ -1,22 +1,44 @@
 import { lstat, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import { z, type ZodType } from "zod";
 
 import { Catalog } from "./catalog.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import { GuardAdapterSchema, type GuardAdapter } from "./guard-protocol.js";
 import { newClaimId } from "./ids.js";
 import { RegistryGit, type RegistryMutationResult } from "./registry-git.js";
+import { activeClaimRelativePath, taskRelativePath } from "./registry-paths.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import {
+  TaskCompletionEvidenceRecordSchema,
+  TaskCompletionEvidenceSchema,
+  assertParentCompletionReady,
+  taskCompletionEvidenceDigest,
+  taskCompletionRelativePath,
+  type TaskCompletionEvidence,
+  type TaskCompletionEvidenceRecord,
+} from "./task-completion.js";
+import {
   ActiveClaimSchema,
+  ClaimCoordinateSchema,
   ClaimHistorySchema,
   ConflictingClaimSummarySchema,
+  ContractActiveClaimSchema,
+  LegacyContractActiveClaimSchema,
   type ActiveClaim,
   type ClaimHistory,
+  type ContractActiveClaim,
+  type LegacyContractActiveClaim,
   type TaskRecord,
 } from "./schemas.js";
+import {
+  conflictingExclusiveGrant,
+  normalizeWorkContract,
+  workContractDigest,
+  type WorkContract,
+} from "./work-contract.js";
 
 const taskIdPattern = /^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const claimIdPattern = /^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -24,6 +46,7 @@ const projectIdPattern = /^prj-[a-z0-9][a-z0-9-]{1,62}$/;
 const repositoryIdPattern = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const historyYearDirectoryPattern = /^\d{4}$/;
 const maximumHistoryYearDirectories = 10_000;
+const maximumActiveClaims = 10_000;
 const boundedCoordinate = (maximumBytes: number) => z.string().min(1).max(maximumBytes)
   .regex(/^[^\u0000-\u001f\u007f]+$/u)
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
@@ -35,16 +58,17 @@ const ClaimTaskInputSchema = z.object({
   task_alias: boundedCoordinate(160),
   project_id: z.string().regex(projectIdPattern),
   repo_id: z.string().regex(repositoryIdPattern),
-  session_id: boundedCoordinate(255),
-  host: boundedCoordinate(255),
-  branch: boundedCoordinate(255),
-  worktree_ref: boundedCoordinate(255),
+  origin_adapter: GuardAdapterSchema,
+  session_id: ClaimCoordinateSchema,
+  host: ClaimCoordinateSchema,
+  branch: ClaimCoordinateSchema,
+  worktree_ref: ClaimCoordinateSchema,
 }).strict();
 
 const FinishOutcomeSchema = z.object({
   status: z.enum(["completed", "handoff", "abandoned"]),
   outcome: boundedText(4096).optional(),
-  branch: boundedCoordinate(255),
+  branch: ClaimCoordinateSchema,
   head_sha: boundedCoordinate(128),
   validation: z.array(boundedText(512).refine((value) => value.trim().length > 0)).min(1).max(64),
   handoff_path: z.string().max(160).regex(/^handoffs\/tsk-[0-9a-f-]+\/clm-[0-9a-f-]+\.md$/).optional(),
@@ -61,7 +85,8 @@ const RecoveryStatusActionSchema = z.object({ kind: z.literal("status") }).stric
 const RecoveryForceEndActionSchema = z.object({ kind: z.literal("force-end") }).strict();
 const RecoveryTakeoverActionSchema = z.object({
   kind: z.literal("takeover"),
-  session_id: boundedCoordinate(255),
+  origin_adapter: GuardAdapterSchema,
+  session_id: ClaimCoordinateSchema,
 }).strict();
 const RecoveryActionSchema = z.discriminatedUnion("kind", [
   RecoveryStatusActionSchema,
@@ -106,15 +131,11 @@ export interface RecoveryForceEnd {
 
 export interface RecoveryTakeover {
   kind: "takeover";
-  active: ActiveClaim;
+  active: ContractActiveClaim;
   history: ClaimHistory;
 }
 
 export type RecoveryResult = RecoveryStatus | RecoveryForceEnd | RecoveryTakeover;
-
-function activeRelativePath(taskId: string): string {
-  return `claims/active/${taskId}.yaml`;
-}
 
 function historyRelativePath(year: number | string, taskId: string, claimId: string): string {
   return `claims/history/${year}/${taskId}/${claimId}.yaml`;
@@ -182,15 +203,16 @@ export class ClaimService {
     ]);
   }
 
-  async claimTask(rawInput: ClaimTaskInput): Promise<ActiveClaim> {
+  async claimTask(rawInput: ClaimTaskInput): Promise<ContractActiveClaim> {
     this.sensitiveData.assertSafe(rawInput);
     const input = parse(ClaimTaskInputSchema, rawInput, "INVALID_CLAIM", "Invalid Claim input");
     await this.assertActivePathComponents(input.task_id);
-    const sourceTaskRevision = await this.catalog.getTaskSourceRevision(input.task_id);
-    let claimed: ActiveClaim | undefined;
+    let claimed: ContractActiveClaim | undefined;
 
     await this.registry.transact(`registry: claim task ${input.task_id}`, async () => {
       const task = await this.catalog.getTask(input.task_id);
+      const workContract = this.requireTaskContract(task);
+      let sourceTaskRevision = await this.taskSourceRevision(task);
       this.assertClaimInputMatchesTask(input, task);
       const existing = await this.readActive(task);
       if (existing) {
@@ -208,28 +230,84 @@ export class ClaimService {
           summary.success ? { conflicting_claim: summary.data } : {},
         );
       }
+      const activeClaims = await this.readAllActiveClaims(input.task_id);
+      this.assertSessionAvailable(activeClaims, input.origin_adapter, input.session_id, input.host, input.task_id);
+      this.assertResourcesAvailable(activeClaims, workContract, input.task_id);
       const predecessor = await this.latestReusablePredecessor(task, input);
-      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(task.id, "active");
+      const lifecyclePaths = await this.catalog.transitionTaskLifecycle(task.id, "active");
+      const canonicalTaskPath = taskRelativePath(task.id);
+      let expectedRegularBlob: { path: string; objectId: string } | undefined;
+      if (lifecyclePaths.length > 0) {
+        if (task.kind === "formal" || lifecyclePaths.length !== 1 || lifecyclePaths[0] !== canonicalTaskPath) {
+          throw corruption("Task lifecycle transition returned a noncanonical mutation path", { task_id: task.id });
+        }
+        sourceTaskRevision = await this.registry.worktreeRegularBlobObjectId(canonicalTaskPath);
+        expectedRegularBlob = { path: canonicalTaskPath, objectId: sourceTaskRevision };
+      }
 
       const started = this.timestamp();
       claimed = parse(
-        ActiveClaimSchema,
+        ContractActiveClaimSchema,
         {
           ...input,
           source_task_revision: sourceTaskRevision,
           claim_id: newClaimId(Date.parse(started)),
           started_at: started,
+          work_contract: workContract,
+          work_contract_digest: workContractDigest(workContract),
           ...(predecessor ? { predecessor_claim_id: predecessor.claim_id } : {}),
         },
         "INVALID_CLAIM",
         "Claim record failed validation",
       );
-      await this.catalog.records.writeJson(activeRelativePath(input.task_id), claimed);
-      return stage([...lifecyclePaths, activeRelativePath(input.task_id)]);
+      await this.catalog.records.writeJson(activeClaimRelativePath(input.task_id), claimed);
+      return {
+        paths: [...lifecyclePaths, activeClaimRelativePath(input.task_id)],
+        ...(expectedRegularBlob ? { expectedRegularBlobs: [expectedRegularBlob] } : {}),
+      };
     });
 
     if (!claimed) throw new Error("Claim transaction did not produce an active Claim");
-    return this.assertOwner(input.task_id, claimed.claim_id);
+    return this.requireAdapterBoundClaim(await this.assertOwner(input.task_id, claimed.claim_id));
+  }
+
+  /** Resolves exact adapter/session/host ownership without aliases or prefixes. */
+  async resolveSessionClaim(originAdapter: GuardAdapter, sessionId: string, host: string): Promise<ActiveClaim | undefined> {
+    this.sensitiveData.assertSafe({ origin_adapter: originAdapter, session_id: sessionId, host });
+    const lookup = parse(
+      z.object({
+        origin_adapter: GuardAdapterSchema,
+        session_id: ClaimCoordinateSchema,
+        host: ClaimCoordinateSchema,
+      }).strict(),
+      { origin_adapter: originAdapter, session_id: sessionId, host },
+      "INVALID_CLAIM",
+      "Invalid Claim session lookup",
+    );
+    const matches = (await this.readAllActiveClaims()).filter((active) =>
+      "origin_adapter" in active && active.origin_adapter === lookup.origin_adapter &&
+      active.session_id === lookup.session_id && active.host === lookup.host);
+    if (matches.length > 1) {
+      throw corruption("Exact session owns more than one active Task", {
+        candidate_count: matches.length,
+      });
+    }
+    return matches[0];
+  }
+
+  /** Bounded read-only enumeration used by Guard ownership conflict audits. */
+  async listActiveClaims(): Promise<ActiveClaim[]> {
+    return this.readAllActiveClaims();
+  }
+
+  /** Pins every Registry-backed Guard read to one immutable committed tree. */
+  async withCommittedView<T>(read: () => Promise<T>): Promise<T> {
+    return this.registry.withCommittedTree(["tasks", "repositories", "claims/active"], read);
+  }
+
+  /** True only while a committed Guard view is held and HEAD has moved away. */
+  async committedViewIsStale(): Promise<boolean> {
+    return this.registry.committedViewIsStale();
   }
 
   async finishClaim(taskId: string, expectedClaimId: string, rawOutcome: FinishOutcome): Promise<ClaimHistory> {
@@ -250,12 +328,41 @@ export class ClaimService {
       const task = await this.catalog.getTask(taskId);
       const active = await this.requireOwner(task, expectedClaimId);
       await this.assertHandoffAvailable(outcome.handoff_path);
-      history = this.finishHistory(active, outcome, releasedAt);
+      let completionBinding: {
+        completion_evidence_path: string;
+        completion_evidence_digest: string;
+      } | undefined;
+      if (task.kind === "formal" && outcome.status === "completed") {
+        const contractActive = this.requireWorkContractClaim(active);
+        const completion = await this.completionEvidenceAt(task.id, active.claim_id);
+        if (!completion) {
+          throw new ControlError(
+            "COMPLETION_EVIDENCE_REQUIRED",
+            "Formal Claim completion requires evidence from the active generation",
+          );
+        }
+        if (
+          completion.task_id !== contractActive.task_id ||
+          completion.claim_id !== contractActive.claim_id ||
+          completion.work_contract_digest !== contractActive.work_contract_digest
+        ) {
+          throw new ControlError(
+            "COMPLETION_EVIDENCE_MISMATCH",
+            "Completion evidence does not match the active Claim and Work Contract",
+          );
+        }
+        await this.assertFormalCompletionSemantics(task, completion.evidence);
+        completionBinding = {
+          completion_evidence_path: taskCompletionRelativePath(task.id, active.claim_id),
+          completion_evidence_digest: taskCompletionEvidenceDigest(completion),
+        };
+      }
+      history = this.finishHistory(active, outcome, releasedAt, completionBinding);
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
-      await this.catalog.records.remove(activeRelativePath(taskId));
-      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(taskId, outcome.status);
-      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId), ...lifecyclePaths]);
+      await this.catalog.records.remove(activeClaimRelativePath(taskId));
+      const lifecyclePaths = await this.catalog.transitionTaskLifecycle(taskId, outcome.status);
+      return stage([historyRelativePath(year, taskId, expectedClaimId), activeClaimRelativePath(taskId), ...lifecyclePaths]);
     });
 
     if (!history) throw new Error("Claim finish transaction did not produce history");
@@ -274,7 +381,7 @@ export class ClaimService {
 
     if (action.kind === "status") return this.recoveryStatus(taskId, expectedClaimId);
     if (action.kind === "force-end") return this.forceEnd(taskId, expectedClaimId);
-    return this.takeover(taskId, expectedClaimId, action.session_id);
+    return this.takeover(taskId, expectedClaimId, action.origin_adapter, action.session_id);
   }
 
   /** Returns the active Claim after validating the persistent Task and Claim record. */
@@ -290,6 +397,104 @@ export class ClaimService {
     assertClaimId(expectedClaimId);
     const task = await this.catalog.getTask(taskId);
     return this.requireOwner(task, expectedClaimId);
+  }
+
+  async markCompletionReady(
+    taskId: string,
+    expectedClaimId: string,
+    rawEvidence: TaskCompletionEvidence,
+  ): Promise<TaskCompletionEvidenceRecord> {
+    assertTaskId(taskId);
+    assertClaimId(expectedClaimId);
+    this.sensitiveData.assertSafe(rawEvidence);
+    const completionPath = taskCompletionRelativePath(taskId, expectedClaimId);
+    await this.assertRegistryPathComponents(completionPath);
+    let result: TaskCompletionEvidenceRecord | undefined;
+
+    await this.registry.transact(`registry: mark task completion ready ${expectedClaimId}`, async () => {
+      const task = await this.catalog.getTask(taskId);
+      const active = this.requireWorkContractClaim(await this.requireOwner(task, expectedClaimId));
+      if (task.kind !== "formal" || task.task_role === undefined || task.work_contract === undefined) {
+        throw new ControlError(
+          "TASK_COMPLETION_FORMAL_REQUIRED",
+          "Completion readiness requires a configured formal standalone or parent Task",
+        );
+      }
+      if (
+        task.task_role === "parent" &&
+        (!Array.isArray(rawEvidence?.integration_validation) ||
+          rawEvidence.integration_validation.length === 0 ||
+          rawEvidence.integration_validation.some((entry) => typeof entry !== "string" || !entry.trim()))
+      ) {
+        throw new ControlError(
+          "PARENT_INTEGRATION_VALIDATION_REQUIRED",
+          "Parent completion requires bounded integration validation",
+        );
+      }
+      const evidence = parse(
+        TaskCompletionEvidenceSchema,
+        rawEvidence,
+        "INVALID_COMPLETION_EVIDENCE",
+        "Completion evidence failed validation",
+      );
+      await this.assertFormalCompletionSemantics(task, evidence);
+
+      const existing = await this.completionEvidenceAt(taskId, expectedClaimId);
+      if (existing) {
+        if (
+          existing.task_id !== task.id ||
+          existing.claim_id !== active.claim_id ||
+          existing.work_contract_digest !== active.work_contract_digest
+        ) {
+          throw corruption("Completion evidence binding disagrees with the active Claim", {
+            task_id: task.id,
+            claim_id: active.claim_id,
+          });
+        }
+        if (JSON.stringify(existing.evidence) !== JSON.stringify(evidence)) {
+          throw new ControlError(
+            "COMPLETION_EVIDENCE_CONFLICT",
+            "Completion evidence is immutable for one Claim generation",
+          );
+        }
+        result = existing;
+        return stage([]);
+      }
+
+      result = parse(
+        TaskCompletionEvidenceRecordSchema,
+        {
+          version: 1,
+          task_id: task.id,
+          claim_id: active.claim_id,
+          work_contract_digest: active.work_contract_digest,
+          recorded_at: this.timestamp(),
+          evidence,
+        },
+        "INVALID_COMPLETION_EVIDENCE",
+        "Completion evidence record failed validation",
+      );
+      await this.catalog.records.writeJson(completionPath, result);
+      return stage([completionPath]);
+    });
+
+    if (!result) throw new Error("Completion readiness transaction did not produce evidence");
+    return result;
+  }
+
+  async getCompletionEvidence(taskId: string, claimId: string): Promise<TaskCompletionEvidenceRecord> {
+    assertTaskId(taskId);
+    assertClaimId(claimId);
+    const completionPath = taskCompletionRelativePath(taskId, claimId);
+    await this.assertRegistryPathComponents(completionPath);
+    const record = await this.completionEvidenceAt(taskId, claimId);
+    if (!record) {
+      throw new ControlError(
+        "COMPLETION_EVIDENCE_NOT_FOUND",
+        "Exact Task completion evidence does not exist",
+      );
+    }
+    return record;
   }
 
   async getClaimHistory(taskId: string, claimId: string): Promise<ClaimHistory> {
@@ -423,22 +628,27 @@ export class ClaimService {
       history = this.recoveryHistory(active, "force-ended", releasedAt);
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
-      await this.catalog.records.remove(activeRelativePath(taskId));
-      const lifecyclePaths = await this.catalog.transitionTemporaryLifecycle(taskId, "handoff");
-      return stage([historyRelativePath(year, taskId, expectedClaimId), activeRelativePath(taskId), ...lifecyclePaths]);
+      await this.catalog.records.remove(activeClaimRelativePath(taskId));
+      const lifecyclePaths = await this.catalog.transitionTaskLifecycle(taskId, "handoff");
+      return stage([historyRelativePath(year, taskId, expectedClaimId), activeClaimRelativePath(taskId), ...lifecyclePaths]);
     });
     if (!history) throw new Error("Claim force-end transaction did not produce history");
     return { kind: "force-end", history };
   }
 
-  private async takeover(taskId: string, expectedClaimId: string, sessionId: string): Promise<RecoveryTakeover> {
+  private async takeover(
+    taskId: string,
+    expectedClaimId: string,
+    originAdapter: GuardAdapter,
+    sessionId: string,
+  ): Promise<RecoveryTakeover> {
     await this.assertActivePathComponents(taskId);
     const releasedAt = this.timestamp();
     const year = this.historyYear(releasedAt);
     const historyRelative = historyRelativePath(year, taskId, expectedClaimId);
     await this.assertRegistryPathComponents(historyRelative);
     let history: ClaimHistory | undefined;
-    let replacement: ActiveClaim | undefined;
+    let replacement: ContractActiveClaim | undefined;
     await this.registry.transact(`registry: take over claim ${expectedClaimId}`, async () => {
       const task = await this.catalog.getTask(taskId);
       const active = await this.readActive(task);
@@ -446,8 +656,8 @@ export class ClaimService {
         throw new ControlError("CLAIM_NOT_FOUND", "Task does not have an active Claim", { task_id: task.id });
       }
       if (active.claim_id !== expectedClaimId) {
-        history = await this.requireLinkedTakeoverRetry(task, expectedClaimId, active, sessionId);
-        replacement = active;
+        history = await this.requireLinkedTakeoverRetry(task, expectedClaimId, active, originAdapter, sessionId);
+        replacement = this.requireAdapterBoundClaim(active);
         return stage([]);
       }
       if (active.host !== this.config.buildHost) {
@@ -456,13 +666,18 @@ export class ClaimService {
           build_host: this.config.buildHost,
         });
       }
+      const contractActive = this.requireWorkContractClaim(active);
+      const activeClaims = await this.readAllActiveClaims(task.id);
+      this.assertSessionAvailable(activeClaims, originAdapter, sessionId, this.config.buildHost, task.id);
+      this.assertResourcesAvailable(activeClaims, contractActive.work_contract, task.id);
       const started = this.timestamp();
-      const { predecessor_claim_id: _allocationPredecessor, ...takeoverBase } = active;
+      const { predecessor_claim_id: _allocationPredecessor, ...takeoverBase } = contractActive;
       replacement = parse(
-        ActiveClaimSchema,
+        ContractActiveClaimSchema,
         {
           ...takeoverBase,
           claim_id: newClaimId(Date.parse(started)),
+          origin_adapter: originAdapter,
           session_id: sessionId,
           host: this.config.buildHost,
           started_at: started,
@@ -476,16 +691,16 @@ export class ClaimService {
           claim_id: expectedClaimId,
         });
       }
-      history = this.takeoverHistory(active, releasedAt, replacement.claim_id);
+      history = this.takeoverHistory(contractActive, releasedAt, replacement.claim_id);
       await this.assertHistoryDestinationAbsent(historyRelative, taskId, expectedClaimId);
       await this.catalog.records.writeJson(historyRelative, history);
-      await this.catalog.records.remove(activeRelativePath(taskId));
-      await this.catalog.records.writeJson(activeRelativePath(taskId), replacement);
-      return stage([historyRelative, activeRelativePath(taskId)]);
+      await this.catalog.records.remove(activeClaimRelativePath(taskId));
+      await this.catalog.records.writeJson(activeClaimRelativePath(taskId), replacement);
+      return stage([historyRelative, activeClaimRelativePath(taskId)]);
     });
 
     if (!history || !replacement) throw new Error("Claim takeover transaction did not produce both records");
-    const verified = await this.assertOwner(taskId, replacement.claim_id);
+    const verified = this.requireAdapterBoundClaim(await this.assertOwner(taskId, replacement.claim_id));
     return { kind: "takeover", active: verified, history };
   }
 
@@ -493,6 +708,7 @@ export class ClaimService {
     task: TaskRecord,
     expectedClaimId: string,
     active: ActiveClaim,
+    requestedOriginAdapter: GuardAdapter,
     requestedSessionId: string,
   ): Promise<ClaimHistory> {
     if (active.host !== this.config.buildHost) {
@@ -502,7 +718,7 @@ export class ClaimService {
       });
     }
     try {
-      await this.registry.assertHeadRegularFile(activeRelativePath(task.id));
+      await this.registry.assertHeadRegularFile(activeClaimRelativePath(task.id));
     } catch (cause) {
       throw corruption("Active takeover successor is not a committed regular Registry record", {
         task_id: task.id,
@@ -532,6 +748,8 @@ export class ClaimService {
       history.claim_id !== expectedClaimId ||
       history.successor_claim_id !== active.claim_id ||
       active.claim_id === expectedClaimId ||
+      !("origin_adapter" in active) ||
+      active.origin_adapter !== requestedOriginAdapter ||
       active.session_id !== requestedSessionId
     ) {
       throw new ControlError("CLAIM_MISMATCH", "Claim generation is not the requested direct takeover predecessor", {
@@ -620,7 +838,7 @@ export class ClaimService {
 
   private async readActive(task: TaskRecord): Promise<ActiveClaim | undefined> {
     await this.assertActivePathComponents(task.id);
-    const recordPath = activeRelativePath(task.id);
+    const recordPath = activeClaimRelativePath(task.id);
     let active: ActiveClaim | undefined;
     try {
       active = await this.catalog.records.readOptionalJson(recordPath, ActiveClaimSchema, {
@@ -638,6 +856,164 @@ export class ClaimService {
     this.assertActiveMatchesTask(active, task, recordPath);
     this.sensitiveData.assertSafe(active);
     return active;
+  }
+
+  private async completionEvidenceAt(
+    taskId: string,
+    claimId: string,
+  ): Promise<TaskCompletionEvidenceRecord | undefined> {
+    const record = await this.catalog.records.readOptionalJson(
+      taskCompletionRelativePath(taskId, claimId),
+      TaskCompletionEvidenceRecordSchema,
+      { field: "claim_id", value: claimId },
+    );
+    if (record && (record.task_id !== taskId || record.claim_id !== claimId)) {
+      throw corruption("Completion evidence path and embedded identity disagree", {
+        task_id: taskId,
+        claim_id: claimId,
+      });
+    }
+    if (record) this.sensitiveData.assertSafe(record);
+    return record;
+  }
+
+  private async assertFormalCompletionSemantics(
+    task: TaskRecord,
+    evidence: TaskCompletionEvidence,
+  ): Promise<void> {
+    if (task.kind !== "formal" || task.task_role === undefined || task.work_contract === undefined) {
+      throw new ControlError(
+        "TASK_COMPLETION_FORMAL_REQUIRED",
+        "Completion readiness requires a configured formal standalone or parent Task",
+      );
+    }
+    if (task.task_role === "parent") {
+      assertParentCompletionReady(task, await this.catalog.listChildren(task.id), evidence);
+    } else if (evidence.child_dispositions.length !== 0) {
+      throw new ControlError(
+        "INVALID_PARENT_COMPLETION",
+        "Standalone Task completion cannot carry child dispositions",
+      );
+    }
+  }
+
+  private requireTaskContract(task: TaskRecord): WorkContract {
+    if ((task.kind !== "child" && task.task_role === undefined) || task.work_contract === undefined) {
+      throw new ControlError("TASK_CONTRACT_REQUIRED", "Task must be configured with a Work Contract before Claim acquisition", {
+        task_id: task.id,
+      });
+    }
+    if (task.work_contract.task_id !== task.id) {
+      throw corruption("Task Work Contract identity disagrees with its Registry Task", { task_id: task.id });
+    }
+    try {
+      return normalizeWorkContract(task.work_contract);
+    } catch (cause) {
+      throw corruption("Task Work Contract could not be normalized", {
+        task_id: task.id,
+        cause: errorMessage(cause),
+      });
+    }
+  }
+
+  private async taskSourceRevision(task: TaskRecord): Promise<string> {
+    return task.kind === "formal"
+      ? task.issue_revision
+      : this.registry.headRegularBlobObjectId(taskRelativePath(task.id));
+  }
+
+  private async readAllActiveClaims(referenceTaskId = "tsk-00000000-0000-7000-8000-000000000000"): Promise<ActiveClaim[]> {
+    const directory = dirname(activeClaimRelativePath(referenceTaskId));
+    const entries = await this.catalog.records.listDirectoryEntries(directory, maximumActiveClaims);
+    const claims: ActiveClaim[] = [];
+    for (const entry of entries) {
+      const match = entry.kind === "file" ? entry.name.match(/^(tsk-[0-9a-f-]+)\.yaml$/) : undefined;
+      if (!match || !taskIdPattern.test(match[1] as string)) {
+        throw corruption("Active Claim directory contains a malformed entry", {});
+      }
+      const task = await this.catalog.getTask(match[1] as string);
+      const active = await this.readActive(task);
+      if (!active) {
+        throw corruption("Enumerated active Claim is missing", { task_id: task.id });
+      }
+      claims.push(active);
+    }
+    return claims;
+  }
+
+  private assertSessionAvailable(
+    activeClaims: ActiveClaim[],
+    originAdapter: GuardAdapter,
+    sessionId: string,
+    host: string,
+    requestedTaskId: string,
+  ): void {
+    const conflicting = activeClaims.find((active) =>
+      active.task_id !== requestedTaskId && active.session_id === sessionId && active.host === host &&
+      (!("origin_adapter" in active) || active.origin_adapter === originAdapter));
+    if (!conflicting) return;
+    const summary = ConflictingClaimSummarySchema.safeParse(conflicting);
+    throw new ControlError(
+      "TASK_SESSION_BUSY",
+      "Exact host session already owns a different active Task",
+      summary.success ? { conflicting_claim: summary.data } : {},
+    );
+  }
+
+  private assertResourcesAvailable(
+    activeClaims: ActiveClaim[],
+    requestedContract: WorkContract,
+    requestedTaskId: string,
+  ): void {
+    for (const active of activeClaims) {
+      if (active.task_id === requestedTaskId) continue;
+      const contractActive = this.requireWorkContractClaim(active);
+      const conflict = conflictingExclusiveGrant(requestedContract, contractActive.work_contract);
+      if (!conflict) continue;
+      const summary = ConflictingClaimSummarySchema.safeParse(active);
+      throw new ControlError(
+        "TASK_RESOURCE_CONFLICT",
+        "An exact Work Contract resource conflicts with an active Claim",
+        {
+          resource: conflict.resource,
+          ...(summary.success ? { conflicting_claim: summary.data } : {}),
+        },
+      );
+    }
+  }
+
+  private requireWorkContractClaim(active: ActiveClaim): ContractActiveClaim | LegacyContractActiveClaim {
+    const legacy = LegacyContractActiveClaimSchema.safeParse(active);
+    if (legacy.success) return legacy.data;
+    const parsed = ContractActiveClaimSchema.safeParse(active);
+    if (parsed.success) return parsed.data;
+    if (ActiveClaimSchema.safeParse(active).success) {
+      throw new ControlError(
+        "ACTIVE_CLAIM_CONTRACT_REQUIRED",
+        "Active Claim lacks the immutable Work Contract snapshot required for acquisition",
+        { task_id: active.task_id, claim_id: active.claim_id },
+      );
+    }
+    throw corruption("Active Claim Work Contract integrity validation failed", {
+      task_id: active.task_id,
+      claim_id: active.claim_id,
+    });
+  }
+
+  private requireAdapterBoundClaim(active: ActiveClaim): ContractActiveClaim {
+    const parsed = ContractActiveClaimSchema.safeParse(active);
+    if (parsed.success) return parsed.data;
+    if (ActiveClaimSchema.safeParse(active).success) {
+      throw new ControlError(
+        "ACTIVE_CLAIM_CONTRACT_REQUIRED",
+        "Active Claim lacks exact adapter and Work Contract authority required for acquisition",
+        { task_id: active.task_id, claim_id: active.claim_id },
+      );
+    }
+    throw corruption("Active Claim adapter/Work Contract integrity validation failed", {
+      task_id: active.task_id,
+      claim_id: active.claim_id,
+    });
   }
 
   private async requireOwner(task: TaskRecord, expectedClaimId: string): Promise<ActiveClaim> {
@@ -717,7 +1093,7 @@ export class ClaimService {
   }
 
   private async assertActivePathComponents(taskId: string): Promise<void> {
-    await this.assertRegistryPathComponents(activeRelativePath(taskId));
+    await this.assertRegistryPathComponents(activeClaimRelativePath(taskId));
   }
 
   private async assertHandoffAvailable(handoffPath: string | undefined): Promise<void> {
@@ -808,11 +1184,19 @@ export class ClaimService {
     }
   }
 
-  private finishHistory(active: ActiveClaim, outcome: FinishOutcome, releasedAt: string): ClaimHistory {
+  private finishHistory(
+    active: ActiveClaim,
+    outcome: FinishOutcome,
+    releasedAt: string,
+    completionBinding?: {
+      completion_evidence_path: string;
+      completion_evidence_digest: string;
+    },
+  ): ClaimHistory {
     return parse(
       ClaimHistorySchema,
       {
-        ...active,
+        ...this.claimHistoryBase(active),
         branch: outcome.branch,
         head_sha: outcome.head_sha,
         validation_summary: outcome.validation.join("\n"),
@@ -820,6 +1204,7 @@ export class ClaimService {
         status: outcome.status,
         ...(outcome.outcome ? { outcome: outcome.outcome } : {}),
         ...(outcome.handoff_path ? { handoff_path: outcome.handoff_path } : {}),
+        ...completionBinding,
       },
       "INVALID_CLAIM_HISTORY",
       "Claim history record failed validation",
@@ -834,7 +1219,7 @@ export class ClaimService {
     return parse(
       ClaimHistorySchema,
       {
-        ...active,
+        ...this.claimHistoryBase(active),
         released_at: releasedAt,
         status,
       },
@@ -847,7 +1232,7 @@ export class ClaimService {
     return parse(
       ClaimHistorySchema,
       {
-        ...active,
+        ...this.claimHistoryBase(active),
         released_at: releasedAt,
         status: "taken-over",
         successor_claim_id: successorClaimId,
@@ -855,6 +1240,12 @@ export class ClaimService {
       "INVALID_CLAIM_HISTORY",
       "Claim history record failed validation",
     );
+  }
+
+  private claimHistoryBase(active: ActiveClaim): Omit<ContractActiveClaim, "work_contract"> | ActiveClaim {
+    if (!("work_contract" in active)) return active;
+    const { work_contract: _snapshot, ...historyBase } = active;
+    return historyBase;
   }
 
   private timestamp(): string {
