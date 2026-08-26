@@ -4,13 +4,23 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { Catalog } from "../catalog.js";
+import type { SourceCatalogPort } from "../github-source.js";
 import { sourceIndexKey } from "../ids.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
+import type { RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { commitFile, configFor, git, isolatedRegistryGit, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
+
+type Assert<T extends true> = T;
+type SourceCatalogPortPinnedRepositoryContract = Assert<SourceCatalogPort extends {
+  withPinnedRepositoryByGitHubNode<T>(
+    githubNodeId: string,
+    use: (repository: RepositoryRecord) => Promise<T>,
+  ): Promise<T>;
+} ? true : false>;
 
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));

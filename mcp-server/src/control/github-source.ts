@@ -48,6 +48,10 @@ export interface ProjectMembershipPort {
 export interface SourceCatalogPort {
   registerRepository(input: RegisterRepositoryInput): Promise<RepositoryRegistration>;
   getRepository(repoId: string): Promise<RepositoryRecord>;
+  withPinnedRepositoryByGitHubNode<T>(
+    githubNodeId: string,
+    use: (repository: RepositoryRecord) => Promise<T>,
+  ): Promise<T>;
   getTask(taskId: string): Promise<TaskRecord>;
   getTaskSourceRevision(taskId: string): Promise<string>;
   registerFormalTask(input: RegisterFormalTaskInput): Promise<FormalTaskRegistration>;

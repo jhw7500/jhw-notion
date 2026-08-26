@@ -27,6 +27,12 @@ function fixture(overrides: {
   const catalog = {
     registerRepository: vi.fn(async (input) => ({ repository: { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug }, created: true })),
     getRepository: vi.fn(async () => repository),
+    async withPinnedRepositoryByGitHubNode<T>(
+      _githubNodeId: string,
+      use: (record: RepositoryRecord) => Promise<T>,
+    ): Promise<T> {
+      return use(repository);
+    },
     getTask: vi.fn(async () => formal),
     getTaskSourceRevision: vi.fn(async () => formal.issue_revision),
     registerFormalTask: vi.fn(async (input) => {
