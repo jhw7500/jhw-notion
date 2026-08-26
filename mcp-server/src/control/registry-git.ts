@@ -208,6 +208,21 @@ export class RegistryGit {
     }
   }
 
+  /** Fails closed when the committed view no longer matches Registry HEAD. */
+  async assertCommittedViewCurrent(): Promise<void> {
+    const pinned = this.committedTree?.commit;
+    if (pinned === undefined) {
+      throw new ControlError("REGISTRY_CORRUPT", "Registry final fence requires a committed-tree scope");
+    }
+    const current = await this.headCommit();
+    if (current !== pinned) {
+      throw new ControlError(
+        "REGISTRY_MOVED_DURING_READ",
+        "Registry HEAD moved while this read was in progress",
+      );
+    }
+  }
+
   /** One recursive listing, held to the same gates a single lookup applies. */
   private async committedSubtree(relativeDirectory: string, commit: string): Promise<Map<string, HeadBlobEntry>> {
     if (!isSafeRegistryRelativePath(relativeDirectory)) {
