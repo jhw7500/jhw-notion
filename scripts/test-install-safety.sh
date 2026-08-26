@@ -409,4 +409,5 @@ test_atomic_config_syncs_mode_before_content
 test_npm_pipeline_failure_stops_install
 test_empty_uninstall_creates_nothing
 test_owned_round_trip
+node "$REPO_ROOT/scripts/test-task-skill-contract.mjs"
 echo "installer safety: ok"

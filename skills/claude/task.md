@@ -15,6 +15,32 @@ argument-hint: "(start | resume | promote | handoff | finish | switch | recover)
 - token, private configured path, secret-like text를 content flag/Handoff/output에 넣지 않는다. `--repo-path`는 command에만 전달하고 응답에 반복하지 않는다.
 - nonzero exit에서 자동 reset/rebase/force/retry/takeover하지 않는다.
 
+## Task start authorization gate
+
+새 Task 등록·기존 Task 재개·Handoff에서의 재개·switch의 후속 start는 사용자가 명시적으로 요청하거나 승인했을 때만 실행한다. 그 요청/승인은 이 흐름의 승인이다. 이미 명시적으로 승인했다면 두 번째 승인을 묻지 않는다. 승인되지 않았다면 start 전에 한 번만 승인을 받는다.
+
+모든 `task start`는 아래 순서로 실행한다. raw config·`.env`를 source/read하지 않고, raw `jhw-control`을 호출하지 않는다. `preflight`가 nonzero이면 그 exit로 즉시 멈춘다. 그 뒤 `portfolio status` 또는 `task start`를 실행하거나 Task·Claim·worktree mutation을 시도하지 않는다. `portfolio status`의 반환값으로만 project/repository ID와 checkout 좌표를 검증하며 이름·이전 로그·추측으로 대체하지 않는다.
+
+<!-- task-start-contract: begin -->
+```bash
+"$HOME/.local/bin/jhw-control-host" preflight
+rc=$?
+if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+
+"$HOME/.local/bin/jhw-control-host" portfolio status
+rc=$?
+if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+# Verify the returned canonical project ID, repository ID, and absolute checkout root.
+
+"$HOME/.local/bin/jhw-control-host" task start \
+  --project <verified-project-id> --repo-id <verified-repo-id> \
+  --repo-path <absolute-checkout-root> \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
+```
+<!-- task-start-contract: end -->
+
+`task start` 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 보고하고 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
+
 ## 좌표 없는 Task/Handoff 수신 발견
 
 사용자가 `태스크 받아서`, `작업준비`, `HANDOFF*.md`를 받아서/이어서 작업하라는 표현으로 Task 인수를 명시했지만 canonical `task_id`·Issue URL이 없으면 다음 discovery만 먼저 수행한다. 일반 조사 요청에는 자동 실행하지 않는다.
@@ -24,19 +50,13 @@ argument-hint: "(start | resume | promote | handoff | finish | switch | recover)
 3. 사용자가 파일명을 지정했다면 pathless `HANDOFF*.md` basename 또는 exact literal `.ai/handoff.md`만 받으며 다른 path component·`..`·separator는 거부한다. 지정한 logical name과 일치하는 후보를 모든 worktree에서 먼저 찾고 glob 확장·부분 일치·현재 checkout 우선 선택으로 대체하지 않는다. 파일명을 지정하지 않았을 때만 두 후보 종류를 모두 모은다.
 4. 후보를 원래 logical-name byte와 porcelain record 기준으로 안정 정렬한다. 0개면 발견 실패를 보고하고 멈춘다. 여러 개면 임의로 읽거나 선택하거나 Claim하지 말고 총 개수와 최대 20개만 보여준 뒤 사용자 선택을 기다린다. 각 항목은 `순번 + JSON-style escaped logical name + escaped branch(없으면 detached) + worktree-key`로 표시한다. `worktree-key`는 record의 첫 `worktree ` byte부터 마지막 field byte까지 single-NUL field separator를 보존하고 terminating double NUL은 제외한 raw bytes의 SHA-256 앞 12 hex인 선택용 비권위 식별자다. C0/C1·ESC·bidi/non-printable 문자를 escape하고 원래 name byte로 비교한다. 절대 worktree path는 출력하지 않으며 20개 초과분은 생략 수를 표시한다.
 5. 단일 후보를 읽기 직전과 사용자가 복수 후보를 선택한 뒤에는 `git worktree list --porcelain -z`부터 다시 실행한다. 내부에 보존한 exact worktree root, `worktree-key`, exact logical name이 모두 그대로인지 확인한다. shell의 check-then-read로 대체하지 말고 local Python의 `os.open`을 사용해 root를 `O_DIRECTORY|O_NOFOLLOW`, canonical copy면 `.ai`도 같은 방식, 마지막 파일은 `O_RDONLY|O_NOFOLLOW`로 descriptor-relative open한 뒤 `fstat` regular file을 확인한다. 같은 fd에서 최대 12 KiB와 초과 확인용 1 byte만 읽는다. Python/필수 flag가 없거나 초과·교체·누락·symlink이면 truncate하거나 다른 후보로 넘어가지 말고 멈춘다.
-6. 선택한 Handoff의 Task/Issue/branch/worktree 표기는 **discovery hint**일 뿐이다. Task를 받아 작업하라는 현재 요청은 명시적 resume이므로, 발견한 Task ID에는 기존-Task `jhw-control task start --task ...`를 실행해 Claim을 획득하고 그 성공 결과로만 canonical Task·Claim·owner를 확정한다. `task status`는 이미 active라고 알려진 Claim의 읽기 전용 소유권 확인에만 쓰며 released Handoff 수신을 대신하지 않는다. 다른 owner·충돌·불일치·좌표 부재에서는 작업하거나 자동 takeover하지 않는다.
+6. 선택한 Handoff의 Task/Issue/branch/worktree 표기는 **discovery hint**일 뿐이다. Task를 받아 작업하라는 현재 요청은 명시적 resume이므로, 위 Task start authorization gate의 preflight → portfolio coordinate verification 뒤에 기존-Task launcher start를 실행해 Claim을 획득하고 그 성공 결과로만 canonical Task·Claim·owner를 확정한다. `task status`는 이미 active라고 알려진 Claim의 읽기 전용 소유권 확인에만 쓰며 released Handoff 수신을 대신하지 않는다. 다른 owner·충돌·불일치·좌표 부재에서는 작업하거나 자동 takeover하지 않는다.
 
 ## 새 Task 시작
 
 ### Formal GitHub Issue
 
-Issue URL이 authority coordinate다. 서버가 verified repository token으로 current node ID, canonical URL, revision, `<owner>/<repo>#<number>` alias를 도출한다.
-
-```bash
-jhw-control task start \
-  --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
-  --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
-```
+Issue URL이 authority coordinate다. 서버가 verified repository token으로 current node ID, canonical URL, revision, `<owner>/<repo>#<number>` alias를 도출한다. 위 authorization gate의 formal Issue form을 사용한다.
 
 `--issue-node-id`/`--issue-revision`은 independently verified expectation이 이미 있을 때만 추가한다. caller 값을 source authority처럼 만들지 않는다.
 
@@ -44,22 +64,24 @@ jhw-control task start \
 
 `--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다.
 
+위 authorization gate의 preflight와 portfolio coordinate verification을 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다.
+
 ```bash
-jhw-control task start \
-  --project <prj-id> --repo-id <repo-id> --repo-path <absolute-checkout-root> \
+"$HOME/.local/bin/jhw-control-host" task start \
+  --project <verified-project-id> --repo-id <verified-repo-id> --repo-path <absolute-checkout-root> \
   --temp-alias <alias> --goal <goal> \
   --done <condition> [--done <condition> ...] \
   --scope <scope> [--scope <scope> ...] --session <session-id>
 ```
 
-성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
-
 ## 기존 Task 재개
 
 재개는 `status`가 아니라 같은 persistent Task를 다시 claim하는 명시적 start다. registration field를 섞지 않는다.
 
+위 authorization gate의 preflight와 portfolio coordinate verification을 통과한 뒤에만 launcher로 재개한다.
+
 ```bash
-jhw-control task start \
+"$HOME/.local/bin/jhw-control-host" task start \
   --task <tsk-id> --repo-path <absolute-checkout-root> --session <session-id>
 ```
 
@@ -120,10 +142,10 @@ Formal Task의 `--status completed`는 해당 Claim generation만 archive/releas
 사용자가 "현재 Task를 마무리하고 다른 작업으로 넘어간다"를 명시적으로 요청한 경우에만 사용한다. 전환은 새 커맨드가 아니라 위 **종료(finish)와 새 Task 시작/재개(start)의 연속 실행**이다. 서버에 switch 커맨드는 없으며 두 명령의 규격·정지 조건을 그대로 따른다.
 
 1. **입력을 한 번에 수집한다.** 현재 Task의 종료 status(completed면 `--outcome` 포함)와 validation 1개 이상, 그리고 대상 좌표 — 기존 Task 재개면 `<tsk-id>`, 신규면 project/repo-id/repo-path와 Issue URL 또는 temporary 등록 필드. validation은 세션에서 실제 수행된 검증 근거만 사용하고 자동 생성하지 않는다.
-2. **대상 좌표를 추측하지 않는다.** 대상 repo-id/project가 불확실하면 `jhw-control portfolio status` 결과의 `repositories` 배열로 확인한다. 미등록 저장소면 멈추고 repository 등록을 먼저 안내한다. `--repo-path`는 대상 checkout의 절대경로를 존재 확인 후 사용한다.
+2. **대상 좌표를 추측하지 않는다.** 대상 start는 authorization gate의 launcher `portfolio status` 결과의 `repositories` 배열로 확인한다. 미등록 저장소면 멈추고 repository 등록을 먼저 안내한다. `--repo-path`는 대상 checkout의 절대경로를 존재 확인 후 사용한다.
 3. **(필요 시) Issue를 먼저 만든다.** 대상 Issue가 아직 없으면 사용자 제공 제목·본문으로 `gh issue create --repo <owner>/<repo>`를 실행하고, 반환된 URL만 authority coordinate로 사용한다. Issue 생성이 실패하면 finish 전이므로 아무것도 변하지 않은 상태다 — 멈추고 보고한다.
 4. **finish를 먼저 실행한다** (위 종료 규격 그대로). `--status handoff`로 넘기는 경우 `--next-step`에 대상 Issue URL 또는 Task 좌표를 남겨 체인을 기록한다. finish가 nonzero면 **start를 실행하지 않고** 멈춘다.
-5. **start를 실행한다** (위 새 Task 시작 또는 재개 규격 그대로). `--session`은 finish에 쓴 것과 같은 session-id를 승계한다.
+5. **start를 실행한다** (위 새 Task 시작 또는 재개 규격의 authorization gate 포함). `--session`은 finish에 쓴 것과 같은 session-id를 승계한다.
 6. **finish 성공 후 start 실패는 정상 상태다** — 현재 Task는 이미 종료됐고 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. start 재시도는 finish를 반복하지 않고 start만 다시 실행한다.
 7. **결과를 함께 보고한다.** 종료한 Task(tsk-id, status, released claim)와 시작한 Task(tsk-id, 새 claim_id, branch, worktree_ref)를 한 번에 보여준다.
 
