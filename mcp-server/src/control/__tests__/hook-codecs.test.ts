@@ -124,25 +124,36 @@ describe("native hook input codecs", () => {
   });
 
   it.each(adapters)("rejects missing and empty required %s coordinates", async (_adapter, key) => {
-    // Break caught: empty native identity, cwd, tool, prompt, or correlation reaches Guard as ambient/default state.
+    // Break caught: deleting or emptying any event-required native coordinate reaches Guard as ambient/default state.
     const codec = (await loadCodecs())[key];
-    const cases: Array<[HookEventName, Record<string, unknown>]> = [
-      ["UserPromptSubmit", { ...nativePayload.UserPromptSubmit, session_id: "" }],
-      ["UserPromptSubmit", { ...nativePayload.UserPromptSubmit, prompt: "" }],
-      ["PreToolUse", { ...nativePayload.PreToolUse, cwd: "" }],
-      ["PreToolUse", { ...nativePayload.PreToolUse, tool_name: "" }],
-      ["PreToolUse", { ...nativePayload.PreToolUse, tool_use_id: "" }],
-      ["PostToolUse", { ...nativePayload.PostToolUse, tool_name: "" }],
-      ["PostToolUse", { ...nativePayload.PostToolUse, tool_use_id: "" }],
+    const cases: Array<[HookEventName, Record<string, unknown>, readonly string[]]> = [
+      [
+        "UserPromptSubmit",
+        nativePayload.UserPromptSubmit,
+        ["session_id", "cwd", "prompt"],
+      ],
+      [
+        "PreToolUse",
+        nativePayload.PreToolUse,
+        ["session_id", "cwd", "tool_name", "tool_input", "tool_use_id"],
+      ],
+      [
+        "PostToolUse",
+        nativePayload.PostToolUse,
+        ["session_id", "cwd", "tool_name", "tool_input", "tool_use_id"],
+      ],
     ];
-    for (const [event, raw] of cases) expect(() => codec.decode(event, raw)).toThrow();
-
-    const missingPrompt = { ...nativePayload.UserPromptSubmit } as Record<string, unknown>;
-    delete missingPrompt.prompt;
-    const missingInput = { ...nativePayload.PreToolUse } as Record<string, unknown>;
-    delete missingInput.tool_input;
-    expect(() => codec.decode("UserPromptSubmit", missingPrompt)).toThrow();
-    expect(() => codec.decode("PreToolUse", missingInput)).toThrow();
+    for (const [event, fixture, fields] of cases) {
+      for (const field of fields) {
+        const missing = { ...fixture };
+        delete missing[field];
+        expect(() => codec.decode(event, missing), `${event}.${field} missing`).toThrow();
+        expect(
+          () => codec.decode(event, { ...fixture, [field]: "" }),
+          `${event}.${field} empty`,
+        ).toThrow();
+      }
+    }
   });
 
   it.each(adapters)("rejects unknown top-level %s payload fields", async (_adapter, key) => {

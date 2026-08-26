@@ -20,6 +20,7 @@ const prompt = z.string()
   .min(1)
   .max(64 * 1024)
   .refine((value) => Buffer.byteLength(value, "utf8") <= 64 * 1024);
+const toolInput = z.record(z.unknown());
 
 // Keep the two native schema sets distinct. Task 2 can refine one adapter from
 // recorded fixtures without silently widening the other adapter's parser.
@@ -34,7 +35,7 @@ const ClaudePreToolUseSchema = z.object({
   cwd,
   hook_event_name: z.literal("PreToolUse"),
   tool_name: coordinate(64),
-  tool_input: z.unknown(),
+  tool_input: toolInput,
   tool_use_id: coordinate(255),
 }).strict();
 const ClaudePostToolUseSchema = z.object({
@@ -42,7 +43,7 @@ const ClaudePostToolUseSchema = z.object({
   cwd,
   hook_event_name: z.literal("PostToolUse"),
   tool_name: coordinate(64),
-  tool_input: z.unknown(),
+  tool_input: toolInput,
   tool_use_id: coordinate(255),
 }).strict();
 
@@ -57,7 +58,7 @@ const CodexPreToolUseSchema = z.object({
   cwd,
   hook_event_name: z.literal("PreToolUse"),
   tool_name: coordinate(64),
-  tool_input: z.unknown(),
+  tool_input: toolInput,
   tool_use_id: coordinate(255),
 }).strict();
 const CodexPostToolUseSchema = z.object({
@@ -65,7 +66,7 @@ const CodexPostToolUseSchema = z.object({
   cwd,
   hook_event_name: z.literal("PostToolUse"),
   tool_name: coordinate(64),
-  tool_input: z.unknown(),
+  tool_input: toolInput,
   tool_use_id: coordinate(255),
 }).strict();
 

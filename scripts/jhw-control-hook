@@ -66,17 +66,59 @@ capture_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/jhw-control-hook.XXXXXX" 2>/de
   exit 0
 }
 capture_file="${capture_dir}/core-output"
+overflow_file="${capture_dir}/overflow"
 cleanup() {
   /usr/bin/rm -f -- "$capture_file"
+  /usr/bin/rm -f -- "$overflow_file"
   /usr/bin/rmdir -- "$capture_dir" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 
 set +e
-"$timeout_command" --foreground 8 "$core" "$@" | /usr/bin/head -c 12289 > "$capture_file"
+"$timeout_command" --foreground 8 "$core" "$@" | "$node_command" -e '
+const fs = require("node:fs");
+const capture = process.argv[1];
+const overflow = process.argv[2];
+const maximum = 12 * 1024;
+let descriptor;
+let retained = 0;
+let exceeded = false;
+let failed = false;
+try {
+  descriptor = fs.openSync(capture, "wx", 0o600);
+} catch {
+  process.exit(1);
+}
+process.stdin.on("data", (chunk) => {
+  if (failed) return;
+  const available = maximum - retained;
+  const selected = available > 0 ? chunk.subarray(0, available) : Buffer.alloc(0);
+  let offset = 0;
+  try {
+    while (offset < selected.length) {
+      offset += fs.writeSync(descriptor, selected, offset, selected.length - offset);
+    }
+    retained += selected.length;
+    if (chunk.length > selected.length) exceeded = true;
+  } catch {
+    failed = true;
+  }
+});
+process.stdin.on("error", () => { failed = true; });
+process.stdin.on("end", () => {
+  try {
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    if (exceeded) fs.closeSync(fs.openSync(overflow, "wx", 0o600));
+  } catch {
+    failed = true;
+  }
+  process.exitCode = failed ? 1 : 0;
+});
+' "$capture_file" "$overflow_file"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
-if [[ "${pipeline_status[0]-1}" -ne 0 || "${pipeline_status[1]-1}" -ne 0 ]]; then
+if [[ "${pipeline_status[0]-1}" -ne 0 || "${pipeline_status[1]-1}" -ne 0 || -e "$overflow_file" ]]; then
   render_failure "GUARD_UNAVAILABLE"
   exit 0
 fi
@@ -85,17 +127,49 @@ if "$node_command" -e '
 const fs = require("node:fs");
 try {
   const bytes = fs.readFileSync(process.argv[1]);
+  const event = process.argv[2];
   if (bytes.length === 0 || bytes.length > 12 * 1024) process.exit(1);
   const text = bytes.toString("utf8");
   const value = JSON.parse(text);
   if (typeof value !== "object" || value === null || Array.isArray(value)) process.exit(1);
+  const exactKeys = (object, expected) => {
+    const keys = Object.keys(object).sort();
+    const wanted = [...expected].sort();
+    return keys.length === wanted.length && keys.every((key, index) => key === wanted[index]);
+  };
+  const hook = value.hookSpecificOutput;
+  let valid = false;
+  if (event === "PreToolUse") {
+    if (hook && typeof hook === "object" && !Array.isArray(hook) && hook.hookEventName === "PreToolUse") {
+      if (hook.permissionDecision === "allow") {
+        valid = exactKeys(value, ["hookSpecificOutput"]) &&
+          exactKeys(hook, ["hookEventName", "permissionDecision"]);
+      } else if (hook.permissionDecision === "deny") {
+        valid = exactKeys(value, ["hookSpecificOutput", "systemMessage"]) &&
+          exactKeys(hook, ["hookEventName", "permissionDecision", "permissionDecisionReason"]) &&
+          typeof hook.permissionDecisionReason === "string" && hook.permissionDecisionReason.length > 0 &&
+          typeof value.systemMessage === "string" && value.systemMessage.length > 0;
+      }
+    }
+  } else if (event === "UserPromptSubmit") {
+    valid = exactKeys(value, ["hookSpecificOutput", "systemMessage"]) &&
+      hook && typeof hook === "object" && !Array.isArray(hook) &&
+      exactKeys(hook, ["hookEventName", "additionalContext"]) &&
+      hook.hookEventName === "UserPromptSubmit" &&
+      typeof hook.additionalContext === "string" && hook.additionalContext.length > 0 &&
+      typeof value.systemMessage === "string" && value.systemMessage.length > 0;
+  } else if (event === "PostToolUse") {
+    valid = exactKeys(value, ["systemMessage"]) &&
+      typeof value.systemMessage === "string" && value.systemMessage.length > 0;
+  }
+  if (!valid) process.exit(1);
   const line = `${JSON.stringify(value)}\n`;
   if (Buffer.byteLength(line, "utf8") > 12 * 1024) process.exit(1);
   process.stdout.write(line);
 } catch {
   process.exit(1);
 }
-' "$capture_file"; then
+' "$capture_file" "$fallback_event"; then
   exit 0
 fi
 

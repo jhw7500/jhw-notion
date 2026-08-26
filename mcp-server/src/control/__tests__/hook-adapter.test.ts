@@ -107,6 +107,23 @@ function exactFailure(event: HookEventName, code: "GUARD_UNAVAILABLE" | "GUARD_P
   return { systemMessage: code };
 }
 
+function preToolDenyLineOfBytes(bytes: number): string {
+  const base = {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: "BOUNDARY",
+    },
+    systemMessage: "",
+  };
+  const fixedBytes = Buffer.byteLength(`${JSON.stringify(base)}\n`, "utf8");
+  if (bytes <= fixedBytes) throw new TypeError("Boundary fixture is too small");
+  base.systemMessage = "x".repeat(bytes - fixedBytes);
+  const line = `${JSON.stringify(base)}\n`;
+  if (Buffer.byteLength(line, "utf8") !== bytes) throw new TypeError("Boundary fixture drifted");
+  return line;
+}
+
 class ObservableGuard implements HookGuardPort {
   readonly calls: Array<{ method: string; event: unknown }> = [];
 
@@ -497,6 +514,12 @@ printf '%s\\n' "$CORE_OUTPUT"
     ["empty core output", undefined, "#!/usr/bin/env bash\nexit 0\n"],
     ["malformed core JSON", undefined, "#!/usr/bin/env bash\nprintf 'not-json\\n'\n"],
     ["multiple core JSON values", undefined, "#!/usr/bin/env bash\nprintf '{}\\n{}\\n'\n"],
+    ["empty JSON object", undefined, "#!/usr/bin/env bash\nprintf '{}\\n'\n"],
+    [
+      "wrong-event native object",
+      undefined,
+      "#!/usr/bin/env bash\nprintf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"wrong\"},\"systemMessage\":\"wrong\"}\\n'\n",
+    ],
   ] as const)("renders unavailable on %s", async (_name, timeoutSource, coreSource) => {
     // Break caught: a watchdog/core failure returns its bytes or empty stdout instead of a static native response.
     const fixture = await launcherFixture();
@@ -513,21 +536,54 @@ printf '%s\\n' "$CORE_OUTPUT"
     expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
   });
 
-  it("captures only bounded core output", async () => {
-    // Break caught: a runaway core fills launcher memory or forwards an oversized native envelope.
+  it("accepts one exact event-specific envelope at the 12 KiB capture boundary", async () => {
+    // Break caught: overflow detection rejects an exact 12,288-byte native response.
     const fixture = await launcherFixture();
     await installTimeout(fixture);
     await writeExecutable(fixture.core, `#!/usr/bin/env bash
-printf '%s\\n' "$CORE_OUTPUT"
+printf '%s' "$CORE_OUTPUT"
 `);
+    const line = preToolDenyLineOfBytes(12 * 1024);
     const result = await runLauncher(
       fixture,
       ["--adapter", "codex", "--event", "PreToolUse"],
       preToolPayload(),
-      { CORE_OUTPUT: JSON.stringify({ systemMessage: "x".repeat(13 * 1024) }) },
+      { CORE_OUTPUT: line },
+    );
+
+    expect(result).toEqual({ stdout: line, stderr: "" });
+  });
+
+  it("retains at most 12 KiB while detecting one overflow byte", async () => {
+    // Break caught: overflow detection writes a 12,289th core byte into the bounded response capture.
+    const fixture = await launcherFixture();
+    await installTimeout(fixture);
+    await rm(join(fixture.bin, "node"));
+    await writeExecutable(join(fixture.bin, "node"), `#!/usr/bin/env bash
+"$REAL_NODE" "$@"
+status=$?
+if [[ "$#" -eq 4 && -f "$3" ]]; then
+  /usr/bin/stat -c '%s' "$3" > "$CAPTURE_SIZE_LOG"
+fi
+exit "$status"
+`);
+    await writeExecutable(fixture.core, `#!/usr/bin/env bash
+printf '%s' "$CORE_OUTPUT"
+`);
+    const captureSizeLog = join(fixture.root, "capture-size");
+    const result = await runLauncher(
+      fixture,
+      ["--adapter", "codex", "--event", "PreToolUse"],
+      preToolPayload(),
+      {
+        CORE_OUTPUT: preToolDenyLineOfBytes(12 * 1024 + 1),
+        REAL_NODE: process.execPath,
+        CAPTURE_SIZE_LOG: captureSizeLog,
+      },
     );
 
     expect(JSON.parse(result.stdout)).toEqual(exactFailure("PreToolUse", "GUARD_UNAVAILABLE"));
+    expect(await readFile(captureSizeLog, "utf8")).toBe(`${12 * 1024}\n`);
     expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
   });
 
