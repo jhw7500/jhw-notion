@@ -19,172 +19,19 @@ argument-hint: "(start | resume | promote | handoff | finish | switch | recover)
 
 새 Task 등록·기존 Task 재개·Handoff에서의 재개·switch의 후속 start는 사용자가 명시적으로 요청하거나 승인했을 때만 실행한다. 그 요청/승인은 이 흐름의 승인이다. 이미 명시적으로 승인했다면 두 번째 승인을 묻지 않는다. 승인되지 않았다면 start 전에 한 번만 승인을 받는다.
 
-모든 `task start`는 아래 순서로 실행한다. raw config·`.env`를 source/read하지 않고, raw `jhw-control`을 호출하지 않는다. `preflight`가 nonzero이면 그 exit로 즉시 멈춘다. 그 뒤 `portfolio status` 또는 `task start`를 실행하거나 Task·Claim·worktree mutation을 시도하지 않는다. `portfolio status`의 반환값만으로 project/repository ID와 그 association을 검증하며 이름·이전 로그·추측으로 대체하지 않는다. checkout root는 portfolio에 없는 필드이므로 현재 checkout의 직접 `git rev-parse --show-toplevel` 사실로만 검증한다.
+모든 `task start`는 아래 순서로 실행한다. raw config·`.env`를 source/read하지 않고, raw `jhw-control`을 호출하지 않는다. `preflight`가 nonzero이면 그 exit로 즉시 멈추고 `task start`나 Task·Claim·worktree mutation을 시도하지 않는다. checkout root는 현재 checkout의 직접 `git rev-parse --show-toplevel` 사실로만 얻고, Project/Repository association은 launcher resolver가 Registry의 pinned read 안에서 확정한다.
 
 <!-- task-start-contract: gate:begin -->
 ```bash
-verified_checkout_slug() {
-  node - "$1" <<'NODE'
-const { execFileSync } = require("node:child_process");
-const root = process.argv[2];
-const urls = (arguments_) => {
-  let output;
-  try {
-    output = execFileSync("git", arguments_, {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-  } catch {
-    throw new Error("origin is unavailable");
-  }
-  const values = output.split("\n").filter(Boolean);
-  if (values.length !== 1) throw new Error("origin URL is ambiguous");
-  return values[0];
-};
-const fetchUrl = urls(["remote", "get-url", "--all", "origin"]);
-const pushUrl = urls(["remote", "get-url", "--all", "--push", "origin"]);
-if (fetchUrl !== pushUrl) throw new Error("origin fetch/push mismatch");
-const prefix = ["https://github.com/", "git@github.com:", "ssh://git@github.com/"]
-  .find((value) => fetchUrl.startsWith(value));
-if (!prefix) throw new Error("origin is not GitHub");
-const parts = fetchUrl.slice(prefix.length).split("/");
-if (parts.length !== 2) throw new Error("origin path is invalid");
-const [owner, rawRepository] = parts;
-const repository = rawRepository.endsWith(".git") ? rawRepository.slice(0, -4) : rawRepository;
-if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(owner) ||
-    !/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$/.test(repository)) {
-  throw new Error("origin slug is invalid");
-}
-process.stdout.write(`${owner}/${repository}`);
-NODE
-}
-
-prepare_task_start_gate() {
-  if [ "$#" -gt 1 ]; then return 64; fi
-  if [ "$#" -eq 1 ]; then
-    task_start_checkout="$1"
-    case "$task_start_checkout" in /*) ;; *) return 64;; esac
-  else
-    task_start_checkout='.'
-  fi
-
-  "$HOME/.local/bin/jhw-control-host" preflight >/dev/null
-  rc=$?
-  if [ "$rc" -ne 0 ]; then return "$rc"; fi
-
-  checkout_root="$(git -C "$task_start_checkout" rev-parse --show-toplevel)"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then return "$rc"; fi
-  case "$checkout_root" in /*) ;; *) return 1;; esac
-  git -C "$checkout_root" rev-parse --is-inside-work-tree >/dev/null || return $?
-  expected_repository_slug="$(verified_checkout_slug "$checkout_root")" || return $?
-
-portfolio_state='{"pages":[],"total_items":null,"item_count":0,"projects":{},"repositories":{},"next_page_id":"page-1"}'
-while :; do
-  requested_page_id="$(node -e 'const state=JSON.parse(process.argv[1]); if (state.next_page_id) process.stdout.write(state.next_page_id);' "$portfolio_state")" || return $?
-  [ -n "$requested_page_id" ] || break
-  if [ "$requested_page_id" = "page-1" ]; then
-    portfolio_json="$("$HOME/.local/bin/jhw-control-host" portfolio status)"
-  else
-    portfolio_json="$("$HOME/.local/bin/jhw-control-host" portfolio status --page "$requested_page_id")"
-  fi
-  rc=$?
-  if [ "$rc" -ne 0 ]; then return "$rc"; fi
-  portfolio_state="$(node - "$portfolio_state" "$portfolio_json" "$requested_page_id" <<'NODE'
-const [rawState, rawEnvelope, requestedPageId] = process.argv.slice(2);
-const id = (value, prefix) => typeof value === "string" &&
-  new RegExp(`^${prefix}-[a-z0-9][a-z0-9-]{1,62}$`).test(value);
-const slug = (value) => typeof value === "string" &&
-  /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/.test(value);
-const exact = (value, keys) => value && typeof value === "object" && !Array.isArray(value) &&
-  Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
-const state = JSON.parse(rawState);
-const envelope = JSON.parse(rawEnvelope);
-if (!exact(envelope, ["command", "result"]) || envelope.command !== "portfolio status") {
-  throw new Error("portfolio envelope invalid");
-}
-const result = envelope.result;
-const required = ["page_id", "items", "repositories", "truncated", "total_items"];
-const allowed = result && typeof result === "object" && !Array.isArray(result) &&
-  required.every((key) => Object.hasOwn(result, key)) &&
-  Object.keys(result).every((key) => required.includes(key) || key === "next_page_id");
-if (!allowed || typeof result.page_id !== "string" || result.page_id !== requestedPageId ||
-    !Array.isArray(result.items) || result.items.length > 20 ||
-    !Array.isArray(result.repositories) || typeof result.truncated !== "boolean" ||
-    !Number.isInteger(result.total_items) || result.total_items < 0 ||
-    result.truncated !== Object.hasOwn(result, "next_page_id")) throw new Error("portfolio page invalid");
-const expectedPageId = `page-${state.pages.length + 1}`;
-if (requestedPageId !== expectedPageId || state.pages.includes(result.page_id)) throw new Error("portfolio page sequence invalid");
-if (result.truncated && result.next_page_id !== `page-${state.pages.length + 2}`) throw new Error("portfolio next page invalid");
-if (state.total_items !== null && state.total_items !== result.total_items) throw new Error("portfolio count changed");
-if (result.total_items === 0 ? (state.pages.length !== 0 || result.items.length !== 0 || result.truncated) : result.items.length === 0) {
-  throw new Error("portfolio page count invalid");
-}
-const nextItemCount = state.item_count + result.items.length;
-const nextPageCount = state.pages.length + 1;
-if (nextItemCount > result.total_items || nextPageCount > Math.max(result.total_items, 1) ||
-    (result.truncated && nextItemCount >= result.total_items) || (!result.truncated && nextItemCount !== result.total_items)) {
-  throw new Error("portfolio bounded count invalid");
-}
-for (const item of result.items) {
-  const itemKeys = ["project_id", "title", "repo_ids"];
-  if (!exact(item, itemKeys) || !id(item.project_id, "prj") || typeof item.title !== "string" ||
-      Buffer.byteLength(item.title, "utf8") > 256 || !Array.isArray(item.repo_ids) ||
-      item.repo_ids.length === 0 || item.repo_ids.length > 64 || !item.repo_ids.every((repoId) => id(repoId, "repo")) ||
-      new Set(item.repo_ids).size !== item.repo_ids.length || Object.hasOwn(state.projects, item.project_id)) {
-    throw new Error("portfolio item invalid");
-  }
-  state.projects[item.project_id] = item.repo_ids;
-}
-for (const repository of result.repositories) {
-  if (!exact(repository, ["repo_id", "slug", "allow_public"]) || !id(repository.repo_id, "repo") ||
-      !slug(repository.slug) || typeof repository.allow_public !== "boolean") throw new Error("portfolio repository invalid");
-  const next = JSON.stringify([repository.slug, repository.allow_public]);
-  if (Object.hasOwn(state.repositories, repository.repo_id) && state.repositories[repository.repo_id] !== next) {
-    throw new Error("portfolio repository changed");
-  }
-  state.repositories[repository.repo_id] = next;
-}
-state.pages.push(result.page_id);
-state.total_items = result.total_items;
-state.item_count = nextItemCount;
-state.next_page_id = result.truncated ? result.next_page_id : null;
-process.stdout.write(JSON.stringify(state));
-NODE
-)" || return $?
-done
-}
-
-resolve_portfolio_coordinates() {
-  node - "$portfolio_state" "$1" <<'NODE'
-const [rawState, expectedSlug] = process.argv.slice(2);
-const state = JSON.parse(rawState);
-if (!Array.isArray(state.pages) || state.next_page_id !== null || state.item_count !== state.total_items ||
-    !state.projects || !state.repositories) throw new Error("portfolio coordinates unavailable");
-const repositoryIds = Object.entries(state.repositories)
-  .filter(([, value]) => JSON.parse(value)[0] === expectedSlug)
-  .map(([repositoryId]) => repositoryId);
-if (repositoryIds.length !== 1) throw new Error("portfolio repository is missing or ambiguous");
-const [repositoryId] = repositoryIds;
-const projectIds = Object.entries(state.projects)
-  .filter(([, repoIds]) => Array.isArray(repoIds) && repoIds.includes(repositoryId))
-  .map(([projectId]) => projectId);
-if (projectIds.length !== 1) throw new Error("portfolio project is missing or ambiguous");
-process.stdout.write(`${projectIds[0]}\t${repositoryId}`);
-NODE
-}
-
-bind_portfolio_coordinates() {
-  coordinates="$(resolve_portfolio_coordinates "$1")" || return $?
-  project_id="${coordinates%%$'\t'*}"
-  repo_id="${coordinates#*$'\t'}"
-  [ "$project_id" != "$coordinates" ] && [ -n "$repo_id" ]
-}
+"$HOME/.local/bin/jhw-control-host" preflight >/dev/null || exit $?
+REPOSITORY_PATH="$(git rev-parse --show-toplevel)" || exit $?
+test -n "$REPOSITORY_PATH" || exit 1
 ```
 <!-- task-start-contract: gate:end -->
 
-`task start` 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 보고하고 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
+`task start` 성공 결과에서 immutable `task_id`, 새 `claim_id`, `branch`, `worktree_ref`만 보고하고 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
+
+`PROJECT_REPOSITORY_NOT_FOUND`이면 올바른 Project Record에 Repository를 등록한 뒤 새 요청으로 다시 시작한다. `PROJECT_REPOSITORY_AMBIGUOUS`이면 Repository의 Project association을 하나로 줄인 뒤 새 요청으로 다시 시작한다. `PROJECT_REPOSITORY_NOT_FOUND`와 `PROJECT_REPOSITORY_AMBIGUOUS` 모두 추측, 임의 선택, 자동 재시도, explicit mode fallback을 금지한다.
 
 ## 좌표 없는 Task/Handoff 수신 발견
 
@@ -195,7 +42,7 @@ bind_portfolio_coordinates() {
 3. 사용자가 파일명을 지정했다면 pathless `HANDOFF*.md` basename 또는 exact literal `.ai/handoff.md`만 받으며 다른 path component·`..`·separator는 거부한다. 지정한 logical name과 일치하는 후보를 모든 worktree에서 먼저 찾고 glob 확장·부분 일치·현재 checkout 우선 선택으로 대체하지 않는다. 파일명을 지정하지 않았을 때만 두 후보 종류를 모두 모은다.
 4. 후보를 원래 logical-name byte와 porcelain record 기준으로 안정 정렬한다. 0개면 발견 실패를 보고하고 멈춘다. 여러 개면 임의로 읽거나 선택하거나 Claim하지 말고 총 개수와 최대 20개만 보여준 뒤 사용자 선택을 기다린다. 각 항목은 `순번 + JSON-style escaped logical name + escaped branch(없으면 detached) + worktree-key`로 표시한다. `worktree-key`는 record의 첫 `worktree ` byte부터 마지막 field byte까지 single-NUL field separator를 보존하고 terminating double NUL은 제외한 raw bytes의 SHA-256 앞 12 hex인 선택용 비권위 식별자다. C0/C1·ESC·bidi/non-printable 문자를 escape하고 원래 name byte로 비교한다. 절대 worktree path는 출력하지 않으며 20개 초과분은 생략 수를 표시한다.
 5. 단일 후보를 읽기 직전과 사용자가 복수 후보를 선택한 뒤에는 `git worktree list --porcelain -z`부터 다시 실행한다. 내부에 보존한 exact worktree root, `worktree-key`, exact logical name이 모두 그대로인지 확인한다. shell의 check-then-read로 대체하지 말고 local Python의 `os.open`을 사용해 root를 `O_DIRECTORY|O_NOFOLLOW`, canonical copy면 `.ai`도 같은 방식, 마지막 파일은 `O_RDONLY|O_NOFOLLOW`로 descriptor-relative open한 뒤 `fstat` regular file을 확인한다. 같은 fd에서 최대 12 KiB와 초과 확인용 1 byte만 읽는다. Python/필수 flag가 없거나 초과·교체·누락·symlink이면 truncate하거나 다른 후보로 넘어가지 말고 멈춘다.
-6. 선택한 Handoff의 Task/Issue/branch/worktree 표기는 **discovery hint**일 뿐이다. Task를 받아 작업하라는 현재 요청은 명시적 resume이므로, 위 Task start authorization gate의 preflight → portfolio coordinate verification 뒤에 기존-Task launcher start를 실행해 Claim을 획득하고 그 성공 결과로만 canonical Task·Claim·owner를 확정한다. `task status`는 이미 active라고 알려진 Claim의 읽기 전용 소유권 확인에만 쓰며 released Handoff 수신을 대신하지 않는다. 다른 owner·충돌·불일치·좌표 부재에서는 작업하거나 자동 takeover하지 않는다.
+6. 선택한 Handoff의 Task/Issue/branch/worktree 표기는 **discovery hint**일 뿐이다. Task를 받아 작업하라는 현재 요청은 명시적 resume이므로, 위 Task start authorization gate 뒤에 기존-Task launcher start를 실행해 Claim을 획득하고 그 성공 결과로만 canonical Task·Claim·owner를 확정한다. `task status`는 이미 active라고 알려진 Claim의 읽기 전용 소유권 확인에만 쓰며 released Handoff 수신을 대신하지 않는다. 다른 owner·충돌·불일치·좌표 부재에서는 작업하거나 자동 takeover하지 않는다.
 
 ## 새 Task 시작
 
@@ -205,11 +52,9 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 
 <!-- task-start-contract: formal:begin -->
 ```bash
-prepare_task_start_gate || exit $?
-[ "$expected_repository_slug" = "<owner>/<repo>" ] || exit 1
-bind_portfolio_coordinates "<owner>/<repo>" || exit $?
 "$HOME/.local/bin/jhw-control-host" task start \
-  --project "$project_id" --repo-id "$repo_id" --repo-path "$checkout_root" \
+  --resolve-from-checkout true \
+  --repo-path "$REPOSITORY_PATH" \
   --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
 ```
 <!-- task-start-contract: formal:end -->
@@ -220,15 +65,13 @@ bind_portfolio_coordinates "<owner>/<repo>" || exit $?
 
 `--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다.
 
-위 authorization gate의 preflight와 portfolio coordinate verification을 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다.
-`<expected-repository-slug>`는 current checkout의 verified Git remote identity에서 얻은 canonical `<owner>/<repo>`이며, `repo_id`·이전 로그·추측으로 대체하지 않는다. 확인할 수 없으면 멈춘다.
+위 authorization gate를 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다. Project/Repository association을 caller가 고르거나 명시하지 않는다.
 
 <!-- task-start-contract: temporary:begin -->
 ```bash
-prepare_task_start_gate || exit $?
-bind_portfolio_coordinates "$expected_repository_slug" || exit $?
 "$HOME/.local/bin/jhw-control-host" task start \
-  --project "$project_id" --repo-id "$repo_id" --repo-path "$checkout_root" \
+  --resolve-from-checkout true \
+  --repo-path "$REPOSITORY_PATH" \
   --temp-alias <alias> --goal <goal> \
   --done <condition> [--done <condition> ...] \
   --scope <scope> [--scope <scope> ...] --session <session-id>
@@ -239,15 +82,12 @@ bind_portfolio_coordinates "$expected_repository_slug" || exit $?
 
 재개는 `status`가 아니라 같은 persistent Task를 다시 claim하는 명시적 start다. registration field를 섞지 않는다.
 
-위 authorization gate의 preflight와 portfolio coordinate verification을 통과한 뒤에만 launcher로 재개한다.
-`<expected-repository-slug>`는 current checkout의 verified Git remote identity에서 얻은 canonical `<owner>/<repo>`이며, 확인할 수 없으면 멈춘다.
+위 authorization gate를 통과한 뒤에만 launcher로 재개한다. resolver나 Project/Repository registration field를 섞지 않는다.
 
 <!-- task-start-contract: resume:begin -->
 ```bash
-prepare_task_start_gate || exit $?
-bind_portfolio_coordinates "$expected_repository_slug" || exit $?
 "$HOME/.local/bin/jhw-control-host" task start \
-  --task <tsk-id> --repo-path "$checkout_root" --session <session-id>
+  --task <tsk-id> --repo-path "$REPOSITORY_PATH" --session <session-id>
 ```
 <!-- task-start-contract: resume:end -->
 
@@ -307,17 +147,17 @@ Formal Task의 `--status completed`는 해당 Claim generation만 archive/releas
 
 사용자가 "현재 Task를 마무리하고 다른 작업으로 넘어간다"를 명시적으로 요청한 경우에만 사용한다. 전환은 새 커맨드가 아니라 위 **종료(finish)와 새 Task 시작/재개(start)의 연속 실행**이다. 서버에 switch 커맨드는 없으며 두 명령의 규격·정지 조건을 그대로 따른다.
 
-1. **입력을 한 번에 수집한다.** 현재 Task의 종료 status(completed면 `--outcome` 포함)와 validation 1개 이상, 그리고 대상 좌표 — 기존 Task 재개면 `<tsk-id>`, 신규면 project/repo-id/repo-path와 Issue URL 또는 temporary 등록 필드. validation은 세션에서 실제 수행된 검증 근거만 사용하고 자동 생성하지 않는다.
-2. **대상 좌표를 추측하지 않는다.** 대상 start는 authorization gate의 launcher `portfolio status` 결과의 `repositories` 배열로 확인한다. 미등록 저장소면 멈추고 repository 등록을 먼저 안내한다. `--repo-path`는 대상 checkout의 절대경로를 존재 확인 후 사용한다.
+1. **입력을 한 번에 수집한다.** 현재 Task의 종료 status(completed면 `--outcome` 포함)와 validation 1개 이상, 그리고 대상 좌표 — 기존 Task 재개면 `<tsk-id>`, 신규면 대상 checkout root와 Issue URL 또는 temporary 등록 필드. validation은 세션에서 실제 수행된 검증 근거만 사용하고 자동 생성하지 않는다.
+2. **대상 좌표를 추측하지 않는다.** `--repo-path`는 대상 checkout의 절대 Git root를 확인해 사용하고, 신규 start의 Project/Repository association은 launcher resolver가 확정한다.
 3. **(필요 시) Issue를 먼저 만든다.** 대상 Issue가 아직 없으면 사용자 제공 제목·본문으로 `gh issue create --repo <owner>/<repo>`를 실행하고, 반환된 URL만 authority coordinate로 사용한다. Issue 생성이 실패하면 finish 전이므로 아무것도 변하지 않은 상태다 — 멈추고 보고한다.
-4. **대상 gate를 finish 전에 실행하고, 그 검증 결과를 보존한 뒤 finish를 실행한다.** target checkout의 absolute root는 `prepare_task_start_gate <absolute-target-checkout-root>`가 현재 checkout 직접 사실과 origin fetch/push identity로 검증해 `checkout_root`에 보존한다. 그 gate의 portfolio association도 finish 전에 검증한다. gate가 nonzero이면 finish/start 모두 실행하지 않는다. 아래 formal target의 executable sequencing contract처럼 finish가 nonzero이면 **start를 실행하지 않고** 멈춘다. Temporary/resume target도 같은 retained `checkout_root`와 verified coordinates를 사용하며, finish 뒤에 gate를 다시 실행하지 않는다.
+4. **대상 gate를 finish 전에 실행하고, 그 Git root를 보존한 뒤 finish를 실행한다.** gate가 nonzero이면 finish/start 모두 실행하지 않는다. 아래 formal target의 executable sequencing contract처럼 finish가 nonzero이면 **start를 실행하지 않고** 멈춘다. Temporary/resume target도 같은 retained `REPOSITORY_PATH`를 사용하며, finish 뒤에 gate를 다시 실행하지 않는다.
 
 <!-- task-start-contract: switch:begin -->
 ```bash
 target_checkout_root="<absolute-target-checkout-root>"
-prepare_task_start_gate "$target_checkout_root" || exit $?
-[ "$expected_repository_slug" = "<owner>/<repo>" ] || exit 1
-bind_portfolio_coordinates "$expected_repository_slug" || exit $?
+"$HOME/.local/bin/jhw-control-host" preflight >/dev/null || exit $?
+REPOSITORY_PATH="$(git -C "$target_checkout_root" rev-parse --show-toplevel)" || exit $?
+test "$REPOSITORY_PATH" = "$target_checkout_root" || exit 1
 
 jhw-control task finish --task <tsk-id> --claim <claim-id> \
   --status handoff --validation <validation>
@@ -325,7 +165,7 @@ rc=$?
 if [ "$rc" -ne 0 ]; then exit "$rc"; fi
 
 "$HOME/.local/bin/jhw-control-host" task start \
-  --project "$project_id" --repo-id "$repo_id" --repo-path "$checkout_root" \
+  --resolve-from-checkout true --repo-path "$REPOSITORY_PATH" \
   --issue-url https://github.com/<owner>/<repo>/issues/<number> --session <session-id>
 ```
 <!-- task-start-contract: switch:end -->
@@ -376,6 +216,6 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
 - exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.
 - exit `75`: Registry dirty/diverged 또는 lock contention/acquisition timeout. stop; 자동 retry/rebase/force 금지. Lock helper spawn/setup/acquire 실패는 일반 command `1`, preflight NO-GO `78`이다.
-- `REGISTRY_MOVED_DURING_READ`: 읽기 도중 다른 세션이 Registry에 커밋해 이 읽기가 뒤처진 것이다. **Registry 손상이 아니므로 같은 명령을 그대로 다시 실행**한다. 읽기 전용 명령(`status`·`handoff`·`assert-owner`·`recover --action status`)은 host lock을 잡지 않아 이 조건에 걸릴 수 있다. 반복되면 쓰기가 계속 들어오는 것이니 한가한 시점에 다시 본다.
+- resolver `task start`/`task finish`가 `REGISTRY_MOVED_DURING_READ`를 반환하면 자동 재실행 없이 멈추고 보고한다. 수동 재실행 안내는 `status`, `handoff`, `assert-owner`, `recover --action status` 읽기 전용 명령에만 제한한다. 읽기 전용 명령에서 반복되면 쓰기가 계속 들어오는 것이니 한가한 시점에 다시 본다.
 - `error.reason`은 같은 code 안에서 조치가 갈리는 축이다. `HANDOFF_RETRY_CONFLICT`: `git_identity_changed`·`dirty_delta_changed`는 worktree가 커밋된 Handoff 증거(branch·head_sha·ahead·behind·dirty delta)에서 움직인 것 — **커밋된 Handoff가 정본**이므로 로컬 움직임(새 commit·파일 변경)은 되돌린 뒤 같은 필드로 재시도하고, 작업을 유지하려 하거나 되돌릴 수 없는 움직임(upstream 이동에 따른 ahead/behind 변화)이면 completed/abandoned release 후 새 Claim에서 이어간다(그 release는 handoff 경로를 타지 않는다), `legacy_dirty_evidence_ambiguous`는 구 포맷(새 Handoff 생성), `retry_fields_changed`·`handoff_metadata_mismatch`는 재시도 요청이 커밋본과 다른 것(커밋된 필드·좌표 그대로 재시도), 그 외 git-state 파스 계열은 커밋된 Handoff 자체 손상. `WORKTREE_DIRTY` + `handoff_copy_not_plain_file`은 worktree가 더러운 게 아니라 `.ai/handoff.md` 사본이 malformed인 것이다. `INVALID_WORKTREE_INSPECTION` + `duplicate_dirty_files`는 inspection이 중복 dirty 엔트리를 반환해 fail-closed한 것 — 재실행 후에도 반복되면 Git status 자체가 이상한 것이다. reason은 journal에도 `error_reason`으로 남아 사후 감사에서 같은 축을 쓴다.
 - 다른 nonzero: stable `error.code`만 보고하고 secret/raw path를 출력하지 않는다.
