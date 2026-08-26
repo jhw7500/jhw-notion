@@ -14,7 +14,12 @@ import {
   type NormalizeOperationContext,
 } from "../operation-normalizer.js";
 import { guardToolIdentityInventoryForTesting, resolveGuardTool } from "../guard-tool-resolver.js";
-import { CanonicalOperationSchema, type JsonValue, type PreToolUseEvent } from "../guard-protocol.js";
+import {
+  CanonicalOperationSchema,
+  type CanonicalOperation,
+  type JsonValue,
+  type PreToolUseEvent,
+} from "../guard-protocol.js";
 
 const TASK_ID = "tsk-018f21e0-7b2c-7a00-8000-000000000001";
 const CLAIM_ID = "clm-018f21e0-7b2c-7a00-8000-000000000002";
@@ -54,6 +59,15 @@ const unsupportedEnvCommands = [
   "env - bash ./unsupported-env.sh",
   "env --definitely-unsupported bash ./unsupported-env.sh",
   "env --unset= bash ./unsupported-env.sh",
+] as const;
+const broadEnvAssignmentCommands = [
+  "env 1A=x bash ./broad-env.sh",
+  "env A-B=x bash ./broad-env.sh",
+  "env A.B=x bash ./broad-env.sh",
+  "env =x bash ./broad-env.sh",
+  "env /=x bash ./broad-env.sh",
+  "env -- 1A=x bash ./broad-env.sh",
+  "env -- -A=x bash ./broad-env.sh",
 ] as const;
 
 describe("operation normalization", () => {
@@ -437,6 +451,63 @@ describe("operation normalization", () => {
     expect(JSON.stringify(first)).not.toContain("echo first");
     expect(JSON.stringify(second)).not.toContain("echo second");
   });
+
+  it("binds post-separator env assignment to script bytes without exposing private material", async () => {
+    const script = join(root, "post-separator.sh");
+    const firstContent = "printf first\n";
+    const secondContent = "printf second\n";
+    try {
+      await writeFile(script, firstContent, { mode: 0o600 });
+      const first = await normalizeOperation(event({
+        tool_input: { command: "env -- MODE=safe bash ./post-separator.sh" },
+      }), context, KEY);
+      await writeFile(script, secondContent, { mode: 0o600 });
+      const second = await normalizeOperation(event({
+        tool_input: { command: "env -- MODE=safe bash ./post-separator.sh" },
+      }), context, KEY);
+
+      expect(first.digest).not.toBe(second.digest);
+      for (const operation of [first, second]) {
+        const serialized = JSON.stringify(operation);
+        expect(serialized).not.toContain(root);
+        expect(serialized).not.toContain("post-separator.sh");
+        expect(serialized).not.toContain(firstContent.trim());
+        expect(serialized).not.toContain(secondContent.trim());
+      }
+    } finally {
+      await rm(script, { force: true });
+    }
+  });
+
+  it.each(broadEnvAssignmentCommands)(
+    "rejects broad GNU env assignment before canonical output: %s",
+    async (command) => {
+      const script = join(root, "broad-env.sh");
+      try {
+        const attempts: PromiseSettledResult<CanonicalOperation>[] = [];
+        await writeFile(script, "printf first\n", { mode: 0o600 });
+        attempts.push(...await Promise.allSettled([
+          normalizeOperation(event({ tool_input: { command } }), context, KEY),
+        ]));
+        await writeFile(script, "printf second\n", { mode: 0o600 });
+        attempts.push(...await Promise.allSettled([
+          normalizeOperation(event({ tool_input: { command } }), context, KEY),
+        ]));
+
+        for (const attempt of attempts) {
+          expect(attempt).toMatchObject({
+            status: "rejected",
+            reason: {
+              name: "ShellClassificationError",
+              code: "unsafe_local_script",
+            },
+          });
+        }
+      } finally {
+        await rm(script, { force: true });
+      }
+    },
+  );
 
   it.each(unsupportedEnvCommands)(
     "rejects unsupported executable-producing GNU env grammar before canonical output: %s",

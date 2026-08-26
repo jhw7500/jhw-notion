@@ -60,6 +60,13 @@ const legacyUnsupportedEnvPermitFixtures = [
   ["env --definitely-unsupported bash ./unsupported-env.sh", "3875e32ef61ac7c59694b9fd2ffb0fa74b9c606a14891ef6904c6d5bab8952db"],
   ["env --unset= bash ./unsupported-env.sh", "1de629ce503d6aa6bf50329fb5dd895034bce8d96f5b5e1526e02bf9aed35e67"],
 ] as const;
+// Deliberate pre-micro-fix migration fixtures. The literal digests were
+// captured on 73769ff and independently reproduced from hand-authored
+// canonical HMAC material; current classifier behavior is not an oracle.
+const legacyBroadEnvAssignmentPermitFixtures = [
+  ["env 1A=x bash ./broad-env.sh", "26eb582c2e837276f64cfc260b176768d833dc7fe00479665126eabdbaa0dc4d"],
+  ["env -- -A=x bash ./broad-env.sh", "8fc06452273ab148d04afc999a28584ccbac77b724d31c457c4279101a91b067"],
+] as const;
 const runFile = promisify(execFile);
 const nonBashStatusWhitespace = [
   ["vertical tab", "\u000b"],
@@ -2395,6 +2402,61 @@ describe("GuardService", () => {
           state: "APPROVED",
         });
         expect(requests[0]).not.toHaveProperty("correlation_id");
+      },
+    );
+
+    it.each(legacyBroadEnvAssignmentPermitFixtures)(
+      "keeps a legacy broad env assignment permit approved after script bytes change: %s",
+      async (command, legacyDigest) => {
+        missingRepositoryModify();
+        const script = join(fixture.root, "broad-env.sh");
+        try {
+          await writeFile(script, "printf first\n", { mode: 0o600 });
+          const legacyOperation: CanonicalOperation = {
+            protocol_version: 1,
+            operation_id: "op-018f21e0-7b2c-7a00-8000-000000000006",
+            origin_adapter: "codex",
+            evaluation_stage: "hook",
+            session_id: SESSION_ID,
+            task_id: TASK_ID,
+            claim_id: CLAIM_ID,
+            cwd_worktree_ref: "wt-guard-task",
+            tool: "shell",
+            requirements: [{ capability: "shell.unclassified", resource: REPOSITORY }],
+            risk: "high",
+            execution_boundary: "hook",
+            summary: "shell.unclassified repository:repo-guard",
+            digest: legacyDigest,
+          };
+          const pending = await fixture.requestStore.createOrReusePending(legacyOperation);
+          await expect(fixture.requestStore.approveFromPrompt(
+            "codex",
+            SESSION_ID,
+            `/jhw:unlock ${pending.request.request_id}`,
+          )).resolves.toMatchObject({ status: "APPROVED" });
+          await writeFile(script, "printf second\n", { mode: 0o600 });
+
+          const decision = await integratedService().evaluatePreTool(preTool(
+            fixture.root,
+            "Bash",
+            { command },
+            "call-broad-env-retry",
+          ));
+          const requests = await storedRequests();
+
+          expect.soft(decision).toMatchObject({
+            decision: "DENY",
+            code: "GUARD_WORKTREE_MISMATCH",
+          });
+          expect.soft(requests).toHaveLength(1);
+          expect.soft(requests[0]).toMatchObject({
+            request_id: pending.request.request_id,
+            state: "APPROVED",
+          });
+          expect.soft(requests[0]).not.toHaveProperty("correlation_id");
+        } finally {
+          await rm(script, { force: true });
+        }
       },
     );
   });

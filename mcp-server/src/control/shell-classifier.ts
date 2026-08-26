@@ -359,6 +359,17 @@ function executableArgv(argv: readonly string[]): string[] | undefined {
     const argument = argv[index] as string;
     if (argument === "--") {
       index += 1;
+      while (index < argv.length) {
+        const postSeparatorArgument = argv[index] as string;
+        if (isAssignment(postSeparatorArgument)) {
+          index += 1;
+          continue;
+        }
+        if (postSeparatorArgument.includes("=")) {
+          throw new ShellClassificationError("unsafe_local_script");
+        }
+        break;
+      }
       break;
     }
     if (isAssignment(argument)) {
@@ -394,6 +405,9 @@ function executableArgv(argv: readonly string[]): string[] | undefined {
       continue;
     }
     if (argument.startsWith("-")) {
+      throw new ShellClassificationError("unsafe_local_script");
+    }
+    if (argument.includes("=")) {
       throw new ShellClassificationError("unsafe_local_script");
     }
     break;

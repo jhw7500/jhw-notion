@@ -59,6 +59,43 @@ const unsupportedNonExecutingEnvCases = [
   "env --definitely-unsupported bash ./unsupported-env.sh",
   "env --unset= bash ./unsupported-env.sh",
 ] as const;
+const broadEnvAssignmentCases = [
+  {
+    name: "leading digit",
+    command: "env 1A=x bash ./broad-env.sh",
+    argv: ["1A=x", "bash", "./broad-env.sh"],
+  },
+  {
+    name: "hyphen",
+    command: "env A-B=x bash ./broad-env.sh",
+    argv: ["A-B=x", "bash", "./broad-env.sh"],
+  },
+  {
+    name: "dot",
+    command: "env A.B=x bash ./broad-env.sh",
+    argv: ["A.B=x", "bash", "./broad-env.sh"],
+  },
+  {
+    name: "empty name",
+    command: "env =x bash ./broad-env.sh",
+    argv: ["=x", "bash", "./broad-env.sh"],
+  },
+  {
+    name: "slash",
+    command: "env /=x bash ./broad-env.sh",
+    argv: ["/=x", "bash", "./broad-env.sh"],
+  },
+  {
+    name: "post-separator leading digit",
+    command: "env -- 1A=x bash ./broad-env.sh",
+    argv: ["--", "1A=x", "bash", "./broad-env.sh"],
+  },
+  {
+    name: "post-separator leading dash",
+    command: "env -- -A=x bash ./broad-env.sh",
+    argv: ["--", "-A=x", "bash", "./broad-env.sh"],
+  },
+] as const;
 
 describe("conservative shell classification", () => {
   let root: string;
@@ -632,6 +669,7 @@ describe("conservative shell classification", () => {
       "MODE=safe env SECOND=safe ./prefixed.sh",
       "env MODE=safe ./prefixed.sh",
       "env MODE=safe -- ./prefixed.sh",
+      "env A=B=C bash ./prefixed.sh",
       "env -i MODE=safe ./prefixed.sh",
       "env --ignore-environment MODE=safe ./prefixed.sh",
       "env -u UNUSED MODE=safe ./prefixed.sh",
@@ -641,6 +679,88 @@ describe("conservative shell classification", () => {
       const result = await classifyShell(command, context);
       expect(result.script_content_sha256).toBe(expected);
     }
+  });
+
+  it("binds post-separator env assignment to local script bytes", async () => {
+    const script = join(cwd, "post-separator.sh");
+    const firstContent = "printf first\n";
+    const secondContent = "printf second\n";
+    try {
+      await writeFile(script, firstContent, { mode: 0o600 });
+      const first = await Promise.all([
+        classifyShell("env -- MODE=safe bash ./post-separator.sh", context),
+        classifyShell("env -- A=B=C bash ./post-separator.sh", context),
+      ]);
+      await writeFile(script, secondContent, { mode: 0o600 });
+      const second = await Promise.all([
+        classifyShell("env -- MODE=safe bash ./post-separator.sh", context),
+        classifyShell("env -- A=B=C bash ./post-separator.sh", context),
+      ]);
+
+      for (let index = 0; index < first.length; index += 1) {
+        expect(first[index]?.script_content_sha256)
+          .toBe(createHash("sha256").update(firstContent).digest("hex"));
+        expect(second[index]?.script_content_sha256)
+          .toBe(createHash("sha256").update(secondContent).digest("hex"));
+        expect(first[index]?.script_content_sha256).not.toBe(second[index]?.script_content_sha256);
+      }
+    } finally {
+      await rm(script, { force: true });
+    }
+  });
+
+  it.each(broadEnvAssignmentCases)(
+    "rejects broad GNU env assignment $name after proving both script revisions execute",
+    async ({ command, argv }) => {
+      const script = join(cwd, "broad-env.sh");
+      try {
+        await writeFile(script, "exit 47\n", { mode: 0o600 });
+        expect(spawnSync("/usr/bin/env", argv, {
+          cwd,
+          env: { ...process.env },
+          stdio: "ignore",
+        }).status).toBe(47);
+        await expect(classifyShell(command, context)).rejects.toMatchObject({
+          name: "ShellClassificationError",
+          code: "unsafe_local_script",
+        } satisfies Partial<ShellClassificationError>);
+
+        await writeFile(script, "exit 48\n", { mode: 0o600 });
+        expect(spawnSync("/usr/bin/env", argv, {
+          cwd,
+          env: { ...process.env },
+          stdio: "ignore",
+        }).status).toBe(48);
+        await expect(classifyShell(command, context)).rejects.toMatchObject({
+          name: "ShellClassificationError",
+          code: "unsafe_local_script",
+        } satisfies Partial<ShellClassificationError>);
+      } finally {
+        await rm(script, { force: true });
+      }
+    },
+  );
+
+  it("keeps equals-bearing behavior outside env unchanged", async () => {
+    const script = join(cwd, "local=name.sh");
+    const content = "#!/bin/sh\nprintf local\n";
+    try {
+      const ordinary = await classifyShell("custom-tool A-B=x", context);
+      await writeFile(script, content, { mode: 0o700 });
+      const local = await classifyShell("./local=name.sh", context);
+
+      expect(ordinary.requirements).toEqual([{ capability: "shell.unclassified", resource: repository }]);
+      expect(local.script_content_sha256).toBe(createHash("sha256").update(content).digest("hex"));
+    } finally {
+      await rm(script, { force: true });
+    }
+  });
+
+  it("treats a post-separator dash token as the env executable", async () => {
+    const result = await classifyShell("env -- --opaque value", context);
+
+    expect(result.requirements).toEqual([{ capability: "shell.unclassified", resource: repository }]);
+    expect(result.digest_argv).toEqual(["env", "--", "--opaque", "value"]);
   });
 
   it("fails closed for an env-prefixed unsafe local script", async () => {
