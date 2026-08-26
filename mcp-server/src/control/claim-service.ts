@@ -212,7 +212,7 @@ export class ClaimService {
     await this.registry.transact(`registry: claim task ${input.task_id}`, async () => {
       const task = await this.catalog.getTask(input.task_id);
       const workContract = this.requireTaskContract(task);
-      const sourceTaskRevision = await this.taskSourceRevision(task);
+      let sourceTaskRevision = await this.taskSourceRevision(task);
       this.assertClaimInputMatchesTask(input, task);
       const existing = await this.readActive(task);
       if (existing) {
@@ -235,6 +235,15 @@ export class ClaimService {
       this.assertResourcesAvailable(activeClaims, workContract, input.task_id);
       const predecessor = await this.latestReusablePredecessor(task, input);
       const lifecyclePaths = await this.catalog.transitionTaskLifecycle(task.id, "active");
+      const canonicalTaskPath = taskRelativePath(task.id);
+      let expectedRegularBlob: { path: string; objectId: string } | undefined;
+      if (lifecyclePaths.length > 0) {
+        if (task.kind === "formal" || lifecyclePaths.length !== 1 || lifecyclePaths[0] !== canonicalTaskPath) {
+          throw corruption("Task lifecycle transition returned a noncanonical mutation path", { task_id: task.id });
+        }
+        sourceTaskRevision = await this.registry.worktreeRegularBlobObjectId(canonicalTaskPath);
+        expectedRegularBlob = { path: canonicalTaskPath, objectId: sourceTaskRevision };
+      }
 
       const started = this.timestamp();
       claimed = parse(
@@ -252,7 +261,10 @@ export class ClaimService {
         "Claim record failed validation",
       );
       await this.catalog.records.writeJson(activeClaimRelativePath(input.task_id), claimed);
-      return stage([...lifecyclePaths, activeClaimRelativePath(input.task_id)]);
+      return {
+        paths: [...lifecyclePaths, activeClaimRelativePath(input.task_id)],
+        ...(expectedRegularBlob ? { expectedRegularBlobs: [expectedRegularBlob] } : {}),
+      };
     });
 
     if (!claimed) throw new Error("Claim transaction did not produce an active Claim");

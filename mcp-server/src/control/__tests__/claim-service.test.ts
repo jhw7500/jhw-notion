@@ -1,4 +1,4 @@
-import { link, mkdir, readFile, rename, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { appendFile, link, mkdir, readFile, rename, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,7 +7,7 @@ import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { ControlError } from "../errors.js";
 import { ProcessRunner } from "../process.js";
-import { RegistryGit } from "../registry-git.js";
+import { RegistryGit, type ProcessRunnerLike } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import { taskCompletionEvidenceDigest } from "../task-completion.js";
 import { normalizeWorkContract, workContractDigest } from "../work-contract.js";
@@ -26,7 +26,11 @@ afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
 });
 
-async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: SensitiveDataPolicy): Promise<{
+async function claimsFixture(
+  now: () => Date = () => fixedNow,
+  sensitiveData?: SensitiveDataPolicy,
+  runnerFactory: (fixture: RegistryFixture) => ProcessRunnerLike = () => new ProcessRunner(),
+): Promise<{
   fixture: RegistryFixture;
   claims: ClaimService;
   catalog: Catalog;
@@ -35,7 +39,7 @@ async function claimsFixture(now: () => Date = () => fixedNow, sensitiveData?: S
   const fixture = await makeRegistryFixture();
   fixtures.push(fixture);
   const config = configFor(fixture.registryDir);
-  const registry = isolatedRegistryGit(config, new ProcessRunner());
+  const registry = isolatedRegistryGit(config, runnerFactory(fixture));
   const catalog = new Catalog(config, registry, undefined, {
     assertKnownContract: async () => undefined,
     assertKnownRequirement: async () => undefined,
@@ -405,7 +409,7 @@ describe("ClaimService", () => {
     await expect(claims.assertOwner(task.id, second.claim_id)).resolves.toEqual(second);
   });
 
-  it("moves a child through handoff, permits resume, and rejects terminal reclaim", async () => {
+  it("moves a child through handoff with the committed resumed Task revision and rejects terminal reclaim", async () => {
     const { claims, task, catalog, fixture } = await formalClaimsFixture("parent");
     const child = await catalog.registerChildTask({
       parent_task_id: task.id,
@@ -434,6 +438,17 @@ describe("ClaimService", () => {
       task_alias: child.aliases[0],
       session_id: "codex-child-resumed",
     }));
+    const persisted = JSON.parse(await readFile(
+      join(fixture.registryDir, "claims", "active", `${child.id}.yaml`),
+      "utf8",
+    ));
+    const committedTaskRevision = (await git(
+      fixture.registryDir,
+      "rev-parse",
+      `HEAD:tasks/${child.id}.yaml`,
+    )).trim();
+    expect(resumed.source_task_revision).toBe(committedTaskRevision);
+    expect(persisted.source_task_revision).toBe(committedTaskRevision);
     expect((await catalog.getTask(child.id) as { lifecycle: string }).lifecycle).toBe("active");
     await claims.finishClaim(child.id, resumed.claim_id, {
       status: "abandoned",
@@ -1133,7 +1148,7 @@ describe("ClaimService", () => {
     });
   });
 
-  it("marks force-ended temporary work resumable as handoff", async () => {
+  it("marks force-ended temporary work resumable with the committed resumed Task revision", async () => {
     const { claims, task, fixture } = await claimsFixture();
     const active = await claims.claimTask(claimInput(task.id));
 
@@ -1141,13 +1156,164 @@ describe("ClaimService", () => {
 
     const record = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
     expect(record.lifecycle).toBe("handoff");
-    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-resume" }))).resolves.toMatchObject({
+    const returned = await claims.claimTask(claimInput(task.id, { session_id: "codex-resume" }));
+    expect(returned).toMatchObject({
       task_id: task.id,
       session_id: "codex-resume",
       predecessor_claim_id: active.claim_id,
     });
     const resumed = JSON.parse(await readFile(join(fixture.registryDir, "tasks", `${task.id}.yaml`), "utf8"));
+    const persisted = JSON.parse(await readFile(
+      join(fixture.registryDir, "claims", "active", `${task.id}.yaml`),
+      "utf8",
+    ));
+    const committedTaskRevision = (await git(
+      fixture.registryDir,
+      "rev-parse",
+      `HEAD:tasks/${task.id}.yaml`,
+    )).trim();
     expect(resumed.lifecycle).toBe("active");
+    expect(returned.source_task_revision).toBe(committedTaskRevision);
+    expect(persisted.source_task_revision).toBe(committedTaskRevision);
+  });
+
+  it("rejects an ambiguous post-transition blob before publishing resumed ownership", async () => {
+    let hashInvoked = false;
+    const { claims, task, fixture } = await claimsFixture(
+      () => fixedNow,
+      undefined,
+      (): ProcessRunnerLike => {
+        const delegate = new ProcessRunner();
+        return {
+          async run(command, args, options) {
+            if (command === "git" && args[0] === "hash-object") {
+              hashInvoked = true;
+              return {
+                command,
+                args,
+                stdout: `${"a".repeat(40)}\n${"b".repeat(40)}\n`,
+                stderr: "",
+                exitCode: 0,
+              };
+            }
+            return delegate.run(command, args, options);
+          },
+          runRaw: (command, args, options, maximumBytes) =>
+            delegate.runRaw(command, args, options, maximumBytes),
+        };
+      },
+    );
+    const first = await claims.claimTask(claimInput(task.id));
+    await claims.recoverClaim(task.id, first.claim_id, { kind: "force-end" });
+    const activePath = `claims/active/${task.id}.yaml`;
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeRemoteHead = (await git(fixture.remoteDir, "rev-parse", "main")).trim();
+
+    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-ambiguous-resume" })))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    expect(hashInvoked).toBe(true);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.remoteDir, "rev-parse", "main")).trim()).toBe(beforeRemoteHead);
+    expect((await git(fixture.registryDir, "ls-tree", "--name-only", "HEAD", "--", activePath)).trim()).toBe("");
+  });
+
+  it("rejects a changed post-transition blob before committing resumed ownership", async () => {
+    let alteredAfterHash = false;
+    const { claims, task, fixture } = await claimsFixture(
+      () => fixedNow,
+      undefined,
+      (createdFixture): ProcessRunnerLike => {
+        const delegate = new ProcessRunner();
+        return {
+          async run(command, args, options) {
+            if (command === "git" && args[0] === "hash-object" && !alteredAfterHash) {
+              const result = await delegate.run(command, args, options);
+              const relativePath = args.at(-1);
+              if (!relativePath) throw new Error("hash-object test invocation omitted its path");
+              await appendFile(join(createdFixture.registryDir, relativePath), " ", "utf8");
+              alteredAfterHash = true;
+              return result;
+            }
+            return delegate.run(command, args, options);
+          },
+          runRaw: (command, args, options, maximumBytes) =>
+            delegate.runRaw(command, args, options, maximumBytes),
+        };
+      },
+    );
+    const first = await claims.claimTask(claimInput(task.id));
+    await claims.recoverClaim(task.id, first.claim_id, { kind: "force-end" });
+    const activePath = `claims/active/${task.id}.yaml`;
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeRemoteHead = (await git(fixture.remoteDir, "rev-parse", "main")).trim();
+
+    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-stage-race-resume" })))
+      .rejects.toMatchObject({ code: "MUTATION_PATH_MISMATCH" });
+
+    expect(alteredAfterHash).toBe(true);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.remoteDir, "rev-parse", "main")).trim()).toBe(beforeRemoteHead);
+    expect((await git(fixture.remoteDir, "ls-tree", "--name-only", "main", "--", activePath)).trim()).toBe("");
+  });
+
+  it("rejects a commit-time changed blob before pushing resumed ownership", async () => {
+    let armCommitMutation = false;
+    let mutatedAtCommit = false;
+    let expectedTaskBlob: string | undefined;
+    let taskPath = "";
+    const { claims, task, fixture } = await claimsFixture(
+      () => fixedNow,
+      undefined,
+      (createdFixture): ProcessRunnerLike => {
+        const delegate = new ProcessRunner();
+        return {
+          async run(command, args, options) {
+            if (command === "git" && args[0] === "hash-object") {
+              const result = await delegate.run(command, args, options);
+              expectedTaskBlob = result.stdout.trim();
+              return result;
+            }
+            if (command === "git" && args[0] === "commit" && armCommitMutation) {
+              armCommitMutation = false;
+              await appendFile(join(createdFixture.registryDir, taskPath), " ", "utf8");
+              await delegate.run("git", ["add", "-f", "--", taskPath], options);
+              mutatedAtCommit = true;
+              return delegate.run(command, args, options);
+            }
+            return delegate.run(command, args, options);
+          },
+          runRaw: (command, args, options, maximumBytes) =>
+            delegate.runRaw(command, args, options, maximumBytes),
+        };
+      },
+    );
+    taskPath = `tasks/${task.id}.yaml`;
+    const first = await claims.claimTask(claimInput(task.id));
+    await claims.recoverClaim(task.id, first.claim_id, { kind: "force-end" });
+    const activePath = `claims/active/${task.id}.yaml`;
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeRemoteHead = (await git(fixture.remoteDir, "rev-parse", "main")).trim();
+    armCommitMutation = true;
+
+    await expect(claims.claimTask(claimInput(task.id, { session_id: "codex-commit-race-resume" })))
+      .rejects.toMatchObject({ code: "MUTATION_PATH_MISMATCH" });
+
+    const committedTaskBlob = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+    const changedWorktreeBlob = (await git(
+      fixture.registryDir,
+      "hash-object",
+      `--path=${taskPath}`,
+      "--",
+      taskPath,
+    )).trim();
+    expect(mutatedAtCommit).toBe(true);
+    expect(expectedTaskBlob).toMatch(/^[0-9a-f]{40,64}$/);
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).not.toBe(beforeHead);
+    expect(committedTaskBlob).toBe(changedWorktreeBlob);
+    expect(committedTaskBlob).not.toBe(expectedTaskBlob);
+    expect((await git(fixture.remoteDir, "rev-parse", "main")).trim()).toBe(beforeRemoteHead);
+    expect((await git(fixture.remoteDir, "ls-tree", "--name-only", "main", "--", activePath)).trim()).toBe("");
   });
 
   it("rejects a caller-supplied predecessor instead of trusting a forged recovery link", async () => {

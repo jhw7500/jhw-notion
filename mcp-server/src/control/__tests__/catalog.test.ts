@@ -340,6 +340,44 @@ describe("Catalog", () => {
     });
   });
 
+  it("blocks an active formal source revision advance without moving Registry authority", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const taskPath = `tasks/${formal.id}.yaml`;
+    await commitFile(fixture.registryDir, `claims/active/${formal.id}.yaml`, "{}\n");
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeTaskRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+
+    await expect(catalog.registerFormalTask({
+      ...issueInput,
+      issue_revision: "2026-08-14T00:00:00Z",
+    })).rejects.toMatchObject({ code: "TASK_CONTRACT_ACTIVE" });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim()).toBe(beforeTaskRevision);
+  });
+
+  it("keeps an active formal source revision retry idempotent at the same revision", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const taskPath = `tasks/${formal.id}.yaml`;
+    await commitFile(fixture.registryDir, `claims/active/${formal.id}.yaml`, "{}\n");
+    await git(fixture.registryDir, "push", "origin", "main");
+    const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+    const beforeTaskRevision = (await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim();
+
+    await expect(catalog.registerFormalTask(issueInput)).resolves.toMatchObject({
+      task: formal,
+      created: false,
+    });
+
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(beforeHead);
+    expect((await git(fixture.registryDir, "rev-parse", `HEAD:${taskPath}`)).trim()).toBe(beforeTaskRevision);
+  });
+
   it("makes a bounded temporary alias idempotent and rejects conflicting reuse", async () => {
     const { catalog } = await catalogFixture();
     await catalog.registerRepository(repositoryInput);
@@ -1244,7 +1282,7 @@ describe("Catalog Task contracts and one-level child topology", () => {
     })).rejects.toMatchObject({ code: "TASK_CONTRACT_ACTIVE" });
   });
 
-  it("refuses to refresh an unconfigured legacy formal Task before inactive configuration", async () => {
+  it("preserves TASK_CONTRACT_REQUIRED before an active formal source revision refresh", async () => {
     const { catalog, fixture } = await catalogFixture(undefined, false);
     const parent = await registerParent(catalog);
     const legacy = { ...parent } as Record<string, unknown>;
@@ -1252,6 +1290,8 @@ describe("Catalog Task contracts and one-level child topology", () => {
     delete legacy.work_contract;
     const taskPath = `tasks/${parent.id}.yaml`;
     await commitFile(fixture.registryDir, taskPath, `${JSON.stringify(legacy)}\n`);
+    await git(fixture.registryDir, "push", "origin", "main");
+    await commitFile(fixture.registryDir, `claims/active/${parent.id}.yaml`, "{}\n");
     await git(fixture.registryDir, "push", "origin", "main");
     const beforeHead = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
     const beforeBytes = await readFile(join(fixture.registryDir, taskPath), "utf8");

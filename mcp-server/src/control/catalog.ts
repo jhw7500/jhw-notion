@@ -410,6 +410,12 @@ export class Catalog {
         if (current.task_role === undefined || current.work_contract === undefined) {
           throw new ControlError("TASK_CONTRACT_REQUIRED", "Legacy Task must be configured before source refresh");
         }
+        if (requestedRevision > currentRevision) {
+          const active = await this.records.readOptionalJson(activeClaimRelativePath(current.id), z.unknown());
+          if (active !== undefined) {
+            throw new ControlError("TASK_CONTRACT_ACTIVE", "Active Tasks cannot refresh their formal source revision");
+          }
+        }
         const updated = record(FormalTaskSchema, {
           ...current,
           aliases,
