@@ -403,6 +403,11 @@ interface InitialProjectPage {
   items: z.infer<typeof ItemConnectionSchema>;
 }
 
+export interface ResolvedProjectAssociation {
+  project_id: string;
+  source_revision: string;
+}
+
 function jsonFrom<T>(stdout: string, schema: z.ZodType<T>, code: string): T {
   let raw: unknown;
   try {
@@ -876,6 +881,18 @@ export class GitHubProjectClient {
     if (!source.success) throw new ControlError("INVALID_PROJECT_SOURCE", "Project snapshot source failed validation");
     this.assertContentSafe(source.data);
     return source.data;
+  }
+
+  async resolveUniqueProjectForRepository(repoId: string): Promise<ResolvedProjectAssociation> {
+    const source = await this.readAll();
+    const matches = source.items.filter((item) => item.repo_ids.includes(repoId));
+    if (matches.length === 0) {
+      throw new ControlError("PROJECT_REPOSITORY_NOT_FOUND", "No Project Record contains the Repository");
+    }
+    if (matches.length !== 1) {
+      throw new ControlError("PROJECT_REPOSITORY_AMBIGUOUS", "Multiple Project Records contain the Repository");
+    }
+    return { project_id: matches[0]!.project_id, source_revision: source.source_revision };
   }
 
   /** Proves the canonical Project Record, its repository relation, and one attachment. */

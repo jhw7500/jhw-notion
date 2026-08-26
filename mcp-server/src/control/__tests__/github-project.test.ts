@@ -354,6 +354,28 @@ describe("GitHubProjectClient", () => {
     await expect(client(wrong).requireProjectRepository("prj-project-1", "repo-other")).rejects.toMatchObject({ code: "PROJECT_REPOSITORY_MISMATCH" });
   });
 
+  it("resolves zero, one, or multiple Project associations from one snapshot", async () => {
+    const one = new QueuedGhRunner();
+    one.enqueue(projectPage({ records: [recordItem(1)] }));
+    await expect(client(one).resolveUniqueProjectForRepository("repo-control")).resolves.toEqual({
+      project_id: "prj-project-1",
+      source_revision: "2026-08-13T00:00:00Z",
+    });
+    expect(one.calls).toHaveLength(1);
+
+    const none = new QueuedGhRunner();
+    none.enqueue(projectPage({ records: [recordItem(1)] }));
+    await expect(client(none).resolveUniqueProjectForRepository("repo-other"))
+      .rejects.toMatchObject({ code: "PROJECT_REPOSITORY_NOT_FOUND" });
+    expect(none.calls).toHaveLength(1);
+
+    const many = new QueuedGhRunner();
+    many.enqueue(projectPage({ records: [recordItem(1), recordItem(2)] }));
+    await expect(client(many).resolveUniqueProjectForRepository("repo-control"))
+      .rejects.toMatchObject({ code: "PROJECT_REPOSITORY_AMBIGUOUS" });
+    expect(many.calls).toHaveLength(1);
+  });
+
   it("paginates archived and active Project items without any repo credential call", async () => {
     const runner = new QueuedGhRunner();
     const first = Array.from({ length: 100 }, (_, i) => recordItem(i + 1));
