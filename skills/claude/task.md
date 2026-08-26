@@ -125,19 +125,33 @@ jhw-control task promote --task <tsk-id> \
 
 ## 종료
 
-사용자가 종료를 명시적으로 요청한 경우에만 실행한다. 모든 status에는 `--validation`이 1개 이상 필요하고 `completed`에는 `--outcome`도 필요하다.
+사용자가 종료를 명시적으로 요청한 경우에만 실행한다. 모든 status에는 `--validation`이 1개 이상 필요하고 `completed`에는 `--outcome`도 필요하다. launcher가 secure store 주입과 hidden preflight를 담당하므로 별도 preflight를 실행하거나 raw config·credential을 읽지 않는다. 사용자가 고른 exact status에 해당하는 branch 하나만 실행하며, Handoff optional field는 사용자가 제공한 것만 포함한다.
 
+<!-- task-lifecycle-contract: finish-standalone:begin -->
 ```bash
-jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
-  --status completed --outcome <result> \
-  --validation <evidence> [--validation <evidence> ...] \
-  [--active-work-minutes <positive-number>]
-
-jhw-control task finish --task <tsk-id> --claim <current-claim-id> \
-  --status handoff --validation <evidence> \
-  [--progress <text>] [--failures <text>] [--next-step <text>] \
-  [--related-adr-and-evidence <text>] [--active-work-minutes <positive-number>]
+finish_status="<finish-status>"
+case "$finish_status" in
+  completed)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --outcome '<result>' --validation '<validation>'
+    ;;
+  handoff)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --validation '<validation>' --progress '<progress>' \
+      --failures '<failures>' --next-step '<next-step>' \
+      --related-adr-and-evidence '<related-adr-and-evidence>'
+    ;;
+  abandoned)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --validation '<validation>'
+    ;;
+  *) exit 1 ;;
+esac
 ```
+<!-- task-lifecycle-contract: finish-standalone:end -->
 
 `--status`는 `completed|handoff|abandoned`다. Handoff source revision은 Claim acquisition 때 frozen된다. `--source-task-revision`을 새로 만들거나 `unknown`을 보내지 않는다; independently retained 값을 보낼 경우 frozen 값과 exact match해야 한다.
 
@@ -152,28 +166,138 @@ Formal Task의 `--status completed`는 해당 Claim generation만 archive/releas
 1. **입력을 한 번에 수집한다.** 현재 Task의 종료 status(completed면 `--outcome` 포함)와 validation 1개 이상, 그리고 대상 좌표 — 기존 Task 재개면 `<tsk-id>`, 신규면 대상 checkout root와 Issue URL 또는 temporary 등록 필드. validation은 세션에서 실제 수행된 검증 근거만 사용하고 자동 생성하지 않는다.
 2. **대상 좌표를 추측하지 않는다.** `--repo-path`는 대상 checkout의 절대 Git root를 확인해 사용하고, 신규 start의 Project/Repository association은 launcher resolver가 확정한다.
 3. **(필요 시) Issue를 먼저 만든다.** 대상 Issue가 아직 없으면 사용자 제공 제목·본문으로 `gh issue create --repo <owner>/<repo>`를 실행하고, 반환된 URL만 authority coordinate로 사용한다. Issue 생성이 실패하면 finish 전이므로 아무것도 변하지 않은 상태다 — 멈추고 보고한다.
-4. **대상 gate를 finish 전에 실행하고, 그 Git root를 보존한 뒤 finish를 실행한다.** gate가 nonzero이면 finish/start 모두 실행하지 않는다. 아래 formal target의 executable sequencing contract처럼 finish가 nonzero이면 **start를 실행하지 않고** 멈춘다. Temporary/resume target도 같은 retained `REPOSITORY_PATH`를 사용하며, finish 뒤에 gate를 다시 실행하지 않는다.
+4. **대상의 absolute exact Git root를 finish 전에 검증하고 보존한다.** path가 absolute가 아니거나 `git -C ... rev-parse --show-toplevel` 결과와 exact match하지 않으면 lifecycle call 없이 멈춘다. 별도 preflight·portfolio lookup은 실행하지 않는다. launcher가 finish/start 각각에서 hidden preflight를 수행한다. finish가 nonzero이면 **start를 실행하지 않고** 멈추며, finish 뒤에 target gate를 다시 실행하지 않는다.
 
-<!-- task-start-contract: switch:begin -->
+Formal target은 다음 exact sequence를 실행한다.
+
+<!-- task-lifecycle-contract: switch-formal:begin -->
 ```bash
-target_checkout_root="<absolute-target-checkout-root>"
-"$HOME/.local/bin/jhw-control-host" preflight >/dev/null || exit $?
-REPOSITORY_PATH="$(git -C "$target_checkout_root" rev-parse --show-toplevel)" || exit $?
-test "$REPOSITORY_PATH" = "$target_checkout_root" || exit 1
+target_checkout="<absolute-target-checkout-root>"
+case "$target_checkout" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+target_root="$(git -C "$target_checkout" rev-parse --show-toplevel)" || exit $?
+test "$target_root" = "$target_checkout" || exit 1
 
-jhw-control task finish --task <tsk-id> --claim <claim-id> \
-  --status handoff --validation <validation>
+finish_status="<finish-status>"
+case "$finish_status" in
+  completed)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --outcome '<result>' --validation '<validation>'
+    ;;
+  handoff)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --validation '<validation>' --progress '<progress>' \
+      --failures '<failures>' --next-step '<next-step>' \
+      --related-adr-and-evidence '<related-adr-and-evidence>'
+    ;;
+  abandoned)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --validation '<validation>'
+    ;;
+  *) exit 1 ;;
+esac
 rc=$?
-if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+test "$rc" -eq 0 || exit "$rc"
 
 "$HOME/.local/bin/jhw-control-host" task start \
-  --resolve-from-checkout true --repo-path "$REPOSITORY_PATH" \
+  --resolve-from-checkout true --repo-path "$target_root" \
   --issue-url 'https://github.com/<owner>/<repo>/issues/<number>' --session '<session-id>'
 ```
-<!-- task-start-contract: switch:end -->
+<!-- task-lifecycle-contract: switch-formal:end -->
 
-5. **start를 실행한다** (위 새 Task 시작 또는 재개 규격의 authorization gate 포함). `--session`은 finish에 쓴 것과 같은 session-id를 승계한다.
-6. **finish 성공 후 start 실패는 정상 상태다** — 현재 Task는 이미 종료됐고 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. finish는 절대 반복하지 않는다. 이후 start는 별도 사용자 승인을 받고 해당 error의 결과 해석 규칙이 허용할 때만 새로 실행하며, `REGISTRY_MOVED_DURING_READ`는 자동 retry나 explicit-mode fallback을 허용하지 않는다.
+Temporary target은 같은 validation/finish contract 뒤에 resolver start를 한 번 실행한다.
+
+<!-- task-lifecycle-contract: switch-temporary:begin -->
+```bash
+target_checkout="<absolute-target-checkout-root>"
+case "$target_checkout" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+target_root="$(git -C "$target_checkout" rev-parse --show-toplevel)" || exit $?
+test "$target_root" = "$target_checkout" || exit 1
+
+finish_status="<finish-status>"
+case "$finish_status" in
+  completed)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --outcome '<result>' --validation '<validation>'
+    ;;
+  handoff)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --validation '<validation>' --progress '<progress>' \
+      --failures '<failures>' --next-step '<next-step>' \
+      --related-adr-and-evidence '<related-adr-and-evidence>'
+    ;;
+  abandoned)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --validation '<validation>'
+    ;;
+  *) exit 1 ;;
+esac
+rc=$?
+test "$rc" -eq 0 || exit "$rc"
+
+"$HOME/.local/bin/jhw-control-host" task start \
+  --resolve-from-checkout true --repo-path "$target_root" \
+  --temp-alias '<temp-alias>' --goal '<goal>' \
+  --done '<condition-1>' --done '<condition-2>' \
+  --scope '<scope-1>' --scope '<scope-2>' \
+  --session '<session-id>'
+```
+<!-- task-lifecycle-contract: switch-temporary:end -->
+
+Existing Task target은 registration/resolver field 없이 같은 retained root로 resume한다.
+
+<!-- task-lifecycle-contract: switch-resume:begin -->
+```bash
+target_checkout="<absolute-target-checkout-root>"
+case "$target_checkout" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+target_root="$(git -C "$target_checkout" rev-parse --show-toplevel)" || exit $?
+test "$target_root" = "$target_checkout" || exit 1
+
+finish_status="<finish-status>"
+case "$finish_status" in
+  completed)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --outcome '<result>' --validation '<validation>'
+    ;;
+  handoff)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --validation '<validation>' --progress '<progress>' \
+      --failures '<failures>' --next-step '<next-step>' \
+      --related-adr-and-evidence '<related-adr-and-evidence>'
+    ;;
+  abandoned)
+    "$HOME/.local/bin/jhw-control-host" task finish \
+      --task '<tsk-id>' --claim '<claim-id>' --status "$finish_status" \
+      --validation '<validation>'
+    ;;
+  *) exit 1 ;;
+esac
+rc=$?
+test "$rc" -eq 0 || exit "$rc"
+
+"$HOME/.local/bin/jhw-control-host" task start \
+  --task '<tsk-id>' --repo-path "$target_root" --session '<session-id>'
+```
+<!-- task-lifecycle-contract: switch-resume:end -->
+
+5. **start를 한 번 실행한다.** Formal/Temporary는 resolver start, Existing Task는 `--task` resume만 사용한다. `--session`은 같은 switch 요청의 session-id를 승계한다. external gate rerun, raw control, rollback, automatic refinish는 없다.
+6. **finish 성공 후 start 실패는 정상적인 부분 완료 상태다.** 이전 Claim은 이미 release되었으며 rollback하거나 release를 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. finish는 절대 반복하지 않는다. 이후 start는 별도 사용자 승인을 받고 해당 error의 결과 해석 규칙이 허용할 때만 새로 실행하며, `REGISTRY_MOVED_DURING_READ`는 자동 retry나 explicit-mode fallback을 허용하지 않는다. target Repository가 미등록되어 `PROJECT_REPOSITORY_NOT_FOUND`이거나 association이 ambiguous이면 이전 Claim release 뒤 start가 실패할 수 있다. 자동 rollback이나 성공 약속을 하지 않는다.
 7. **결과를 함께 보고한다.** 종료한 Task(tsk-id, status, released claim)와 시작한 Task(tsk-id, 새 claim_id, branch, worktree_ref)를 한 번에 보여준다.
 
 completed 전환이어도 이전 worktree는 병합 여부 판정에 따라 남을 수 있다. 전환이 cleanup을 대신하지 않으며, 정리는 아래 recovery의 released-generation cleanup 절차를 따른다.
@@ -219,5 +343,12 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 - exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.
 - exit `75`: Registry dirty/diverged 또는 lock contention/acquisition timeout. stop; 자동 retry/rebase/force 금지. Lock helper spawn/setup/acquire 실패는 일반 command `1`, preflight NO-GO `78`이다.
 - resolver `task start`/`task finish`가 `REGISTRY_MOVED_DURING_READ`를 반환하면 자동 재실행 없이 멈추고 보고한다. 수동 재실행 안내는 `status`, `handoff`, `assert-owner`, `recover --action status` 읽기 전용 명령에만 제한한다. 읽기 전용 명령에서 반복되면 쓰기가 계속 들어오는 것이니 한가한 시점에 다시 본다.
-- `error.reason`은 같은 code 안에서 조치가 갈리는 축이다. `HANDOFF_RETRY_CONFLICT`: `git_identity_changed`·`dirty_delta_changed`는 worktree가 커밋된 Handoff 증거(branch·head_sha·ahead·behind·dirty delta)에서 움직인 것 — **커밋된 Handoff가 정본**이므로 로컬 움직임(새 commit·파일 변경)은 되돌린 뒤 같은 필드로 재시도하고, 작업을 유지하려 하거나 되돌릴 수 없는 움직임(upstream 이동에 따른 ahead/behind 변화)이면 completed/abandoned release 후 새 Claim에서 이어간다(그 release는 handoff 경로를 타지 않는다), `legacy_dirty_evidence_ambiguous`는 구 포맷(새 Handoff 생성), `retry_fields_changed`·`handoff_metadata_mismatch`는 재시도 요청이 커밋본과 다른 것(커밋된 필드·좌표 그대로 재시도), 그 외 git-state 파스 계열은 커밋된 Handoff 자체 손상. `WORKTREE_DIRTY` + `handoff_copy_not_plain_file`은 worktree가 더러운 게 아니라 `.ai/handoff.md` 사본이 malformed인 것이다. `INVALID_WORKTREE_INSPECTION` + `duplicate_dirty_files`는 inspection이 중복 dirty 엔트리를 반환해 fail-closed한 것 — 재실행 후에도 반복되면 Git status 자체가 이상한 것이다. reason은 journal에도 `error_reason`으로 남아 사후 감사에서 같은 축을 쓴다.
+- `error.reason`은 같은 code 안에서 조치가 갈리는 축이다. 자동 overwrite나 finish 재실행을 하지 않는다.
+- `HANDOFF_RETRY_CONFLICT` + `git_identity_changed`·`dirty_delta_changed`: worktree가 커밋된 Handoff 증거(branch·head_sha·ahead·behind·dirty delta)에서 움직인 것이다. **커밋된 Handoff가 정본**이므로 새 commit·파일 변경은 되돌린 뒤 커밋된 같은 필드로 사용자가 승인한 새 요청에서 재시도한다. 작업을 유지하려 하거나 upstream 이동 때문에 되돌릴 수 없으면 completed/abandoned release 후 새 Claim에서 이어가며 handoff retry로 우회하지 않는다.
+- `HANDOFF_RETRY_CONFLICT` + `legacy_dirty_evidence_ambiguous`: 구 포맷 증거이므로 기존 것을 overwrite하지 않고 새 Handoff를 생성한다.
+- `HANDOFF_RETRY_CONFLICT` + `handoff_metadata_mismatch`·`retry_fields_changed`: 요청이 커밋본과 다르므로 커밋된 필드·좌표 그대로 사용자가 승인한 새 요청에서 재시도한다.
+- `HANDOFF_RETRY_CONFLICT` + git-state 파스 계열 `invalid_git_state_line`·`duplicate_git_state_key`·`unexpected_git_state_key`·`missing_git_state_key`·`invalid_git_state_count`·`missing_git_identity`·`invalid_dirty_digest`: 커밋된 Handoff Git-state 증거 자체 손상이므로 멈추고 손상된 정본을 별도로 복구·수정한다.
+- `WORKTREE_DIRTY` + `handoff_copy_not_plain_file`: worktree 변경 문제가 아니라 local `.ai/handoff.md` 사본이 regular file이 아닌 malformed 상태다. 멈추고 local copy 형태를 복구한다.
+- `INVALID_WORKTREE_INSPECTION` + `duplicate_dirty_files`: inspection이 중복 dirty entry를 반환한 상태다. 멈추고 읽기 전용 status를 재실행하며, 반복되면 Git status 자체를 조사한다.
+- reason은 journal에도 `error_reason`으로 남아 사후 감사에서 같은 축을 쓴다.
 - 다른 nonzero: stable `error.code`만 보고하고 secret/raw path를 출력하지 않는다.
