@@ -228,6 +228,29 @@ function formalStartArgs(): string[] {
   ];
 }
 
+function resolvedFormalStartArgs(): string[] {
+  return [
+    "task", "start",
+    "--resolve-from-checkout", "true",
+    "--repo-path", "/private/source/control",
+    "--issue-url", "https://github.com/example/control/issues/1",
+    "--session", "codex-resolved",
+  ];
+}
+
+function resolvedTemporaryStartArgs(): string[] {
+  return [
+    "task", "start",
+    "--resolve-from-checkout", "true",
+    "--repo-path", "/private/source/control",
+    "--temp-alias", "resolved-temp",
+    "--goal", "complete the resolved task",
+    "--done", "targeted test passes",
+    "--scope", "src/control",
+    "--session", "codex-resolved",
+  ];
+}
+
 function registerArgs(): string[] {
   return [
     "project", "register",
@@ -360,6 +383,99 @@ describe("runCli", () => {
     expect(dependencies.source.registerTemporaryTask).not.toHaveBeenCalled();
   });
 
+  it("starts a checkout-resolved Formal Task with the canonical Task coordinates", async () => {
+    const canonicalTask = { ...formalTask(), project_id: "prj-resolved", repo_id: "repo-resolved" };
+    const dependencies = makeCliDependencies({
+      source: { registerFormalTask: vi.fn().mockResolvedValue({ task: canonicalTask, created: true }) },
+    });
+
+    const result = await runCli(resolvedFormalStartArgs(), dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.source.registerFormalTask).toHaveBeenCalledWith({
+      resolve_from_checkout: true,
+      repository_path: "/private/source/control",
+      issue_url: "https://github.com/example/control/issues/1",
+    });
+    expect(dependencies.taskService.start).toHaveBeenCalledWith(expect.objectContaining({
+      task_id: TASK_ID,
+      project_id: "prj-resolved",
+      repo_id: "repo-resolved",
+      session_id: "codex-resolved",
+    }));
+    expect(dependencies.mutationLock.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts a checkout-resolved Temporary Task with the canonical Task coordinates", async () => {
+    const canonicalTask = { ...temporaryTask(), project_id: "prj-resolved", repo_id: "repo-resolved" };
+    const dependencies = makeCliDependencies({
+      source: { registerTemporaryTask: vi.fn().mockResolvedValue(canonicalTask) },
+    });
+
+    const result = await runCli(resolvedTemporaryStartArgs(), dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.source.registerTemporaryTask).toHaveBeenCalledWith({
+      resolve_from_checkout: true,
+      repository_path: "/private/source/control",
+      alias: "resolved-temp",
+      goal: "complete the resolved task",
+      done_conditions: ["targeted test passes"],
+      expected_scope: ["src/control"],
+    });
+    expect(dependencies.taskService.start).toHaveBeenCalledWith(expect.objectContaining({
+      task_id: TASK_ID,
+      project_id: "prj-resolved",
+      repo_id: "repo-resolved",
+      session_id: "codex-resolved",
+    }));
+    expect(dependencies.mutationLock.run).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["PROJECT_REPOSITORY_NOT_FOUND", "PROJECT_REPOSITORY_AMBIGUOUS"] as const)(
+    "projects checkout resolver association failure %s before Claim creation",
+    async (code) => {
+      const dependencies = makeCliDependencies();
+      vi.mocked(dependencies.source.registerFormalTask).mockRejectedValueOnce(new ControlError(code, "safe"));
+
+      const result = await runCli(resolvedFormalStartArgs(), dependencies);
+
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.stderr)).toEqual({ error: { code } });
+      expect(dependencies.taskService.start).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["rejects false resolver", ["task", "start", "--resolve-from-checkout", "false", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
+    ["rejects yes resolver", ["task", "start", "--resolve-from-checkout", "yes", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
+    ["rejects empty resolver", ["task", "start", "--resolve-from-checkout", "", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
+    ["rejects resolver plus Project", [...resolvedFormalStartArgs(), "--project", PROJECT_ID]],
+    ["rejects resolver plus Repository", [...resolvedFormalStartArgs(), "--repo-id", REPO_ID]],
+    ["rejects partial Project coordinates", ["task", "start", "--project", PROJECT_ID, "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
+    ["rejects partial Repository coordinates", ["task", "start", "--repo-id", REPO_ID, "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
+    ["rejects no coordinate mode", ["task", "start", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
+    ["rejects resolver on resume", ["task", "start", "--task", TASK_ID, "--resolve-from-checkout", "true", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects issue node registration on resume", ["task", "start", "--task", TASK_ID, "--issue-node-id", "I_control", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects issue URL registration on resume", ["task", "start", "--task", TASK_ID, "--issue-url", "https://github.com/example/control/issues/1", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects issue revision registration on resume", ["task", "start", "--task", TASK_ID, "--issue-revision", "2026-08-13T00:00:00Z", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects Temporary alias registration on resume", ["task", "start", "--task", TASK_ID, "--temp-alias", "resolved-temp", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects Temporary goal registration on resume", ["task", "start", "--task", TASK_ID, "--goal", "complete the resolved task", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects Temporary done registration on resume", ["task", "start", "--task", TASK_ID, "--done", "targeted test passes", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects Temporary scope registration on resume", ["task", "start", "--task", TASK_ID, "--scope", "src/control", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects Project coordinates on resume", ["task", "start", "--task", TASK_ID, "--project", PROJECT_ID, "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects Repository coordinates on resume", ["task", "start", "--task", TASK_ID, "--repo-id", REPO_ID, "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+  ] as const)("%s before source registration or Claim creation", async (_name, argv) => {
+    const dependencies = makeCliDependencies();
+
+    const result = await runCli([...argv], dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.source.registerFormalTask).not.toHaveBeenCalled();
+    expect(dependencies.source.registerTemporaryTask).not.toHaveBeenCalled();
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
   it("validates the latest Handoff before an existing Task can acquire a Claim", async () => {
     const dependencies = makeCliDependencies({
       taskService: {
@@ -389,6 +505,7 @@ describe("runCli", () => {
       repository_path: "/srv/source/control",
       issue_url: "https://github.com/example/control/issues/1",
     });
+    expect(vi.mocked(dependencies.source.promoteTemporaryTask).mock.calls[0]?.[0]).not.toHaveProperty("resolve_from_checkout");
     expect(dependencies.mutationLock.run).toHaveBeenCalledTimes(1);
   });
 
