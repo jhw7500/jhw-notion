@@ -216,7 +216,9 @@ function expectedFinishArgs(input) {
     if (input.nextStep) base.push("--next-step", input.nextStep);
     if (input.relatedEvidence) base.push("--related-adr-and-evidence", input.relatedEvidence);
   }
-  if (input.sourceRevision) base.push("--source-task-revision", input.sourceRevision);
+  if (input.status === "handoff" && input.sourceRevision) {
+    base.push("--source-task-revision", input.sourceRevision);
+  }
   if (input.activeWorkMinutes) base.push("--active-work-minutes", input.activeWorkMinutes);
   for (const validation of input.validations) base.push("--validation", validation);
   return base;
@@ -565,6 +567,23 @@ async function assertStrictLauncherOracle() {
       { argv: validCompleted.filter((value) => value !== outcomeValue), input: completedInput },
       { argv: [...validCompleted, "--progress", progressValue], input: completedInput },
       { argv: [...expectedFinishArgs(handoffInput), "--outcome", outcomeValue], input: handoffInput },
+      {
+        argv: [
+          "task", "finish", "--task", currentTaskId, "--claim", currentClaimId,
+          "--status", "completed", "--outcome", outcomeValue,
+          "--source-task-revision", sourceRevisionValue,
+          "--validation", validationValues[0],
+        ],
+        input: completedInput,
+      },
+      {
+        argv: [
+          "task", "finish", "--task", currentTaskId, "--claim", currentClaimId,
+          "--status", "abandoned", "--source-task-revision", sourceRevisionValue,
+          "--validation", validationValues[0],
+        ],
+        input: makeFinishInput("abandoned"),
+      },
     ];
     for (const { argv, input } of invalidFinishes) {
       const result = await execFileAsync(launcher, argv, {
@@ -700,6 +719,33 @@ function assertStaticFinishContract(label, markdown) {
 
 async function assertReviewFixes(label, markdown) {
   const checks = [
+    {
+      name: "Handoff-only fields stop before completed/abandoned launcher calls",
+      run: async () => {
+        const handoffOnlyOverrides = [
+          { sourceRevision: sourceRevisionValue },
+          { progress: progressValue },
+          { failures: failuresValue },
+          { nextStep: nextStepValue },
+          { relatedEvidence: relatedEvidenceValue },
+        ];
+        const cases = ["completed", "abandoned"].flatMap((status) =>
+          handoffOnlyOverrides.map((overrides) => ({ status, overrides })));
+        const results = await Promise.allSettled(cases.map(async ({ status, overrides }) => {
+          const finishInput = makeFinishInput(status, overrides);
+          const result = await runFinishWorkflow(markdown, { finishInput });
+          assert.notEqual(result.exitCode, 0,
+            `${status} must reject Handoff-only fields before finish`);
+          assert.deepEqual(result.calls, [],
+            `${status} must not send Handoff-only fields to the launcher`);
+          assert.deepEqual(result.rawCalls, []);
+        }));
+        const failures = results.flatMap((result, index) => result.status === "rejected"
+          ? [`${cases[index].status}/${Object.keys(cases[index].overrides)[0]}: ${result.reason.message}`]
+          : []);
+        assert.deepEqual(failures, [], failures.join("\n"));
+      },
+    },
     {
       name: "minimal and optional/repeated Handoff argv",
       run: async () => {

@@ -159,7 +159,7 @@ finish_args=(task finish --task "$current_task_id" --claim "$current_claim_id" -
 case "$finish_status" in
   completed)
     test -n "$finish_outcome" || exit 1
-    test -z "$handoff_progress$handoff_failures$handoff_next_step$handoff_related_evidence" || exit 1
+    test -z "$source_task_revision$handoff_progress$handoff_failures$handoff_next_step$handoff_related_evidence" || exit 1
     finish_args+=(--outcome "$finish_outcome")
     ;;
   handoff)
@@ -170,17 +170,17 @@ case "$finish_status" in
     if [ -n "$handoff_related_evidence" ]; then
       finish_args+=(--related-adr-and-evidence "$handoff_related_evidence")
     fi
+    if [ -n "$source_task_revision" ]; then
+      test "$source_task_revision" != "unknown" || exit 1
+      finish_args+=(--source-task-revision "$source_task_revision")
+    fi
     ;;
   abandoned)
-    test -z "$finish_outcome$handoff_progress$handoff_failures$handoff_next_step$handoff_related_evidence" || exit 1
+    test -z "$finish_outcome$source_task_revision$handoff_progress$handoff_failures$handoff_next_step$handoff_related_evidence" || exit 1
     ;;
   *) exit 1 ;;
 esac
 
-if [ -n "$source_task_revision" ]; then
-  test "$source_task_revision" != "unknown" || exit 1
-  finish_args+=(--source-task-revision "$source_task_revision")
-fi
 if [ -n "$active_work_minutes" ]; then
   finish_args+=(--active-work-minutes "$active_work_minutes")
 fi
