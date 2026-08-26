@@ -473,10 +473,17 @@ async function assertConsumerContract(label, taskPath) {
 
   const invalidPortfolios = [
     "not-json",
-    JSON.stringify({ result: { items: [], repositories: [] } }),
-    JSON.stringify({ result: { repositories: validPortfolio.result.repositories } }),
-    JSON.stringify({ result: { items: validPortfolio.result.items, repositories: [{ repo_id: "repo-portfolio", slug: "other/repo" }] } }),
-    JSON.stringify({ result: { items: [{ project_id: "prj-one", repo_ids: ["repo-portfolio"] }, { project_id: "prj-two", repo_ids: ["repo-portfolio"] }], repositories: validPortfolio.result.repositories } }),
+    JSON.stringify({ command: "portfolio export", result: validPortfolio.result }),
+    JSON.stringify({ command: "portfolio status", result: { repositories: validPortfolio.result.repositories } }),
+    portfolioPage({ items: [], repositories: [], totalItems: 0 }),
+    portfolioPage({ repositories: [{ repo_id: "repo-portfolio", slug: "other/repo", allow_public: false }] }),
+    portfolioPage({
+      items: [
+        portfolioItem("prj-one", ["repo-portfolio"]),
+        portfolioItem("prj-two", ["repo-portfolio"]),
+      ],
+      totalItems: 2,
+    }),
   ];
   for (const portfolioPayload of invalidPortfolios) {
     const invalid = await runWorkflow(markdown, routes[0], { portfolioPayload });
