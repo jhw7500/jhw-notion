@@ -4,9 +4,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { Catalog } from "../catalog.js";
+import type { SourceCatalogPort } from "../github-source.js";
 import { sourceIndexKey } from "../ids.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
+import type { RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import {
   commitFile,
@@ -19,6 +21,14 @@ import {
 } from "./helpers.js";
 
 const fixtures: RegistryFixture[] = [];
+
+type Assert<T extends true> = T;
+type SourceCatalogPortPinnedRepositoryContract = Assert<SourceCatalogPort extends {
+  withPinnedRepositoryByGitHubNode<T>(
+    githubNodeId: string,
+    use: (repository: RepositoryRecord) => Promise<T>,
+  ): Promise<T>;
+} ? true : false>;
 
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
@@ -484,6 +494,82 @@ describe("Catalog", () => {
     });
     await expect(catalog.getRepository("repo-missing")).rejects.toMatchObject({ code: "REPOSITORY_NOT_FOUND" });
     await expect(catalog.getRepository("../escape")).rejects.toMatchObject({ code: "INVALID_REPOSITORY_ID" });
+  });
+
+  it("resolves a Repository source inside one pinned callback", async () => {
+    const { catalog } = await catalogFixture();
+    await catalog.registerRepository({
+      repo_id: "repo-control",
+      github_node_id: "R_control",
+      slug: "example/control",
+    });
+
+    const result = await catalog.withPinnedRepositoryByGitHubNode("R_control", async (repository) => ({
+      repo_id: repository.id,
+      slug: repository.slug,
+    }));
+
+    expect(result).toEqual({ repo_id: "repo-control", slug: "example/control" });
+  });
+
+  it("rejects a missing Repository source index before entering the pinned callback", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const sourcePath = `repositories/by-source/github/${sourceIndexKey(repositoryInput.github_node_id)}.yaml`;
+    await git(fixture.registryDir, "rm", "--", sourcePath);
+    await git(fixture.registryDir, "commit", "-m", "Remove Repository source index");
+
+    await expect(catalog.withPinnedRepositoryByGitHubNode(repositoryInput.github_node_id, async () => undefined))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it.each([
+    ["malformed", async (fixture: RegistryFixture, sourcePath: string) => {
+      await commitFile(fixture.registryDir, sourcePath, "not JSON\n");
+    }],
+    ["reverse-mismatched", async (fixture: RegistryFixture) => {
+      await commitFile(fixture.registryDir, "repositories/repo-wlan.yaml", `${JSON.stringify({
+        ...repositoryInput,
+        id: "repo-wlan",
+        github_node_id: "R_other",
+      })}\n`);
+    }],
+    ["duplicate", async (fixture: RegistryFixture) => {
+      await commitFile(
+        fixture.registryDir,
+        `repositories/by-source/github/${sourceIndexKey("R_duplicate")}.yaml`,
+        `${JSON.stringify({ repo_id: "repo-wlan" })}\n`,
+      );
+    }],
+  ])("rejects a %s Repository source index before entering the pinned callback", async (_kind, corrupt) => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const sourcePath = `repositories/by-source/github/${sourceIndexKey(repositoryInput.github_node_id)}.yaml`;
+    await corrupt(fixture, sourcePath);
+
+    await expect(catalog.withPinnedRepositoryByGitHubNode(repositoryInput.github_node_id, async () => undefined))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("preserves a pinned callback exception even when the callback moves Registry HEAD", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const callbackError = new Error("callback failed");
+
+    await expect(catalog.withPinnedRepositoryByGitHubNode(repositoryInput.github_node_id, async () => {
+      await commitFile(fixture.registryDir, "repositories/changed-during-callback.yaml", "{}\n");
+      throw callbackError;
+    })).rejects.toBe(callbackError);
+  });
+
+  it("rejects a Repository source result when Registry HEAD moves during the pinned callback", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+
+    await expect(catalog.withPinnedRepositoryByGitHubNode(repositoryInput.github_node_id, async () => {
+      await commitFile(fixture.registryDir, "repositories/changed-during-callback.yaml", "{}\n");
+      return undefined;
+    })).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
   });
 
   it("rejects a malformed repo_id before resolving a Registry path", async () => {

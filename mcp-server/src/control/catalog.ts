@@ -42,14 +42,14 @@ const safeAliasPattern = /^[^\u0000-\u001f\u007f]{1,160}$/;
 const formalAliasPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}#[1-9][0-9]*$/;
 const canonicalIssueUrlPattern = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})\/issues\/([1-9][0-9]*)$/;
 const maximumCatalogEntries = 10_000;
-const githubNodeId = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
+const githubNodeIdSchema = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 
 const RepositorySourceIndexSchema = z.object({ repo_id: z.string().regex(repositoryIdPattern) }).strict();
 const TaskSourceIndexSchema = z.object({ task_id: z.string().regex(taskIdPattern) }).strict();
 
 const RegisterRepositoryInputSchema = z.object({
   repo_id: z.string().regex(repositoryIdPattern),
-  github_node_id: githubNodeId,
+  github_node_id: githubNodeIdSchema,
   slug: z.string().regex(githubSlugPattern),
   allow_public: z.literal(true).optional(),
 }).strict();
@@ -57,7 +57,7 @@ const RegisterRepositoryInputSchema = z.object({
 const RegisterFormalTaskInputSchema = z.object({
   project_id: z.string().regex(projectIdPattern),
   repo_id: z.string().regex(repositoryIdPattern),
-  issue_node_id: githubNodeId,
+  issue_node_id: githubNodeIdSchema,
   issue_revision: z.string().datetime({ offset: true }),
   issue_url: z.string().url(),
   alias: z.string().regex(formalAliasPattern),
@@ -747,6 +747,28 @@ export class Catalog {
     if (!repository) throw new ControlError("REPOSITORY_NOT_FOUND", "Canonical Repository record does not exist", { repo_id: repoId });
     if (repository) this.sensitiveData.assertSafe(repository);
     return repository;
+  }
+
+  async withPinnedRepositoryByGitHubNode<T>(
+    githubNodeId: string,
+    use: (repository: RepositoryRecord) => Promise<T>,
+  ): Promise<T> {
+    const parsed = githubNodeIdSchema.safeParse(githubNodeId);
+    if (!parsed.success) {
+      throw new ControlError("INVALID_REPOSITORY_ID", "GitHub Repository node ID is invalid");
+    }
+    return this.registry.withCommittedTree(["repositories"], async () => {
+      await this.auditRepositorySourceIndexesWithin();
+      const sourcePath = repositorySourceRelativePath(parsed.data);
+      const indexed = await this.repositoryForSource(sourcePath, parsed.data);
+      if (!indexed) {
+        throw new ControlError("REPOSITORY_NOT_FOUND", "Canonical Repository source is not registered");
+      }
+      this.sensitiveData.assertSafe(indexed.repository);
+      const result = await use(indexed.repository);
+      await this.registry.assertCommittedViewCurrent();
+      return result;
+    });
   }
 
   async listRepositories(): Promise<RepositoryRecord[]> {

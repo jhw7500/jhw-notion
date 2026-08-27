@@ -17,7 +17,28 @@ trap 'rm -rf -- "$ROOT"' EXIT
 run_install() {
   local home="$1"
   shift
+  if [ "${1:-}" != "--uninstall" ]; then
+    provision_valid_control_host "$home"
+  fi
   HOME="$home" PATH="$FAKE_BIN:$PATH" bash "$INSTALL" "$@" >"$home/install.log" 2>&1
+}
+
+provision_valid_control_host() {
+  local home="$1"
+  provision_control_host_contract "$home" \
+    '{"commands":["unlock","preflight","portfolio status","task start","task finish"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":3}'
+}
+
+provision_control_host_contract() {
+  local home="$1"
+  local contract="$2"
+  mkdir -p "$home/.local/bin"
+  cat >"$home/.local/bin/jhw-control-host" <<EOF
+#!/bin/sh
+[ "\$#" -eq 1 ] && [ "\$1" = "--contract" ] || exit 64
+printf '%s\\n' '$contract'
+EOF
+  chmod +x "$home/.local/bin/jhw-control-host"
 }
 
 make_tui_roots() {
@@ -300,11 +321,53 @@ EOF
 test_npm_pipeline_failure_stops_install() {
   local home="$ROOT/npm-failure-home"
   mkdir -p "$home"
+  provision_valid_control_host "$home"
   if HOME="$home" PATH="$FAKE_BIN:$PATH" JHW_TEST_NPM_FAIL=1 bash "$INSTALL" >"$home/install.log" 2>&1; then
     echo "npm pipeline failure was masked" >&2
     return 1
   fi
   [ ! -e "$home/.local/bin/jhw-control" ] && [ ! -L "$home/.local/bin/jhw-control" ] || return 1
+}
+
+test_missing_control_host_fails_before_activation() {
+  local home="$ROOT/missing-control-host-home"
+  make_tui_roots "$home"
+
+  if HOME="$home" PATH="$FAKE_BIN:$PATH" bash "$INSTALL" >"$home/install.log" 2>&1; then
+    echo "missing jhw-control-host contract was accepted" >&2
+    return 1
+  fi
+
+  [ ! -e "$home/.local/bin/jhw-control" ] && [ ! -L "$home/.local/bin/jhw-control" ] || return 1
+  [ ! -e "$home/.claude/commands/jhw" ] && [ ! -L "$home/.claude/commands/jhw" ] || return 1
+  [ ! -e "$home/.codex/skills/jhw-task" ] && [ ! -L "$home/.codex/skills/jhw-task" ] || return 1
+  [ ! -e "$home/.claude.json" ] || return 1
+  [ ! -e "$home/.codex/config.toml" ] || return 1
+}
+
+test_non_v3_control_host_contract_fails_before_activation() {
+  local label home contract
+  while IFS='|' read -r label contract; do
+    home="$ROOT/invalid-control-host-$label-home"
+    make_tui_roots "$home"
+    provision_control_host_contract "$home" "$contract"
+
+    if HOME="$home" PATH="$FAKE_BIN:$PATH" bash "$INSTALL" >"$home/install.log" 2>&1; then
+      echo "non-v3 jhw-control-host contract was accepted: $label" >&2
+      return 1
+    fi
+
+    [ ! -e "$home/.local/bin/jhw-control" ] && [ ! -L "$home/.local/bin/jhw-control" ] || return 1
+    [ ! -e "$home/.claude/commands/jhw" ] && [ ! -L "$home/.claude/commands/jhw" ] || return 1
+    [ ! -e "$home/.codex/skills/jhw-task" ] && [ ! -L "$home/.codex/skills/jhw-task" ] || return 1
+    [ ! -e "$home/.claude.json" ] || return 1
+    [ ! -e "$home/.codex/config.toml" ] || return 1
+  done <<'EOF'
+v2|{"commands":["unlock","preflight","portfolio status","task start"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":2}
+unsafe-policy|{"commands":["unlock","preflight","portfolio status","task start","task finish"],"credential_policy":"environment-fallback","name":"jhw-control-host","version":3}
+extra-command|{"commands":["unlock","preflight","portfolio status","task start","task finish","task recover"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":3}
+malformed|not-json
+EOF
 }
 
 test_empty_uninstall_creates_nothing() {
@@ -407,6 +470,9 @@ test_uninstall_preserves_foreign_mcp_configs
 test_uninstall_preserves_foreign_config_symlink
 test_atomic_config_syncs_mode_before_content
 test_npm_pipeline_failure_stops_install
+test_missing_control_host_fails_before_activation
+test_non_v3_control_host_contract_fails_before_activation
 test_empty_uninstall_creates_nothing
 test_owned_round_trip
+node "$REPO_ROOT/scripts/test-task-skill-contract.mjs"
 echo "installer safety: ok"

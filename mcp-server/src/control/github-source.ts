@@ -11,6 +11,7 @@ import type {
   RepositoryRegistration,
 } from "./catalog.js";
 import { ControlError } from "./errors.js";
+import type { ResolvedProjectAssociation } from "./github-project.js";
 import type { ProcessResult, ProcessRunOptions } from "./process.js";
 import type { FormalTask, RepositoryRecord, TaskRecord, TemporaryTask } from "./schemas.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
@@ -43,11 +44,16 @@ export interface GitHubSourceRunner {
 
 export interface ProjectMembershipPort {
   requireProjectRepository(projectId: string, repoId: string): Promise<void>;
+  resolveUniqueProjectForRepository(repoId: string): Promise<ResolvedProjectAssociation>;
 }
 
 export interface SourceCatalogPort {
   registerRepository(input: RegisterRepositoryInput): Promise<RepositoryRegistration>;
   getRepository(repoId: string): Promise<RepositoryRecord>;
+  withPinnedRepositoryByGitHubNode<T>(
+    githubNodeId: string,
+    use: (repository: RepositoryRecord) => Promise<T>,
+  ): Promise<T>;
   getTask(taskId: string): Promise<TaskRecord>;
   getTaskSourceRevision(taskId: string): Promise<string>;
   registerFormalTask(input: RegisterFormalTaskInput): Promise<FormalTaskRegistration>;
@@ -60,6 +66,52 @@ export interface GitHubSourceServiceOptions {
   catalog: SourceCatalogPort | Catalog;
   projects: ProjectMembershipPort;
   sensitiveData?: SensitiveDataPolicy;
+}
+
+type ExplicitTaskCoordinateInput = {
+  project_id: string;
+  repo_id: string;
+  resolve_from_checkout?: never;
+};
+
+type ResolvedTaskCoordinateInput = {
+  resolve_from_checkout: true;
+  project_id?: never;
+  repo_id?: never;
+};
+
+export type TaskCoordinateInput = ExplicitTaskCoordinateInput | ResolvedTaskCoordinateInput;
+
+type FormalTaskSourceInput = {
+  repository_path: string;
+  issue_url: string;
+  expected_issue_node_id?: string;
+  expected_issue_revision?: string;
+};
+
+export type RegisterFormalTaskFromSourceInput = FormalTaskSourceInput & (
+  | (ExplicitTaskCoordinateInput & Pick<RegisterFormalTaskInput, "task_role" | "grants" | "dependencies">)
+  | (ResolvedTaskCoordinateInput & Pick<RegisterFormalTaskInput, "task_role"> & {
+      grants?: never;
+      dependencies?: never;
+    })
+);
+
+type TemporaryTaskSourceInput = Omit<
+  RegisterTemporaryTaskInput,
+  "project_id" | "repo_id" | "grants" | "dependencies"
+> & { repository_path: string };
+
+export type RegisterTemporaryTaskFromSourceInput = TemporaryTaskSourceInput & (
+  | (ExplicitTaskCoordinateInput & Pick<RegisterTemporaryTaskInput, "grants" | "dependencies">)
+  | (ResolvedTaskCoordinateInput & { grants?: never; dependencies?: never })
+);
+
+interface VerifiedTaskContext {
+  project_id: string;
+  repo_id: string;
+  repository: RepositoryRecord;
+  project_source_revision?: string;
 }
 
 interface VerifiedIssue {
@@ -95,6 +147,34 @@ function parseJson<T>(stdout: string, schema: z.ZodType<T>, code: string): T {
 
 function sameSlug(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function remoteLines(result: ProcessResult): string[] {
+  return result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+function assertTaskCoordinateShape(coordinates: TaskCoordinateInput): void {
+  const hasResolver = "resolve_from_checkout" in coordinates;
+  const hasProject = "project_id" in coordinates;
+  const hasRepository = "repo_id" in coordinates;
+  const resolved = hasResolver
+    && coordinates.resolve_from_checkout === true
+    && !hasProject
+    && !hasRepository;
+  const explicit = !hasResolver && hasProject && hasRepository;
+  if (!resolved && !explicit) {
+    throw new ControlError("INVALID_TASK_SCOPE", "Task coordinates must select exactly one mode");
+  }
+}
+
+function assertResolvedContractBoundary(input: {
+  resolve_from_checkout?: unknown;
+  grants?: unknown;
+  dependencies?: unknown;
+}): void {
+  if (input.resolve_from_checkout === true && ("grants" in input || "dependencies" in input)) {
+    throw new ControlError("INVALID_TASK_SCOPE", "Checkout-resolved Tasks define their contract server-side");
+  }
 }
 
 /** Parses only canonical GitHub checkout remotes and returns owner/name. */
@@ -160,42 +240,69 @@ export class GitHubSourceService {
     await this.resolveRepository(slug, false);
   }
 
-  async registerFormalTask(input: {
-    project_id: string;
-    repo_id: string;
-    repository_path: string;
-    issue_url: string;
-    expected_issue_node_id?: string;
-    expected_issue_revision?: string;
-  } & Pick<RegisterFormalTaskInput, "task_role" | "grants" | "dependencies">): Promise<FormalTaskRegistration> {
-    issueCoordinates(input.issue_url);
-    const { repository_path: _repositoryPath, ...content } = input;
-    this.assertCheckoutSafe(content, input.repository_path);
-    const context = await this.requireContext(input.project_id, input.repo_id, input.repository_path);
-    const issue = await this.resolveIssue(context.repository, input.issue_url);
-    this.assertCheckoutSafe(issue, input.repository_path);
+  async registerFormalTask(input: RegisterFormalTaskFromSourceInput): Promise<FormalTaskRegistration> {
+    const { repository_path: repositoryPath, ...formalRequest } = input;
+    issueCoordinates(formalRequest.issue_url);
+    this.assertCheckoutSafe(formalRequest, repositoryPath);
+    assertTaskCoordinateShape(formalRequest);
+    assertResolvedContractBoundary(formalRequest);
+    const context = await this.requireContext(formalRequest, repositoryPath);
+    const issue = await this.resolveIssue(context.repository, formalRequest.issue_url);
+    this.assertCheckoutSafe(issue, repositoryPath);
     if (issue.state === "closed") throw new ControlError("TASK_COMPLETED", "Closed GitHub Issues cannot create Task ownership");
-    if (input.expected_issue_node_id !== undefined && input.expected_issue_node_id !== issue.issue_node_id) {
+    if (formalRequest.expected_issue_node_id !== undefined && formalRequest.expected_issue_node_id !== issue.issue_node_id) {
       throw new ControlError("ISSUE_IDENTITY_MISMATCH", "Caller Issue node ID disagrees with the verified Issue");
     }
-    if (input.expected_issue_revision !== undefined && input.expected_issue_revision !== issue.issue_revision) {
+    if (formalRequest.expected_issue_revision !== undefined && formalRequest.expected_issue_revision !== issue.issue_revision) {
       throw new ControlError("ISSUE_REVISION_MISMATCH", "Caller Issue revision disagrees with the verified Issue");
     }
+    const grants = formalRequest.resolve_from_checkout === true
+      ? [{
+          capability: "repo.modify" as const,
+          resource: { kind: "repository" as const, id: context.repo_id },
+          coordination: "shared" as const,
+        }]
+      : formalRequest.grants;
+    const dependencies = formalRequest.resolve_from_checkout === true ? [] : formalRequest.dependencies;
     return this.options.catalog.registerFormalTask({
-      project_id: input.project_id,
-      repo_id: input.repo_id,
+      project_id: context.project_id,
+      repo_id: context.repo_id,
       ...issueRecord(issue),
       ...(input.task_role !== undefined ? { task_role: input.task_role } : {}),
-      ...(input.grants !== undefined ? { grants: input.grants } : {}),
-      ...(input.dependencies !== undefined ? { dependencies: input.dependencies } : {}),
+      ...(grants !== undefined ? { grants } : {}),
+      ...(dependencies !== undefined ? { dependencies } : {}),
     });
   }
 
-  async registerTemporaryTask(input: RegisterTemporaryTaskInput & { repository_path: string }): Promise<TemporaryTask> {
-    const { repository_path: _repositoryPath, ...record } = input;
-    this.assertCheckoutSafe(record, input.repository_path);
-    await this.requireContext(input.project_id, input.repo_id, input.repository_path);
-    return this.options.catalog.registerTemporaryTask(record);
+  async registerTemporaryTask(input: RegisterTemporaryTaskFromSourceInput): Promise<TemporaryTask> {
+    const { repository_path: repositoryPath, ...temporaryRequest } = input;
+    this.assertCheckoutSafe(temporaryRequest, repositoryPath);
+    assertTaskCoordinateShape(temporaryRequest);
+    assertResolvedContractBoundary(temporaryRequest);
+    const context = await this.requireContext(temporaryRequest, repositoryPath);
+    const {
+      project_id: _projectId,
+      repo_id: _repoId,
+      resolve_from_checkout: _resolve,
+      grants: requestedGrants,
+      dependencies,
+      ...temporary
+    } = temporaryRequest;
+    const grants = temporaryRequest.resolve_from_checkout === true
+      ? [{
+          capability: "repo.modify" as const,
+          resource: { kind: "repository" as const, id: context.repo_id },
+          coordination: "shared" as const,
+        }]
+      : requestedGrants;
+    const resolvedDependencies = temporaryRequest.resolve_from_checkout === true ? [] : dependencies;
+    return this.options.catalog.registerTemporaryTask({
+      ...temporary,
+      project_id: context.project_id,
+      repo_id: context.repo_id,
+      ...(grants !== undefined ? { grants } : {}),
+      ...(resolvedDependencies !== undefined ? { dependencies: resolvedDependencies } : {}),
+    });
   }
 
   async prepareExistingTask(input: { task_id: string; repository_path: string }): Promise<ExistingTaskContext> {
@@ -203,7 +310,10 @@ export class GitHubSourceService {
     this.assertCheckoutSafe({ task_id: input.task_id }, input.repository_path);
     let task = await this.options.catalog.getTask(input.task_id);
     this.assertCheckoutSafe(task, input.repository_path);
-    const context = await this.requireContext(task.project_id, task.repo_id, input.repository_path);
+    const context = await this.requireContext(
+      { project_id: task.project_id, repo_id: task.repo_id },
+      input.repository_path,
+    );
     if (task.kind === "formal") {
       issueCoordinates(task.issue_url);
       const issue = await this.resolveIssue(context.repository, task.issue_url);
@@ -249,7 +359,10 @@ export class GitHubSourceService {
     this.assertCheckoutSafe(content, input.repository_path);
     const current = await this.options.catalog.getTask(input.task_id);
     this.assertCheckoutSafe(current, input.repository_path);
-    const context = await this.requireContext(current.project_id, current.repo_id, input.repository_path);
+    const context = await this.requireContext(
+      { project_id: current.project_id, repo_id: current.repo_id },
+      input.repository_path,
+    );
     const issue = await this.resolveIssue(context.repository, input.issue_url);
     this.assertCheckoutSafe(issue, input.repository_path);
     if (issue.state === "closed") throw new ControlError("TASK_COMPLETED", "Closed GitHub Issues cannot promote Task ownership");
@@ -266,48 +379,97 @@ export class GitHubSourceService {
     });
   }
 
-  private async requireContext(projectId: string, repoId: string, repositoryPath: string): Promise<{ repository: RepositoryRecord }> {
+  private async requireExplicitContext(
+    projectId: string,
+    repoId: string,
+    repositoryPath: string,
+  ): Promise<VerifiedTaskContext> {
     if (!projectIdPattern.test(projectId) || !repoIdPattern.test(repoId)) {
       throw new ControlError("INVALID_TASK_SCOPE", "Task Project/Repository coordinates are invalid");
     }
     const repository = await this.options.catalog.getRepository(repoId);
     this.assertCheckoutSafe(repository, repositoryPath);
     await this.options.projects.requireProjectRepository(projectId, repoId);
-    await this.verifyCheckout(repositoryPath, repository.slug);
-    const actual = await this.resolveRepository(repository.slug, repository.allow_public === true);
-    this.assertCheckoutSafe(actual, repositoryPath);
-    if (actual.node_id !== repository.github_node_id) {
-      throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "Repository Record and GitHub node identity disagree");
+    const checkoutSlug = await this.checkoutSlug(repositoryPath);
+    if (!sameSlug(checkoutSlug, repository.slug)) {
+      throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout origin disagrees with Repository Record");
     }
-    return { repository };
+    const live = await this.readLiveRepository(repository.slug);
+    this.assertCheckoutSafe(live, repositoryPath);
+    this.assertRepositoryPolicy(live, repository);
+    if (live.node_id !== repository.github_node_id) {
+      throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "Repository Record and GitHub node disagree");
+    }
+    const context: VerifiedTaskContext = { project_id: projectId, repo_id: repoId, repository };
+    this.assertCheckoutSafe(context, repositoryPath);
+    return context;
   }
 
-  private async verifyCheckout(repositoryPath: string, expectedSlug: string): Promise<void> {
-    if (!isAbsolute(repositoryPath)) throw new ControlError("INVALID_CHECKOUT_PATH", "Repository checkout path must be absolute");
+  private async requireContext(
+    coordinates: TaskCoordinateInput,
+    repositoryPath: string,
+  ): Promise<VerifiedTaskContext> {
+    if (coordinates.resolve_from_checkout === true) {
+      const checkoutSlug = await this.checkoutSlug(repositoryPath);
+      const live = await this.readLiveRepository(checkoutSlug);
+      this.assertCheckoutSafe(live, repositoryPath);
+      return this.options.catalog.withPinnedRepositoryByGitHubNode(live.node_id, async (repository) => {
+        this.assertCheckoutSafe(repository, repositoryPath);
+        if (!sameSlug(checkoutSlug, repository.slug) || !sameSlug(live.full_name, repository.slug)) {
+          throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "Checkout, GitHub, and Registry disagree");
+        }
+        if (live.node_id !== repository.github_node_id) {
+          throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "Repository node identity disagrees");
+        }
+        this.assertRepositoryPolicy(live, repository);
+        const project = await this.options.projects.resolveUniqueProjectForRepository(repository.id);
+        this.assertCheckoutSafe(project, repositoryPath);
+        const context: VerifiedTaskContext = {
+          project_id: project.project_id,
+          repo_id: repository.id,
+          repository,
+          project_source_revision: project.source_revision,
+        };
+        this.assertCheckoutSafe(context, repositoryPath);
+        return context;
+      });
+    }
+    return this.requireExplicitContext(coordinates.project_id, coordinates.repo_id, repositoryPath);
+  }
+
+  private async checkoutSlug(repositoryPath: string): Promise<string> {
+    if (!isAbsolute(repositoryPath)) {
+      throw new ControlError("INVALID_CHECKOUT_PATH", "Repository checkout path must be absolute");
+    }
     const root = (await this.options.runner.run("git", ["rev-parse", "--show-toplevel"], { cwd: repositoryPath })).stdout.trim();
     if (!isAbsolute(root) || resolve(root) !== resolve(repositoryPath)) {
       throw new ControlError("CHECKOUT_ROOT_MISMATCH", "Repository path is not the exact checkout root");
     }
-    const remoteLines = (await this.options.runner.run("git", ["remote", "get-url", "--all", "origin"], { cwd: repositoryPath }))
-      .stdout.split("\n").map((line) => line.trim()).filter(Boolean);
-    if (remoteLines.length !== 1) {
-      throw new ControlError("AMBIGUOUS_CHECKOUT_ORIGIN", "Checkout must have exactly one origin URL");
-    }
-    const actualSlug = githubSlugFromRemote(remoteLines[0] as string);
-    if (!sameSlug(actualSlug, expectedSlug)) {
-      throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout origin does not match the canonical Repository");
-    }
-    const pushLines = (await this.options.runner.run(
+    const fetch = remoteLines(await this.options.runner.run(
+      "git",
+      ["remote", "get-url", "--all", "origin"],
+      { cwd: repositoryPath },
+    ));
+    const push = remoteLines(await this.options.runner.run(
       "git",
       ["remote", "get-url", "--push", "--all", "origin"],
       { cwd: repositoryPath },
-    )).stdout.split("\n").map((line) => line.trim()).filter(Boolean);
-    if (pushLines.length !== 1) {
-      throw new ControlError("AMBIGUOUS_CHECKOUT_ORIGIN", "Checkout must have exactly one effective push URL");
+    ));
+    if (fetch.length !== 1 || push.length !== 1) {
+      throw new ControlError("AMBIGUOUS_CHECKOUT_ORIGIN", "Checkout must have one fetch and push URL");
     }
-    const pushSlug = githubSlugFromRemote(pushLines[0] as string);
-    if (!sameSlug(pushSlug, expectedSlug)) {
-      throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout push URL does not match the canonical Repository");
+    const fetchSlug = githubSlugFromRemote(fetch[0]!);
+    const pushSlug = githubSlugFromRemote(push[0]!);
+    if (!sameSlug(fetchSlug, pushSlug)) {
+      throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout fetch and push remotes disagree");
+    }
+    return fetchSlug;
+  }
+
+  private async verifyCheckout(repositoryPath: string, expectedSlug: string): Promise<void> {
+    const actualSlug = await this.checkoutSlug(repositoryPath);
+    if (!sameSlug(actualSlug, expectedSlug)) {
+      throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout origin disagrees with requested Repository");
     }
   }
 
@@ -317,21 +479,33 @@ export class GitHubSourceService {
   }
 
   private async resolveRepository(slug: string, allowPublic: boolean): Promise<z.infer<typeof RepositoryResponseSchema>> {
-    const resolved = parseJson(
+    const resolved = await this.readLiveRepository(slug);
+    if (!resolved.private && !allowPublic) {
+      throw new ControlError("REPOSITORY_NOT_PRIVATE", "Phase 1A requires a private GitHub repository");
+    }
+    return resolved;
+  }
+
+  private async readLiveRepository(slug: string): Promise<z.infer<typeof RepositoryResponseSchema>> {
+    const live = parseJson(
       (await this.options.runner.runGh(["api", `repos/${slug}`], "repo")).stdout,
       RepositoryResponseSchema,
       "INVALID_REPOSITORY_RESPONSE",
     );
-    if (!sameSlug(resolved.full_name, slug)) {
-      throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "GitHub repository slug does not match the request");
+    if (!sameSlug(live.full_name, slug)) {
+      throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "GitHub repository slug disagrees");
     }
-    // The private requirement stays the default; a public repository passes
-    // only through the explicit operator opt-in persisted on its record.
-    if (!resolved.private && !allowPublic) {
-      throw new ControlError("REPOSITORY_NOT_PRIVATE", "Phase 1A requires a private GitHub repository");
+    this.sensitiveData.assertSafe(live);
+    return live;
+  }
+
+  private assertRepositoryPolicy(
+    live: z.infer<typeof RepositoryResponseSchema>,
+    repository: RepositoryRecord,
+  ): void {
+    if (!live.private && repository.allow_public !== true) {
+      throw new ControlError("REPOSITORY_NOT_PRIVATE", "Repository Record lacks public opt-in");
     }
-    this.sensitiveData.assertSafe(resolved);
-    return resolved;
   }
 
   private async resolveIssue(repository: RepositoryRecord, issueUrl: string): Promise<VerifiedIssue> {

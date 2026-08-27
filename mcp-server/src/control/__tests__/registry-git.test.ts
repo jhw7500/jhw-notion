@@ -557,6 +557,41 @@ describe("RegistryGit", () => {
     expect(outcome).toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
   });
 
+  it("rejects a committed-tree read when the final fence sees Registry HEAD move", async () => {
+    const { registryDir } = await fixture();
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.withCommittedTree(["repositories"], async () => {
+      await commitFile(registryDir, "repositories/repo-new.yaml", "{}\n");
+      await registry.assertCommittedViewCurrent();
+    })).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
+  });
+
+  it("maps a final fence HEAD inspection failure to Registry corruption", async () => {
+    const { registryDir } = await fixture();
+    const runner = new ProcessRunner();
+    let headInspections = 0;
+    const registry = fixtureRegistryGit(configFor(registryDir), {
+      run: async (command, args, options) => {
+        if (args[0] === "rev-parse" && args[1] === "HEAD" && ++headInspections === 2) {
+          throw new Error("injected final HEAD inspection failure");
+        }
+        return runner.run(command, args, options);
+      },
+      runRaw: runner.runRaw.bind(runner),
+    });
+
+    await expect(registry.withCommittedTree(["repositories"], () => registry.assertCommittedViewCurrent()))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("rejects the final fence when no committed-tree scope is active", async () => {
+    const { registryDir } = await fixture();
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+
+    await expect(registry.assertCommittedViewCurrent()).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
   // A scope is published before the commit it will read is resolved, so a read
   // arriving in that window must be refused rather than handed an empty
   // revision — and the scope has to work normally once it resolves.

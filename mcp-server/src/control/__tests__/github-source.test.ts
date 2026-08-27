@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { ControlError } from "../errors.js";
-import { GitHubSourceService } from "../github-source.js";
+import {
+  GitHubSourceService,
+  type RegisterFormalTaskFromSourceInput,
+  type RegisterTemporaryTaskFromSourceInput,
+  type TaskCoordinateInput,
+} from "../github-source.js";
 import type { RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
@@ -18,17 +23,75 @@ const formal = {
   issue_url: "https://github.com/jhw7500/wlan/issues/7",
 };
 
+if (false) {
+  const acceptCoordinates = (_coordinates: TaskCoordinateInput): void => undefined;
+  acceptCoordinates({ project_id: "prj-wlan", repo_id: "repo-wlan" });
+  acceptCoordinates({ resolve_from_checkout: true });
+  // @ts-expect-error mixed resolved and explicit coordinates are forbidden
+  acceptCoordinates({ resolve_from_checkout: true, project_id: "prj-wlan", repo_id: "repo-wlan" });
+  // @ts-expect-error false is not a supported resolver discriminant
+  acceptCoordinates({ resolve_from_checkout: false, project_id: "prj-wlan", repo_id: "repo-wlan" });
+  // @ts-expect-error one coordinate mode is required
+  acceptCoordinates({});
+  // @ts-expect-error explicit mode requires both Project and Repository coordinates
+  acceptCoordinates({ project_id: "prj-wlan" });
+  // @ts-expect-error explicit mode requires both Project and Repository coordinates
+  acceptCoordinates({ repo_id: "repo-wlan" });
+
+  const acceptFormal = (_input: RegisterFormalTaskFromSourceInput): void => undefined;
+  acceptFormal({
+    resolve_from_checkout: true,
+    repository_path: checkout,
+    issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    // @ts-expect-error checkout-resolved Formal Tasks derive their grant server-side
+    grants: [{
+      capability: "notion.mutate",
+      resource: { kind: "notion_database", id: "knowledgeBase" },
+      coordination: "shared",
+    }],
+  });
+
+  const acceptTemporary = (_input: RegisterTemporaryTaskFromSourceInput): void => undefined;
+  acceptTemporary({
+    resolve_from_checkout: true,
+    repository_path: checkout,
+    alias: "wlan:tmp-resolved",
+    goal: "verify resolver authority",
+    done_conditions: ["targeted tests pass"],
+    expected_scope: ["src/control"],
+    // @ts-expect-error checkout-resolved Temporary Tasks cannot accept caller dependencies
+    dependencies: [{ relation: "observes", task_id: formal.id }],
+  });
+}
+
 function fixture(overrides: {
   remote?: string;
   pushRemote?: string;
+  checkoutRoot?: string;
   private?: boolean;
   fullName?: string;
+  nodeId?: string;
+  repository?: RepositoryRecord;
   issueState?: "open" | "closed";
+  finalFenceError?: string;
   issueRevision?: string;
 } = {}) {
+  const repositoryRecord = overrides.repository ?? repository;
+  const pinnedRepositoryLookup = vi.fn();
   const catalog = {
     registerRepository: vi.fn(async (input) => ({ repository: { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug }, created: true })),
     getRepository: vi.fn(async () => repository),
+    async withPinnedRepositoryByGitHubNode<T>(
+      githubNodeId: string,
+      use: (record: RepositoryRecord) => Promise<T>,
+    ): Promise<T> {
+      pinnedRepositoryLookup(githubNodeId);
+      const result = await use(repositoryRecord);
+      if (overrides.finalFenceError) {
+        throw new ControlError(overrides.finalFenceError, "injected final fence refusal");
+      }
+      return result;
+    },
     getTask: vi.fn(async () => formal),
     getTaskSourceRevision: vi.fn(async () => formal.issue_revision),
     registerFormalTask: vi.fn(async (input) => {
@@ -38,12 +101,18 @@ function fixture(overrides: {
     registerTemporaryTask: vi.fn(),
     promoteTemporaryTask: vi.fn(),
   };
-  const projects = { requireProjectRepository: vi.fn(async () => undefined) };
+  const projects = {
+    requireProjectRepository: vi.fn(async () => undefined),
+    resolveUniqueProjectForRepository: vi.fn(async () => ({
+      project_id: "prj-wlan",
+      source_revision: "2026-08-26T00:00:00Z",
+    })),
+  };
   const runner = {
     run: vi.fn(async (_command: string, args: string[]) => ({
       command: "git", args,
       stdout: args[0] === "rev-parse"
-        ? `${checkout}\n`
+        ? `${overrides.checkoutRoot ?? checkout}\n`
         : args.includes("--push")
           ? (overrides.pushRemote ?? overrides.remote ?? "git@github.com:jhw7500/wlan.git\n")
           : (overrides.remote ?? "git@github.com:jhw7500/wlan.git\n"),
@@ -51,8 +120,8 @@ function fixture(overrides: {
     })),
     runGh: vi.fn(async (args: string[]) => ({
       command: "gh", args,
-      stdout: args[1] === "repos/jhw7500/wlan"
-        ? `${JSON.stringify({ node_id: "R_wlan", full_name: overrides.fullName ?? "jhw7500/wlan", private: overrides.private ?? true })}\n`
+      stdout: args[1]?.startsWith("repos/") && !args[1].includes("/issues/")
+        ? `${JSON.stringify({ node_id: overrides.nodeId ?? "R_wlan", full_name: overrides.fullName ?? "jhw7500/wlan", private: overrides.private ?? true })}\n`
         : `${JSON.stringify({
           node_id: "I_wlan_7",
           number: 7,
@@ -63,7 +132,13 @@ function fixture(overrides: {
       stderr: "", exitCode: 0,
     })),
   };
-  return { service: new GitHubSourceService({ runner, catalog, projects }), catalog, projects, runner };
+  return {
+    service: new GitHubSourceService({ runner, catalog, projects }),
+    catalog,
+    pinnedRepositoryLookup,
+    projects,
+    runner,
+  };
 }
 
 describe("GitHubSourceService", () => {
@@ -232,6 +307,402 @@ describe("GitHubSourceService", () => {
       issue_url: "https://github.com/jhw7500/wlan/issues/7",
       alias: "jhw7500/wlan#7",
     });
+  });
+
+  it("derives formal Task coordinates from the checkout inside one pinned Repository lookup", async () => {
+    const { service, catalog, pinnedRepositoryLookup, projects } = fixture();
+
+    await service.registerFormalTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    });
+
+    expect(pinnedRepositoryLookup).toHaveBeenCalledTimes(1);
+    expect(pinnedRepositoryLookup).toHaveBeenCalledWith("R_wlan");
+    expect(projects.resolveUniqueProjectForRepository).toHaveBeenCalledTimes(1);
+    expect(projects.resolveUniqueProjectForRepository).toHaveBeenCalledWith("repo-wlan");
+    expect(projects.requireProjectRepository).not.toHaveBeenCalled();
+    expect(catalog.registerFormalTask).toHaveBeenCalledWith(expect.objectContaining({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      grants: [{
+        capability: "repo.modify",
+        resource: { kind: "repository", id: "repo-wlan" },
+        coordination: "shared",
+      }],
+      dependencies: [],
+    }));
+  });
+
+  it("derives temporary Task coordinates from the checkout without membership revalidation", async () => {
+    const { service, catalog, pinnedRepositoryLookup, projects } = fixture();
+
+    await service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-01-resolved",
+      goal: "verify checkout resolution",
+      done_conditions: ["resolved source tests pass"],
+      expected_scope: ["src/control"],
+    });
+
+    expect(pinnedRepositoryLookup).toHaveBeenCalledTimes(1);
+    expect(projects.resolveUniqueProjectForRepository).toHaveBeenCalledWith("repo-wlan");
+    expect(projects.requireProjectRepository).not.toHaveBeenCalled();
+    expect(catalog.registerTemporaryTask).toHaveBeenCalledWith({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      alias: "wlan:tmp-20260826-01-resolved",
+      goal: "verify checkout resolution",
+      done_conditions: ["resolved source tests pass"],
+      expected_scope: ["src/control"],
+      grants: [{
+        capability: "repo.modify",
+        resource: { kind: "repository", id: "repo-wlan" },
+        coordination: "shared",
+      }],
+      dependencies: [],
+    });
+  });
+
+  for (const kind of ["formal", "temporary"] as const) {
+    it.each([
+      ["caller grant", {
+        grants: [{
+          capability: "notion.mutate" as const,
+          resource: { kind: "notion_database" as const, id: "knowledgeBase" },
+          coordination: "shared" as const,
+        }],
+      }],
+      ["caller dependency", {
+        dependencies: [{ relation: "observes" as const, task_id: formal.id }],
+      }],
+    ] as const)(`rejects %s at the checkout-resolved ${kind} contract boundary`, async (_label, intent) => {
+      const { service, catalog, pinnedRepositoryLookup, projects, runner } = fixture();
+
+      const operation = kind === "formal"
+        ? service.registerFormalTask({
+          resolve_from_checkout: true,
+          repository_path: checkout,
+          issue_url: "https://github.com/jhw7500/wlan/issues/7",
+          ...intent,
+        } as never)
+        : service.registerTemporaryTask({
+          resolve_from_checkout: true,
+          repository_path: checkout,
+          alias: "wlan:tmp-20260827-resolver-contract",
+          goal: "verify resolver authority",
+          done_conditions: ["caller contract intent rejected"],
+          expected_scope: ["src/control"],
+          ...intent,
+        } as never);
+
+      await expect(operation).rejects.toMatchObject({ code: "INVALID_TASK_SCOPE" });
+      expect(pinnedRepositoryLookup).not.toHaveBeenCalled();
+      expect(projects.requireProjectRepository).not.toHaveBeenCalled();
+      expect(projects.resolveUniqueProjectForRepository).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(runner.runGh).not.toHaveBeenCalled();
+      expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+      expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const kind of ["formal", "temporary"] as const) {
+    it.each([
+      ["mixed resolved and explicit coordinates", {
+        resolve_from_checkout: true,
+        project_id: "prj-forged",
+        repo_id: "repo-forged",
+      }],
+      ["a false resolver discriminant", {
+        resolve_from_checkout: false,
+        project_id: "prj-wlan",
+        repo_id: "repo-wlan",
+      }],
+      ["no coordinates", {}],
+      ["a missing Repository coordinate", { project_id: "prj-wlan" }],
+      ["a missing Project coordinate", { repo_id: "repo-wlan" }],
+    ])(`rejects %s at the ${kind} runtime coordinate boundary`, async (_label, coordinates) => {
+      const { service, catalog, pinnedRepositoryLookup, projects, runner } = fixture();
+
+      const operation = kind === "formal"
+        ? service.registerFormalTask({
+          ...coordinates,
+          repository_path: checkout,
+          issue_url: "https://github.com/jhw7500/wlan/issues/7",
+        } as never)
+        : service.registerTemporaryTask({
+          ...coordinates,
+          repository_path: checkout,
+          alias: "wlan:tmp-20260826-13-invalid-coordinates",
+          goal: "verify exact runtime coordinates",
+          done_conditions: ["ambiguous coordinates rejected"],
+          expected_scope: ["src/control"],
+        } as never);
+
+      await expect(operation).rejects.toMatchObject({ code: "INVALID_TASK_SCOPE" });
+      expect(catalog.getRepository).not.toHaveBeenCalled();
+      expect(pinnedRepositoryLookup).not.toHaveBeenCalled();
+      expect(projects.requireProjectRepository).not.toHaveBeenCalled();
+      expect(projects.resolveUniqueProjectForRepository).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(runner.runGh).not.toHaveBeenCalled();
+      expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+      expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+    });
+  }
+
+  it.each(["formal", "temporary"] as const)(
+    "does not mutate %s Task registration when unique Project resolution fails",
+    async (kind) => {
+      const { service, catalog, projects } = fixture();
+      projects.resolveUniqueProjectForRepository.mockRejectedValueOnce(
+        new ControlError("PROJECT_REPOSITORY_AMBIGUOUS", "injected ambiguous association"),
+      );
+
+      const operation = kind === "formal"
+        ? service.registerFormalTask({
+          resolve_from_checkout: true,
+          repository_path: checkout,
+          issue_url: "https://github.com/jhw7500/wlan/issues/7",
+        })
+        : service.registerTemporaryTask({
+          resolve_from_checkout: true,
+          repository_path: checkout,
+          alias: "wlan:tmp-20260826-02-project-error",
+          goal: "verify no mutation",
+          done_conditions: ["resolver fails closed"],
+          expected_scope: ["src/control"],
+        });
+
+      await expect(operation).rejects.toMatchObject({ code: "PROJECT_REPOSITORY_AMBIGUOUS" });
+      expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+      expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["formal", "temporary"] as const)(
+    "does not mutate %s Task registration when the pinned final fence fails",
+    async (kind) => {
+      const { service, catalog } = fixture({ finalFenceError: "REGISTRY_MOVED_DURING_READ" });
+
+      const operation = kind === "formal"
+        ? service.registerFormalTask({
+          resolve_from_checkout: true,
+          repository_path: checkout,
+          issue_url: "https://github.com/jhw7500/wlan/issues/7",
+        })
+        : service.registerTemporaryTask({
+          resolve_from_checkout: true,
+          repository_path: checkout,
+          alias: "wlan:tmp-20260826-03-fence-error",
+          goal: "verify final fence",
+          done_conditions: ["final fence fails closed"],
+          expected_scope: ["src/control"],
+        });
+
+      await expect(operation).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
+      expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+      expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a non-root checkout before resolved Catalog lookup or mutation", async () => {
+    const { service, catalog, pinnedRepositoryLookup, projects } = fixture({ checkoutRoot: "/fixture/private-source" });
+
+    await expect(service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-04-root",
+      goal: "verify exact root",
+      done_conditions: ["nested path rejected"],
+      expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code: "CHECKOUT_ROOT_MISMATCH" });
+
+    expect(pinnedRepositoryLookup).not.toHaveBeenCalled();
+    expect(projects.resolveUniqueProjectForRepository).not.toHaveBeenCalled();
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["multiple fetch URLs", { remote: "git@github.com:jhw7500/wlan.git\nhttps://github.com/jhw7500/wlan.git\n" }],
+    ["multiple push URLs", { pushRemote: "git@github.com:jhw7500/wlan.git\nhttps://github.com/jhw7500/wlan.git\n" }],
+  ])("rejects %s before resolved Catalog lookup", async (_label, overrides) => {
+    const { service, catalog, pinnedRepositoryLookup } = fixture(overrides);
+
+    await expect(service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-05-cardinality",
+      goal: "verify origin cardinality",
+      done_conditions: ["ambiguous origin rejected"],
+      expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code: "AMBIGUOUS_CHECKOUT_ORIGIN" });
+
+    expect(pinnedRepositoryLookup).not.toHaveBeenCalled();
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+  });
+
+  it("accepts HTTPS fetch with an equivalent SSH push URL", async () => {
+    const { service, catalog } = fixture({
+      remote: "https://github.com/jhw7500/wlan.git\n",
+      pushRemote: "git@github.com:jhw7500/wlan.git\n",
+    });
+
+    await service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-06-mixed-remotes",
+      goal: "verify mixed transport identity",
+      done_conditions: ["temporary Task registered"],
+      expected_scope: ["src/control"],
+    });
+
+    expect(catalog.registerTemporaryTask).toHaveBeenCalled();
+  });
+
+  it("accepts case-only slug differences across checkout, GitHub, and Registry", async () => {
+    const { service, catalog } = fixture({
+      remote: "https://github.com/JHW7500/WLAN.git\n",
+      pushRemote: "git@github.com:jhw7500/wlan.git\n",
+      fullName: "Jhw7500/Wlan",
+    });
+
+    await service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-07-case",
+      goal: "verify case-insensitive identity",
+      done_conditions: ["temporary Task registered"],
+      expected_scope: ["src/control"],
+    });
+
+    expect(catalog.registerTemporaryTask).toHaveBeenCalled();
+  });
+
+  it("accepts a canonical .github Repository name", async () => {
+    const dotGithub: RepositoryRecord = {
+      id: "repo-dot-github",
+      github_node_id: "R_dot_github",
+      slug: "jhw7500/.github",
+    };
+    const { service, catalog } = fixture({
+      repository: dotGithub,
+      remote: "https://github.com/jhw7500/.github.git\n",
+      pushRemote: "git@github.com:jhw7500/.github.git\n",
+      fullName: "jhw7500/.github",
+      nodeId: "R_dot_github",
+    });
+
+    await service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "dot-github:tmp-20260826-01",
+      goal: "verify dotted Repository names",
+      done_conditions: ["temporary Task registered"],
+      expected_scope: ["src/control"],
+    });
+
+    expect(catalog.registerTemporaryTask).toHaveBeenCalledWith(expect.objectContaining({ repo_id: "repo-dot-github" }));
+  });
+
+  it.each([
+    ["live node mismatch", { nodeId: "R_other" }, "REPOSITORY_IDENTITY_MISMATCH"],
+    ["live rename mismatch", { fullName: "jhw7500/renamed" }, "REPOSITORY_IDENTITY_MISMATCH"],
+  ])("rejects %s before resolved Task mutation", async (_label, overrides, code) => {
+    const { service, catalog, projects } = fixture(overrides);
+
+    await expect(service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-08-identity",
+      goal: "verify live identity",
+      done_conditions: ["identity mismatch rejected"],
+      expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code });
+
+    expect(projects.resolveUniqueProjectForRepository).not.toHaveBeenCalled();
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+  });
+
+  it("accepts private resolved repositories by default", async () => {
+    const { service, catalog } = fixture({ private: true });
+
+    await service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-09-private",
+      goal: "verify private policy",
+      done_conditions: ["temporary Task registered"],
+      expected_scope: ["src/control"],
+    });
+
+    expect(catalog.registerTemporaryTask).toHaveBeenCalled();
+  });
+
+  it("rejects public resolved repositories without persisted opt-in", async () => {
+    const { service, catalog, projects } = fixture({ private: false });
+
+    await expect(service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-10-public-denied",
+      goal: "verify public policy",
+      done_conditions: ["missing opt-in rejected"],
+      expected_scope: ["src/control"],
+    })).rejects.toMatchObject({ code: "REPOSITORY_NOT_PRIVATE" });
+
+    expect(projects.resolveUniqueProjectForRepository).not.toHaveBeenCalled();
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+  });
+
+  it("accepts public resolved repositories only with persisted opt-in", async () => {
+    const { service, catalog } = fixture({
+      private: false,
+      repository: { ...repository, allow_public: true },
+    });
+
+    await service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-11-public-optin",
+      goal: "verify public opt-in",
+      done_conditions: ["temporary Task registered"],
+      expected_scope: ["src/control"],
+    });
+
+    expect(catalog.registerTemporaryTask).toHaveBeenCalled();
+  });
+
+  it("rejects protected live Repository responses before pinned lookup or mutation", async () => {
+    const secret = "unmistakably-fake-resolved-source-token";
+    const { catalog, pinnedRepositoryLookup, projects, runner } = fixture();
+    runner.runGh.mockResolvedValueOnce({
+      command: "gh", args: [], stderr: "", exitCode: 0,
+      stdout: `${JSON.stringify({ node_id: secret, full_name: "jhw7500/wlan", private: true })}\n`,
+    });
+    const service = new GitHubSourceService({
+      runner,
+      catalog,
+      projects,
+      sensitiveData: createSensitiveDataPolicy({ FAKE_API_TOKEN: secret }),
+    });
+
+    const error = await service.registerTemporaryTask({
+      resolve_from_checkout: true,
+      repository_path: checkout,
+      alias: "wlan:tmp-20260826-12-protected",
+      goal: "verify protected response rejection",
+      done_conditions: ["protected response rejected"],
+      expected_scope: ["src/control"],
+    }).catch((cause) => cause);
+
+    expect(error).toMatchObject({ code: "SENSITIVE_DATA_REJECTED" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(pinnedRepositoryLookup).not.toHaveBeenCalled();
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
   });
 
   it("rejects an unsafe Issue number before any checkout or GitHub request", async () => {

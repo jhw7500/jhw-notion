@@ -30,7 +30,7 @@ import {
   type GuardRequestStore,
 } from "./guard-state.js";
 import { GitHubProjectClient, type RegistrationRecordWarning } from "./github-project.js";
-import { GitHubSourceService } from "./github-source.js";
+import { GitHubSourceService, type TaskCoordinateInput } from "./github-source.js";
 import { PilotJournal, type JournalPort } from "./journal.js";
 import {
   createProductionMutationLock,
@@ -1135,6 +1135,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const flags = parseFlags(argv.slice(2), new Set([
       "--task",
       "--project", "--repo-id", "--repo-path", "--issue-node-id", "--issue-url", "--issue-revision",
+      "--resolve-from-checkout",
       "--temp-alias", "--goal", "--done", "--scope", "--session", "--role", "--grant", "--depends",
       "--origin-adapter",
     ]), new Set(["--done", "--scope", "--grant", "--depends"]));
@@ -1142,30 +1143,52 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
     const session_id = requireClaimCoordinate(flags, "--session");
-      const origin_adapter = requireOriginAdapter(flags);
+    const origin_adapter = requireOriginAdapter(flags);
     const formalFields = ["--issue-node-id", "--issue-url", "--issue-revision"];
     const temporaryFields = ["--temp-alias", "--goal", "--done", "--scope"];
     const hasFormal = formalFields.some((flag) => flags.has(flag));
     const hasTemporary = temporaryFields.some((flag) => flags.has(flag));
     const existingTaskId = value(flags, "--task");
     const hasExisting = existingTaskId !== undefined;
+    const resolveFromCheckout = value(flags, "--resolve-from-checkout");
+    if (resolveFromCheckout !== undefined && resolveFromCheckout !== "true") {
+      usage("Checkout resolver must be the exact literal true");
+    }
+    const hasResolved = resolveFromCheckout === "true";
+    const hasProject = flags.has("--project");
+    const hasRepository = flags.has("--repo-id");
+    if (hasProject !== hasRepository) usage("Explicit coordinates require both Project and Repository IDs");
+    const hasExplicit = hasProject && hasRepository;
+    if (!hasExisting && hasResolved === hasExplicit) usage("New Task start requires exactly one coordinate mode");
     if (hasExisting && (
-      hasFormal || hasTemporary || flags.has("--project") || flags.has("--repo-id") ||
+      hasFormal || hasTemporary || hasProject || hasRepository || hasResolved ||
       flags.has("--role") || flags.has("--grant") || flags.has("--depends")
     )) {
       usage("Existing Task resume cannot include registration fields");
     }
+    if (hasResolved && (flags.has("--grant") || flags.has("--depends"))) {
+      usage("Checkout-resolved Task start cannot include caller contract fields");
+    }
     if (!hasExisting && hasFormal === hasTemporary) usage("Task start requires exactly one task source");
 
-    const contractIntent = hasExisting
+    const rawGrants = values(flags, "--grant");
+    const rawDependencies = values(flags, "--depends");
+    const contractIntent = hasExisting || hasResolved
       ? undefined
-      : parseContractIntentFlags(values(flags, "--grant"), values(flags, "--depends"));
+      : parseContractIntentFlags(rawGrants, rawDependencies);
     const taskRole = hasExisting ? undefined : parseTaskRoleFlag(value(flags, "--role"));
 
     let task: TaskRecord;
     let alias: string;
-    let project_id: string;
-    let repo_id: string;
+    let coordinates: TaskCoordinateInput | undefined;
+    if (!hasExisting) {
+      coordinates = hasResolved
+        ? { resolve_from_checkout: true }
+        : {
+            project_id: assertPattern(required(flags, "--project"), PROJECT_ID),
+            repo_id: assertPattern(required(flags, "--repo-id"), REPO_ID),
+          };
+    }
     if (hasExisting) {
       const existing = await dependencies.source.prepareExistingTask({
         task_id: assertPattern(existingTaskId, TASK_ID),
@@ -1173,11 +1196,8 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       });
       task = existing.task;
       alias = existing.alias;
-      project_id = task.project_id;
-      repo_id = task.repo_id;
     } else if (hasFormal) {
-      project_id = assertPattern(required(flags, "--project"), PROJECT_ID);
-      repo_id = assertPattern(required(flags, "--repo-id"), REPO_ID);
+      if (coordinates === undefined) usage("New Task coordinate mode is missing");
       const issue_url = required(flags, "--issue-url");
       try {
         const parsed = new URL(issue_url);
@@ -1186,34 +1206,47 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         if (cause instanceof ControlError) throw cause;
         usage("Invalid issue URL");
       }
-      const registration = await dependencies.source.registerFormalTask({
-        project_id,
-        repo_id,
+      const sourceInput = {
         repository_path,
         issue_url,
-        task_role: taskRole,
-        grants: contractIntent?.grants,
-        dependencies: contractIntent?.dependencies,
+        ...(taskRole !== undefined ? { task_role: taskRole } : {}),
         ...(value(flags, "--issue-node-id") ? { expected_issue_node_id: value(flags, "--issue-node-id") } : {}),
         ...(value(flags, "--issue-revision") ? { expected_issue_revision: value(flags, "--issue-revision") } : {}),
-      });
+      };
+      const registration = coordinates.resolve_from_checkout === true
+        ? await dependencies.source.registerFormalTask({ ...coordinates, ...sourceInput })
+        : await dependencies.source.registerFormalTask({
+            ...coordinates,
+            ...sourceInput,
+            ...(contractIntent !== undefined ? {
+              grants: contractIntent.grants,
+              dependencies: contractIntent.dependencies,
+            } : {}),
+          });
       task = registration.task;
       alias = task.aliases[0] ?? usage("Formal Task has no canonical alias");
     } else {
-      project_id = assertPattern(required(flags, "--project"), PROJECT_ID);
-      repo_id = assertPattern(required(flags, "--repo-id"), REPO_ID);
+      if (coordinates === undefined) usage("New Task coordinate mode is missing");
       alias = required(flags, "--temp-alias");
       const goal = required(flags, "--goal");
       const done_conditions = values(flags, "--done").filter((entry) => isNonEmpty(entry));
       const expected_scope = values(flags, "--scope").filter((entry) => isNonEmpty(entry));
       if (done_conditions.length === 0 || expected_scope.length === 0) usage("Temporary task needs done and scope values");
       if (taskRole !== "standalone") usage("Temporary Tasks must use the standalone role");
-      task = await dependencies.source.registerTemporaryTask({
-        project_id, repo_id, repository_path, alias, goal, done_conditions, expected_scope,
-        grants: contractIntent?.grants,
-        dependencies: contractIntent?.dependencies,
-      });
+      task = coordinates.resolve_from_checkout === true
+        ? await dependencies.source.registerTemporaryTask({
+            ...coordinates, repository_path, alias, goal, done_conditions, expected_scope,
+          })
+        : await dependencies.source.registerTemporaryTask({
+            ...coordinates, repository_path, alias, goal, done_conditions, expected_scope,
+            ...(contractIntent !== undefined ? {
+              grants: contractIntent.grants,
+              dependencies: contractIntent.dependencies,
+            } : {}),
+          });
     }
+    const project_id = task.project_id;
+    const repo_id = task.repo_id;
     let latestHandoff: Awaited<ReturnType<CliDependencies["taskService"]["handoff"]>> | undefined;
     if (hasExisting) {
       try {

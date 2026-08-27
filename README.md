@@ -11,6 +11,11 @@ Notion AI Workspace를 여러 AI TUI에서 사용할 수 있는 MCP 서버.
 
 ## 설치
 
+`/jhw:task`가 사용하는 secure launcher는 `claude-config`가 소유한다. 먼저 해당 저장소의
+`install.sh`를 실행해 `$HOME/.local/bin/jhw-control-host`를 설치해야 한다. 이 저장소의
+설치기는 launcher의 공개 계약이 exact v3·`secure-store-only`인지 확인하며, 누락되었거나
+구버전이면 스킬·심링크·MCP 설정을 활성화하기 전에 중단한다.
+
 ```bash
 git clone https://github.com/jhw7500/jhw-notion.git
 cd jhw-notion
