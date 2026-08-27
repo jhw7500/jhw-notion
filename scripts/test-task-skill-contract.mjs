@@ -27,10 +27,12 @@ const tempGoal = "goal with spaces $(printf goal-expanded)";
 const doneValues = [
   "first done condition $(printf done-one-expanded)",
   "second done condition with spaces",
+  "third done condition with 'single quotes' and `printf done-three-expanded`",
 ];
 const scopeValues = [
   "skills/claude/task.md $(printf scope-one-expanded)",
   "scripts/test task contract.mjs",
+  "third scope with 'single quotes' and `printf scope-three-expanded`",
 ];
 const validationValues = [
   "verified-validation $(printf validation-expanded)",
@@ -178,13 +180,14 @@ function expectedStartArgs(route, checkoutRoot) {
     ];
   }
   if (route === "temporary") {
-    return [
+    const args = [
       "task", "start", "--resolve-from-checkout", "true", "--repo-path", checkoutRoot,
       "--temp-alias", tempAlias, "--goal", tempGoal,
-      "--done", doneValues[0], "--done", doneValues[1],
-      "--scope", scopeValues[0], "--scope", scopeValues[1],
-      "--origin-adapter", originAdapter, "--session", sessionValue,
     ];
+    for (const done of doneValues) args.push("--done", done);
+    for (const scope of scopeValues) args.push("--scope", scope);
+    args.push("--origin-adapter", originAdapter, "--session", sessionValue);
+    return args;
   }
   return [
     "task", "start", "--task", targetTaskId, "--repo-path", checkoutRoot,
@@ -351,10 +354,10 @@ function launcherEnv({
     JHW_SESSION_VALUE: sessionValue,
     JHW_TEMP_ALIAS: tempAlias,
     JHW_TEMP_GOAL: tempGoal,
-    JHW_DONE_ONE: doneValues[0],
-    JHW_DONE_TWO: doneValues[1],
-    JHW_SCOPE_ONE: scopeValues[0],
-    JHW_SCOPE_TWO: scopeValues[1],
+    JHW_DONE_COUNT: String(doneValues.length),
+    JHW_SCOPE_COUNT: String(scopeValues.length),
+    ...Object.fromEntries(doneValues.map((value, index) => [`JHW_DONE_${index + 1}`, value])),
+    ...Object.fromEntries(scopeValues.map((value, index) => [`JHW_SCOPE_${index + 1}`, value])),
   };
 }
 
@@ -401,6 +404,8 @@ async function runWorkflow(markdown, route, {
   preflightExit = 0,
   taskStartExit = 0,
   taskStartError = "",
+  envOverrides = {},
+  omittedEnv = [],
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "jhw-task-skill-contract-"));
   try {
@@ -410,11 +415,16 @@ async function runWorkflow(markdown, route, {
     const { home } = await installFakeLauncher(root);
     const bashEnv = await installFakeRawControl(root);
     const command = `${contractBlock(markdown, "gate")}\n${contractBlock(markdown, route.name)}`;
-    const result = await execFileAsync("bash", ["-c", materialize(command)], {
-      cwd: checkoutRoot,
-      env: launcherEnv({
+    const env = {
+      ...launcherEnv({
         home, log, rawLog, bashEnv, checkoutRoot, preflightExit, taskStartExit, taskStartError,
       }),
+      ...envOverrides,
+    };
+    for (const key of omittedEnv) delete env[key];
+    const result = await execFileAsync("bash", ["-c", materialize(command)], {
+      cwd: checkoutRoot,
+      env,
     }).then(
       ({ stdout, stderr }) => ({ exitCode: 0, stdout, stderr }),
       (error) => ({ exitCode: error.code, stdout: error.stdout ?? "", stderr: error.stderr ?? "" }),
@@ -902,6 +912,55 @@ async function assertFinishConsumerContract(label, markdown) {
   }
 }
 
+async function assertRepeatableTemporaryInputs(taskPath) {
+  const markdown = await readFile(taskPath, "utf8");
+  const cases = [
+    {
+      name: "direct Temporary start forwards every done and scope",
+      run: async () => {
+        const result = await runWorkflow(markdown, { name: "temporary" });
+        assert.equal(result.exitCode, 0);
+        assert.deepEqual(result.calls[1], expectedStartArgs("temporary", result.checkoutRoot));
+      },
+    },
+    {
+      name: "switch Temporary start forwards every done and scope",
+      run: async () => {
+        const finishInput = makeFinishInput("completed");
+        const result = await runSwitchWorkflow(markdown, {
+          status: "completed",
+          target: "temporary",
+          finishInput,
+        });
+        assert.equal(result.exitCode, 0);
+        assert.deepEqual(result.calls[1], expectedStartArgs("temporary", result.checkoutRoot));
+      },
+    },
+  ];
+  const results = await Promise.allSettled(cases.map(({ run }) => run()));
+  const failures = results.flatMap((result, index) => result.status === "rejected"
+    ? [`${cases[index].name}: ${result.reason?.message ?? result.reason}`]
+    : []);
+  assert.deepEqual(failures, [], `repeatable Temporary input failures:\n${failures.join("\n")}`);
+}
+
+async function assertInvalidRepeatableTemporaryInputs(taskPath) {
+  const markdown = await readFile(taskPath, "utf8");
+  const cases = [
+    { name: "zero done count", envOverrides: { JHW_DONE_COUNT: "0" } },
+    { name: "non-decimal scope count", envOverrides: { JHW_SCOPE_COUNT: "3x" } },
+    { name: "missing numbered done value", omittedEnv: ["JHW_DONE_2"] },
+    { name: "empty numbered scope value", envOverrides: { JHW_SCOPE_2: "" } },
+  ];
+  for (const testCase of cases) {
+    const result = await runWorkflow(markdown, { name: "temporary" }, testCase);
+    assert.notEqual(result.exitCode, 0, `${testCase.name}: invalid repeatable input must fail`);
+    assert.deepEqual(result.calls, [["preflight"]],
+      `${testCase.name}: invalid repeatable input must fail before task start`);
+    assert.deepEqual(result.rawCalls, []);
+  }
+}
+
 async function assertConsumerContract(label, taskPath) {
   const markdown = await readFile(taskPath, "utf8");
   for (const route of routes) {
@@ -945,6 +1004,8 @@ async function assertConsumerContract(label, taskPath) {
 async function main() {
   assertLauncherV3Fixtures();
   await assertStrictLauncherOracle();
+  await assertRepeatableTemporaryInputs(canonicalTask);
+  await assertInvalidRepeatableTemporaryInputs(canonicalTask);
   await assertConsumerContract("Claude canonical consumer", canonicalTask);
   assert.equal(await realpath(codexReference), await realpath(canonicalTask),
     "Codex task reference must resolve to the canonical Claude task skill");

@@ -85,17 +85,41 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 
 `--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다.
 
-위 authorization gate를 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다. Project/Repository association을 caller가 고르거나 명시하지 않는다. alias, goal, 각 done, 각 scope, session과 source 값은 shell-safe quoting으로 각각 정확히 한 argv argument가 되게 serialize한다. bracket notation을 명령에 그대로 넣지 않는다.
+위 authorization gate를 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다. Project/Repository association을 caller가 고르거나 명시하지 않는다. scalar는 `JHW_TEMP_ALIAS`, `JHW_TEMP_GOAL`, `JHW_ORIGIN_ADAPTER`, `JHW_SESSION_VALUE`로 전달한다. repeatable 값은 leading-zero 없는 양의 10진수 `JHW_DONE_COUNT`·`JHW_SCOPE_COUNT`와 연속된 `JHW_DONE_1..N`·`JHW_SCOPE_1..N` process environment로 전달한다. 각 값은 비어 있지 않은 정확히 한 argv argument여야 하며 누락·gap·잘못된 count에서는 launcher를 호출하지 않는다. shell source, eval, delimiter join, bracket notation을 사용하지 않는다.
 
 <!-- task-start-contract: temporary:begin -->
 ```bash
-"$HOME/.local/bin/jhw-control-host" task start \
-  --resolve-from-checkout true \
-  --repo-path "$REPOSITORY_PATH" \
-  --temp-alias '<alias>' --goal '<goal>' \
-  --done '<condition-1>' --done '<condition-2>' \
-  --scope '<scope-1>' --scope '<scope-2>' \
-  --origin-adapter <claude|codex|gemini|opencode> --session '<session-id>'
+done_count="${JHW_DONE_COUNT-}"
+scope_count="${JHW_SCOPE_COUNT-}"
+case "$done_count" in ""|0*|*[!0-9]*) exit 1 ;; esac
+case "$scope_count" in ""|0*|*[!0-9]*) exit 1 ;; esac
+test -n "${JHW_TEMP_ALIAS-}" || exit 1
+test -n "${JHW_TEMP_GOAL-}" || exit 1
+test -n "${JHW_ORIGIN_ADAPTER-}" || exit 1
+test -n "${JHW_SESSION_VALUE-}" || exit 1
+
+temporary_start_args=(
+  task start --resolve-from-checkout true --repo-path "$REPOSITORY_PATH"
+  --temp-alias "$JHW_TEMP_ALIAS" --goal "$JHW_TEMP_GOAL"
+)
+for ((index = 1; index <= done_count; index++)); do
+  key="JHW_DONE_$index"
+  declare -p "$key" >/dev/null 2>&1 || exit 1
+  value="${!key}"
+  test -n "$value" || exit 1
+  temporary_start_args+=(--done "$value")
+done
+for ((index = 1; index <= scope_count; index++)); do
+  key="JHW_SCOPE_$index"
+  declare -p "$key" >/dev/null 2>&1 || exit 1
+  value="${!key}"
+  test -n "$value" || exit 1
+  temporary_start_args+=(--scope "$value")
+done
+temporary_start_args+=(
+  --origin-adapter "$JHW_ORIGIN_ADAPTER" --session "$JHW_SESSION_VALUE"
+)
+"$HOME/.local/bin/jhw-control-host" "${temporary_start_args[@]}"
 ```
 <!-- task-start-contract: temporary:end -->
 
@@ -316,16 +340,42 @@ Formal target start tail:
 ```
 <!-- task-lifecycle-contract: switch-formal-start:end -->
 
-Temporary target start tail:
+Temporary target start tail은 위와 같은 numbered process-environment 계약을 사용하며 모든
+`done`·`scope`를 finish 입력과 섞지 않고 별도 argv pair로 만든다.
 
 <!-- task-lifecycle-contract: switch-temporary-start:begin -->
 ```bash
-"$HOME/.local/bin/jhw-control-host" task start \
-  --resolve-from-checkout true --repo-path "$target_root" \
-  --temp-alias "$JHW_TEMP_ALIAS" --goal "$JHW_TEMP_GOAL" \
-  --done "$JHW_DONE_ONE" --done "$JHW_DONE_TWO" \
-  --scope "$JHW_SCOPE_ONE" --scope "$JHW_SCOPE_TWO" \
+done_count="${JHW_DONE_COUNT-}"
+scope_count="${JHW_SCOPE_COUNT-}"
+case "$done_count" in ""|0*|*[!0-9]*) exit 1 ;; esac
+case "$scope_count" in ""|0*|*[!0-9]*) exit 1 ;; esac
+test -n "${JHW_TEMP_ALIAS-}" || exit 1
+test -n "${JHW_TEMP_GOAL-}" || exit 1
+test -n "${JHW_ORIGIN_ADAPTER-}" || exit 1
+test -n "${JHW_SESSION_VALUE-}" || exit 1
+
+temporary_start_args=(
+  task start --resolve-from-checkout true --repo-path "$target_root"
+  --temp-alias "$JHW_TEMP_ALIAS" --goal "$JHW_TEMP_GOAL"
+)
+for ((index = 1; index <= done_count; index++)); do
+  key="JHW_DONE_$index"
+  declare -p "$key" >/dev/null 2>&1 || exit 1
+  value="${!key}"
+  test -n "$value" || exit 1
+  temporary_start_args+=(--done "$value")
+done
+for ((index = 1; index <= scope_count; index++)); do
+  key="JHW_SCOPE_$index"
+  declare -p "$key" >/dev/null 2>&1 || exit 1
+  value="${!key}"
+  test -n "$value" || exit 1
+  temporary_start_args+=(--scope "$value")
+done
+temporary_start_args+=(
   --origin-adapter "$JHW_ORIGIN_ADAPTER" --session "$JHW_SESSION_VALUE"
+)
+"$HOME/.local/bin/jhw-control-host" "${temporary_start_args[@]}"
 ```
 <!-- task-lifecycle-contract: switch-temporary-start:end -->
 
