@@ -857,6 +857,62 @@ describe("Phase 1A deterministic adversarial gate", () => {
     });
   });
 
+  it("4c-resolver. checkout resolution persists only the canonical Repository grant through Claim creation", async () => {
+    const fixture = await makeGateFixture();
+    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const source = new GitHubSourceService({
+      runner: new GateSourceRunner(),
+      catalog: graph.catalog,
+      projects: {
+        async requireProjectRepository() {
+          throw new Error("resolved registration must not revalidate explicit membership");
+        },
+        async resolveUniqueProjectForRepository(repoId) {
+          expect(repoId).toBe("repo-control");
+          return { project_id: "prj-control", source_revision: "2026-08-27T00:00:00Z" };
+        },
+      },
+    });
+
+    const registration = await source.registerFormalTask({
+      resolve_from_checkout: true,
+      repository_path: fixture.sourceRepo,
+      issue_url: issueInput.issue_url,
+    });
+    const canonicalContract = {
+      version: 1 as const,
+      task_id: registration.task.id,
+      grants: [{
+        capability: "repo.modify" as const,
+        resource: { kind: "repository" as const, id: "repo-control" },
+        coordination: "shared" as const,
+      }],
+      dependencies: [],
+    };
+
+    const persisted = await graph.catalog.getTask(registration.task.id);
+    expect(persisted).toMatchObject({ project_id: "prj-control", repo_id: "repo-control" });
+    expect(persisted.work_contract).toEqual(canonicalContract);
+    const started = await graph.tasks.start({
+      task_id: registration.task.id,
+      task_alias: registration.task.aliases[0]!,
+      project_id: registration.task.project_id,
+      repo_id: registration.task.repo_id,
+      origin_adapter: "codex",
+      session_id: "codex-resolved-contract",
+      repository_path: fixture.sourceRepo,
+    });
+
+    if (!("work_contract" in started.claim)) throw new Error("resolved Task Claim must retain its Work Contract");
+    expect(started.claim.work_contract).toEqual(canonicalContract);
+    expect(started.claim.work_contract_digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(started.claim.work_contract.grants).not.toContainEqual(expect.objectContaining({
+      capability: "notion.mutate",
+    }));
+  });
+
   it("4d. child-start retains a persisted child when its exact session is already owned", async () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
@@ -1734,10 +1790,12 @@ describe("Phase 1A deterministic adversarial gate", () => {
       },
     });
     const sourceWithContractIntent = Object.create(source) as GitHubSourceService;
-    sourceWithContractIntent.registerFormalTask = (input) => source.registerFormalTask({
-      ...input,
-      ...emptyTaskContractIntent(),
-    });
+    sourceWithContractIntent.registerFormalTask = (input) => input.resolve_from_checkout === true
+      ? source.registerFormalTask(input)
+      : source.registerFormalTask({
+          ...input,
+          ...emptyTaskContractIntent(),
+        });
     const dependencies = cliDependencies(graph, { source: sourceWithContractIntent });
     const registered = await runCli([
       "repository", "register", "--repo-id", "repo-control", "--slug", "jhw7500/control",

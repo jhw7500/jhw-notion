@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { ControlError } from "../errors.js";
-import { GitHubSourceService, type TaskCoordinateInput } from "../github-source.js";
+import {
+  GitHubSourceService,
+  type RegisterFormalTaskFromSourceInput,
+  type RegisterTemporaryTaskFromSourceInput,
+  type TaskCoordinateInput,
+} from "../github-source.js";
 import type { RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
@@ -32,6 +37,31 @@ if (false) {
   acceptCoordinates({ project_id: "prj-wlan" });
   // @ts-expect-error explicit mode requires both Project and Repository coordinates
   acceptCoordinates({ repo_id: "repo-wlan" });
+
+  const acceptFormal = (_input: RegisterFormalTaskFromSourceInput): void => undefined;
+  acceptFormal({
+    resolve_from_checkout: true,
+    repository_path: checkout,
+    issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    // @ts-expect-error checkout-resolved Formal Tasks derive their grant server-side
+    grants: [{
+      capability: "notion.mutate",
+      resource: { kind: "notion_database", id: "knowledgeBase" },
+      coordination: "shared",
+    }],
+  });
+
+  const acceptTemporary = (_input: RegisterTemporaryTaskFromSourceInput): void => undefined;
+  acceptTemporary({
+    resolve_from_checkout: true,
+    repository_path: checkout,
+    alias: "wlan:tmp-resolved",
+    goal: "verify resolver authority",
+    done_conditions: ["targeted tests pass"],
+    expected_scope: ["src/control"],
+    // @ts-expect-error checkout-resolved Temporary Tasks cannot accept caller dependencies
+    dependencies: [{ relation: "observes", task_id: formal.id }],
+  });
 }
 
 function fixture(overrides: {
@@ -301,6 +331,7 @@ describe("GitHubSourceService", () => {
         resource: { kind: "repository", id: "repo-wlan" },
         coordination: "shared",
       }],
+      dependencies: [],
     }));
   });
 
@@ -331,8 +362,52 @@ describe("GitHubSourceService", () => {
         resource: { kind: "repository", id: "repo-wlan" },
         coordination: "shared",
       }],
+      dependencies: [],
     });
   });
+
+  for (const kind of ["formal", "temporary"] as const) {
+    it.each([
+      ["caller grant", {
+        grants: [{
+          capability: "notion.mutate" as const,
+          resource: { kind: "notion_database" as const, id: "knowledgeBase" },
+          coordination: "shared" as const,
+        }],
+      }],
+      ["caller dependency", {
+        dependencies: [{ relation: "observes" as const, task_id: formal.id }],
+      }],
+    ] as const)(`rejects %s at the checkout-resolved ${kind} contract boundary`, async (_label, intent) => {
+      const { service, catalog, pinnedRepositoryLookup, projects, runner } = fixture();
+
+      const operation = kind === "formal"
+        ? service.registerFormalTask({
+          resolve_from_checkout: true,
+          repository_path: checkout,
+          issue_url: "https://github.com/jhw7500/wlan/issues/7",
+          ...intent,
+        } as never)
+        : service.registerTemporaryTask({
+          resolve_from_checkout: true,
+          repository_path: checkout,
+          alias: "wlan:tmp-20260827-resolver-contract",
+          goal: "verify resolver authority",
+          done_conditions: ["caller contract intent rejected"],
+          expected_scope: ["src/control"],
+          ...intent,
+        } as never);
+
+      await expect(operation).rejects.toMatchObject({ code: "INVALID_TASK_SCOPE" });
+      expect(pinnedRepositoryLookup).not.toHaveBeenCalled();
+      expect(projects.requireProjectRepository).not.toHaveBeenCalled();
+      expect(projects.resolveUniqueProjectForRepository).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(runner.runGh).not.toHaveBeenCalled();
+      expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+      expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+    });
+  }
 
   for (const kind of ["formal", "temporary"] as const) {
     it.each([

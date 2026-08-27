@@ -622,6 +622,27 @@ describe("runCli", () => {
     expect(dependencies.mutationLock.run).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["Formal", "--grant", "notion.mutate:notion_database:knowledgeBase:shared", resolvedFormalStartArgs],
+    ["Formal", "--depends", `observes:${CHILD_TASK_ID}`, resolvedFormalStartArgs],
+    ["Temporary", "--grant", "notion.mutate:notion_database:knowledgeBase:shared", resolvedTemporaryStartArgs],
+    ["Temporary", "--depends", `observes:${CHILD_TASK_ID}`, resolvedTemporaryStartArgs],
+  ] as const)("rejects checkout-resolved %s caller contract flag %s before source or Claim mutation", async (
+    _kind,
+    flag,
+    value,
+    args,
+  ) => {
+    const dependencies = makeCliDependencies();
+
+    const result = await runCli([...args(), flag, value], dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.source.registerFormalTask).not.toHaveBeenCalled();
+    expect(dependencies.source.registerTemporaryTask).not.toHaveBeenCalled();
+    expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
   it.each(["PROJECT_REPOSITORY_NOT_FOUND", "PROJECT_REPOSITORY_AMBIGUOUS"] as const)(
     "projects checkout resolver association failure %s before Claim creation",
     async (code) => {
@@ -637,24 +658,24 @@ describe("runCli", () => {
   );
 
   it.each([
-    ["rejects false resolver", ["task", "start", "--resolve-from-checkout", "false", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
-    ["rejects yes resolver", ["task", "start", "--resolve-from-checkout", "yes", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
-    ["rejects empty resolver", ["task", "start", "--resolve-from-checkout", "", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
+    ["rejects false resolver", ["task", "start", "--resolve-from-checkout", "false", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects yes resolver", ["task", "start", "--resolve-from-checkout", "yes", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects empty resolver", ["task", "start", "--resolve-from-checkout", "", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid", "--origin-adapter", "codex"]],
     ["rejects resolver plus Project", [...resolvedFormalStartArgs(), "--project", PROJECT_ID]],
     ["rejects resolver plus Repository", [...resolvedFormalStartArgs(), "--repo-id", REPO_ID]],
-    ["rejects partial Project coordinates", ["task", "start", "--project", PROJECT_ID, "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
-    ["rejects partial Repository coordinates", ["task", "start", "--repo-id", REPO_ID, "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
-    ["rejects no coordinate mode", ["task", "start", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid"]],
-    ["rejects resolver on resume", ["task", "start", "--task", TASK_ID, "--resolve-from-checkout", "true", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects issue node registration on resume", ["task", "start", "--task", TASK_ID, "--issue-node-id", "I_control", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects issue URL registration on resume", ["task", "start", "--task", TASK_ID, "--issue-url", "https://github.com/example/control/issues/1", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects issue revision registration on resume", ["task", "start", "--task", TASK_ID, "--issue-revision", "2026-08-13T00:00:00Z", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects Temporary alias registration on resume", ["task", "start", "--task", TASK_ID, "--temp-alias", "resolved-temp", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects Temporary goal registration on resume", ["task", "start", "--task", TASK_ID, "--goal", "complete the resolved task", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects Temporary done registration on resume", ["task", "start", "--task", TASK_ID, "--done", "targeted test passes", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects Temporary scope registration on resume", ["task", "start", "--task", TASK_ID, "--scope", "src/control", "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects Project coordinates on resume", ["task", "start", "--task", TASK_ID, "--project", PROJECT_ID, "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
-    ["rejects Repository coordinates on resume", ["task", "start", "--task", TASK_ID, "--repo-id", REPO_ID, "--repo-path", "/private/source/control", "--session", "codex-invalid"]],
+    ["rejects partial Project coordinates", ["task", "start", "--project", PROJECT_ID, "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects partial Repository coordinates", ["task", "start", "--repo-id", REPO_ID, "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects no coordinate mode", ["task", "start", "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects resolver on resume", ["task", "start", "--task", TASK_ID, "--resolve-from-checkout", "true", "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects issue node registration on resume", ["task", "start", "--task", TASK_ID, "--issue-node-id", "I_control", "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects issue URL registration on resume", ["task", "start", "--task", TASK_ID, "--issue-url", "https://github.com/example/control/issues/1", "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects issue revision registration on resume", ["task", "start", "--task", TASK_ID, "--issue-revision", "2026-08-13T00:00:00Z", "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects Temporary alias registration on resume", ["task", "start", "--task", TASK_ID, "--temp-alias", "resolved-temp", "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects Temporary goal registration on resume", ["task", "start", "--task", TASK_ID, "--goal", "complete the resolved task", "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects Temporary done registration on resume", ["task", "start", "--task", TASK_ID, "--done", "targeted test passes", "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects Temporary scope registration on resume", ["task", "start", "--task", TASK_ID, "--scope", "src/control", "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects Project coordinates on resume", ["task", "start", "--task", TASK_ID, "--project", PROJECT_ID, "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
+    ["rejects Repository coordinates on resume", ["task", "start", "--task", TASK_ID, "--repo-id", REPO_ID, "--repo-path", "/private/source/control", "--session", "codex-invalid", "--origin-adapter", "codex"]],
   ] as const)("%s before source registration or Claim creation", async (_name, argv) => {
     const dependencies = makeCliDependencies();
 
@@ -1369,7 +1390,7 @@ describe("runCli", () => {
     const dependencies = makeCliDependencies();
     const result = await runCli([
       "task", "start", "--task", TASK_ID, "--repo-path", "/srv/source/control",
-      "--session", "codex-resume", flag, input,
+      "--session", "codex-resume", "--origin-adapter", "codex", flag, input,
     ], dependencies);
 
     expect(result.exitCode).toBe(2);

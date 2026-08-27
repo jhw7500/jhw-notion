@@ -68,20 +68,44 @@ export interface GitHubSourceServiceOptions {
   sensitiveData?: SensitiveDataPolicy;
 }
 
-export type TaskCoordinateInput =
-  | { project_id: string; repo_id: string; resolve_from_checkout?: never }
-  | { resolve_from_checkout: true; project_id?: never; repo_id?: never };
+type ExplicitTaskCoordinateInput = {
+  project_id: string;
+  repo_id: string;
+  resolve_from_checkout?: never;
+};
 
-export type RegisterFormalTaskFromSourceInput = TaskCoordinateInput & {
+type ResolvedTaskCoordinateInput = {
+  resolve_from_checkout: true;
+  project_id?: never;
+  repo_id?: never;
+};
+
+export type TaskCoordinateInput = ExplicitTaskCoordinateInput | ResolvedTaskCoordinateInput;
+
+type FormalTaskSourceInput = {
   repository_path: string;
   issue_url: string;
   expected_issue_node_id?: string;
   expected_issue_revision?: string;
-} & Pick<RegisterFormalTaskInput, "task_role" | "grants" | "dependencies">;
+};
 
-export type RegisterTemporaryTaskFromSourceInput = TaskCoordinateInput
-  & Omit<RegisterTemporaryTaskInput, "project_id" | "repo_id">
-  & { repository_path: string };
+export type RegisterFormalTaskFromSourceInput = FormalTaskSourceInput & (
+  | (ExplicitTaskCoordinateInput & Pick<RegisterFormalTaskInput, "task_role" | "grants" | "dependencies">)
+  | (ResolvedTaskCoordinateInput & Pick<RegisterFormalTaskInput, "task_role"> & {
+      grants?: never;
+      dependencies?: never;
+    })
+);
+
+type TemporaryTaskSourceInput = Omit<
+  RegisterTemporaryTaskInput,
+  "project_id" | "repo_id" | "grants" | "dependencies"
+> & { repository_path: string };
+
+export type RegisterTemporaryTaskFromSourceInput = TemporaryTaskSourceInput & (
+  | (ExplicitTaskCoordinateInput & Pick<RegisterTemporaryTaskInput, "grants" | "dependencies">)
+  | (ResolvedTaskCoordinateInput & { grants?: never; dependencies?: never })
+);
 
 interface VerifiedTaskContext {
   project_id: string;
@@ -140,6 +164,16 @@ function assertTaskCoordinateShape(coordinates: TaskCoordinateInput): void {
   const explicit = !hasResolver && hasProject && hasRepository;
   if (!resolved && !explicit) {
     throw new ControlError("INVALID_TASK_SCOPE", "Task coordinates must select exactly one mode");
+  }
+}
+
+function assertResolvedContractBoundary(input: {
+  resolve_from_checkout?: unknown;
+  grants?: unknown;
+  dependencies?: unknown;
+}): void {
+  if (input.resolve_from_checkout === true && ("grants" in input || "dependencies" in input)) {
+    throw new ControlError("INVALID_TASK_SCOPE", "Checkout-resolved Tasks define their contract server-side");
   }
 }
 
@@ -211,6 +245,7 @@ export class GitHubSourceService {
     issueCoordinates(formalRequest.issue_url);
     this.assertCheckoutSafe(formalRequest, repositoryPath);
     assertTaskCoordinateShape(formalRequest);
+    assertResolvedContractBoundary(formalRequest);
     const context = await this.requireContext(formalRequest, repositoryPath);
     const issue = await this.resolveIssue(context.repository, formalRequest.issue_url);
     this.assertCheckoutSafe(issue, repositoryPath);
@@ -221,20 +256,21 @@ export class GitHubSourceService {
     if (formalRequest.expected_issue_revision !== undefined && formalRequest.expected_issue_revision !== issue.issue_revision) {
       throw new ControlError("ISSUE_REVISION_MISMATCH", "Caller Issue revision disagrees with the verified Issue");
     }
-    const grants = formalRequest.grants ?? (formalRequest.resolve_from_checkout === true
+    const grants = formalRequest.resolve_from_checkout === true
       ? [{
           capability: "repo.modify" as const,
           resource: { kind: "repository" as const, id: context.repo_id },
           coordination: "shared" as const,
         }]
-      : undefined);
+      : formalRequest.grants;
+    const dependencies = formalRequest.resolve_from_checkout === true ? [] : formalRequest.dependencies;
     return this.options.catalog.registerFormalTask({
       project_id: context.project_id,
       repo_id: context.repo_id,
       ...issueRecord(issue),
       ...(input.task_role !== undefined ? { task_role: input.task_role } : {}),
       ...(grants !== undefined ? { grants } : {}),
-      ...(input.dependencies !== undefined ? { dependencies: input.dependencies } : {}),
+      ...(dependencies !== undefined ? { dependencies } : {}),
     });
   }
 
@@ -242,25 +278,30 @@ export class GitHubSourceService {
     const { repository_path: repositoryPath, ...temporaryRequest } = input;
     this.assertCheckoutSafe(temporaryRequest, repositoryPath);
     assertTaskCoordinateShape(temporaryRequest);
+    assertResolvedContractBoundary(temporaryRequest);
     const context = await this.requireContext(temporaryRequest, repositoryPath);
     const {
       project_id: _projectId,
       repo_id: _repoId,
       resolve_from_checkout: _resolve,
+      grants: requestedGrants,
+      dependencies,
       ...temporary
     } = temporaryRequest;
-    const grants = temporary.grants ?? (temporaryRequest.resolve_from_checkout === true
+    const grants = temporaryRequest.resolve_from_checkout === true
       ? [{
           capability: "repo.modify" as const,
           resource: { kind: "repository" as const, id: context.repo_id },
           coordination: "shared" as const,
         }]
-      : undefined);
+      : requestedGrants;
+    const resolvedDependencies = temporaryRequest.resolve_from_checkout === true ? [] : dependencies;
     return this.options.catalog.registerTemporaryTask({
       ...temporary,
       project_id: context.project_id,
       repo_id: context.repo_id,
       ...(grants !== undefined ? { grants } : {}),
+      ...(resolvedDependencies !== undefined ? { dependencies: resolvedDependencies } : {}),
     });
   }
 

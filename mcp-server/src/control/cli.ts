@@ -1166,11 +1166,14 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     )) {
       usage("Existing Task resume cannot include registration fields");
     }
+    if (hasResolved && (flags.has("--grant") || flags.has("--depends"))) {
+      usage("Checkout-resolved Task start cannot include caller contract fields");
+    }
     if (!hasExisting && hasFormal === hasTemporary) usage("Task start requires exactly one task source");
 
     const rawGrants = values(flags, "--grant");
     const rawDependencies = values(flags, "--depends");
-    const contractIntent = hasExisting || (hasResolved && rawGrants.length === 0 && rawDependencies.length === 0)
+    const contractIntent = hasExisting || hasResolved
       ? undefined
       : parseContractIntentFlags(rawGrants, rawDependencies);
     const taskRole = hasExisting ? undefined : parseTaskRoleFlag(value(flags, "--role"));
@@ -1203,18 +1206,23 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         if (cause instanceof ControlError) throw cause;
         usage("Invalid issue URL");
       }
-      const registration = await dependencies.source.registerFormalTask({
-        ...coordinates,
+      const sourceInput = {
         repository_path,
         issue_url,
         ...(taskRole !== undefined ? { task_role: taskRole } : {}),
-        ...(contractIntent !== undefined ? {
-          grants: contractIntent.grants,
-          dependencies: contractIntent.dependencies,
-        } : {}),
         ...(value(flags, "--issue-node-id") ? { expected_issue_node_id: value(flags, "--issue-node-id") } : {}),
         ...(value(flags, "--issue-revision") ? { expected_issue_revision: value(flags, "--issue-revision") } : {}),
-      });
+      };
+      const registration = coordinates.resolve_from_checkout === true
+        ? await dependencies.source.registerFormalTask({ ...coordinates, ...sourceInput })
+        : await dependencies.source.registerFormalTask({
+            ...coordinates,
+            ...sourceInput,
+            ...(contractIntent !== undefined ? {
+              grants: contractIntent.grants,
+              dependencies: contractIntent.dependencies,
+            } : {}),
+          });
       task = registration.task;
       alias = task.aliases[0] ?? usage("Formal Task has no canonical alias");
     } else {
@@ -1225,13 +1233,17 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
       const expected_scope = values(flags, "--scope").filter((entry) => isNonEmpty(entry));
       if (done_conditions.length === 0 || expected_scope.length === 0) usage("Temporary task needs done and scope values");
       if (taskRole !== "standalone") usage("Temporary Tasks must use the standalone role");
-      task = await dependencies.source.registerTemporaryTask({
-        ...coordinates, repository_path, alias, goal, done_conditions, expected_scope,
-        ...(contractIntent !== undefined ? {
-          grants: contractIntent.grants,
-          dependencies: contractIntent.dependencies,
-        } : {}),
-      });
+      task = coordinates.resolve_from_checkout === true
+        ? await dependencies.source.registerTemporaryTask({
+            ...coordinates, repository_path, alias, goal, done_conditions, expected_scope,
+          })
+        : await dependencies.source.registerTemporaryTask({
+            ...coordinates, repository_path, alias, goal, done_conditions, expected_scope,
+            ...(contractIntent !== undefined ? {
+              grants: contractIntent.grants,
+              dependencies: contractIntent.dependencies,
+            } : {}),
+          });
     }
     const project_id = task.project_id;
     const repo_id = task.repo_id;
