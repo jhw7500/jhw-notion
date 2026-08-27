@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_ENTRY="$SCRIPT_DIR/mcp-server/dist/index.js"
 CONTROL_ENTRY="$SCRIPT_DIR/mcp-server/dist/control/cli.js"
 CONTROL_LINK="$HOME/.local/bin/jhw-control"
+HOST_LAUNCHER="$HOME/.local/bin/jhw-control-host"
 CONFIG_EDITOR="$SCRIPT_DIR/scripts/install-config.mjs"
 
 # Colors
@@ -16,6 +17,37 @@ NC='\033[0m'
 ok() { echo -e "  ${GREEN}✅ $1${NC}"; }
 skip() { echo -e "  ${YELLOW}⏭️  $1${NC}"; }
 fail() { echo -e "  ${RED}❌ $1${NC}"; }
+
+require_control_host() {
+  local contract
+  if [ ! -x "$HOST_LAUNCHER" ]; then
+    fail "jhw-control-host v3가 필요합니다. claude-config/install.sh를 먼저 실행하세요."
+    exit 1
+  fi
+  if ! contract="$("$HOST_LAUNCHER" --contract 2>/dev/null)"; then
+    fail "jhw-control-host 계약을 확인할 수 없습니다. claude-config/install.sh를 다시 실행하세요."
+    exit 1
+  fi
+  if ! JHW_CONTROL_HOST_CONTRACT="$contract" node -e '
+    const { isDeepStrictEqual } = require("node:util");
+    const expected = {
+      commands: ["unlock", "preflight", "portfolio status", "task start", "task finish"],
+      credential_policy: "secure-store-only",
+      name: "jhw-control-host",
+      version: 3,
+    };
+    let actual;
+    try {
+      actual = JSON.parse(process.env.JHW_CONTROL_HOST_CONTRACT);
+    } catch {
+      process.exit(1);
+    }
+    process.exit(isDeepStrictEqual(actual, expected) ? 0 : 1);
+  '; then
+    fail "jhw-control-host v3 secure-store-only 계약이 필요합니다. claude-config/install.sh를 다시 실행하세요."
+    exit 1
+  fi
+}
 
 usage() {
   echo "Usage: $0 [--uninstall]"
@@ -263,6 +295,8 @@ fi
 
 # --- Install ---
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then usage; fi
+
+require_control_host
 
 echo "jhw-notion 설치를 시작합니다..."
 echo ""
