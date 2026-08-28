@@ -721,13 +721,23 @@ describe("Phase 1A deterministic adversarial gate", () => {
     ];
     const firstPromise = runCli(formalStartArgs("codex-a"), heldDependencies);
     await enteredStart.promise;
-    const contender = await runCli(formalStartArgs("codex-b"), contenderDependencies);
+    let contenderSettled = false;
+    const contenderPromise = runCli(formalStartArgs("codex-b"), contenderDependencies)
+      .finally(() => { contenderSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const waitedInsteadOfFailingFast = !contenderSettled;
     release.resolve();
-    const first = await firstPromise;
+    const [first, contender] = await Promise.all([firstPromise, contenderPromise]);
 
+    expect(waitedInsteadOfFailingFast).toBe(true);
     expect(first.exitCode).toBe(0);
-    expect(contender).toMatchObject({ exitCode: 75 });
-    expect(JSON.parse(contender.stderr)).toEqual({ error: { code: "LOCK_CONTENDED" } });
+    expect(contender).toMatchObject({ exitCode: 4 });
+    expect(JSON.parse(contender.stderr)).toMatchObject({
+      error: {
+        code: "TASK_ALREADY_CLAIMED",
+        conflicting_claim: { task_id: canonical.id },
+      },
+    });
     const started = JSON.parse(first.stdout).result;
     expect(started.task.task_id).toBe(canonical.id);
     expect(await graph.claims.getActive(started.task.task_id)).toMatchObject({ claim_id: started.claim.claim_id });

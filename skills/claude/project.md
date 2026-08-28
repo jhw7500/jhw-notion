@@ -78,7 +78,7 @@ Project Record는 비공개 Project의 canonical DraftIssue다. Registry Issue�
 
 성공 시 `project_id`, `project_item_id`, `source_node_id`만 보고한다. partial failure 후에는 동일 approved payload와 정확히 하나인 같은 DraftIssue만 재사용한다. 다른 title/body/field/node를 자동 채택하거나 중복 item을 만들지 않는다.
 
-Project write는 read에 지연되어 반영되므로 등록은 두 번 기다린다 — 레코드 부재 확인(2초 1회)과 최종 검증(최대 14초)이며, 둘이 합성되면 **최악 16초**다. **그 시간이 걸리는 것은 정상**이므로 중간에 끊지 않는다. 그동안 호스트 전역 lock을 잡으므로 다른 세션의 lifecycle 명령이 `LOCK_CONTENDED`로 실패할 수 있다. 중단된 등록을 재시도하면 host-local 등록 기록의 좌표로 기존 DraftIssue를 단건 조회해 재사용하므로 중복이 생기지 않는다. 그 기록은 보조 수단이라 없거나 읽히지 않아도 등록은 그대로 진행된다.
+Project write는 read에 지연되어 반영되므로 등록은 두 번 기다린다 — 레코드 부재 확인(2초 1회)과 최종 검증(최대 14초)이며, 둘이 합성되면 **최악 16초**다. **그 시간이 걸리는 것은 정상**이므로 중간에 끊지 않는다. 그동안 호스트 전역 lock을 잡으므로 다른 세션의 lifecycle 명령은 최대 30초 기다리고, 그 뒤에도 점유 중이면 `LOCK_CONTENDED` + `registry_state_lock`을 반환할 수 있다. optional `lock_holder`는 관측값이므로 `registry.lock`을 삭제하거나 holder를 자동 종료하지 않는다. 중단된 등록을 재시도하면 host-local 등록 기록의 좌표로 기존 DraftIssue를 단건 조회해 재사용하므로 중복이 생기지 않는다. 그 기록은 보조 수단이라 없거나 읽히지 않아도 등록은 그대로 진행된다.
 
 성공 결과에 `registration_record_warning`이 실려 오면 등록은 정상이고 host-local 등록 기록만 고장난 것이다 — exit code는 `0`이며, `REGISTRATION_RECORD_UNREADABLE`·`REGISTRATION_RECORD_AT_CAPACITY`는 등록이 진행 중이 아닐 때 `project-registrations.json`을 삭제해 복구하되, 파일이 멀쩡해 보이면 state directory 자체(심링크로 바뀜, 읽기 비트 없음)를 보고, `REGISTRATION_RECORD_UNWRITABLE`은 디스크 여유와 상위 경로 권한을 확인한다. 실패한 등록의 `stderr`에도 실리므로, 재실행을 지시받은 경우 그 재시도는 좌표 없이 돈다. 방치해도 등록은 옳지만 재시도가 단건 조회로 수렴하지 못한다.
 

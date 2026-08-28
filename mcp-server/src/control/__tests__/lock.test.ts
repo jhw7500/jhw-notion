@@ -104,7 +104,7 @@ describe("callback mutation lock", () => {
     expect(seen.env).not.toHaveProperty("JHW_CONTROL_LOCK_HELD");
   });
 
-  it("keeps Registry writers nonblocking while the captured Guard authority uses bounded host waiting", async () => {
+  it("keeps the Registry writer bounded wait separate from the Guard five-second override", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
     roots.push(root);
     const seen: string[][] = [];
@@ -114,14 +114,17 @@ describe("callback mutation lock", () => {
         return completedAcquisition(0);
       },
     };
-    const lock = new MutationLock(configFor(join(root, "state")), {}, runtime);
+    const lock = new MutationLock(configFor(join(root, "state")), {}, runtime, {}, {
+      waitSeconds: 30,
+      contendedReason: "registry_state_lock",
+    });
     const authority = createGuardMutationLockAuthorityForTesting(lock);
 
-    await lock.run(async () => undefined);
+    await lock.run(async () => undefined, { command: "preflight" });
     await runWithGuardMutationLockAuthority(authority, async () => undefined);
 
     expect(seen).toEqual([
-      ["-n", "-E", "75", "3"],
+      ["-w", "30", "-E", "75", "3"],
       ["-w", "5", "-E", "75", "3"],
     ]);
   });
@@ -198,6 +201,80 @@ describe("callback mutation lock", () => {
     releaseCallback.resolve();
     await running;
     expect((await contender(join(stateDir, "registry.lock"))).code).toBe(0);
+  });
+
+  it("returns bounded holder diagnostics across projects after a real wait timeout", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const holderEntered = deferred();
+    const releaseHolder = deferred();
+    const holder = new MutationLock(configFor(stateDir));
+    const otherProjectConfig = { ...configFor(stateDir), registryDir: "/srv/other-registry" };
+    const waiting = new MutationLock(otherProjectConfig, process.env, undefined, {}, {
+      waitSeconds: 1,
+      contendedReason: "registry_state_lock",
+    });
+    const waitingCallback = vi.fn(async () => undefined);
+    const held = holder.run(async () => {
+      holderEntered.resolve();
+      await releaseHolder.promise;
+    }, { command: "preflight" });
+    await holderEntered.promise;
+
+    try {
+      await expect(waiting.run(waitingCallback, { command: "task start" })).rejects.toMatchObject({
+        code: "LOCK_CONTENDED",
+        details: {
+          reason: "registry_state_lock",
+          lock_holder: {
+            command: "preflight",
+            acquired_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+            elapsed_ms: expect.any(Number),
+            pid_state: "alive",
+          },
+        },
+      });
+      expect(waitingCallback).not.toHaveBeenCalled();
+    } finally {
+      releaseHolder.resolve();
+      await held;
+    }
+  });
+
+  it("recovers after a holder is killed without deleting registry.lock", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-lock-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const lockPath = join(stateDir, "registry.lock");
+    await mkdir(stateDir);
+    const holder = spawnChild(
+      "/usr/bin/flock",
+      ["--no-fork", lockPath, "/bin/sh", "-c", "printf ready; exec sleep 30"],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const ready = new Promise<void>((resolve, reject) => {
+      holder.once("error", reject);
+      holder.stdout?.once("data", () => resolve());
+      holder.once("close", (status) => {
+        if (status !== null && status !== 0) reject(new Error(`holder exited before readiness: ${status}`));
+      });
+    });
+
+    try {
+      await ready;
+      expect((await contender(lockPath)).code).toBe(75);
+      const closed = new Promise<void>((resolve) => holder.once("close", () => resolve()));
+      holder.kill("SIGKILL");
+      await closed;
+
+      await expect(new MutationLock(configFor(stateDir)).run(async () => "acquired", {
+        command: "preflight",
+      })).resolves.toBe("acquired");
+      expect((await lstat(lockPath)).isFile()).toBe(true);
+    } finally {
+      if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
+    }
   });
 
   it("releases the inherited lock FD after a callback error", async () => {

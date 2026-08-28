@@ -39,7 +39,7 @@ export JHW_PREFLIGHT_PROJECT_ITEM_ID=<PVTI_trial-item>
 export JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER=<positive-number>
 ```
 
-`JHW_REGISTRY_DIR`의 realpath/inode, `JHW_REGISTRY_REPOSITORY`, remote의 단 하나뿐인 SSH URL은 같은 Registry를 가리켜야 한다. `JHW_CONTROL_STATE_DIR`는 이 host의 모든 invocation에서 같아야 `registry.lock`이 전역 mutation lock 역할을 한다. private state/snapshot directory는 `0700`, file은 `0600`이다.
+`JHW_REGISTRY_DIR`의 realpath/inode, `JHW_REGISTRY_REPOSITORY`, remote의 단 하나뿐인 SSH URL은 같은 Registry를 가리켜야 한다. `JHW_CONTROL_STATE_DIR`는 이 host의 모든 invocation에서 같아야 프로젝트와 세션에 관계없이 `registry.lock`이 전역 mutation lock 역할을 한다. 일반 Registry writer는 최대 30초 기다리고, 그 뒤에도 점유 중이면 `LOCK_CONTENDED` + `registry_state_lock`을 반환한다. private state/snapshot directory는 `0700`, file은 `0600`이다.
 
 비밀은 host credential store가 **명령 process에만** 주입한다. `.env`, shell history, argument, Git/Handoff, journal, snapshot, report, AI context에 넣지 않는다.
 
@@ -193,7 +193,7 @@ state directory의 모드는 **열 수 있는 한** 매 호출 `0700`으로 복�
 
 경고는 실패한 등록의 `stderr`에도 실린다. `PROJECT_REGISTRATION_UNSETTLED`로 재실행을 지시받았는데 이 경고가 함께 왔다면, 그 재시도는 좌표 없이 도는 것이므로 부재 확인 창에 의존한다.
 
-두 창은 합성될 수 있다. 부재 확인을 쓰고 만든 레코드가 다시 늦게 보이면 **최악 16초**가 걸린다. 그 사이 호스트 전역 lock을 잡고 있으므로 다른 세션의 lifecycle 명령은 `LOCK_CONTENDED`(exit 75)로 즉시 실패한다 — 일괄 등록은 한가한 시간에 한다. **중간에 끊지 않는다.**
+두 창은 합성될 수 있다. 부재 확인을 쓰고 만든 레코드가 다시 늦게 보이면 **최악 16초**가 걸린다. 그 사이 호스트 전역 lock을 잡고 있으므로 다른 세션의 lifecycle 명령은 최대 30초 기다린다. 그 뒤에도 점유 중이면 `LOCK_CONTENDED`(exit 75) + `registry_state_lock`과 optional `lock_holder` 진단을 반환한다. 진단은 관측값이므로 `registry.lock`을 삭제하거나 holder를 자동 종료하지 않는다. 일괄 등록은 한가한 시간에 하며 **중간에 끊지 않는다.**
 
 읽기 전용 명령(`task status`·`handoff`·`assert-owner`·`recover --action status`·`portfolio status`)은 호스트 lock을 잡지 않는다. 그래서 이들이 도는 동안 다른 세션이 Registry에 커밋하면 `REGISTRY_MOVED_DURING_READ`가 날 수 있다 — **Registry가 손상된 것이 아니라 이 읽기가 뒤처진 것**이므로 그대로 다시 실행하면 된다. `REGISTRY_CORRUPT`와 구분되는 이유가 이것이고, 반복해서 난다면 그때는 쓰기가 계속 들어오고 있는 것이니 한가한 시점에 다시 본다.
 

@@ -57,6 +57,15 @@ describe("error reason vocabulary", () => {
     expect(doc).toContain("`guard_state_lock`");
   });
 
+  it("binds Registry contention to vocabulary and operator documentation", () => {
+    const source = readFileSync(join(controlDir, "process.ts"), "utf8");
+    const doc = readFileSync(join(repositoryRoot, "skills", "claude", "task.md"), "utf8");
+
+    expect(source).toContain('contendedReason: "registry_state_lock"');
+    expect(ERROR_REASONS).toContain("registry_state_lock");
+    expect(doc).toContain("`registry_state_lock`");
+  });
+
   it("documents every registered reason where the operator is told to read it", () => {
     // The operator docs are the skill files; every axis must be named in at
     // least one of them, not necessarily in task.md specifically.

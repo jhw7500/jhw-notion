@@ -354,9 +354,23 @@ describe("Guard production provenance", () => {
     });
     await enteredPromise;
 
-    await expect(second.run(async () => undefined)).rejects.toMatchObject({ code: "LOCK_CONTENDED" });
+    let secondEntered = false;
+    let secondSettled = false;
+    const competing = second.run(async () => {
+      secondEntered = true;
+    }).then(
+      () => "fulfilled" as const,
+      () => "rejected" as const,
+    ).finally(() => { secondSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const waitedInsteadOfFailingFast = !secondEntered && !secondSettled;
     release();
     await held;
+    const outcome = await competing;
+
+    expect(waitedInsteadOfFailingFast).toBe(true);
+    expect(outcome).toBe("fulfilled");
+    expect(secondEntered).toBe(true);
   });
 
   it("retains exactly-one consume in a module-owned production request store", async () => {
