@@ -26,7 +26,7 @@ run_install() {
 provision_valid_control_host() {
   local home="$1"
   provision_control_host_contract "$home" \
-    '{"commands":["unlock","preflight","portfolio status","task start","task finish"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":3}'
+    '{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":4}'
 }
 
 provision_control_host_contract() {
@@ -345,7 +345,7 @@ test_missing_control_host_fails_before_activation() {
   [ ! -e "$home/.codex/config.toml" ] || return 1
 }
 
-test_non_v3_control_host_contract_fails_before_activation() {
+test_non_v4_control_host_contract_fails_before_activation() {
   local label home contract
   while IFS='|' read -r label contract; do
     home="$ROOT/invalid-control-host-$label-home"
@@ -353,7 +353,7 @@ test_non_v3_control_host_contract_fails_before_activation() {
     provision_control_host_contract "$home" "$contract"
 
     if HOME="$home" PATH="$FAKE_BIN:$PATH" bash "$INSTALL" >"$home/install.log" 2>&1; then
-      echo "non-v3 jhw-control-host contract was accepted: $label" >&2
+      echo "non-v4 jhw-control-host contract was accepted: $label" >&2
       return 1
     fi
 
@@ -363,9 +363,10 @@ test_non_v3_control_host_contract_fails_before_activation() {
     [ ! -e "$home/.claude.json" ] || return 1
     [ ! -e "$home/.codex/config.toml" ] || return 1
   done <<'EOF'
-v2|{"commands":["unlock","preflight","portfolio status","task start"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":2}
-unsafe-policy|{"commands":["unlock","preflight","portfolio status","task start","task finish"],"credential_policy":"environment-fallback","name":"jhw-control-host","version":3}
-extra-command|{"commands":["unlock","preflight","portfolio status","task start","task finish","task recover"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":3}
+former-v3|{"commands":["unlock","preflight","portfolio status","task start","task finish"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":3}
+unsafe-policy|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner"],"credential_policy":"environment-fallback","name":"jhw-control-host","version":4}
+missing-lifecycle-command|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task recover","task assert-owner"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":4}
+extra-command|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner","task unsupported"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":4}
 malformed|not-json
 EOF
 }
@@ -471,8 +472,8 @@ test_uninstall_preserves_foreign_config_symlink
 test_atomic_config_syncs_mode_before_content
 test_npm_pipeline_failure_stops_install
 test_missing_control_host_fails_before_activation
-test_non_v3_control_host_contract_fails_before_activation
 test_empty_uninstall_creates_nothing
 test_owned_round_trip
+test_non_v4_control_host_contract_fails_before_activation
 node "$REPO_ROOT/scripts/test-task-skill-contract.mjs"
 echo "installer safety: ok"

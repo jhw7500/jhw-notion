@@ -659,6 +659,30 @@ function assertStaticStartContract(label, markdown) {
     /수동 재실행[^\n]*`status`[^\n]*`handoff`[^\n]*`assert-owner`[^\n]*`recover --action status`[^\n]*읽기 전용 명령에만 제한/);
 }
 
+const hostOnlyLifecycleCounts = new Map([
+  ["child-start", 1],
+  ["contract", 2],
+  ["completion-ready", 1],
+  ["promote", 1],
+  ["status", 1],
+  ["handoff", 1],
+  ["recover", 4],
+  ["assert-owner", 1],
+]);
+
+function assertHostOnlyLifecycleContract(label, markdown) {
+  assert.doesNotMatch(markdown, /(^|[^-])jhw-control task(?:\s|$)/m,
+    `${label}: raw Task lifecycle invocation must not remain`);
+  for (const [subcommand, expectedCount] of hostOnlyLifecycleCounts) {
+    const absoluteInvocation = new RegExp(
+      `^"\\$HOME/\\.local/bin/jhw-control-host" task ${subcommand}(?: \\\\| |$)`,
+      "gm",
+    );
+    assert.equal(markdown.match(absoluteInvocation)?.length ?? 0, expectedCount,
+      `${label}: ${subcommand} must use the absolute host exactly ${expectedCount} time(s)`);
+  }
+}
+
 function assertStaticFinishContract(label, markdown) {
   const lifecycleBlocks = [
     lifecycleContractBlock(markdown, "finish"),
@@ -963,6 +987,7 @@ async function assertInvalidRepeatableTemporaryInputs(taskPath) {
 
 async function assertConsumerContract(label, taskPath) {
   const markdown = await readFile(taskPath, "utf8");
+  assertHostOnlyLifecycleContract(label, markdown);
   for (const route of routes) {
     const success = await runWorkflow(markdown, route);
     assert.equal(success.exitCode, 0, `${label} ${route.name}: complete route argv must pass`);

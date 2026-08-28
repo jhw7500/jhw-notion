@@ -130,7 +130,7 @@ Temporary Task도 `standalone`으로 저장한다. legacy `expected_scope`와 �
 같은 repository에서 독립적인 하위 작업을 수행할 때 formal parent를 먼저 `parent` role로 구성하고 child를 등록한 즉시 Claim한다. child마다 별도 session, Claim, branch, worktree가 필요하며 parent grant는 상속되지 않는다.
 
 ```bash
-jhw-control task child-start \
+"$HOME/.local/bin/jhw-control-host" task child-start \
   --parent <parent-tsk-id> --alias <child-alias> \
   --repo-path <absolute-checkout-root> --goal <goal> \
   --done <condition> [--done <condition> ...] \
@@ -176,7 +176,7 @@ child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또�
 활성 Claim 확인만 요청받았으면:
 
 ```bash
-jhw-control task status --task <tsk-id> [--claim <active-claim-id>]
+"$HOME/.local/bin/jhw-control-host" task status --task <tsk-id> [--claim <active-claim-id>]
 ```
 
 owner(host/branch/worktree), dirty/ahead/behind와 current Claim을 보여준다. 다른 owner이면 작업하지 않는다.
@@ -186,12 +186,12 @@ owner(host/branch/worktree), dirty/ahead/behind와 current Claim을 보여준다
 legacy contractless Task 또는 inactive Task의 contract를 구성·교체할 때만 실행한다.
 
 ```bash
-jhw-control task contract --task <tsk-id> --role standalone \
+"$HOME/.local/bin/jhw-control-host" task contract --task <tsk-id> --role standalone \
   --grant repo.modify:repository:<repo-id>:shared \
   [--grant test.host:repository:<repo-id>:shared ...] \
   [--depends blocked_by:<tsk-id> ...]
 
-jhw-control task contract --task <formal-tsk-id> --role parent \
+"$HOME/.local/bin/jhw-control-host" task contract --task <formal-tsk-id> --role parent \
   --grant repo.modify:repository:<repo-id>:shared
 ```
 
@@ -210,7 +210,7 @@ adapter 필드가 없던 legacy active Claim/history는 lifecycle 조회와 reco
 사용자가 Handoff를 명시적으로 요청한 경우에만 exact Claim 또는 unambiguous latest history를 읽는다.
 
 ```bash
-jhw-control task handoff --task <tsk-id> [--claim <released-handoff-claim-id>]
+"$HOME/.local/bin/jhw-control-host" task handoff --task <tsk-id> [--claim <released-handoff-claim-id>]
 ```
 
 12 KiB fixed-six-section 결과만 보여주며 다른 history/session을 자동 확장하지 않는다.
@@ -218,7 +218,7 @@ jhw-control task handoff --task <tsk-id> [--claim <released-handoff-claim-id>]
 Temporary Task를 verified Issue로 승격하라는 요청에는 Task ID를 보존한다.
 
 ```bash
-jhw-control task promote --task <tsk-id> \
+"$HOME/.local/bin/jhw-control-host" task promote --task <tsk-id> \
   --repo-path <absolute-checkout-root> \
   --issue-url https://github.com/<owner>/<repo>/issues/<number>
 ```
@@ -232,7 +232,7 @@ jhw-control task promote --task <tsk-id> \
 Formal standalone/parent를 completed로 끝내기 전에는 같은 active Claim에 completion evidence를 먼저 기록한다. 이 command는 Issue를 닫거나 Claim을 release하지 않는다.
 
 ```bash
-jhw-control task completion-ready --task <tsk-id> --claim <current-claim-id> \
+"$HOME/.local/bin/jhw-control-host" task completion-ready --task <tsk-id> --claim <current-claim-id> \
   --integration-validation <evidence> \
   [--integration-validation <evidence> ...] \
   [--child-disposition <child-tsk-id>:superseded|not-required|accepted-risk ...]
@@ -400,14 +400,14 @@ completed 전환이어도 이전 worktree는 병합 여부 판정에 따라 남�
 활성 Claim은 status부터 읽는다.
 
 ```bash
-jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action status
+"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <active-claim-id> --action status
 ```
 
 stale을 추정하지 않는다. `force-end`/`takeover`는 결과를 보여준 뒤 **실행 직전에 별도 사용자 승인**을 받는다.
 
 ```bash
-jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action force-end
-jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action takeover \
+"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <active-claim-id> --action force-end
+"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <active-claim-id> --action takeover \
   --origin-adapter <claude|codex|gemini|opencode> --session <new-session-id>
 ```
 
@@ -416,7 +416,7 @@ Takeover 성공 시 반환된 새 `claim_id`로 `task status`를 다시 확인�
 이미 release된 Claim generation의 pending cleanup은 exact history ID로만 실행한다.
 
 ```bash
-jhw-control task recover --task <tsk-id> --expect <released-claim-id> --action cleanup
+"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <released-claim-id> --action cleanup
 ```
 
 exact `pending-remove`는 cleanup이 재개하는 상태다. active successor/cross-host/coordinate mismatch, dirty worktree, source checkout에 통합되지 않은 commit, `pending-create`, 또는 다른 generation의 ambiguous pending state에서만 멈춘다. 파일 삭제나 새 Claim으로 우회하지 않는다. worktree의 commit이 이미 병합됐으면 commit 수와 무관하게 제거된다. `WORKTREE_UNPUSHED`는 이 cleanup 경로에서만 보인다 — 아직 병합되지 않았거나 source checkout이 detached인 것이므로, 병합과 checkout 상태를 확인하고 다시 실행한다. `task finish`는 이 코드를 표면화하지 않고 `worktree_removed: false`와 `cleanup_error`만 반환하므로, 사유를 알려면 위 cleanup을 실행한다.
@@ -426,7 +426,7 @@ exact `pending-remove`는 cleanup이 재개하는 상태다. active successor/cr
 push, PR, merge, deploy 각각의 직전에 실행한다.
 
 ```bash
-jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
+"$HOME/.local/bin/jhw-control-host" task assert-owner --task <tsk-id> --claim <current-claim-id>
 ```
 
 이 확인은 raw Git을 통합 enforcement하지 않는 **advisory check**라서 확인 직후 승인된 takeover와 race할 수 있다. 안전을 보장하는 wrapper로 표현하지 않는다. 실패하면 공유 동작을 하지 않는다.
