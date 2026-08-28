@@ -61,7 +61,7 @@ Project Record는 Project-only token으로 완전히 읽고 쓸 수 있는 canon
 
 `jhw-control preflight`는 mutation 전에 committed authority/version, read-only Notion ancestry, exact Project scope, private Project/Registry repository, unique matching SSH remote를 검증한다. 그 뒤 고정 canonical Project DraftIssue fixture의 field를 write/restore하고, 이와 독립된 Registry Issue를 unchanged-write하며, fetch/dry-run push를 확인한다. 성공은 `credentials`, `authority`, `notion_guard`, `project`, `registry_repository`, `registry_issue`, `registry_git` 일곱 check가 모두 `ok`일 때뿐이다.
 
-모든 compliant process는 동일한 Registry realpath/inode/remote identity와 immutable absolute `JHW_CONTROL_STATE_DIR`를 사용한다. 그래야 하나의 `registry.lock`이 host mutation을 직렬화한다. process timeout은 bounded이며 Git/SSH는 noninteractive다. secret과 configured private path는 Registry/GitHub/Handoff/journal/snapshot/output/error에 쓰기 전에 중앙 reject policy가 차단한다.
+모든 compliant process는 동일한 Registry realpath/inode/remote identity와 immutable absolute `JHW_CONTROL_STATE_DIR`를 사용한다. 그래야 프로젝트와 세션에 관계없이 하나의 `registry.lock`이 host mutation을 직렬화한다. 일반 Registry writer는 최대 30초 bounded wait하며, timeout은 `LOCK_CONTENDED` + `registry_state_lock`과 optional bounded holder 진단을 반환한다. lock 파일의 metadata는 관측용일 뿐이고 kernel flock만 authority다. process timeout은 bounded이며 Git/SSH는 noninteractive다. secret과 configured private path는 Registry/GitHub/Handoff/journal/snapshot/output/error에 쓰기 전에 중앙 reject policy가 차단한다.
 
 measurement journal은 derived observation이다. journal append가 실패해도 이미 계산된 command success/failure와 coordinates/exit은 바뀌지 않고 bounded `journal_warning`만 추가된다. Phase 1A는 build server manual/on-demand 실행이며 Actions/schedule이 없다. 운영 순서와 stable exit은 `docs/project-control/phase1a-runbook.md`가 정본이다.
 
