@@ -745,7 +745,7 @@ function errorCode(cause: unknown): string {
 function exitCode(cause: unknown, command?: CommandName): CliResult["exitCode"] {
   const code = errorCode(cause);
   if (new Set([
-    "TASK_ALREADY_CLAIMED", "CLAIM_MISMATCH", "CLAIM_NOT_FOUND",
+    "TASK_ALREADY_CLAIMED", "TASK_SESSION_BUSY", "CLAIM_MISMATCH", "CLAIM_NOT_FOUND",
     // Board occupancy/coordinate conflicts are the same family: a script must
     // tell "the board is busy" apart from a crash.
     "BOARD_NOT_FOUND", "BOARD_ALREADY_REGISTERED", "BOARD_NOT_EMPTY", "BOARD_BUSY", "BOARD_RESERVED",
@@ -811,7 +811,10 @@ function errorReason(cause: unknown): string | undefined {
 }
 
 function conflictingClaim(cause: unknown): ConflictingClaimSummary | undefined {
-  if (!(cause instanceof ControlError) || cause.code !== "TASK_ALREADY_CLAIMED") return undefined;
+  if (
+    !(cause instanceof ControlError) ||
+    !new Set(["TASK_ALREADY_CLAIMED", "TASK_SESSION_BUSY"]).has(cause.code)
+  ) return undefined;
   const parsed = ConflictingClaimSummarySchema.safeParse(cause.details.conflicting_claim);
   return parsed.success ? parsed.data : undefined;
 }

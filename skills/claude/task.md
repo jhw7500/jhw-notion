@@ -29,7 +29,7 @@ test -n "$REPOSITORY_PATH" || exit 1
 ```
 <!-- task-start-contract: gate:end -->
 
-`task start` 성공 시 launcher result에서 오직 `task_id`, `claim_id`, `branch`, `worktree_ref` 네 필드만 사용자에게 보고하고 다른 result 필드는 보고하거나 출력하지 않는다. 이 네 immutable 좌표만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
+`task start` 성공 시 launcher result에서 오직 `task_id`, `claim_id`, `branch`, `worktree_ref` 네 필드만 사용자에게 보고하고 다른 result 필드는 보고하거나 출력하지 않는다. 이 네 immutable 좌표만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED` 또는 `TASK_SESSION_BUSY`이면 검증된 `error.conflicting_claim`에서 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 좌표만 보여주고 멈춘다. session ID, repository path, token, raw message와 그 밖의 필드는 보고하거나 출력하지 않는다. `TASK_SESSION_BUSY`의 좌표는 같은 exact session을 이미 점유한 active Task/Claim이다. 자동 status/finish/takeover하지 않는다.
 
 성공 envelope의 `result`에는 향후 safe field가 추가될 수 있다. 사용자 보고는 다음 positive recipe 그대로 네 필드의 새 object를 만들어야 하며 `result` 전체를 전달하거나 나머지 field를 펼치지 않는다.
 
@@ -153,7 +153,7 @@ child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또�
 
 같은 오류에 `error.retained_claim`도 있으면 위 start보다 먼저 해당 exact Claim generation에 아래 recovery 절차를 적용한다. active/released 상태와 안전한 cleanup 여부를 확인한 뒤에만 저장된 child를 재개한다. Task/Claim 파일을 Registry에서 직접 삭제하지 않는다.
 
-성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED`이면 검증된 `error.conflicting_claim`의 bounded 좌표만 보여주고 멈춘다. 자동 status/takeover하지 않는다.
+성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED` 또는 `TASK_SESSION_BUSY`이면 검증된 `error.conflicting_claim`에서 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 좌표만 보여주고 멈춘다. session ID, repository path, token, raw message와 그 밖의 필드는 보고하거나 출력하지 않는다. `TASK_SESSION_BUSY`에서 이 좌표는 같은 exact session을 이미 점유한 active Task/Claim이며, `error.retained_task`가 함께 있으면 그것은 등록됐지만 시작되지 못한 새 child이므로 서로 혼동하지 않는다. 자동 status/finish/takeover하지 않으며, 사용자가 명시적으로 Task 전환을 요청한 경우에만 아래 전환 절차에 conflicting Task/Claim 좌표를 사용한다.
 
 ## 기존 Task 재개
 
@@ -390,7 +390,7 @@ Existing Task target start tail은 registration/resolver field 없이 retained r
 <!-- task-lifecycle-contract: switch-resume-start:end -->
 
 5. **start를 한 번 실행한다.** Formal/Temporary는 resolver start, Existing Task는 `--task` resume만 사용한다. `--session`은 같은 switch 요청의 session-id를 승계하고 현재 TUI의 exact `--origin-adapter`를 함께 전달한다. external gate rerun, raw control, rollback, automatic refinish는 없다.
-6. **finish 성공 후 start 실패는 정상적인 부분 완료 상태다.** 이전 Claim은 이미 release되었으며 rollback하거나 release를 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. finish는 절대 반복하지 않는다. 이후 start는 별도 사용자 승인을 받고 해당 error의 결과 해석 규칙이 허용할 때만 새로 실행하며, `REGISTRY_MOVED_DURING_READ`는 자동 retry나 explicit-mode fallback을 허용하지 않는다. target Repository가 미등록되어 `PROJECT_REPOSITORY_NOT_FOUND`이거나 association이 ambiguous이면 이전 Claim release 뒤 start가 실패할 수 있다. 자동 rollback이나 성공 약속을 하지 않는다.
+6. **finish 성공 후 start 실패는 정상적인 부분 완료 상태다.** 이전 Claim은 이미 release되었으며 rollback하거나 release를 되돌리지 않는다. start 오류만 결과 해석 절차대로 보고하며, `TASK_ALREADY_CLAIMED` 또는 `TASK_SESSION_BUSY`이면 기존 규칙대로 bounded 좌표만 보여주고 멈춘다. finish는 절대 반복하지 않는다. 이후 start는 별도 사용자 승인을 받고 해당 error의 결과 해석 규칙이 허용할 때만 새로 실행하며, `REGISTRY_MOVED_DURING_READ`는 자동 retry나 explicit-mode fallback을 허용하지 않는다. target Repository가 미등록되어 `PROJECT_REPOSITORY_NOT_FOUND`이거나 association이 ambiguous이면 이전 Claim release 뒤 start가 실패할 수 있다. 자동 rollback이나 성공 약속을 하지 않는다.
 7. **결과를 함께 보고한다.** 종료한 Task(current-tsk-id, status, released claim)와 시작한 Task(target-tsk-id, 새 claim_id, branch, worktree_ref)를 서로 구분해 한 번에 보여준다.
 
 completed 전환이어도 이전 worktree는 병합 여부 판정에 따라 남을 수 있다. 전환이 cleanup을 대신하지 않으며, 정리는 아래 recovery의 released-generation cleanup 절차를 따른다.

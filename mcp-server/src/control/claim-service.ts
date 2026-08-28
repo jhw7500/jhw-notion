@@ -952,7 +952,14 @@ export class ClaimService {
       active.task_id !== requestedTaskId && active.session_id === sessionId && active.host === host &&
       (!("origin_adapter" in active) || active.origin_adapter === originAdapter));
     if (!conflicting) return;
-    const summary = ConflictingClaimSummarySchema.safeParse(conflicting);
+    const summary = ConflictingClaimSummarySchema.safeParse({
+      task_id: conflicting.task_id,
+      claim_id: conflicting.claim_id,
+      host: conflicting.host,
+      branch: conflicting.branch,
+      worktree_ref: conflicting.worktree_ref,
+      started_at: conflicting.started_at,
+    });
     throw new ControlError(
       "TASK_SESSION_BUSY",
       "Exact host session already owns a different active Task",

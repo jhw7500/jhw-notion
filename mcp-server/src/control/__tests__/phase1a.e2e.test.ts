@@ -938,7 +938,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       grants: [sharedGrant],
       dependencies: [],
     });
-    await graph.tasks.start({
+    const blockerStart = await graph.tasks.start({
       task_id: blocker.id,
       task_alias: blocker.aliases[0]!,
       project_id: blocker.project_id,
@@ -955,7 +955,18 @@ describe("Phase 1A deterministic adversarial gate", () => {
     const retainedTaskId = JSON.parse(result.stderr).error.retained_task.task_id as string;
 
     expect(JSON.parse(result.stderr)).toEqual({
-      error: { code: "TASK_SESSION_BUSY", retained_task: { task_id: retainedTaskId } },
+      error: {
+        code: "TASK_SESSION_BUSY",
+        conflicting_claim: {
+          task_id: blockerStart.claim.task_id,
+          claim_id: blockerStart.claim.claim_id,
+          host: blockerStart.claim.host,
+          branch: blockerStart.claim.branch,
+          worktree_ref: blockerStart.claim.worktree_ref,
+          started_at: blockerStart.claim.started_at,
+        },
+        retained_task: { task_id: retainedTaskId },
+      },
     });
     const [child] = await graph.catalog.listChildren(parent.id);
     expect(child).toMatchObject({ id: retainedTaskId, aliases: ["control:retained-session-child"] });
