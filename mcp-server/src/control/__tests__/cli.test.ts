@@ -848,9 +848,41 @@ describe("runCli", () => {
     expect(JSON.parse(journal)).not.toHaveProperty("error_reason");
   });
 
+  it("returns bounded owner coordinates and exit code 4 for exact session occupancy", () => {
+    const conflictingClaim = {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      host: "build-host",
+      branch: "task/000000000001-control-task",
+      worktree_ref: "wt-000000000001-control-task",
+      started_at: "2026-08-13T00:00:00.000Z",
+    };
+    const result = controlErrorResult(new ControlError(
+      "TASK_SESSION_BUSY",
+      "occupied with raw-secret-message",
+      {
+        conflicting_claim: conflictingClaim,
+        session_id: "codex-secret-session",
+        repository_path: "/private/source/control",
+        token: "secret-token",
+      },
+    ), "task start");
+
+    expect(result.exitCode).toBe(4);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "TASK_SESSION_BUSY", conflicting_claim: conflictingClaim },
+    });
+    expect(result.stderr).not.toContain("codex-secret-session");
+    expect(result.stderr).not.toContain("secret-token");
+    expect(result.stderr).not.toContain("raw-secret-message");
+    expect(result.stderr).not.toContain("/private/source/control");
+  });
+
   it.each([
-    undefined,
-    {
+    ["TASK_ALREADY_CLAIMED", "missing", undefined],
+    ["TASK_SESSION_BUSY", "missing", undefined],
+    ["TASK_ALREADY_CLAIMED", "extra-field", {
       task_id: TASK_ID,
       claim_id: CLAIM_ID,
       host: "build-host",
@@ -858,12 +890,21 @@ describe("runCli", () => {
       worktree_ref: "wt-control",
       started_at: "2026-08-13T00:00:00.000Z",
       session_id: "must-reject-extra-field",
-    },
-  ])("fails closed when Claim-conflict coordinates are missing or malformed", async (conflicting_claim) => {
+    }],
+    ["TASK_SESSION_BUSY", "extra-field", {
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      host: "build-host",
+      branch: "task/control",
+      worktree_ref: "wt-control",
+      started_at: "2026-08-13T00:00:00.000Z",
+      session_id: "must-reject-extra-field",
+    }],
+  ] as const)("fails closed for %s when Claim-conflict coordinates are %s", async (code, _shape, conflicting_claim) => {
     const result = await runCli(formalStartArgs(), makeCliDependencies({
       taskService: {
         start: async () => {
-          throw new ControlError("TASK_ALREADY_CLAIMED", "occupied", {
+          throw new ControlError(code, "occupied", {
             ...(conflicting_claim ? { conflicting_claim } : {}),
           });
         },
@@ -871,7 +912,7 @@ describe("runCli", () => {
     }));
 
     expect(result.exitCode).toBe(4);
-    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "TASK_ALREADY_CLAIMED" } });
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code } });
     expect(result.stderr).not.toContain("must-reject-extra-field");
   });
 
