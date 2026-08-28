@@ -244,6 +244,32 @@ export const ConflictingClaimSummarySchema = ActiveClaimBaseSchema.pick({
 }).strict();
 export type ConflictingClaimSummary = z.infer<typeof ConflictingClaimSummarySchema>;
 
+/** Closed command labels that may be persisted in Registry lock diagnostics. */
+export const RegistryMutationCommandSchema = z.enum([
+  "preflight",
+  "repository register",
+  "task start",
+  "task child-start",
+  "task contract",
+  "task completion-ready",
+  "task finish",
+  "task promote",
+  "task recover",
+  "project register",
+  "project update",
+  "portfolio export",
+]);
+export type RegistryMutationCommand = z.infer<typeof RegistryMutationCommandSchema>;
+
+/** The complete public diagnosis for one contended Registry lock holder. */
+export const LockHolderSummarySchema = z.object({
+  command: RegistryMutationCommandSchema,
+  acquired_at: OffsetDateTimeSchema,
+  elapsed_ms: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  pid_state: z.enum(["alive", "dead", "unknown"]),
+}).strict();
+export type LockHolderSummary = z.infer<typeof LockHolderSummarySchema>;
+
 /** The only child-registration coordinate an error envelope may retain. */
 export const RetainedTaskSummarySchema = z.object({
   task_id: TaskIdSchema,
@@ -304,6 +330,8 @@ export const ERROR_REASONS = [
   "live_pid_recorded",
   // LOCK_CONTENDED — boards.lock, distinguished from registry.lock contention.
   "board_state_lock",
+  // LOCK_CONTENDED — the host-global Registry writer lock.
+  "registry_state_lock",
   // LOCK_CONTENDED — the independent one-time Guard request state lock.
   "guard_state_lock",
 ] as const;

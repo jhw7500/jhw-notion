@@ -13,7 +13,7 @@ import {
   type GuardHostCoordinateAuthority,
 } from "./guard-coordinate.js";
 import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
-import type { ErrorReason } from "./schemas.js";
+import type { ErrorReason, RegistryMutationCommand } from "./schemas.js";
 import { isSensitiveEnvironmentKey } from "./sensitive-data.js";
 
 const MAX_CAPTURE_BYTES = 1024 * 1024;
@@ -493,8 +493,12 @@ const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLO
 const strictLockCreateFlags = lockOpenFlags | constants.O_EXCL;
 const existingLockOpenFlags = constants.O_RDWR | constants.O_NOFOLLOW;
 
+export interface MutationLockRunContext {
+  command: RegistryMutationCommand;
+}
+
 export interface MutationLockPort {
-  run<T>(callback: () => Promise<T>): Promise<T>;
+  run<T>(callback: () => Promise<T>, context?: MutationLockRunContext): Promise<T>;
 }
 
 export interface MutationLockChild {
@@ -641,7 +645,7 @@ export class MutationLock implements MutationLockPort {
     }
   }
 
-  async run<T>(callback: () => Promise<T>): Promise<T> {
+  async run<T>(callback: () => Promise<T>, _context?: MutationLockRunContext): Promise<T> {
     return this.#runLocked(async () => callback());
   }
 

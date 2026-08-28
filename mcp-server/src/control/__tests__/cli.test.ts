@@ -879,6 +879,54 @@ describe("runCli", () => {
     expect(result.stderr).not.toContain("/private/source/control");
   });
 
+  it("emits only the bounded Registry lock holder summary", () => {
+    const result = controlErrorResult(new ControlError("LOCK_CONTENDED", "private diagnostic", {
+      reason: "registry_state_lock",
+      lock_holder: {
+        command: "preflight",
+        acquired_at: "2026-08-29T00:00:00.000Z",
+        elapsed_ms: 30_012,
+        pid_state: "alive",
+      },
+      pid: 12345,
+      session_id: "private-session",
+      repository_path: "/private/repository",
+    }));
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: {
+        code: "LOCK_CONTENDED",
+        reason: "registry_state_lock",
+        lock_holder: {
+          command: "preflight",
+          acquired_at: "2026-08-29T00:00:00.000Z",
+          elapsed_ms: 30_012,
+          pid_state: "alive",
+        },
+      },
+    });
+    expect(result.stderr).not.toContain("12345");
+    expect(result.stderr).not.toContain("private-session");
+    expect(result.stderr).not.toContain("/private/repository");
+  });
+
+  it("drops a malformed Registry lock holder instead of forwarding extra fields", () => {
+    const result = controlErrorResult(new ControlError("LOCK_CONTENDED", "private diagnostic", {
+      reason: "registry_state_lock",
+      lock_holder: {
+        command: "preflight",
+        acquired_at: "2026-08-29T00:00:00.000Z",
+        elapsed_ms: 30_012,
+        pid_state: "alive",
+        pid: 12345,
+      },
+    }));
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "LOCK_CONTENDED", reason: "registry_state_lock" },
+    });
+  });
+
   it.each([
     ["TASK_ALREADY_CLAIMED", "missing", undefined],
     ["TASK_SESSION_BUSY", "missing", undefined],
@@ -1562,6 +1610,16 @@ describe("runCli", () => {
     expect(status.exitCode).toBe(0);
     expect(exported.exitCode).toBe(0);
     expect(mutationLock.run).toHaveBeenCalledTimes(2);
+    expect(mutationLock.run).toHaveBeenNthCalledWith(
+      1,
+      expect.any(Function),
+      { command: "preflight" },
+    );
+    expect(mutationLock.run).toHaveBeenNthCalledWith(
+      2,
+      expect.any(Function),
+      { command: "portfolio export" },
+    );
   });
 
   it.each([

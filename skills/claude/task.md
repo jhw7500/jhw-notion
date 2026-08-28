@@ -458,6 +458,7 @@ jhw-control guard preflight
 
 ## 결과 해석
 
+- `LOCK_CONTENDED` + `registry_state_lock`이면 같은 호스트의 Registry writer가 최대 30초 대기 뒤에도 실행 중인 것이다. optional `lock_holder`의 `command`, `acquired_at`, `elapsed_ms`, `pid_state`만 보고하며 `registry.lock`을 삭제하거나 holder를 자동 종료하지 않는다.
 - Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
 - exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.

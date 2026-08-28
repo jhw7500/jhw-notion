@@ -62,6 +62,7 @@ import {
   ConflictingClaimSummarySchema,
   ClaimCoordinateSchema,
   GuardRequestSchema,
+  LockHolderSummarySchema,
   ErrorReasonSchema,
   PreflightResultSchema,
   ProjectRecordLinkSchema,
@@ -75,11 +76,13 @@ import {
   type BoardMode,
   type BoundedPortfolioPayload,
   type ConflictingClaimSummary,
+  type LockHolderSummary,
   type PreflightResult,
   type ProjectRecordLink,
   type ProjectRecordUpdate,
   type RegisterProjectInput,
   type RetainedTaskSummary,
+  type RegistryMutationCommand,
   type SnapshotExportResult,
   type TaskRecord,
   type UpdateProjectInput,
@@ -810,6 +813,12 @@ function errorReason(cause: unknown): string | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
+function lockHolder(cause: unknown): LockHolderSummary | undefined {
+  if (!(cause instanceof ControlError) || cause.code !== "LOCK_CONTENDED") return undefined;
+  const parsed = LockHolderSummarySchema.safeParse(cause.details.lock_holder);
+  return parsed.success ? parsed.data : undefined;
+}
+
 function conflictingClaim(cause: unknown): ConflictingClaimSummary | undefined {
   if (
     !(cause instanceof ControlError) ||
@@ -835,6 +844,7 @@ function journalErrorFields(stderr: string): { error_code: string; error_reason?
 export function controlErrorResult(cause: unknown, command?: CommandName, retainedTaskValue?: unknown): CliResult {
   const code = errorCode(cause);
   const reason = errorReason(cause);
+  const holder = lockHolder(cause);
   const conflict = conflictingClaim(cause);
   const boardConflict = conflictingBoard(cause);
   const retained = code === "TASK_ALREADY_CLAIMED" ? undefined : retainedClaim(cause);
@@ -842,6 +852,7 @@ export function controlErrorResult(cause: unknown, command?: CommandName, retain
   const error = {
     code,
     ...(reason ? { reason } : {}),
+    ...(holder ? { lock_holder: holder } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),
     ...(boardConflict ? { conflicting_board: boardConflict } : {}),
     ...(retained ? { retained_claim: retained } : {}),
@@ -1675,14 +1686,18 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
 export async function runCli(argv: string[], dependencies: CliDependencies): Promise<CliResult> {
   const started = dependencies.now?.() ?? new Date();
   const command = commandFor(argv);
+  const lockCommand = mutationLockCommand(argv);
   let flags: ParsedFlags | undefined;
   let result: CliResult;
   try {
     // Lifecycle work cannot reach a production service path without first
     // acquiring the injected host-global callback lock. Read-only commands
     // intentionally remain lock-free.
-    const execution = requiresMutationLock(argv)
-      ? await dependencies.mutationLock.run(() => execute(command, argv, dependencies))
+    const execution = lockCommand
+      ? await dependencies.mutationLock.run(
+        () => execute(command, argv, dependencies),
+        { command: lockCommand },
+      )
       : await execute(command, argv, dependencies);
     if (Buffer.byteLength(execution.result.stdout || execution.result.stderr, "utf8") > CLI_RESULT_BUDGET) {
       throw new ControlError("CLI_OUTPUT_TOO_LARGE", "A control command exceeded the bounded output envelope");
@@ -1791,18 +1806,35 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
   return result;
 }
 
+function mutationLockCommand(argv: readonly string[]): RegistryMutationCommand | undefined {
+  if (argv.length === 1 && argv[0] === "preflight") return "preflight";
+  if (argv[0] === "repository" && argv[1] === "register") return "repository register";
+  if (argv[0] === "task") {
+    switch (argv[1]) {
+      case "start": return "task start";
+      case "child-start": return "task child-start";
+      case "contract": return "task contract";
+      case "completion-ready": return "task completion-ready";
+      case "finish": return "task finish";
+      case "promote": return "task promote";
+      case "recover": {
+        const index = argv.indexOf("--action");
+        return new Set(["force-end", "takeover", "cleanup"]).has(argv[index + 1] ?? "")
+          ? "task recover"
+          : undefined;
+      }
+      default: return undefined;
+    }
+  }
+  if (argv[0] === "project" && argv[1] === "register") return "project register";
+  if (argv[0] === "project" && argv[1] === "update") return "project update";
+  if (argv[0] === "portfolio" && argv[1] === "export") return "portfolio export";
+  return undefined;
+}
+
 /** True only for lifecycle mutations that require the host-global callback lock. */
 export function requiresMutationLock(argv: readonly string[]): boolean {
-  if (argv.length === 1 && argv[0] === "preflight") return true;
-  if (argv[0] === "repository" && argv[1] === "register") return true;
-  if (argv[0] === "task" && new Set([
-    "start", "child-start", "contract", "completion-ready", "finish", "promote",
-  ]).has(argv[1] ?? "")) return true;
-  if (argv[0] === "project" && (argv[1] === "register" || argv[1] === "update")) return true;
-  if (argv[0] === "portfolio" && argv[1] === "export") return true;
-  if (argv[0] !== "task" || argv[1] !== "recover") return false;
-  const index = argv.indexOf("--action");
-  return argv[index + 1] === "force-end" || argv[index + 1] === "takeover" || argv[index + 1] === "cleanup";
+  return mutationLockCommand(argv) !== undefined;
 }
 
 /**
