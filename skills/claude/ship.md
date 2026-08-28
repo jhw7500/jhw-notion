@@ -47,7 +47,7 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 | `--auto-fix` | actionable 지적을 고쳐 재푸시 → 재리뷰 라운드 반복 | off (보고만) |
 | `--base <branch>` | PR 대상(base) 브랜치 | `main` |
 | `--reviewers <list>` | 대기할 리뷰어 부분집합 (예: `codex,gemini-assist`) | 감지된 전체 채널 |
-| `--timeout <min>` | **한 라운드**의 폴링 최대 대기 (간격 ~60s) | 12분 |
+| `--timeout <min>` | **한 라운드**의 폴링 최대 대기 (간격 ~60s) | 20분 |
 | `--max-rounds <n>` | `--auto-fix` 재리뷰 라운드 상한 | 3 |
 
 각 옵션 상세:
@@ -61,7 +61,7 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 - `--auto-fix` — actionable 지적을 고쳐 재푸시 → **재리뷰 라운드 반복**(기본 **최대 3라운드**, `--max-rounds`로 조정). 기본 off(모니터+보고만). N라운드 후에도 FEEDBACK이면 보고하고 머지 안 함.
 - `--base <branch>` — PR base. 기본 `main`(리포 기본 브랜치).
 - `--reviewers <list>` — 대기할 리뷰어 부분집합(예: `codex,gemini-assist`). 기본 전체.
-- `--timeout <min>` — **한 라운드**의 폴링 최대 대기. 기본 12분, 폴링 간격 ~60s.
+- `--timeout <min>` — **한 라운드**의 폴링 최대 대기. 기본 20분, 폴링 간격 ~60s.
 - `--max-rounds <n>` — `--auto-fix` 시 재리뷰 라운드 상한(기본 3). `--timeout`이 한 라운드 한도라면, 이 값은 라운드 수를 제한.
 - `--block-on <severity>` — CLEAN 판정의 **블로킹 심각도 임계**(기본 `must-fix`). 이 미만 지적(should-fix/minor/nit 등)은 보고만 하고 머지/종료를 막지 않는다. `should-fix`로 올리면 더 엄격.
 
@@ -122,7 +122,7 @@ collect
 폴링 루프(간격·타임아웃 적용). 본 하니스에서 긴 foreground `sleep`이 막히면 짧은 간격으로 반복하거나 `gh run watch`(BG)를 병용한다:
 
 ```bash
-INTERVAL=60; DEADLINE=$(( $(date +%s) + ${TIMEOUT_MIN:-12}*60 ))
+INTERVAL=60; DEADLINE=$(( $(date +%s) + ${TIMEOUT_MIN:-20}*60 ))
 # 폴링은 "한 번 collect → 에이전트가 판정"의 반복이다. 긴 foreground sleep이 막히면
 # break 하지 말고 **에이전트가 다음 차례에 collect()를 다시 호출**(≈INTERVAL 간격)해 DEADLINE까지 반복한다.
 collect > /tmp/ship_signals.$PR   # 매 호출 1회분. 에이전트가 읽어 리뷰어별 terminal 판정.
@@ -138,7 +138,7 @@ collect > /tmp/ship_signals.$PR   # 매 호출 1회분. 에이전트가 읽어 �
 - **Codex**: **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**. (a) 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) 리뷰·코멘트가 전혀 없고 `chatgpt-codex-connector[bot] +1` 리액션만 있으면 → **CLEAN**(무지적 신호), (c) 아무 신호도 없으면 **PENDING**.
 - **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
 - **Claude/Gemini schema-3 공통 판정**: reviewer별로 가장 최근에 시작된 현재-head run을 고르고, 위 state 계약과 그 run의 동일 ID/attempt를 가진 v3 봇 코멘트가 정확히 하나이며 run이 `completed`여야 terminal이다. 다른 head/run의 historical v3 코멘트는 선택 대상이 아니다. 성공 state이면 canonical 본문의 `### New findings`와 `### Still open` 아래에서만 정확한 `#### RVW-<12hex> [SEVERITY] title` heading을 센다. `### Resolved`/`### Retracted`, 일반 산문의 bracket 문자열, `filtered_max_severity`는 활성 지적이 아니다. `accepted_count`와 활성 heading 수가 다르거나 state/표시 메타가 불일치하면 성공으로 간주하지 않고 FAILED로 보고한다.
-- **Claude 리뷰**: 유효한 현재-head v3 성공에서 활성 `[CRITICAL]`/`[HIGH]`이 있으면 FEEDBACK, 없으면 CLEAN이다. 유효한 현재-head 실패 state는 FAILED(재실행 후보). run이 `in_progress`면 PENDING. 워크플로우 파일을 바꾸는 PR에서 claude-code-action의 default-branch 동일성 검증으로 모델이 의도적으로 스킵된 경우도 FAILED로 명시하되, 같은 역할의 앱 대체 신호 적용 여부는 아래 규칙을 따른다. **멈춘 in_progress run**(INTERVAL 3회 연속 in_progress 또는 TIMEOUT_MIN 초과)은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체한다.
+- **Claude 리뷰**: 유효한 현재-head v3 성공에서 활성 `[CRITICAL]`/`[HIGH]`이 있으면 FEEDBACK, 없으면 CLEAN이다. 유효한 현재-head 실패 state는 FAILED(재실행 후보). run이 `in_progress`면 PENDING. 워크플로우 파일을 바꾸는 PR에서 claude-code-action의 default-branch 동일성 검증으로 모델이 의도적으로 스킵된 경우도 FAILED로 명시하되, 같은 역할의 앱 대체 신호 적용 여부는 아래 규칙을 따른다. **TIMEOUT_MIN을 초과한 in_progress run**은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체한다.
 - **Gemini 리뷰(워크플로우)**: 유효한 현재-head v3 성공은 Claude와 같은 canonical 활성 heading 규칙으로 판정한다. provider/quota/지역/출력 계약 실패를 포함한 현재-head 실패 state는 FAILED이며, run 재실행 또는 Gemini Assist 앱 결과로 대체할 수 있다(중복이면 앱 우선).
 - **Claude/Gemini legacy v2 호환**: v3 마커가 전혀 없을 때만 완료 run + legacy marker + `- Reviewed: 현재 SHA`를 terminal로 인정하고, 기존 bracket 심각도 규칙을 적용한다. 현재-head v2 `Status: failure`/`Last attempt: failure`는 FAILED다.
 - **OpenCode 리뷰(활성화된 리포)**: `OpenCode Auto PR Review` run `completed` + **이번 라운드에 새로 달린** 마커 코멘트(스티키가 아니라 누적형 — 최신 것만 이번 라운드)로 판정. run은 완료됐는데 새 코멘트가 없거나 "Failed to get summary from agent"로 실패하면 **FAILED** — CLI 플레이크로 재실행이 1차 복구.
