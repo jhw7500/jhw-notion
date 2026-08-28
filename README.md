@@ -62,6 +62,7 @@ Notion Integration 생성: https://www.notion.so/my-integrations
 | `jhw_context` | 프로젝트 컨텍스트 로드 |
 | `jhw_history` | 프로젝트 타임라인 조회 |
 | `jhw_retrieve` | 주제별 결정·지식·문서 본문 스니펫 조회 |
+| `jhw_fetch` | 페이지 전체 본문을 구조 보존 Markdown으로 조회 |
 | `jhw_record` | DB에 레코드 생성 |
 | `jhw_note` | Knowledge Base에 메모 |
 | `jhw_append` | 기존 페이지 끝에 보강 heading·본문 append |
@@ -70,6 +71,14 @@ Notion Integration 생성: https://www.notion.so/my-integrations
 | `jhw_close` | 프로젝트 종료 + 회고 |
 | `jhw_report_preview` | 기간별 업무 보고서 미리보기 |
 | `jhw_report_export` | 보고서 출력(redmine/markdown/json) + 선택 저장 |
+
+### `jhw_fetch` 계약
+
+- 입력: `pageId`(Notion page UUID 또는 URL), 선택 `maxCharacters`(1~200,000자, 기본 100,000자).
+- 동작: 페이지 메타데이터와 모든 top-level block 페이지를 읽고, `has_children` block을 끝까지 재귀 조회한다. 모든 Notion 호출은 공통 `callNotion` retry/rate-limit/error 경로를 사용하며 페이지를 변경하지 않는다.
+- 출력: JSON의 `pageId`, `url`, `title`, `markdown`, `truncated`, 기본 사유 `truncation`, 전체 사유 배열 `truncations`, `metadata.blocksRead`, `metadata.characters`, `metadata.maxCharacters`.
+- 구조: heading, 목록, 체크박스, 인용, callout, code, divider, 표와 중첩 깊이를 Markdown으로 보존한다.
+- 절단: 문자 한도는 `reason=max_characters`와 `atCharacter`를, 내부 10,000-block 안전 한도·비정상 pagination·partial/unsupported block은 해당 reason과 `blockId`/`depth`를 반환한다. 둘 이상이면 구조 조회 사유가 `truncation`에 우선하고 모든 사유가 `truncations`에 남는다. `truncated:false`일 때만 본문이 완전하다.
 
 ## 스킬 (커맨드)
 
@@ -144,7 +153,7 @@ npm run build --prefix mcp-server
 ```
 jhw-notion/
 ├── mcp-server/          # TypeScript MCP 서버 (Notion API 직접 호출)
-│   ├── src/tools/       # 14개 도구 핸들러
+│   ├── src/tools/       # 15개 도구 핸들러
 │   └── dist/            # 빌드 결과
 ├── skills/claude/       # 공유 TUI 스킬 정본 (Project Control 명시적 진입점 포함)
 ├── install.sh           # 원클릭 설치/제거
