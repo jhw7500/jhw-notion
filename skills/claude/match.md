@@ -42,7 +42,8 @@ argument-hint: "[--from-review] [--db <db>] [--report <report>] [내용 또는 �
    - **가드는 건수와 무관하다**: `searchIncomplete:true`면 엔진이 검색을 포기한 것으로, **결과가 N건 와도** 쿼리와 무관한 최근순 폴백일 수 있다 — 그 쿼리를 "매칭 없음"의 근거로 쓰지 않는다(있는 매칭의 참고는 가능). `truncated:true`(잔여 있음)인 0건도 NEW 확정 금지. 두 경우 모두 단일 토큰으로 좁혀 재검색하거나 SIMILAR(불확실)로 보수 처리한다.
 
 4. **2단계 — 본문 fetch** (병렬)
-   - ≥1건 매칭된 후보들에 대해 top-5 페이지 본문을 `mcp__notion__notion-fetch`로 **한 메시지 안에서 모두 병렬** 호출.
+   - ≥1건 매칭된 후보들에 대해 top-5 페이지 본문을 `mcp__jhw-notion__jhw_fetch`로 **한 메시지 안에서 모두 병렬** 호출한다 (`pageId=<검색 결과 URL 또는 UUID>`).
+   - 응답의 `truncated:true`면 본문이 완전하지 않으므로 DUPLICATE/AUGMENT를 확정하지 않는다. 더 큰 `maxCharacters`로 다시 조회하거나 SIMILAR(불확실)로 보수 처리한다.
    - 동일 URL이 여러 후보의 매칭에 등장하면 한 번만 fetch (중복 호출 방지).
 
 5. **LLM 의미적 판정** — verdict 부여 (§verdict).
@@ -151,7 +152,7 @@ AUGMENT 시 properties는 건드리지 않는다 (report/category/tags 등 원�
 ## 규칙
 
 - **같은 DB 결과만 사용** — `jhw_search`를 `db=<후보 DB>`로 호출하면 서버가 해당 DB로 한정 검색한다 (KB는 `db=knowledgeBase`, Decision Log는 `db=decisionLog`; 상세 §흐름3).
-- **모든 jhw_search와 notion-fetch는 한 메시지 안에서 병렬 호출** — 순차 호출 금지 (전역 규칙).
+- **모든 jhw_search와 jhw_fetch는 한 메시지 안에서 병렬 호출** — 순차 호출 금지 (전역 규칙).
 - **AUGMENT 본문 append 형식**: `jhw_append(pageId=target_url, heading="YYYY-MM-DD 보강", content=<신규 본문>)`를 호출한다. MCP가 2000자 분할·100블록 배치 append를 처리하며 properties는 건드리지 않는다.
 - **DUPLICATE 기본 skip**. 사용자가 "N번 신규"로 강제 신규 저장 가능.
 - **확신 없으면 SIMILAR로 보수적 분류**. DUPLICATE 남발은 정보 손실. AUGMENT 잘못 판정해서 엉뚱한 페이지에 append하는 것이 가장 위험.

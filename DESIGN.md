@@ -132,9 +132,9 @@ export const NOTION_CONFIG = {
 };
 ```
 
-### 4.3 MCP 도구 정의 (14개)
+### 4.3 MCP 도구 정의 (15개)
 
-#### 읽기 도구 (7개)
+#### 읽기 도구 (8개)
 
 | 도구 | 입력 | 출력 | 설명 |
 |------|------|------|------|
@@ -144,6 +144,7 @@ export const NOTION_CONFIG = {
 | `jhw_history` | `{ project: string }` | 시간순 활동 타임라인 | 프로젝트 히스토리 |
 | `jhw_recall` | `{ query: string, notionFallback?: boolean }` | 캐시+Notion 검색 결과 | 로컬 캐시 우선 회상 |
 | `jhw_retrieve` | `{ topic: string, project?: string }` | 관련 본문 스니펫 | 주제별 결정·지식·문서 조회 |
+| `jhw_fetch` | `{ pageId: string, maxCharacters?: number }` | 페이지 메타데이터 + 구조 보존 Markdown + 절단 상태 | 전체 페이지 읽기 전용 조회 |
 | `jhw_report_preview` | `{ period: string, ... }` | 기간별 보고서 미리보기 | report 필드 기반 보고서 조회 |
 
 #### 쓰기 도구 (7개)
@@ -206,6 +207,20 @@ export const NOTION_CONFIG = {
 // 2. 결과를 DB별로 그룹화
 // 3. 각 결과에서 제목, 날짜, 미리보기 추출
 // 4. 구조화된 JSON 반환
+```
+
+#### jhw_fetch
+
+```typescript
+// 입력
+{ pageId: string, maxCharacters?: number } // UUID/URL, 기본 100000자
+
+// 동작
+// 1. pageId를 dashed UUID로 정규화하고 페이지 메타데이터 조회
+// 2. block children pagination과 중첩 children을 끝까지 재귀 조회
+// 3. heading/list/code/quote/table 등 구조를 Markdown으로 변환
+// 4. 문자·block·pagination 한계 또는 partial/unsupported block이면
+//    truncated + 기본 사유(truncation) + 전체 사유(truncations) 반환
 ```
 
 #### jhw_start

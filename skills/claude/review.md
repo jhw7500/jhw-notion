@@ -212,14 +212,14 @@ argument-hint: "[--match]"
 > `jhw_search`는 Notion 라이브 검색이라 방금 저장한 페이지는 인덱싱 지연으로 자기대조도 불안정하다.
 > `--match`는 *저장 전* 대조라 중복을 애초에 만들지 않고, 승인도 1회로 합쳐진다.
 
-대조 파이프라인(핵심어 추출 → `jhw_search` 병렬 → `notion-fetch` 병렬 → 4-tier verdict)과
+대조 파이프라인(핵심어 추출 → `jhw_search` 병렬 → `jhw_fetch` 병렬 → 4-tier verdict)과
 AUGMENT append 절차는 **`match.md`를 단일 정본으로 그대로 재사용**한다(여기 중복 정의하지 않음 — drift 방지).
 review 흐름에는 아래 M1–M3 세 지점만 덧댄다.
 
 ### M1. 대조 단계 삽입 (§3 직후, §4 직전)
 §3에서 합치기·가치평가까지 끝난 **최종 후보 각각**에 대해 `match.md` §흐름 2–5를 실행한다:
 - 후보별 핵심어 2–3개 추출 → `jhw_search`를 `db=<후보 DB>`로 **한 메시지 안에서 병렬 호출**한다 — 서버가 해당 DB로 한정 검색(페이지네이션)하므로 전역 top-10 한계 없이 동일 DB 중복을 잡는다. report는 필터하지 않는다(다른 report로 잘못 저장된 중복도 잡기 위함 — `jhw_search`에 report 인자 없음). 상세 `match.md §흐름3`.
-- 매칭 ≥1건인 후보는 top-5 페이지를 `notion-fetch`로 **병렬** fetch (동일 URL은 1회만).
+- 매칭 ≥1건인 후보는 top-5 페이지를 `mcp__jhw-notion__jhw_fetch`로 **병렬** fetch한다(동일 URL은 1회만). `truncated:true` 처리도 `match.md §흐름4`를 그대로 따른다.
 - LLM 의미 판정으로 후보마다 verdict(NEW/SIMILAR/AUGMENT/DUPLICATE) + target_url + 사유를 부여한다 (`match.md §verdict`). 검색 0건 + `truncated:false`면 즉시 NEW; **0건이어도 `truncated:true`면 NEW 확정 금지**(재검색/SIMILAR 보수 처리 — `match.md §흐름3`).
 - 확신 없으면 SIMILAR로 보수적 분류(`match.md` 규칙). AUGMENT 오판(엉뚱한 페이지 append)이 가장 위험.
 
