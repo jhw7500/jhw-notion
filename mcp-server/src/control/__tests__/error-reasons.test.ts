@@ -58,8 +58,10 @@ describe("error reason vocabulary", () => {
   });
 
   it("binds Registry contention to vocabulary and operator documentation", () => {
+    const source = readFileSync(join(controlDir, "process.ts"), "utf8");
     const doc = readFileSync(join(repositoryRoot, "skills", "claude", "task.md"), "utf8");
 
+    expect(source).toContain('contendedReason: "registry_state_lock"');
     expect(ERROR_REASONS).toContain("registry_state_lock");
     expect(doc).toContain("`registry_state_lock`");
   });

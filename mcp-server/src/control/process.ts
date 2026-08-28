@@ -5,6 +5,7 @@ import { type FileHandle } from "node:fs/promises";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Readable } from "node:stream";
+import { z } from "zod";
 
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
@@ -13,7 +14,13 @@ import {
   type GuardHostCoordinateAuthority,
 } from "./guard-coordinate.js";
 import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDirectoryHooks } from "./journal.js";
-import type { ErrorReason, RegistryMutationCommand } from "./schemas.js";
+import {
+  OffsetDateTimeSchema,
+  RegistryMutationCommandSchema,
+  type ErrorReason,
+  type LockHolderSummary,
+  type RegistryMutationCommand,
+} from "./schemas.js";
 import { isSensitiveEnvironmentKey } from "./sensitive-data.js";
 
 const MAX_CAPTURE_BYTES = 1024 * 1024;
@@ -21,6 +28,7 @@ const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
 const MAX_PROCESS_TIMEOUT_MS = 600_000;
 const PROCESS_STOP_GRACE_MS = 100;
 const LOCK_HELPER_TIMEOUT_MS = 5_000;
+const LOCK_HOLDER_RECORD_MAX_BYTES = 1024;
 const GUARD_REGISTRY_WAIT_SECONDS = 5;
 const GUARD_REGISTRY_ADMISSION_LIMIT = 16;
 
@@ -493,6 +501,13 @@ const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLO
 const strictLockCreateFlags = lockOpenFlags | constants.O_EXCL;
 const existingLockOpenFlags = constants.O_RDWR | constants.O_NOFOLLOW;
 
+const LockHolderRecordSchema = z.object({
+  version: z.literal(1),
+  command: RegistryMutationCommandSchema,
+  acquired_at: OffsetDateTimeSchema,
+  pid: z.number().int().positive().max(2_147_483_647),
+}).strict();
+
 export interface MutationLockRunContext {
   command: RegistryMutationCommand;
 }
@@ -585,6 +600,69 @@ function acquisitionFailure(status: number | null, contendedReason?: string): Co
   return new ControlError("LOCK_ACQUIRE_FAILED", "Host lock acquisition command failed");
 }
 
+function hasErrno(cause: unknown, code: string): boolean {
+  return typeof cause === "object" && cause !== null && "code" in cause && cause.code === code;
+}
+
+function pidState(pid: number): LockHolderSummary["pid_state"] {
+  try {
+    process.kill(pid, 0);
+    return "alive";
+  } catch (cause) {
+    if (hasErrno(cause, "ESRCH")) return "dead";
+    if (hasErrno(cause, "EPERM")) return "alive";
+    return "unknown";
+  }
+}
+
+/** Diagnostic metadata is best-effort and never participates in lock authority. */
+async function writeLockHolderRecord(
+  lockFile: FileHandle,
+  context: MutationLockRunContext | undefined,
+): Promise<void> {
+  try {
+    if (!context) {
+      await lockFile.truncate(0);
+      return;
+    }
+    const record = LockHolderRecordSchema.parse({
+      version: 1,
+      command: context.command,
+      acquired_at: new Date().toISOString(),
+      pid: process.pid,
+    });
+    const encoded = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+    if (encoded.byteLength > LOCK_HOLDER_RECORD_MAX_BYTES) return;
+    await lockFile.write(encoded, 0, encoded.byteLength, 0);
+    await lockFile.truncate(encoded.byteLength);
+  } catch {
+    // The kernel flock is authoritative; unavailable diagnostics do not alter
+    // an already-acquired mutation boundary.
+  }
+}
+
+async function readLockHolderSummary(lockFile: FileHandle): Promise<LockHolderSummary | undefined> {
+  try {
+    const info = await lockFile.stat();
+    if (info.size <= 0 || info.size > LOCK_HOLDER_RECORD_MAX_BYTES) return undefined;
+    const encoded = Buffer.alloc(info.size);
+    const { bytesRead } = await lockFile.read(encoded, 0, info.size, 0);
+    if (bytesRead !== info.size) return undefined;
+    const parsed = LockHolderRecordSchema.safeParse(JSON.parse(encoded.toString("utf8")));
+    if (!parsed.success) return undefined;
+    const acquiredAt = Date.parse(parsed.data.acquired_at);
+    if (!Number.isFinite(acquiredAt)) return undefined;
+    return {
+      command: parsed.data.command,
+      acquired_at: parsed.data.acquired_at,
+      elapsed_ms: Math.max(0, Math.floor(Date.now() - acquiredAt)),
+      pid_state: pidState(parsed.data.pid),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Waits for one flock acquisition process; it owns no long-lived child streams. */
 function acquireLock(child: MutationLockChild, helperTimeoutMs: number, contendedReason?: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -638,15 +716,15 @@ export class MutationLock implements MutationLockPort {
       directMutationLockAuthorities.set(this, {
         coordinate: `${resolve(this.#stateDir)}\u0000${lockFileName}`,
         hostCoordinate: createGuardHostCoordinateAuthority(this.#stateDir),
-        guardEligible: lockFileName === "registry.lock" && options.waitSeconds === undefined,
+        guardEligible: lockFileName === "registry.lock",
         runGuard: <T>(callback: () => Promise<T>) =>
           this.#runLocked(async () => callback(), GUARD_REGISTRY_WAIT_SECONDS),
       });
     }
   }
 
-  async run<T>(callback: () => Promise<T>, _context?: MutationLockRunContext): Promise<T> {
-    return this.#runLocked(async () => callback());
+  async run<T>(callback: () => Promise<T>, context?: MutationLockRunContext): Promise<T> {
+    return this.#runLocked(async () => callback(), undefined, context);
   }
 
   /** Runs against the exact retained directory inode whose child lock FD is flocked. */
@@ -657,9 +735,11 @@ export class MutationLock implements MutationLockPort {
   async #runLocked<T>(
     callback: (directory: SecureStateDirectory) => Promise<T>,
     waitOverride?: number,
+    context?: MutationLockRunContext,
   ): Promise<T> {
     let directory: SecureStateDirectory | undefined;
     let lockFile: FileHandle | undefined;
+    const registryLock = (this.#options.lockFileName ?? "registry.lock") === "registry.lock";
     try {
       try {
         directory = await openSecureStateDirectory(
@@ -720,11 +800,22 @@ export class MutationLock implements MutationLockPort {
       }
       // A blocking helper legitimately runs for its full wait; the watchdog
       // must outlive it or every contended blocking acquire reports a timeout.
-      await acquireLock(
-        child,
-        wait === undefined ? LOCK_HELPER_TIMEOUT_MS : Math.max(LOCK_HELPER_TIMEOUT_MS, (wait + 2) * 1000),
+      try {
+        await acquireLock(
+          child,
+          wait === undefined ? LOCK_HELPER_TIMEOUT_MS : Math.max(LOCK_HELPER_TIMEOUT_MS, (wait + 2) * 1000),
           this.#options.contendedReason,
-      );
+        );
+      } catch (cause) {
+        if (registryLock && cause instanceof ControlError && cause.code === "LOCK_CONTENDED") {
+          const holder = await readLockHolderSummary(lockFile);
+          if (holder) {
+            throw new ControlError(cause.code, cause.message, { ...cause.details, lock_holder: holder });
+          }
+        }
+        throw cause;
+      }
+      if (registryLock) await writeLockHolderRecord(lockFile, context);
       return await callback(directory);
     } finally {
       await lockFile?.close();
@@ -739,7 +830,10 @@ const intrinsicMutationLockRunInStateDirectory = MutationLock.prototype.runInSta
 export type ProductionMutationLockProfile = "registry" | "board";
 
 function productionMutationOptions(profile: ProductionMutationLockProfile): Readonly<MutationLockOptions> {
-  if (profile === "registry") return Object.freeze({});
+  if (profile === "registry") return Object.freeze({
+    waitSeconds: 30,
+    contendedReason: "registry_state_lock",
+  });
   return Object.freeze({
     lockFileName: "boards.lock",
     waitSeconds: 5,
@@ -778,8 +872,8 @@ export function isDirectMutationLock(value: unknown): value is MutationLock {
 
 /**
  * Creates opaque Guard-only acquisition authority for the exact direct
- * Registry-writer lock. The writer's public run() remains non-blocking; only
- * this captured authority uses bounded host-lock waiting.
+ * Registry-writer lock. The writer's public run() uses the production bounded
+ * wait while this captured authority keeps its independent five-second bound.
  */
 export function createGuardMutationLockAuthority(
   mutationLock: MutationLock,
@@ -792,7 +886,7 @@ export function createGuardMutationLockAuthority(
     mutationLock.runInStateDirectory !== intrinsicMutationLockRunInStateDirectory ||
     !direct?.guardEligible
   ) {
-    throw new TypeError("Guard mutation authority requires the concrete MutationLock non-blocking Registry implementation");
+    throw new TypeError("Guard mutation authority requires the concrete MutationLock Registry implementation");
   }
   const authority = Object.freeze({
     [guardMutationAuthorityBrand]: true,
