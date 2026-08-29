@@ -475,5 +475,6 @@ test_missing_control_host_fails_before_activation
 test_empty_uninstall_creates_nothing
 test_owned_round_trip
 test_non_v4_control_host_contract_fails_before_activation
+node "$REPO_ROOT/scripts/test-ship-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-task-skill-contract.mjs"
 echo "installer safety: ok"
