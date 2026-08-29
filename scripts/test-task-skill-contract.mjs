@@ -85,6 +85,37 @@ const finishedTaskEnvelope = {
     worktree_removed: false,
   },
 };
+const inactiveDiscoveryEnvelope = {
+  command: "task recover",
+  result: {
+    kind: "resolved",
+    task_id: targetTaskId,
+    state: "inactive",
+    handoff: { available: false },
+  },
+};
+const activeDiscoveryEnvelope = {
+  command: "task recover",
+  result: {
+    kind: "resolved",
+    task_id: targetTaskId,
+    state: "active",
+    claim: {
+      task_id: targetTaskId,
+      claim_id: startedClaimId,
+      host: "build-host",
+      branch: "task/0123456789ab-created",
+      worktree_ref: worktreeRef,
+      started_at: "2026-08-26T00:00:00.000Z",
+    },
+    recovery: {
+      process_exists: false,
+      worktree_mapped: true,
+      dirty: false,
+      ahead: 0,
+    },
+  },
+};
 const routes = [{ name: "formal" }, { name: "temporary" }, { name: "resume" }];
 
 function contractBlock(markdown, name) {
@@ -195,6 +226,14 @@ function expectedStartArgs(route, checkoutRoot) {
   ];
 }
 
+function expectedRecoveryDiscoveryArgs(checkoutRoot) {
+  return [
+    "task", "recover", "--action", "status",
+    "--resolve-from-checkout", "true", "--repo-path", checkoutRoot,
+    "--issue-url", issueUrl,
+  ];
+}
+
 function makeFinishInput(status, overrides = {}) {
   return {
     status,
@@ -277,6 +316,15 @@ if (argv[0] === "task" && argv[1] === "finish") {
   process.stdout.write(JSON.stringify(payload) + "\n");
   process.exit(0);
 }
+if (argv[0] === "task" && argv[1] === "recover") {
+  const expected = JSON.parse(process.env.JHW_TASK_CONTRACT_VALID_RECOVERY);
+  if (JSON.stringify(argv) !== JSON.stringify(expected)) {
+    process.stderr.write(JSON.stringify({ error: { code: "INVALID_TEST_ARGV" } }) + "\n");
+    process.exit(64);
+  }
+  process.stdout.write(process.env.JHW_TASK_CONTRACT_RECOVERY_PAYLOAD + "\n");
+  process.exit(0);
+}
 process.exit(64);
 `;
 
@@ -321,6 +369,7 @@ function launcherEnv({
   finishExit = 0,
   finishInput = makeFinishInput("handoff"),
   targetCheckout = checkoutRoot,
+  recoveryPayload = inactiveDiscoveryEnvelope,
 }) {
   return {
     HOME: home,
@@ -337,6 +386,8 @@ function launcherEnv({
     JHW_TASK_CONTRACT_FINISH_EXIT: String(finishExit),
     JHW_TASK_CONTRACT_FINISH_PAYLOAD: JSON.stringify(finishedTaskEnvelope),
     JHW_TASK_CONTRACT_VALID_FINISHES: JSON.stringify([expectedFinishArgs(finishInput)]),
+    JHW_TASK_CONTRACT_VALID_RECOVERY: JSON.stringify(expectedRecoveryDiscoveryArgs(checkoutRoot)),
+    JHW_TASK_CONTRACT_RECOVERY_PAYLOAD: JSON.stringify(recoveryPayload),
     JHW_FINISH_STATUS: finishInput.status,
     JHW_CURRENT_TASK_ID: currentTaskId,
     JHW_CURRENT_CLAIM_ID: currentClaimId,
@@ -359,6 +410,33 @@ function launcherEnv({
     ...Object.fromEntries(doneValues.map((value, index) => [`JHW_DONE_${index + 1}`, value])),
     ...Object.fromEntries(scopeValues.map((value, index) => [`JHW_SCOPE_${index + 1}`, value])),
   };
+}
+
+async function runRecoveryDiscovery(markdown, recoveryPayload = inactiveDiscoveryEnvelope) {
+  const root = await mkdtemp(join(tmpdir(), "jhw-task-recovery-discovery-contract-"));
+  try {
+    const log = join(root, "launcher.log");
+    const rawLog = join(root, "raw-control.log");
+    const checkoutRoot = await createCheckout(root);
+    const { home } = await installFakeLauncher(root);
+    const bashEnv = await installFakeRawControl(root);
+    const command = `${contractBlock(markdown, "gate")}\n${lifecycleContractBlock(markdown, "recovery-discovery")}`;
+    const result = await execFileAsync("bash", ["-c", command], {
+      cwd: checkoutRoot,
+      env: launcherEnv({ home, log, rawLog, bashEnv, checkoutRoot, recoveryPayload }),
+    }).then(
+      ({ stdout, stderr }) => ({ exitCode: 0, stdout, stderr }),
+      (error) => ({ exitCode: error.code, stdout: error.stdout ?? "", stderr: error.stderr ?? "" }),
+    );
+    return {
+      ...result,
+      calls: await readCalls(log),
+      rawCalls: await readRawCalls(rawLog),
+      checkoutRoot,
+    };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 async function pathExists(path) {
@@ -575,6 +653,24 @@ async function assertStrictLauncherOracle() {
         `strict fake launcher must reject invalid argv: ${JSON.stringify(argv)}; stderr=${result.stderr}`);
       assert.deepEqual(JSON.parse(result.stderr), { error: { code: "INVALID_TEST_ARGV" } });
     }
+    const validRecovery = expectedRecoveryDiscoveryArgs(checkoutRoot);
+    const invalidRecoveries = [
+      [...validRecovery, "--expect", currentClaimId],
+      [...validRecovery, "--session", sessionValue],
+      validRecovery.filter((value) => value !== issueUrl),
+      validRecovery.map((value) => value === "status" ? "takeover" : value),
+    ];
+    for (const argv of invalidRecoveries) {
+      const result = await execFileAsync(launcher, argv, {
+        env: launcherEnv({ home, log, rawLog, bashEnv, checkoutRoot }),
+      }).then(
+        () => ({ exitCode: 0, stderr: "" }),
+        (error) => ({ exitCode: error.code, stderr: error.stderr ?? "" }),
+      );
+      assert.equal(result.exitCode, 64,
+        `strict fake launcher must reject invalid recovery argv: ${JSON.stringify(argv)}; stderr=${result.stderr}`);
+      assert.deepEqual(JSON.parse(result.stderr), { error: { code: "INVALID_TEST_ARGV" } });
+    }
     const completedInput = makeFinishInput("completed");
     const handoffInput = makeFinishInput("handoff");
     const validCompleted = expectedFinishArgs(completedInput);
@@ -666,9 +762,87 @@ const hostOnlyLifecycleCounts = new Map([
   ["promote", 1],
   ["status", 1],
   ["handoff", 1],
-  ["recover", 4],
+  ["recover", 5],
   ["assert-owner", 1],
 ]);
+
+const recoveryInterpretationRules = [
+  "`inactive`: 반환된 canonical `task_id`를 기존 Task 재개 block의 `--task`에 사용하고 registration field는 보내지 않는다.",
+  "`active`: `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 Claim 좌표와 recovery observations만 보여주고, 별도 승인 전에는 멈춘다.",
+  "`handoff.available: false`: exact latest generation에는 Handoff가 없다는 뜻이다.",
+  "`process_exists: false`: recovery observation일 뿐 stale 판정이 아니다.",
+  "takeover 성공 후에는 반환된 새 `claim_id`만 사용해 `task status`를 확인한다.",
+  "`TASK_CONTRACT_MISMATCH`: checkout recovery discovery로 canonical Task를 찾고 formal registration을 반복하지 않는다.",
+  "`TASK_ALREADY_CLAIMED`: 반환된 exact Claim 좌표를 recovery status로 확인하고 자동 takeover하지 않는다.",
+];
+
+function assertStaticRecoveryDiscoveryContract(label, markdown) {
+  const block = lifecycleContractBlock(markdown, "recovery-discovery");
+  const exactBlock = [
+    '"$HOME/.local/bin/jhw-control-host" task recover \\',
+    "  --action status \\",
+    "  --resolve-from-checkout true \\",
+    '  --repo-path "$REPOSITORY_PATH" \\',
+    '  --issue-url "$JHW_TARGET_ISSUE_URL"',
+  ].join("\n");
+  assert.equal(block.trimEnd(), exactBlock,
+    `${label}: recovery discovery argv must remain exact`);
+  for (const rule of recoveryInterpretationRules) {
+    assert.ok(markdown.includes(rule), `${label}: missing recovery rule: ${rule}`);
+  }
+}
+
+async function assertRecoveryDiscoveryConsumerContract(label, markdown) {
+  const inactive = await runRecoveryDiscovery(markdown, inactiveDiscoveryEnvelope);
+  assert.equal(inactive.exitCode, 0);
+  assert.deepEqual(inactive.calls, [
+    ["preflight"],
+    expectedRecoveryDiscoveryArgs(inactive.checkoutRoot),
+  ]);
+  assert.deepEqual(inactive.rawCalls, []);
+  const inactiveResult = JSON.parse(inactive.stdout).result;
+  assert.equal(inactiveResult.state, "inactive");
+  assert.equal(inactiveResult.task_id, targetTaskId);
+  assert.deepEqual(inactiveResult.handoff, { available: false });
+
+  const resumed = await runWorkflow(markdown, { name: "resume" });
+  assert.equal(resumed.exitCode, 0);
+  assert.deepEqual(resumed.calls, [
+    ["preflight"],
+    expectedStartArgs("resume", resumed.checkoutRoot),
+  ]);
+  assert.equal(resumed.calls[1][3], inactiveResult.task_id,
+    `${label}: inactive discovery must feed its returned Task ID to resume`);
+  assert.doesNotMatch(resumed.calls[1].join(" "),
+    /--resolve-from-checkout|--issue-url|--project|--repo-id|--grant|--depends/,
+    `${label}: inactive resume must not repeat registration fields`);
+
+  const active = await runRecoveryDiscovery(markdown, activeDiscoveryEnvelope);
+  assert.equal(active.exitCode, 0);
+  assert.deepEqual(active.calls, [
+    ["preflight"],
+    expectedRecoveryDiscoveryArgs(active.checkoutRoot),
+  ]);
+  assert.deepEqual(active.rawCalls, []);
+  assert.equal(active.calls.some((call) => call.includes("takeover")), false,
+    `${label}: active discovery must never auto-takeover`);
+  const activeResult = JSON.parse(active.stdout).result;
+  assert.equal(activeResult.state, "active");
+  assert.deepEqual(Object.keys(activeResult.claim), [
+    "task_id", "claim_id", "host", "branch", "worktree_ref", "started_at",
+  ]);
+  assert.equal(activeResult.recovery.process_exists, false,
+    `${label}: process absence remains an observation, not a stale verdict`);
+
+  for (const code of ["TASK_CONTRACT_MISMATCH", "TASK_ALREADY_CLAIMED"]) {
+    const failedStart = await runWorkflow(markdown, { name: "formal" }, { taskStartError: code });
+    assert.equal(failedStart.exitCode, 1);
+    assert.deepEqual(failedStart.calls.map(commandName), ["preflight", "task start"]);
+    const discovered = await runRecoveryDiscovery(markdown, activeDiscoveryEnvelope);
+    assert.deepEqual(discovered.calls.map(commandName), ["preflight", "task recover"]);
+    assert.equal(discovered.calls.some((call) => call.includes("takeover")), false);
+  }
+}
 
 function assertHostOnlyLifecycleContract(label, markdown) {
   assert.doesNotMatch(markdown, /(^|[^-])jhw-control task(?:\s|$)/m,
@@ -987,6 +1161,7 @@ async function assertInvalidRepeatableTemporaryInputs(taskPath) {
 
 async function assertConsumerContract(label, taskPath) {
   const markdown = await readFile(taskPath, "utf8");
+  assertStaticRecoveryDiscoveryContract(label, markdown);
   assertHostOnlyLifecycleContract(label, markdown);
   for (const route of routes) {
     const success = await runWorkflow(markdown, route);
@@ -1017,6 +1192,7 @@ async function assertConsumerContract(label, taskPath) {
   assert.deepEqual(moved.calls, [["preflight"], expectedStartArgs("formal", moved.checkoutRoot)]);
   assert.deepEqual(JSON.parse(moved.stderr), { error: { code: "REGISTRY_MOVED_DURING_READ" } });
   assert.doesNotMatch(moved.calls.flat().join("\n"), /portfolio status|--project|--repo-id/);
+  await assertRecoveryDiscoveryConsumerContract(label, markdown);
   await assertFinishConsumerContract(label, markdown);
   assert.deepEqual(await runStartReportingRecipe(markdown), {
     task_id: targetTaskId,
