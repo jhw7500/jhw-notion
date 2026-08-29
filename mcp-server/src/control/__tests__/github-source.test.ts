@@ -81,6 +81,7 @@ function fixture(overrides: {
   const repositoryRecord = overrides.repository ?? repository;
   const pinnedRepositoryLookup = vi.fn();
   const pinnedFormalTaskLookup = vi.fn();
+  const pinEvents: string[] = [];
   const catalog = {
     registerRepository: vi.fn(async (input) => ({ repository: { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug }, created: true })),
     getRepository: vi.fn(async () => repository),
@@ -89,22 +90,32 @@ function fixture(overrides: {
       use: (record: RepositoryRecord) => Promise<T>,
     ): Promise<T> {
       pinnedRepositoryLookup(githubNodeId);
-      const result = await use(repositoryRecord);
-      if (overrides.finalFenceError) {
-        throw new ControlError(overrides.finalFenceError, "injected final fence refusal");
+      pinEvents.push("repository:begin");
+      try {
+        const result = await use(repositoryRecord);
+        if (overrides.finalFenceError) {
+          throw new ControlError(overrides.finalFenceError, "injected final fence refusal");
+        }
+        return result;
+      } finally {
+        pinEvents.push("repository:end");
       }
-      return result;
     },
     async withPinnedFormalTaskByGitHubNode<T>(
       githubNodeId: string,
       use: (task: FormalTask) => Promise<T>,
     ): Promise<T> {
       pinnedFormalTaskLookup(githubNodeId);
-      const result = await use(overrides.formalTask ?? formal);
-      if (overrides.formalFinalFenceError) {
-        throw new ControlError(overrides.formalFinalFenceError, "injected formal Task final fence refusal");
+      pinEvents.push("formal:begin");
+      try {
+        const result = await use(overrides.formalTask ?? formal);
+        if (overrides.formalFinalFenceError) {
+          throw new ControlError(overrides.formalFinalFenceError, "injected formal Task final fence refusal");
+        }
+        return result;
+      } finally {
+        pinEvents.push("formal:end");
       }
-      return result;
     },
     getTask: vi.fn(async () => formal),
     getTaskSourceRevision: vi.fn(async () => formal.issue_revision),
@@ -151,6 +162,7 @@ function fixture(overrides: {
     catalog,
     pinnedRepositoryLookup,
     pinnedFormalTaskLookup,
+    pinEvents,
     projects,
     runner,
   };
@@ -351,7 +363,7 @@ describe("GitHubSourceService", () => {
   });
 
   it("resolves an existing formal Task from the exact checkout and verified Issue", async () => {
-    const { service, catalog, pinnedFormalTaskLookup } = fixture();
+    const { service, catalog, pinnedFormalTaskLookup, pinEvents } = fixture();
 
     const selected = await service.withResolvedExistingFormalTask({
       repository_path: checkout,
@@ -363,6 +375,12 @@ describe("GitHubSourceService", () => {
       alias: "jhw7500/wlan#7",
     });
     expect(pinnedFormalTaskLookup).toHaveBeenCalledWith("I_wlan_7");
+    expect(pinEvents).toEqual([
+      "repository:begin",
+      "formal:begin",
+      "formal:end",
+      "repository:end",
+    ]);
     expect(catalog.registerFormalTask).not.toHaveBeenCalled();
     expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
   });
