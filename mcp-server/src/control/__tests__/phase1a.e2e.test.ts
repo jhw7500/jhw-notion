@@ -1657,6 +1657,132 @@ describe("Phase 1A deterministic adversarial gate", () => {
     });
   }, 15_000);
 
+  it("16b. checkout recovery discovery spans exact Handoff resume, active takeover, and force-end", async () => {
+    const fixture = await makeGateFixture();
+    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
+    const graph = graphFor(fixture, fixture.cloneA);
+    await graph.catalog.registerRepository(repositoryInput);
+    const formal = (await graph.catalog.registerFormalTask({
+      ...issueInput,
+      grants: [{
+        capability: "repo.modify",
+        resource: { kind: "repository", id: "repo-control" },
+        coordination: "shared",
+      }],
+      dependencies: [],
+    })).task;
+    const source = new GitHubSourceService({
+      runner: new GateSourceRunner(),
+      catalog: graph.catalog,
+      projects: {
+        requireProjectRepository: async () => undefined,
+        resolveUniqueProjectForRepository: async () => ({
+          project_id: "prj-control",
+          source_revision: "2026-08-29T00:00:00Z",
+        }),
+      },
+    });
+    const dependencies = cliDependencies(graph, { source });
+    const discoveryArgs = [
+      "task", "recover", "--action", "status",
+      "--resolve-from-checkout", "true",
+      "--repo-path", fixture.sourceRepo,
+      "--issue-url", issueInput.issue_url,
+    ];
+
+    const started = await runCli([
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo,
+      "--session", "codex-before-handoff", "--origin-adapter", "codex",
+    ], dependencies);
+    const firstClaimId = JSON.parse(started.stdout).result.claim.claim_id as string;
+    const released = await runCli([
+      "task", "finish", "--task", formal.id, "--claim", firstClaimId,
+      "--status", "handoff", "--validation", "recovery discovery e2e: pass",
+      "--progress", "resume this exact formal generation",
+    ], dependencies);
+    expect(released.exitCode).toBe(0);
+
+    const inactive = await runCli(discoveryArgs, dependencies);
+    expect(inactive.exitCode).toBe(0);
+    expect(JSON.parse(inactive.stdout).result).toMatchObject({
+      kind: "resolved",
+      task_id: formal.id,
+      state: "inactive",
+      handoff: {
+        available: true,
+        claim_id: firstClaimId,
+        sections: { "Progress Since Last Checkpoint": "resume this exact formal generation" },
+      },
+    });
+
+    const resumed = await runCli([
+      "task", "start", "--task", formal.id, "--repo-path", fixture.sourceRepo,
+      "--session", "codex-resumed", "--origin-adapter", "codex",
+    ], dependencies);
+    expect(resumed.exitCode).toBe(0);
+    const resumedResult = JSON.parse(resumed.stdout).result;
+    const resumedClaimId = resumedResult.claim.claim_id as string;
+    expect(resumedClaimId).not.toBe(firstClaimId);
+    expect(resumedResult.latest_handoff.claim_id).toBe(firstClaimId);
+    const resumedMapping = JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
+      .worktrees[resumedResult.claim.worktree_ref];
+    expect(await exists(join(resumedMapping.path, ".ai", "handoff.md"))).toBe(true);
+
+    const active = await runCli(discoveryArgs, dependencies);
+    expect(active.exitCode).toBe(0);
+    expect(JSON.parse(active.stdout).result).toEqual({
+      kind: "resolved",
+      task_id: formal.id,
+      state: "active",
+      claim: {
+        task_id: formal.id,
+        claim_id: resumedClaimId,
+        host: graph.config.buildHost,
+        branch: resumedResult.claim.branch,
+        worktree_ref: resumedResult.claim.worktree_ref,
+        started_at: resumedResult.claim.started_at,
+      },
+      recovery: {
+        process_exists: false,
+        worktree_mapped: true,
+        dirty: true,
+        ahead: 0,
+      },
+    });
+    expect((await graph.claims.getActive(formal.id))?.claim_id).toBe(resumedClaimId);
+    expect(active.stdout).not.toContain("codex-resumed");
+    expect(active.stdout).not.toContain(fixture.sourceRepo);
+
+    const takeover = await runCli([
+      "task", "recover", "--task", formal.id, "--expect", resumedClaimId,
+      "--action", "takeover", "--origin-adapter", "codex", "--session", "codex-takeover",
+    ], dependencies);
+    expect(takeover.exitCode).toBe(0);
+    const replacementClaimId = JSON.parse(takeover.stdout).result.active.claim_id as string;
+    expect(replacementClaimId).not.toBe(resumedClaimId);
+    const status = await runCli([
+      "task", "status", "--task", formal.id, "--claim", replacementClaimId,
+    ], dependencies);
+    expect(status.exitCode).toBe(0);
+    expect(JSON.parse(status.stdout).result.claim.claim_id).toBe(replacementClaimId);
+    expect(takeover.stdout).not.toContain("codex-takeover");
+
+    const forceEnded = await runCli([
+      "task", "recover", "--task", formal.id, "--expect", replacementClaimId,
+      "--action", "force-end",
+    ], dependencies);
+    expect(forceEnded.exitCode).toBe(0);
+    const afterForceEnd = await runCli(discoveryArgs, dependencies);
+    expect(afterForceEnd.exitCode).toBe(0);
+    expect(JSON.parse(afterForceEnd.stdout).result).toEqual({
+      kind: "resolved",
+      task_id: formal.id,
+      state: "inactive",
+      handoff: { available: false },
+    });
+    expect(await exists(join(fixture.cloneA, "handoffs", formal.id, `${firstClaimId}.md`))).toBe(true);
+  }, 30_000);
+
   it("17. completed formal Claim history does not replace an open Issue as lifecycle authority", async () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
