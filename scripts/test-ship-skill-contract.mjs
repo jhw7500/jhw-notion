@@ -200,6 +200,7 @@ async function main() {
       ROUND: "2",
       ROUND_HEAD: currentHead,
       ROUND_STARTED_AT: roundStartedAt,
+      ROUND_PUSHED_AT: roundStartedAt,
       SHIP_ROUND_STATE_FILE: roundStatePath,
       SHIP_NOW_EPOCH: String(startEpoch + 60),
       ...envOverrides,
@@ -256,6 +257,21 @@ async function main() {
     assert.equal(duplicate.stdout.trim(), "TRIGGER_FAILED,duplicate_request_marker");
     assert.equal(duplicate.log.filter((args) => args.includes("POST")).length, 0);
 
+    const bashThreeCompatible = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+      }),
+      [
+        "enable -n mapfile",
+        "ship_codex_trigger",
+        "printf '%s,%s\\n' \"$SHIP_CODEX_TRIGGER_STATUS\" \"$SHIP_CODEX_REQUEST_COMMENT_ID\"",
+      ].join("\n"),
+    );
+    assert.equal(bashThreeCompatible.stdout.trim(), "STARTED,9002",
+      "the trigger contract must run without Bash 4 mapfile support");
+    assert.equal(bashThreeCompatible.log.filter((args) => args.includes("POST")).length, 0,
+      "a Bash 3-compatible retry must reuse the existing marker without posting a duplicate");
+
     const bsdTimestamp = await run(
       baseState({
         issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
@@ -292,6 +308,19 @@ async function main() {
       { SHIP_NOW_EPOCH: String(startEpoch + 180) },
     );
     assert.equal(workflowMissing.stdout.trim(), "TRIGGER_FAILED,current_head_run_missing");
+
+    const slowPushCompletedAt = "2026-08-29T00:04:00Z";
+    const slowPushEpoch = Date.parse(slowPushCompletedAt) / 1000;
+    const workflowAfterSlowPush = await run(
+      baseState(),
+      "ship_workflow_trigger 'Gemini Auto PR Review'\nprintf '%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\"",
+      {
+        ROUND_PUSHED_AT: slowPushCompletedAt,
+        SHIP_NOW_EPOCH: String(slowPushEpoch + 179),
+      },
+    );
+    assert.equal(workflowAfterSlowPush.stdout.trim(), "PENDING",
+      "workflow grace must start after a successful push, not at the pre-push filter timestamp");
 
     const workflowClockAdvances = await run(
       baseState(),

@@ -81,7 +81,7 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
    - 워크플로우 리뷰어: `actions/runs?head_sha=$SHA`(주 감지, PAT에서 동작) + `gh run watch <run-id> --exit-status`(BG, 라이브 대기). `gh pr checks`/`commits/{sha}/check-runs`는 토큰 Checks-read 권한 없으면 403이라 의존하지 않는다.
    - 앱/봇 리뷰어: 매 간격 `reviews`/`comments`/`issue-comments`/`reactions` 수집
 5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다.
-6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. **push 직전에** `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 캡처하고 재푸시 → **`ROUND_HEAD="$(git rev-parse HEAD)"` 및 `SHA="$ROUND_HEAD"` 재계산** → 아래 라운드 계약 실행 → 4로 복귀한다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 3) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
+6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. **push 직전에** `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 캡처하고 재푸시 → 성공 직후 `ROUND_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"` 캡처 → **`ROUND_HEAD="$(git rev-parse HEAD)"` 및 `SHA="$ROUND_HEAD"` 재계산** → 아래 라운드 계약 실행 → 4로 복귀한다. `ROUND_STARTED_AT`은 run 필터 경계이고, 180초 생성 유예는 느린 push 시간을 제외하도록 `ROUND_PUSHED_AT`부터 잰다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 3) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
 7. **머지 게이트** — `--merge` AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) → `gh pr merge $PR --merge --delete-branch`
    - 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT}` 중 하나이거나 타겟 `FAIL`이면 **머지하지 않고** 보고
    - **루프는 반드시 종료**: (a) 전원 CLEAN(블로킹 0) → 머지/종료, (b) `--max-rounds` 도달 → 남은 블로킹 보고 후 종료, (c) 트리거 유예 만료 → TRIGGER_FAILED 보고, (d) `--timeout` → 시작 후 미응답 TIMEOUT 보고. 종료 조건이 "지적 0건"이 아니라 "블로킹 0건"이라 nit 무한생성에도 끝난다.
@@ -90,7 +90,7 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 
 ## auto-fix 라운드 트리거 계약
 
-이 계약은 **재푸시 라운드(2+)에서만** 실행한다. `ROUND_STARTED_AT`은 push 직전 시각이고 `ROUND_HEAD`는 push 후 정확한 40자리 SHA다. Codex 요청 상태 파일은 요청 코멘트 ID·GitHub가 반환한 생성 시각·대상 HEAD를 보존하며, 같은 라운드/HEAD를 재시도하면 숨은 마커로 기존 요청을 재사용한다. Claude/Gemini workflow는 3회 폴링에 해당하는 180초 동안 현재 HEAD의 새 run 생성을 확인하고, 그 뒤에도 없으면 `TRIGGER_FAILED`다. 20분 `SHIP_TIMEOUT_MIN`은 **시작된 리뷰의 응답 대기**에만 적용한다.
+이 계약은 **재푸시 라운드(2+)에서만** 실행한다. `ROUND_STARTED_AT`은 push 직전 필터 경계, `ROUND_PUSHED_AT`은 성공한 push 직후 생성 유예 경계이고, `ROUND_HEAD`는 push 후 정확한 40자리 SHA다. Codex 요청 상태 파일은 요청 코멘트 ID·GitHub가 반환한 생성 시각·대상 HEAD를 보존하며, 같은 라운드/HEAD를 재시도하면 숨은 마커로 기존 요청을 재사용한다. Claude/Gemini workflow는 push 완료 후 3회 폴링에 해당하는 180초 동안 현재 HEAD의 새 run 생성을 확인하고, 그 뒤에도 없으면 `TRIGGER_FAILED`다. 20분 `SHIP_TIMEOUT_MIN`은 **시작된 리뷰의 응답 대기**에만 적용한다.
 
 <!-- ship-round-contract: trigger-and-scope:begin -->
 ```bash
@@ -99,6 +99,7 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 : "${ROUND:?auto-fix 라운드 번호가 필요합니다}"
 : "${ROUND_HEAD:?push 후 HEAD가 필요합니다}"
 : "${ROUND_STARTED_AT:?push 직전 UTC 시각이 필요합니다}"
+: "${ROUND_PUSHED_AT:?push 성공 직후 UTC 시각이 필요합니다}"
 [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2 2>/dev/null || exit 2; }
 [[ "$ROUND" =~ ^[1-9][0-9]*$ ]] || { echo "invalid ROUND" >&2; return 2 2>/dev/null || exit 2; }
 [[ "$ROUND_HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid ROUND_HEAD" >&2; return 2 2>/dev/null || exit 2; }
@@ -167,7 +168,7 @@ ship_codex_trigger_failed() {
 }
 
 ship_codex_trigger() {
-  local actor marker body endpoint query raw id created_at extra
+  local actor marker body endpoint query raw line id created_at extra
   local -a matches=()
 
   SHIP_CODEX_TRIGGER_STATUS=""
@@ -187,7 +188,10 @@ $marker"
     return
   }
   if [[ -n "$raw" ]]; then
-    mapfile -t matches <<<"$raw"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      matches[${#matches[@]}]="$line"
+    done <<<"$raw"
   fi
 
   case "${#matches[@]}" in
@@ -196,7 +200,13 @@ $marker"
         ship_codex_trigger_failed request_post_failed
         return
       }
-      mapfile -t matches <<<"$raw"
+      matches=()
+      if [[ -n "$raw" ]]; then
+        while IFS= read -r line; do
+          [[ -n "$line" ]] || continue
+          matches[${#matches[@]}]="$line"
+        done <<<"$raw"
+      fi
       SHIP_CODEX_REQUEST_CREATED=true
       ;;
     1) ;;
@@ -224,13 +234,28 @@ $marker"
 }
 
 ship_workflow_trigger() {
-  local workflow_name="$1" endpoint raw start_epoch now_epoch elapsed
+  local workflow_name="$1" endpoint raw start_epoch pushed_epoch now_epoch elapsed
   local run_id attempt name head created_at status conclusion
   local selected_id="" selected_created=""
 
   SHIP_WORKFLOW_TRIGGER_STATUS=""
   SHIP_WORKFLOW_TRIGGER_REASON=""
   SHIP_WORKFLOW_RUN_ID=""
+  start_epoch="$(ship_timestamp_epoch "$ROUND_STARTED_AT")" || {
+    SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
+    SHIP_WORKFLOW_TRIGGER_REASON=invalid_round_started_at
+    return
+  }
+  pushed_epoch="$(ship_timestamp_epoch "$ROUND_PUSHED_AT")" || {
+    SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
+    SHIP_WORKFLOW_TRIGGER_REASON=invalid_round_pushed_at
+    return
+  }
+  if (( pushed_epoch < start_epoch )); then
+    SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
+    SHIP_WORKFLOW_TRIGGER_REASON=invalid_round_pushed_at
+    return
+  fi
   endpoint="repos/$REPO_NWO/actions/runs?head_sha=$ROUND_HEAD&per_page=100"
   raw="$(gh api "$endpoint" --paginate \
     --jq '.workflow_runs[] | [.id, .run_attempt, .name, .head_sha, .created_at, .status, (.conclusion // "null")] | @tsv' 2>/dev/null)" || {
@@ -258,17 +283,12 @@ ship_workflow_trigger() {
     return
   fi
 
-  start_epoch="$(ship_timestamp_epoch "$ROUND_STARTED_AT")" || {
-    SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
-    SHIP_WORKFLOW_TRIGGER_REASON=invalid_round_started_at
-    return
-  }
   now_epoch="$(ship_now_epoch)" || {
     SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
     SHIP_WORKFLOW_TRIGGER_REASON=clock_lookup_failed
     return
   }
-  elapsed=$(( now_epoch - start_epoch ))
+  elapsed=$(( now_epoch - pushed_epoch ))
   if (( elapsed >= SHIP_TRIGGER_GRACE_SECONDS )); then
     SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
     SHIP_WORKFLOW_TRIGGER_REASON=current_head_run_missing
@@ -373,7 +393,7 @@ ship_auto_fix_push_ready() {
 ```
 <!-- ship-round-contract: trigger-and-scope:end -->
 
-실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_HEAD`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. expected 집합에 Codex가 있으면 `ship_codex_trigger`, Claude/Gemini가 있으면 각 정확한 workflow 이름으로 `ship_workflow_trigger`를 호출한다. `ship_codex_trigger`가 기록한 상태 변수와 파일은 폴링 종료까지 유지한다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다.
+실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_PUSHED_AT`, `ROUND_HEAD`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. expected 집합에 Codex가 있으면 `ship_codex_trigger`, Claude/Gemini가 있으면 각 정확한 workflow 이름으로 `ship_workflow_trigger`를 호출한다. `ship_codex_trigger`가 기록한 상태 변수와 파일은 폴링 종료까지 유지한다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다.
 
 ## 리뷰 라운드 모니터링 구현 (gh + bash)
 
@@ -426,7 +446,7 @@ collect > /tmp/ship_signals.$PR   # 매 호출 1회분. 에이전트가 읽어 �
 
 ### 리뷰어별 terminal 판정 규칙
 
-- **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. auto-fix 라운드에서는 `head_sha == ROUND_HEAD`이고 `created_at >= ROUND_STARTED_AT`인 run만 해당 라운드 실행이다. 180초 안에 이 run이 없으면 **TRIGGER_FAILED**이며, 시작된 run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**이다.
+- **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. auto-fix 라운드에서는 `head_sha == ROUND_HEAD`이고 `created_at >= ROUND_STARTED_AT`인 run만 해당 라운드 실행이다. push 완료 시각인 `ROUND_PUSHED_AT`부터 180초 안에 이 run이 없으면 **TRIGGER_FAILED**이며, 시작된 run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**이다.
 - **Codex**: auto-fix 라운드에서는 성공적으로 기록된 요청 댓글의 `created_at` 이후 신호만 본다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**. (a) 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) PR 또는 정확한 요청 댓글에 요청 시각 이후 `chatgpt-codex-connector[bot] +1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
 - **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
 - **Claude/Gemini schema-3 공통 판정**: reviewer별로 가장 최근에 시작된 현재-head run을 고르고, 위 state 계약과 그 run의 동일 ID/attempt를 가진 v3 봇 코멘트가 정확히 하나이며 run이 `completed`여야 terminal이다. 다른 head/run의 historical v3 코멘트는 선택 대상이 아니다. 성공 state이면 canonical 본문의 `### New findings`와 `### Still open` 아래에서만 정확한 `#### RVW-<12hex> [SEVERITY] title` heading을 센다. `### Resolved`/`### Retracted`, 일반 산문의 bracket 문자열, `filtered_max_severity`는 활성 지적이 아니다. `accepted_count`와 활성 heading 수가 다르거나 state/표시 메타가 불일치하면 성공으로 간주하지 않고 FAILED로 보고한다.
