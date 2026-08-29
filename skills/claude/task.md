@@ -169,6 +169,32 @@ child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또�
 ```
 <!-- task-start-contract: resume:end -->
 
+### checkout과 Issue로 기존 formal Task 발견
+
+사용자가 기존 formal Task의 재개·복구를 명시했지만 canonical Task ID를 모르거나, formal start가 `TASK_CONTRACT_MISMATCH` 또는 `TASK_ALREADY_CLAIMED`를 반환하면 같은 checkout과 canonical Issue URL로 읽기 전용 discovery를 실행한다. 위 gate에서 확정한 `REPOSITORY_PATH`와 사용자가 제공했거나 검증된 Issue URL을 process environment의 `JHW_TARGET_ISSUE_URL` 한 argv 값으로 전달한다. Task/Claim registration, Issue revision 갱신, contract 변경, takeover, force-end는 이 단계에서 실행하지 않는다.
+
+<!-- task-lifecycle-contract: recovery-discovery:begin -->
+```bash
+"$HOME/.local/bin/jhw-control-host" task recover \
+  --action status \
+  --resolve-from-checkout true \
+  --repo-path "$REPOSITORY_PATH" \
+  --issue-url "$JHW_TARGET_ISSUE_URL"
+```
+<!-- task-lifecycle-contract: recovery-discovery:end -->
+
+결과는 다음 경계로 해석한다.
+
+- `inactive`: 반환된 canonical `task_id`를 기존 Task 재개 block의 `--task`에 사용하고 registration field는 보내지 않는다.
+- `active`: `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 Claim 좌표와 recovery observations만 보여주고, 별도 승인 전에는 멈춘다.
+- `handoff.available: false`: exact latest generation에는 Handoff가 없다는 뜻이다.
+- `process_exists: false`: recovery observation일 뿐 stale 판정이 아니다.
+- takeover 성공 후에는 반환된 새 `claim_id`만 사용해 `task status`를 확인한다.
+- `TASK_CONTRACT_MISMATCH`: checkout recovery discovery로 canonical Task를 찾고 formal registration을 반복하지 않는다.
+- `TASK_ALREADY_CLAIMED`: 반환된 exact Claim 좌표를 recovery status로 확인하고 자동 takeover하지 않는다.
+
+`active`에서 session ID, absolute path, Project/Repository 내부 좌표, Work Contract, token, raw message와 다른 result field를 표시하지 않는다. `inactive`에서 `handoff.available: true`인 경우에만 반환된 bounded latest Handoff를 재개 context로 사용한다. discovery가 nonzero이면 stable `error.code`만 보고 멈추며 registration fallback이나 자동 retry를 하지 않는다.
+
 성공 결과에 `latest_handoff`가 있을 때만 그것을 재개 context로 보여준다. `latest_handoff`가 없고(강제종료 등) 사용자가 컨텍스트 복구를 요청하면 repo root의 `HANDOFF.<세션>.md`를 보조 context로 읽을 수 있다 — Task 좌표·상태·증거는 command 결과만 정본이다. `TASK_COMPLETED`, `WORKTREE_CLEANUP_REQUIRED`, source/Project/repository mismatch이면 멈춘다. cleanup이 필요하면 아래 exact released-generation 절차를 먼저 승인받는다.
 
 기존 `task start --task ...`에는 registration/contract flag(`--project`, `--repo-id`, Issue/temporary 필드, `--role`, `--grant`, `--depends`)를 섞지 않는다. CLI는 이를 무시하지 않고 `INVALID_CLI_ARGUMENT`로 거부한다.

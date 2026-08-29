@@ -771,6 +771,29 @@ export class Catalog {
     });
   }
 
+  async withPinnedFormalTaskByGitHubNode<T>(
+    githubNodeId: string,
+    use: (task: FormalTask) => Promise<T>,
+  ): Promise<T> {
+    const parsed = githubNodeIdSchema.safeParse(githubNodeId);
+    if (!parsed.success) {
+      throw new ControlError("INVALID_ISSUE_ID", "GitHub Issue node ID is invalid");
+    }
+    await this.registry.assertReady();
+    return this.registry.withCommittedTree(["tasks", "repositories"], async () => {
+      await this.auditTaskSourceIndexesWithin();
+      const sourcePath = taskSourceRelativePath(parsed.data);
+      const indexed = await this.formalTaskForSource(sourcePath, parsed.data);
+      if (!indexed) {
+        throw new ControlError("TASK_NOT_FOUND", "Verified Issue has no canonical Task");
+      }
+      this.sensitiveData.assertSafe(indexed.task);
+      const result = await use(indexed.task);
+      await this.registry.assertCommittedViewCurrent();
+      return result;
+    });
+  }
+
   async listRepositories(): Promise<RepositoryRecord[]> {
     await this.auditRepositorySourceIndexes();
     const entries = await this.records.listDirectoryEntries("repositories", maximumCatalogEntries);

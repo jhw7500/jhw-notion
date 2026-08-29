@@ -311,6 +311,18 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 
 ## 8. recovery와 dirty/ahead fail-stop
 
+기존 formal Task ID를 모르거나 formal start가 `TASK_CONTRACT_MISMATCH` 또는 `TASK_ALREADY_CLAIMED`를 반환하면 현재 checkout과 canonical Issue URL로 읽기 전용 discovery를 실행한다.
+
+```bash
+"$HOME/.local/bin/jhw-control-host" task recover \
+  --action status \
+  --resolve-from-checkout true \
+  --repo-path <absolute-exact-checkout-root> \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number>
+```
+
+`state: inactive`이면 반환된 canonical `task_id`를 registration field 없이 기존 `task start --task`에 사용한다. `handoff.available: false`는 exact latest Claim generation에 Handoff가 없다는 뜻이다. `state: active`이면 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 Claim 좌표와 recovery observations만 표시하고 멈춘다. `process_exists: false`는 관찰일 뿐 stale 판정이나 takeover 권한이 아니다. takeover·force-end는 아래 exact 좌표 명령을 실행하기 직전에 계속 별도 승인을 받는다.
+
 활성 Claim 상태를 먼저 읽는다.
 
 ```bash

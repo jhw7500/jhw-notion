@@ -23,7 +23,15 @@ import {
 } from "./handoff.js";
 import type { RegistryMutationResult, RegistryTransactionResult } from "./registry-git.js";
 import { taskRelativePath } from "./registry-paths.js";
-import type { ActiveClaim, ClaimHistory, ContractActiveClaim, ErrorReason, TaskRecord } from "./schemas.js";
+import {
+  ConflictingClaimSummarySchema,
+  type ActiveClaim,
+  type ClaimHistory,
+  type ConflictingClaimSummary,
+  type ContractActiveClaim,
+  type ErrorReason,
+  type TaskRecord,
+} from "./schemas.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import type { TaskCompletionEvidence, TaskCompletionEvidenceRecord } from "./task-completion.js";
 import {
@@ -142,6 +150,26 @@ export interface TaskHandoffResult {
   generated_at: string;
   sections: ReturnType<typeof parseHandoffSections>;
 }
+
+export type TaskResumeContext =
+  | { available: false }
+  | { available: true; handoff: TaskHandoffResult };
+
+export type TaskRecoveryDiscovery =
+  | {
+      state: "inactive";
+      handoff: TaskResumeContext;
+    }
+  | {
+      state: "active";
+      claim: ConflictingClaimSummary;
+      recovery: {
+        process_exists: boolean;
+        worktree_mapped: boolean;
+        dirty: boolean;
+        ahead: number;
+      };
+    };
 
 export interface TaskRecoverInput {
   task_id: string;
@@ -511,6 +539,61 @@ export class TaskService {
     const result = { active, worktree };
     this.sensitiveData.assertSafe(result);
     return result;
+  }
+
+  async resumeContext(taskId: string): Promise<TaskResumeContext> {
+    let latest: ClaimHistory;
+    try {
+      latest = await this.claims.latestClaimHistory(taskId);
+    } catch (cause) {
+      if (cause instanceof ControlError && cause.code === "CLAIM_HISTORY_NOT_FOUND") {
+        return { available: false };
+      }
+      throw cause;
+    }
+    if (latest.status !== "handoff" || !latest.handoff_path) {
+      return { available: false };
+    }
+    return {
+      available: true,
+      handoff: await this.handoff(taskId, latest.claim_id),
+    };
+  }
+
+  async recoveryDiscovery(taskId: string): Promise<TaskRecoveryDiscovery> {
+    const active = await this.claims.getActive(taskId);
+    if (!active) {
+      return { state: "inactive", handoff: await this.resumeContext(taskId) };
+    }
+    const status = await this.claims.recoverClaim(
+      taskId,
+      active.claim_id,
+      { kind: "status" },
+    );
+    if (status.kind !== "status") {
+      throw new ControlError(
+        "INVALID_RECOVERY_RESULT",
+        "Recovery discovery did not return status",
+      );
+    }
+    const claim = ConflictingClaimSummarySchema.parse({
+      task_id: active.task_id,
+      claim_id: active.claim_id,
+      host: active.host,
+      branch: active.branch,
+      worktree_ref: active.worktree_ref,
+      started_at: active.started_at,
+    });
+    return {
+      state: "active",
+      claim,
+      recovery: {
+        process_exists: status.process_exists,
+        worktree_mapped: status.worktree_mapped,
+        dirty: status.dirty,
+        ahead: status.ahead,
+      },
+    };
   }
 
   async handoff(taskId: string, claimId?: string): Promise<TaskHandoffResult> {

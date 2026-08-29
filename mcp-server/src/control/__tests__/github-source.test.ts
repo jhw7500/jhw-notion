@@ -7,7 +7,7 @@ import {
   type RegisterTemporaryTaskFromSourceInput,
   type TaskCoordinateInput,
 } from "../github-source.js";
-import type { RepositoryRecord } from "../schemas.js";
+import type { FormalTask, RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 
 const checkout = "/fixture/private-source/wlan";
@@ -74,10 +74,14 @@ function fixture(overrides: {
   repository?: RepositoryRecord;
   issueState?: "open" | "closed";
   finalFenceError?: string;
+  formalFinalFenceError?: string;
   issueRevision?: string;
+  formalTask?: FormalTask;
 } = {}) {
   const repositoryRecord = overrides.repository ?? repository;
   const pinnedRepositoryLookup = vi.fn();
+  const pinnedFormalTaskLookup = vi.fn();
+  const pinEvents: string[] = [];
   const catalog = {
     registerRepository: vi.fn(async (input) => ({ repository: { id: input.repo_id, github_node_id: input.github_node_id, slug: input.slug }, created: true })),
     getRepository: vi.fn(async () => repository),
@@ -86,11 +90,32 @@ function fixture(overrides: {
       use: (record: RepositoryRecord) => Promise<T>,
     ): Promise<T> {
       pinnedRepositoryLookup(githubNodeId);
-      const result = await use(repositoryRecord);
-      if (overrides.finalFenceError) {
-        throw new ControlError(overrides.finalFenceError, "injected final fence refusal");
+      pinEvents.push("repository:begin");
+      try {
+        const result = await use(repositoryRecord);
+        if (overrides.finalFenceError) {
+          throw new ControlError(overrides.finalFenceError, "injected final fence refusal");
+        }
+        return result;
+      } finally {
+        pinEvents.push("repository:end");
       }
-      return result;
+    },
+    async withPinnedFormalTaskByGitHubNode<T>(
+      githubNodeId: string,
+      use: (task: FormalTask) => Promise<T>,
+    ): Promise<T> {
+      pinnedFormalTaskLookup(githubNodeId);
+      pinEvents.push("formal:begin");
+      try {
+        const result = await use(overrides.formalTask ?? formal);
+        if (overrides.formalFinalFenceError) {
+          throw new ControlError(overrides.formalFinalFenceError, "injected formal Task final fence refusal");
+        }
+        return result;
+      } finally {
+        pinEvents.push("formal:end");
+      }
     },
     getTask: vi.fn(async () => formal),
     getTaskSourceRevision: vi.fn(async () => formal.issue_revision),
@@ -136,6 +161,8 @@ function fixture(overrides: {
     service: new GitHubSourceService({ runner, catalog, projects }),
     catalog,
     pinnedRepositoryLookup,
+    pinnedFormalTaskLookup,
+    pinEvents,
     projects,
     runner,
   };
@@ -333,6 +360,110 @@ describe("GitHubSourceService", () => {
       }],
       dependencies: [],
     }));
+  });
+
+  it("resolves an existing formal Task from the exact checkout and verified Issue", async () => {
+    const { service, catalog, pinnedFormalTaskLookup, pinEvents } = fixture();
+
+    const selected = await service.withResolvedExistingFormalTask({
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    }, async ({ task, alias }) => ({ task_id: task.id, alias }));
+
+    expect(selected).toEqual({
+      task_id: formal.id,
+      alias: "jhw7500/wlan#7",
+    });
+    expect(pinnedFormalTaskLookup).toHaveBeenCalledWith("I_wlan_7");
+    expect(pinEvents).toEqual([
+      "repository:begin",
+      "formal:begin",
+      "formal:end",
+      "repository:end",
+    ]);
+    expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+  });
+
+  it("keeps the stored Task revision when the verified live Issue is newer", async () => {
+    const { service, catalog } = fixture({ issueRevision: "2026-08-29T00:00:00Z" });
+
+    const selected = await service.withResolvedExistingFormalTask({
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    }, async ({ task }) => ({ task_id: task.id, issue_revision: task.issue_revision }));
+
+    expect(selected).toEqual({
+      task_id: formal.id,
+      issue_revision: "2026-08-14T00:00:00Z",
+    });
+    expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+  });
+
+  it("allows a closed verified Issue to resolve an existing formal Task", async () => {
+    const { service, catalog } = fixture({ issueState: "closed" });
+
+    await expect(service.withResolvedExistingFormalTask({
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    }, async ({ task }) => task.id)).resolves.toBe(formal.id);
+
+    expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects a cross-repository Issue before formal Task lookup", async () => {
+    const { service, pinnedFormalTaskLookup } = fixture();
+
+    await expect(service.withResolvedExistingFormalTask({
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/other/issues/7",
+    }, async ({ task }) => task.id)).rejects.toMatchObject({
+      code: "ISSUE_REPOSITORY_MISMATCH",
+    });
+    expect(pinnedFormalTaskLookup).not.toHaveBeenCalled();
+  });
+
+  it("rejects an ambiguous Project association before formal Task lookup", async () => {
+    const { service, projects, pinnedFormalTaskLookup } = fixture();
+    projects.resolveUniqueProjectForRepository.mockRejectedValueOnce(
+      new ControlError("PROJECT_REPOSITORY_AMBIGUOUS", "injected ambiguity"),
+    );
+
+    await expect(service.withResolvedExistingFormalTask({
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    }, async ({ task }) => task.id)).rejects.toMatchObject({
+      code: "PROJECT_REPOSITORY_AMBIGUOUS",
+    });
+    expect(pinnedFormalTaskLookup).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["Project", { project_id: "prj-other" }],
+    ["Repository", { repo_id: "repo-other" }],
+    ["Issue node", { issue_node_id: "I_other" }],
+    ["Issue URL", { issue_url: "https://github.com/jhw7500/wlan/issues/8" }],
+    ["canonical alias", { aliases: ["jhw7500/wlan#8"] }],
+  ])("rejects a Task whose stored %s source disagrees with the verified context", async (_label, mismatch) => {
+    const { service } = fixture({ formalTask: { ...formal, ...mismatch } });
+
+    await expect(service.withResolvedExistingFormalTask({
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    }, async ({ task }) => task.id)).rejects.toMatchObject({
+      code: "FORMAL_TASK_SOURCE_MISMATCH",
+    });
+  });
+
+  it("propagates the pinned formal Task final fence after the callback", async () => {
+    const { service } = fixture({ formalFinalFenceError: "REGISTRY_MOVED_DURING_READ" });
+
+    await expect(service.withResolvedExistingFormalTask({
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    }, async ({ task }) => task.id)).rejects.toMatchObject({
+      code: "REGISTRY_MOVED_DURING_READ",
+    });
   });
 
   it("derives temporary Task coordinates from the checkout without membership revalidation", async () => {

@@ -128,6 +128,18 @@ Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Regi
 
 `task start --task`는 같은 persistent Task를 명시적으로 재개하고 bounded latest Handoff만 반환한다. Handoff source revision은 Claim 시점에 고정된다. release 뒤 local cleanup은 `task recover --action cleanup`으로 exact Claim generation만 복구한다. `task assert-owner`는 raw Git을 통합 enforce하지 않는 advisory check라서 승인된 takeover와 race할 수 있다.
 
+기존 formal Task ID를 모르면 현재 checkout과 canonical Issue URL로 읽기 전용 recovery discovery를 실행한다.
+
+```bash
+"$HOME/.local/bin/jhw-control-host" task recover \
+  --action status \
+  --resolve-from-checkout true \
+  --repo-path <absolute-exact-checkout-root> \
+  --issue-url https://github.com/<owner>/<repo>/issues/<number>
+```
+
+`state: inactive`이면 반환된 canonical `task_id`를 registration field 없이 `task start --task`에 사용한다. `handoff.available: false`는 exact latest Claim generation에 Handoff가 없다는 뜻이다. `state: active`이면 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 Claim 좌표와 recovery observations만 표시하고 멈춘다. `process_exists: false`만으로 stale을 판정하거나 takeover하지 않는다. `TASK_CONTRACT_MISMATCH`와 `TASK_ALREADY_CLAIMED`도 formal registration을 반복하지 말고 이 status로 canonical Task/Claim을 확인하며, takeover·force-end는 계속 별도 실행 직전 승인이 필요하다.
+
 measurement journal은 authority가 아니다. 성공 output에 `journal_warning.code=JOURNAL_WRITE_FAILED`가 붙어도 command는 이미 성공했으므로 재시도하지 않는다. 실패 command도 원래 exit/error를 유지한다.
 
 설정, 안전한 credential 주입, stable exit code, 세 번의 자연 Task cycle, 중단 기준은 [Phase 1A runbook](docs/project-control/phase1a-runbook.md)을 따른다. Phase 1B/cutover는 별도 승인 계획이 필요하다.

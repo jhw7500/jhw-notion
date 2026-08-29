@@ -8,7 +8,7 @@ import type { SourceCatalogPort } from "../github-source.js";
 import { sourceIndexKey } from "../ids.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
-import type { RepositoryRecord } from "../schemas.js";
+import type { FormalTask, RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import {
   commitFile,
@@ -27,6 +27,12 @@ type SourceCatalogPortPinnedRepositoryContract = Assert<SourceCatalogPort extend
   withPinnedRepositoryByGitHubNode<T>(
     githubNodeId: string,
     use: (repository: RepositoryRecord) => Promise<T>,
+  ): Promise<T>;
+} ? true : false>;
+type CatalogPinnedFormalTaskContract = Assert<Catalog extends {
+  withPinnedFormalTaskByGitHubNode<T>(
+    githubNodeId: string,
+    use: (task: FormalTask) => Promise<T>,
   ): Promise<T>;
 } ? true : false>;
 
@@ -568,6 +574,104 @@ describe("Catalog", () => {
 
     await expect(catalog.withPinnedRepositoryByGitHubNode(repositoryInput.github_node_id, async () => {
       await commitFile(fixture.registryDir, "repositories/changed-during-callback.yaml", "{}\n");
+      return undefined;
+    })).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
+  });
+
+  it("resolves one formal Task from its Issue source without changing Registry HEAD", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const before = (await git(fixture.registryDir, "rev-parse", "HEAD")).trim();
+
+    const selected = await catalog.withPinnedFormalTaskByGitHubNode(
+      issueInput.issue_node_id,
+      async (task) => ({ id: task.id, kind: task.kind }),
+    );
+
+    expect(selected).toEqual({ id: formal.id, kind: "formal" });
+    expect((await git(fixture.registryDir, "rev-parse", "HEAD")).trim()).toBe(before);
+  });
+
+  it("fails closed when the verified Issue source is not registered", async () => {
+    const { catalog } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+
+    await expect(catalog.withPinnedFormalTaskByGitHubNode(
+      "I_unregistered",
+      async (task) => task.id,
+    )).rejects.toMatchObject({ code: "TASK_NOT_FOUND" });
+  });
+
+  it("rejects a dirty Registry before invoking the formal Task callback", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    await catalog.registerFormalTask(issueInput);
+    await writeFile(join(fixture.registryDir, "dirty-untracked"), "dirty\n", "utf8");
+    let entered = false;
+
+    await expect(catalog.withPinnedFormalTaskByGitHubNode(
+      issueInput.issue_node_id,
+      async (task) => {
+        entered = true;
+        return task.id;
+      },
+    )).rejects.toMatchObject({ code: "REGISTRY_DIRTY" });
+    expect(entered).toBe(false);
+  });
+
+  it.each([
+    ["malformed", async (fixture: RegistryFixture, sourcePath: string) => {
+      await commitFile(fixture.registryDir, sourcePath, "not JSON\n");
+    }],
+    ["reverse-mismatched", async (fixture: RegistryFixture, _sourcePath: string, formal: FormalTask) => {
+      await commitFile(
+        fixture.registryDir,
+        `tasks/${formal.id}.yaml`,
+        `${JSON.stringify({ ...formal, issue_node_id: "I_other" })}\n`,
+      );
+    }],
+    ["duplicate", async (fixture: RegistryFixture, _sourcePath: string, formal: FormalTask) => {
+      await commitFile(
+        fixture.registryDir,
+        `tasks/by-source/github/${sourceIndexKey("I_duplicate")}.yaml`,
+        `${JSON.stringify({ task_id: formal.id })}\n`,
+      );
+    }],
+  ])("rejects a %s formal Task source index before entering the pinned callback", async (_kind, corrupt) => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const sourcePath = `tasks/by-source/github/${sourceIndexKey(issueInput.issue_node_id)}.yaml`;
+    await corrupt(fixture, sourcePath, formal);
+    await git(fixture.registryDir, "push", "origin", "main");
+    let entered = false;
+
+    await expect(catalog.withPinnedFormalTaskByGitHubNode(issueInput.issue_node_id, async () => {
+      entered = true;
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(entered).toBe(false);
+  });
+
+  it("preserves a formal Task callback exception even when the callback moves Registry HEAD", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    await catalog.registerFormalTask(issueInput);
+    const callbackError = new Error("callback failed");
+
+    await expect(catalog.withPinnedFormalTaskByGitHubNode(issueInput.issue_node_id, async () => {
+      await commitFile(fixture.registryDir, "tasks/changed-during-callback.yaml", "{}\n");
+      throw callbackError;
+    })).rejects.toBe(callbackError);
+  });
+
+  it("rejects a formal Task source result when Registry HEAD moves during the pinned callback", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    await catalog.registerFormalTask(issueInput);
+
+    await expect(catalog.withPinnedFormalTaskByGitHubNode(issueInput.issue_node_id, async () => {
+      await commitFile(fixture.registryDir, "tasks/changed-during-callback.yaml", "{}\n");
       return undefined;
     })).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
   });
