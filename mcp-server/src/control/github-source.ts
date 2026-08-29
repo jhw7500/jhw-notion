@@ -54,6 +54,10 @@ export interface SourceCatalogPort {
     githubNodeId: string,
     use: (repository: RepositoryRecord) => Promise<T>,
   ): Promise<T>;
+  withPinnedFormalTaskByGitHubNode<T>(
+    githubNodeId: string,
+    use: (task: FormalTask) => Promise<T>,
+  ): Promise<T>;
   getTask(taskId: string): Promise<TaskRecord>;
   getTaskSourceRevision(taskId: string): Promise<string>;
   registerFormalTask(input: RegisterFormalTaskInput): Promise<FormalTaskRegistration>;
@@ -131,6 +135,11 @@ export interface ExistingTaskContext {
   task: TaskRecord;
   alias: string;
   source_task_revision: string;
+}
+
+export interface ExistingFormalTaskResolution {
+  task: FormalTask;
+  alias: string;
 }
 
 function parseJson<T>(stdout: string, schema: z.ZodType<T>, code: string): T {
@@ -303,6 +312,40 @@ export class GitHubSourceService {
       ...(grants !== undefined ? { grants } : {}),
       ...(resolvedDependencies !== undefined ? { dependencies: resolvedDependencies } : {}),
     });
+  }
+
+  async withResolvedExistingFormalTask<T>(
+    input: { repository_path: string; issue_url: string },
+    use: (resolved: ExistingFormalTaskResolution) => Promise<T>,
+  ): Promise<T> {
+    issueCoordinates(input.issue_url);
+    this.assertCheckoutSafe({ issue_url: input.issue_url }, input.repository_path);
+    const context = await this.requireContext(
+      { resolve_from_checkout: true },
+      input.repository_path,
+    );
+    const issue = await this.resolveIssue(context.repository, input.issue_url);
+    this.assertCheckoutSafe(issue, input.repository_path);
+    return this.options.catalog.withPinnedFormalTaskByGitHubNode(
+      issue.issue_node_id,
+      async (task) => {
+        if (
+          task.project_id !== context.project_id ||
+          task.repo_id !== context.repo_id ||
+          task.issue_node_id !== issue.issue_node_id ||
+          task.issue_url !== issue.issue_url ||
+          !task.aliases.includes(issue.alias)
+        ) {
+          throw new ControlError(
+            "FORMAL_TASK_SOURCE_MISMATCH",
+            "Verified Issue and canonical Task source disagree",
+          );
+        }
+        const resolved = { task, alias: issue.alias };
+        this.assertCheckoutSafe(resolved, input.repository_path);
+        return use(resolved);
+      },
+    );
   }
 
   async prepareExistingTask(input: { task_id: string; repository_path: string }): Promise<ExistingTaskContext> {
