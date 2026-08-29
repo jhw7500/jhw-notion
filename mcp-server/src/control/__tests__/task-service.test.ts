@@ -768,6 +768,97 @@ describe("TaskService", () => {
     expect(claims.latestHandoffHistory).not.toHaveBeenCalled();
   });
 
+  it("reports inactive recovery with no Handoff when Claim history is absent", async () => {
+    const { tasks } = await taskFixture();
+
+    await expect(tasks.recoveryDiscovery(TASK_ID)).resolves.toEqual({
+      state: "inactive",
+      handoff: { available: false },
+    });
+  });
+
+  it("uses only the exact latest Handoff generation as resume context", async () => {
+    const { tasks, claims, fixture } = await taskFixture();
+    const relativePath = `handoffs/${TASK_ID}/${CLAIM_ID}.md`;
+    const content = buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: activeClaim.source_task_revision,
+      claim_id: CLAIM_ID,
+      generated_at: "2026-08-13T12:36:56.789Z",
+      progress: "resume this exact generation",
+    });
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(join(fixture.registryDir, relativePath), content, "utf8");
+    const latest = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:36:56.789Z",
+      status: "handoff" as const,
+      handoff_path: relativePath,
+    };
+    claims.latestClaimHistory.mockResolvedValue(latest);
+    claims.getClaimHistory.mockResolvedValue(latest);
+
+    await expect(tasks.resumeContext(TASK_ID)).resolves.toMatchObject({
+      available: true,
+      handoff: {
+        claim_id: CLAIM_ID,
+        sections: { "Progress Since Last Checkpoint": "resume this exact generation" },
+      },
+    });
+    expect(claims.latestHandoffHistory).not.toHaveBeenCalled();
+    expect(claims.getClaimHistory).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
+  });
+
+  it("does not substitute an older Handoff after a newer force-end", async () => {
+    const { tasks, claims } = await taskFixture();
+    claims.latestClaimHistory.mockResolvedValue({
+      ...activeClaim,
+      released_at: "2026-08-13T12:40:00.000Z",
+      status: "force-ended",
+    });
+
+    await expect(tasks.resumeContext(TASK_ID)).resolves.toEqual({ available: false });
+    expect(claims.latestHandoffHistory).not.toHaveBeenCalled();
+    expect(claims.getClaimHistory).not.toHaveBeenCalled();
+  });
+
+  it("strips session identity and internal Task coordinates from active recovery discovery", async () => {
+    const { tasks, claims } = await taskFixture();
+    claims.getActive.mockResolvedValue(activeClaim);
+    claims.recoverClaim.mockResolvedValue({
+      kind: "status",
+      active: activeClaim,
+      recorded: { host: activeClaim.host, session_id: activeClaim.session_id },
+      process_exists: false,
+      worktree_mapped: true,
+      dirty: false,
+      ahead: 0,
+    });
+
+    const discovered = await tasks.recoveryDiscovery(TASK_ID);
+
+    expect(discovered).toEqual({
+      state: "active",
+      claim: {
+        task_id: TASK_ID,
+        claim_id: CLAIM_ID,
+        host: activeClaim.host,
+        branch: activeClaim.branch,
+        worktree_ref: activeClaim.worktree_ref,
+        started_at: activeClaim.started_at,
+      },
+      recovery: {
+        process_exists: false,
+        worktree_mapped: true,
+        dirty: false,
+        ahead: 0,
+      },
+    });
+    expect(JSON.stringify(discovered)).not.toContain(activeClaim.session_id);
+    expect(JSON.stringify(discovered)).not.toContain(activeClaim.project_id);
+    expect(JSON.stringify(discovered)).not.toContain(activeClaim.repo_id);
+  });
+
   it("rejects an absolute host path restored from a committed Handoff", async () => {
     const { tasks, claims, fixture } = await taskFixture();
     const relativePath = `handoffs/${TASK_ID}/${CLAIM_ID}.md`;
