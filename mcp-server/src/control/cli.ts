@@ -224,11 +224,14 @@ export interface CliDependencies {
   registrationRecordWarning?: { code?: RegistrationRecordWarning };
   env: NodeJS.ProcessEnv;
   now?: () => Date;
-  taskService: Pick<TaskService, "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff" | "markCompletionReady">;
+  taskService: Pick<TaskService,
+    "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff" |
+    "resumeContext" | "recoveryDiscovery" | "markCompletionReady">;
   claimService: Pick<ClaimService, "getActive">;
   catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask" | "registerChildTask" | "configureInactiveTask">;
   source: Pick<GitHubSourceService,
-    "registerRepository" | "registerFormalTask" | "registerTemporaryTask" | "prepareExistingTask" | "promoteTemporaryTask">;
+    "registerRepository" | "registerFormalTask" | "registerTemporaryTask" | "prepareExistingTask" |
+    "withResolvedExistingFormalTask" | "promoteTemporaryTask">;
   portfolio: PortfolioPort;
   preflight: PreflightPort;
   guardMode: "enforce" | "observe";
@@ -1263,13 +1266,8 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const repo_id = task.repo_id;
     let latestHandoff: Awaited<ReturnType<CliDependencies["taskService"]["handoff"]>> | undefined;
     if (hasExisting) {
-      try {
-        latestHandoff = await dependencies.taskService.handoff(task.id);
-      } catch (cause) {
-        if (!(cause instanceof ControlError && new Set(["HANDOFF_NOT_FOUND", "CLAIM_HISTORY_NOT_FOUND"]).has(cause.code))) {
-          throw cause;
-        }
-      }
+      const context = await dependencies.taskService.resumeContext(task.id);
+      if (context.available) latestHandoff = context.handoff;
     }
     const started = await dependencies.taskService.start({
       task_id: task.id,
@@ -1514,11 +1512,85 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task recover") {
-    const flags = parseFlags(argv.slice(2), new Set(["--task", "--expect", "--action", "--session", "--origin-adapter"]));
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--task", "--expect", "--action", "--session", "--origin-adapter",
+      "--resolve-from-checkout", "--repo-path", "--issue-url",
+    ]));
     assertSafeFlags(flags, dependencies);
+    const actionName = required(flags, "--action");
+    const discoveryNames = [
+      "--resolve-from-checkout",
+      "--repo-path",
+      "--issue-url",
+    ] as const;
+    const discoveryCount = discoveryNames.filter((name) => flags.has(name)).length;
+    if (discoveryCount > 0) {
+      if (
+        actionName !== "status" ||
+        discoveryCount !== discoveryNames.length ||
+        value(flags, "--resolve-from-checkout") !== "true" ||
+        flags.has("--task") ||
+        flags.has("--expect") ||
+        flags.has("--session") ||
+        flags.has("--origin-adapter")
+      ) {
+        usage("Recovery discovery requires only checkout, Issue, and status");
+      }
+      const repository_path = required(flags, "--repo-path");
+      if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
+      const discovered = await dependencies.source.withResolvedExistingFormalTask({
+        repository_path,
+        issue_url: required(flags, "--issue-url"),
+      }, async ({ task }) => ({
+        task_id: task.id,
+        snapshot: await dependencies.taskService.recoveryDiscovery(task.id),
+      }));
+      if (discovered.snapshot.state === "active") {
+        return {
+          flags,
+          result: resultJson(command, {
+            kind: "resolved",
+            task_id: discovered.task_id,
+            state: "active",
+            claim: discovered.snapshot.claim,
+            recovery: discovered.snapshot.recovery,
+          }),
+        };
+      }
+      if (!discovered.snapshot.handoff.available) {
+        return {
+          flags,
+          result: resultJson(command, {
+            kind: "resolved",
+            task_id: discovered.task_id,
+            state: "inactive",
+            handoff: { available: false },
+          }),
+        };
+      }
+      return {
+        flags,
+        result: boundedHandoffResult(
+          command,
+          discovered.snapshot.handoff.handoff,
+          (handoff) => ({
+            kind: "resolved",
+            task_id: discovered.task_id,
+            state: "inactive",
+            handoff: {
+              available: true,
+              claim_id: handoff.claim_id,
+              handoff_pointer: handoff.handoff_pointer,
+              generated_at: handoff.generated_at,
+              sections: handoff.sections,
+              truncated: handoff.truncated,
+            },
+          }),
+        ),
+      };
+    }
     const task_id = requireTaskId(flags);
     const claim_id = requireClaimId(flags, "--expect");
-    const actionName = required(flags, "--action");
     let action: TaskRecoverInput["action"];
     if (actionName === "status" || actionName === "force-end" || actionName === "cleanup") {
       // The documented session is advisory for non-takeover recovery.

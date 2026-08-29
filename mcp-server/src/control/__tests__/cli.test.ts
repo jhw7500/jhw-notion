@@ -75,6 +75,26 @@ const started = {
   reused: false,
 };
 
+const conflictingClaim = {
+  task_id: TASK_ID,
+  claim_id: CLAIM_ID,
+  host: activeClaim.host,
+  branch: activeClaim.branch,
+  worktree_ref: activeClaim.worktree_ref,
+  started_at: activeClaim.started_at,
+};
+
+function handoffResult(sections: Record<string, string> = { "Progress Since Last Checkpoint": "bounded" }) {
+  return {
+    handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md`,
+    task_id: TASK_ID,
+    claim_id: CLAIM_ID,
+    source_task_revision: "2026-08-13T00:00:00Z",
+    generated_at: "2026-08-13T00:01:00Z",
+    sections,
+  };
+}
+
 function formalTask() {
   return {
     id: TASK_ID,
@@ -166,13 +186,11 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
       history: { ...activeClaim, status: "completed", released_at: "2026-08-13T00:01:00.000Z" },
       worktree_removed: true,
     }),
-    handoff: vi.fn().mockResolvedValue({
-      handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md`,
-      task_id: TASK_ID,
-      claim_id: CLAIM_ID,
-      source_task_revision: "2026-08-13T00:00:00Z",
-      generated_at: "2026-08-13T00:01:00Z",
-      sections: { "Progress Since Last Checkpoint": "bounded" },
+    handoff: vi.fn().mockResolvedValue(handoffResult()),
+    resumeContext: vi.fn().mockResolvedValue({ available: true, handoff: handoffResult() }),
+    recoveryDiscovery: vi.fn().mockResolvedValue({
+      state: "inactive",
+      handoff: { available: false },
     }),
     recover: vi.fn().mockResolvedValue({ kind: "status", active: activeClaim, process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 }),
     assertOwner: vi.fn().mockResolvedValue(activeClaim),
@@ -201,6 +219,10 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     registerFormalTask: vi.fn().mockResolvedValue({ task: formalTask(), created: true }),
     registerTemporaryTask: vi.fn().mockResolvedValue(temporaryTask()),
     prepareExistingTask: vi.fn().mockResolvedValue({ task: formalTask(), alias: "example/control#1", source_task_revision: "2026-08-13T00:00:00Z" }),
+    withResolvedExistingFormalTask: vi.fn(async (
+      _input: { repository_path: string; issue_url: string },
+      use: (resolved: { task: ReturnType<typeof formalTask>; alias: string }) => Promise<unknown>,
+    ) => use({ task: formalTask(), alias: "example/control#1" })),
     promoteTemporaryTask: vi.fn().mockResolvedValue(formalTask()),
     ...overrides.source,
   };
@@ -391,6 +413,16 @@ function resolvedTemporaryStartArgs(): string[] {
     "--scope", "src/control",
     "--origin-adapter", "codex",
     "--session", "codex-resolved",
+  ];
+}
+
+function recoveryDiscoveryArgs(): string[] {
+  return [
+    "task", "recover",
+    "--action", "status",
+    "--resolve-from-checkout", "true",
+    "--repo-path", "/private/source/control",
+    "--issue-url", "https://github.com/example/control/issues/1",
   ];
 }
 
@@ -724,10 +756,10 @@ describe("runCli", () => {
     });
   });
 
-  it("validates the latest Handoff before an existing Task can acquire a Claim", async () => {
+  it("validates the exact resume context before an existing Task can acquire a Claim", async () => {
     const dependencies = makeCliDependencies({
       taskService: {
-        handoff: vi.fn().mockRejectedValue(new ControlError("REGISTRY_CORRUPT", "invalid committed Handoff")),
+        resumeContext: vi.fn().mockRejectedValue(new ControlError("REGISTRY_CORRUPT", "invalid committed Handoff")),
       },
     });
 
@@ -738,6 +770,26 @@ describe("runCli", () => {
     expect(result.exitCode).toBe(1);
     expect(JSON.parse(result.stderr)).toEqual({ error: { code: "REGISTRY_CORRUPT" } });
     expect(dependencies.taskService.start).not.toHaveBeenCalled();
+  });
+
+  it("does not query historical Handoff generations when exact resume context is unavailable", async () => {
+    const historicalHandoff = vi.fn().mockRejectedValue(new Error("historical Handoff lookup must not run"));
+    const dependencies = makeCliDependencies({
+      taskService: {
+        handoff: historicalHandoff,
+        resumeContext: vi.fn().mockResolvedValue({ available: false }),
+      },
+    });
+
+    const result = await runCli([
+      "task", "start", "--task", TASK_ID,
+      "--repo-path", "/fixture/private-source/control",
+      "--session", "codex-resume", "--origin-adapter", "codex",
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).not.toHaveProperty("latest_handoff");
+    expect(historicalHandoff).not.toHaveBeenCalled();
   });
 
   it("promotes a temporary Task only through verified Issue authority", async () => {
@@ -769,6 +821,137 @@ describe("runCli", () => {
     });
   });
 
+  it("returns a bounded active recovery discovery snapshot without acquiring the mutation lock", async () => {
+    const dependencies = makeCliDependencies({
+      taskService: {
+        recoveryDiscovery: vi.fn().mockResolvedValue({
+          state: "active",
+          claim: conflictingClaim,
+          recovery: {
+            process_exists: false,
+            worktree_mapped: true,
+            dirty: false,
+            ahead: 0,
+          },
+        }),
+      },
+    });
+
+    const result = await runCli(recoveryDiscoveryArgs(), dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      command: "task recover",
+      result: {
+        kind: "resolved",
+        task_id: TASK_ID,
+        state: "active",
+        claim: conflictingClaim,
+        recovery: {
+          process_exists: false,
+          worktree_mapped: true,
+          dirty: false,
+          ahead: 0,
+        },
+      },
+    });
+    expect(dependencies.source.withResolvedExistingFormalTask).toHaveBeenCalledWith({
+      repository_path: "/private/source/control",
+      issue_url: "https://github.com/example/control/issues/1",
+    }, expect.any(Function));
+    expect(dependencies.taskService.recoveryDiscovery).toHaveBeenCalledWith(TASK_ID);
+    expect(dependencies.mutationLock.run).not.toHaveBeenCalled();
+    expect(result.stdout).not.toContain(activeClaim.session_id);
+    expect(result.stdout).not.toContain(activeClaim.project_id);
+    expect(result.stdout).not.toContain(activeClaim.repo_id);
+    expect(result.stdout).not.toContain("/private/source/control");
+  });
+
+  it("returns explicit inactive Handoff absence from checkout discovery", async () => {
+    const dependencies = makeCliDependencies({
+      taskService: {
+        recoveryDiscovery: vi.fn().mockResolvedValue({
+          state: "inactive",
+          handoff: { available: false },
+        }),
+      },
+    });
+
+    const result = await runCli(recoveryDiscoveryArgs(), dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).toEqual({
+      kind: "resolved",
+      task_id: TASK_ID,
+      state: "inactive",
+      handoff: { available: false },
+    });
+  });
+
+  it("bounds inactive discovery Handoff sections and excludes internal Handoff fields", async () => {
+    const sections = Object.fromEntries([
+      "Progress Since Last Checkpoint",
+      "Git State",
+      "Validation",
+      "Failures and Dead Ends",
+      "Exact Next Step",
+      "Related ADR and Evidence",
+    ].map((name) => [name, "\\".repeat(2_000)]));
+    const dependencies = makeCliDependencies({
+      taskService: {
+        recoveryDiscovery: vi.fn().mockResolvedValue({
+          state: "inactive",
+          handoff: { available: true, handoff: handoffResult(sections) },
+        }),
+      },
+    });
+
+    const result = await runCli(recoveryDiscoveryArgs(), dependencies);
+    const handoff = JSON.parse(result.stdout).result.handoff;
+
+    expect(result.exitCode).toBe(0);
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    expect(handoff.truncated).toBe(true);
+    expect(Object.keys(handoff).sort()).toEqual([
+      "available", "claim_id", "generated_at", "handoff_pointer", "sections", "truncated",
+    ]);
+    expect(Object.keys(handoff.sections)).toEqual(Object.keys(sections));
+    expect(result.stdout).not.toContain("source_task_revision");
+  });
+
+  it.each([
+    ["false resolver", [
+      "task", "recover", "--action", "status", "--resolve-from-checkout", "false",
+      "--repo-path", "/private/source/control", "--issue-url", "https://github.com/example/control/issues/1",
+    ]],
+    ["missing resolver", [
+      "task", "recover", "--action", "status", "--repo-path", "/private/source/control",
+      "--issue-url", "https://github.com/example/control/issues/1",
+    ]],
+    ["missing checkout", [
+      "task", "recover", "--action", "status", "--resolve-from-checkout", "true",
+      "--issue-url", "https://github.com/example/control/issues/1",
+    ]],
+    ["missing Issue", [
+      "task", "recover", "--action", "status", "--resolve-from-checkout", "true",
+      "--repo-path", "/private/source/control",
+    ]],
+    ["exact Task mixed in", [...recoveryDiscoveryArgs(), "--task", TASK_ID]],
+    ["exact Claim mixed in", [...recoveryDiscoveryArgs(), "--expect", CLAIM_ID]],
+    ["session mixed in", [...recoveryDiscoveryArgs(), "--session", "private-session"]],
+    ["adapter mixed in", [...recoveryDiscoveryArgs(), "--origin-adapter", "codex"]],
+    ["takeover action", recoveryDiscoveryArgs().map((value) => value === "status" ? "takeover" : value)],
+    ["force-end action", recoveryDiscoveryArgs().map((value) => value === "status" ? "force-end" : value)],
+  ] as const)("rejects recovery discovery with %s before calling source or Task ports", async (_name, argv) => {
+    const dependencies = makeCliDependencies();
+
+    const result = await runCli([...argv], dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.source.withResolvedExistingFormalTask).not.toHaveBeenCalled();
+    expect(dependencies.taskService.recoveryDiscovery).not.toHaveBeenCalled();
+  });
+
   it.each(["handoff", "resume"] as const)("keeps escaped %s Handoff JSON within the 12 KiB CLI envelope", async (kind) => {
     const sections = Object.fromEntries([
       "Progress Since Last Checkpoint",
@@ -779,16 +962,13 @@ describe("runCli", () => {
       "Related ADR and Evidence",
     ].map((name) => [name, "\\".repeat(2_000)]));
     const journal = { append: vi.fn().mockRejectedValue(new Error("injected journal gap")) };
+    const bounded = handoffResult(sections);
     const dependencies = makeCliDependencies({
       journal,
-      taskService: { handoff: vi.fn().mockResolvedValue({
-        handoff_pointer: `handoffs/${TASK_ID}/${CLAIM_ID}.md`,
-        task_id: TASK_ID,
-        claim_id: CLAIM_ID,
-        source_task_revision: "2026-08-13T00:00:00Z",
-        generated_at: "2026-08-13T00:01:00Z",
-        sections,
-      }) },
+      taskService: {
+        handoff: vi.fn().mockResolvedValue(bounded),
+        resumeContext: vi.fn().mockResolvedValue({ available: true, handoff: bounded }),
+      },
     });
     const argv = kind === "handoff"
       ? ["task", "handoff", "--task", TASK_ID, "--claim", CLAIM_ID]

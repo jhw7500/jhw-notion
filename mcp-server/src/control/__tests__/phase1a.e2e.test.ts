@@ -214,6 +214,9 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
         const task = await graph.catalog.getTask(input.task_id);
         return { task, alias: task.aliases[0]!, source_task_revision: await graph.catalog.getTaskSourceRevision(task.id) };
       },
+      withResolvedExistingFormalTask: async () => {
+        throw new ControlError("TASK_NOT_FOUND", "checkout recovery discovery is not configured by this fixture");
+      },
       promoteTemporaryTask: async (input) => graph.catalog.promoteTemporaryTask(input.task_id, issueInput),
     },
     portfolio: {
