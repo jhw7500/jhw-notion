@@ -106,15 +106,33 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 
 SHIP_TRIGGER_GRACE_SECONDS="${SHIP_TRIGGER_GRACE_SECONDS:-180}"
 SHIP_TIMEOUT_MIN="${SHIP_TIMEOUT_MIN:-20}"
-SHIP_NOW_EPOCH="${SHIP_NOW_EPOCH:-$(date +%s)}"
+SHIP_NOW_EPOCH="${SHIP_NOW_EPOCH:-}"
+SHIP_BLOCK_ON="${SHIP_BLOCK_ON:-must-fix}"
 SHIP_CODEX_LOGIN="${SHIP_CODEX_LOGIN:-chatgpt-codex-connector[bot]}"
 SHIP_ROUND_STATE_FILE="${SHIP_ROUND_STATE_FILE:-${TMPDIR:-/tmp}/jhw-ship.${PR}.round.${ROUND}.state}"
 [[ "$SHIP_TRIGGER_GRACE_SECONDS" =~ ^[0-9]+$ ]] || { echo "invalid SHIP_TRIGGER_GRACE_SECONDS" >&2; return 2 2>/dev/null || exit 2; }
 [[ "$SHIP_TIMEOUT_MIN" =~ ^[1-9][0-9]*$ ]] || { echo "invalid SHIP_TIMEOUT_MIN" >&2; return 2 2>/dev/null || exit 2; }
-[[ "$SHIP_NOW_EPOCH" =~ ^[0-9]+$ ]] || { echo "invalid SHIP_NOW_EPOCH" >&2; return 2 2>/dev/null || exit 2; }
+[[ -z "$SHIP_NOW_EPOCH" || "$SHIP_NOW_EPOCH" =~ ^[0-9]+$ ]] || { echo "invalid SHIP_NOW_EPOCH" >&2; return 2 2>/dev/null || exit 2; }
+case "$SHIP_BLOCK_ON" in
+  must-fix) SHIP_CODEX_BLOCKING_PATTERN='(^|[^A-Za-z0-9])(P0|P1)([^0-9]|$)' ;;
+  should-fix) SHIP_CODEX_BLOCKING_PATTERN='(^|[^A-Za-z0-9])(P0|P1|P2)([^0-9]|$)' ;;
+  *) echo "invalid SHIP_BLOCK_ON" >&2; return 2 2>/dev/null || exit 2 ;;
+esac
+
+ship_now_epoch() {
+  local now
+  if [[ -n "$SHIP_NOW_EPOCH" ]]; then
+    printf '%s\n' "$SHIP_NOW_EPOCH"
+    return
+  fi
+  now="$(date +%s 2>/dev/null)" || return 1
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$now"
+}
 
 ship_timestamp_epoch() {
-  date -u -d "$1" +%s 2>/dev/null
+  date -u -d "$1" +%s 2>/dev/null ||
+    date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null
 }
 
 ship_at_or_after() {
@@ -206,7 +224,7 @@ $marker"
 }
 
 ship_workflow_trigger() {
-  local workflow_name="$1" endpoint raw start_epoch elapsed
+  local workflow_name="$1" endpoint raw start_epoch now_epoch elapsed
   local run_id attempt name head created_at status conclusion
   local selected_id="" selected_created=""
 
@@ -245,7 +263,12 @@ ship_workflow_trigger() {
     SHIP_WORKFLOW_TRIGGER_REASON=invalid_round_started_at
     return
   }
-  elapsed=$(( SHIP_NOW_EPOCH - start_epoch ))
+  now_epoch="$(ship_now_epoch)" || {
+    SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
+    SHIP_WORKFLOW_TRIGGER_REASON=clock_lookup_failed
+    return
+  }
+  elapsed=$(( now_epoch - start_epoch ))
   if (( elapsed >= SHIP_TRIGGER_GRACE_SECONDS )); then
     SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
     SHIP_WORKFLOW_TRIGGER_REASON=current_head_run_missing
@@ -259,7 +282,7 @@ ship_codex_author_matches() {
 }
 
 ship_codex_signal_status() {
-  local reviews pull_comments issue_reactions comment_reactions request_epoch deadline
+  local reviews pull_comments issue_reactions comment_reactions request_epoch now_epoch deadline
   local actor commit_id original_commit_id occurred_at blocking content
   local has_response=false has_blocking=false has_positive=false has_negative=false has_eyes=false
 
@@ -270,11 +293,11 @@ ship_codex_signal_status() {
   fi
 
   reviews="$(gh api "repos/$REPO_NWO/pulls/$PR/reviews?per_page=100" --paginate \
-    --jq '.[] | [.user.login, (.commit_id // ""), (.submitted_at // ""), (((.body // "") | test("(^|[^A-Za-z0-9])P1([^0-9]|$)"; "i")))] | @tsv' 2>/dev/null)" || {
+    --jq ".[] | [.user.login, (.commit_id // \"\"), (.submitted_at // \"\"), (((.body // \"\") | test(\"$SHIP_CODEX_BLOCKING_PATTERN\"; \"i\")))] | @tsv" 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   pull_comments="$(gh api "repos/$REPO_NWO/pulls/$PR/comments?per_page=100" --paginate \
-    --jq '.[] | [.user.login, (.commit_id // ""), (.original_commit_id // .commit_id // ""), (.created_at // ""), (((.body // "") | test("(^|[^A-Za-z0-9])P1([^0-9]|$)"; "i")))] | @tsv' 2>/dev/null)" || {
+    --jq ".[] | [.user.login, (.commit_id // \"\"), (.original_commit_id // .commit_id // \"\"), (.created_at // \"\"), (((.body // \"\") | test(\"$SHIP_CODEX_BLOCKING_PATTERN\"; \"i\")))] | @tsv" 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   issue_reactions="$(gh api "repos/$REPO_NWO/issues/$PR/reactions?per_page=100" --paginate \
@@ -322,8 +345,11 @@ ship_codex_signal_status() {
     request_epoch="$(ship_timestamp_epoch "$SHIP_CODEX_REQUESTED_AT")" || {
       SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=invalid_request_timestamp; return;
     }
+    now_epoch="$(ship_now_epoch)" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=clock_lookup_failed; return;
+    }
     deadline=$(( request_epoch + SHIP_TIMEOUT_MIN * 60 ))
-    if (( SHIP_NOW_EPOCH >= deadline )); then
+    if (( now_epoch >= deadline )); then
       SHIP_CODEX_REVIEW_STATUS=TIMEOUT
     else
       SHIP_CODEX_REVIEW_STATUS=PENDING
@@ -347,7 +373,7 @@ ship_auto_fix_push_ready() {
 ```
 <!-- ship-round-contract: trigger-and-scope:end -->
 
-실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_HEAD`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, expected 집합에 Codex가 있으면 `ship_codex_trigger`, Claude/Gemini가 있으면 각 정확한 workflow 이름으로 `ship_workflow_trigger`를 호출한다. `ship_codex_trigger`가 기록한 상태 변수와 파일은 폴링 종료까지 유지한다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다.
+실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_HEAD`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. expected 집합에 Codex가 있으면 `ship_codex_trigger`, Claude/Gemini가 있으면 각 정확한 workflow 이름으로 `ship_workflow_trigger`를 호출한다. `ship_codex_trigger`가 기록한 상태 변수와 파일은 폴링 종료까지 유지한다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다.
 
 ## 리뷰 라운드 모니터링 구현 (gh + bash)
 
@@ -417,7 +443,7 @@ LLM 자동 리뷰어는 라운드마다 새 nit을 만들어 "지적 0건"에 �
 - **블로킹 임계** = `--block-on`(기본 `must-fix`) 이상. 리뷰어 라벨 매핑:
   - Claude/Gemini schema-3: 활성 섹션에서 정규식 `^#### RVW-[0-9a-f]{12} \[(CRITICAL|HIGH|MEDIUM)\] .+$`와 일치하는 canonical heading만 센다. `[CRITICAL]`/`[HIGH]`(블로킹) ▸ `[MEDIUM]`; filtered/normalized 후보와 Resolved/Retracted는 경고·이력이며 블로킹이 아니다.
   - Claude/Gemini legacy v2 및 OpenCode v2: `[CRITICAL]`/`[HIGH]`(블로킹) ▸ `[MEDIUM]` ▸ `[LOW]`.
-  - Codex: `P1`(블로킹) ▸ `P2` ▸ `P3`
+  - Codex: `P0`/`P1`(블로킹) ▸ `P2` ▸ `P3`
   - Gemini Assist: `critical`/`high`(블로킹) ▸ `medium` ▸ `low`
   - `--block-on should-fix`면 `[MEDIUM]`/`P2`/`medium`까지 블로킹으로 포함.
 - **CLEAN** = 응답 완료 + **열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만, 게이트 통과).

@@ -48,6 +48,13 @@ function rows(values) {
   if (values.length > 0) process.stdout.write(values.join("\n") + "\n");
 }
 
+function isBlocking(item) {
+  if (typeof item.blocking === "boolean") return item.blocking;
+  const queryIndex = argv.indexOf("--jq");
+  const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
+  return typeof item.severity === "string" && query.includes(item.severity.toUpperCase());
+}
+
 if (argv[0] !== "api" || !argv[1]) process.exit(2);
 const endpoint = argv[1];
 if ((state.failEndpoints || []).some((part) => endpoint.includes(part))) process.exit(1);
@@ -95,12 +102,12 @@ if (/\/issues\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
 }
 
 if (/\/pulls\/\d+\/reviews\?per_page=100$/.test(endpoint)) {
-  rows(state.reviews.map((item) => [item.actor, item.commitId, item.submittedAt, item.blocking ? "true" : "false"].join("\t")));
+  rows(state.reviews.map((item) => [item.actor, item.commitId, item.submittedAt, isBlocking(item) ? "true" : "false"].join("\t")));
   process.exit(0);
 }
 
 if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
-  rows(state.pullComments.map((item) => [item.actor, item.commitId, item.originalCommitId, item.createdAt, item.blocking ? "true" : "false"].join("\t")));
+  rows(state.pullComments.map((item) => [item.actor, item.commitId, item.originalCommitId, item.createdAt, isBlocking(item) ? "true" : "false"].join("\t")));
   process.exit(0);
 }
 
@@ -111,6 +118,34 @@ if (endpoint.includes("/actions/runs?")) {
 
 process.stderr.write("unexpected fake gh endpoint: " + endpoint + "\n");
 process.exit(2);
+`;
+
+const fakeDateSource = String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+
+const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === "+%s") {
+  process.stdout.write(fs.readFileSync(process.env.FAKE_DATE_EPOCH_FILE, "utf8").trim() + "\n");
+  process.exit(0);
+}
+
+if (process.env.FAKE_DATE_BSD_ONLY !== "1" && argv.length === 4 && argv[0] === "-u" && argv[1] === "-d" && argv[3] === "+%s") {
+  const epoch = Date.parse(argv[2]) / 1000;
+  if (Number.isInteger(epoch)) {
+    process.stdout.write(String(epoch) + "\n");
+    process.exit(0);
+  }
+}
+
+if (argv.length === 6 && argv[0] === "-j" && argv[1] === "-u" && argv[2] === "-f" && argv[3] === "%Y-%m-%dT%H:%M:%SZ" && argv[5] === "+%s") {
+  const epoch = Date.parse(argv[4]) / 1000;
+  if (Number.isInteger(epoch)) {
+    process.stdout.write(String(epoch) + "\n");
+    process.exit(0);
+  }
+}
+
+process.exit(1);
 `;
 
 function baseState(overrides = {}) {
@@ -135,24 +170,31 @@ async function main() {
   const contract = contractBlock(markdown);
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-ship-contract-"));
   const fakeGh = join(tempRoot, "gh");
+  const fakeDate = join(tempRoot, "date");
   const contractPath = join(tempRoot, "contract.bash");
   const statePath = join(tempRoot, "gh-state.json");
   const logPath = join(tempRoot, "gh-log.jsonl");
   const roundStatePath = join(tempRoot, "round.state");
+  const nowEpochPath = join(tempRoot, "now-epoch");
 
   await writeFile(fakeGh, fakeGhSource);
   await chmod(fakeGh, 0o755);
+  await writeFile(fakeDate, fakeDateSource);
+  await chmod(fakeDate, 0o755);
   await writeFile(contractPath, contract);
 
   async function run(state, commands, overrides = {}) {
+    const { FAKE_DATE_INITIAL_EPOCH = startEpoch + 60, ...envOverrides } = overrides;
     await writeFile(statePath, JSON.stringify(state, null, 2));
     await writeFile(logPath, "");
+    await writeFile(nowEpochPath, String(FAKE_DATE_INITIAL_EPOCH));
     await rm(roundStatePath, { force: true });
     const env = {
       ...process.env,
       PATH: `${tempRoot}:${process.env.PATH}`,
       FAKE_GH_STATE: statePath,
       FAKE_GH_LOG: logPath,
+      FAKE_DATE_EPOCH_FILE: nowEpochPath,
       REPO_NWO: "example/repo",
       PR: "42",
       ROUND: "2",
@@ -160,7 +202,7 @@ async function main() {
       ROUND_STARTED_AT: roundStartedAt,
       SHIP_ROUND_STATE_FILE: roundStatePath,
       SHIP_NOW_EPOCH: String(startEpoch + 60),
-      ...overrides,
+      ...envOverrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
     const result = await execFileAsync("bash", ["-c", script], { env, maxBuffer: 1024 * 1024 });
@@ -214,6 +256,16 @@ async function main() {
     assert.equal(duplicate.stdout.trim(), "TRIGGER_FAILED,duplicate_request_marker");
     assert.equal(duplicate.log.filter((args) => args.includes("POST")).length, 0);
 
+    const bsdTimestamp = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+      }),
+      "ship_codex_trigger\nprintf '%s,%s\\n' \"$SHIP_CODEX_TRIGGER_STATUS\" \"$SHIP_CODEX_REQUEST_COMMENT_ID\"",
+      { FAKE_DATE_BSD_ONLY: "1" },
+    );
+    assert.equal(bsdTimestamp.stdout.trim(), "STARTED,9002",
+      "GitHub timestamps must parse with the BSD date available on macOS");
+
     const workflowStarted = await run(
       baseState({
         runs: [
@@ -240,6 +292,23 @@ async function main() {
       { SHIP_NOW_EPOCH: String(startEpoch + 180) },
     );
     assert.equal(workflowMissing.stdout.trim(), "TRIGGER_FAILED,current_head_run_missing");
+
+    const workflowClockAdvances = await run(
+      baseState(),
+      [
+        "ship_workflow_trigger 'Gemini Auto PR Review'",
+        "printf 'first=%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\"",
+        `printf '%s\\n' '${startEpoch + 180}' > \"$FAKE_DATE_EPOCH_FILE\"`,
+        "ship_workflow_trigger 'Gemini Auto PR Review'",
+        "printf 'second=%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_TRIGGER_REASON\"",
+      ].join("\n"),
+      { SHIP_NOW_EPOCH: "", FAKE_DATE_INITIAL_EPOCH: startEpoch + 179 },
+    );
+    assert.equal(
+      workflowClockAdvances.stdout,
+      "first=PENDING\nsecond=TRIGGER_FAILED,current_head_run_missing\n",
+      "each poll must refresh the current clock before evaluating the trigger deadline",
+    );
 
     const workflowLookupFailed = await run(
       baseState({ failEndpoints: ["/actions/runs?"] }),
@@ -294,6 +363,31 @@ async function main() {
       "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
     );
     assert.equal(currentBlockingReview.stdout.trim(), "FEEDBACK");
+
+    const currentP0Review = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [
+          { actor: "chatgpt-codex-connector[bot]", commitId: currentHead, submittedAt: "2026-08-29T00:03:00Z", severity: "P0" },
+        ],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(currentP0Review.stdout.trim(), "FEEDBACK",
+      "the default must-fix threshold must block both P0 and P1 findings");
+
+    const currentP2Inline = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        pullComments: [
+          { actor: "chatgpt-codex-connector[bot]", commitId: currentHead, originalCommitId: currentHead, createdAt: "2026-08-29T00:03:00Z", severity: "P2" },
+        ],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+      { SHIP_BLOCK_ON: "should-fix" },
+    );
+    assert.equal(currentP2Inline.stdout.trim(), "FEEDBACK",
+      "the should-fix threshold must include P2 inline findings");
 
     const currentReaction = await run(
       baseState({
