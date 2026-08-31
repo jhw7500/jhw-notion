@@ -112,7 +112,9 @@ function fallbackEvent(argv: readonly string[]): HookEventName {
 function serializeNative(event: HookEventName, value: unknown): string {
   const parsed = NativeHookOutputSchema.parse(value);
   if (
-    event === "PreToolUse" && !("hookSpecificOutput" in parsed) ||
+    event === "PreToolUse" && !(
+      "hookSpecificOutput" in parsed && parsed.hookSpecificOutput.hookEventName === "PreToolUse"
+    ) ||
     event === "UserPromptSubmit" && !(
       "hookSpecificOutput" in parsed && parsed.hookSpecificOutput.hookEventName === "UserPromptSubmit"
     ) ||

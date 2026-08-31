@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { GuardSideEventResult } from "../guard-service.js";
 import type { GuardDecision } from "../schemas.js";
@@ -275,6 +275,42 @@ describe("strict hook adapter executable core", () => {
 
     expect(JSON.parse(result.stdout)).toEqual(exactFailure("PreToolUse", "GUARD_PROTOCOL_MISMATCH"));
     expect(result.exitCode).toBe(0);
+  });
+
+  it("rejects a prompt-shaped renderer result for a PreToolUse invocation", async () => {
+    // Break caught: a future PreToolUse renderer drift emits a non-blocking prompt envelope.
+    vi.resetModules();
+    const codecs = await import("../hook-codecs.js");
+    vi.doMock("../hook-codecs.js", () => ({
+      ...codecs,
+      codexHookCodec: {
+        ...codecs.codexHookCodec,
+        renderPreTool: () => ({
+          hookSpecificOutput: {
+            hookEventName: "UserPromptSubmit",
+            additionalContext: "wrong native event",
+          },
+          systemMessage: "wrong native event",
+        }),
+      },
+    }));
+    try {
+      const { runHookAdapter } = await loadAdapter();
+      const result = await runHookAdapter(
+        ["--adapter", "codex", "--event", "PreToolUse"],
+        preToolPayload(),
+        new ObservableGuard(),
+      );
+
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: `${JSON.stringify(exactFailure("PreToolUse", "GUARD_PROTOCOL_MISMATCH"))}\n`,
+        stderr: "",
+      });
+    } finally {
+      vi.doUnmock("../hook-codecs.js");
+      vi.resetModules();
+    }
   });
 
   it("maps thrown Guard authority failures to unavailable and exits zero", async () => {
