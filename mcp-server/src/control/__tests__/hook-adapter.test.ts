@@ -1,6 +1,6 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { chmod, cp, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -462,12 +462,35 @@ async function buildFixture(): Promise<string> {
     copyFile(join(mcpRoot, "scripts", "clean-dist.mjs"), join(fixture, "scripts", "clean-dist.mjs")),
     cp(join(mcpRoot, "node_modules"), join(fixture, "node_modules"), {
       recursive: true,
+      dereference: false,
+      verbatimSymlinks: true,
       mode: fsConstants.COPYFILE_FICLONE,
     }),
   ]);
-  expect((await lstat(join(fixture, "node_modules"))).isSymbolicLink()).toBe(false);
+  const fixtureDependencies = join(fixture, "node_modules");
+  expect((await lstat(fixtureDependencies)).isSymbolicLink()).toBe(false);
+  expect(await assertContainedDependencyLinks(fixtureDependencies)).toBeGreaterThan(0);
+  const sourceTypeScript = await stat(join(mcpRoot, "node_modules", "typescript", "package.json"));
+  const fixtureTypeScript = await stat(join(fixtureDependencies, "typescript", "package.json"));
+  expect([fixtureTypeScript.dev, fixtureTypeScript.ino]).not.toEqual([sourceTypeScript.dev, sourceTypeScript.ino]);
   await execFile("npm", ["run", "build"], { cwd: fixture, encoding: "utf8" });
   return fixture;
+}
+
+async function assertContainedDependencyLinks(root: string, directory = root): Promise<number> {
+  const rootPath = await realpath(root);
+  let links = 0;
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isSymbolicLink()) {
+      const target = await realpath(path);
+      expect(target === rootPath || target.startsWith(`${rootPath}/`)).toBe(true);
+      links += 1;
+    } else if (entry.isDirectory()) {
+      links += await assertContainedDependencyLinks(rootPath, path);
+    }
+  }
+  return links;
 }
 
 async function installTimeout(fixture: LauncherFixture, source?: string): Promise<string> {
