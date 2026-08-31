@@ -476,8 +476,8 @@ describe("8-second fail-closed launcher", () => {
     // Break caught: the inner deadline is absent/wrong or command substitution stores native stdin.
     const fixture = await launcherFixture();
     await installTimeout(fixture);
-    const allowed = JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+    const neutral = JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PreToolUse" },
     });
     await writeExecutable(fixture.core, `#!/usr/bin/env bash
 IFS= read -r payload || true
@@ -489,10 +489,10 @@ printf '%s\\n' "$CORE_OUTPUT"
       fixture,
       ["--adapter", "claude", "--event", "PreToolUse"],
       stdin,
-      { CORE_OUTPUT: allowed },
+      { CORE_OUTPUT: neutral },
     );
 
-    expect(result).toEqual({ stdout: `${allowed}\n`, stderr: "" });
+    expect(result).toEqual({ stdout: `${neutral}\n`, stderr: "" });
     expect(await readFile(join(fixture.root, "forwarded-stdin"), "utf8")).toBe(stdin);
     const watchdog = (await readFile(join(fixture.root, "watchdog.log"), "utf8")).trimEnd().split("\n");
     expect(watchdog.slice(0, 2)).toEqual(["--foreground", "8"]);

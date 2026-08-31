@@ -70,10 +70,9 @@ const CodexPostToolUseSchema = z.object({
   tool_use_id: coordinate(255),
 }).strict();
 
-const preToolAllowOutputSchema = z.object({
+const preToolNeutralOutputSchema = z.object({
   hookSpecificOutput: z.object({
     hookEventName: z.literal("PreToolUse"),
-    permissionDecision: z.literal("allow"),
   }).strict(),
 }).strict();
 const preToolDenyOutputSchema = z.object({
@@ -96,7 +95,7 @@ const postOutputSchema = z.object({
 }).strict();
 
 export const NativeHookOutputSchema = z.union([
-  preToolAllowOutputSchema,
+  preToolNeutralOutputSchema,
   preToolDenyOutputSchema,
   promptOutputSchema,
   postOutputSchema,
@@ -193,7 +192,6 @@ function renderPreTool(result: GuardDecision): unknown {
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
       },
     };
   }

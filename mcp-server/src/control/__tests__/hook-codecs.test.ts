@@ -184,8 +184,8 @@ describe("native hook response renderers", () => {
     });
   });
 
-  it.each(adapters)("renders exact %s allow semantics without advisory denial", async (_adapter, key) => {
-    // Break caught: an authoritative ALLOW is omitted or rendered with a stale deny message.
+  it.each(adapters)("renders neutral %s allow semantics without a permission override", async (_adapter, key) => {
+    // Break caught: ALLOW reintroduces a native permission override or retains a stale deny message.
     const codec = (await loadCodecs())[key];
     expect(codec.renderPreTool({
       decision: "ALLOW",
@@ -195,7 +195,6 @@ describe("native hook response renderers", () => {
     })).toEqual({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "allow",
       },
     });
   });

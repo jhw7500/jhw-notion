@@ -141,9 +141,9 @@ try {
   let valid = false;
   if (event === "PreToolUse") {
     if (hook && typeof hook === "object" && !Array.isArray(hook) && hook.hookEventName === "PreToolUse") {
-      if (hook.permissionDecision === "allow") {
-        valid = exactKeys(value, ["hookSpecificOutput"]) &&
-          exactKeys(hook, ["hookEventName", "permissionDecision"]);
+      if (exactKeys(value, ["hookSpecificOutput"]) &&
+          exactKeys(hook, ["hookEventName"])) {
+        valid = true;
       } else if (hook.permissionDecision === "deny") {
         valid = exactKeys(value, ["hookSpecificOutput", "systemMessage"]) &&
           exactKeys(hook, ["hookEventName", "permissionDecision", "permissionDecisionReason"]) &&
