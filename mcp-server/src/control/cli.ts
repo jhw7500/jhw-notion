@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-import { realpathSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { constants as fsConstants, realpathSync, writeSync } from "node:fs";
+import { lstat, open, readlink, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
+import { TextDecoder } from "node:util";
 import { z, type ZodType } from "zod";
 
 import { spawn } from "node:child_process";
-import { writeSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 
 import { BoardJournal, type BoardJournalPort } from "./board-journal.js";
@@ -24,6 +25,7 @@ import { loadControlConfig } from "./config.js";
 import { ControlContractAuthority } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
 import { GuardAdapterSchema, type GuardAdapter } from "./guard-protocol.js";
+import { adapterContractResults, NativeHookOutputSchema, renderStaticHookFailure } from "./hook-codecs.js";
 import {
   createProductionGuardRequestStore,
   GuardDigestKey,
@@ -119,10 +121,23 @@ const GuardRequestStatusSchema = z.union([
     counts: GuardRequestCountsSchema,
   }).strict(),
 ]);
-const GuardAdapterCoverageEntrySchema = z.object({
+const GuardStatusAdapterCoverageEntrySchema = z.object({
   prompt_origin: z.literal("pending"),
   pre_tool_blocking: z.literal("pending"),
   execution_recheck: z.literal("pending"),
+}).strict();
+const GuardStatusAdapterCoverageSchema = z.object({
+  claude: GuardStatusAdapterCoverageEntrySchema,
+  codex: GuardStatusAdapterCoverageEntrySchema,
+  gemini: GuardStatusAdapterCoverageEntrySchema,
+  opencode: GuardStatusAdapterCoverageEntrySchema,
+}).strict();
+const GuardAdapterCoverageEntrySchema = z.object({
+  prompt_origin: z.enum(["ok", "missing", "unsupported"]),
+  pre_tool_block: z.enum(["ok", "missing", "unsupported"]),
+  post_tool_correlation: z.enum(["ok", "missing", "unsupported"]),
+  execution_recheck: z.literal("pending"),
+  enforced: z.boolean(),
 }).strict();
 const GuardAdapterCoverageSchema = z.object({
   claude: GuardAdapterCoverageEntrySchema,
@@ -137,20 +152,27 @@ const GuardSessionClaimStatusSchema = z.union([
     work_contract_digest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   }).strict(),
 ]);
-const GuardStatusResultSchema = z.object({
+const GuardDiagnosticStateSchema = z.object({
   protocol_version: z.literal(1),
   runtime_mode: z.enum(["enforce", "observe"]),
   request_state: GuardRequestStatusSchema,
   digest_key: z.object({ safety: z.enum(["ready", "not_initialized", "unavailable"]) }).strict(),
   registry_claims: z.object({ availability: z.enum(["available", "unavailable"]) }).strict(),
   session_claim: GuardSessionClaimStatusSchema.optional(),
-  adapter_coverage: GuardAdapterCoverageSchema,
+}).strict();
+type GuardDiagnosticState = z.infer<typeof GuardDiagnosticStateSchema>;
+const GuardStatusResultSchema = GuardDiagnosticStateSchema.extend({
+  adapter_coverage: GuardStatusAdapterCoverageSchema,
 }).strict();
 type GuardStatusResult = z.infer<typeof GuardStatusResultSchema>;
+const GuardPreflightDiagnosticsSchema = GuardDiagnosticStateSchema.extend({
+  adapter_coverage: GuardAdapterCoverageSchema,
+}).strict();
+type GuardPreflightDiagnostics = z.infer<typeof GuardPreflightDiagnosticsSchema>;
 const GuardPreflightResultSchema = z.object({
   status: z.literal("NO-GO"),
   code: z.literal("GUARD_UNAVAILABLE"),
-  diagnostics: GuardStatusResultSchema,
+  diagnostics: GuardPreflightDiagnosticsSchema,
 }).strict();
 
 const commandNames = [
@@ -213,6 +235,36 @@ export interface PreflightPort {
   run(): Promise<PreflightResult>;
 }
 
+interface CodexHookMetadataCommon {
+  eventName: string;
+  matcher: string | null;
+  timeoutSec: number;
+  source: string;
+  sourcePath: string;
+  isManaged: boolean;
+  enabled: boolean;
+  trustStatus: "managed" | "untrusted" | "trusted" | "modified";
+  currentHash: string;
+  displayOrder: number;
+}
+
+export type CodexHookMetadata = CodexHookMetadataCommon & (
+  | { handlerType: "command"; async: boolean; command: string }
+  | { handlerType: "mcpTool"; server: string; tool: string }
+);
+
+export interface CodexHookProbeResult {
+  exitCode: number | null;
+  signal: string | null;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+}
+
+export interface CodexHookRuntimePort {
+  list(): Promise<CodexHookMetadata[]>;
+  probe(home: string, command: string): Promise<CodexHookProbeResult>;
+}
+
 export interface CliDependencies {
   stateDir: string;
   /**
@@ -238,6 +290,8 @@ export interface CliDependencies {
   guardRequests: Pick<GuardRequestStore, "inspect">;
   guardDigestKey: Pick<GuardDigestKey, "inspect">;
   guardClaims: Pick<ClaimService, "withCommittedView" | "listActiveClaims">;
+  codexRepositoryRoot?: string;
+  codexHookRuntime?: CodexHookRuntimePort;
   mutationLock: MutationLockPort;
   journal?: JournalPort;
   boardService: Pick<
@@ -390,6 +444,8 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
     guardRequests: createProductionGuardRequestStore(config, env),
     guardDigestKey: new GuardDigestKey(config.stateDir),
     guardClaims: claims,
+    codexRepositoryRoot: codexRepositoryRoot(),
+    codexHookRuntime: createCodexHookRuntime(env),
     mutationLock: createProductionMutationLock(config, env),
     // The board lock is a second host-global lock with its own identity: board
     // commands must never contend with registry.lock, and boards.lock waits
@@ -641,17 +697,435 @@ function validatedPortResult<T>(schema: ZodType<T>, raw: unknown, code: string):
   return parsed.data;
 }
 
-function pendingAdapterCoverage(): z.infer<typeof GuardAdapterCoverageSchema> {
-  const pending = () => ({
-    prompt_origin: "pending" as const,
-    pre_tool_blocking: "pending" as const,
-    execution_recheck: "pending" as const,
+const codexHookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse"] as const;
+const codexRuntimeEventNames = {
+  UserPromptSubmit: "userPromptSubmit",
+  PreToolUse: "preToolUse",
+  PostToolUse: "postToolUse",
+} as const;
+const maximumCodexHooksBytes = 128 * 1024;
+const maximumCodexRuntimeEntries = 256;
+const maximumCodexProbeBytes = 12 * 1024;
+
+const CodexHookMetadataCommonSchema = z.object({
+  eventName: z.string().min(1).max(255),
+  matcher: z.string().max(4_096).nullable(),
+  timeoutSec: z.number().int().nonnegative().max(86_400),
+  source: z.string().min(1).max(255),
+  sourcePath: z.string().min(1).max(4_096),
+  isManaged: z.boolean(),
+  enabled: z.boolean(),
+  trustStatus: z.enum(["managed", "untrusted", "trusted", "modified"]),
+  currentHash: z.string().min(1).max(4_096),
+  displayOrder: z.number().int().nonnegative().max(1_000_000),
+}).passthrough();
+const CodexHookMetadataSchema = z.discriminatedUnion("handlerType", [
+  CodexHookMetadataCommonSchema.extend({
+    handlerType: z.literal("command"),
+    async: z.boolean(),
+    command: z.string().min(1).max(4_096),
+  }),
+  CodexHookMetadataCommonSchema.extend({
+    handlerType: z.literal("mcpTool"),
+    server: z.string().min(1).max(4_096),
+    tool: z.string().min(1).max(4_096),
+  }),
+]);
+const CodexHookMetadataListSchema = z.array(CodexHookMetadataSchema).max(maximumCodexRuntimeEntries);
+const CodexHooksListResultSchema = z.object({
+  data: z.array(z.object({
+    hooks: z.array(CodexHookMetadataSchema).max(maximumCodexRuntimeEntries),
+    errors: z.array(z.unknown()).max(0),
+    warnings: z.array(z.unknown()).max(maximumCodexRuntimeEntries),
+  }).passthrough()).max(1),
+}).passthrough();
+const CodexHookProbeResultSchema = z.object({
+  exitCode: z.number().int().nonnegative().max(255).nullable(),
+  signal: z.string().min(1).max(64).nullable(),
+  stdout: z.custom<Uint8Array>((value) => value instanceof Uint8Array && value.byteLength <= maximumCodexProbeBytes),
+  stderr: z.custom<Uint8Array>((value) => value instanceof Uint8Array && value.byteLength <= maximumCodexProbeBytes),
+}).strict();
+
+function codexRepositoryRoot(): string {
+  return resolvePath(dirname(fileURLToPath(import.meta.url)), "../../..");
+}
+
+function exactObjectKeys(value: unknown, expected: readonly string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function expectedCodexHookCommand(eventName: typeof codexHookEvents[number]): string {
+  return `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${eventName}`;
+}
+
+function isExactCodexHookGroup(value: unknown, eventName: typeof codexHookEvents[number]): boolean {
+  if (!exactObjectKeys(value, ["hooks"]) || !Array.isArray(value.hooks) || value.hooks.length !== 1) return false;
+  const handler = value.hooks[0];
+  return exactObjectKeys(handler, ["type", "command", "timeout"]) &&
+    handler.type === "command" && handler.command === expectedCodexHookCommand(eventName) && handler.timeout === 12;
+}
+
+async function readBoundedNoFollowRegularFile(file: string, maximumBytes: number): Promise<Buffer | undefined> {
+  const handle = await open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > maximumBytes) return undefined;
+    const buffer = Buffer.alloc(maximumBytes + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, null);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > maximumBytes) return undefined;
+    return buffer.subarray(0, offset);
+  } finally {
+    await handle.close();
+  }
+}
+
+type ExactCodexInstallationEvidence = {
+  probeCommand: string;
+};
+
+async function inspectExactCodexInstallation(
+  home: string,
+  repositoryRoot: string = codexRepositoryRoot(),
+): Promise<ExactCodexInstallationEvidence | undefined> {
+  if (!isAbsolute(home) || !isAbsolute(repositoryRoot)) return undefined;
+  const launcherPath = join(home, ".local", "bin", "jhw-control-hook");
+  const expectedLauncher = join(repositoryRoot, "scripts", "jhw-control-hook");
+  const corePath = join(repositoryRoot, "mcp-server", "dist", "control", "hook-adapter.js");
+  const hooksPath = join(home, ".codex", "hooks.json");
+  try {
+    const launcherInfo = await lstat(launcherPath);
+    if (!launcherInfo.isSymbolicLink() || await readlink(launcherPath) !== expectedLauncher) return undefined;
+    const resolvedLauncherInfo = await stat(launcherPath);
+    if (!resolvedLauncherInfo.isFile() || (resolvedLauncherInfo.mode & 0o111) === 0) return undefined;
+    const coreInfo = await lstat(corePath);
+    if (!coreInfo.isFile() || coreInfo.isSymbolicLink() || (coreInfo.mode & 0o111) === 0) return undefined;
+    const bytes = await readBoundedNoFollowRegularFile(hooksPath, maximumCodexHooksBytes);
+    if (!bytes) return undefined;
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    const document: unknown = JSON.parse(text);
+    if (!document || typeof document !== "object" || Array.isArray(document)) return undefined;
+    const hooks = (document as Record<string, unknown>).hooks;
+    if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return undefined;
+    const exact = codexHookEvents.every((eventName) => {
+      const groups = (hooks as Record<string, unknown>)[eventName];
+      return Array.isArray(groups) && groups.length > 0 && isExactCodexHookGroup(groups[0], eventName) &&
+        groups.filter((group) => isExactCodexHookGroup(group, eventName)).length === 1;
+    });
+    if (!exact) return undefined;
+    const preToolGroups = (hooks as Record<string, unknown>).PreToolUse as Array<{ hooks: Array<{ command: string }> }>;
+    return { probeCommand: preToolGroups[0]?.hooks[0]?.command as string };
+  } catch {
+    return undefined;
+  }
+}
+
+function isExactTrustedCodexRuntimeEntry(
+  entry: z.infer<typeof CodexHookMetadataSchema>,
+  home: string,
+  eventName: typeof codexHookEvents[number],
+): boolean {
+  return entry.eventName === codexRuntimeEventNames[eventName] &&
+    entry.handlerType === "command" &&
+    entry.async === false &&
+    entry.command === expectedCodexHookCommand(eventName) &&
+    entry.matcher === null &&
+    entry.timeoutSec === 12 &&
+    entry.source === "user" &&
+    entry.sourcePath === join(home, ".codex", "hooks.json") &&
+    entry.isManaged === false &&
+    entry.enabled === true &&
+    entry.trustStatus === "trusted" &&
+    entry.currentHash.length > 0 && entry.currentHash.length <= 4_096;
+}
+
+function hasEffectiveTrustedCodexRuntime(
+  raw: unknown,
+  home: string,
+): boolean {
+  const parsed = CodexHookMetadataListSchema.safeParse(raw);
+  if (!parsed.success) return false;
+  return codexHookEvents.every((eventName) => {
+    const handlers = parsed.data.filter((entry) =>
+      entry.eventName === codexRuntimeEventNames[eventName]);
+    const exact = handlers.filter((entry) => isExactTrustedCodexRuntimeEntry(entry, home, eventName));
+    if (exact.length !== 1) return false;
+    return !handlers.some((entry) => entry !== exact[0] &&
+      entry.enabled &&
+      (entry.handlerType === "mcpTool" || entry.async === false) &&
+      (entry.isManaged || entry.trustStatus === "managed" || entry.trustStatus === "trusted"));
   });
+}
+
+function hasExactCodexHookProbe(raw: unknown): boolean {
+  const parsed = CodexHookProbeResultSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.exitCode !== 0 || parsed.data.signal !== null || parsed.data.stderr.byteLength !== 0) {
+    return false;
+  }
+  const expectedValue = renderStaticHookFailure("PreToolUse", "GUARD_PROTOCOL_MISMATCH");
+  const expected = Buffer.from(`${JSON.stringify(expectedValue)}\n`, "utf8");
+  const stdout = Buffer.from(parsed.data.stdout);
+  if (!stdout.equals(expected)) return false;
+  try {
+    return NativeHookOutputSchema.safeParse(JSON.parse(stdout.toString("utf8"))).success;
+  } catch {
+    return false;
+  }
+}
+
+async function inspectAdapterCoverage(
+  dependencies: CliDependencies,
+): Promise<z.infer<typeof GuardAdapterCoverageSchema>> {
+  const installation = dependencies.env.HOME !== undefined &&
+    adapterContractResults.codex.fixture_axes.prompt_origin &&
+    adapterContractResults.codex.fixture_axes.pre_tool_block &&
+    adapterContractResults.codex.fixture_axes.post_tool_correlation &&
+    await inspectExactCodexInstallation(
+      dependencies.env.HOME,
+      dependencies.codexRepositoryRoot ?? codexRepositoryRoot(),
+    );
+  const installed = installation !== false && installation !== undefined;
+  let runtimeTrusted = false;
+  let probeTrusted = false;
+  if (installed && dependencies.codexHookRuntime) {
+    try {
+      runtimeTrusted = hasEffectiveTrustedCodexRuntime(
+        await dependencies.codexHookRuntime.list(),
+        dependencies.env.HOME as string,
+      );
+      if (runtimeTrusted) {
+        probeTrusted = hasExactCodexHookProbe(await dependencies.codexHookRuntime.probe(
+          dependencies.env.HOME as string,
+          (installation as ExactCodexInstallationEvidence).probeCommand,
+        ));
+      }
+    } catch {
+      runtimeTrusted = false;
+      probeTrusted = false;
+    }
+  }
+  const missing = {
+    prompt_origin: "missing" as const,
+    pre_tool_block: "missing" as const,
+    post_tool_correlation: "missing" as const,
+    execution_recheck: "pending" as const,
+    enforced: false,
+  };
+  const unsupported = {
+    prompt_origin: "unsupported" as const,
+    pre_tool_block: "unsupported" as const,
+    post_tool_correlation: "unsupported" as const,
+    execution_recheck: "pending" as const,
+    enforced: false,
+  };
   return {
-    claude: pending(),
-    codex: pending(),
-    gemini: pending(),
-    opencode: pending(),
+    claude: { ...missing },
+    codex: installed ? {
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: dependencies.guardMode === "enforce" && runtimeTrusted && probeTrusted,
+    } : { ...missing },
+    gemini: { ...unsupported },
+    opencode: { ...unsupported },
+  };
+}
+
+async function listCodexRuntimeHooks(env: NodeJS.ProcessEnv): Promise<CodexHookMetadata[]> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("codex", ["app-server", "--stdio"], { env, stdio: ["pipe", "pipe", "pipe"] });
+    let settled = false;
+    let shuttingDown = false;
+    let outcomeCause: unknown;
+    let outcomeValue: CodexHookMetadata[] | undefined;
+    let forceTimer: NodeJS.Timeout | undefined;
+    let stdout = "";
+    let outputBytes = 0;
+    let initialized = false;
+    const requestShutdown = (cause?: unknown, value?: CodexHookMetadata[]) => {
+      if (settled || shuttingDown) return;
+      shuttingDown = true;
+      outcomeCause = cause;
+      outcomeValue = value;
+      clearTimeout(timer);
+      child.stdin.end();
+      child.kill("SIGTERM");
+      forceTimer = setTimeout(() => child.kill("SIGKILL"), 250);
+    };
+    const timer = setTimeout(() => requestShutdown(new Error("Codex hook inventory timed out")), 5_000);
+    const writeMessage = (message: unknown) => child.stdin.write(`${JSON.stringify(message)}\n`);
+    child.on("error", (cause) => {
+      if (settled) return;
+      if (child.pid !== undefined) {
+        requestShutdown(cause);
+        return;
+      }
+      clearTimeout(timer);
+      settled = true;
+      reject(cause);
+    });
+    child.stdin.on("error", (cause) => {
+      if (!shuttingDown) requestShutdown(cause);
+    });
+    child.on("close", () => {
+      if (settled) return;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      settled = true;
+      if (!shuttingDown) reject(new Error("Codex hook inventory closed early"));
+      else if (outcomeCause !== undefined) reject(outcomeCause);
+      else resolve(outcomeValue ?? []);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      outputBytes += chunk.length;
+      if (outputBytes > maximumCodexHooksBytes) requestShutdown(new Error("Codex hook inventory output exceeded its bound"));
+    });
+    child.stdout.on("data", (chunk: Buffer) => {
+      outputBytes += chunk.length;
+      if (outputBytes > maximumCodexHooksBytes) {
+        requestShutdown(new Error("Codex hook inventory output exceeded its bound"));
+        return;
+      }
+      stdout += chunk.toString("utf8");
+      const lines = stdout.split("\n");
+      stdout = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line) continue;
+        let message: unknown;
+        try { message = JSON.parse(line); } catch {
+          requestShutdown(new Error("Codex hook inventory returned invalid JSON"));
+          return;
+        }
+        if (!message || typeof message !== "object") continue;
+        const response = message as { id?: unknown; result?: unknown; error?: unknown };
+        if (response.id === 1) {
+          if (response.error !== undefined || initialized) {
+            requestShutdown(new Error("Codex hook inventory initialization failed"));
+            return;
+          }
+          initialized = true;
+          writeMessage({ method: "initialized" });
+          writeMessage({ id: 2, method: "hooks/list", params: { cwds: [] } });
+        } else if (response.id === 2) {
+          if (response.error !== undefined || !initialized) {
+            requestShutdown(new Error("Codex hook inventory request failed"));
+            return;
+          }
+          const parsed = CodexHooksListResultSchema.safeParse(response.result);
+          if (!parsed.success) {
+            requestShutdown(new Error("Codex hook inventory response was invalid"));
+            return;
+          }
+          requestShutdown(undefined, parsed.data.data.flatMap((entry) => entry.hooks));
+          return;
+        }
+      }
+    });
+    writeMessage({
+      id: 1,
+      method: "initialize",
+      params: {
+        clientInfo: { name: "jhw-control", version: "1" },
+        capabilities: { experimentalApi: true },
+      },
+    });
+  });
+}
+
+async function probeCodexHookCommand(
+  env: NodeJS.ProcessEnv,
+  home: string,
+  command: string,
+): Promise<CodexHookProbeResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("/bin/sh", ["-lc", command], {
+      cwd: home,
+      detached: true,
+      env: { ...env, HOME: home },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let shutdownRequested = false;
+    let terminalError: unknown;
+    let forceTimer: NodeJS.Timeout | undefined;
+
+    const signalGroup = (signal: NodeJS.Signals) => {
+      if (child.pid === undefined) return;
+      try {
+        process.kill(-child.pid, signal);
+      } catch {
+        try { child.kill(signal); } catch {}
+      }
+    };
+    const requestShutdown = (cause: unknown) => {
+      if (settled || shutdownRequested) return;
+      shutdownRequested = true;
+      terminalError = cause;
+      child.stdin.end();
+      signalGroup("SIGTERM");
+      forceTimer = setTimeout(() => signalGroup("SIGKILL"), 250);
+    };
+    const timer = setTimeout(() => requestShutdown(new Error("Codex hook probe timed out")), 9_000);
+    const capture = (target: Buffer[], stream: "stdout" | "stderr", chunk: Buffer) => {
+      if (stream === "stdout") stdoutBytes += chunk.length;
+      else stderrBytes += chunk.length;
+      if (stdoutBytes > maximumCodexProbeBytes || stderrBytes > maximumCodexProbeBytes) {
+        requestShutdown(new Error("Codex hook probe output exceeded its bound"));
+        return;
+      }
+      target.push(Buffer.from(chunk));
+    };
+
+    child.on("error", (cause) => {
+      if (settled) return;
+      if (child.pid === undefined) {
+        settled = true;
+        clearTimeout(timer);
+        if (forceTimer) clearTimeout(forceTimer);
+        reject(cause);
+        return;
+      }
+      requestShutdown(cause);
+    });
+    child.stdin.on("error", (cause) => requestShutdown(cause));
+    child.stdout.on("data", (chunk: Buffer) => capture(stdout, "stdout", chunk));
+    child.stderr.on("data", (chunk: Buffer) => capture(stderr, "stderr", chunk));
+    child.on("close", (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (terminalError !== undefined) {
+        reject(terminalError);
+        return;
+      }
+      resolve({
+        exitCode,
+        signal,
+        stdout: Buffer.concat(stdout, stdoutBytes),
+        stderr: Buffer.concat(stderr, stderrBytes),
+      });
+    });
+    child.stdin.end('{"hook_event_name":"PreToolUse"}\n');
+  });
+}
+
+function createCodexHookRuntime(env: NodeJS.ProcessEnv): CodexHookRuntimePort {
+  return {
+    list: () => listCodexRuntimeHooks(env),
+    probe: (home, command) => probeCodexHookCommand(env, home, command),
   };
 }
 
@@ -669,10 +1143,24 @@ function guardRequestCounts(requests: z.infer<typeof GuardRequestSchema>[]): z.i
   return GuardRequestCountsSchema.parse(counts);
 }
 
-async function inspectGuardStatus(
+function pendingAdapterCoverage(): z.infer<typeof GuardStatusAdapterCoverageSchema> {
+  const pending = () => ({
+    prompt_origin: "pending" as const,
+    pre_tool_blocking: "pending" as const,
+    execution_recheck: "pending" as const,
+  });
+  return {
+    claude: pending(),
+    codex: pending(),
+    gemini: pending(),
+    opencode: pending(),
+  };
+}
+
+async function inspectGuardState(
   dependencies: CliDependencies,
   session?: string,
-): Promise<GuardStatusResult> {
+): Promise<GuardDiagnosticState> {
   let requestState: z.infer<typeof GuardRequestStatusSchema>;
   try {
     const inspected = GuardRequestInspectionSchema.parse(await dependencies.guardRequests.inspect());
@@ -684,7 +1172,7 @@ async function inspectGuardStatus(
     requestState = { safety: "unavailable" };
   }
 
-  let digestKey: GuardStatusResult["digest_key"];
+  let digestKey: GuardDiagnosticState["digest_key"];
   try {
     const inspected = GuardDigestKeyInspectionSchema.parse(await dependencies.guardDigestKey.inspect());
     digestKey = { safety: inspected.status };
@@ -692,8 +1180,8 @@ async function inspectGuardStatus(
     digestKey = { safety: "unavailable" };
   }
 
-  let registryClaims: GuardStatusResult["registry_claims"];
-  let sessionClaim: GuardStatusResult["session_claim"];
+  let registryClaims: GuardDiagnosticState["registry_claims"];
+  let sessionClaim: GuardDiagnosticState["session_claim"];
   try {
     const rawClaims = await dependencies.guardClaims.withCommittedView(
       () => dependencies.guardClaims.listActiveClaims(),
@@ -719,18 +1207,34 @@ async function inspectGuardStatus(
     if (session !== undefined) sessionClaim = { match: "unavailable" };
   }
 
-  return GuardStatusResultSchema.parse({
+  return GuardDiagnosticStateSchema.parse({
     protocol_version: 1,
     runtime_mode: dependencies.guardMode,
     request_state: requestState,
     digest_key: digestKey,
     registry_claims: registryClaims,
     ...(sessionClaim ? { session_claim: sessionClaim } : {}),
+  });
+}
+
+async function inspectGuardStatus(
+  dependencies: CliDependencies,
+  session?: string,
+): Promise<GuardStatusResult> {
+  return GuardStatusResultSchema.parse({
+    ...await inspectGuardState(dependencies, session),
     adapter_coverage: pendingAdapterCoverage(),
   });
 }
 
-function guardPreflightNoGo(command: "guard preflight", diagnostics: GuardStatusResult): CliResult {
+async function inspectGuardPreflight(dependencies: CliDependencies): Promise<GuardPreflightDiagnostics> {
+  return GuardPreflightDiagnosticsSchema.parse({
+    ...await inspectGuardState(dependencies),
+    adapter_coverage: await inspectAdapterCoverage(dependencies),
+  });
+}
+
+function guardPreflightNoGo(command: "guard preflight", diagnostics: GuardPreflightDiagnostics): CliResult {
   const result = GuardPreflightResultSchema.parse({
     status: "NO-GO",
     code: "GUARD_UNAVAILABLE",
@@ -1740,7 +2244,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     assertSafeFlags(flags, dependencies);
     return {
       flags,
-      result: guardPreflightNoGo(command, await inspectGuardStatus(dependencies)),
+      result: guardPreflightNoGo(command, await inspectGuardPreflight(dependencies)),
     };
   }
 
