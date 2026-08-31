@@ -336,7 +336,7 @@ describe("WorktreeManager", () => {
     expect((await stat(root)).mode & 0o777).toBe(0o755);
   });
 
-  it("rejects a corrupted worktree mapping Claim generation", async () => {
+  it("rejects a corrupted worktree mapping claim generation", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const active = claim();
     await manager.createOrReuse(active, repoDir);
