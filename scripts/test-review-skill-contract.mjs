@@ -12,6 +12,26 @@ const codexReference = join(repoRoot, "skills", "codex", "jhw-review", "referenc
 const review = readFileSync(canonicalReview, "utf8");
 const failures = [];
 
+function initialFrontmatter(markdown, label) {
+  const match = markdown.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+  if (!match) {
+    failures.push(`missing initial YAML frontmatter: ${label}`);
+    return new Map();
+  }
+  return new Map(match[1].split(/\r?\n/).flatMap((line) => {
+    const field = line.match(/^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/);
+    return field ? [[field[1], field[2]]] : [];
+  }));
+}
+
+const canonicalFrontmatter = initialFrontmatter(review, "canonical review");
+if (canonicalFrontmatter.get("description")?.includes("--control") !== true) {
+  failures.push("canonical review frontmatter description must mention --control");
+}
+if (canonicalFrontmatter.get("argument-hint") !== '"[--match] [--control]"') {
+  failures.push("canonical review frontmatter argument-hint must be [--match] [--control]");
+}
+
 const required = [
   "[--match] [--control]",
   "task status",
@@ -57,8 +77,17 @@ const requiredMatrixRows = [
   ["이미 완료된 작업 + active Task 없음", "Issue close·Project update 등 남은 tracker 작업만 제안", "소급 Task 생성"],
   ["control lookup unavailable", "stable diagnostic과 수동 확인 제안", "cached/session 기억으로 owner 판정"],
 ];
+const matrixRows = control.split(/\r?\n/).flatMap((line) => {
+  const cells = line.trim().split("|");
+  if (cells.length !== 5 || cells[0] !== "" || cells[4] !== "") return [];
+  const normalized = cells.slice(1, -1).map((cell) => cell.trim().replaceAll(/\s+/g, " "));
+  if (normalized.every((cell) => /^-+$/.test(cell))) return [];
+  return [normalized];
+});
 for (const row of requiredMatrixRows) {
-  if (!row.every((cell) => control.includes(cell))) {
+  const normalized = row.map((cell) => cell.replaceAll(/\s+/g, " "));
+  if (!matrixRows.some((actual) => actual.length === normalized.length &&
+      actual.every((cell, index) => cell === normalized[index]))) {
     failures.push(`missing control suggestion matrix row: ${row[0]}`);
   }
 }
@@ -110,15 +139,12 @@ try {
 
 try {
   const generated = readFileSync(codexSkill, "utf8");
-  if (!generated.includes("--control")) {
+  const generatedFrontmatter = initialFrontmatter(generated, "generated Codex review SKILL.md");
+  if (generatedFrontmatter.get("description")?.includes("--control") !== true) {
     failures.push("generated Codex SKILL.md description must mention --control after sync");
   }
 } catch (error) {
   failures.push(`cannot read generated Codex review SKILL.md: ${error.code ?? error.message}`);
-}
-
-if (!review.startsWith("---\n") || !review.includes('argument-hint: "[--match] [--control]"')) {
-  failures.push("canonical review frontmatter must contain updated --match/--control argument hint");
 }
 
 if (failures.length > 0) {
