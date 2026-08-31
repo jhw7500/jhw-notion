@@ -10,6 +10,7 @@ REAL_TIMEOUT="$(command -v timeout)"
 cat >"$FAKE_BIN/timeout" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >>"\${JHW_FAKE_PROBE_LOG:?}"
+printf '%s\n' "\$PWD" >"\${JHW_FAKE_PROBE_CWD_LOG:?}"
 exec "$REAL_TIMEOUT" "\$@"
 EOF
 chmod +x "$FAKE_BIN/timeout"
@@ -63,7 +64,8 @@ input.on("line", (line) => {
     return;
   }
   if (message.method === "hooks/list") {
-    if (stage !== 2 || message.id === undefined || !Array.isArray(message.params?.cwds) || message.params.cwds.length > 1) {
+    if (stage !== 2 || message.id === undefined || !Array.isArray(message.params?.cwds) ||
+        message.params.cwds.length !== 1 || message.params.cwds[0] !== process.cwd()) {
       fail("invalid-hooks-list");
     }
     append("hooks/list");
@@ -117,7 +119,7 @@ input.on("line", (line) => {
     });
     if (mode === "missing-display-order") delete hooks[1].displayOrder;
     stage = 3;
-    send(message.id, { data: [{ cwd: message.params.cwds[0] ?? process.cwd(), hooks, errors: [], warnings: [] }] });
+    send(message.id, { data: [{ cwd: message.params.cwds[0], hooks, errors: [], warnings: [] }] });
     setImmediate(() => process.exit(0));
     return;
   }
@@ -136,7 +138,7 @@ self_test_fake_app_server() {
   printf '%s\n' \
     '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"fixture-preflight","version":"1"},"capabilities":{"experimentalApi":true}}}' \
     '{"method":"initialized"}' \
-    '{"id":2,"method":"hooks/list","params":{"cwds":[]}}' |
+    "{\"id\":2,\"method\":\"hooks/list\",\"params\":{\"cwds\":[\"$REPO_ROOT\"]}}" |
     HOME="$home" JHW_FAKE_CODEX_MODE="trusted" JHW_FAKE_CODEX_LOG="$log" \
       "$FAKE_BIN/codex" app-server --stdio >"$output"
   node - "$log" "$output" "$home" <<'EOF'
@@ -180,7 +182,7 @@ make_home() {
     *) ln -s "$REPO_ROOT/scripts/jhw-control-hook" "$home/.local/bin/jhw-control-hook" ;;
   esac
   case "$scenario" in
-    exact-trusted|exact-untrusted|exact-unavailable|exact-runtime-source|exact-runtime-duplicate|exact-stubborn|exact-foreign-trusted-after|exact-mcp-untrusted|exact-guard-async|exact-missing-display-order|launcher-missing|launcher-regular|launcher-foreign)
+    exact-trusted|exact-invalid-shell|exact-untrusted|exact-unavailable|exact-runtime-source|exact-runtime-duplicate|exact-stubborn|exact-foreign-trusted-after|exact-mcp-untrusted|exact-guard-async|exact-missing-display-order|launcher-missing|launcher-regular|launcher-foreign)
       printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s],"PostToolUse":[%s]}}\n' \
         "$(owned_group_json UserPromptSubmit)" \
         "$(owned_group_json PreToolUse)" \
@@ -204,9 +206,10 @@ make_home() {
 }
 
 run_preflight() {
-  local scenario="$1" home="$2" output="$home/preflight.out" error="$home/preflight.err" rc mode log probe_log
+  local scenario="$1" home="$2" output="$home/preflight.out" error="$home/preflight.err" rc mode log probe_log probe_cwd_log runtime_shell
   case "$scenario" in
     exact-trusted) mode="trusted" ;;
+    exact-invalid-shell) mode="trusted" ;;
     exact-untrusted) mode="untrusted" ;;
     exact-unavailable) mode="unavailable" ;;
     exact-runtime-source) mode="wrong-source" ;;
@@ -220,13 +223,17 @@ run_preflight() {
   esac
   log="$ROOT/$scenario-app-server.log"
   probe_log="$ROOT/$scenario-shell-probe.log"
+  probe_cwd_log="$ROOT/$scenario-shell-probe-cwd.log"
+  runtime_shell="${SHELL:-/bin/sh}"
+  [ "$scenario" != "exact-invalid-shell" ] || runtime_shell="$home/private-missing-shell"
   local started_ms finished_ms elapsed_ms stubborn_pid
   started_ms="$(date +%s%3N)"
-  if HOME="$home" PATH="$FAKE_BIN:$PATH" \
+  if HOME="$home" PATH="$FAKE_BIN:$PATH" SHELL="$runtime_shell" \
       JHW_FAKE_CODEX_MODE="$mode" \
       JHW_FAKE_CODEX_LOG="$log" \
       JHW_FAKE_CODEX_PID="$ROOT/$scenario-app-server.pid" \
       JHW_FAKE_PROBE_LOG="$probe_log" \
+      JHW_FAKE_PROBE_CWD_LOG="$probe_cwd_log" \
       JHW_REGISTRY_DIR="$home/registry" \
       JHW_WORKTREE_ROOT="$home/worktrees" \
       JHW_BUILD_HOST="fixture-host" \
@@ -259,10 +266,10 @@ run_preflight() {
       return 1
     fi
   fi
-  node - "$scenario" "$output" "$error" "$log" "$probe_log" <<'EOF'
+  node - "$scenario" "$output" "$error" "$log" "$probe_log" "$probe_cwd_log" "$REPO_ROOT" <<'EOF'
 const fs = require("node:fs");
 const path = require("node:path");
-const [scenario, stdoutPath, stderrPath, logPath, probeLogPath] = process.argv.slice(2);
+const [scenario, stdoutPath, stderrPath, logPath, probeLogPath, probeCwdLogPath, expectedProbeCwd] = process.argv.slice(2);
 const stdout = fs.readFileSync(stdoutPath, "utf8");
 const stderr = fs.readFileSync(stderrPath, "utf8");
 const raw = stdout || stderr;
@@ -324,12 +331,15 @@ if (scenario === "exact-trusted" || scenario === "exact-mcp-untrusted") {
   if (probe.length !== 1 || !probe[0].startsWith("--foreground 8 ")) {
     fail("shell probe did not traverse the canonical launcher timeout boundary exactly once");
   }
+  if (!fs.existsSync(probeCwdLogPath) || fs.readFileSync(probeCwdLogPath, "utf8").trim() !== expectedProbeCwd) {
+    fail("shell probe did not use the Codex inventory cwd");
+  }
 }
 EOF
 }
 
 all_scenarios=(
-  exact-trusted exact-untrusted exact-unavailable exact-runtime-source exact-runtime-duplicate exact-stubborn
+  exact-trusted exact-invalid-shell exact-untrusted exact-unavailable exact-runtime-source exact-runtime-duplicate exact-stubborn
   exact-foreign-trusted-after exact-mcp-untrusted exact-guard-async exact-missing-display-order
   launcher-missing launcher-regular launcher-foreign duplicate-config missing malformed foreign
 )

@@ -260,9 +260,14 @@ export interface CodexHookProbeResult {
   stderr: Uint8Array;
 }
 
+export interface CodexHookRuntimeInventory {
+  cwd: string;
+  hooks: CodexHookMetadata[];
+}
+
 export interface CodexHookRuntimePort {
-  list(): Promise<CodexHookMetadata[]>;
-  probe(home: string, command: string): Promise<CodexHookProbeResult>;
+  list(): Promise<CodexHookRuntimeInventory>;
+  probe(home: string, command: string, cwd: string): Promise<CodexHookProbeResult>;
 }
 
 export interface CliDependencies {
@@ -734,10 +739,11 @@ const CodexHookMetadataSchema = z.discriminatedUnion("handlerType", [
 const CodexHookMetadataListSchema = z.array(CodexHookMetadataSchema).max(maximumCodexRuntimeEntries);
 const CodexHooksListResultSchema = z.object({
   data: z.array(z.object({
+    cwd: z.string().min(1).max(4_096),
     hooks: z.array(CodexHookMetadataSchema).max(maximumCodexRuntimeEntries),
     errors: z.array(z.unknown()).max(0),
     warnings: z.array(z.unknown()).max(maximumCodexRuntimeEntries),
-  }).passthrough()).max(1),
+  }).passthrough()).length(1),
 }).passthrough();
 const CodexHookProbeResultSchema = z.object({
   exitCode: z.number().int().nonnegative().max(255).nullable(),
@@ -896,14 +902,17 @@ async function inspectAdapterCoverage(
   let probeTrusted = false;
   if (installed && dependencies.codexHookRuntime) {
     try {
+      const inventory = await dependencies.codexHookRuntime.list();
+      const inventoryCwdInfo = isAbsolute(inventory.cwd) ? await stat(inventory.cwd) : undefined;
       runtimeTrusted = hasEffectiveTrustedCodexRuntime(
-        await dependencies.codexHookRuntime.list(),
+        inventoryCwdInfo?.isDirectory() ? inventory.hooks : undefined,
         dependencies.env.HOME as string,
       );
       if (runtimeTrusted) {
         probeTrusted = hasExactCodexHookProbe(await dependencies.codexHookRuntime.probe(
           dependencies.env.HOME as string,
           (installation as ExactCodexInstallationEvidence).probeCommand,
+          inventory.cwd,
         ));
       }
     } catch {
@@ -939,18 +948,19 @@ async function inspectAdapterCoverage(
   };
 }
 
-async function listCodexRuntimeHooks(env: NodeJS.ProcessEnv): Promise<CodexHookMetadata[]> {
+async function listCodexRuntimeHooks(env: NodeJS.ProcessEnv): Promise<CodexHookRuntimeInventory> {
+  const requestedCwd = process.cwd();
   return new Promise((resolve, reject) => {
     const child = spawn("codex", ["app-server", "--stdio"], { env, stdio: ["pipe", "pipe", "pipe"] });
     let settled = false;
     let shuttingDown = false;
     let outcomeCause: unknown;
-    let outcomeValue: CodexHookMetadata[] | undefined;
+    let outcomeValue: CodexHookRuntimeInventory | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
     let stdout = "";
     let outputBytes = 0;
     let initialized = false;
-    const requestShutdown = (cause?: unknown, value?: CodexHookMetadata[]) => {
+    const requestShutdown = (cause?: unknown, value?: CodexHookRuntimeInventory) => {
       if (settled || shuttingDown) return;
       shuttingDown = true;
       outcomeCause = cause;
@@ -982,7 +992,8 @@ async function listCodexRuntimeHooks(env: NodeJS.ProcessEnv): Promise<CodexHookM
       settled = true;
       if (!shuttingDown) reject(new Error("Codex hook inventory closed early"));
       else if (outcomeCause !== undefined) reject(outcomeCause);
-      else resolve(outcomeValue ?? []);
+      else if (outcomeValue !== undefined) resolve(outcomeValue);
+      else reject(new Error("Codex hook inventory returned no result"));
     });
     child.stderr.on("data", (chunk: Buffer) => {
       outputBytes += chunk.length;
@@ -1013,7 +1024,7 @@ async function listCodexRuntimeHooks(env: NodeJS.ProcessEnv): Promise<CodexHookM
           }
           initialized = true;
           writeMessage({ method: "initialized" });
-          writeMessage({ id: 2, method: "hooks/list", params: { cwds: [] } });
+          writeMessage({ id: 2, method: "hooks/list", params: { cwds: [requestedCwd] } });
         } else if (response.id === 2) {
           if (response.error !== undefined || !initialized) {
             requestShutdown(new Error("Codex hook inventory request failed"));
@@ -1024,7 +1035,12 @@ async function listCodexRuntimeHooks(env: NodeJS.ProcessEnv): Promise<CodexHookM
             requestShutdown(new Error("Codex hook inventory response was invalid"));
             return;
           }
-          requestShutdown(undefined, parsed.data.data.flatMap((entry) => entry.hooks));
+          const inventory = parsed.data.data[0];
+          if (!inventory || !isAbsolute(inventory.cwd) || inventory.cwd !== requestedCwd) {
+            requestShutdown(new Error("Codex hook inventory cwd was invalid"));
+            return;
+          }
+          requestShutdown(undefined, { cwd: inventory.cwd, hooks: inventory.hooks });
           return;
         }
       }
@@ -1044,10 +1060,11 @@ async function probeCodexHookCommand(
   env: NodeJS.ProcessEnv,
   home: string,
   command: string,
+  cwd: string,
 ): Promise<CodexHookProbeResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn("/bin/sh", ["-lc", command], {
-      cwd: home,
+    const child = spawn(env.SHELL ?? "/bin/sh", ["-lc", command], {
+      cwd,
       detached: true,
       env: { ...env, HOME: home },
       stdio: ["pipe", "pipe", "pipe"],
@@ -1125,7 +1142,7 @@ async function probeCodexHookCommand(
 function createCodexHookRuntime(env: NodeJS.ProcessEnv): CodexHookRuntimePort {
   return {
     list: () => listCodexRuntimeHooks(env),
-    probe: (home, command) => probeCodexHookCommand(env, home, command),
+    probe: (home, command, cwd) => probeCodexHookCommand(env, home, command, cwd),
   };
 }
 

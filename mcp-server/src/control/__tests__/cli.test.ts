@@ -56,6 +56,11 @@ type Task3CodexHookProbeResult = {
   stderr: Uint8Array;
 };
 
+type Task3CodexHookRuntimeInventory = {
+  cwd: string;
+  hooks: Task3CodexHookMetadata[];
+};
+
 function lockConfig(stateDir: string): ControlConfig {
   return {
     registryDir: "/srv/registry",
@@ -200,8 +205,8 @@ type Overrides = {
   guardClaims?: Record<string, unknown>;
   codexRepositoryRoot?: string;
   codexHookRuntime?: {
-    list(): Promise<Task3CodexHookMetadata[]>;
-    probe(home: string, command: string): Promise<Task3CodexHookProbeResult>;
+    list(): Promise<Task3CodexHookRuntimeInventory>;
+    probe(home: string, command: string, cwd: string): Promise<Task3CodexHookProbeResult>;
   };
   registrationRecordWarning?: CliDependencies["registrationRecordWarning"];
 };
@@ -578,9 +583,10 @@ function task3SuccessfulProbe(): Task3CodexHookProbeResult {
 function task3Runtime(
   metadata: Task3CodexHookMetadata[],
   probeResult: Task3CodexHookProbeResult = task3SuccessfulProbe(),
+  cwd: string = dirname(dirname(metadata[0]?.sourcePath ?? "/private/.codex/hooks.json")),
 ) {
   return {
-    list: vi.fn().mockResolvedValue(metadata),
+    list: vi.fn().mockResolvedValue({ cwd, hooks: metadata }),
     probe: vi.fn().mockResolvedValue(probeResult),
   };
 }
@@ -2555,9 +2561,28 @@ describe("runCli", () => {
     expect(runtime.probe).toHaveBeenCalledWith(
       fixture.home,
       '"$HOME/.local/bin/jhw-control-hook" --adapter codex --event PreToolUse',
+      fixture.home,
     );
     expect(Buffer.byteLength(result.stdout || result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
   });
+
+  it.each(["relative", "missing"] as const)(
+    "does not probe trusted Codex hooks from a %s inventory cwd",
+    async (scenario) => {
+      const fixture = await task3CodexHome("exact");
+      const cwd = scenario === "relative" ? "relative-runtime-cwd" : join(fixture.home, "missing-runtime-cwd");
+      const runtime = task3Runtime(task3RuntimeEntries(fixture.hooksPath), task3SuccessfulProbe(), cwd);
+      const result = await runCli(["guard", "preflight"], makeCliDependencies({
+        env: { HOME: fixture.home },
+        codexRepositoryRoot: fixture.repositoryRoot,
+        codexHookRuntime: runtime,
+      }));
+
+      expect(task3AdapterCoverage(result).codex.enforced).toBe(false);
+      expect(runtime.probe).not.toHaveBeenCalled();
+      expect(`${result.stdout}${result.stderr}`).not.toContain(cwd);
+    },
+  );
 
   it("never reports trusted exact Codex hooks as enforced while runtime mode is observe", async () => {
     const fixture = await task3CodexHome("exact");
@@ -3053,7 +3078,7 @@ describe("runCli", () => {
   ] as const)("keeps enforcement false when the Codex shell probe has %s", async (_scenario, probe) => {
     const fixture = await task3CodexHome("exact");
     const runtime = {
-      list: vi.fn().mockResolvedValue(task3RuntimeEntries(fixture.hooksPath)),
+      list: vi.fn().mockResolvedValue({ cwd: fixture.home, hooks: task3RuntimeEntries(fixture.hooksPath) }),
       probe: vi.fn(probe),
     };
     const result = await runCli(["guard", "preflight"], makeCliDependencies({

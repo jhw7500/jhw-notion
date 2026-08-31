@@ -130,7 +130,7 @@ validate_control_artifacts() {
   fi
   if [ -e "$CONTROL_HOOK_LINK" ] || [ -L "$CONTROL_HOOK_LINK" ]; then
     if ! { [ -L "$CONTROL_HOOK_LINK" ] &&
-           [ "$(readlink -f -- "$CONTROL_HOOK_LINK" 2>/dev/null)" = "$(readlink -f -- "$CONTROL_HOOK_ENTRY")" ]; }; then
+           [ "$(readlink -- "$CONTROL_HOOK_LINK" 2>/dev/null)" = "$CONTROL_HOOK_ENTRY" ]; }; then
       fail "$CONTROL_HOOK_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
       exit 1
     fi
@@ -145,7 +145,7 @@ install_control_hook() {
   mkdir -p "$(dirname "$CONTROL_HOOK_LINK")"
   if [ -e "$CONTROL_HOOK_LINK" ] || [ -L "$CONTROL_HOOK_LINK" ]; then
     if [ -L "$CONTROL_HOOK_LINK" ] &&
-       [ "$(readlink -f -- "$CONTROL_HOOK_LINK" 2>/dev/null)" = "$(readlink -f -- "$CONTROL_HOOK_ENTRY")" ]; then
+       [ "$(readlink -- "$CONTROL_HOOK_LINK" 2>/dev/null)" = "$CONTROL_HOOK_ENTRY" ]; then
       HOOK_LINK_CREATED=0
       skip "$CONTROL_HOOK_LINK 이미 최신"
       return
@@ -747,6 +747,69 @@ is_unprovisioned_control_diagnostic() {
   ' <<<"$output"
 }
 
+validate_guard_preflight_diagnostic() {
+  local output="$1" rc="$2"
+  GUARD_PREFLIGHT_RC="$rc" node -e '
+    const fs = require("node:fs");
+    const raw = fs.readFileSync(0, "utf8");
+    if (Buffer.byteLength(raw, "utf8") > 12 * 1024) process.exit(1);
+    let payload;
+    try { payload = JSON.parse(raw); } catch { process.exit(1); }
+    const exact = (value, keys) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const actual = Object.keys(value).sort();
+      const expected = [...keys].sort();
+      return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+    };
+    const oneOf = (value, choices) => choices.includes(value);
+    const nonnegativeInteger = (value) => Number.isInteger(value) && value >= 0;
+    const validCounts = (value) => {
+      const keys = ["PENDING", "APPROVED", "CONSUMED", "COMPLETED", "FAILED", "EXPIRED", "total"];
+      if (!exact(value, keys) || !keys.every((key) => nonnegativeInteger(value[key]))) return false;
+      return value.total === keys.slice(0, -1).reduce((sum, key) => sum + value[key], 0);
+    };
+    const validRequestState = (value) => {
+      if (exact(value, ["safety"]) && value.safety === "unavailable") return true;
+      return exact(value, ["safety", "counts"]) &&
+        oneOf(value.safety, ["ready", "not_initialized"]) && validCounts(value.counts);
+    };
+    const validCoverageEntry = (value) => exact(value, [
+      "prompt_origin", "pre_tool_block", "post_tool_correlation", "execution_recheck", "enforced",
+    ]) && oneOf(value.prompt_origin, ["ok", "missing", "unsupported"]) &&
+      oneOf(value.pre_tool_block, ["ok", "missing", "unsupported"]) &&
+      oneOf(value.post_tool_correlation, ["ok", "missing", "unsupported"]) &&
+      value.execution_recheck === "pending" && typeof value.enforced === "boolean";
+    const exactStaticCoverage = (value, state) => validCoverageEntry(value) &&
+      value.prompt_origin === state && value.pre_tool_block === state &&
+      value.post_tool_correlation === state && value.enforced === false;
+    const rc = Number(process.env.GUARD_PREFLIGHT_RC);
+    if (rc !== 78 || !exact(payload, ["command", "result"]) || payload.command !== "guard preflight") process.exit(1);
+    const result = payload.result;
+    if (!exact(result, ["status", "code", "diagnostics"]) ||
+        result.status !== "NO-GO" || result.code !== "GUARD_UNAVAILABLE") process.exit(1);
+    const diagnostics = result.diagnostics;
+    if (!exact(diagnostics, [
+      "protocol_version", "runtime_mode", "request_state", "digest_key", "registry_claims", "adapter_coverage",
+    ]) || diagnostics.protocol_version !== 1 ||
+        !oneOf(diagnostics.runtime_mode, ["enforce", "observe"]) ||
+        !validRequestState(diagnostics.request_state) ||
+        !exact(diagnostics.digest_key, ["safety"]) ||
+        !oneOf(diagnostics.digest_key.safety, ["ready", "not_initialized", "unavailable"]) ||
+        !exact(diagnostics.registry_claims, ["availability"]) ||
+        !oneOf(diagnostics.registry_claims.availability, ["available", "unavailable"])) process.exit(1);
+    const coverage = diagnostics.adapter_coverage;
+    if (!exact(coverage, ["claude", "codex", "gemini", "opencode"]) ||
+        !exactStaticCoverage(coverage.claude, "missing") ||
+        !validCoverageEntry(coverage.codex) ||
+        coverage.codex.prompt_origin !== "ok" || coverage.codex.pre_tool_block !== "ok" ||
+        coverage.codex.post_tool_correlation !== "ok" ||
+        (diagnostics.runtime_mode !== "enforce" && coverage.codex.enforced) ||
+        !exactStaticCoverage(coverage.gemini, "unsupported") ||
+        !exactStaticCoverage(coverage.opencode, "unsupported")) process.exit(1);
+    process.stdout.write(JSON.stringify(payload));
+  ' <<<"$output"
+}
+
 unregister_codex_hooks() {
   local hooks_file="$1" rc
   if [ ! -e "$hooks_file" ] && [ ! -L "$hooks_file" ]; then
@@ -804,39 +867,25 @@ unregister_codex_hooks() {
 }
 
 run_guard_preflight() {
-  local output rc
+  local output rc validated_output
   if output="$("$CONTROL_LINK" guard preflight 2>&1)"; then
     rc=0
   else
     rc=$?
   fi
-  [ -z "$output" ] || printf '%s\n' "$output" | sed 's/^/  /'
   if is_unprovisioned_control_diagnostic "$output" "$rc"; then
     INSTALL_UNPROTECTED=1
+    printf '  %s\n' '{"error":{"code":"INVALID_CONFIG"}}'
     echo -e "  ${YELLOW}⚠️  UNPROTECTED: Project Control coordinates are not configured.${NC}"
     echo "  Configure JHW_REGISTRY_DIR, JHW_WORKTREE_ROOT, GitHub Project/Registry coordinates, then rerun jhw-control guard preflight."
     return
   fi
-  if ! GUARD_PREFLIGHT_RC="$rc" node -e '
-    const fs = require("node:fs");
-    let payload;
-    try { payload = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(1); }
-    const rc = Number(process.env.GUARD_PREFLIGHT_RC);
-    if (payload?.command !== "guard preflight") process.exit(1);
-    if (rc === 0 && (!payload.result || typeof payload.result !== "object")) process.exit(1);
-    if (rc === 78 && (payload?.result?.status !== "NO-GO" || payload?.result?.code !== "GUARD_UNAVAILABLE")) process.exit(1);
-  ' <<<"$output"; then
+  if ! validated_output="$(validate_guard_preflight_diagnostic "$output" "$rc")"; then
     fail "Guard preflight가 진단 결과가 아닌 오류를 반환했습니다. 설치를 중단합니다."
     exit 1
   fi
-  case "$rc" in
-    0) ok "Guard preflight 실행 완료" ;;
-    78) skip "Guard preflight는 NO-GO — hook 신뢰 검토 또는 미구현 adapter가 남아 있습니다." ;;
-    *)
-      fail "Guard preflight 진단을 실행하지 못했습니다 (exit $rc). 설치를 중단합니다."
-      exit 1
-      ;;
-  esac
+  [ -z "$validated_output" ] || printf '%s\n' "$validated_output" | sed 's/^/  /'
+  skip "Guard preflight는 NO-GO — hook 신뢰 검토 또는 미구현 adapter가 남아 있습니다."
 }
 
 # --- Uninstall ---

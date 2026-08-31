@@ -841,6 +841,43 @@ test_install_rejects_malformed_diagnostic_and_rolls_back_hooks() {
   }
   [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || return 1
   ! grep -qF '설치 완료!' "$home/install.log" || return 1
+  ! grep -qF 'not-json-private-marker' "$home/install.log" || {
+    echo "malformed Guard diagnostic bytes leaked into installer output" >&2
+    return 1
+  }
+}
+
+test_install_requires_complete_guard_diagnostic_schema() {
+  local scenario home output rc
+  for scenario in success-envelope no-go-envelope missing-installed-axes; do
+    home="$ROOT/guard-diagnostic-schema-$scenario-home"
+    make_tui_roots "$home"
+    rc=78
+    case "$scenario" in
+      success-envelope)
+        rc=0
+        output='{"command":"guard preflight","result":{"private_marker":"success-envelope-private-marker"}}'
+        ;;
+      no-go-envelope)
+        output='{"command":"guard preflight","result":{"status":"NO-GO","code":"GUARD_UNAVAILABLE","private_marker":"no-go-envelope-private-marker"}}'
+        ;;
+      missing-installed-axes)
+        output='{"command":"guard preflight","result":{"status":"NO-GO","code":"GUARD_UNAVAILABLE","diagnostics":{"protocol_version":1,"runtime_mode":"enforce","request_state":{"safety":"not_initialized","counts":{"PENDING":0,"APPROVED":0,"CONSUMED":0,"COMPLETED":0,"FAILED":0,"EXPIRED":0,"total":0}},"digest_key":{"safety":"not_initialized"},"registry_claims":{"availability":"available"},"adapter_coverage":{"claude":{"prompt_origin":"missing","pre_tool_block":"missing","post_tool_correlation":"missing","execution_recheck":"pending","enforced":false},"codex":{"prompt_origin":"missing","pre_tool_block":"missing","post_tool_correlation":"missing","execution_recheck":"pending","enforced":false},"gemini":{"prompt_origin":"unsupported","pre_tool_block":"unsupported","post_tool_correlation":"unsupported","execution_recheck":"pending","enforced":false},"opencode":{"prompt_origin":"unsupported","pre_tool_block":"unsupported","post_tool_correlation":"unsupported","execution_recheck":"pending","enforced":false}}}}}'
+        ;;
+    esac
+
+    if JHW_TEST_DIAGNOSTIC_OUTPUT="$output" JHW_TEST_DIAGNOSTIC_EXIT="$rc" run_install "$home"; then
+      echo "installer accepted incomplete Guard diagnostic: $scenario" >&2
+      return 1
+    fi
+    [ ! -e "$home/.codex/hooks.json" ] || return 1
+    [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || return 1
+    ! grep -qF '설치 완료!' "$home/install.log" || return 1
+    ! grep -qF 'private-marker' "$home/install.log" || {
+      echo "unvalidated Guard diagnostic bytes leaked into installer output: $scenario" >&2
+      return 1
+    }
+  done
 }
 
 test_preflight_failure_restores_exact_prior_hook_state() {
@@ -1636,21 +1673,35 @@ EOF
 }
 
 test_control_hook_collision_fails_closed() {
-  local kind home target outside before
-  for kind in file symlink; do
+  local kind home target outside before outside_before
+  for kind in file symlink indirect dotdot; do
     home="$ROOT/control-hook-$kind-collision-home"
     make_tui_roots "$home"
     mkdir -p "$home/.local/bin"
     target="$home/.local/bin/jhw-control-hook"
-    if [ "$kind" = "file" ]; then
-      printf 'foreign-hook-file' >"$target"
-      before="$(sha256sum "$target")"
-    else
-      outside="$ROOT/control-hook-external-target"
-      printf 'foreign-hook-symlink-target' >"$outside"
-      ln -s "$outside" "$target"
-      before="$(readlink -- "$target")"
-    fi
+    case "$kind" in
+      file)
+        printf 'foreign-hook-file' >"$target"
+        before="$(sha256sum "$target")"
+        ;;
+      symlink)
+        outside="$home/foreign-launcher-target"
+        printf 'foreign-hook-symlink-target' >"$outside"
+        ln -s "$outside" "$target"
+        before="$(readlink -- "$target")"
+        ;;
+      indirect)
+        outside="$home/indirect-launcher-hop"
+        ln -s "$REPO_ROOT/scripts/jhw-control-hook" "$outside"
+        outside_before="$(readlink -- "$outside")"
+        ln -s "$outside" "$target"
+        before="$(readlink -- "$target")"
+        ;;
+      dotdot)
+        ln -s "$REPO_ROOT/scripts/../scripts/jhw-control-hook" "$target"
+        before="$(readlink -- "$target")"
+        ;;
+    esac
 
     if run_install "$home"; then
       echo "external jhw-control-hook $kind collision did not abort" >&2
@@ -1660,7 +1711,11 @@ test_control_hook_collision_fails_closed() {
       [ ! -L "$target" ] && [ "$(sha256sum "$target")" = "$before" ] || return 1
     else
       [ -L "$target" ] && [ "$(readlink -- "$target")" = "$before" ] || return 1
-      assert_file_text "$outside" "foreign-hook-symlink-target"
+      if [ "$kind" = "symlink" ]; then
+        assert_file_text "$outside" "foreign-hook-symlink-target"
+      elif [ "$kind" = "indirect" ]; then
+        [ -L "$outside" ] && [ "$(readlink -- "$outside")" = "$outside_before" ] || return 1
+      fi
     fi
   done
 }
@@ -3164,6 +3219,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   install-preflight) test_install_orders_guard_transaction_and_runs_public_preflight; exit ;;
   diagnostic-failure) test_install_aborts_on_guard_diagnostic_execution_failure; exit ;;
   malformed-diagnostic) test_install_rejects_malformed_diagnostic_and_rolls_back_hooks; exit ;;
+  diagnostic-schema) test_install_requires_complete_guard_diagnostic_schema; exit ;;
   rollback-hooks) test_preflight_failure_restores_exact_prior_hook_state; exit ;;
   default-unprovisioned) test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks; exit ;;
   invalid-default-guard) test_no_coordinates_with_explicit_invalid_guard_mode_aborts; exit ;;
@@ -3245,6 +3301,7 @@ test_fresh_install_creates_both_control_links_and_exact_hooks
 test_install_orders_guard_transaction_and_runs_public_preflight
 test_install_aborts_on_guard_diagnostic_execution_failure
 test_install_rejects_malformed_diagnostic_and_rolls_back_hooks
+test_install_requires_complete_guard_diagnostic_schema
 test_preflight_failure_restores_exact_prior_hook_state
 test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks
 test_no_coordinates_with_explicit_invalid_guard_mode_aborts
