@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -375,10 +375,10 @@ describe("strict hook adapter executable core", () => {
   });
 
   it("builds both control cores as executable files", async () => {
-    // Break caught: TypeScript emits the hook core but package build leaves it non-executable or absent.
-    await execFile("npm", ["run", "build"], { cwd: mcpRoot, encoding: "utf8" });
-    const cli = await lstat(join(mcpRoot, "dist", "control", "cli.js"));
-    const hook = await lstat(compiledCore);
+    // Break caught: an isolated package build omits either generated executable.
+    const fixture = await buildFixture();
+    const cli = await lstat(join(fixture, "dist", "control", "cli.js"));
+    const hook = await lstat(join(fixture, "dist", "control", "hook-adapter.js"));
     expect(cli.isFile()).toBe(true);
     expect(cli.mode & 0o111).not.toBe(0);
     expect(hook.isFile()).toBe(true);
@@ -445,6 +445,24 @@ async function launcherFixture(): Promise<LauncherFixture> {
 async function writeExecutable(path: string, source: string): Promise<void> {
   await writeFile(path, source, { encoding: "utf8", mode: 0o755 });
   await chmod(path, 0o755);
+}
+
+async function buildFixture(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "jhw-hook-build-"));
+  paths.push(root);
+  const fixture = join(root, "mcp-server");
+  await Promise.all([
+    mkdir(join(fixture, "scripts"), { recursive: true }),
+    cp(join(mcpRoot, "src"), join(fixture, "src"), { recursive: true }),
+  ]);
+  await Promise.all([
+    copyFile(join(mcpRoot, "package.json"), join(fixture, "package.json")),
+    copyFile(join(mcpRoot, "tsconfig.json"), join(fixture, "tsconfig.json")),
+    copyFile(join(mcpRoot, "scripts", "clean-dist.mjs"), join(fixture, "scripts", "clean-dist.mjs")),
+    symlink(join(mcpRoot, "node_modules"), join(fixture, "node_modules"), "dir"),
+  ]);
+  await execFile("npm", ["run", "build"], { cwd: fixture, encoding: "utf8" });
+  return fixture;
 }
 
 async function installTimeout(fixture: LauncherFixture, source?: string): Promise<string> {
