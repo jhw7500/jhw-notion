@@ -304,6 +304,38 @@ describe("WorktreeManager", () => {
     );
   });
 
+  it("matches only the active Claim mapped to the exact current checkout", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.claimsMappedToCheckout([active], created.path)).resolves.toEqual(new Set([active.claim_id]));
+    await expect(manager.claimsMappedToCheckout([active], repoDir)).resolves.toEqual(new Set());
+  });
+
+  it("does not treat another host's Claim as a local worktree match", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const remote = claim({ host: "other-host" });
+
+    await expect(manager.claimsMappedToCheckout([remote], repoDir)).resolves.toEqual(new Set());
+  });
+
+  it("rejects a corrupted worktree mapping Claim generation", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      worktrees: Record<string, { claim_id: string }>;
+    };
+    state.worktrees[active.worktree_ref].claim_id = "clm-0198aabb-ccdd-7eef-8abc-0123456789ac";
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    await expect(manager.claimsMappedToCheckout([active], repoDir)).rejects.toMatchObject({
+      code: "WORKTREE_CLAIM_MISMATCH",
+    });
+  });
+
   it("refuses to remove a dirty worktree and removes a clean worktree without releasing its Claim", async () => {
     const { repoDir, manager } = await worktreeFixture();
     const active = claim();

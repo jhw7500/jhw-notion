@@ -468,6 +468,38 @@ export class WorktreeManager {
     return (await this.inspectClaimFull(claim)).inspection;
   }
 
+  async claimsMappedToCheckout(
+    claims: readonly ActiveClaim[],
+    repositoryPath: string,
+  ): Promise<ReadonlySet<string>> {
+    const repository = await this.repositoryInfo(repositoryPath);
+    const state = await this.loadState();
+    const root = await this.worktreeRoot();
+    const matched = new Set<string>();
+
+    for (const rawClaim of claims) {
+      const parsed = ActiveClaimSchema.safeParse(rawClaim);
+      if (!parsed.success) {
+        throw new ControlError("INVALID_CLAIM", "Current-context lookup received an invalid active Claim");
+      }
+      const claim = parsed.data;
+      validateClaim(claim);
+      if (claim.host !== this.config.buildHost) continue;
+
+      const mapping = state.worktrees[claim.worktree_ref];
+      if (!mapping) {
+        throw new ControlError("WORKTREE_NOT_MAPPED", "Active Claim has no host-local worktree mapping", {
+          worktree_ref: claim.worktree_ref,
+        });
+      }
+      this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
+      await this.verifyWorktree(mapping.path, claim.branch, repository.identity, root);
+      if (await realpath(mapping.path) === repository.root) matched.add(claim.claim_id);
+    }
+
+    return matched;
+  }
+
   private async inspectClaimFull(claim: WorktreeClaim): Promise<FullWorktreeInspection> {
     validateClaim(claim);
     this.assertLocalHost(claim);
