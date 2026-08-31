@@ -5,9 +5,14 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory } from "./schemas.js";
 import { LOCAL_HANDOFF_DIRECTORY, LOCAL_HANDOFF_RELATIVE_PATH } from "./handoff.js";
-import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
+import {
+  inspectSecureStateDirectory,
+  openSecureStateDirectory,
+  type SecureStateDirectory,
+} from "./journal.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import { githubSlugFromCheckout } from "./github-source.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
 
 const STATE_VERSION = 2;
@@ -466,6 +471,68 @@ export class WorktreeManager {
 
   async inspect(claim: WorktreeClaim): Promise<WorktreeInspection> {
     return (await this.inspectClaimFull(claim)).inspection;
+  }
+
+  async claimsMappedToCheckout(
+    claims: readonly ActiveClaim[],
+    repositoryPath: string,
+    repositorySlug: string,
+  ): Promise<ReadonlySet<string>> {
+    const repository = await this.repositoryInfo(repositoryPath);
+    const state = await this.loadReadOnlyState();
+    const matched = new Set<string>();
+    let root: string | undefined;
+
+    for (const rawClaim of claims) {
+      const parsed = ActiveClaimSchema.safeParse(rawClaim);
+      if (!parsed.success) {
+        throw new ControlError("INVALID_CLAIM", "Current-context lookup received an invalid active Claim");
+      }
+      const claim = parsed.data;
+      validateClaim(claim);
+      if (claim.host !== this.config.buildHost) continue;
+
+      const mapping = state.worktrees[claim.worktree_ref];
+      if (!mapping) {
+        throw new ControlError("WORKTREE_NOT_MAPPED", "Active Claim has no host-local worktree mapping", {
+          worktree_ref: claim.worktree_ref,
+        });
+      }
+      root ??= await this.readOnlyWorktreeRoot();
+      const mappedRepository = await this.repositoryInfo(mapping.repository_path);
+      if (
+        mapping.repository_path !== mappedRepository.root ||
+        mapping.repository_identity !== mappedRepository.identity
+      ) {
+        throw new ControlError(
+          "WORKTREE_REPOSITORY_MISMATCH",
+          "Stored repository root does not match its physical Git identity",
+          { worktree_ref: claim.worktree_ref },
+        );
+      }
+      this.assertExactGeneration(mapping, claim, mappedRepository.identity, root, "active");
+      let mappedRepositorySlug: string;
+      try {
+        mappedRepositorySlug = await githubSlugFromCheckout(this.runner, mapping.repository_path);
+      } catch {
+        throw new ControlError(
+          "WORKTREE_REPOSITORY_MISMATCH",
+          "Mapped repository does not have one canonical GitHub origin",
+          { worktree_ref: claim.worktree_ref },
+        );
+      }
+      if (mappedRepositorySlug.toLowerCase() !== repositorySlug.toLowerCase()) {
+        throw new ControlError(
+          "WORKTREE_REPOSITORY_MISMATCH",
+          "Mapped repository origin disagrees with the pinned Repository",
+          { worktree_ref: claim.worktree_ref },
+        );
+      }
+      await this.verifyWorktree(mapping.path, claim.branch, mappedRepository.identity, root);
+      if (await realpath(mapping.path) === repository.root) matched.add(claim.claim_id);
+    }
+
+    return matched;
   }
 
   private async inspectClaimFull(claim: WorktreeClaim): Promise<FullWorktreeInspection> {
@@ -1058,6 +1125,19 @@ export class WorktreeManager {
     return realpath(this.config.worktreeRoot);
   }
 
+  private async readOnlyWorktreeRoot(): Promise<string> {
+    if (!isAbsolute(this.config.worktreeRoot)) {
+      throw new ControlError("UNSAFE_WORKTREE_ROOT", "Worktree root must be absolute", { worktree_root: this.config.worktreeRoot });
+    }
+    const entry = await lstat(this.config.worktreeRoot);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) {
+      throw new ControlError("UNSAFE_WORKTREE_ROOT", "Worktree root must be a non-symbolic directory", {
+        worktree_root: this.config.worktreeRoot,
+      });
+    }
+    return realpath(this.config.worktreeRoot);
+  }
+
   private worktreePath(root: string, ref: string): string {
     if (!logicalRef.test(ref)) throw new ControlError("INVALID_WORKTREE_REF", "Invalid logical worktree ref", { worktree_ref: ref });
     const path = join(root, ref);
@@ -1090,29 +1170,41 @@ export class WorktreeManager {
   }
 
   private async loadState(): Promise<WorktreeState> {
-    return this.withStateDirectory(async (directory) => {
-      let file;
-      try {
-        file = await directory.openFile(WORKTREE_STATE_FILE, stateReadFlags);
-      } catch (cause) {
-        if (isNotFound(cause)) return { version: STATE_VERSION, worktrees: {} };
+    return this.withStateDirectory((directory) => this.readState(directory));
+  }
+
+  private async loadReadOnlyState(): Promise<WorktreeState> {
+    const inspected = await inspectSecureStateDirectory(this.config.stateDir);
+    if (inspected.status === "not_initialized") return { version: STATE_VERSION, worktrees: {} };
+    try {
+      return await this.readState(inspected.directory);
+    } finally {
+      await inspected.directory.close().catch(() => undefined);
+    }
+  }
+
+  private async readState(directory: SecureStateDirectory): Promise<WorktreeState> {
+    let file;
+    try {
+      file = await directory.openFile(WORKTREE_STATE_FILE, stateReadFlags);
+    } catch (cause) {
+      if (isNotFound(cause)) return { version: STATE_VERSION, worktrees: {} };
+      throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file");
+    }
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.nlink !== 1) {
         throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file");
       }
-      try {
-        const info = await file.stat();
-        if (!info.isFile() || info.nlink !== 1) {
-          throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file");
-        }
-        return parseState(JSON.parse(await file.readFile("utf8")));
-      } catch (cause) {
-        if (cause instanceof ControlError) throw cause;
-        throw new ControlError("INVALID_WORKTREE_STATE", "Worktree state could not be parsed", {
-          cause: cause instanceof Error ? cause.message : String(cause),
-        });
-      } finally {
-        await file.close().catch(() => undefined);
-      }
-    });
+      return parseState(JSON.parse(await file.readFile("utf8")));
+    } catch (cause) {
+      if (cause instanceof ControlError) throw cause;
+      throw new ControlError("INVALID_WORKTREE_STATE", "Worktree state could not be parsed", {
+        cause: cause instanceof Error ? cause.message : String(cause),
+      });
+    } finally {
+      await file.close().catch(() => undefined);
+    }
   }
 
   private async saveState(state: WorktreeState): Promise<void> {

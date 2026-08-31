@@ -89,6 +89,7 @@ async function makeGateFixture(): Promise<GateFixture> {
   await writeFile(join(sourceRepo, "README.md"), "# Source\n", "utf8");
   await git(sourceRepo, "add", "README.md");
   await git(sourceRepo, "commit", "-m", "Initial source");
+  await git(sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
   const fixture = {
     root: base.root,
     remoteDir: base.remoteDir,
@@ -217,6 +218,10 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
       withResolvedExistingFormalTask: async () => {
         throw new ControlError("TASK_NOT_FOUND", "checkout recovery discovery is not configured by this fixture");
       },
+      withResolvedTaskStatusContext: async (_input, use) => graph.catalog.withPinnedRepositoryByGitHubNode(
+        repositoryInput.github_node_id,
+        async (repository) => use({ project_id: "prj-control", repo_id: repository.id, repository_slug: repository.slug }),
+      ),
       promoteTemporaryTask: async (input) => graph.catalog.promoteTemporaryTask(input.task_id, issueInput),
     },
     portfolio: {
@@ -420,6 +425,16 @@ function temporaryStartArgs(alias: string, sourceRepo: string, session: string):
     "--temp-alias", alias, "--goal", "exercise the deterministic gate", "--done", "gate passes",
     "--scope", "src/control", "--grant", "repo.modify:repository:repo-control:shared",
     "--origin-adapter", "codex", "--session", session,
+  ];
+}
+
+function currentStatusArgs(repositoryPath: string, adapter: "codex" | "gemini", session: string): string[] {
+  return [
+    "task", "status",
+    "--resolve-from-checkout", "true",
+    "--repo-path", repositoryPath,
+    "--origin-adapter", adapter,
+    "--session", session,
   ];
 }
 
@@ -872,7 +887,6 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
   it("4c-resolver. checkout resolution persists only the canonical Repository grant through Claim creation", async () => {
     const fixture = await makeGateFixture();
-    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
     const source = new GitHubSourceService({
@@ -1364,6 +1378,94 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(await exists(join(fixture.cloneA, "claims", "active", `${task.id}.yaml`))).toBe(false);
   });
 
+  it("9a. checkout-resolved status distinguishes current, mismatch, ambiguity, and a moved pinned Registry", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const dependencies = cliDependencies(graph);
+    const currentStart = await runCli(
+      temporaryStartArgs("control:current-status", fixture.sourceRepo, "codex-current-status"),
+      dependencies,
+    );
+    const otherStart = await runCli(
+      temporaryStartArgs("control:other-status", fixture.sourceRepo, "gemini-other-status")
+        .map((value) => value === "codex" ? "gemini" : value),
+      dependencies,
+    );
+    expect(currentStart.exitCode).toBe(0);
+    expect(otherStart.exitCode).toBe(0);
+    const currentClaim = JSON.parse(currentStart.stdout).result.claim as { claim_id: string; worktree_ref: string };
+    const otherClaim = JSON.parse(otherStart.stdout).result.claim as { claim_id: string };
+    const currentMapping = JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
+      .worktrees[currentClaim.worktree_ref] as { path: string };
+
+    const currentOwner = await runCli(
+      currentStatusArgs(currentMapping.path, "codex", "codex-current-status"),
+      dependencies,
+    );
+    const otherOwner = await runCli(
+      currentStatusArgs(currentMapping.path, "gemini", "not-an-owner"),
+      dependencies,
+    );
+    const ambiguous = await runCli(
+      currentStatusArgs(currentMapping.path, "gemini", "gemini-other-status"),
+      dependencies,
+    );
+
+    expect(currentOwner.exitCode).toBe(0);
+    expect(JSON.parse(currentOwner.stdout).result).toMatchObject({
+      kind: "resolved",
+      match: "unique",
+      claim: { claim_id: currentClaim.claim_id },
+      relation: { session_match: true, worktree_match: true, owner: "current" },
+    });
+    expect(otherOwner.exitCode).toBe(0);
+    expect(JSON.parse(otherOwner.stdout).result).toMatchObject({
+      kind: "resolved",
+      match: "unique",
+      claim: { claim_id: currentClaim.claim_id },
+      relation: { session_match: false, worktree_match: true, owner: "mismatch" },
+    });
+    expect(ambiguous.exitCode).toBe(0);
+    expect(JSON.parse(ambiguous.stdout).result).toEqual(expect.objectContaining({
+      kind: "resolved",
+      match: "ambiguous",
+      candidate_count: 2,
+    }));
+    expect(JSON.parse(ambiguous.stdout).result).not.toHaveProperty("claim");
+    expect(JSON.parse(currentOwner.stdout).result).not.toHaveProperty("repository_slug");
+    expect(JSON.stringify(ambiguous)).not.toContain(currentMapping.path);
+    expect(JSON.stringify(currentOwner)).not.toContain("https://github.com/jhw7500/control.git");
+    expect(JSON.stringify(ambiguous)).not.toContain("gemini-other-status");
+
+    let sourceCalls = 0;
+    const movedDependencies = cliDependencies(graph, {
+      source: {
+        ...dependencies.source,
+        withResolvedTaskStatusContext: async (_input, use) => graph.catalog.withPinnedRepositoryByGitHubNode(
+          repositoryInput.github_node_id,
+          async (repository) => {
+            sourceCalls += 1;
+            const result = await use({ project_id: "prj-control", repo_id: repository.id, repository_slug: repository.slug });
+            await writeFile(join(fixture.cloneA, "current-status-race.json"), "{}\n", "utf8");
+            await git(fixture.cloneA, "add", "current-status-race.json");
+            await git(fixture.cloneA, "commit", "-m", "Move Registry during current status");
+            return result;
+          },
+        ),
+      },
+    });
+    const moved = await runCli(
+      currentStatusArgs(currentMapping.path, "codex", "codex-current-status"),
+      movedDependencies,
+    );
+
+    expect(sourceCalls).toBe(1);
+    expect(JSON.parse(moved.stderr)).toEqual({ error: { code: "REGISTRY_MOVED_DURING_READ" } });
+    expect(`${moved.stdout}${moved.stderr}`).not.toContain(currentMapping.path);
+    expect(`${moved.stdout}${moved.stderr}`).not.toContain("codex-current-status");
+    expect(otherClaim.claim_id).not.toBe(currentClaim.claim_id);
+  }, 15_000);
+
   it("10. Handoff release retains the Task, committed checkpoint, mapping, and worktree", async () => {
     const fixture = await makeGateFixture();
     const graph = graphFor(fixture, fixture.cloneA);
@@ -1659,7 +1761,6 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
   it("16b. checkout recovery discovery spans exact Handoff resume, active takeover, and force-end", async () => {
     const fixture = await makeGateFixture();
-    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
     const formal = (await graph.catalog.registerFormalTask({
@@ -1918,7 +2019,6 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
   it("21. public Repository and formal Task flow verifies membership, checkout, Issue coordinates, and source authority before Claim", async () => {
     const fixture = await makeGateFixture();
-    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
     const graph = graphFor(fixture, fixture.cloneA);
     const runner = new GateSourceRunner();
     let membershipFailure: string | undefined;
@@ -2184,6 +2284,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
         assertTakeoverEligible: graph.worktrees.assertTakeoverEligible.bind(graph.worktrees),
         rebindTakeover: graph.worktrees.rebindTakeover.bind(graph.worktrees),
         cleanupReleased: graph.worktrees.cleanupReleased.bind(graph.worktrees),
+        claimsMappedToCheckout: graph.worktrees.claimsMappedToCheckout.bind(graph.worktrees),
       } : graph.worktrees;
       const tasks = boundary === "after-release"
         ? new TaskService(graph.config, graph.claims, worktrees, graph.registry)
@@ -2393,7 +2494,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "--validation", "pre-rename handoff: pass", "--progress", "resume after the repository rename",
     ], initialDependencies)).exitCode).toBe(0);
     const renamedSlug = "jhw7500/control-renamed";
-    await git(fixture.sourceRepo, "remote", "add", "origin", `git@github.com:${renamedSlug}.git`);
+    await git(fixture.sourceRepo, "remote", "set-url", "origin", `git@github.com:${renamedSlug}.git`);
 
     const sourceRunner: GitHubSourceRunner = {
       run: graph.runner.run.bind(graph.runner),

@@ -142,6 +142,12 @@ export interface ExistingFormalTaskResolution {
   alias: string;
 }
 
+export interface ResolvedTaskStatusContext {
+  project_id: string;
+  repo_id: string;
+  repository_slug: string;
+}
+
 function parseJson<T>(stdout: string, schema: z.ZodType<T>, code: string): T {
   let value: unknown;
   try {
@@ -200,6 +206,38 @@ export function githubSlugFromRemote(remote: string, sshOnly = false): string {
     throw new ControlError(sshOnly ? "REGISTRY_REMOTE_NOT_SSH" : "INVALID_CHECKOUT_ORIGIN", "Remote is not a canonical GitHub URL");
   }
   return `${match[1]}/${match[2]}`;
+}
+
+export async function githubSlugFromCheckout(
+  runner: Pick<GitHubSourceRunner, "run">,
+  repositoryPath: string,
+): Promise<string> {
+  if (!isAbsolute(repositoryPath)) {
+    throw new ControlError("INVALID_CHECKOUT_PATH", "Repository checkout path must be absolute");
+  }
+  const root = (await runner.run("git", ["rev-parse", "--show-toplevel"], { cwd: repositoryPath })).stdout.trim();
+  if (!isAbsolute(root) || resolve(root) !== resolve(repositoryPath)) {
+    throw new ControlError("CHECKOUT_ROOT_MISMATCH", "Repository path is not the exact checkout root");
+  }
+  const fetch = remoteLines(await runner.run(
+    "git",
+    ["remote", "get-url", "--all", "origin"],
+    { cwd: repositoryPath },
+  ));
+  const push = remoteLines(await runner.run(
+    "git",
+    ["remote", "get-url", "--push", "--all", "origin"],
+    { cwd: repositoryPath },
+  ));
+  if (fetch.length !== 1 || push.length !== 1) {
+    throw new ControlError("AMBIGUOUS_CHECKOUT_ORIGIN", "Checkout must have one fetch and push URL");
+  }
+  const fetchSlug = githubSlugFromRemote(fetch[0]!);
+  const pushSlug = githubSlugFromRemote(push[0]!);
+  if (!sameSlug(fetchSlug, pushSlug)) {
+    throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout fetch and push remotes disagree");
+  }
+  return fetchSlug;
 }
 
 function issueCoordinates(issueUrl: string): { slug: string; number: number; canonicalUrl: string } {
@@ -346,6 +384,22 @@ export class GitHubSourceService {
     });
   }
 
+  async withResolvedTaskStatusContext<T>(
+    input: { repository_path: string },
+    use: (context: ResolvedTaskStatusContext) => Promise<T>,
+  ): Promise<T> {
+    this.assertCheckoutSafe({}, input.repository_path);
+    return this.withResolvedCheckoutContext(input.repository_path, async (context) => {
+      const resolved = {
+        project_id: context.project_id,
+        repo_id: context.repo_id,
+        repository_slug: context.repository.slug,
+      };
+      this.assertCheckoutSafe(resolved, input.repository_path);
+      return use(resolved);
+    });
+  }
+
   async prepareExistingTask(input: { task_id: string; repository_path: string }): Promise<ExistingTaskContext> {
     if (!taskIdPattern.test(input.task_id)) throw new ControlError("INVALID_TASK_ID", "Task ID is invalid");
     this.assertCheckoutSafe({ task_id: input.task_id }, input.repository_path);
@@ -486,32 +540,7 @@ export class GitHubSourceService {
   }
 
   private async checkoutSlug(repositoryPath: string): Promise<string> {
-    if (!isAbsolute(repositoryPath)) {
-      throw new ControlError("INVALID_CHECKOUT_PATH", "Repository checkout path must be absolute");
-    }
-    const root = (await this.options.runner.run("git", ["rev-parse", "--show-toplevel"], { cwd: repositoryPath })).stdout.trim();
-    if (!isAbsolute(root) || resolve(root) !== resolve(repositoryPath)) {
-      throw new ControlError("CHECKOUT_ROOT_MISMATCH", "Repository path is not the exact checkout root");
-    }
-    const fetch = remoteLines(await this.options.runner.run(
-      "git",
-      ["remote", "get-url", "--all", "origin"],
-      { cwd: repositoryPath },
-    ));
-    const push = remoteLines(await this.options.runner.run(
-      "git",
-      ["remote", "get-url", "--push", "--all", "origin"],
-      { cwd: repositoryPath },
-    ));
-    if (fetch.length !== 1 || push.length !== 1) {
-      throw new ControlError("AMBIGUOUS_CHECKOUT_ORIGIN", "Checkout must have one fetch and push URL");
-    }
-    const fetchSlug = githubSlugFromRemote(fetch[0]!);
-    const pushSlug = githubSlugFromRemote(push[0]!);
-    if (!sameSlug(fetchSlug, pushSlug)) {
-      throw new ControlError("CHECKOUT_REMOTE_MISMATCH", "Checkout fetch and push remotes disagree");
-    }
-    return fetchSlug;
+    return githubSlugFromCheckout(this.options.runner, repositoryPath);
   }
 
   private async verifyCheckout(repositoryPath: string, expectedSlug: string): Promise<void> {

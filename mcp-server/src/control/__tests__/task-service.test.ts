@@ -20,9 +20,11 @@ const fixtures: RegistryFixture[] = [];
 const localPaths: string[] = [];
 const TASK_ID = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab";
+const REPOSITORY_SLUG = "jhw7500/wlan";
 const taskAlias = "wlan:tmp-20260813-01-fix";
 const plan = worktreePlan(TASK_ID, taskAlias);
 const activeWorkContract = { version: 1 as const, task_id: TASK_ID, grants: [], dependencies: [] };
+let currentContextTaskSequence = 0;
 
 const activeClaim = {
   task_id: TASK_ID,
@@ -63,6 +65,39 @@ const startInput = {
   repository_path: "/srv/jhw/source-repository",
 };
 
+function currentContextClaim(taskId: string, overrides: Partial<typeof activeClaim> = {}) {
+  const contract = { ...activeWorkContract, task_id: taskId };
+  return {
+    ...activeClaim,
+    task_id: taskId,
+    work_contract: contract,
+    work_contract_digest: workContractDigest(contract),
+    ...overrides,
+  };
+}
+
+async function setCurrentContextTaskLifecycle(
+  fixture: RegistryFixture,
+  taskId: string,
+  kind: "temporary" | "child",
+  lifecycle: "handoff" | "completed",
+): Promise<void> {
+  const taskPath = join(fixture.registryDir, "tasks", `${taskId}.yaml`);
+  const record = JSON.parse(await readFile(taskPath, "utf8")) as Record<string, unknown>;
+  if (kind === "temporary") {
+    await writeFile(taskPath, `${JSON.stringify({ ...record, lifecycle })}\n`, "utf8");
+    return;
+  }
+  const { expected_scope: _expectedScope, task_role: _taskRole, ...child } = record;
+  await writeFile(taskPath, `${JSON.stringify({
+    ...child,
+    kind: "child",
+    parent_task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ff",
+    required_for_parent: true,
+    lifecycle,
+  })}\n`, "utf8");
+}
+
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
   await Promise.all(localPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -85,6 +120,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     }),
     recoverClaim: vi.fn(),
     getActive: vi.fn().mockResolvedValue(undefined),
+    listActiveClaims: vi.fn().mockResolvedValue([]),
     resolveSessionClaim: vi.fn().mockResolvedValue(undefined),
     getClaimHistory: vi.fn(),
     latestClaimHistory: vi.fn().mockRejectedValue(new ControlError("CLAIM_HISTORY_NOT_FOUND", "no history")),
@@ -116,6 +152,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     assertForceEndEligible: vi.fn().mockResolvedValue(undefined),
     assertTakeoverEligible: vi.fn().mockResolvedValue(undefined),
     rebindTakeover: vi.fn().mockResolvedValue({ changed: true }),
+    claimsMappedToCheckout: vi.fn().mockResolvedValue(new Set<string>()),
   };
   const registry = {
     headRegularBlobObjectId: vi.fn().mockResolvedValue(activeClaim.source_task_revision),
@@ -165,10 +202,274 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     registry,
     worktreePath,
     fixture,
+    async registerCurrentContextTask() {
+      const config = configFor(fixture.registryDir);
+      const catalog = new Catalog(config, isolatedRegistryGit(config, new ProcessRunner()));
+      await catalog.registerRepository({
+        repo_id: "repo-wlan",
+        github_node_id: "R_wlan",
+        slug: "jhw7500/wlan",
+      });
+      return catalog.registerTemporaryTask({
+        project_id: "prj-wlan",
+        repo_id: "repo-wlan",
+        alias: `wlan:tmp-current-context-${++currentContextTaskSequence}`,
+        goal: "classify the current Task owner",
+        done_conditions: ["current context resolves"],
+        expected_scope: ["src/control"],
+        ...emptyTaskContractIntent(),
+      });
+    },
   };
 }
 
 describe("TaskService", () => {
+  it("returns a unique current owner only when session and worktree both match", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const claim = currentContextClaim(task.id);
+    const input = {
+      project_id: claim.project_id,
+      repo_id: claim.repo_id,
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex" as const,
+      session_id: claim.session_id,
+    };
+    claims.listActiveClaims.mockResolvedValue([claim]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([claim.claim_id]));
+
+    const result = await tasks.currentContext(input);
+    expect(result).toEqual({
+      project_id: input.project_id,
+      repo_id: input.repo_id,
+      match: "unique",
+      task: { task_id: claim.task_id, kind: "temporary", lifecycle: "active" },
+      claim: {
+        task_id: claim.task_id,
+        claim_id: claim.claim_id,
+        host: claim.host,
+        branch: claim.branch,
+        worktree_ref: claim.worktree_ref,
+        started_at: claim.started_at,
+      },
+      relation: { session_match: true, worktree_match: true, owner: "current" },
+    });
+    expect(result).not.toHaveProperty("claim.session_id");
+    expect(result).not.toHaveProperty("claim.origin_adapter");
+    expect(result).not.toHaveProperty("repository_path");
+    expect(result).not.toHaveProperty("repository_slug");
+    expect(result).not.toHaveProperty("task.aliases");
+    expect(worktrees.claimsMappedToCheckout).toHaveBeenCalledWith(
+      [claim],
+      startInput.repository_path,
+      REPOSITORY_SLUG,
+    );
+  });
+
+  it.each([
+    ["temporary", "completed"],
+    ["child", "handoff"],
+  ] as const)("rejects a unique active Claim paired with an inactive %s Task", async (kind, lifecycle) => {
+    const { tasks, claims, worktrees, fixture, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    await setCurrentContextTaskLifecycle(fixture, task.id, kind, lifecycle);
+    const claim = currentContextClaim(task.id);
+    claims.listActiveClaims.mockResolvedValue([claim]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([claim.claim_id]));
+
+    await expect(tasks.currentContext({
+      project_id: claim.project_id,
+      repo_id: claim.repo_id,
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: claim.session_id,
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("returns ambiguous without candidate coordinates when session and worktree select different Claims", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const firstTask = await registerCurrentContextTask();
+    const secondTask = await registerCurrentContextTask();
+    const first = currentContextClaim(firstTask.id);
+    const second = currentContextClaim(secondTask.id, {
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      session_id: "other-session",
+      task_alias: "wlan:tmp-current-context-second",
+      branch: "task/0123456789ac-wlan-tmp-current-context-second",
+      worktree_ref: "wt-0123456789ac-wlan-tmp-current-context-second",
+    });
+    const input = {
+      project_id: first.project_id,
+      repo_id: first.repo_id,
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex" as const,
+      session_id: first.session_id,
+    };
+    claims.listActiveClaims.mockResolvedValue([first, second]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([second.claim_id]));
+
+    await expect(tasks.currentContext(input)).resolves.toEqual({
+      project_id: input.project_id,
+      repo_id: input.repo_id,
+      match: "ambiguous",
+      candidate_count: 2,
+    });
+  });
+
+  it("rejects an inactive selected Task before returning multi-candidate ambiguity", async () => {
+    const { tasks, claims, worktrees, fixture, registerCurrentContextTask } = await taskFixture();
+    const firstTask = await registerCurrentContextTask();
+    const secondTask = await registerCurrentContextTask();
+    await setCurrentContextTaskLifecycle(fixture, secondTask.id, "child", "completed");
+    const first = currentContextClaim(firstTask.id);
+    const second = currentContextClaim(secondTask.id, {
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      session_id: "other-session",
+      task_alias: "wlan:tmp-current-context-second",
+      branch: "task/0123456789ac-wlan-tmp-current-context-second",
+      worktree_ref: "wt-0123456789ac-wlan-tmp-current-context-second",
+    });
+    claims.listActiveClaims.mockResolvedValue([first, second]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([second.claim_id]));
+
+    await expect(tasks.currentContext({
+      project_id: first.project_id,
+      repo_id: first.repo_id,
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: first.session_id,
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("returns none when neither session nor worktree selects an active Claim", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.listActiveClaims.mockResolvedValue([]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set());
+
+    await expect(tasks.currentContext({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: "codex-a",
+    })).resolves.toEqual({ project_id: "prj-wlan", repo_id: "repo-wlan", match: "none" });
+  });
+
+  it.each([
+    ["an inactive Task", async (fixture: RegistryFixture, taskId: string) => {
+      await setCurrentContextTaskLifecycle(fixture, taskId, "temporary", "completed");
+      return {};
+    }],
+    ["inconsistent Project coordinates", async () => ({ project_id: "prj-other" })],
+  ] as const)("rejects an unselected same-Repository Claim with %s", async (_label, corrupt) => {
+    const { tasks, claims, worktrees, fixture, registerCurrentContextTask } = await taskFixture();
+    await registerCurrentContextTask();
+    const unselectedTask = await registerCurrentContextTask();
+    const unselected = currentContextClaim(unselectedTask.id, {
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      session_id: "other-session",
+      task_alias: "wlan:tmp-current-context-unselected",
+      branch: "task/0123456789ac-wlan-tmp-current-context-unselected",
+      worktree_ref: "wt-0123456789ac-wlan-tmp-current-context-unselected",
+      ...await corrupt(fixture, unselectedTask.id),
+    });
+    claims.listActiveClaims.mockResolvedValue([unselected]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set());
+
+    await expect(tasks.currentContext({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: "not-an-owner",
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
+  it("marks a session-only active Claim as a mismatch", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const claim = currentContextClaim(task.id);
+    claims.listActiveClaims.mockResolvedValue([claim]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set());
+
+    await expect(tasks.currentContext({
+      project_id: claim.project_id,
+      repo_id: claim.repo_id,
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: claim.session_id,
+    })).resolves.toMatchObject({
+      match: "unique",
+      relation: { session_match: true, worktree_match: false, owner: "mismatch" },
+    });
+  });
+
+  it("marks a worktree-only active Claim as a mismatch", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const claim = currentContextClaim(task.id, { session_id: "other-session" });
+    claims.listActiveClaims.mockResolvedValue([claim]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([claim.claim_id]));
+
+    await expect(tasks.currentContext({
+      project_id: claim.project_id,
+      repo_id: claim.repo_id,
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: "codex-a",
+    })).resolves.toMatchObject({
+      match: "unique",
+      relation: { session_match: false, worktree_match: true, owner: "mismatch" },
+    });
+  });
+
+  it("marks a legacy worktree match as unverifiable", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const { origin_adapter: _originAdapter, ...legacy } = currentContextClaim(task.id);
+    claims.listActiveClaims.mockResolvedValue([legacy]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([legacy.claim_id]));
+
+    await expect(tasks.currentContext({
+      project_id: legacy.project_id,
+      repo_id: legacy.repo_id,
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: "codex-a",
+    })).resolves.toMatchObject({
+      match: "unique",
+      relation: { session_match: false, worktree_match: true, owner: "unverifiable" },
+    });
+  });
+
+  it.each([
+    ["Claim Project", { project_id: "prj-other" }, { project_id: "prj-wlan", repo_id: "repo-wlan" }],
+    ["Task Repository", { repo_id: "repo-other" }, { project_id: "prj-wlan", repo_id: "repo-other" }],
+  ])("rejects current Task context when %s disagrees with the candidate Task", async (_label, overrides, input) => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const claim = currentContextClaim(task.id, overrides);
+    claims.listActiveClaims.mockResolvedValue([claim]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([claim.claim_id]));
+
+    await expect(tasks.currentContext({
+      ...input,
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: claim.session_id,
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
   it("returns the exact current owner and audited private worktree view for Guard policy", async () => {
     const { tasks, claims, worktrees, worktreePath } = await taskFixture();
 
@@ -649,6 +950,7 @@ describe("TaskService", () => {
       assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
       rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
       cleanupReleased: worktrees.cleanupReleased.bind(worktrees),
+      claimsMappedToCheckout: worktrees.claimsMappedToCheckout.bind(worktrees),
     };
     const tasks = new TaskService(config, claims, taskWorktrees, registry);
     const input = {
@@ -1271,6 +1573,7 @@ describe("TaskService", () => {
       assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
       rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
       cleanupReleased: worktrees.cleanupReleased.bind(worktrees),
+      claimsMappedToCheckout: worktrees.claimsMappedToCheckout.bind(worktrees),
     };
     let failFirstRelease = true;
     const claims = {
@@ -1283,6 +1586,7 @@ describe("TaskService", () => {
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
       getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
+      listActiveClaims: actualClaims.listActiveClaims.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1404,6 +1708,7 @@ describe("TaskService", () => {
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
       getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
+      listActiveClaims: actualClaims.listActiveClaims.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1591,6 +1896,7 @@ describe("TaskService", () => {
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
       getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
+      listActiveClaims: actualClaims.listActiveClaims.bind(actualClaims),
       finishClaim: async (...args: Parameters<ClaimService["finishClaim"]>) => {
         if (failFirstRelease) {
           failFirstRelease = false;
@@ -1675,6 +1981,7 @@ describe("TaskService", () => {
       latestHandoffHistory: actualClaims.latestHandoffHistory.bind(actualClaims),
       markCompletionReady: actualClaims.markCompletionReady.bind(actualClaims),
       getCompletionEvidence: actualClaims.getCompletionEvidence.bind(actualClaims),
+      listActiveClaims: actualClaims.listActiveClaims.bind(actualClaims),
       finishClaim: actualClaims.finishClaim.bind(actualClaims),
     };
     const secretPath = "/srv/jhw/private/project-secret";
@@ -1689,6 +1996,7 @@ describe("TaskService", () => {
       assertTakeoverEligible: vi.fn(),
       rebindTakeover: vi.fn(),
       cleanupReleased: vi.fn(),
+      claimsMappedToCheckout: vi.fn(),
     };
     const tasks = new TaskService(config, claims, failedWorktrees, registry);
 

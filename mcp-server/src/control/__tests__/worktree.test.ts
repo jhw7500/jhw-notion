@@ -14,6 +14,8 @@ import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./hel
 const fixtures: RegistryFixture[] = [];
 const TASK_ID = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab";
+const CANONICAL_SLUG = "jhw7500/wlan";
+const CANONICAL_ORIGIN = `https://github.com/${CANONICAL_SLUG}.git`;
 const execFile = promisify(execFileCallback);
 
 function claim(overrides: Record<string, string> = {}) {
@@ -63,6 +65,7 @@ async function worktreeFixture(): Promise<{
   await writeFile(join(repoDir, "README.md"), "# Source\n", "utf8");
   await git(repoDir, "add", "README.md");
   await git(repoDir, "commit", "-m", "Initial source");
+  await git(repoDir, "remote", "add", "origin", CANONICAL_ORIGIN);
   const config = configFor(fixture.registryDir);
   return { fixture, repoDir, manager: new WorktreeManager(config) };
 }
@@ -302,6 +305,175 @@ describe("WorktreeManager", () => {
     expect(JSON.parse(await readFile(statePath, "utf8")).worktrees[initial.worktree_ref].claim_id).toBe(
       replacement.claim_id,
     );
+  });
+
+  it("matches only the active Claim mapped to the exact current checkout", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.claimsMappedToCheckout([active], created.path, CANONICAL_SLUG)).resolves.toEqual(new Set([active.claim_id]));
+    await expect(manager.claimsMappedToCheckout([active], repoDir, CANONICAL_SLUG)).resolves.toEqual(new Set());
+  });
+
+  it("validates a mapped Claim in its own clone before classifying another clone of the same repository", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const canonicalOrigin = CANONICAL_ORIGIN;
+    const independentClone = join(fixture.root, "independent-source-clone");
+    await git(fixture.root, "clone", repoDir, independentClone);
+    await git(independentClone, "remote", "set-url", "origin", canonicalOrigin);
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.claimsMappedToCheckout([active], independentClone, CANONICAL_SLUG)).resolves.toEqual(new Set());
+  });
+
+  it("rejects a self-consistent mapping owned by a different canonical repository", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const unrelated = join(fixture.root, "unrelated-source-repository");
+    await git(fixture.root, "init", "--initial-branch=main", unrelated);
+    await git(unrelated, "config", "user.name", "Phase1A Test");
+    await git(unrelated, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(unrelated, "README.md"), "# Unrelated\n", "utf8");
+    await git(unrelated, "add", "README.md");
+    await git(unrelated, "commit", "-m", "Initial unrelated source");
+    await git(unrelated, "remote", "add", "origin", "https://github.com/other-owner/other-repository.git");
+    await git(unrelated, "branch", active.branch);
+    await git(repoDir, "worktree", "remove", created.path);
+    await git(unrelated, "worktree", "add", created.path, active.branch);
+
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      worktrees: Record<string, { repository_path: string; repository_identity: string }>;
+    };
+    state.worktrees[active.worktree_ref].repository_path = unrelated;
+    state.worktrees[active.worktree_ref].repository_identity = await realpath(join(unrelated, ".git"));
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    await expect(manager.claimsMappedToCheckout([active], repoDir, CANONICAL_SLUG)).rejects.toMatchObject({
+      code: "WORKTREE_REPOSITORY_MISMATCH",
+      details: { worktree_ref: active.worktree_ref },
+    });
+  });
+
+  it.each([
+    ["missing", async (repoDir: string) => git(repoDir, "remote", "remove", "origin")],
+    ["noncanonical", async (repoDir: string) => git(repoDir, "remote", "set-url", "origin", "https://example.invalid/wlan.git")],
+    ["multiple", async (repoDir: string) => git(repoDir, "remote", "set-url", "--add", "origin", "https://github.com/jhw7500/wlan-mirror.git")],
+    ["divergent", async (repoDir: string) => git(repoDir, "remote", "set-url", "--push", "origin", "https://github.com/other-owner/other-repository.git")],
+  ] as const)("bounds a mapping-owned checkout with %s origins to its worktree reference", async (_label, configureOrigin) => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await configureOrigin(repoDir);
+
+    const error = await manager.claimsMappedToCheckout([active], created.path, CANONICAL_SLUG).catch((cause) => cause);
+    expect(error).toMatchObject({
+      code: "WORKTREE_REPOSITORY_MISMATCH",
+      details: { worktree_ref: active.worktree_ref },
+    });
+    expect((error as ControlError).details).toEqual({ worktree_ref: active.worktree_ref });
+  });
+
+  it("rejects a stored repository path whose physical Git identity disagrees with the mapping", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const independentClone = join(fixture.root, "corrupt-mapping-source-clone");
+    await git(fixture.root, "clone", repoDir, independentClone);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      worktrees: Record<string, { repository_path: string }>;
+    };
+    state.worktrees[active.worktree_ref].repository_path = independentClone;
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    await expect(manager.claimsMappedToCheckout([active], created.path, CANONICAL_SLUG)).rejects.toMatchObject({
+      code: "WORKTREE_REPOSITORY_MISMATCH",
+    });
+  });
+
+  it("does not treat another host's Claim as a local worktree match", async () => {
+    const { repoDir, manager } = await worktreeFixture();
+    const remote = claim({ host: "other-host" });
+
+    await expect(manager.claimsMappedToCheckout([remote], repoDir, CANONICAL_SLUG)).resolves.toEqual(new Set());
+  });
+
+  it("does not initialize state or worktree directories for a zero-Claim lookup", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const root = join(fixture.root, "worktrees");
+    const stateDirectory = join(fixture.root, "state");
+
+    await expect(manager.claimsMappedToCheckout([], repoDir, CANONICAL_SLUG)).resolves.toEqual(new Set());
+    await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(stateDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects but does not chmod an insecure existing state directory during lookup", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const stateDirectory = join(fixture.root, "state");
+    await mkdir(stateDirectory, { mode: 0o700 });
+    await chmod(stateDirectory, 0o755);
+
+    await expect(manager.claimsMappedToCheckout([], repoDir, CANONICAL_SLUG)).rejects.toMatchObject({
+      code: "UNSAFE_STATE_PATH",
+    });
+    expect((await stat(stateDirectory)).mode & 0o777).toBe(0o755);
+  });
+
+  it("reports an absent local mapping without initializing state or worktree directories", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const root = join(fixture.root, "worktrees");
+    const stateDirectory = join(fixture.root, "state");
+
+    await expect(manager.claimsMappedToCheckout([claim()], repoDir, CANONICAL_SLUG)).rejects.toMatchObject({
+      code: "WORKTREE_NOT_MAPPED",
+    });
+    await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(stateDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects malformed initialized state instead of treating it as absent", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const stateDirectory = join(fixture.root, "state");
+    await mkdir(stateDirectory, { mode: 0o700 });
+    await writeFile(join(stateDirectory, "worktrees.json"), "{}\n", { mode: 0o600 });
+
+    await expect(manager.claimsMappedToCheckout([], repoDir, CANONICAL_SLUG)).rejects.toMatchObject({
+      code: "INVALID_WORKTREE_STATE",
+    });
+  });
+
+  it("does not chmod the configured worktree root during lookup", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const root = join(fixture.root, "worktrees");
+
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    expect(created.path).toContain(root);
+    await chmod(root, 0o755);
+    await expect(manager.claimsMappedToCheckout([active], created.path, CANONICAL_SLUG)).resolves.toEqual(new Set([active.claim_id]));
+    await expect(stat(root)).resolves.toMatchObject({ mode: expect.any(Number) });
+    expect((await stat(root)).mode & 0o777).toBe(0o755);
+  });
+
+  it("rejects a corrupted worktree mapping claim generation", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      worktrees: Record<string, { claim_id: string }>;
+    };
+    state.worktrees[active.worktree_ref].claim_id = "clm-0198aabb-ccdd-7eef-8abc-0123456789ac";
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    await expect(manager.claimsMappedToCheckout([active], repoDir, CANONICAL_SLUG)).rejects.toMatchObject({
+      code: "WORKTREE_CLAIM_MISMATCH",
+    });
   });
 
   it("refuses to remove a dirty worktree and removes a clean worktree without releasing its Claim", async () => {

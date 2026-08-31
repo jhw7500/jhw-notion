@@ -44,7 +44,13 @@ import { PreflightService } from "./preflight.js";
 import { RegistrationHintStore } from "./registration-hint.js";
 import { RegistryGit } from "./registry-git.js";
 import { createSensitiveDataPolicy } from "./sensitive-data.js";
-import { TaskService, type TaskFinishInput, type TaskRecoverInput } from "./task-service.js";
+import {
+  TaskService,
+  type CurrentTaskContextResult,
+  type CurrentTaskSummary,
+  type TaskFinishInput,
+  type TaskRecoverInput,
+} from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
 import {
   parseContractIntentFlags,
@@ -283,12 +289,12 @@ export interface CliDependencies {
   now?: () => Date;
   taskService: Pick<TaskService,
     "start" | "status" | "finish" | "recover" | "assertOwner" | "handoff" |
-    "resumeContext" | "recoveryDiscovery" | "markCompletionReady">;
+    "resumeContext" | "recoveryDiscovery" | "markCompletionReady" | "currentContext">;
   claimService: Pick<ClaimService, "getActive">;
   catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask" | "registerChildTask" | "configureInactiveTask">;
   source: Pick<GitHubSourceService,
     "registerRepository" | "registerFormalTask" | "registerTemporaryTask" | "prepareExistingTask" |
-    "withResolvedExistingFormalTask" | "promoteTemporaryTask">;
+    "withResolvedExistingFormalTask" | "withResolvedTaskStatusContext" | "promoteTemporaryTask">;
   portfolio: PortfolioPort;
   preflight: PreflightPort;
   guardMode: "enforce" | "observe";
@@ -578,6 +584,67 @@ function activeSummary(active: ActiveClaim): Record<string, unknown> {
     branch: active.branch,
     worktree_ref: active.worktree_ref,
     started_at: active.started_at,
+  };
+}
+
+function currentTaskSummaryProjection(task: CurrentTaskSummary): Record<string, unknown> {
+  if (task.kind === "formal") {
+    return {
+      task_id: task.task_id,
+      kind: "formal",
+      issue_url: task.issue_url,
+      ...(task.task_role === undefined ? {} : { task_role: task.task_role }),
+    };
+  }
+  if (task.kind === "temporary") {
+    return { task_id: task.task_id, kind: "temporary", lifecycle: task.lifecycle };
+  }
+  return {
+    task_id: task.task_id,
+    kind: "child",
+    lifecycle: task.lifecycle,
+    parent_task_id: task.parent_task_id,
+  };
+}
+
+/** Explicit public projection: checkout paths and session coordinates never escape status. */
+function currentTaskStatusProjection(status: CurrentTaskContextResult): Record<string, unknown> {
+  if (status.match === "none") {
+    return {
+      kind: "resolved",
+      project_id: status.project_id,
+      repo_id: status.repo_id,
+      match: "none",
+    };
+  }
+  if (status.match === "ambiguous") {
+    return {
+      kind: "resolved",
+      project_id: status.project_id,
+      repo_id: status.repo_id,
+      match: "ambiguous",
+      candidate_count: status.candidate_count,
+    };
+  }
+  return {
+    kind: "resolved",
+    project_id: status.project_id,
+    repo_id: status.repo_id,
+    match: "unique",
+    task: currentTaskSummaryProjection(status.task),
+    claim: {
+      task_id: status.claim.task_id,
+      claim_id: status.claim.claim_id,
+      host: status.claim.host,
+      branch: status.claim.branch,
+      worktree_ref: status.claim.worktree_ref,
+      started_at: status.claim.started_at,
+    },
+    relation: {
+      session_match: status.relation.session_match,
+      worktree_match: status.relation.worktree_match,
+      owner: status.relation.owner,
+    },
   };
 }
 
@@ -1947,8 +2014,33 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task status") {
-    const flags = parseFlags(argv.slice(2), new Set(["--task", "--claim"]));
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--task", "--claim", "--resolve-from-checkout", "--repo-path", "--origin-adapter", "--session",
+    ]));
     assertSafeFlags(flags, dependencies);
+    const resolveFromCheckout = value(flags, "--resolve-from-checkout");
+    const currentFields = ["--resolve-from-checkout", "--repo-path", "--origin-adapter", "--session"] as const;
+    const currentCount = currentFields.filter((flag) => flags.has(flag)).length;
+    if (currentCount > 0) {
+      if (currentCount !== currentFields.length || resolveFromCheckout !== "true" ||
+          flags.has("--task") || flags.has("--claim")) {
+        usage("Current Task status requires only checkout, adapter, and session coordinates");
+      }
+      const repository_path = required(flags, "--repo-path");
+      if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
+      const resolved = await dependencies.source.withResolvedTaskStatusContext(
+        { repository_path },
+        (context) => dependencies.taskService.currentContext({
+          project_id: context.project_id,
+          repo_id: context.repo_id,
+          repository_slug: context.repository_slug,
+          repository_path,
+          origin_adapter: requireOriginAdapter(flags),
+          session_id: requireClaimCoordinate(flags, "--session"),
+        }),
+      );
+      return { flags, result: resultJson(command, currentTaskStatusProjection(resolved)) };
+    }
     const task_id = requireTaskId(flags);
     const requestedClaim = value(flags, "--claim");
     const claim_id = requestedClaim ? assertPattern(requestedClaim, CLAIM_ID) : (await dependencies.claimService.getActive(task_id))?.claim_id;
