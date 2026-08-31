@@ -25,8 +25,8 @@ cd jhw-notion
 ```
 
 install.sh가 자동으로:
-1. MCP 서버 빌드 (npm install + build)
-2. `~/.local/bin/jhw-control` 심링크 생성
+1. MCP 서버 빌드 (`npm ci` + build; manifest/lockfile 불일치 시 수정 없이 실패)
+2. `~/.local/bin/jhw-control`과 `~/.local/bin/jhw-control-hook`을 검증한 뒤 두 심링크 생성
 3. 설치된 TUI 감지
 4. 스킬 심링크 생성
 5. 각 TUI 설정 파일에 MCP 서버 등록
@@ -34,8 +34,25 @@ install.sh가 자동으로:
    - Gemini: `~/.gemini/settings.json`의 `mcpServers`
    - OpenCode: `~/.config/opencode/opencode.json`의 `mcp`
    - Codex: `~/.codex/config.toml`의 `mcp_servers`
+6. Codex가 설치되어 있으면 `~/.codex/hooks.json`의 `UserPromptSubmit`·`PreToolUse`·`PostToolUse` Guard command group 등록 후 public `jhw-control guard preflight` 실행
 
 모든 canonical/legacy skill target과 same-name MCP entry는 이 저장소 소유임이 증명될 때만 교체한다. 다른 file/symlink/registration이 있으면 그대로 보존하고 install은 fail-closed한다. JSON/TOML 설정은 기존 mode를 보존한 private same-directory temp에서 fsync 후 atomic publish한다. Codex backup도 이 설치기의 명시적 namespace만 관리한다.
+
+Codex hook의 canonical command는 다음 문자열이다. `$HOME` 값을 미리 보간하지 않고 double-quoted shell expansion으로 남기므로 공백·apostrophe·double quote가 포함된 HOME도 하나의 launcher argv가 된다.
+
+```sh
+"$HOME/.local/bin/jhw-control-hook" --adapter codex --event <Event>
+```
+
+installer는 이 canonical command와 이전 installer가 만든 exact legacy absolute launcher command만 자기 소유로 본다. install은 소유가 증명된 legacy만 canonical로 migration하고 uninstall은 이 두 exact variant만 제거한다. 유사 command, wrapper, 외부 group은 수정하지 않는다. 각 이벤트에서 Guard group은 맨 앞에 추가되며 기존 외부 group은 lexical byte content와 기존 상대 순서를 유지한다.
+
+`jhw-control guard status`는 기존 Plan 2의 고정 `pending` coverage를 유지하며 설치 상태를 추론하지 않는다. 설치된 Codex 0.150은 같은 이벤트의 matching synchronous local handler를 함께 실행하므로 local config에 Guard가 존재하거나 첫 위치라는 사실만으로 보호를 주장하지 않는다. `jhw-control guard preflight`의 Codex `enforced: true`는 `enforce` mode에서 세 이벤트마다 exact trusted synchronous Guard가 하나이고, Guard 외에 활성·실행 가능한 synchronous `command`/`mcpTool` handler가 없음을 read-only runtime inventory로 확인하며, owned launcher symlink가 이 저장소의 executable `scripts/jhw-control-hook`를 가리키고 executable regular `mcp-server/dist/control/hook-adapter.js` core가 존재하며, 저장된 PreToolUse command의 bounded shell probe가 stderr 없이 exact `GUARD_PROTOCOL_MISMATCH` deny를 반환할 때만 가능하다. `command` variant의 `async: false`만 synchronous이고 `mcpTool` variant는 항상 synchronous다. 실행 가능한 foreign handler는 trusted 또는 managed 항목이며 untrusted·modified·disabled handler와 asynchronous command는 충돌로 보지 않는다. variant별 `command`/`async` 또는 `server`/`tool`, trust metadata, probe를 검증할 수 없으면 `enforced: false`/`NO-GO`다. project-source inventory는 이 명령을 실행한 current working directory 범위이므로 진단은 대상 worktree에서 실행한다. 미신뢰 훅 실행을 강제로 우회 허용한 별도 Codex 런타임은 이 판정의 전제 밖이므로 사용하지 않는다.
+
+Codex hook 등록은 설치기가 hook을 자동 신뢰하지 않는다. 중첩된 ownership key까지 중복 없는 exact group만 소유하며 모호한 JSON과 fatal UTF-8 검증을 통과하지 못한 raw bytes는 fail-closed하고 malformed backup도 byte-exact하게 남긴다. 설치 후 Codex의 `/hooks` 화면에서 세 command hook을 검토하고 활성화·신뢰 상태를 확인한다. 설치 마지막 preflight의 정형 `NO-GO`(exit 78)는 신뢰 검토 또는 미구현 adapter가 남았다는 fail-closed 진단이므로 그대로 표시하고 설치는 완료하지만 보호 완료를 뜻하지 않는다. Project Control/Guard 환경 설정이 하나도 없는 기본 설치는 public diagnostic의 exact `INVALID_CONFIG`만 `UNPROTECTED`로 분류하고 필수 좌표 설정 안내와 함께 완료한다. 이때 launcher·스킬·MCP는 설치하지만 Guard hook group은 활성화하지 않으며, 이전 설치의 exact owned group만 제거하고 외부 hook은 보존한다. 좌표를 설정한 뒤 installer를 다시 실행해야 Guard group이 등록된다. required/optional을 불문한 일부 명시 설정, invalid Guard mode, malformed/non-Guard output, 또는 다른 실행 실패는 설치를 중단하고 이번 실행이 추가한 hook config/link만 원상 복구한다. Codex PostToolUse adapter의 `ok: true`는 승인된 invocation이 transport event까지 도달해 exact Guard correlation을 닫았다는 뜻일 뿐, tool의 업무 성공을 뜻하지 않는다.
+
+hook config 등록·rollback·uninstall은 same-parent private `0700` `.hooks.json.jhw-txn.*` namespace를 사용하고, launcher symlink 제거는 별도의 same-parent private `0700` `.jhw-control-hook-link-txn.*` no-clobber namespace를 사용한다. Node는 live path를 capture하기 전에 intent를 fsync하고, capture 후 실제 type·mode·identity와 exact bytes를 `0600` manifest/evidence에 기록한다. symlink/FIFO는 follow하지 않고 exclusive hard-link로 원 객체를 복구한다. launcher 제거도 owned symlink를 private `captured-link`로 atomic rename한 뒤 identity/target을 재검증하며, 경합 교체된 외부 object는 absent live path에만 no-clobber republish한다. winner가 있으면 덮어쓰거나 지우지 않고 evidence를 보존한다. 경합 중 capture된 directory는 Node 표준 API로 안전한 no-clobber rename을 할 수 없으므로 private `captured-live` subtree와 launcher를 보존하고 `manual recovery required`로 중단하며, live path를 복구했다고 주장하지 않는다. rollback의 live candidate도 이동 전에 별도 intent를 fsync한다. 이동 직후 기록이 끊기면 recovery는 live parent와 transaction directory를 먼저 fsync하고 surviving `candidate-live` identity를 manifest에 인수한 뒤, 종류와 무관하게 exact candidate 경로와 launcher를 보존한 `manual-recovery-required` 상태에서 중단한다. Node의 pathname-only hard-link API로는 기록한 inode와 이후 publication source를 원자적으로 결속할 수 없으므로 이 interrupted-intent 경로는 live `hooks.json`을 자동 재게시하지 않는다. 정상적으로 중단 없이 진행되는 등록·복구·rollback만 준비된 inode를 absent `hooks.json`에 exclusive link하는 방식으로 publish한다. 그 사이 다른 path가 생기면 해당 winner를 덮어쓰거나 지우지 않고 launcher와 original/published/candidate evidence를 보존한다. 어느 namespace든 기존 transaction directory가 남아 있으면 다음 install/uninstall은 새 transaction을 만들기 전에 그 exact path를 안내하고 fail-closed한다.
+
+helper 결과나 fsync가 불명확한 경우 installer는 현재 path 상태를 단정하지 않으며, 검증된 manifest의 존재하는 evidence 경로와 실제 mode만 안내한다. register와 unregister 모두 inspector가 durable `manual-recovery-required`와 실제 `captured-live`를 확인하면 helper 종료 코드와 무관하게 그 exact evidence를 선택한다. rollback은 재검증된 durable stage와 실제 `candidate-live`, launcher 제거는 전용 manifest stage와 실제 `captured-link`를 기준으로 안내한다. 따라서 stage commit 직후 helper가 비정상 종료해도 해당 exact 경로를 표시한다. parent fsync 전에 실패한 `rollback-capture-intent`도 검증 가능한 candidate가 남아 있으면 내구성 완료를 주장하지 않은 채 그 경로와 live unknown/absent 상태만 안내한다. live config를 exclusive link하고 parent를 sync한 뒤 private `published-ready`를 떼기 전에는 `activation-detach-intent`와 exact delete target을 먼저 기록한다. 중단 시 이 stage만 `published-ready` 하나의 누락을 허용하므로 surviving live config와 transaction evidence를 검사할 수 있지만, installer는 완료를 주장하지 않고 launcher와 private transaction을 보존한다. finalize는 각 artifact의 recorded identity와 durable delete-intent를 확인해 재시도하고 unexpected loss/substitution을 삭제하지 않는다. transaction directory 제거 뒤 parent fsync가 실패하면 evidence가 제거됐다는 사실과 durability 미확인 상태를 그대로 알리고 launcher를 유지하며, evidence가 보존됐다고 말하거나 완료를 주장하지 않는다. Claude Guard 배선은 후속 단계이며 Gemini/OpenCode Guard는 현재 지원하지 않는다.
 
 ### Notion API Key 설정
 
@@ -52,7 +69,7 @@ Notion Integration 생성: https://www.notion.so/my-integrations
 ./install.sh --uninstall
 ```
 
-`jhw-control`, 네 TUI의 canonical/legacy link, MCP registration은 이 저장소 소유일 때만 제거된다. 다른 파일, link, same-name MCP entry, backup은 덮어쓰거나 삭제하지 않는다.
+`jhw-control`, `jhw-control-hook`, 정확히 소유한 Codex hook group, 네 TUI의 canonical/legacy link, MCP registration은 이 저장소 소유일 때만 제거된다. 다른 파일, link, hook group, same-name MCP entry, backup은 덮어쓰거나 삭제하지 않는다.
 
 ## MCP 도구
 

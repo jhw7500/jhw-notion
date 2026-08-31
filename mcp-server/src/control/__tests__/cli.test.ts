@@ -1,6 +1,6 @@
-import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
@@ -21,6 +21,45 @@ const CLAIM_ID = "clm-0198e748-3a00-7000-8000-000000000002";
 const CHILD_TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000003";
 const PROJECT_ID = "prj-control";
 const REPO_ID = "repo-control";
+
+type Task3CodexHookMetadataCommon = {
+  eventName: string;
+  matcher: string | null;
+  timeoutSec: number;
+  source: string;
+  sourcePath: string;
+  isManaged: boolean;
+  enabled: boolean;
+  trustStatus: "managed" | "untrusted" | "trusted" | "modified";
+  currentHash: string;
+  displayOrder: number;
+};
+
+type Task3CodexCommandHookMetadata = Task3CodexHookMetadataCommon & {
+  handlerType: "command";
+  async: boolean;
+  command: string;
+};
+
+type Task3CodexMcpToolHookMetadata = Task3CodexHookMetadataCommon & {
+  handlerType: "mcpTool";
+  server: string;
+  tool: string;
+};
+
+type Task3CodexHookMetadata = Task3CodexCommandHookMetadata | Task3CodexMcpToolHookMetadata;
+
+type Task3CodexHookProbeResult = {
+  exitCode: number | null;
+  signal: string | null;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+};
+
+type Task3CodexHookRuntimeInventory = {
+  cwd: string;
+  hooks: Task3CodexHookMetadata[];
+};
 
 function lockConfig(stateDir: string): ControlConfig {
   return {
@@ -164,6 +203,11 @@ type Overrides = {
   guardRequests?: Pick<GuardRequestStore, "inspect">;
   guardDigestKey?: Pick<GuardDigestKey, "inspect">;
   guardClaims?: Record<string, unknown>;
+  codexRepositoryRoot?: string;
+  codexHookRuntime?: {
+    list(): Promise<Task3CodexHookRuntimeInventory>;
+    probe(home: string, command: string, cwd: string): Promise<Task3CodexHookProbeResult>;
+  };
   registrationRecordWarning?: CliDependencies["registrationRecordWarning"];
 };
 
@@ -287,6 +331,8 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     guardRequests: overrides.guardRequests ?? { inspect: vi.fn().mockResolvedValue({ status: "ready", requests: [] }) },
     guardDigestKey: overrides.guardDigestKey ?? { inspect: vi.fn().mockResolvedValue({ status: "ready" }) },
     guardClaims,
+    ...(overrides.codexRepositoryRoot ? { codexRepositoryRoot: overrides.codexRepositoryRoot } : {}),
+    ...(overrides.codexHookRuntime ? { codexHookRuntime: overrides.codexHookRuntime } : {}),
     ...(overrides.journal ? { journal: overrides.journal } : {}),
     boardJournal: overrides.boardJournal ?? { append: vi.fn().mockResolvedValue(undefined) },
     ...(overrides.registrationRecordWarning ? { registrationRecordWarning: overrides.registrationRecordWarning } : {}),
@@ -374,6 +420,175 @@ function guardRequest(state: GuardRequestLifecycle, sequence: number): GuardRequ
   const consumed = { ...approved, consumed_at: consumedAt, correlation_id: `tool-use-${sequence}` };
   if (state === "CONSUMED") return consumed;
   return { ...consumed, finished_at: "2026-08-13T00:03:00.000Z" };
+}
+
+const task3HookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse"] as const;
+const task3RuntimeEventNames = {
+  UserPromptSubmit: "userPromptSubmit",
+  PreToolUse: "preToolUse",
+  PostToolUse: "postToolUse",
+} as const;
+
+function task3OwnedHookGroup(event: typeof task3HookEvents[number]) {
+  return {
+    hooks: [{
+      type: "command",
+      command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
+      timeout: 12,
+    }],
+  };
+}
+
+async function task3CodexHome(
+  hooks: "exact" | "missing" | "malformed" | "foreign",
+  artifact: "owned" | "missing" | "regular" | "foreign-symlink" |
+    "same-target-different-link-text" | "resolved-nonregular" | "resolved-nonexecutable" |
+    "core-missing" | "core-nonregular" | "core-nonexecutable" = "owned",
+): Promise<{
+  home: string;
+  hooksPath: string;
+  launcherPath: string;
+  repositoryRoot: string;
+  expectedLauncherPath: string;
+  corePath: string;
+  foreignLauncherTarget?: string;
+}> {
+  const home = await mkdtemp(join(tmpdir(), `jhw-hook-preflight-${hooks}-`));
+  const hooksPath = join(home, ".codex", "hooks.json");
+  const launcherPath = join(home, ".local", "bin", "jhw-control-hook");
+  const repositoryRoot = join(home, "repository");
+  const expectedLauncherPath = join(repositoryRoot, "scripts", "jhw-control-hook");
+  const corePath = join(repositoryRoot, "mcp-server", "dist", "control", "hook-adapter.js");
+  await mkdir(join(home, ".local", "bin"), { recursive: true });
+  await mkdir(join(home, ".codex"), { recursive: true });
+  await mkdir(dirname(expectedLauncherPath), { recursive: true });
+  await mkdir(dirname(corePath), { recursive: true });
+
+  if (artifact === "resolved-nonregular") {
+    await mkdir(expectedLauncherPath);
+  } else {
+    await writeFile(expectedLauncherPath, "#!/bin/sh\nexit 0\n", {
+      mode: artifact === "resolved-nonexecutable" ? 0o600 : 0o700,
+    });
+  }
+  if (artifact === "core-nonregular") {
+    await mkdir(corePath);
+  } else if (artifact !== "core-missing") {
+    await writeFile(corePath, "#!/usr/bin/env node\n", {
+      mode: artifact === "core-nonexecutable" ? 0o600 : 0o700,
+    });
+  }
+
+  let foreignLauncherTarget: string | undefined;
+  if (artifact === "missing") {
+    // The canonical launcher is intentionally absent.
+  } else if (artifact === "regular") {
+    await writeFile(launcherPath, "private-regular-launcher-marker", { mode: 0o700 });
+  } else if (artifact === "foreign-symlink") {
+    foreignLauncherTarget = join(home, "private-foreign-launcher-target");
+    await writeFile(foreignLauncherTarget, "private-foreign-launcher-marker", { mode: 0o700 });
+    await symlink(foreignLauncherTarget, launcherPath);
+  } else if (artifact === "same-target-different-link-text") {
+    await symlink(`${repositoryRoot}/scripts/../scripts/jhw-control-hook`, launcherPath);
+  } else {
+    await symlink(expectedLauncherPath, launcherPath);
+  }
+  const fixture = {
+    home,
+    hooksPath,
+    launcherPath,
+    repositoryRoot,
+    expectedLauncherPath,
+    corePath,
+    ...(foreignLauncherTarget ? { foreignLauncherTarget } : {}),
+  };
+  if (hooks === "missing") return fixture;
+  if (hooks === "malformed") {
+    await writeFile(hooksPath, '{"hooks":{"PreToolUse":["private-secret-marker"],', { mode: 0o600 });
+    return fixture;
+  }
+  const document = hooks === "exact"
+    ? { hooks: Object.fromEntries(task3HookEvents.map((event) => [event, [task3OwnedHookGroup(event)]])) }
+    : {
+      hooks: Object.fromEntries(task3HookEvents.map((event) => [event, [{
+        hooks: [{
+          type: "command",
+          command: `/private/foreign-secret --event ${event}`,
+          timeout: 12,
+        }],
+      }]])),
+  };
+  const exactText = `${JSON.stringify(document, null, 2)}\n`;
+  await writeFile(hooksPath, exactText, { mode: 0o600 });
+  return fixture;
+}
+
+function task3AdapterCoverage(result: Awaited<ReturnType<typeof runCli>>): Record<string, Record<string, unknown>> {
+  const output = result.stdout || result.stderr;
+  const payload = JSON.parse(output) as { result: { diagnostics: { adapter_coverage: Record<string, Record<string, unknown>> } } };
+  return payload.result.diagnostics.adapter_coverage;
+}
+
+function task3RuntimeEntries(hooksPath: string): Task3CodexCommandHookMetadata[] {
+  return task3HookEvents.map((event, index) => ({
+    eventName: task3RuntimeEventNames[event],
+    handlerType: "command",
+    async: false,
+    command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
+    matcher: null,
+    timeoutSec: 12,
+    source: "user",
+    sourcePath: hooksPath,
+    isManaged: false,
+    enabled: true,
+    trustStatus: "trusted",
+    // hooks/list owns the hash semantics. Preflight treats this as opaque,
+    // bounded metadata and relies on trustStatus rather than re-hashing files.
+    currentHash: `opaque-runtime-${task3RuntimeEventNames[event]}-v1`,
+    displayOrder: (index + 1) * 10,
+  }));
+}
+
+function task3McpRuntimeEntry(
+  base: Task3CodexCommandHookMetadata,
+  overrides: Partial<Omit<Task3CodexMcpToolHookMetadata, "handlerType">> = {},
+): Task3CodexMcpToolHookMetadata {
+  return {
+    eventName: base.eventName,
+    handlerType: "mcpTool",
+    server: "fixture-server",
+    tool: "fixture-tool",
+    matcher: base.matcher,
+    timeoutSec: base.timeoutSec,
+    source: "project",
+    sourcePath: "/private/project-hooks.json",
+    isManaged: false,
+    enabled: true,
+    trustStatus: "untrusted",
+    currentHash: "opaque-runtime-mcp-tool-v1",
+    displayOrder: 100,
+    ...overrides,
+  };
+}
+
+function task3SuccessfulProbe(): Task3CodexHookProbeResult {
+  return {
+    exitCode: 0,
+    signal: null,
+    stdout: Buffer.from('{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"GUARD_PROTOCOL_MISMATCH"},"systemMessage":"GUARD_PROTOCOL_MISMATCH"}\n'),
+    stderr: Buffer.alloc(0),
+  };
+}
+
+function task3Runtime(
+  metadata: Task3CodexHookMetadata[],
+  probeResult: Task3CodexHookProbeResult = task3SuccessfulProbe(),
+  cwd: string = dirname(dirname(metadata[0]?.sourcePath ?? "/private/.codex/hooks.json")),
+) {
+  return {
+    list: vi.fn().mockResolvedValue({ cwd, hooks: metadata }),
+    probe: vi.fn().mockResolvedValue(probeResult),
+  };
 }
 
 function formalStartArgs(): string[] {
@@ -2292,7 +2507,653 @@ describe("runCli", () => {
     expect(requiresMutationLock(["preflight"])).toBe(true);
   });
 
-  it("renders closed ready counts, mode, Registry availability, and fixed pending coverage", async () => {
+  it("reports exact adapter axes and requires trusted enabled Codex runtime evidence for enforcement", async () => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const runtime = task3Runtime(metadata);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+    const coverage = task3AdapterCoverage(result);
+    const exactAxes = [
+      "prompt_origin",
+      "pre_tool_block",
+      "post_tool_correlation",
+      "execution_recheck",
+      "enforced",
+    ].sort();
+
+    expect(Object.keys(coverage).sort()).toEqual(["claude", "codex", "gemini", "opencode"]);
+    for (const adapter of Object.values(coverage)) expect(Object.keys(adapter).sort()).toEqual(exactAxes);
+    expect(coverage).toEqual({
+      claude: {
+        prompt_origin: "missing",
+        pre_tool_block: "missing",
+        post_tool_correlation: "missing",
+        execution_recheck: "pending",
+        enforced: false,
+      },
+      codex: {
+        prompt_origin: "ok",
+        pre_tool_block: "ok",
+        post_tool_correlation: "ok",
+        execution_recheck: "pending",
+        enforced: true,
+      },
+      gemini: {
+        prompt_origin: "unsupported",
+        pre_tool_block: "unsupported",
+        post_tool_correlation: "unsupported",
+        execution_recheck: "pending",
+        enforced: false,
+      },
+      opencode: {
+        prompt_origin: "unsupported",
+        pre_tool_block: "unsupported",
+        post_tool_correlation: "unsupported",
+        execution_recheck: "pending",
+        enforced: false,
+      },
+    });
+    expect(runtime.probe).toHaveBeenCalledOnce();
+    expect(runtime.probe).toHaveBeenCalledWith(
+      fixture.home,
+      '"$HOME/.local/bin/jhw-control-hook" --adapter codex --event PreToolUse',
+      fixture.home,
+    );
+    expect(Buffer.byteLength(result.stdout || result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
+  });
+
+  it.each(["relative", "missing"] as const)(
+    "does not probe trusted Codex hooks from a %s inventory cwd",
+    async (scenario) => {
+      const fixture = await task3CodexHome("exact");
+      const cwd = scenario === "relative" ? "relative-runtime-cwd" : join(fixture.home, "missing-runtime-cwd");
+      const runtime = task3Runtime(task3RuntimeEntries(fixture.hooksPath), task3SuccessfulProbe(), cwd);
+      const result = await runCli(["guard", "preflight"], makeCliDependencies({
+        env: { HOME: fixture.home },
+        codexRepositoryRoot: fixture.repositoryRoot,
+        codexHookRuntime: runtime,
+      }));
+
+      expect(task3AdapterCoverage(result).codex.enforced).toBe(false);
+      expect(runtime.probe).not.toHaveBeenCalled();
+      expect(`${result.stdout}${result.stderr}`).not.toContain(cwd);
+    },
+  );
+
+  it("never reports trusted exact Codex hooks as enforced while runtime mode is observe", async () => {
+    const fixture = await task3CodexHome("exact");
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      guardMode: "observe",
+      codexHookRuntime: task3Runtime(task3RuntimeEntries(fixture.hooksPath)),
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+  });
+
+  it("does not turn fixture-proven contract evidence and exact hooks bytes into enforcement by themselves", async () => {
+    const fixture = await task3CodexHome("exact");
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+  });
+
+  it.each(["missing", "regular", "foreign-symlink"] as const)(
+    "reports all Codex installed axes missing when the exact launcher is %s",
+    async (launcher) => {
+      const fixture = await task3CodexHome("exact", launcher);
+      const hooksBefore = await readFile(fixture.hooksPath);
+      const hooksStatBefore = await stat(fixture.hooksPath);
+      const launcherBytesBefore = launcher === "missing" ? undefined : await readFile(fixture.launcherPath);
+      const launcherStatBefore = launcher === "missing" ? undefined : await lstat(fixture.launcherPath);
+      const launcherTargetBefore = launcher === "foreign-symlink" ? await readlink(fixture.launcherPath) : undefined;
+      const result = await runCli(["guard", "preflight"], makeCliDependencies({
+        env: { HOME: fixture.home },
+        codexRepositoryRoot: fixture.repositoryRoot,
+        codexHookRuntime: task3Runtime(task3RuntimeEntries(fixture.hooksPath)),
+      }));
+
+      expect(task3AdapterCoverage(result).codex).toEqual({
+        prompt_origin: "missing",
+        pre_tool_block: "missing",
+        post_tool_correlation: "missing",
+        execution_recheck: "pending",
+        enforced: false,
+      });
+      expect(await readFile(fixture.hooksPath)).toEqual(hooksBefore);
+      expect((await stat(fixture.hooksPath)).mtimeMs).toBe(hooksStatBefore.mtimeMs);
+      if (launcher === "missing") {
+        await expect(lstat(fixture.launcherPath)).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(await readFile(fixture.launcherPath)).toEqual(launcherBytesBefore);
+        expect((await lstat(fixture.launcherPath)).mtimeMs).toBe(launcherStatBefore?.mtimeMs);
+      }
+      if (launcher === "foreign-symlink") {
+        expect((await lstat(fixture.launcherPath)).isSymbolicLink()).toBe(true);
+        expect(await readlink(fixture.launcherPath)).toBe(launcherTargetBefore);
+      }
+      expect(`${result.stdout}${result.stderr}`).not.toContain(fixture.home);
+      expect(`${result.stdout}${result.stderr}`).not.toContain("private-regular-launcher-marker");
+      expect(`${result.stdout}${result.stderr}`).not.toContain("private-foreign-launcher-marker");
+    },
+  );
+
+  it.each([
+    "same-target-different-link-text",
+    "resolved-nonregular",
+    "resolved-nonexecutable",
+    "core-missing",
+    "core-nonregular",
+    "core-nonexecutable",
+  ] as const)("rejects isolated Codex artifact state %s without mutating it", async (artifact) => {
+    const fixture = await task3CodexHome("exact", artifact);
+    const hooksBefore = await readFile(fixture.hooksPath);
+    const hooksBeforeStat = await stat(fixture.hooksPath);
+    const linkBefore = await readlink(fixture.launcherPath);
+    const linkBeforeStat = await lstat(fixture.launcherPath);
+    const inspectedPath = artifact.startsWith("core-") ? fixture.corePath : fixture.expectedLauncherPath;
+    const inspectedBefore = await lstat(inspectedPath).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT") return undefined;
+      throw cause;
+    });
+    const inspectedBytesBefore = inspectedBefore?.isFile() ? await readFile(inspectedPath) : undefined;
+    if (artifact === "same-target-different-link-text") {
+      expect(await realpath(fixture.launcherPath)).toBe(await realpath(fixture.expectedLauncherPath));
+      expect(linkBefore).not.toBe(fixture.expectedLauncherPath);
+    }
+
+    const runtime = task3Runtime(task3RuntimeEntries(fixture.hooksPath));
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "missing",
+      pre_tool_block: "missing",
+      post_tool_correlation: "missing",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.list).not.toHaveBeenCalled();
+    expect(runtime.probe).not.toHaveBeenCalled();
+    expect(await readFile(fixture.hooksPath)).toEqual(hooksBefore);
+    expect((await stat(fixture.hooksPath)).ino).toBe(hooksBeforeStat.ino);
+    expect(await readlink(fixture.launcherPath)).toBe(linkBefore);
+    const linkAfterStat = await lstat(fixture.launcherPath);
+    expect({ dev: linkAfterStat.dev, ino: linkAfterStat.ino, mode: linkAfterStat.mode }).toEqual({
+      dev: linkBeforeStat.dev,
+      ino: linkBeforeStat.ino,
+      mode: linkBeforeStat.mode,
+    });
+    if (inspectedBefore) {
+      const inspectedAfter = await lstat(inspectedPath);
+      expect({ dev: inspectedAfter.dev, ino: inspectedAfter.ino, mode: inspectedAfter.mode, size: inspectedAfter.size }).toEqual({
+        dev: inspectedBefore.dev,
+        ino: inspectedBefore.ino,
+        mode: inspectedBefore.mode,
+        size: inspectedBefore.size,
+      });
+      if (inspectedBytesBefore) expect(await readFile(inspectedPath)).toEqual(inspectedBytesBefore);
+    } else {
+      await expect(lstat(inspectedPath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    expect(`${result.stdout}${result.stderr}`).not.toContain(fixture.home);
+  });
+
+  it.each(task3HookEvents)("requires the canonical %s group to be first in local config", async (event) => {
+    const fixture = await task3CodexHome("exact");
+    const document = JSON.parse(await readFile(fixture.hooksPath, "utf8")) as {
+      hooks: Record<typeof event, Array<Record<string, unknown>>>;
+    };
+    document.hooks[event].unshift({
+      hooks: [{ type: "command", command: "/private/foreign-first", timeout: 12 }],
+    });
+    await writeFile(fixture.hooksPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+    const before = await readFile(fixture.hooksPath);
+    const runtime = task3Runtime(task3RuntimeEntries(fixture.hooksPath));
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "missing",
+      pre_tool_block: "missing",
+      post_tool_correlation: "missing",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.list).not.toHaveBeenCalled();
+    expect(runtime.probe).not.toHaveBeenCalled();
+    expect(await readFile(fixture.hooksPath)).toEqual(before);
+    expect(`${result.stdout}${result.stderr}`).not.toContain("/private/foreign-first");
+  });
+
+  it.each(task3HookEvents)("rejects duplicate exact %s config groups as non-exact", async (event) => {
+    const fixture = await task3CodexHome("exact");
+    const document = JSON.parse(await readFile(fixture.hooksPath, "utf8")) as {
+      hooks: Record<typeof event, ReturnType<typeof task3OwnedHookGroup>[]>;
+    };
+    document.hooks[event].push(task3OwnedHookGroup(event));
+    await writeFile(fixture.hooksPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+    const before = await readFile(fixture.hooksPath);
+    const beforeStat = await stat(fixture.hooksPath);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: task3Runtime(task3RuntimeEntries(fixture.hooksPath)),
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "missing",
+      pre_tool_block: "missing",
+      post_tool_correlation: "missing",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(await readFile(fixture.hooksPath)).toEqual(before);
+    expect((await stat(fixture.hooksPath)).mtimeMs).toBe(beforeStat.mtimeMs);
+    expect(`${result.stdout}${result.stderr}`).not.toContain(fixture.home);
+  });
+
+  it("rejects a hooks.json symlink without reading through or mutating it", async () => {
+    const fixture = await task3CodexHome("exact");
+    const foreignTarget = join(fixture.home, "private-foreign-hooks-target.json");
+    const exactBytes = await readFile(fixture.hooksPath);
+    await writeFile(foreignTarget, exactBytes, { mode: 0o640 });
+    await unlink(fixture.hooksPath);
+    await symlink(foreignTarget, fixture.hooksPath);
+    const targetBefore = await readFile(foreignTarget);
+    const targetStatBefore = await stat(foreignTarget);
+    const linkBefore = await readlink(fixture.hooksPath);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: task3Runtime(task3RuntimeEntries(fixture.hooksPath)),
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "missing",
+      pre_tool_block: "missing",
+      post_tool_correlation: "missing",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect((await lstat(fixture.hooksPath)).isSymbolicLink()).toBe(true);
+    expect(await readlink(fixture.hooksPath)).toBe(linkBefore);
+    expect(await readFile(foreignTarget)).toEqual(targetBefore);
+    expect((await stat(foreignTarget)).mtimeMs).toBe(targetStatBefore.mtimeMs);
+    expect(`${result.stdout}${result.stderr}`).not.toContain(fixture.home);
+  });
+
+  it("keeps installed axes ok but enforcement false for a duplicate exact runtime handler", async () => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const runtime = task3Runtime([...metadata, { ...metadata[0] as Task3CodexCommandHookMetadata }]);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.probe).not.toHaveBeenCalled();
+  });
+
+  it.each(task3HookEvents)("ignores an untrusted synchronous foreign %s executor before Guard", async (event) => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const guard = metadata.find((entry) => entry.eventName === task3RuntimeEventNames[event]) as Task3CodexCommandHookMetadata;
+    const foreign = {
+      ...guard,
+      command: "/private/foreign-first-runtime",
+      source: "project",
+      sourcePath: "/private/project-hooks.json",
+      trustStatus: "untrusted" as const,
+      displayOrder: guard.displayOrder - 1,
+    };
+    const runtime = task3Runtime([...metadata, foreign]);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex.enforced).toBe(true);
+    expect(runtime.probe).toHaveBeenCalledOnce();
+    expect(`${result.stdout}${result.stderr}`).not.toContain("/private/foreign-first-runtime");
+  });
+
+  it.each(task3HookEvents)("rejects a trusted synchronous foreign %s command after Guard", async (event) => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const guard = metadata.find((entry) => entry.eventName === task3RuntimeEventNames[event]) as Task3CodexCommandHookMetadata;
+    const foreign = {
+      ...guard,
+      command: "/private/foreign-after-runtime",
+      source: "project",
+      sourcePath: "/private/project-hooks.json",
+      trustStatus: "trusted" as const,
+      displayOrder: 100,
+    };
+    const runtime = task3Runtime([...metadata, foreign]);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex.enforced).toBe(false);
+    expect(runtime.probe).not.toHaveBeenCalled();
+  });
+
+  it("allows a trusted asynchronous foreign command before Guard", async () => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const guard = metadata[0] as Task3CodexCommandHookMetadata;
+    const foreign = {
+      ...guard,
+      async: true,
+      command: "/private/foreign-async-runtime",
+      source: "project",
+      sourcePath: "/private/project-hooks.json",
+      displayOrder: guard.displayOrder - 1,
+    };
+    const runtime = task3Runtime([...metadata, foreign]);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex.enforced).toBe(true);
+    expect(runtime.probe).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["trusted", { isManaged: false, trustStatus: "trusted" as const }],
+    ["managed", { isManaged: true, trustStatus: "managed" as const, source: "managed" }],
+  ] as const)("rejects a %s synchronous foreign MCP tool after Guard", async (_scenario, overrides) => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const foreign = task3McpRuntimeEntry(metadata[1] as Task3CodexCommandHookMetadata, overrides);
+    const runtime = task3Runtime([...metadata, foreign]);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex.enforced).toBe(false);
+    expect(runtime.probe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["untrusted", { trustStatus: "untrusted" as const }],
+    ["modified", { trustStatus: "modified" as const }],
+    ["disabled managed", { isManaged: true, trustStatus: "managed" as const, source: "managed", enabled: false }],
+  ] as const)("allows a foreign MCP tool in %s state", async (_scenario, overrides) => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const foreign = task3McpRuntimeEntry(metadata[1] as Task3CodexCommandHookMetadata, overrides);
+    const runtime = task3Runtime([...metadata, foreign]);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex.enforced).toBe(true);
+    expect(runtime.probe).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an unknown MCP-style handler discriminator", async () => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const malformed = {
+      ...(metadata[1] as Task3CodexCommandHookMetadata),
+      handlerType: "mcp_tool",
+      async: true,
+      command: "foreign-server/foreign-tool",
+    } as unknown as Task3CodexHookMetadata;
+    const runtime = task3Runtime([...metadata, malformed]);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex.enforced).toBe(false);
+    expect(runtime.probe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing server", (entry: Task3CodexMcpToolHookMetadata) => {
+      const changed = { ...entry } as Partial<Task3CodexMcpToolHookMetadata>;
+      delete changed.server;
+      return changed as Task3CodexHookMetadata;
+    }],
+    ["missing tool", (entry: Task3CodexMcpToolHookMetadata) => {
+      const changed = { ...entry } as Partial<Task3CodexMcpToolHookMetadata>;
+      delete changed.tool;
+      return changed as Task3CodexHookMetadata;
+    }],
+    ["numeric server", (entry: Task3CodexMcpToolHookMetadata) =>
+      ({ ...entry, server: 7 }) as unknown as Task3CodexHookMetadata],
+    ["null tool", (entry: Task3CodexMcpToolHookMetadata) =>
+      ({ ...entry, tool: null }) as unknown as Task3CodexHookMetadata],
+  ] as const)("rejects MCP runtime metadata with %s", async (_scenario, mutate) => {
+    const fixture = await task3CodexHome("exact");
+    const metadata = task3RuntimeEntries(fixture.hooksPath);
+    const foreign = task3McpRuntimeEntry(metadata[1] as Task3CodexCommandHookMetadata);
+    const runtime = task3Runtime([...metadata, mutate(foreign)]);
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex.enforced).toBe(false);
+    expect(runtime.probe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["asynchronous exact Guard", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) =>
+      index === 0 ? { ...entry, async: true } : entry)],
+    ["missing async mode", (entries: Task3CodexCommandHookMetadata[]) => {
+      const changed = entries.map((entry) => ({ ...entry })) as Array<Partial<Task3CodexCommandHookMetadata>>;
+      delete changed[0]?.async;
+      return changed as Task3CodexCommandHookMetadata[];
+    }],
+    ["string async mode", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) =>
+      index === 0 ? { ...entry, async: "false" as unknown as boolean } : entry)],
+    ["numeric async mode", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) =>
+      index === 0 ? { ...entry, async: 0 as unknown as boolean } : entry)],
+    ["null async mode", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) =>
+      index === 0 ? { ...entry, async: null as unknown as boolean } : entry)],
+    ["missing display order", (entries: Task3CodexCommandHookMetadata[]) => {
+      const changed = entries.map((entry) => ({ ...entry })) as Array<Partial<Task3CodexCommandHookMetadata>>;
+      delete changed[0]?.displayOrder;
+      return changed as Task3CodexCommandHookMetadata[];
+    }],
+    ["non-integer display order", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) =>
+      index === 0 ? { ...entry, displayOrder: 10.5 } : entry)],
+  ] as const)("rejects runtime inventory with %s", async (_scenario, mutate) => {
+    const fixture = await task3CodexHome("exact");
+    const runtime = task3Runtime(mutate(task3RuntimeEntries(fixture.hooksPath)));
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.probe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing handler", (entries: Task3CodexCommandHookMetadata[]) => entries.slice(0, 2)],
+    ["wrong event", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, eventName: "sessionStart" } : entry)],
+    ["wrong handler type", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, handlerType: "prompt" as unknown as "command" } : entry)],
+    ["wrong command", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, command: "/private/foreign-command" } : entry)],
+    ["non-null matcher", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, matcher: "Bash" } : entry)],
+    ["wrong timeout", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, timeoutSec: 13 } : entry)],
+    ["wrong source path", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, sourcePath: "/private/foreign-hooks.json" } : entry)],
+    ["non-user source", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, source: "project" } : entry)],
+    ["managed hook", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, isManaged: true } : entry)],
+    ["disabled", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, enabled: false } : entry)],
+    ["managed trust status", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, trustStatus: "managed" as const } : entry)],
+    ["untrusted", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, trustStatus: "untrusted" as const } : entry)],
+    ["modified", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, trustStatus: "modified" as const } : entry)],
+    ["empty opaque hash", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, currentHash: "" } : entry)],
+    ["unbounded opaque hash", (entries: Task3CodexCommandHookMetadata[]) => entries.map((entry, index) => index === 0 ? { ...entry, currentHash: "x".repeat(4_097) } : entry)],
+  ] as const)("keeps exact Codex hooks unenforced when runtime inventory has a %s", async (_scenario, mutate) => {
+    const fixture = await task3CodexHome("exact");
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: task3Runtime(mutate(task3RuntimeEntries(fixture.hooksPath))),
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(`${result.stdout}${result.stderr}`).not.toContain("/private/foreign");
+  });
+
+  it.each([
+    ["timeout", () => Promise.reject(new Error("/private/probe-timeout secret-probe-token"))],
+    ["nonzero exit", () => Promise.resolve({ ...task3SuccessfulProbe(), exitCode: 17 })],
+    ["signal", () => Promise.resolve({ ...task3SuccessfulProbe(), exitCode: null, signal: "SIGTERM" })],
+    ["malformed stdout", () => Promise.resolve({ ...task3SuccessfulProbe(), stdout: Buffer.from("{\n") })],
+    ["multiple stdout objects", () => {
+      const success = task3SuccessfulProbe();
+      return Promise.resolve({ ...success, stdout: Buffer.concat([Buffer.from(success.stdout), Buffer.from(success.stdout)]) });
+    }],
+    ["oversized stdout", () => Promise.resolve({ ...task3SuccessfulProbe(), stdout: Buffer.alloc(12 * 1024 + 1, 0x61) })],
+    ["stderr bytes", () => Promise.resolve({ ...task3SuccessfulProbe(), stderr: Buffer.from("private-probe-stderr-marker") })],
+    ["wrong native event", () => Promise.resolve({
+      ...task3SuccessfulProbe(),
+      stdout: Buffer.from('{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"GUARD_PROTOCOL_MISMATCH"},"systemMessage":"GUARD_PROTOCOL_MISMATCH"}\n'),
+    })],
+  ] as const)("keeps enforcement false when the Codex shell probe has %s", async (_scenario, probe) => {
+    const fixture = await task3CodexHome("exact");
+    const runtime = {
+      list: vi.fn().mockResolvedValue({ cwd: fixture.home, hooks: task3RuntimeEntries(fixture.hooksPath) }),
+      probe: vi.fn(probe),
+    };
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.probe).toHaveBeenCalledOnce();
+    expect(`${result.stdout}${result.stderr}`).not.toContain("private-probe");
+    expect(`${result.stdout}${result.stderr}`).not.toContain("secret-probe-token");
+  });
+
+  it("fails closed and redacts a rejected Codex runtime inventory inspector", async () => {
+    const fixture = await task3CodexHome("exact");
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      codexHookRuntime: {
+        list: vi.fn().mockRejectedValue(new Error("/private/runtime-hooks.json secret-runtime-token")),
+        probe: vi.fn().mockRejectedValue(new Error("probe must not run")),
+      },
+    }));
+
+    expect(task3AdapterCoverage(result).codex).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(`${result.stdout}${result.stderr}`).not.toContain("/private/runtime-hooks.json");
+    expect(`${result.stdout}${result.stderr}`).not.toContain("secret-runtime-token");
+    expect(Buffer.byteLength(result.stdout || result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
+  });
+
+  it.each(["missing", "malformed", "foreign"] as const)(
+    "fails closed and leaves %s Codex hook state untouched",
+    async (scenario) => {
+      const fixture = await task3CodexHome(scenario);
+      const before = scenario === "missing" ? undefined : await readFile(fixture.hooksPath);
+      const beforeStat = scenario === "missing" ? undefined : await stat(fixture.hooksPath);
+      const result = await runCli(["guard", "preflight"], makeCliDependencies({
+        env: { HOME: fixture.home },
+        codexRepositoryRoot: fixture.repositoryRoot,
+        codexHookRuntime: task3Runtime(task3RuntimeEntries(fixture.hooksPath)),
+      }));
+
+      expect(task3AdapterCoverage(result).codex).toEqual({
+        prompt_origin: "missing",
+        pre_tool_block: "missing",
+        post_tool_correlation: "missing",
+        execution_recheck: "pending",
+        enforced: false,
+      });
+      if (before && beforeStat) {
+        expect(await readFile(fixture.hooksPath)).toEqual(before);
+        expect((await stat(fixture.hooksPath)).mtimeMs).toBe(beforeStat.mtimeMs);
+      } else {
+        await expect(readFile(fixture.hooksPath)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      expect(`${result.stdout}${result.stderr}`).not.toContain("private-secret-marker");
+      expect(`${result.stdout}${result.stderr}`).not.toContain("/private/foreign-secret");
+      expect(Buffer.byteLength(result.stdout || result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
+    },
+  );
+
+  it("keeps guard status on fixed pending coverage while preflight owns installed-state evidence", async () => {
     const requests = (["PENDING", "APPROVED", "CONSUMED", "COMPLETED", "FAILED", "EXPIRED"] as const)
       .map((state, index) => ({
         ...guardRequest(state, index + 1),
