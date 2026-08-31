@@ -313,6 +313,37 @@ describe("WorktreeManager", () => {
     await expect(manager.claimsMappedToCheckout([active], repoDir)).resolves.toEqual(new Set());
   });
 
+  it("validates a mapped Claim in its own clone before classifying another clone of the same repository", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const canonicalOrigin = "https://github.com/jhw7500/wlan.git";
+    await git(repoDir, "remote", "add", "origin", canonicalOrigin);
+    const independentClone = join(fixture.root, "independent-source-clone");
+    await git(fixture.root, "clone", repoDir, independentClone);
+    await git(independentClone, "remote", "set-url", "origin", canonicalOrigin);
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+
+    await expect(manager.claimsMappedToCheckout([active], independentClone)).resolves.toEqual(new Set());
+  });
+
+  it("rejects a stored repository path whose physical Git identity disagrees with the mapping", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    const independentClone = join(fixture.root, "corrupt-mapping-source-clone");
+    await git(fixture.root, "clone", repoDir, independentClone);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8")) as {
+      worktrees: Record<string, { repository_path: string }>;
+    };
+    state.worktrees[active.worktree_ref].repository_path = independentClone;
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    await expect(manager.claimsMappedToCheckout([active], created.path)).rejects.toMatchObject({
+      code: "WORKTREE_REPOSITORY_MISMATCH",
+    });
+  });
+
   it("does not treat another host's Claim as a local worktree match", async () => {
     const { repoDir, manager } = await worktreeFixture();
     const remote = claim({ host: "other-host" });
@@ -320,12 +351,54 @@ describe("WorktreeManager", () => {
     await expect(manager.claimsMappedToCheckout([remote], repoDir)).resolves.toEqual(new Set());
   });
 
-  it("does not create or chmod the configured worktree root during lookup", async () => {
+  it("does not initialize state or worktree directories for a zero-Claim lookup", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const root = join(fixture.root, "worktrees");
+    const stateDirectory = join(fixture.root, "state");
 
     await expect(manager.claimsMappedToCheckout([], repoDir)).resolves.toEqual(new Set());
     await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(stateDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects but does not chmod an insecure existing state directory during lookup", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const stateDirectory = join(fixture.root, "state");
+    await mkdir(stateDirectory, { mode: 0o700 });
+    await chmod(stateDirectory, 0o755);
+
+    await expect(manager.claimsMappedToCheckout([], repoDir)).rejects.toMatchObject({
+      code: "UNSAFE_STATE_PATH",
+    });
+    expect((await stat(stateDirectory)).mode & 0o777).toBe(0o755);
+  });
+
+  it("reports an absent local mapping without initializing state or worktree directories", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const root = join(fixture.root, "worktrees");
+    const stateDirectory = join(fixture.root, "state");
+
+    await expect(manager.claimsMappedToCheckout([claim()], repoDir)).rejects.toMatchObject({
+      code: "WORKTREE_NOT_MAPPED",
+    });
+    await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(stateDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects malformed initialized state instead of treating it as absent", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const stateDirectory = join(fixture.root, "state");
+    await mkdir(stateDirectory, { mode: 0o700 });
+    await writeFile(join(stateDirectory, "worktrees.json"), "{}\n", { mode: 0o600 });
+
+    await expect(manager.claimsMappedToCheckout([], repoDir)).rejects.toMatchObject({
+      code: "INVALID_WORKTREE_STATE",
+    });
+  });
+
+  it("does not chmod the configured worktree root during lookup", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const root = join(fixture.root, "worktrees");
 
     const active = claim();
     const created = await manager.createOrReuse(active, repoDir);

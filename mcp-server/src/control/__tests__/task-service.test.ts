@@ -75,6 +75,28 @@ function currentContextClaim(taskId: string, overrides: Partial<typeof activeCla
   };
 }
 
+async function setCurrentContextTaskLifecycle(
+  fixture: RegistryFixture,
+  taskId: string,
+  kind: "temporary" | "child",
+  lifecycle: "handoff" | "completed",
+): Promise<void> {
+  const taskPath = join(fixture.registryDir, "tasks", `${taskId}.yaml`);
+  const record = JSON.parse(await readFile(taskPath, "utf8")) as Record<string, unknown>;
+  if (kind === "temporary") {
+    await writeFile(taskPath, `${JSON.stringify({ ...record, lifecycle })}\n`, "utf8");
+    return;
+  }
+  const { expected_scope: _expectedScope, task_role: _taskRole, ...child } = record;
+  await writeFile(taskPath, `${JSON.stringify({
+    ...child,
+    kind: "child",
+    parent_task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ff",
+    required_for_parent: true,
+    lifecycle,
+  })}\n`, "utf8");
+}
+
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
   await Promise.all(localPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -215,12 +237,46 @@ describe("TaskService", () => {
     claims.listActiveClaims.mockResolvedValue([claim]);
     worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([claim.claim_id]));
 
-    await expect(tasks.currentContext(input)).resolves.toMatchObject({
+    const result = await tasks.currentContext(input);
+    expect(result).toEqual({
+      project_id: input.project_id,
+      repo_id: input.repo_id,
       match: "unique",
       task: { task_id: claim.task_id, kind: "temporary", lifecycle: "active" },
-      claim: { task_id: claim.task_id, claim_id: claim.claim_id },
+      claim: {
+        task_id: claim.task_id,
+        claim_id: claim.claim_id,
+        host: claim.host,
+        branch: claim.branch,
+        worktree_ref: claim.worktree_ref,
+        started_at: claim.started_at,
+      },
       relation: { session_match: true, worktree_match: true, owner: "current" },
     });
+    expect(result).not.toHaveProperty("claim.session_id");
+    expect(result).not.toHaveProperty("claim.origin_adapter");
+    expect(result).not.toHaveProperty("repository_path");
+    expect(result).not.toHaveProperty("task.aliases");
+  });
+
+  it.each([
+    ["temporary", "completed"],
+    ["child", "handoff"],
+  ] as const)("rejects a unique active Claim paired with an inactive %s Task", async (kind, lifecycle) => {
+    const { tasks, claims, worktrees, fixture, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    await setCurrentContextTaskLifecycle(fixture, task.id, kind, lifecycle);
+    const claim = currentContextClaim(task.id);
+    claims.listActiveClaims.mockResolvedValue([claim]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([claim.claim_id]));
+
+    await expect(tasks.currentContext({
+      project_id: claim.project_id,
+      repo_id: claim.repo_id,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: claim.session_id,
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
   });
 
   it("returns ambiguous without candidate coordinates when session and worktree select different Claims", async () => {
@@ -251,6 +307,31 @@ describe("TaskService", () => {
       match: "ambiguous",
       candidate_count: 2,
     });
+  });
+
+  it("rejects an inactive selected Task before returning multi-candidate ambiguity", async () => {
+    const { tasks, claims, worktrees, fixture, registerCurrentContextTask } = await taskFixture();
+    const firstTask = await registerCurrentContextTask();
+    const secondTask = await registerCurrentContextTask();
+    await setCurrentContextTaskLifecycle(fixture, secondTask.id, "child", "completed");
+    const first = currentContextClaim(firstTask.id);
+    const second = currentContextClaim(secondTask.id, {
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      session_id: "other-session",
+      task_alias: "wlan:tmp-current-context-second",
+      branch: "task/0123456789ac-wlan-tmp-current-context-second",
+      worktree_ref: "wt-0123456789ac-wlan-tmp-current-context-second",
+    });
+    claims.listActiveClaims.mockResolvedValue([first, second]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set([second.claim_id]));
+
+    await expect(tasks.currentContext({
+      project_id: first.project_id,
+      repo_id: first.repo_id,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: first.session_id,
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
   });
 
   it("returns none when neither session nor worktree selects an active Claim", async () => {

@@ -626,8 +626,12 @@ export class TaskService {
           TaskRecordSchema,
           { field: "id", value: claim.task_id },
         );
-        if (task.project_id !== input.project_id || task.repo_id !== input.repo_id ||
-            claim.project_id !== input.project_id) {
+        if (
+          task.project_id !== input.project_id ||
+          task.repo_id !== input.repo_id ||
+          claim.project_id !== input.project_id ||
+          (task.kind !== "formal" && task.lifecycle !== "active")
+        ) {
           throw new ControlError("REGISTRY_CORRUPT", "Current Task, Claim, and checkout context disagree");
         }
         return { claim, task };

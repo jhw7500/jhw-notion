@@ -5,7 +5,11 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { ActiveClaimSchema, ClaimHistorySchema, type ActiveClaim, type ClaimHistory } from "./schemas.js";
 import { LOCAL_HANDOFF_DIRECTORY, LOCAL_HANDOFF_RELATIVE_PATH } from "./handoff.js";
-import { openSecureStateDirectory, type SecureStateDirectory } from "./journal.js";
+import {
+  inspectSecureStateDirectory,
+  openSecureStateDirectory,
+  type SecureStateDirectory,
+} from "./journal.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
@@ -473,7 +477,7 @@ export class WorktreeManager {
     repositoryPath: string,
   ): Promise<ReadonlySet<string>> {
     const repository = await this.repositoryInfo(repositoryPath);
-    const state = await this.loadState();
+    const state = await this.loadReadOnlyState();
     const matched = new Set<string>();
     let root: string | undefined;
 
@@ -486,16 +490,26 @@ export class WorktreeManager {
       validateClaim(claim);
       if (claim.host !== this.config.buildHost) continue;
 
-      root ??= await this.readOnlyWorktreeRoot();
-
       const mapping = state.worktrees[claim.worktree_ref];
       if (!mapping) {
         throw new ControlError("WORKTREE_NOT_MAPPED", "Active Claim has no host-local worktree mapping", {
           worktree_ref: claim.worktree_ref,
         });
       }
-      this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
-      await this.verifyWorktree(mapping.path, claim.branch, repository.identity, root);
+      root ??= await this.readOnlyWorktreeRoot();
+      const mappedRepository = await this.repositoryInfo(mapping.repository_path);
+      if (
+        mapping.repository_path !== mappedRepository.root ||
+        mapping.repository_identity !== mappedRepository.identity
+      ) {
+        throw new ControlError(
+          "WORKTREE_REPOSITORY_MISMATCH",
+          "Stored repository root does not match its physical Git identity",
+          { worktree_ref: claim.worktree_ref },
+        );
+      }
+      this.assertExactGeneration(mapping, claim, mappedRepository.identity, root, "active");
+      await this.verifyWorktree(mapping.path, claim.branch, mappedRepository.identity, root);
       if (await realpath(mapping.path) === repository.root) matched.add(claim.claim_id);
     }
 
@@ -1137,29 +1151,41 @@ export class WorktreeManager {
   }
 
   private async loadState(): Promise<WorktreeState> {
-    return this.withStateDirectory(async (directory) => {
-      let file;
-      try {
-        file = await directory.openFile(WORKTREE_STATE_FILE, stateReadFlags);
-      } catch (cause) {
-        if (isNotFound(cause)) return { version: STATE_VERSION, worktrees: {} };
+    return this.withStateDirectory((directory) => this.readState(directory));
+  }
+
+  private async loadReadOnlyState(): Promise<WorktreeState> {
+    const inspected = await inspectSecureStateDirectory(this.config.stateDir);
+    if (inspected.status === "not_initialized") return { version: STATE_VERSION, worktrees: {} };
+    try {
+      return await this.readState(inspected.directory);
+    } finally {
+      await inspected.directory.close().catch(() => undefined);
+    }
+  }
+
+  private async readState(directory: SecureStateDirectory): Promise<WorktreeState> {
+    let file;
+    try {
+      file = await directory.openFile(WORKTREE_STATE_FILE, stateReadFlags);
+    } catch (cause) {
+      if (isNotFound(cause)) return { version: STATE_VERSION, worktrees: {} };
+      throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file");
+    }
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.nlink !== 1) {
         throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file");
       }
-      try {
-        const info = await file.stat();
-        if (!info.isFile() || info.nlink !== 1) {
-          throw new ControlError("UNSAFE_STATE_PATH", "Worktree state must be a regular file");
-        }
-        return parseState(JSON.parse(await file.readFile("utf8")));
-      } catch (cause) {
-        if (cause instanceof ControlError) throw cause;
-        throw new ControlError("INVALID_WORKTREE_STATE", "Worktree state could not be parsed", {
-          cause: cause instanceof Error ? cause.message : String(cause),
-        });
-      } finally {
-        await file.close().catch(() => undefined);
-      }
-    });
+      return parseState(JSON.parse(await file.readFile("utf8")));
+    } catch (cause) {
+      if (cause instanceof ControlError) throw cause;
+      throw new ControlError("INVALID_WORKTREE_STATE", "Worktree state could not be parsed", {
+        cause: cause instanceof Error ? cause.message : String(cause),
+      });
+    } finally {
+      await file.close().catch(() => undefined);
+    }
   }
 
   private async saveState(state: WorktreeState): Promise<void> {
