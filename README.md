@@ -155,7 +155,7 @@ test -n "$REPOSITORY_PATH" || exit 1
   --origin-adapter '<claude|codex|gemini|opencode>' --session '<session-id>'
 ```
 
-current-context는 같은 repository의 active Claim 중 `session_id`·adapter·host로 선택된 집합과 checkout에 매핑된 집합의 **union**을 후보로 삼는다. 후보가 없으면 `match=none`, 하나면 `match=unique`이며 session과 worktree가 모두 맞을 때만 `owner=current`(하나만 맞으면 `mismatch`, legacy로 ownership을 검증할 수 없으면 `unverifiable`)다. 둘 이상이면 `match=ambiguous`와 `candidate_count`만 반환하고 Claim을 선택하지 않으며 후보 좌표도 노출하지 않는다. `unique` success output에는 `session_id`나 absolute/private path를 포함하지 않는다.
+current-context는 같은 repository의 active Claim 중 `session_id`·adapter·host로 선택된 집합과 checkout에 매핑된 집합의 **union**을 후보로 삼는다. 후보가 없으면 `match=none`, 하나면 `match=unique`이며 session과 worktree가 모두 맞을 때만 `owner=current`(하나만 맞으면 `mismatch`, legacy로 ownership을 검증할 수 없으면 `unverifiable`)다. 둘 이상이면 `match=ambiguous`와 `candidate_count`만 반환하고 Claim을 선택하지 않으며 후보 좌표도 노출하지 않는다. `none`/`unique`/`ambiguous` 모든 성공 output에는 `session_id`나 absolute/private path를 포함하지 않는다.
 
 `/jhw:review --control`은 이 조회를 사용하는 opt-in proposal-only flow다. Notion 저장, Project Control Project, Project Control Task, GitHub Issue 승인은 각각 별도 slot이며 한 authority의 승인이 다른 authority로 전파되지 않는다.
 

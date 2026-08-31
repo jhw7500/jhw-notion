@@ -32,7 +32,7 @@ for (const [label, source] of [["README", readme], ["runbook", runbook]]) {
     ["exact current-context command", /"\$HOME\/\.local\/bin\/jhw-control-host" task status[^`]*--resolve-from-checkout true[^`]*--repo-path "\$REPOSITORY_PATH"[^`]*--origin-adapter '<claude\|codex\|gemini\|opencode>' --session '<session-id>'/],
     ["current owner requires session and worktree", /session과 worktree가 모두 (?:맞을|일치할) 때만 `owner=current`/],
     ["ambiguous is count-only and hides Claim coordinates", /match=ambiguous[^.]*candidate_count[^.]*Claim을 선택하지 않으며[^.]*좌표도 노출하지 않는다/],
-    ["successful output excludes private coordinates", /`unique` success output에는 `session_id`나 absolute\/private path를 포함하지 않는다/],
+    ["all successful outcomes exclude private coordinates", /`none`\/`unique`\/`ambiguous` 모든 성공 output에는 `session_id`나 absolute\/private path를 포함하지 않는다/],
     ["review control is opt-in proposal-only", /\/jhw:review --control[^.]*opt-in proposal-only flow/],
     ["authority approvals stay separate", /Notion 저장[^.]*Project Control Project[^.]*Project Control Task[^.]*GitHub Issue[^.]*(?:각각 별도 slot|별도 승인 slot)[^.]*(?:전파하지 않는다|전파되지 않는다)/],
     ["host v4 stays because task status is allowlisted", /host contract v4 remains unchanged because the existing `task status` allowlist already includes/],
