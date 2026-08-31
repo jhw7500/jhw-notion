@@ -9,8 +9,23 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const canonicalReview = join(repoRoot, "skills", "claude", "review.md");
 const codexSkill = join(repoRoot, "skills", "codex", "jhw-review", "SKILL.md");
 const codexReference = join(repoRoot, "skills", "codex", "jhw-review", "references", "review.md");
+const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
+const runbook = readFileSync(join(repoRoot, "docs", "project-control", "phase1a-runbook.md"), "utf8");
 const review = readFileSync(canonicalReview, "utf8");
 const failures = [];
+
+for (const [label, source] of [["README", readme], ["runbook", runbook]]) {
+  for (const marker of [
+    "--resolve-from-checkout true",
+    "none",
+    "unique",
+    "ambiguous",
+    "session_id",
+    "contract v4",
+  ]) {
+    if (!source.includes(marker)) failures.push(`${label} missing marker: ${marker}`);
+  }
+}
 
 function initialFrontmatter(markdown, label) {
   const match = markdown.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---\r?\n/);
