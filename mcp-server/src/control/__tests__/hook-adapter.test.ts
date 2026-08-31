@@ -277,6 +277,30 @@ describe("strict hook adapter executable core", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it.each(["claude", "codex"] as const)("serializes neutral %s Guard ALLOW without a permission override", async (adapter) => {
+    // Break caught: a valid Guard ALLOW reintroduces permissionDecision or diverges from the core output schema.
+    const { runHookAdapter } = await loadAdapter();
+    const neutral = { hookSpecificOutput: { hookEventName: "PreToolUse" } };
+    const result = await runHookAdapter(
+      ["--adapter", adapter, "--event", "PreToolUse"],
+      preToolPayload(),
+      new ObservableGuard(undefined, {
+        decision: "ALLOW",
+        operation_id: "op-018f21e0-7b2c-7a00-8000-000000000004",
+        summary: "Read repository status",
+        execution_boundary: "hook",
+      }),
+    );
+
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: `${JSON.stringify(neutral)}\n`,
+      stderr: "",
+    });
+    expect(result.stdout).not.toContain("permissionDecision");
+    expect(result.stdout).not.toContain("permissionDecisionReason");
+  });
+
   it("rejects a prompt-shaped renderer result for a PreToolUse invocation", async () => {
     // Break caught: a future PreToolUse renderer drift emits a non-blocking prompt envelope.
     vi.resetModules();
@@ -534,6 +558,21 @@ printf '%s\\n' "$CORE_OUTPUT"
     // Break caught: a partial installation silently allows because the launcher target is absent.
     const fixture = await launcherFixture();
     await installTimeout(fixture);
+    const result = await runLauncher(
+      fixture,
+      ["--adapter", "claude", "--event", "PreToolUse"],
+      preToolPayload(),
+    );
+
+    expect(JSON.parse(result.stdout)).toEqual(exactFailure("PreToolUse", "GUARD_UNAVAILABLE"));
+    expect(result.stderr).toBe("");
+  });
+
+  it("rejects the legacy PreToolUse allow override", async () => {
+    // Break caught: launcher validation widens and lets the former native permission bypass through.
+    const fixture = await launcherFixture();
+    await installTimeout(fixture);
+    await writeExecutable(fixture.core, "#!/usr/bin/env bash\nprintf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\"}}\\n'\n");
     const result = await runLauncher(
       fixture,
       ["--adapter", "claude", "--event", "PreToolUse"],
