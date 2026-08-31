@@ -608,6 +608,22 @@ export class TaskService {
 
     const repositoryClaims = (await this.claims.listActiveClaims())
       .filter((claim) => claim.repo_id === input.repo_id);
+    const repositoryClaimTasks = await Promise.all(repositoryClaims.map(async (claim) => {
+      const task = await this.records.readJson(
+        taskRelativePath(claim.task_id),
+        TaskRecordSchema,
+        { field: "id", value: claim.task_id },
+      );
+      if (
+        task.project_id !== input.project_id ||
+        task.repo_id !== input.repo_id ||
+        claim.project_id !== input.project_id ||
+        (task.kind !== "formal" && task.lifecycle !== "active")
+      ) {
+        throw new ControlError("REGISTRY_CORRUPT", "Current Task, Claim, and checkout context disagree");
+      }
+      return { claim, task };
+    }));
     const worktreeMatches = await this.worktrees.claimsMappedToCheckout(
       repositoryClaims,
       input.repository_path,
@@ -624,24 +640,7 @@ export class TaskService {
     if (candidateIds.size === 0) {
       return { project_id: input.project_id, repo_id: input.repo_id, match: "none" };
     }
-    const candidates = await Promise.all(repositoryClaims
-      .filter((claim) => candidateIds.has(claim.claim_id))
-      .map(async (claim) => {
-        const task = await this.records.readJson(
-          taskRelativePath(claim.task_id),
-          TaskRecordSchema,
-          { field: "id", value: claim.task_id },
-        );
-        if (
-          task.project_id !== input.project_id ||
-          task.repo_id !== input.repo_id ||
-          claim.project_id !== input.project_id ||
-          (task.kind !== "formal" && task.lifecycle !== "active")
-        ) {
-          throw new ControlError("REGISTRY_CORRUPT", "Current Task, Claim, and checkout context disagree");
-        }
-        return { claim, task };
-      }));
+    const candidates = repositoryClaimTasks.filter(({ claim }) => candidateIds.has(claim.claim_id));
     if (candidates.length > 1) {
       return {
         project_id: input.project_id,

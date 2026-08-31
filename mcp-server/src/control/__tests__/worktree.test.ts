@@ -358,6 +358,25 @@ describe("WorktreeManager", () => {
     });
   });
 
+  it.each([
+    ["missing", async (repoDir: string) => git(repoDir, "remote", "remove", "origin")],
+    ["noncanonical", async (repoDir: string) => git(repoDir, "remote", "set-url", "origin", "https://example.invalid/wlan.git")],
+    ["multiple", async (repoDir: string) => git(repoDir, "remote", "set-url", "--add", "origin", "https://github.com/jhw7500/wlan-mirror.git")],
+    ["divergent", async (repoDir: string) => git(repoDir, "remote", "set-url", "--push", "origin", "https://github.com/other-owner/other-repository.git")],
+  ] as const)("bounds a mapping-owned checkout with %s origins to its worktree reference", async (_label, configureOrigin) => {
+    const { repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    await configureOrigin(repoDir);
+
+    const error = await manager.claimsMappedToCheckout([active], created.path, CANONICAL_SLUG).catch((cause) => cause);
+    expect(error).toMatchObject({
+      code: "WORKTREE_REPOSITORY_MISMATCH",
+      details: { worktree_ref: active.worktree_ref },
+    });
+    expect((error as ControlError).details).toEqual({ worktree_ref: active.worktree_ref });
+  });
+
   it("rejects a stored repository path whose physical Git identity disagrees with the mapping", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const active = claim();

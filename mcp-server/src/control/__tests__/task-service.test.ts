@@ -360,6 +360,37 @@ describe("TaskService", () => {
     })).resolves.toEqual({ project_id: "prj-wlan", repo_id: "repo-wlan", match: "none" });
   });
 
+  it.each([
+    ["an inactive Task", async (fixture: RegistryFixture, taskId: string) => {
+      await setCurrentContextTaskLifecycle(fixture, taskId, "temporary", "completed");
+      return {};
+    }],
+    ["inconsistent Project coordinates", async () => ({ project_id: "prj-other" })],
+  ] as const)("rejects an unselected same-Repository Claim with %s", async (_label, corrupt) => {
+    const { tasks, claims, worktrees, fixture, registerCurrentContextTask } = await taskFixture();
+    await registerCurrentContextTask();
+    const unselectedTask = await registerCurrentContextTask();
+    const unselected = currentContextClaim(unselectedTask.id, {
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      session_id: "other-session",
+      task_alias: "wlan:tmp-current-context-unselected",
+      branch: "task/0123456789ac-wlan-tmp-current-context-unselected",
+      worktree_ref: "wt-0123456789ac-wlan-tmp-current-context-unselected",
+      ...await corrupt(fixture, unselectedTask.id),
+    });
+    claims.listActiveClaims.mockResolvedValue([unselected]);
+    worktrees.claimsMappedToCheckout.mockResolvedValue(new Set());
+
+    await expect(tasks.currentContext({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      repository_slug: REPOSITORY_SLUG,
+      repository_path: startInput.repository_path,
+      origin_adapter: "codex",
+      session_id: "not-an-owner",
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+  });
+
   it("marks a session-only active Claim as a mismatch", async () => {
     const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
     const task = await registerCurrentContextTask();
