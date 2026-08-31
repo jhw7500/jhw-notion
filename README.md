@@ -145,7 +145,7 @@ Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Regi
 
 `task start --task`는 같은 persistent Task를 명시적으로 재개하고 bounded latest Handoff만 반환한다. Handoff source revision은 Claim 시점에 고정된다. release 뒤 local cleanup은 `task recover --action cleanup`으로 exact Claim generation만 복구한다. `task assert-owner`는 raw Git을 통합 enforce하지 않는 advisory check라서 승인된 takeover와 race할 수 있다.
 
-현재 checkout의 Task를 확인할 때는 이미 v4 allowlist에 있는 `task status`에 current-context flags를 그대로 전달한다. host contract v4 remains unchanged: 새 launcher command를 추가하지 않고 기존 `task status`만 사용한다.
+현재 checkout의 Task를 확인할 때는 이미 v4 allowlist에 있는 `task status`에 current-context flags를 그대로 전달한다. host contract v4 remains unchanged because the existing `task status` allowlist already includes this command; 새 launcher command/version은 추가하지 않는다.
 
 ```bash
 REPOSITORY_PATH="$(git rev-parse --show-toplevel)" || exit $?
@@ -155,9 +155,9 @@ test -n "$REPOSITORY_PATH" || exit 1
   --origin-adapter '<claude|codex|gemini|opencode>' --session '<session-id>'
 ```
 
-current-context는 같은 repository의 active Claim 중 `session_id`·adapter·host로 선택된 집합과 checkout에 매핑된 집합의 **union**을 후보로 삼는다. 후보가 없으면 `match=none`, 하나면 `match=unique`이며 session과 worktree가 모두 맞을 때만 `owner=current`(하나만 맞으면 `mismatch`, legacy로 ownership을 검증할 수 없으면 `unverifiable`)다. 둘 이상이면 `match=ambiguous`와 `candidate_count`만 반환하고 Claim을 선택하지 않는다. 출력에는 `session_id`나 absolute/private path를 포함하지 않는다.
+current-context는 같은 repository의 active Claim 중 `session_id`·adapter·host로 선택된 집합과 checkout에 매핑된 집합의 **union**을 후보로 삼는다. 후보가 없으면 `match=none`, 하나면 `match=unique`이며 session과 worktree가 모두 맞을 때만 `owner=current`(하나만 맞으면 `mismatch`, legacy로 ownership을 검증할 수 없으면 `unverifiable`)다. 둘 이상이면 `match=ambiguous`와 `candidate_count`만 반환하고 Claim을 선택하지 않으며 후보 좌표도 노출하지 않는다. `unique` success output에는 `session_id`나 absolute/private path를 포함하지 않는다.
 
-`/jhw:review --control`은 이 조회를 사용하는 opt-in proposal flow다. Notion 저장, Project Control Project, Project Control Task, GitHub Issue 승인은 각각 별도 slot이며 한 authority의 승인이 다른 authority로 전파되지 않는다.
+`/jhw:review --control`은 이 조회를 사용하는 opt-in proposal-only flow다. Notion 저장, Project Control Project, Project Control Task, GitHub Issue 승인은 각각 별도 slot이며 한 authority의 승인이 다른 authority로 전파되지 않는다.
 
 기존 formal Task ID를 모르면 현재 checkout과 canonical Issue URL로 읽기 전용 recovery discovery를 실행한다.
 
