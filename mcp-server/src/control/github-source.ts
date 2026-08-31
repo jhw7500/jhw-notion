@@ -142,6 +142,11 @@ export interface ExistingFormalTaskResolution {
   alias: string;
 }
 
+export interface ResolvedTaskStatusContext {
+  project_id: string;
+  repo_id: string;
+}
+
 function parseJson<T>(stdout: string, schema: z.ZodType<T>, code: string): T {
   let value: unknown;
   try {
@@ -343,6 +348,18 @@ export class GitHubSourceService {
           return use(resolved);
         },
       );
+    });
+  }
+
+  async withResolvedTaskStatusContext<T>(
+    input: { repository_path: string },
+    use: (context: ResolvedTaskStatusContext) => Promise<T>,
+  ): Promise<T> {
+    this.assertCheckoutSafe({}, input.repository_path);
+    return this.withResolvedCheckoutContext(input.repository_path, async (context) => {
+      const resolved = { project_id: context.project_id, repo_id: context.repo_id };
+      this.assertCheckoutSafe(resolved, input.repository_path);
+      return use(resolved);
     });
   }
 

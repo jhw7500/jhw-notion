@@ -2184,6 +2184,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
         assertTakeoverEligible: graph.worktrees.assertTakeoverEligible.bind(graph.worktrees),
         rebindTakeover: graph.worktrees.rebindTakeover.bind(graph.worktrees),
         cleanupReleased: graph.worktrees.cleanupReleased.bind(graph.worktrees),
+        claimsMappedToCheckout: graph.worktrees.claimsMappedToCheckout.bind(graph.worktrees),
       } : graph.worktrees;
       const tasks = boundary === "after-release"
         ? new TaskService(graph.config, graph.claims, worktrees, graph.registry)

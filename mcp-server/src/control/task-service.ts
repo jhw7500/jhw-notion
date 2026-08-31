@@ -31,6 +31,9 @@ import {
   type ContractActiveClaim,
   type ErrorReason,
   type TaskRecord,
+  TaskRecordSchema,
+  type TaskRole,
+  type TemporaryLifecycle,
 } from "./schemas.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import type { TaskCompletionEvidence, TaskCompletionEvidenceRecord } from "./task-completion.js";
@@ -51,6 +54,7 @@ export interface ClaimServicePort {
   latestClaimHistory(taskId: string): Promise<ClaimHistory>;
   latestHandoffHistory(taskId: string): Promise<ClaimHistory>;
   getActive(taskId: string): Promise<ActiveClaim | undefined>;
+  listActiveClaims(): Promise<ActiveClaim[]>;
   markCompletionReady(
     taskId: string,
     claimId: string,
@@ -72,6 +76,7 @@ export interface WorktreeManagerPort {
   assertTakeoverEligible(previous: ActiveClaim): Promise<void>;
   rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<{ changed: boolean }>;
   cleanupReleased(history: ClaimHistory): Promise<WorktreeRemovalResult>;
+  claimsMappedToCheckout(claims: readonly ActiveClaim[], repositoryPath: string): Promise<ReadonlySet<string>>;
 }
 
 export interface RegistryGitPort {
@@ -104,6 +109,35 @@ export interface TaskStatusResult {
   active: ActiveClaim;
   worktree: Omit<WorktreeInspection, "path" | "repository_path">;
 }
+
+export type CurrentTaskSummary =
+  | { task_id: string; kind: "formal"; issue_url: string; task_role?: TaskRole }
+  | { task_id: string; kind: "temporary"; lifecycle: TemporaryLifecycle }
+  | { task_id: string; kind: "child"; lifecycle: TemporaryLifecycle; parent_task_id: string };
+
+export interface CurrentTaskContextInput {
+  project_id: string;
+  repo_id: string;
+  repository_path: string;
+  origin_adapter: GuardAdapter;
+  session_id: string;
+}
+
+export type CurrentTaskContextResult =
+  | { project_id: string; repo_id: string; match: "none" }
+  | { project_id: string; repo_id: string; match: "ambiguous"; candidate_count: number }
+  | {
+      project_id: string;
+      repo_id: string;
+      match: "unique";
+      task: CurrentTaskSummary;
+      claim: ConflictingClaimSummary;
+      relation: {
+        session_match: boolean;
+        worktree_match: boolean;
+        owner: "current" | "mismatch" | "unverifiable";
+      };
+    };
 
 /** Internal read-only Guard view. Host paths must never enter a decision envelope. */
 export interface GuardTaskInspection {
@@ -215,6 +249,27 @@ function reusableDisposition(history: ClaimHistory): Exclude<RetainedWorktreeGen
   if (history.status === "force-ended") return "force-ended";
   if (history.status === "abandoned" && history.outcome === "worktree_create_failed") return "create-failed";
   return undefined;
+}
+
+function currentTaskSummary(task: TaskRecord): CurrentTaskSummary {
+  switch (task.kind) {
+    case "formal":
+      return {
+        task_id: task.id,
+        kind: task.kind,
+        issue_url: task.issue_url,
+        ...(task.task_role !== undefined ? { task_role: task.task_role } : {}),
+      };
+    case "temporary":
+      return { task_id: task.id, kind: task.kind, lifecycle: task.lifecycle };
+    case "child":
+      return {
+        task_id: task.id,
+        kind: task.kind,
+        lifecycle: task.lifecycle,
+        parent_task_id: task.parent_task_id,
+      };
+  }
 }
 
 function assertValidation(validation: string[]): void {
@@ -539,6 +594,78 @@ export class TaskService {
     const result = { active, worktree };
     this.sensitiveData.assertSafe(result);
     return result;
+  }
+
+  async currentContext(input: CurrentTaskContextInput): Promise<CurrentTaskContextResult> {
+    const { repository_path: _repositoryPath, ...safeInput } = input;
+    this.sensitiveData.assertSafe(safeInput);
+    createSensitiveDataPolicy({}, [input.repository_path]).assertSafe(safeInput);
+
+    const repositoryClaims = (await this.claims.listActiveClaims())
+      .filter((claim) => claim.repo_id === input.repo_id);
+    const worktreeMatches = await this.worktrees.claimsMappedToCheckout(
+      repositoryClaims,
+      input.repository_path,
+    );
+    const sessionMatches = new Set(repositoryClaims
+      .filter((claim) => "origin_adapter" in claim &&
+        claim.origin_adapter === input.origin_adapter &&
+        claim.session_id === input.session_id &&
+        claim.host === this.config.buildHost)
+      .map((claim) => claim.claim_id));
+    const candidateIds = new Set([...sessionMatches, ...worktreeMatches]);
+
+    if (candidateIds.size === 0) {
+      return { project_id: input.project_id, repo_id: input.repo_id, match: "none" };
+    }
+    const candidates = await Promise.all(repositoryClaims
+      .filter((claim) => candidateIds.has(claim.claim_id))
+      .map(async (claim) => {
+        const task = await this.records.readJson(
+          taskRelativePath(claim.task_id),
+          TaskRecordSchema,
+          { field: "id", value: claim.task_id },
+        );
+        if (task.project_id !== input.project_id || task.repo_id !== input.repo_id ||
+            claim.project_id !== input.project_id) {
+          throw new ControlError("REGISTRY_CORRUPT", "Current Task, Claim, and checkout context disagree");
+        }
+        return { claim, task };
+      }));
+    if (candidates.length > 1) {
+      return {
+        project_id: input.project_id,
+        repo_id: input.repo_id,
+        match: "ambiguous",
+        candidate_count: candidates.length,
+      };
+    }
+
+    const [{ claim, task }] = candidates;
+    if (!claim || !task) throw new ControlError("REGISTRY_CORRUPT", "Current-context candidate disappeared");
+
+    const sessionMatch = sessionMatches.has(claim.claim_id);
+    const worktreeMatch = worktreeMatches.has(claim.claim_id);
+    const owner = !("origin_adapter" in claim)
+      ? "unverifiable" as const
+      : sessionMatch && worktreeMatch
+        ? "current" as const
+        : "mismatch" as const;
+    return {
+      project_id: input.project_id,
+      repo_id: input.repo_id,
+      match: "unique",
+      task: currentTaskSummary(task),
+      claim: ConflictingClaimSummarySchema.parse({
+        task_id: claim.task_id,
+        claim_id: claim.claim_id,
+        host: claim.host,
+        branch: claim.branch,
+        worktree_ref: claim.worktree_ref,
+        started_at: claim.started_at,
+      }),
+      relation: { session_match: sessionMatch, worktree_match: worktreeMatch, owner },
+    };
   }
 
   async resumeContext(taskId: string): Promise<TaskResumeContext> {

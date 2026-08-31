@@ -73,6 +73,7 @@ function fixture(overrides: {
   nodeId?: string;
   repository?: RepositoryRecord;
   issueState?: "open" | "closed";
+  pinnedRepositoryError?: string;
   finalFenceError?: string;
   formalFinalFenceError?: string;
   issueRevision?: string;
@@ -90,6 +91,9 @@ function fixture(overrides: {
       use: (record: RepositoryRecord) => Promise<T>,
     ): Promise<T> {
       pinnedRepositoryLookup(githubNodeId);
+      if (overrides.pinnedRepositoryError) {
+        throw new ControlError(overrides.pinnedRepositoryError, "injected pinned Repository refusal");
+      }
       pinEvents.push("repository:begin");
       try {
         const result = await use(repositoryRecord);
@@ -360,6 +364,52 @@ describe("GitHubSourceService", () => {
       }],
       dependencies: [],
     }));
+  });
+
+  it("pins the checkout-resolved Project and Repository for current Task status", async () => {
+    const { service, pinEvents } = fixture();
+
+    const result = await service.withResolvedTaskStatusContext(
+      { repository_path: checkout },
+      async (context) => {
+        expect(pinEvents).toEqual(["repository:begin"]);
+        return context;
+      },
+    );
+
+    expect(result).toEqual({ project_id: "prj-wlan", repo_id: "repo-wlan" });
+    expect(JSON.stringify(result)).not.toContain(checkout);
+    expect(pinEvents).toEqual(["repository:begin", "repository:end"]);
+  });
+
+  it("rejects current Task status when the checkout Repository is unregistered", async () => {
+    const { service } = fixture({ pinnedRepositoryError: "REPOSITORY_NOT_FOUND" });
+
+    await expect(service.withResolvedTaskStatusContext(
+      { repository_path: checkout },
+      async (context) => context,
+    )).rejects.toMatchObject({ code: "REPOSITORY_NOT_FOUND" });
+  });
+
+  it("rejects current Task status when the checkout Project association is ambiguous", async () => {
+    const { service, projects } = fixture();
+    projects.resolveUniqueProjectForRepository.mockRejectedValueOnce(
+      new ControlError("PROJECT_REPOSITORY_AMBIGUOUS", "injected ambiguity"),
+    );
+
+    await expect(service.withResolvedTaskStatusContext(
+      { repository_path: checkout },
+      async (context) => context,
+    )).rejects.toMatchObject({ code: "PROJECT_REPOSITORY_AMBIGUOUS" });
+  });
+
+  it("propagates Registry movement after current Task status callback", async () => {
+    const { service } = fixture({ finalFenceError: "REGISTRY_MOVED_DURING_READ" });
+
+    await expect(service.withResolvedTaskStatusContext(
+      { repository_path: checkout },
+      async (context) => context,
+    )).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
   });
 
   it("resolves an existing formal Task from the exact checkout and verified Issue", async () => {
