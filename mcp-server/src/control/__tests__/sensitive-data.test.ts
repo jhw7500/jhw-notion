@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { createCliDependencies, runCli } from "../cli.js";
 import { ControlError } from "../errors.js";
 import { assertNoAbsoluteHostPaths, createSensitiveDataPolicy } from "../sensitive-data.js";
 
@@ -146,5 +147,44 @@ describe("SensitiveDataPolicy", () => {
     expect(error.message).not.toContain(privatePath);
     expect(JSON.stringify(error)).not.toContain(privatePath);
     expect(JSON.stringify(error)).not.toContain("C:\\private\\source-checkout");
+  });
+
+  it("keeps checkout-resolved status source failures to their stable error code", async () => {
+    const privatePath = "/srv/private/current-checkout";
+    const secret = "unmistakably-fake-current-status-secret";
+    const dependencies = createCliDependencies({
+      HOME: "/fixture/home",
+      JHW_REGISTRY_DIR: "/fixture/registry",
+      JHW_WORKTREE_ROOT: "/fixture/worktrees",
+      JHW_CONTROL_STATE_DIR: "/fixture/state",
+      JHW_BUILD_HOST: "fixture-host",
+      JHW_GITHUB_OWNER: "fixture-owner",
+      JHW_PROJECT_NUMBER: "7",
+      JHW_REGISTRY_REPOSITORY: "fixture-owner/registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_trial",
+      JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+      GH_REPO_TOKEN: secret,
+    });
+    dependencies.source.withResolvedTaskStatusContext = async () => {
+      throw new ControlError("CHECKOUT_ROOT_MISMATCH", `source failed at ${privatePath} with ${secret}`);
+    };
+
+    const result = await runCli([
+      "task", "status",
+      "--resolve-from-checkout", "true",
+      "--repo-path", privatePath,
+      "--origin-adapter", "codex",
+      "--session", "private-session-value",
+    ], {
+      ...dependencies,
+      journal: { append: async () => undefined },
+    });
+    const output = `${result.stdout}${result.stderr}`;
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "CHECKOUT_ROOT_MISMATCH" } });
+    expect(output).not.toContain(privatePath);
+    expect(output).not.toContain(secret);
+    expect(output).not.toContain("private-session-value");
   });
 });

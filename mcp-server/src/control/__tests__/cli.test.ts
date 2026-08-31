@@ -22,6 +22,16 @@ const CHILD_TASK_ID = "tsk-0198e748-3a00-7000-8000-000000000003";
 const PROJECT_ID = "prj-control";
 const REPO_ID = "repo-control";
 
+function currentStatusArgs(): string[] {
+  return [
+    "task", "status",
+    "--resolve-from-checkout", "true",
+    "--repo-path", "/srv/jhw/control-worktree",
+    "--origin-adapter", "codex",
+    "--session", "private-session-value",
+  ];
+}
+
 type Task3CodexHookMetadataCommon = {
   eventName: string;
   matcher: string | null;
@@ -226,6 +236,23 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
         behind: 0,
       },
     }),
+    currentContext: vi.fn().mockResolvedValue({
+      project_id: PROJECT_ID,
+      repo_id: REPO_ID,
+      match: "unique",
+      task: { task_id: TASK_ID, kind: "temporary", lifecycle: "active" },
+      claim: {
+        task_id: TASK_ID,
+        claim_id: CLAIM_ID,
+        host: "build-host",
+        branch: activeClaim.branch,
+        worktree_ref: activeClaim.worktree_ref,
+        started_at: activeClaim.started_at,
+        session_id: "must-not-project",
+      },
+      relation: { session_match: true, worktree_match: true, owner: "current" },
+      repository_path: "/private/service-result",
+    }),
     finish: vi.fn().mockResolvedValue({
       history: { ...activeClaim, status: "completed", released_at: "2026-08-13T00:01:00.000Z" },
       worktree_removed: true,
@@ -267,6 +294,10 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
       _input: { repository_path: string; issue_url: string },
       use: (resolved: { task: ReturnType<typeof formalTask>; alias: string }) => Promise<unknown>,
     ) => use({ task: formalTask(), alias: "example/control#1" })),
+    withResolvedTaskStatusContext: vi.fn(async <T>(
+      _input: { repository_path: string },
+      use: (context: { project_id: string; repo_id: string }) => Promise<T>,
+    ): Promise<T> => use({ project_id: PROJECT_ID, repo_id: REPO_ID })),
     promoteTemporaryTask: vi.fn().mockResolvedValue(formalTask()),
     ...overrides.source,
   };
@@ -1976,6 +2007,125 @@ describe("runCli", () => {
     expect(result.stdout).not.toContain("/private");
   });
 
+  it.each([
+    [
+      "none",
+      { project_id: PROJECT_ID, repo_id: REPO_ID, match: "none", repository_path: "/private/none" },
+      { kind: "resolved", project_id: PROJECT_ID, repo_id: REPO_ID, match: "none" },
+    ],
+    [
+      "unique current owner",
+      {
+        project_id: PROJECT_ID,
+        repo_id: REPO_ID,
+        match: "unique",
+        task: { task_id: TASK_ID, kind: "temporary", lifecycle: "active" },
+        claim: {
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          host: "build-host",
+          branch: activeClaim.branch,
+          worktree_ref: activeClaim.worktree_ref,
+          started_at: activeClaim.started_at,
+          session_id: "must-not-project",
+        },
+        relation: { session_match: true, worktree_match: true, owner: "current" },
+        repository_path: "/private/current",
+      },
+      {
+        kind: "resolved",
+        project_id: PROJECT_ID,
+        repo_id: REPO_ID,
+        match: "unique",
+        task: { task_id: TASK_ID, kind: "temporary", lifecycle: "active" },
+        claim: {
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          host: "build-host",
+          branch: activeClaim.branch,
+          worktree_ref: activeClaim.worktree_ref,
+          started_at: activeClaim.started_at,
+        },
+        relation: { session_match: true, worktree_match: true, owner: "current" },
+      },
+    ],
+    [
+      "unique mismatch owner",
+      {
+        project_id: PROJECT_ID,
+        repo_id: REPO_ID,
+        match: "unique",
+        task: { task_id: TASK_ID, kind: "formal", issue_url: "https://github.com/example/control/issues/1", task_role: "standalone" },
+        claim: {
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          host: "build-host",
+          branch: activeClaim.branch,
+          worktree_ref: activeClaim.worktree_ref,
+          started_at: activeClaim.started_at,
+        },
+        relation: { session_match: false, worktree_match: true, owner: "mismatch" },
+      },
+      {
+        kind: "resolved",
+        project_id: PROJECT_ID,
+        repo_id: REPO_ID,
+        match: "unique",
+        task: { task_id: TASK_ID, kind: "formal", issue_url: "https://github.com/example/control/issues/1", task_role: "standalone" },
+        claim: {
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          host: "build-host",
+          branch: activeClaim.branch,
+          worktree_ref: activeClaim.worktree_ref,
+          started_at: activeClaim.started_at,
+        },
+        relation: { session_match: false, worktree_match: true, owner: "mismatch" },
+      },
+    ],
+    [
+      "ambiguous",
+      { project_id: PROJECT_ID, repo_id: REPO_ID, match: "ambiguous", candidate_count: 2, claim: activeClaim },
+      { kind: "resolved", project_id: PROJECT_ID, repo_id: REPO_ID, match: "ambiguous", candidate_count: 2 },
+    ],
+  ])("projects checkout-resolved current status %s without service extras", async (_label, currentContext, expected) => {
+    const dependencies = makeCliDependencies({
+      taskService: { currentContext: vi.fn().mockResolvedValue(currentContext) },
+    });
+
+    const result = await runCli(currentStatusArgs(), dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).toEqual(expected);
+    expect(JSON.parse(result.stdout).result).not.toHaveProperty("repository_path");
+    expect(JSON.parse(result.stdout).result).not.toHaveProperty("claim.session_id");
+  });
+
+  it.each([
+    ["missing session", currentStatusArgs().slice(0, -2)],
+    ["false resolver", currentStatusArgs().map((v) => v === "true" ? "false" : v)],
+    ["mixed exact mode", [...currentStatusArgs(), "--task", TASK_ID]],
+    ["mixed claim", [...currentStatusArgs(), "--claim", CLAIM_ID]],
+    ["relative root", currentStatusArgs().map((v) => v === "/srv/jhw/control-worktree" ? "relative" : v)],
+  ])("rejects current status mode: %s", async (_label, argv) => {
+    const dependencies = makeCliDependencies();
+
+    const result = await runCli(argv, dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.taskService.currentContext).not.toHaveBeenCalled();
+  });
+
+  it("does not expose current status session or private paths", async () => {
+    const result = await runCli(currentStatusArgs(), makeCliDependencies());
+    const output = `${result.stdout}${result.stderr}`;
+
+    expect(output).not.toContain("private-session-value");
+    expect(output).not.toContain("/srv/jhw/control-worktree");
+    expect(output).not.toContain("/private/service-result");
+    expect(output).not.toContain("must-not-project");
+  });
+
   it("classifies only lifecycle mutations for host locking", () => {
     expect(requiresMutationLock(["task", "start"])).toBe(true);
     expect(requiresMutationLock(["task", "child-start"])).toBe(true);
@@ -1988,6 +2138,7 @@ describe("runCli", () => {
     expect(requiresMutationLock(["project", "update"])).toBe(true);
     expect(requiresMutationLock(["preflight"])).toBe(true);
     expect(requiresMutationLock(["task", "status"])).toBe(false);
+    expect(requiresMutationLock(currentStatusArgs())).toBe(false);
     expect(requiresMutationLock(["task", "recover", "--action", "status"])).toBe(false);
     expect(requiresMutationLock(["portfolio", "status"])).toBe(false);
     expect(requiresMutationLock(["portfolio", "export"])).toBe(true);
