@@ -474,8 +474,8 @@ export class WorktreeManager {
   ): Promise<ReadonlySet<string>> {
     const repository = await this.repositoryInfo(repositoryPath);
     const state = await this.loadState();
-    const root = await this.worktreeRoot();
     const matched = new Set<string>();
+    let root: string | undefined;
 
     for (const rawClaim of claims) {
       const parsed = ActiveClaimSchema.safeParse(rawClaim);
@@ -485,6 +485,8 @@ export class WorktreeManager {
       const claim = parsed.data;
       validateClaim(claim);
       if (claim.host !== this.config.buildHost) continue;
+
+      root ??= await this.readOnlyWorktreeRoot();
 
       const mapping = state.worktrees[claim.worktree_ref];
       if (!mapping) {
@@ -1087,6 +1089,19 @@ export class WorktreeManager {
       });
     }
     await chmod(this.config.worktreeRoot, 0o700);
+    return realpath(this.config.worktreeRoot);
+  }
+
+  private async readOnlyWorktreeRoot(): Promise<string> {
+    if (!isAbsolute(this.config.worktreeRoot)) {
+      throw new ControlError("UNSAFE_WORKTREE_ROOT", "Worktree root must be absolute", { worktree_root: this.config.worktreeRoot });
+    }
+    const entry = await lstat(this.config.worktreeRoot);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) {
+      throw new ControlError("UNSAFE_WORKTREE_ROOT", "Worktree root must be a non-symbolic directory", {
+        worktree_root: this.config.worktreeRoot,
+      });
+    }
     return realpath(this.config.worktreeRoot);
   }
 

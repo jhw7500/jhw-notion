@@ -320,6 +320,22 @@ describe("WorktreeManager", () => {
     await expect(manager.claimsMappedToCheckout([remote], repoDir)).resolves.toEqual(new Set());
   });
 
+  it("does not create or chmod the configured worktree root during lookup", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const root = join(fixture.root, "worktrees");
+
+    await expect(manager.claimsMappedToCheckout([], repoDir)).resolves.toEqual(new Set());
+    await expect(stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+
+    const active = claim();
+    const created = await manager.createOrReuse(active, repoDir);
+    expect(created.path).toContain(root);
+    await chmod(root, 0o755);
+    await expect(manager.claimsMappedToCheckout([active], created.path)).resolves.toEqual(new Set([active.claim_id]));
+    await expect(stat(root)).resolves.toMatchObject({ mode: expect.any(Number) });
+    expect((await stat(root)).mode & 0o777).toBe(0o755);
+  });
+
   it("rejects a corrupted worktree mapping Claim generation", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const active = claim();
