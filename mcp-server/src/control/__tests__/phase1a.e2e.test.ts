@@ -89,6 +89,7 @@ async function makeGateFixture(): Promise<GateFixture> {
   await writeFile(join(sourceRepo, "README.md"), "# Source\n", "utf8");
   await git(sourceRepo, "add", "README.md");
   await git(sourceRepo, "commit", "-m", "Initial source");
+  await git(sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
   const fixture = {
     root: base.root,
     remoteDir: base.remoteDir,
@@ -219,7 +220,7 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
       },
       withResolvedTaskStatusContext: async (_input, use) => graph.catalog.withPinnedRepositoryByGitHubNode(
         repositoryInput.github_node_id,
-        async (repository) => use({ project_id: "prj-control", repo_id: repository.id }),
+        async (repository) => use({ project_id: "prj-control", repo_id: repository.id, repository_slug: repository.slug }),
       ),
       promoteTemporaryTask: async (input) => graph.catalog.promoteTemporaryTask(input.task_id, issueInput),
     },
@@ -886,7 +887,6 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
   it("4c-resolver. checkout resolution persists only the canonical Repository grant through Claim creation", async () => {
     const fixture = await makeGateFixture();
-    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
     const source = new GitHubSourceService({
@@ -1432,7 +1432,9 @@ describe("Phase 1A deterministic adversarial gate", () => {
       candidate_count: 2,
     }));
     expect(JSON.parse(ambiguous.stdout).result).not.toHaveProperty("claim");
+    expect(JSON.parse(currentOwner.stdout).result).not.toHaveProperty("repository_slug");
     expect(JSON.stringify(ambiguous)).not.toContain(currentMapping.path);
+    expect(JSON.stringify(currentOwner)).not.toContain("https://github.com/jhw7500/control.git");
     expect(JSON.stringify(ambiguous)).not.toContain("gemini-other-status");
 
     let sourceCalls = 0;
@@ -1443,7 +1445,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
           repositoryInput.github_node_id,
           async (repository) => {
             sourceCalls += 1;
-            const result = await use({ project_id: "prj-control", repo_id: repository.id });
+            const result = await use({ project_id: "prj-control", repo_id: repository.id, repository_slug: repository.slug });
             await writeFile(join(fixture.cloneA, "current-status-race.json"), "{}\n", "utf8");
             await git(fixture.cloneA, "add", "current-status-race.json");
             await git(fixture.cloneA, "commit", "-m", "Move Registry during current status");
@@ -1759,7 +1761,6 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
   it("16b. checkout recovery discovery spans exact Handoff resume, active takeover, and force-end", async () => {
     const fixture = await makeGateFixture();
-    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
     const graph = graphFor(fixture, fixture.cloneA);
     await graph.catalog.registerRepository(repositoryInput);
     const formal = (await graph.catalog.registerFormalTask({
@@ -2018,7 +2019,6 @@ describe("Phase 1A deterministic adversarial gate", () => {
 
   it("21. public Repository and formal Task flow verifies membership, checkout, Issue coordinates, and source authority before Claim", async () => {
     const fixture = await makeGateFixture();
-    await git(fixture.sourceRepo, "remote", "add", "origin", "https://github.com/jhw7500/control.git");
     const graph = graphFor(fixture, fixture.cloneA);
     const runner = new GateSourceRunner();
     let membershipFailure: string | undefined;
@@ -2494,7 +2494,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
       "--validation", "pre-rename handoff: pass", "--progress", "resume after the repository rename",
     ], initialDependencies)).exitCode).toBe(0);
     const renamedSlug = "jhw7500/control-renamed";
-    await git(fixture.sourceRepo, "remote", "add", "origin", `git@github.com:${renamedSlug}.git`);
+    await git(fixture.sourceRepo, "remote", "set-url", "origin", `git@github.com:${renamedSlug}.git`);
 
     const sourceRunner: GitHubSourceRunner = {
       run: graph.runner.run.bind(graph.runner),

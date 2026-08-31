@@ -296,8 +296,8 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     ) => use({ task: formalTask(), alias: "example/control#1" })),
     withResolvedTaskStatusContext: vi.fn(async <T>(
       _input: { repository_path: string },
-      use: (context: { project_id: string; repo_id: string }) => Promise<T>,
-    ): Promise<T> => use({ project_id: PROJECT_ID, repo_id: REPO_ID })),
+      use: (context: { project_id: string; repo_id: string; repository_slug: string }) => Promise<T>,
+    ): Promise<T> => use({ project_id: PROJECT_ID, repo_id: REPO_ID, repository_slug: "example/control" })),
     promoteTemporaryTask: vi.fn().mockResolvedValue(formalTask()),
     ...overrides.source,
   };
@@ -2098,7 +2098,11 @@ describe("runCli", () => {
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout).result).toEqual(expected);
     expect(JSON.parse(result.stdout).result).not.toHaveProperty("repository_path");
+    expect(JSON.parse(result.stdout).result).not.toHaveProperty("repository_slug");
     expect(JSON.parse(result.stdout).result).not.toHaveProperty("claim.session_id");
+    expect(dependencies.taskService.currentContext).toHaveBeenCalledWith(expect.objectContaining({
+      repository_slug: "example/control",
+    }));
   });
 
   it.each([

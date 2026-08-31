@@ -76,7 +76,11 @@ export interface WorktreeManagerPort {
   assertTakeoverEligible(previous: ActiveClaim): Promise<void>;
   rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<{ changed: boolean }>;
   cleanupReleased(history: ClaimHistory): Promise<WorktreeRemovalResult>;
-  claimsMappedToCheckout(claims: readonly ActiveClaim[], repositoryPath: string): Promise<ReadonlySet<string>>;
+  claimsMappedToCheckout(
+    claims: readonly ActiveClaim[],
+    repositoryPath: string,
+    repositorySlug: string,
+  ): Promise<ReadonlySet<string>>;
 }
 
 export interface RegistryGitPort {
@@ -118,6 +122,7 @@ export type CurrentTaskSummary =
 export interface CurrentTaskContextInput {
   project_id: string;
   repo_id: string;
+  repository_slug: string;
   repository_path: string;
   origin_adapter: GuardAdapter;
   session_id: string;
@@ -606,6 +611,7 @@ export class TaskService {
     const worktreeMatches = await this.worktrees.claimsMappedToCheckout(
       repositoryClaims,
       input.repository_path,
+      input.repository_slug,
     );
     const sessionMatches = new Set(repositoryClaims
       .filter((claim) => "origin_adapter" in claim &&

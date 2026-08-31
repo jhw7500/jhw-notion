@@ -12,6 +12,7 @@ import {
 } from "./journal.js";
 import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
+import { githubSlugFromCheckout } from "./github-source.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
 
 const STATE_VERSION = 2;
@@ -475,6 +476,7 @@ export class WorktreeManager {
   async claimsMappedToCheckout(
     claims: readonly ActiveClaim[],
     repositoryPath: string,
+    repositorySlug: string,
   ): Promise<ReadonlySet<string>> {
     const repository = await this.repositoryInfo(repositoryPath);
     const state = await this.loadReadOnlyState();
@@ -509,6 +511,23 @@ export class WorktreeManager {
         );
       }
       this.assertExactGeneration(mapping, claim, mappedRepository.identity, root, "active");
+      let mappedRepositorySlug: string;
+      try {
+        mappedRepositorySlug = await githubSlugFromCheckout(this.runner, mapping.repository_path);
+      } catch {
+        throw new ControlError(
+          "WORKTREE_REPOSITORY_MISMATCH",
+          "Mapped repository does not have one canonical GitHub origin",
+          { worktree_ref: claim.worktree_ref },
+        );
+      }
+      if (mappedRepositorySlug.toLowerCase() !== repositorySlug.toLowerCase()) {
+        throw new ControlError(
+          "WORKTREE_REPOSITORY_MISMATCH",
+          "Mapped repository origin disagrees with the pinned Repository",
+          { worktree_ref: claim.worktree_ref },
+        );
+      }
       await this.verifyWorktree(mapping.path, claim.branch, mappedRepository.identity, root);
       if (await realpath(mapping.path) === repository.root) matched.add(claim.claim_id);
     }

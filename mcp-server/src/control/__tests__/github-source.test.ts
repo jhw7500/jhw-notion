@@ -377,7 +377,11 @@ describe("GitHubSourceService", () => {
       },
     );
 
-    expect(result).toEqual({ project_id: "prj-wlan", repo_id: "repo-wlan" });
+    expect(result).toEqual({
+      project_id: "prj-wlan",
+      repo_id: "repo-wlan",
+      repository_slug: "jhw7500/wlan",
+    });
     expect(JSON.stringify(result)).not.toContain(checkout);
     expect(pinEvents).toEqual(["repository:begin", "repository:end"]);
   });

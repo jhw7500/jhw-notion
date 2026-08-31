@@ -20,6 +20,7 @@ const fixtures: RegistryFixture[] = [];
 const localPaths: string[] = [];
 const TASK_ID = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab";
+const REPOSITORY_SLUG = "jhw7500/wlan";
 const taskAlias = "wlan:tmp-20260813-01-fix";
 const plan = worktreePlan(TASK_ID, taskAlias);
 const activeWorkContract = { version: 1 as const, task_id: TASK_ID, grants: [], dependencies: [] };
@@ -230,6 +231,7 @@ describe("TaskService", () => {
     const input = {
       project_id: claim.project_id,
       repo_id: claim.repo_id,
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex" as const,
       session_id: claim.session_id,
@@ -256,7 +258,13 @@ describe("TaskService", () => {
     expect(result).not.toHaveProperty("claim.session_id");
     expect(result).not.toHaveProperty("claim.origin_adapter");
     expect(result).not.toHaveProperty("repository_path");
+    expect(result).not.toHaveProperty("repository_slug");
     expect(result).not.toHaveProperty("task.aliases");
+    expect(worktrees.claimsMappedToCheckout).toHaveBeenCalledWith(
+      [claim],
+      startInput.repository_path,
+      REPOSITORY_SLUG,
+    );
   });
 
   it.each([
@@ -273,6 +281,7 @@ describe("TaskService", () => {
     await expect(tasks.currentContext({
       project_id: claim.project_id,
       repo_id: claim.repo_id,
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex",
       session_id: claim.session_id,
@@ -294,6 +303,7 @@ describe("TaskService", () => {
     const input = {
       project_id: first.project_id,
       repo_id: first.repo_id,
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex" as const,
       session_id: first.session_id,
@@ -328,6 +338,7 @@ describe("TaskService", () => {
     await expect(tasks.currentContext({
       project_id: first.project_id,
       repo_id: first.repo_id,
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex",
       session_id: first.session_id,
@@ -342,6 +353,7 @@ describe("TaskService", () => {
     await expect(tasks.currentContext({
       project_id: "prj-wlan",
       repo_id: "repo-wlan",
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex",
       session_id: "codex-a",
@@ -358,6 +370,7 @@ describe("TaskService", () => {
     await expect(tasks.currentContext({
       project_id: claim.project_id,
       repo_id: claim.repo_id,
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex",
       session_id: claim.session_id,
@@ -377,6 +390,7 @@ describe("TaskService", () => {
     await expect(tasks.currentContext({
       project_id: claim.project_id,
       repo_id: claim.repo_id,
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex",
       session_id: "codex-a",
@@ -396,6 +410,7 @@ describe("TaskService", () => {
     await expect(tasks.currentContext({
       project_id: legacy.project_id,
       repo_id: legacy.repo_id,
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex",
       session_id: "codex-a",
@@ -417,6 +432,7 @@ describe("TaskService", () => {
 
     await expect(tasks.currentContext({
       ...input,
+      repository_slug: REPOSITORY_SLUG,
       repository_path: startInput.repository_path,
       origin_adapter: "codex",
       session_id: claim.session_id,

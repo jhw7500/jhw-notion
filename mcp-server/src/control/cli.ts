@@ -2033,6 +2033,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         (context) => dependencies.taskService.currentContext({
           project_id: context.project_id,
           repo_id: context.repo_id,
+          repository_slug: context.repository_slug,
           repository_path,
           origin_adapter: requireOriginAdapter(flags),
           session_id: requireClaimCoordinate(flags, "--session"),
