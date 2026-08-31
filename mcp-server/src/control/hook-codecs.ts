@@ -21,53 +21,115 @@ const prompt = z.string()
   .max(64 * 1024)
   .refine((value) => Buffer.byteLength(value, "utf8") <= 64 * 1024);
 const toolInput = z.record(z.unknown());
+const requiredNativeJson = z.unknown().refine((value) => value !== undefined, "Required");
+const transcriptPath = coordinate(4_096);
+const nullableTranscriptPath = transcriptPath.nullable();
+const claudePermissionMode = z.enum([
+  "default",
+  "plan",
+  "acceptEdits",
+  "auto",
+  "dontAsk",
+  "bypassPermissions",
+]);
+const claudeEffort = z.object({
+  level: z.enum(["low", "medium", "high", "xhigh", "max"]),
+}).strict().optional();
+const codexPermissionMode = z.enum([
+  "default",
+  "acceptEdits",
+  "plan",
+  "dontAsk",
+  "bypassPermissions",
+]);
+const documentedAgentMetadata = {
+  agent_id: coordinate(255).optional(),
+  agent_type: coordinate(255).optional(),
+};
 
 // Keep the two native schema sets distinct. Task 2 can refine one adapter from
 // recorded fixtures without silently widening the other adapter's parser.
+// Claude Code 2.1.246 documents these optional common hook fields. Agent
+// metadata is accepted but never copied into Guard authority coordinates.
 const ClaudeUserPromptSubmitSchema = z.object({
   session_id: coordinate(255),
+  ...documentedAgentMetadata,
+  prompt_id: coordinate(255).optional(),
+  transcript_path: transcriptPath.optional(),
   cwd,
+  permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("UserPromptSubmit"),
   prompt,
 }).strict();
 const ClaudePreToolUseSchema = z.object({
   session_id: coordinate(255),
+  ...documentedAgentMetadata,
+  prompt_id: coordinate(255).optional(),
+  transcript_path: transcriptPath.optional(),
   cwd,
+  permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("PreToolUse"),
+  effort: claudeEffort,
   tool_name: coordinate(64),
   tool_input: toolInput,
   tool_use_id: coordinate(255),
 }).strict();
 const ClaudePostToolUseSchema = z.object({
   session_id: coordinate(255),
+  ...documentedAgentMetadata,
+  prompt_id: coordinate(255).optional(),
+  transcript_path: transcriptPath.optional(),
   cwd,
+  permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("PostToolUse"),
+  effort: claudeEffort,
   tool_name: coordinate(64),
   tool_input: toolInput,
+  tool_response: z.unknown().optional(),
   tool_use_id: coordinate(255),
+  duration_ms: z.number().finite().nonnegative().optional(),
 }).strict();
 
+// Codex CLI 0.149.1 generated command-hook schemas require the metadata
+// below. The Guard keeps its narrower object-only tool input authority while
+// requiring each pinned native coordinate and rejecting every unknown field.
 const CodexUserPromptSubmitSchema = z.object({
-  session_id: coordinate(255),
   cwd,
+  ...documentedAgentMetadata,
   hook_event_name: z.literal("UserPromptSubmit"),
+  model: coordinate(255),
+  permission_mode: codexPermissionMode,
   prompt,
+  session_id: coordinate(255),
+  transcript_path: nullableTranscriptPath,
+  turn_id: coordinate(255),
 }).strict();
 const CodexPreToolUseSchema = z.object({
-  session_id: coordinate(255),
   cwd,
+  ...documentedAgentMetadata,
   hook_event_name: z.literal("PreToolUse"),
-  tool_name: coordinate(64),
+  model: coordinate(255),
+  permission_mode: codexPermissionMode,
+  session_id: coordinate(255),
   tool_input: toolInput,
+  tool_name: coordinate(64),
   tool_use_id: coordinate(255),
+  transcript_path: nullableTranscriptPath,
+  turn_id: coordinate(255),
 }).strict();
 const CodexPostToolUseSchema = z.object({
-  session_id: coordinate(255),
   cwd,
+  ...documentedAgentMetadata,
   hook_event_name: z.literal("PostToolUse"),
-  tool_name: coordinate(64),
+  model: coordinate(255),
+  permission_mode: codexPermissionMode,
+  session_id: coordinate(255),
   tool_input: toolInput,
+  tool_name: coordinate(64),
+  tool_response: requiredNativeJson,
   tool_use_id: coordinate(255),
+  transcript_path: nullableTranscriptPath,
+  turn_id: coordinate(255),
 }).strict();
 
 const preToolNeutralOutputSchema = z.object({
@@ -112,11 +174,7 @@ export interface HookCodec {
   ): unknown;
 }
 
-type NativeSchemaSet = Readonly<{
-  UserPromptSubmit: typeof ClaudeUserPromptSubmitSchema;
-  PreToolUse: typeof ClaudePreToolUseSchema;
-  PostToolUse: typeof ClaudePostToolUseSchema;
-}>;
+type NativeSchemaSet = Readonly<Record<HookEventName, z.ZodTypeAny>>;
 
 function decodeNative(
   adapter: "claude" | "codex",
@@ -125,7 +183,7 @@ function decodeNative(
   raw: unknown,
 ): GuardCommonEvent {
   if (event === "UserPromptSubmit") {
-    const native = schemas.UserPromptSubmit.parse(raw);
+    const native = schemas.UserPromptSubmit.parse(raw) as { session_id: string; prompt: string };
     return GuardCommonEventSchema.parse({
       protocol_version: 1,
       adapter,
@@ -135,7 +193,13 @@ function decodeNative(
     });
   }
   if (event === "PreToolUse") {
-    const native = schemas.PreToolUse.parse(raw);
+    const native = schemas.PreToolUse.parse(raw) as {
+      session_id: string;
+      cwd: string;
+      tool_name: string;
+      tool_input: unknown;
+      tool_use_id: string;
+    };
     return GuardCommonEventSchema.parse({
       protocol_version: 1,
       adapter,
@@ -147,7 +211,7 @@ function decodeNative(
       tool_use_id: native.tool_use_id,
     });
   }
-  const native = schemas.PostToolUse.parse(raw);
+  const native = schemas.PostToolUse.parse(raw) as { session_id: string; tool_use_id: string };
   return GuardCommonEventSchema.parse({
     protocol_version: 1,
     adapter,
@@ -251,6 +315,32 @@ const codexSchemas: NativeSchemaSet = Object.freeze({
   UserPromptSubmit: CodexUserPromptSubmitSchema,
   PreToolUse: CodexPreToolUseSchema,
   PostToolUse: CodexPostToolUseSchema,
+});
+
+export interface AdapterContractResult {
+  contract_version: 1;
+  adapter: "claude" | "codex";
+  native_version: string;
+  fixture_axes: Readonly<{
+    prompt_origin: true;
+    pre_tool_block: true;
+    post_tool_correlation: true;
+  }>;
+}
+
+export const adapterContractResults: Readonly<Record<"claude" | "codex", AdapterContractResult>> = Object.freeze({
+  claude: Object.freeze({
+    contract_version: 1,
+    adapter: "claude",
+    native_version: "2.1.246",
+    fixture_axes: Object.freeze({ prompt_origin: true, pre_tool_block: true, post_tool_correlation: true }),
+  }),
+  codex: Object.freeze({
+    contract_version: 1,
+    adapter: "codex",
+    native_version: "0.149.1",
+    fixture_axes: Object.freeze({ prompt_origin: true, pre_tool_block: true, post_tool_correlation: true }),
+  }),
 });
 
 export const claudeHookCodec: HookCodec = Object.freeze({

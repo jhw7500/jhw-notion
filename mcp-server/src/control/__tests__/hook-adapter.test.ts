@@ -54,7 +54,7 @@ afterEach(async () => {
   await Promise.all(paths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-function preToolPayload(secret = "tool-secret-9ee12c"): string {
+function preToolPayload(secret = "tool-secret-9ee12c", adapter: HookAdapterName = "claude"): string {
   return JSON.stringify({
     session_id: "native-session-17",
     cwd: "/srv/worktrees/native-17",
@@ -62,19 +62,31 @@ function preToolPayload(secret = "tool-secret-9ee12c"): string {
     tool_name: "Bash",
     tool_input: { command: `deploy --token=${secret}` },
     tool_use_id: "call-native-17",
+    ...(adapter === "codex" ? {
+      model: "gpt-5-codex",
+      permission_mode: "default",
+      transcript_path: null,
+      turn_id: "codex-turn-17",
+    } : {}),
   });
 }
 
-function promptPayload(secret = "prompt-secret-8d6a31"): string {
+function promptPayload(secret = "prompt-secret-8d6a31", adapter: HookAdapterName = "claude"): string {
   return JSON.stringify({
     session_id: "native-session-17",
     cwd: "/srv/worktrees/native-17",
     hook_event_name: "UserPromptSubmit",
     prompt: secret,
+    ...(adapter === "codex" ? {
+      model: "gpt-5-codex",
+      permission_mode: "default",
+      transcript_path: null,
+      turn_id: "codex-turn-17",
+    } : {}),
   });
 }
 
-function postToolPayload(): string {
+function postToolPayload(adapter: HookAdapterName = "claude"): string {
   return JSON.stringify({
     session_id: "native-session-17",
     cwd: "/srv/worktrees/native-17",
@@ -82,6 +94,13 @@ function postToolPayload(): string {
     tool_name: "Bash",
     tool_input: { command: "git push origin HEAD" },
     tool_use_id: "call-native-17",
+    ...(adapter === "codex" ? {
+      model: "gpt-5-codex",
+      permission_mode: "default",
+      transcript_path: null,
+      turn_id: "codex-turn-17",
+      tool_response: { success: true },
+    } : {}),
   });
 }
 
@@ -216,9 +235,9 @@ describe("strict hook adapter executable core", () => {
     ["claude", "UserPromptSubmit", promptPayload(), "submitUserPrompt", "user_prompt_submit"],
     ["claude", "PreToolUse", preToolPayload(), "evaluatePreTool", "pre_tool_use"],
     ["claude", "PostToolUse", postToolPayload(), "completePostTool", "post_tool_use"],
-    ["codex", "UserPromptSubmit", promptPayload(), "submitUserPrompt", "user_prompt_submit"],
-    ["codex", "PreToolUse", preToolPayload(), "evaluatePreTool", "pre_tool_use"],
-    ["codex", "PostToolUse", postToolPayload(), "completePostTool", "post_tool_use"],
+    ["codex", "UserPromptSubmit", promptPayload(undefined, "codex"), "submitUserPrompt", "user_prompt_submit"],
+    ["codex", "PreToolUse", preToolPayload(undefined, "codex"), "evaluatePreTool", "pre_tool_use"],
+    ["codex", "PostToolUse", postToolPayload("codex"), "completePostTool", "post_tool_use"],
   ] as const)("routes %s %s only to the central Guard method", async (
     adapter,
     event,
@@ -270,7 +289,7 @@ describe("strict hook adapter executable core", () => {
     );
     const result = await runHookAdapter(
       ["--adapter", "codex", "--event", "PreToolUse"],
-      preToolPayload(),
+      preToolPayload(undefined, "codex"),
       guard,
     );
 
@@ -284,7 +303,7 @@ describe("strict hook adapter executable core", () => {
     const neutral = { hookSpecificOutput: { hookEventName: "PreToolUse" } };
     const result = await runHookAdapter(
       ["--adapter", adapter, "--event", "PreToolUse"],
-      preToolPayload(),
+      preToolPayload(undefined, adapter),
       new ObservableGuard(undefined, {
         decision: "ALLOW",
         operation_id: "op-018f21e0-7b2c-7a00-8000-000000000004",
@@ -323,7 +342,7 @@ describe("strict hook adapter executable core", () => {
       const { runHookAdapter } = await loadAdapter();
       const result = await runHookAdapter(
         ["--adapter", "codex", "--event", "PreToolUse"],
-        preToolPayload(),
+        preToolPayload(undefined, "codex"),
         new ObservableGuard(),
       );
 
@@ -364,7 +383,7 @@ describe("strict hook adapter executable core", () => {
     const promptSecret = "prompt-secret-d53be1";
     const result = await runHookAdapter(
       ["--adapter", "codex", "--event", "UserPromptSubmit"],
-      promptPayload(promptSecret),
+      promptPayload(promptSecret, "codex"),
       new ObservableGuard(),
     );
     const lines = result.stdout.trimEnd().split("\n");

@@ -1,0 +1,10 @@
+{
+  "cwd": "/workspace/adapter-contract",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-5-codex",
+  "permission_mode": "default",
+  "prompt": "/jhw:unlock req-018f21e0-7b2c-7a00-8000-000000000003",
+  "session_id": "codex-contract-session-01",
+  "transcript_path": null,
+  "turn_id": "codex-contract-turn-01"
+}

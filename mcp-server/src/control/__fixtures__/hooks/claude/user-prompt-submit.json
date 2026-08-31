@@ -1,0 +1,9 @@
+{
+  "session_id": "claude-contract-session-01",
+  "prompt_id": "018f21e0-7b2c-7a00-8000-000000000011",
+  "transcript_path": "/workspace/adapter-contract/transcript.jsonl",
+  "cwd": "/workspace/adapter-contract",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "/jhw:unlock req-018f21e0-7b2c-7a00-8000-000000000003"
+}

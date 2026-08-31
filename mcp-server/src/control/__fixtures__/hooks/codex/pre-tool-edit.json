@@ -1,0 +1,16 @@
+{
+  "cwd": "/workspace/adapter-contract",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-5-codex",
+  "permission_mode": "default",
+  "session_id": "codex-contract-session-01",
+  "tool_input": {
+    "file_path": "/workspace/adapter-contract/src/example.ts",
+    "old_string": "export const value = 1;",
+    "new_string": "export const value = 2;"
+  },
+  "tool_name": "Edit",
+  "tool_use_id": "call_contract_edit_01",
+  "transcript_path": null,
+  "turn_id": "codex-contract-turn-01"
+}
