@@ -1,4 +1,5 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import { chmod, cp, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -383,7 +384,7 @@ describe("strict hook adapter executable core", () => {
     expect(cli.mode & 0o111).not.toBe(0);
     expect(hook.isFile()).toBe(true);
     expect(hook.mode & 0o111).not.toBe(0);
-  });
+  }, 30_000);
 
   it("installs both exact package binary mappings", async () => {
     // Break caught: publishing the package drops/renames either control binary or points it at the wrong compiled core.
@@ -459,8 +460,12 @@ async function buildFixture(): Promise<string> {
     copyFile(join(mcpRoot, "package.json"), join(fixture, "package.json")),
     copyFile(join(mcpRoot, "tsconfig.json"), join(fixture, "tsconfig.json")),
     copyFile(join(mcpRoot, "scripts", "clean-dist.mjs"), join(fixture, "scripts", "clean-dist.mjs")),
-    symlink(join(mcpRoot, "node_modules"), join(fixture, "node_modules"), "dir"),
+    cp(join(mcpRoot, "node_modules"), join(fixture, "node_modules"), {
+      recursive: true,
+      mode: fsConstants.COPYFILE_FICLONE,
+    }),
   ]);
+  expect((await lstat(join(fixture, "node_modules"))).isSymbolicLink()).toBe(false);
   await execFile("npm", ["run", "build"], { cwd: fixture, encoding: "utf8" });
   return fixture;
 }
