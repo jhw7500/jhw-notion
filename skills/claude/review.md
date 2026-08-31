@@ -1,6 +1,6 @@
 ---
-description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평가 및 승인 저장 · --match 저장 전 기존 Notion 대조(중복 skip/보강 append)
-argument-hint: "[--match]"
+description: 세션 마무리 시 Notion 저장 후보 정리·저장가치 평가 및 승인 저장 · --match 기존 Notion 대조 · --control Issue·Project·Task 정합성 제안
+argument-hint: "[--match] [--control]"
 ---
 
 # /jhw:review — 세션 마무리 리뷰
@@ -276,6 +276,92 @@ review 흐름에는 아래 M1–M3 세 지점만 덧댄다.
 - **DUPLICATE** → skip.
 
 §7 결과 보고에 append/skip 수를 더한다: **신규 X / 보강(append) Y / 중복 skip Z / 하-옵트인 제외 W**. 신규·보강 URL을 각각 1줄씩 텍스트로 보고한다.
+
+## --control — Project Control 후속 제안 (옵트인)
+
+`--control`은 Notion 저장 후보를 바꾸지 않고, 세션 종료 시점의 GitHub Issue·Project Control Project·Task/Claim 후속 조치를 **제안만** 한다.
+
+### 플래그와 읽기 범위
+
+- 허용 조합은 기본 review, `--match`, `--control`, `--match --control`이다.
+- `--control`이 없으면 현재 review 본문을 그대로 실행한다. 기본 review와 `--match`의 기존 저장·대조·승인 흐름은 변경하지 않는다.
+- `--match --control`에서 NEW/SIMILAR/AUGMENT/DUPLICATE verdict는 Notion 후보에만 적용하며, Project Control 제안에는 사용하지 않는다.
+- control 조회 실패는 Notion 후보를 버리거나 저장 승인을 확대하지 않는다. Notion section은 정상 표시하고 control section만 stable diagnostic과 함께 unavailable로 표시한다.
+
+읽기 전 다음 checkout root gate와 host launcher command를 정확히 한 번 실행한다. launcher가 보호된 config와 credential을 주입하는 유일한 진입점이며, skill은 config를 source하거나 credential fallback을 만들지 않는다.
+
+```bash
+REPOSITORY_PATH="$(git rev-parse --show-toplevel)" || exit $?
+test -n "$REPOSITORY_PATH" || exit 1
+"$HOME/.local/bin/jhw-control-host" task status \
+  --resolve-from-checkout true --repo-path "$REPOSITORY_PATH" \
+  --origin-adapter '<claude|codex|gemini|opencode>' --session '<session-id>'
+```
+
+이 `task status`는 read-only다. `jhw-control-host preflight`는 fixture write/restore를 포함하므로 이 read stage에서 자동 실행하지 않는다. 세션 대화에 직접 나온 Issue/PR URL 또는 unique lookup이 반환한 formal Issue URL만 읽고, repository 전체 history를 자동 검색하지 않는다. resolved `project_id`가 있으면 기존 bounded `portfolio status --project`로 Project metadata와 stale 표식만 읽는다.
+
+### 결과 해석과 표시
+
+- `match=none`: 현재 session/worktree와 맞는 active Claim이 없다. 등록 repository인지 확인한 뒤 즉시 착수라면 Task 유형 선택만 제안한다.
+- `match=unique`는 `relation.owner`를 함께 해석한다. `unique/current`는 exact adapter session과 exact worktree가 모두 일치한 현재 owner다. `unique/mismatch`는 둘 중 하나만 맞거나 최종 관계가 일치하지 않은 타 owner다. `unique/unverifiable`는 legacy Claim처럼 worktree만 맞고 adapter ownership을 증명할 수 없는 경우다.
+- `match=ambiguous`는 유효 후보가 둘 이상이다. candidate count만 표시하며 후보 좌표를 고르거나 펼치지 않는다.
+- 기존 Notion 카드 section은 `Notion 저장 후보`로 유지한다. 그 중 Projects DB 후보는 **Notion Projects DB**로 표시한다. 별도 control section의 **Project Control Project**는 GitHub Project 기반 tracker이며 Notion DB와 같은 상태 모델이나 승인 대상이 아니다.
+
+표시할 별도 section 제목은 반드시 다음과 같다.
+
+```text
+Project Control 후속 제안 — GitHub Project 기반
+```
+
+각 control 카드는 `authority: GitHub Issue | Project Control Project | Project Control Task`, 현재 세션과 bounded read에서 직접 확인한 `evidence`, 아직 실행되지 않은 `proposed action`, `approval route`, blocked이면 stable code 또는 relation만 표시한다. session ID, absolute checkout/worktree/config path, raw credential, raw error message는 표시하지 않는다.
+
+### `--control` 출력 레시피
+
+`--control`이 있을 때만 다음 순서로 출력한다.
+
+1. 기존 `Notion 저장 후보` 카드와 기존 Notion 승인 안내를 그대로 표시한다. `--match` verdict가 있으면 이 카드에만 표시한다.
+2. `Project Control 후속 제안 — GitHub Project 기반` section을 별도로 표시하고, 확인된 사실·제안·blocked reason을 authority별 카드로 나눈다.
+3. 카드 아래에는 아직 실행되지 않았음을 명시하고 다음 승인 slot을 분리해 제시한다: 승인 slot: `Notion 저장` | `Project Control Project` | `Project Control Task` | `GitHub Issue`.
+4. 사용자가 slot과 action을 명시한 새 요청을 주기 전에는 제안만 남기고 멈춘다. unavailable·mismatch·ambiguous 카드에는 허용된 수동 확인만 제시한다.
+
+### 제안 매트릭스
+
+서로 다른 authority의 액션은 별도 카드로 유지하고, 위에서 먼저 일치하는 안전 경계를 적용한다.
+
+| 관측 | 제안 | 금지 |
+|---|---|---|
+| Project/Repository 미등록 + 반복·다중 세션 작업 | Project/Repository 등록 또는 control 없이 진행 | 자동 등록, 임의 ID 생성 |
+| 미래·미착수 backlog | GitHub Issue 생성 또는 보류 | Task 선점, Temporary Task 자동 생성 |
+| 즉시 착수 + `match=none` + 등록 repository | Formal Issue Task / Temporary Task / Task 없음 선택 | 무승인 `task start` |
+| 완료 증거 + `unique/current` active Claim | completion-ready와 completed finish 제안 | 증거 생성, 자동 finish |
+| 진행 중 + `unique/current` active Claim | 현재 Task 유지 또는 명시적 handoff 제안 | 불필요한 새 Task 생성 |
+| `unique/mismatch` 또는 `unique/unverifiable` | exact status/handoff/recovery 확인 제안 | 현재 owner 취급, 자동 takeover/force-end |
+| `match=ambiguous` | 후보 정합성 조사와 recovery status 제안 | 후보 선택, 좌표 추측 |
+| 완료된 Task + GitHub Issue open | Issue close를 별도 제안 | Task finish 승인으로 Issue까지 닫기 |
+| Project metadata stale | Project update를 별도 제안 | Task/Issue 승인과 묶어 update |
+| 이미 완료된 작업 + active Task 없음 | Issue close·Project update 등 남은 tracker 작업만 제안 | 소급 Task 생성 |
+| control lookup unavailable | stable diagnostic과 수동 확인 제안 | cached/session 기억으로 owner 판정 |
+
+완료 증거는 현재 세션에서 실제 수행한 validation, merged PR, closed Issue처럼 직접 확인한 사실만 쓴다. 단순히 대화가 끝났거나 프로세스가 없다는 사실은 완료 증거가 아니다. 자동 start, finish, handoff, takeover, force-end, retry, 소급 Task 생성 금지.
+
+### Stable diagnostic과 중단 규칙
+
+- `PROJECT_REPOSITORY_NOT_FOUND`면 등록 제안만 표시하고 current Task를 추측하지 않는다. `PROJECT_REPOSITORY_AMBIGUOUS`면 association 정리만 제안하고 임의 Project를 고르지 않는다.
+- `REGISTRY_MOVED_DURING_READ`면 결과를 버리고 stable diagnostic만 표시한다. 자동 retry하지 않는다.
+- credential/config 오류는 stable code만 표시하며 raw config key value, credential provider path, token을 출력하지 않는다.
+- `unique/mismatch` 또는 `unique/unverifiable`이면 Claim 여섯 좌표와 relation만 표시하고 멈춘다. `match=ambiguous`이면 candidate count만 표시하고 좌표를 추측하지 않는다.
+- Project status pagination 또는 GitHub read가 불완전하면 stale/closed를 확정하지 않고 해당 제안을 blocked로 표시한다.
+- 새 `reason` 식별자를 만들지 않는다. 같은 stable code 안에서 새 조치 분기가 필요하면 별도 설계 승인과 `ERROR_REASONS`·canonical task skill·테스트 갱신이 필요하다.
+
+## 승인 분리
+
+기존 `OK`, `전체 저장`, 번호 조정은 Notion 저장 후보에만 적용한다. 특히 Notion `OK`와 Notion Projects DB 완료 저장은 Task finish, Issue close, Project Control Project update 승인이 아니다. control 카드는 자동 실행하지 않으며, 사용자가 authority와 action을 명시한 새 요청에서만 진행한다.
+
+- Project/Repository 등록·갱신은 기존 `/jhw:project` 계약으로 별도 승인한다.
+- Task start, completion-ready, finish, handoff, recovery는 기존 `/jhw:task` 계약으로 별도 승인한다.
+- GitHub Issue 생성·닫기는 별도 GitHub mutation 제안과 승인으로만 진행한다.
+
+한 authority의 승인은 다른 authority에 전파되지 않는다. Task completed finish는 Issue close나 Project Control Project update 승인이 아니며, Issue close 또는 Project update도 Task lifecycle 승인이 아니다.
 
 ## 사용 시점
 

@@ -1,6 +1,6 @@
 ---
 name: jhw-review
-description: "세션 마무리 시 Notion 저장 후보 정리·저장가치 평가 및 승인 저장 · --match 저장 전 기존 Notion 대조(중복 skip/보강 append) Use when the user invokes `/jhw:review`, `$jhw-review`, or asks to run the JHW review command."
+description: "세션 마무리 시 Notion 저장 후보 정리·저장가치 평가 및 승인 저장 · --match 기존 Notion 대조 · --control Issue·Project·Task 정합성 제안 Use when the user invokes `/jhw:review`, `$jhw-review`, or asks to run the JHW review command."
 ---
 
 # jhw-review

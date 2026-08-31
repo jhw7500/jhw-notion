@@ -3347,5 +3347,6 @@ test_failed_hook_registration_preserves_preexisting_owned_hook_link
 test_hooks_config_symlink_and_nonregular_fail_closed
 test_new_hooks_file_is_private
 test_unsupported_tuis_receive_no_guard_wiring
+node "$REPO_ROOT/scripts/test-review-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-task-skill-contract.mjs"
 echo "installer safety: ok"
