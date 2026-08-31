@@ -21,6 +21,7 @@ const prompt = z.string()
   .max(64 * 1024)
   .refine((value) => Buffer.byteLength(value, "utf8") <= 64 * 1024);
 const toolInput = z.record(z.unknown());
+const requiredNativeJson = z.unknown().refine((value) => value !== undefined, "Required");
 const transcriptPath = coordinate(4_096);
 const nullableTranscriptPath = transcriptPath.nullable();
 const claudePermissionMode = z.enum([
@@ -84,46 +85,46 @@ const ClaudePostToolUseSchema = z.object({
   duration_ms: z.number().finite().nonnegative().optional(),
 }).strict();
 
-// Codex CLI 0.149.1 generated command-hook schemas document the metadata
+// Codex CLI 0.149.1 generated command-hook schemas require the metadata
 // below. The Guard keeps its narrower object-only tool input authority while
-// accepting the documented metadata and rejecting every unknown field.
+// requiring each pinned native coordinate and rejecting every unknown field.
 const CodexUserPromptSubmitSchema = z.object({
   cwd,
   ...documentedAgentMetadata,
   hook_event_name: z.literal("UserPromptSubmit"),
-  model: coordinate(255).optional(),
-  permission_mode: codexPermissionMode.optional(),
+  model: coordinate(255),
+  permission_mode: codexPermissionMode,
   prompt,
   session_id: coordinate(255),
-  transcript_path: nullableTranscriptPath.optional(),
-  turn_id: coordinate(255).optional(),
+  transcript_path: nullableTranscriptPath,
+  turn_id: coordinate(255),
 }).strict();
 const CodexPreToolUseSchema = z.object({
   cwd,
   ...documentedAgentMetadata,
   hook_event_name: z.literal("PreToolUse"),
-  model: coordinate(255).optional(),
-  permission_mode: codexPermissionMode.optional(),
+  model: coordinate(255),
+  permission_mode: codexPermissionMode,
   session_id: coordinate(255),
   tool_input: toolInput,
   tool_name: coordinate(64),
   tool_use_id: coordinate(255),
-  transcript_path: nullableTranscriptPath.optional(),
-  turn_id: coordinate(255).optional(),
+  transcript_path: nullableTranscriptPath,
+  turn_id: coordinate(255),
 }).strict();
 const CodexPostToolUseSchema = z.object({
   cwd,
   ...documentedAgentMetadata,
   hook_event_name: z.literal("PostToolUse"),
-  model: coordinate(255).optional(),
-  permission_mode: codexPermissionMode.optional(),
+  model: coordinate(255),
+  permission_mode: codexPermissionMode,
   session_id: coordinate(255),
   tool_input: toolInput,
   tool_name: coordinate(64),
-  tool_response: z.unknown().optional(),
+  tool_response: requiredNativeJson,
   tool_use_id: coordinate(255),
-  transcript_path: nullableTranscriptPath.optional(),
-  turn_id: coordinate(255).optional(),
+  transcript_path: nullableTranscriptPath,
+  turn_id: coordinate(255),
 }).strict();
 
 const preToolNeutralOutputSchema = z.object({

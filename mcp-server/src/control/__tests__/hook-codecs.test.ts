@@ -54,6 +54,34 @@ const nativePayload = {
   },
 } as const;
 
+function nativePayloadFor(adapter: "claude" | "codex") {
+  if (adapter === "claude") return nativePayload;
+  return {
+    UserPromptSubmit: {
+      ...nativePayload.UserPromptSubmit,
+      model: "gpt-5-codex",
+      permission_mode: "default",
+      transcript_path: null,
+      turn_id: "codex-turn-17",
+    },
+    PreToolUse: {
+      ...nativePayload.PreToolUse,
+      model: "gpt-5-codex",
+      permission_mode: "default",
+      transcript_path: null,
+      turn_id: "codex-turn-17",
+    },
+    PostToolUse: {
+      ...nativePayload.PostToolUse,
+      model: "gpt-5-codex",
+      permission_mode: "default",
+      transcript_path: null,
+      turn_id: "codex-turn-17",
+      tool_response: { success: true },
+    },
+  };
+}
+
 const adapters = [
   ["claude", "claudeHookCodec"],
   ["codex", "codexHookCodec"],
@@ -69,15 +97,16 @@ describe("native hook input codecs", () => {
   it.each(adapters)("maps exact snake_case %s coordinates into Guard events", async (adapter, key) => {
     // Break caught: a native coordinate is renamed, dropped, synthesized, or mapped to the wrong Guard variant.
     const codec = (await loadCodecs())[key];
+    const payload = nativePayloadFor(adapter);
 
-    expect(codec.decode("UserPromptSubmit", nativePayload.UserPromptSubmit)).toEqual({
+    expect(codec.decode("UserPromptSubmit", payload.UserPromptSubmit)).toEqual({
       protocol_version: 1,
       adapter,
       event: "user_prompt_submit",
       session_id: "native-session-17",
       prompt: `/jhw:unlock ${REQUEST_ID}`,
     });
-    expect(codec.decode("PreToolUse", nativePayload.PreToolUse)).toEqual({
+    expect(codec.decode("PreToolUse", payload.PreToolUse)).toEqual({
       protocol_version: 1,
       adapter,
       event: "pre_tool_use",
@@ -87,7 +116,7 @@ describe("native hook input codecs", () => {
       tool_input: { command: "git push origin HEAD" },
       tool_use_id: "call-native-17",
     });
-    expect(codec.decode("PostToolUse", nativePayload.PostToolUse)).toEqual({
+    expect(codec.decode("PostToolUse", payload.PostToolUse)).toEqual({
       protocol_version: 1,
       adapter,
       event: "post_tool_use",
@@ -97,11 +126,11 @@ describe("native hook input codecs", () => {
     });
   });
 
-  it.each(adapters)("uses only prompt as the authoritative %s prompt field", async (_adapter, key) => {
+  it.each(adapters)("uses only prompt as the authoritative %s prompt field", async (adapter, key) => {
     // Break caught: fallback text such as user_prompt or an embedded transcript can approve a permit.
     const codec = (await loadCodecs())[key];
     const raw = {
-      ...nativePayload.UserPromptSubmit,
+      ...nativePayloadFor(adapter).UserPromptSubmit,
       prompt: "literal-user-prompt",
       user_prompt: `/jhw:unlock ${REQUEST_ID}`,
     };
@@ -115,31 +144,31 @@ describe("native hook input codecs", () => {
     })).toThrow();
   });
 
-  it.each(adapters)("rejects %s event argument and payload disagreement", async (_adapter, key) => {
+  it.each(adapters)("rejects %s event argument and payload disagreement", async (adapter, key) => {
     // Break caught: a PreToolUse payload is decoded through a less restrictive side-event branch.
     const codec = (await loadCodecs())[key];
     for (const event of ["UserPromptSubmit", "PostToolUse"] as const) {
-      expect(() => codec.decode(event, nativePayload.PreToolUse)).toThrow();
+      expect(() => codec.decode(event, nativePayloadFor(adapter).PreToolUse)).toThrow();
     }
   });
 
-  it.each(adapters)("rejects missing and empty required %s coordinates", async (_adapter, key) => {
+  it.each(adapters)("rejects missing and empty required %s coordinates", async (adapter, key) => {
     // Break caught: deleting or emptying any event-required native coordinate reaches Guard as ambient/default state.
     const codec = (await loadCodecs())[key];
     const cases: Array<[HookEventName, Record<string, unknown>, readonly string[]]> = [
       [
         "UserPromptSubmit",
-        nativePayload.UserPromptSubmit,
+        nativePayloadFor(adapter).UserPromptSubmit,
         ["session_id", "cwd", "prompt"],
       ],
       [
         "PreToolUse",
-        nativePayload.PreToolUse,
+        nativePayloadFor(adapter).PreToolUse,
         ["session_id", "cwd", "tool_name", "tool_input", "tool_use_id"],
       ],
       [
         "PostToolUse",
-        nativePayload.PostToolUse,
+        nativePayloadFor(adapter).PostToolUse,
         ["session_id", "cwd", "tool_name", "tool_input", "tool_use_id"],
       ],
     ];
@@ -156,11 +185,11 @@ describe("native hook input codecs", () => {
     }
   });
 
-  it.each(adapters)("rejects unknown top-level %s payload fields", async (_adapter, key) => {
+  it.each(adapters)("rejects unknown top-level %s payload fields", async (adapter, key) => {
     // Break caught: a permissive passthrough begins treating unreviewed native fields as adapter authority.
     const codec = (await loadCodecs())[key];
     expect(() => codec.decode("PreToolUse", {
-      ...nativePayload.PreToolUse,
+      ...nativePayloadFor(adapter).PreToolUse,
       prompt: `/jhw:unlock ${REQUEST_ID}`,
     })).toThrow();
   });
@@ -262,17 +291,17 @@ describe("native hook response renderers", () => {
     expect(Buffer.byteLength(post, "utf8")).toBeLessThanOrEqual(12 * 1024);
   });
 
-  it.each(adapters)("never reflects raw %s prompt or tool input bytes", async (_adapter, key) => {
+  it.each(adapters)("never reflects raw %s prompt or tool input bytes", async (adapter, key) => {
     // Break caught: failure/decision rendering serializes the native request and leaks prompt or tool arguments.
     const codec = (await loadCodecs())[key];
     const promptSecret = "prompt-secret-7c592c";
     const toolSecret = "tool-input-secret-6f41e9";
     const decodedPrompt = codec.decode("UserPromptSubmit", {
-      ...nativePayload.UserPromptSubmit,
+      ...nativePayloadFor(adapter).UserPromptSubmit,
       prompt: promptSecret,
     });
     const decodedTool = codec.decode("PreToolUse", {
-      ...nativePayload.PreToolUse,
+      ...nativePayloadFor(adapter).PreToolUse,
       tool_input: { command: `deploy --token=${toolSecret}` },
     });
     const rendered = JSON.stringify([

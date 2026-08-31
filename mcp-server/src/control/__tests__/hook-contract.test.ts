@@ -100,6 +100,27 @@ describe("recorded native hook contracts", () => {
     }
   });
 
+  it("catches omitted Codex 0.149.1 required native coordinates before Guard evaluation", async () => {
+    const codecs = await loadCodecs();
+    const required: ReadonlyArray<readonly [
+      HookEventName,
+      "user-prompt-submit" | "pre-tool-edit" | "post-tool-edit",
+      readonly string[],
+    ]> = [
+      ["UserPromptSubmit", "user-prompt-submit", ["model", "permission_mode", "transcript_path", "turn_id"]],
+      ["PreToolUse", "pre-tool-edit", ["model", "permission_mode", "transcript_path", "turn_id"]],
+      ["PostToolUse", "post-tool-edit", ["model", "permission_mode", "transcript_path", "turn_id", "tool_response"]],
+    ];
+
+    for (const [event, fixture, fields] of required) {
+      for (const field of fields) {
+        const native = fixtureJson("codex", fixture);
+        delete native[field];
+        expect(() => codecs.codexHookCodec.decode(event, native), `${event}.${field}`).toThrow();
+      }
+    }
+  });
+
   it("catches adapter normalization drift by preserving equal edit requirements, risk, and boundary", async () => {
     const codecs = await loadCodecs();
     const root = await mkdtemp(join(tmpdir(), "hook-contract-"));
