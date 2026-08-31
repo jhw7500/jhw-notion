@@ -32,6 +32,9 @@ const claudePermissionMode = z.enum([
   "dontAsk",
   "bypassPermissions",
 ]);
+const claudeEffort = z.object({
+  level: z.enum(["low", "medium", "high", "xhigh", "max"]),
+}).strict().optional();
 const codexPermissionMode = z.enum([
   "default",
   "acceptEdits",
@@ -66,6 +69,7 @@ const ClaudePreToolUseSchema = z.object({
   cwd,
   permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("PreToolUse"),
+  effort: claudeEffort,
   tool_name: coordinate(64),
   tool_input: toolInput,
   tool_use_id: coordinate(255),
@@ -78,6 +82,7 @@ const ClaudePostToolUseSchema = z.object({
   cwd,
   permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("PostToolUse"),
+  effort: claudeEffort,
   tool_name: coordinate(64),
   tool_input: toolInput,
   tool_response: z.unknown().optional(),

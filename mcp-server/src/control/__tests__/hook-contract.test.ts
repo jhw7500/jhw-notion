@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { normalizeOperation, type NormalizeOperationContext } from "../operation-normalizer.js";
 import { exactGuardUnlockRequestId, type GuardCommonEvent, type PreToolUseEvent } from "../guard-protocol.js";
 import { NativeHookOutputSchema } from "../hook-codecs.js";
+import type { GuardSideEventResult } from "../guard-service.js";
 import type { GuardDecision } from "../schemas.js";
 
 type HookEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse";
@@ -36,8 +37,21 @@ interface HookCodecsModule {
   adapterContractResults: Readonly<Record<Adapter, AdapterContractResult>>;
 }
 
+interface HookAdapterModule {
+  runHookAdapter(
+    argv: readonly string[],
+    raw: string | Uint8Array,
+    guard: {
+      submitUserPrompt(event: unknown): Promise<GuardSideEventResult>;
+      evaluatePreTool(event: unknown): Promise<GuardDecision>;
+      completePostTool(event: unknown): Promise<GuardSideEventResult>;
+    },
+  ): Promise<{ exitCode: 0; stdout: string; stderr: "" }>;
+}
+
 const modulePath = "../hook-codecs.js";
 const loadCodecs = async (): Promise<HookCodecsModule> => import(modulePath) as Promise<HookCodecsModule>;
+const loadAdapter = async (): Promise<HookAdapterModule> => import("../hook-adapter.js") as Promise<HookAdapterModule>;
 const fixtureRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../__fixtures__/hooks");
 const REQUEST_ID = "req-018f21e0-7b2c-7a00-8000-000000000003";
 const TASK_ID = "tsk-018f21e0-7b2c-7a00-8000-000000000001";
@@ -97,6 +111,22 @@ describe("recorded native hook contracts", () => {
       expect(decoded).toMatchObject({ adapter, event: "pre_tool_use" });
       expect(decoded).not.toHaveProperty("agent_id");
       expect(decoded).not.toHaveProperty("agent_type");
+    }
+  });
+
+  it("catches Claude effort schema drift while discarding valid effort from Guard authority", async () => {
+    const codecs = await loadCodecs();
+    for (const event of ["PreToolUse", "PostToolUse"] as const) {
+      const fixture = event === "PreToolUse" ? "pre-tool-edit" : "post-tool-edit";
+      const native = fixtureJson("claude", fixture);
+      const decoded = codecs.claudeHookCodec.decode(event, native);
+      expect(decoded).not.toHaveProperty("effort");
+      for (const effort of [
+        { level: "turbo" },
+        { level: "high", unreviewed: true },
+        { level: 3 },
+        {},
+      ]) expect(() => codecs.claudeHookCodec.decode(event, { ...native, effort })).toThrow();
     }
   });
 
@@ -177,6 +207,43 @@ describe("recorded native hook contracts", () => {
       expect(decoded).toMatchObject({ prompt: native.prompt });
       expect(native.prompt).toBe(`/jhw:unlock ${REQUEST_ID}`);
     }
+  });
+
+  it("catches adapter prompt rewriting by delivering fixture bytes and whitespace/case sentinels unchanged to submitUserPrompt", async () => {
+    const { runHookAdapter } = await loadAdapter();
+    const received: GuardCommonEvent[] = [];
+    const guard = {
+      submitUserPrompt: async (event: unknown): Promise<GuardSideEventResult> => {
+        received.push(event as GuardCommonEvent);
+        return { status: "NO_STATE_CHANGE", event: "user_prompt_submit", summary: "Prompt recorded" };
+      },
+      evaluatePreTool: async (): Promise<GuardDecision> => ({
+        decision: "DENY",
+        code: "GUARD_PROTOCOL_MISMATCH",
+        summary: "Unused prompt-port guard method",
+      }),
+      completePostTool: async (): Promise<GuardSideEventResult> => ({
+        status: "NO_STATE_CHANGE",
+        event: "post_tool_use",
+        summary: "Unused prompt-port guard method",
+      }),
+    };
+    const rawFixture = fixtureBytes("claude", "user-prompt-submit");
+    const fixturePrompt = (JSON.parse(rawFixture.toString("utf8")) as { prompt: string }).prompt;
+    const sentinel = " \t/JHW:Unlock req-018f21e0-7b2c-7a00-8000-000000000003  ";
+    const rawSentinel = Buffer.from(JSON.stringify({
+      ...fixtureJson("claude", "user-prompt-submit"),
+      prompt: sentinel,
+    }), "utf8");
+
+    expect(await runHookAdapter(["--adapter", "claude", "--event", "UserPromptSubmit"], rawFixture, guard))
+      .toMatchObject({ exitCode: 0, stderr: "" });
+    expect(await runHookAdapter(["--adapter", "claude", "--event", "UserPromptSubmit"], rawSentinel, guard))
+      .toMatchObject({ exitCode: 0, stderr: "" });
+    expect(received).toHaveLength(2);
+    expect(received[0]).toMatchObject({ event: "user_prompt_submit", prompt: fixturePrompt });
+    expect(received[1]).toMatchObject({ event: "user_prompt_submit", prompt: sentinel });
+    expect(fixturePrompt).toBe(`/jhw:unlock ${REQUEST_ID}`);
   });
 
   it("catches non-prompt authority fallback by rejecting user_prompt, input, transcript, and assistant text", async () => {

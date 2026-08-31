@@ -5,6 +5,9 @@
   "cwd": "/workspace/adapter-contract",
   "permission_mode": "default",
   "hook_event_name": "PreToolUse",
+  "effort": {
+    "level": "high"
+  },
   "tool_name": "Edit",
   "tool_input": {
     "file_path": "/workspace/adapter-contract/src/example.ts",
