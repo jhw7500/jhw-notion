@@ -1266,6 +1266,10 @@ jhw_pr_dispatch_same_head() {
   }
   [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2; }
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid dispatch head" >&2; return 2; }
+  ship_timestamp_epoch "${ROUND_STARTED_AT:-}" >/dev/null || {
+    echo "invalid ROUND_STARTED_AT" >&2
+    return 2
+  }
   case "$workflow_file|$workflow_name" in
     'claude-code-review.yml|Claude Code Review') ;;
     'gemini-auto-review.yml|Gemini Auto PR Review') ;;
@@ -1300,6 +1304,7 @@ jhw_pr_dispatch_same_head() {
     [[ -n "$id" ]] || continue
     [[ "$id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ ]] || continue
     [[ "$name" == "$workflow_name" && "$run_head" == "$head" && "$event" == workflow_dispatch ]] || continue
+    ship_at_or_after "$created_at" "$ROUND_STARTED_AT" || continue
     case "$status" in
       queued|in_progress|completed) ;;
       *) continue ;;
@@ -2061,7 +2066,7 @@ ship_auto_fix_push_ready() {
 ```
 <!-- pr-round-contract: trigger-and-scope:end -->
 
-실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_PUSHED_AT`, `ROUND_HEAD`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. 아래 호출은 문자열 입력을 명령으로 바꾸지 않는 닫힌 reviewer/workflow 집합이다. `request`는 활성 중앙 workflow의 같은-head `workflow_dispatch` run을 재사용하거나 정확히 한 번 dispatch한다. `auto=true`는 일반 event run을 기다리되 App은 현재 head에 명시적으로 요청한다. `skip`과 `auto=false`는 AI 요청·dispatch·대기를 하지 않는다.
+실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_PUSHED_AT`, `ROUND_HEAD`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. 아래 호출은 문자열 입력을 명령으로 바꾸지 않는 닫힌 reviewer/workflow 집합이다. `request`는 활성 중앙 workflow의 현재 round에서 시작된 같은-head `workflow_dispatch` run을 재사용하거나 정확히 한 번 dispatch한다. 이전 round의 같은-head run은 재사용하지 않는다. `auto=true`는 일반 event run을 기다리되 App은 현재 head에 명시적으로 요청한다. `skip`과 `auto=false`는 AI 요청·dispatch·대기를 하지 않는다.
 
 ```bash
 case "$EFFECTIVE_REVIEW_POLICY" in

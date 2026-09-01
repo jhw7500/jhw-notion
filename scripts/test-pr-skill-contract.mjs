@@ -1630,6 +1630,30 @@ async function main() {
     assert.equal(sameHeadWorkflow.stdout.trim(), "REUSED,9301");
     assert.equal(sameHeadWorkflow.log.filter(isWorkflowDispatch).length, 0);
 
+    const priorRoundSameHeadWorkflow = await run(
+      baseState({
+        runs: [
+          {
+            id: 9306,
+            attempt: 1,
+            name: "Claude Code Review",
+            head: currentHead,
+            createdAt: "2026-08-28T23:59:59Z",
+            status: "completed",
+            conclusion: "success",
+            event: "workflow_dispatch",
+          },
+        ],
+      }),
+      [
+        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
+        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_RUN_ID\"",
+      ].join("\n"),
+    );
+    assert.equal(priorRoundSameHeadWorkflow.stdout.trim(), "DISPATCHED,");
+    assert.equal(priorRoundSameHeadWorkflow.log.filter(isWorkflowDispatch).length, 1,
+      "a same-head workflow run from an earlier round must not suppress the current dispatch");
+
     const exactDispatch = await run(
       baseState({
         runs: [

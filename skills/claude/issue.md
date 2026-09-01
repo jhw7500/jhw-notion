@@ -835,12 +835,19 @@ if (latestRun?.status === "completed" && !["success", "neutral", "skipped"].incl
   emit("FAILED", latestRun.url, "workflow_failed");
 }
 const latestRunEpoch = latestRun ? epoch(latestRun.created_at) : null;
+const latestRunSecondCount = latestRunEpoch === null ? 0 : runs.filter((run) =>
+  epoch(run.created_at) === latestRunEpoch).length;
+const isCurrentRunSignal = (value) => {
+  const parsed = epoch(value);
+  return parsed !== null && (parsed > latestRunEpoch ||
+    (parsed === latestRunEpoch && latestRunSecondCount === 1));
+};
 const currentComments = latestRunEpoch === null
   ? comments
-  : comments.filter((comment) => epoch(comment.created_at) > latestRunEpoch);
+  : comments.filter((comment) => isCurrentRunSignal(comment.created_at));
 const currentReactions = latestRunEpoch === null
   ? reactions
-  : reactions.filter((reaction) => epoch(reaction.created_at) > latestRunEpoch);
+  : reactions.filter((reaction) => isCurrentRunSignal(reaction.created_at));
 const orderedComments = [...currentComments].sort((left, right) =>
   epoch(right.created_at) - epoch(left.created_at) || Number(right.id) - Number(left.id));
 const verdictComment = orderedComments[0];
@@ -1027,22 +1034,105 @@ jhw_issue_cleanup_execution_files() {
   return "$cleanup_status"
 }
 
-jhw_issue_handle_execution_signal() {
-  local status="$1"
+jhw_issue_trap_handler_from_spec() {
+  local spec="$1" signal="$2" expected
+  case "$signal" in
+    EXIT) expected=EXIT ;;
+    HUP) expected=SIGHUP ;;
+    INT) expected=SIGINT ;;
+    TERM) expected=SIGTERM ;;
+    *) return 2 ;;
+  esac
+  [[ "$spec" == "trap -- "* ]] || return 1
+  spec="${spec#trap -- }"
+  # `spec` comes only from Bash `trap -p`; eval reconstructs its shell-quoted argv.
+  eval "set -- $spec"
+  (( $# == 2 )) || return 1
+  [[ "$2" == "$expected" ]] || return 1
+  printf '%s' "$1"
+}
+
+jhw_issue_current_trap_spec() {
+  local signal="$1" spec
+  case "$signal" in EXIT|HUP|INT|TERM) ;; *) return 2 ;; esac
+  spec="$(trap -p "$signal")" || return 1
+  if [[ -n "$spec" ]]; then
+    jhw_issue_trap_handler_from_spec "$spec" "$signal" >/dev/null || return 1
+  fi
+  printf '%s' "$spec"
+}
+
+jhw_issue_restore_trap_spec() {
+  local spec="$1" signal="$2"
+  case "$signal" in EXIT|HUP|INT|TERM) ;; *) return 2 ;; esac
+  if [[ -n "$spec" ]]; then
+    jhw_issue_trap_handler_from_spec "$spec" "$signal" >/dev/null || return 1
+    # The validated command was emitted by Bash itself and restores the exact caller handler.
+    eval "$spec"
+  else
+    trap - "$signal"
+  fi
+}
+
+jhw_issue_restore_execution_traps() {
+  local restore_status=0
+  jhw_issue_restore_trap_spec "${JHW_ISSUE_PREV_EXIT_TRAP:-}" EXIT || restore_status=1
+  jhw_issue_restore_trap_spec "${JHW_ISSUE_PREV_HUP_TRAP:-}" HUP || restore_status=1
+  jhw_issue_restore_trap_spec "${JHW_ISSUE_PREV_INT_TRAP:-}" INT || restore_status=1
+  jhw_issue_restore_trap_spec "${JHW_ISSUE_PREV_TERM_TRAP:-}" TERM || restore_status=1
+  return "$restore_status"
+}
+
+jhw_issue_cleanup_on_exit() {
+  local status="$1" previous_spec="${JHW_ISSUE_PREV_EXIT_TRAP:-}"
   jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
   trap - EXIT HUP INT TERM
+  JHW_ISSUE_EXECUTION_CLEANUP_INSTALLED=false
+  if [[ -n "$previous_spec" ]]; then
+    # Run the caller EXIT trap once in a child exit context so `$?` remains the original status.
+    ( eval "$previous_spec"; exit "$status" ) || true
+  fi
+  exit "$status"
+}
+
+jhw_issue_handle_execution_signal() {
+  local signal="$1" status="$2" previous_spec=''
+  case "$signal" in
+    HUP) previous_spec="${JHW_ISSUE_PREV_HUP_TRAP:-}" ;;
+    INT) previous_spec="${JHW_ISSUE_PREV_INT_TRAP:-}" ;;
+    TERM) previous_spec="${JHW_ISSUE_PREV_TERM_TRAP:-}" ;;
+    *) return 2 ;;
+  esac
+  jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
+  jhw_issue_restore_execution_traps >/dev/null 2>&1 || trap - EXIT HUP INT TERM
+  JHW_ISSUE_EXECUTION_CLEANUP_INSTALLED=false
+  [[ -z "$previous_spec" ]] || kill -s "$signal" "$$"
   exit "$status"
 }
 
 jhw_issue_install_execution_cleanup() {
-  trap 'jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true' EXIT
-  trap 'jhw_issue_handle_execution_signal 129' HUP
-  trap 'jhw_issue_handle_execution_signal 130' INT
-  trap 'jhw_issue_handle_execution_signal 143' TERM
+  [[ "${JHW_ISSUE_EXECUTION_CLEANUP_INSTALLED:-false}" == false ]] || return 2
+  JHW_ISSUE_PREV_EXIT_TRAP="$(jhw_issue_current_trap_spec EXIT)" || return 1
+  JHW_ISSUE_PREV_HUP_TRAP="$(jhw_issue_current_trap_spec HUP)" || return 1
+  JHW_ISSUE_PREV_INT_TRAP="$(jhw_issue_current_trap_spec INT)" || return 1
+  JHW_ISSUE_PREV_TERM_TRAP="$(jhw_issue_current_trap_spec TERM)" || return 1
+  trap 'jhw_issue_cleanup_on_exit "$?"' EXIT
+  trap 'jhw_issue_handle_execution_signal HUP 129' HUP
+  trap 'jhw_issue_handle_execution_signal INT 130' INT
+  trap 'jhw_issue_handle_execution_signal TERM 143' TERM
+  JHW_ISSUE_EXECUTION_CLEANUP_INSTALLED=true
 }
 
 jhw_issue_clear_execution_cleanup() {
-  trap - EXIT HUP INT TERM
+  local restore_status=0
+  [[ "${JHW_ISSUE_EXECUTION_CLEANUP_INSTALLED:-false}" == true ]] || return 2
+  jhw_issue_restore_execution_traps || restore_status=1
+  JHW_ISSUE_EXECUTION_CLEANUP_INSTALLED=false
+  JHW_ISSUE_PREV_EXIT_TRAP=''
+  JHW_ISSUE_PREV_HUP_TRAP=''
+  JHW_ISSUE_PREV_INT_TRAP=''
+  JHW_ISSUE_PREV_TERM_TRAP=''
+  return "$restore_status"
 }
 
 jhw_issue_initialize_state_file() {
@@ -1239,7 +1329,10 @@ jhw_issue_execute() {
   JHW_ISSUE_STATE_FILE="$(jhw_issue_create_state_file)" || return 1
   JHW_ISSUE_ACTIVE_SIGNAL_FILE=''
   export JHW_ISSUE_STATE_FILE JHW_ISSUE_ACTIVE_SIGNAL_FILE
-  jhw_issue_install_execution_cleanup
+  if ! jhw_issue_install_execution_cleanup; then
+    jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
+    return 1
+  fi
   if ! jhw_issue_create "$title" "$body" "$mode" "$timeout"; then
     render_status=1
   elif ! jhw_issue_initialize_state_file "$JHW_ISSUE_STATE_FILE"; then
@@ -1275,7 +1368,7 @@ jhw_issue_execute() {
     fi
   fi
   jhw_issue_cleanup_execution_files || render_status=1
-  jhw_issue_clear_execution_cleanup
+  jhw_issue_clear_execution_cleanup || render_status=1
   return "$render_status"
 }
 ```
@@ -1284,6 +1377,7 @@ jhw_issue_execute() {
 실행 시작 시 private summary state와 현재 활성 signal snapshot 좌표를 추적하고
 `jhw_issue_install_execution_cleanup`으로 `EXIT/HUP/INT/TERM` 정리를 등록한다. partial failure,
 timeout, 중단 신호에서도 summary state와 0600 signal snapshot만 제거하며 생성된 Issue는 보존한다.
+설치 전에 있던 caller-owned trap 사양은 정상 epilogue와 신호 처리 모두에서 그대로 복원한다.
 GitHub의 UTC 시각은 초 단위이므로 요청과 응답이 같은 초에 기록될 수 있다. 댓글은 같은 초일 때
 요청 댓글보다 큰 comment ID만 후속 신호로 인정하고, reaction은 정확한 요청 댓글의 reactions
 endpoint에 종속되므로 같은 초를 허용한다. workflow run에는 요청 comment ID가 없어서 같은 초의
@@ -1292,6 +1386,8 @@ endpoint에 종속되므로 같은 초를 허용한다. workflow run에는 요�
 workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다. relevant run ID가 양의
 safe integer가 아니면 정렬 권한을 정할 수 없어 classifier가 fail-closed한다. bot 댓글도 같은
 순서의 최신 substantive 댓글만 판정하며, 거절 reaction은 그 댓글이 없거나 더 나중일 때만 우선한다.
+최신 run과 같은 초에 relevant run이 정확히 하나뿐이면 초 단위 GitHub 시각의 fast response를
+그 run의 신호로 인정한다. 같은 초의 relevant run이 둘 이상이면 상관관계가 모호하므로 인정하지 않는다.
 댓글과 reaction이 같은 초면 교차 타입 순서를 증명할 수 없어 `PENDING`으로 재poll한다. 최신 retry
 run과 같거나 오래된 댓글·reaction도 terminal 신호에서 제외한다. 요청 reviewer가 없고 capability
 부재로 unavailable reviewer가 있으면 highest disposition은 `UNAVAILABLE`이다. 명시적 skip이나

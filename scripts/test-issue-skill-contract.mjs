@@ -939,6 +939,32 @@ async function main() {
     assert.equal(sameSecondClean.stdout.split("\n")[0], "CLEAN",
       "a reviewer comment with a later ID in the request second must be accepted");
 
+    const sameSecondRunResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("No blockers found.", { createdAt: "2026-09-01T00:02:00Z" }),
+        ],
+        runs: [{
+          id: 500,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "success",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: "https://github.com/example/repo/actions/runs/500",
+          displayTitle: "Review this",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(sameSecondRunResponse.stdout.split("\n")[0], "CLEAN",
+      "a sole workflow run must accept its fast reviewer response from the same timestamp second");
+
     const sameSecondEarlierComment = await classify(
       issueState({
         issueExists: true,
@@ -1529,6 +1555,31 @@ async function main() {
       "TERM must remove the active private signal snapshot");
     assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
       "TERM must remove the private summary state alongside the active snapshot");
+
+    const restoredCallerTraps = await runIssueResult(
+      issueState(),
+      [
+        "trap ':' EXIT",
+        "trap ':' HUP",
+        "trap ':' INT",
+        "trap ':' TERM",
+        'before_exit="$(trap -p EXIT)"',
+        'before_hup="$(trap -p HUP)"',
+        'before_int="$(trap -p INT)"',
+        'before_term="$(trap -p TERM)"',
+        "if jhw_issue_execute 'Review this' 'Body text' skip 20 >/dev/null; then status=0; else status=$?; fi",
+        '[[ "$(trap -p EXIT)" == "$before_exit" ]] || exit 21',
+        '[[ "$(trap -p HUP)" == "$before_hup" ]] || exit 22',
+        '[[ "$(trap -p INT)" == "$before_int" ]] || exit 23',
+        '[[ "$(trap -p TERM)" == "$before_term" ]] || exit 24',
+        "trap - EXIT HUP INT TERM",
+        "printf 'status=%s\\n' \"$status\"",
+      ].join("\n"),
+      { JHW_ISSUE_STATE_FILE: "" },
+    );
+    assert.equal(restoredCallerTraps.code, 0,
+      "Issue execution must restore every caller-owned trap");
+    assert.equal(restoredCallerTraps.stdout, "status=0\n");
 
     const corruptPollRecovery = await runIssueResult(
       issueState(),
