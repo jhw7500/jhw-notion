@@ -835,19 +835,33 @@ if (latestRun?.status === "completed" && !["success", "neutral", "skipped"].incl
   emit("FAILED", latestRun.url, "workflow_failed");
 }
 const latestRunEpoch = latestRun ? epoch(latestRun.created_at) : null;
-const latestRunSecondCount = latestRunEpoch === null ? 0 : runs.filter((run) =>
-  epoch(run.created_at) === latestRunEpoch).length;
-const isCurrentRunSignal = (value) => {
-  const parsed = epoch(value);
+const latestRunId = latestRun ? Number(latestRun.id) : null;
+let latestRunReference = null;
+if (latestRun) {
+  const runUrl = typeof latestRun.url === "string" ? latestRun.url : "";
+  const runUrlMatch = runUrl.match(
+    /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/([1-9][0-9]*)$/,
+  );
+  if (!runUrlMatch || Number(runUrlMatch[1]) !== latestRunId) {
+    process.stderr.write("invalid workflow run URL\n");
+    process.exit(1);
+  }
+  const escapedRunUrl = runUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const runReferenceStart = String.raw`(?:^|[\s(\[<{])`;
+  const runReferenceBoundary = String.raw`(?=$|[\s)\]}>]|[.,;:!?](?=$|[\s)\]}>]))`;
+  latestRunReference = new RegExp(`${runReferenceStart}${escapedRunUrl}${runReferenceBoundary}`);
+}
+const isCurrentRunComment = (comment) => {
+  const parsed = epoch(comment.created_at);
   return parsed !== null && (parsed > latestRunEpoch ||
-    (parsed === latestRunEpoch && latestRunSecondCount === 1));
+    (parsed === latestRunEpoch && latestRunReference.test(comment.body || "")));
 };
 const currentComments = latestRunEpoch === null
   ? comments
-  : comments.filter((comment) => isCurrentRunSignal(comment.created_at));
+  : comments.filter((comment) => isCurrentRunComment(comment));
 const currentReactions = latestRunEpoch === null
   ? reactions
-  : reactions.filter((reaction) => isCurrentRunSignal(reaction.created_at));
+  : reactions.filter((reaction) => epoch(reaction.created_at) > latestRunEpoch);
 const orderedComments = [...currentComments].sort((left, right) =>
   epoch(right.created_at) - epoch(left.created_at) || Number(right.id) - Number(left.id));
 const verdictComment = orderedComments[0];
@@ -1386,10 +1400,10 @@ endpoint에 종속되므로 같은 초를 허용한다. workflow run에는 요�
 workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다. relevant run ID가 양의
 safe integer가 아니면 정렬 권한을 정할 수 없어 classifier가 fail-closed한다. bot 댓글도 같은
 순서의 최신 substantive 댓글만 판정하며, 거절 reaction은 그 댓글이 없거나 더 나중일 때만 우선한다.
-최신 run과 같은 초에 relevant run이 정확히 하나뿐이면 초 단위 GitHub 시각의 fast response를
-그 run의 신호로 인정한다. 같은 초의 relevant run이 둘 이상이면 상관관계가 모호하므로 인정하지 않는다.
+최신 run과 같은 초의 bot 댓글은 본문이 그 run의 검증된 `html_url`을 정확히 참조할 때만
+fast response로 인정한다. 좌표 없는 같은 초 댓글과 run 좌표를 담을 수 없는 reaction은 인정하지 않는다.
 댓글과 reaction이 같은 초면 교차 타입 순서를 증명할 수 없어 `PENDING`으로 재poll한다. 최신 retry
-run과 같거나 오래된 댓글·reaction도 terminal 신호에서 제외한다. 요청 reviewer가 없고 capability
+run보다 오래되거나 같은 초지만 상관 좌표가 없는 댓글·reaction도 terminal 신호에서 제외한다. 요청 reviewer가 없고 capability
 부재로 unavailable reviewer가 있으면 highest disposition은 `UNAVAILABLE`이다. 명시적 skip이나
 `review.auto=false`처럼 unavailable도 없는 의도적 no-review는 기존 `CLEAN`을 유지한다.
 

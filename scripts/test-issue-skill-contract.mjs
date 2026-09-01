@@ -944,7 +944,11 @@ async function main() {
         issueExists: true,
         issueComments: [
           requestComment,
-          response("No blockers found.", { createdAt: "2026-09-01T00:02:00Z" }),
+          response([
+            "**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/500)",
+            "",
+            "No blockers found.",
+          ].join("\n"), { createdAt: "2026-09-01T00:02:00Z" }),
         ],
         runs: [{
           id: 500,
@@ -963,7 +967,151 @@ async function main() {
       triggerDeadline - 1,
     );
     assert.equal(sameSecondRunResponse.stdout.split("\n")[0], "CLEAN",
-      "a sole workflow run must accept its fast reviewer response from the same timestamp second");
+      "a fast reviewer response that names its workflow run must be accepted in the same timestamp second");
+
+    const sameSecondUncorrelatedResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("No blockers found.", { createdAt: "2026-09-01T00:02:00Z" }),
+        ],
+        runs: [{
+          id: 500,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "in_progress",
+          conclusion: "null",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: "https://github.com/example/repo/actions/runs/500",
+          displayTitle: "Review this",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(sameSecondUncorrelatedResponse.stdout.split("\n")[0], "PENDING",
+      "a same-second response without the latest run coordinate must remain uncorrelated");
+
+    for (const malformedSuffix of [
+      "0",
+      "abc",
+      "/attempts/1",
+      "?check_suite_focus=true",
+      ".evil.example",
+    ]) {
+      const malformedSameSecondReference = await classify(
+        issueState({
+          issueExists: true,
+          issueComments: [
+            requestComment,
+            response([
+              `**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/500${malformedSuffix})`,
+              "",
+              "No blockers found.",
+            ].join("\n"), { createdAt: "2026-09-01T00:02:00Z" }),
+          ],
+          runs: [{
+            id: 500,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "in_progress",
+            conclusion: "null",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/500",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          }],
+        }),
+        "claude",
+        triggerDeadline - 1,
+      );
+      assert.equal(malformedSameSecondReference.stdout.split("\n")[0], "PENDING",
+        `a malformed latest-run URL suffix (${malformedSuffix}) must not correlate a same-second response`);
+    }
+
+    for (const malformedReference of [
+      "xhttps://github.com/example/repo/actions/runs/500",
+      "prefix-https://github.com/example/repo/actions/runs/500)",
+      "https://evil.example/?next=https://github.com/example/repo/actions/runs/500",
+    ]) {
+      const malformedSameSecondReference = await classify(
+        issueState({
+          issueExists: true,
+          issueComments: [
+            requestComment,
+            response([
+              `**Claude finished @jhw7500's task** —— ${malformedReference}`,
+              "",
+              "No blockers found.",
+            ].join("\n"), { createdAt: "2026-09-01T00:02:00Z" }),
+          ],
+          runs: [{
+            id: 500,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "in_progress",
+            conclusion: "null",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/500",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          }],
+        }),
+        "claude",
+        triggerDeadline - 1,
+      );
+      assert.equal(malformedSameSecondReference.stdout.split("\n")[0], "PENDING",
+        `a malformed latest-run URL prefix (${malformedReference}) must not correlate a same-second response`);
+    }
+
+    const preRetrySameSecondResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response([
+            "**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/499)",
+            "",
+            "No blockers found.",
+          ].join("\n"), { createdAt: "2026-09-01T00:02:00Z" }),
+        ],
+        runs: [
+          {
+            id: 499,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "success",
+            createdAt: "2026-09-01T00:01:59Z",
+            url: "https://github.com/example/repo/actions/runs/499",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+          {
+            id: 500,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "in_progress",
+            conclusion: "null",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/500",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(preRetrySameSecondResponse.stdout.split("\n")[0], "PENDING",
+      "an earlier run response must not become terminal for a same-second retry");
 
     const sameSecondEarlierComment = await classify(
       issueState({
