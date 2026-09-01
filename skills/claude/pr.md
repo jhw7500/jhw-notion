@@ -159,6 +159,21 @@ jhw_pr_wait_required_checks() {
   [[ "$actual_head" == "$expected_head" ]] || return 3
 }
 
+jhw_pr_merge_reviewed_head() {
+  local pr="$1" reviewed_head="$2" method="$3" strategy_flag
+  [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
+  [[ "$pr" =~ ^[1-9][0-9]*$ ]] || return 2
+  [[ "$reviewed_head" =~ ^[0-9a-f]{40}$ ]] || return 2
+  case "$method" in
+    merge) strategy_flag='--merge' ;;
+    squash) strategy_flag='--squash' ;;
+    rebase) strategy_flag='--rebase' ;;
+    *) echo "unsupported merge method" >&2; return 2 ;;
+  esac
+  gh pr merge "$pr" --repo "$REPO_NWO" --match-head-commit "$reviewed_head" \
+    "$strategy_flag" --delete-branch
+}
+
 jhw_pr_reviewed_receipt() {
   local head="$1"
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid reviewed head" >&2; return 2; }
@@ -285,25 +300,32 @@ jhw_pr_reconcile_review_labels() {
   labels="$(gh pr view "$PR" --repo "$REPO_NWO" --json labels --jq '.labels[].name')" || return 1
   case "$mode" in
     request)
-      grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels" &&
-        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null
-      grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels" ||
-        gh pr edit "$PR" --repo "$REPO_NWO" --add-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null
+      if grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels"; then
+        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null || return 1
+      fi
+      if ! grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels"; then
+        gh pr edit "$PR" --repo "$REPO_NWO" --add-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null || return 1
+      fi
       ;;
     skip)
-      grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels" &&
-        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null
-      grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels" ||
-        gh pr edit "$PR" --repo "$REPO_NWO" --add-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null
+      if grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels"; then
+        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null || return 1
+      fi
+      if ! grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels"; then
+        gh pr edit "$PR" --repo "$REPO_NWO" --add-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null || return 1
+      fi
       ;;
     auto)
-      grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels" &&
-        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null
-      grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels" &&
-        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null
+      if grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels"; then
+        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null || return 1
+      fi
+      if grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels"; then
+        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null || return 1
+      fi
       ;;
     *) echo "invalid review mode" >&2; return 2 ;;
   esac
+  return 0
 }
 
 jhw_pr_verify_remote_policy() {
@@ -385,7 +407,7 @@ jhw_pr_apply_existing_pr_policy() {
    - 앱/봇 리뷰어: 매 간격 `reviews`/`comments`/`issue-comments`/`reactions` 수집
 5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다.
 6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. **push 직전에** `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 캡처하고 재푸시 → 성공 직후 `ROUND_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"` 캡처 → **`ROUND_HEAD="$(git rev-parse HEAD)"` 및 `SHA="$ROUND_HEAD"` 재계산** → 아래 라운드 계약 실행 → 4로 복귀한다. `ROUND_STARTED_AT`은 run 필터 경계이고, 180초 생성 유예는 느린 push 시간을 제외하도록 `ROUND_PUSHED_AT`부터 잰다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 5) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
-7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `gh pr merge $PR --merge --delete-branch`
+7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" <merge|squash|rebase>`. 이 helper는 `gh pr merge --match-head-commit "$ROUND_HEAD"`로 최종 mutation 자체를 검토된 SHA에 원자적으로 묶는다.
    - 명시적 `--no-review --merge`에서는 AI gate만 면제한다. required CI, 타겟, 현재 head, mergeability와 merge method 검증은 그대로 유지하고 `AI review: explicitly skipped (--no-review; review:skip)` receipt를 남긴다.
    - 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT}` 중 하나이거나 타겟 `FAIL`이면 **머지하지 않고** 보고
    - **루프는 반드시 종료**: (a) 전원 CLEAN(블로킹 0) → 머지/종료, (b) `--max-rounds`(기본 5) 도달 → 남은 블로킹 보고 후 종료, (c) 트리거 유예 만료 → TRIGGER_FAILED 보고, (d) `--timeout` → 시작 후 미응답 TIMEOUT 보고. 종료 조건이 "지적 0건"이 아니라 "블로킹 0건"이라 nit 무한생성에도 끝난다.

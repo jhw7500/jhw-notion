@@ -165,6 +165,20 @@ if (argv[0] === "pr" && argv[1] === "checks") {
   process.exit(state.requiredChecksExit || 0);
 }
 
+if (argv[0] === "pr" && argv[1] === "merge") {
+  if (!state.prExists) process.exit(1);
+  if (state.headBeforeMerge) state.prHead = state.headBeforeMerge;
+  const expectedHead = optionValue("--match-head-commit");
+  const strategies = ["--merge", "--squash", "--rebase"].filter((flag) => argv.includes(flag));
+  if (expectedHead !== state.prHead || strategies.length !== 1 || !argv.includes("--delete-branch")) {
+    save();
+    process.exit(1);
+  }
+  state.prMerged = true;
+  save();
+  process.exit(0);
+}
+
 if (argv[0] === "workflow" && argv[1] === "view") {
   const workflow = argv[2];
   if (state.failWorkflowView || !state.workflowStates?.[workflow]) process.exit(1);
@@ -320,6 +334,7 @@ function baseState(overrides = {}) {
     prNumber: 42,
     prUrl: "https://github.com/example/repo/pull/42",
     prDraft: false,
+    prMerged: false,
     localHead: currentHead,
     remoteBranchHead: oldHead,
     prHead: oldHead,
@@ -365,6 +380,7 @@ async function main() {
   assert.match(prText, /jhw_pr_dispatch_same_head gemini-auto-review\.yml 'Gemini Auto PR Review' "\$ROUND_HEAD"/);
   assert.match(prText, /jhw_pr_dispatch_same_head opencode-auto-review\.yml 'OpenCode Auto PR Review' "\$ROUND_HEAD"/);
   assert.match(prText, /jhw_pr_wait_required_checks "\$PR" "\$ROUND_HEAD"/);
+  assert.match(prText, /gh pr merge .*--match-head-commit/);
   assert.match(agentsText, /\| `pr\.md` \|/);
   assert.match(agentsText, /ship\.md.*deprecated/i);
   assert.match(readmeText, /\/jhw:pr --review/);
@@ -566,6 +582,20 @@ async function main() {
     assert.ok(autoRemoveRequest >= 0 && autoRemoveSkip > autoRemoveRequest && autoPush > autoRemoveSkip,
       "auto mode must remove both overrides before push");
     assert.deepEqual(autoExisting.state.prLabels, []);
+
+    const autoNoLabels = await run(
+      baseState({ prLabels: [] }),
+      `jhw_pr_apply_existing_pr_policy auto ${currentHead}`,
+    );
+    assert.deepEqual(autoNoLabels.state.prLabels, [],
+      "auto mode must succeed when neither override label is present");
+
+    const autoRequestOnly = await run(
+      baseState({ prLabels: ["review:request"] }),
+      `jhw_pr_apply_existing_pr_policy auto ${currentHead}`,
+    );
+    assert.deepEqual(autoRequestOnly.state.prLabels, [],
+      "auto mode must remove a lone request override without returning grep status 1");
 
     const frozenPolicy = await runResult(
       baseState({ prLabels: ["review:skip"], freezeLabels: true }),
@@ -812,6 +842,27 @@ async function main() {
     );
     assert.equal(changedDuringChecks.code, 3,
       "a head change during required checks must invalidate all collected results");
+
+    const atomicMerge = await run(
+      baseState({ prHead: currentHead }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge`,
+    );
+    assert.equal(atomicMerge.state.prMerged, true);
+    assert.deepEqual(
+      atomicMerge.log.filter((args) => args[0] === "pr" && args[1] === "merge"),
+      [[
+        "pr", "merge", "42", "--repo", "example/repo", "--match-head-commit", currentHead,
+        "--merge", "--delete-branch",
+      ]],
+    );
+
+    const mergeRace = await runResult(
+      baseState({ prHead: currentHead, headBeforeMerge: oldHead }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge`,
+    );
+    assert.notEqual(mergeRace.code, 0,
+      "a remote head change immediately before merge must reject the merge atomically");
+    assert.equal(mergeRace.state.prMerged, false);
 
     const skipWaitPlan = await run(baseState(), "jhw_pr_mode_wait_plan skip true");
     assert.equal(
