@@ -223,6 +223,11 @@ if (argv[0] === "pr" && argv[1] === "edit") {
 if (argv[0] === "pr" && argv[1] === "ready") {
   if (!state.prExists || state.failPrReady) process.exit(1);
   state.prDraft = false;
+  if (state.runOnReady) {
+    const nextRun = Array.isArray(state.runOnReady) ? state.runOnReady.shift() : state.runOnReady;
+    if (nextRun) state.runs.push(nextRun);
+    if (!Array.isArray(state.runOnReady)) delete state.runOnReady;
+  }
   save();
   process.exit(0);
 }
@@ -495,7 +500,9 @@ if (endpoint.includes("/actions/runs?")) {
   const queryIndex = argv.indexOf("--jq");
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
   rows(state.runs.map((item) => {
-    const fields = [item.id, item.attempt, item.name, item.head, item.createdAt, item.status, item.conclusion];
+    const fields = [item.id, item.attempt];
+    if (query.includes(".run_number")) fields.push(item.runNumber ?? item.id);
+    fields.push(item.name, item.head, item.createdAt, item.status, item.conclusion);
     if (query.includes(".event")) fields.push(item.event || "pull_request");
     return fields.join("\t");
   }));
@@ -1764,6 +1771,28 @@ async function main() {
       baseState({
         prDraft: true,
         prLabels: ["review:skip"],
+        runOnPush: {
+          id: 9501,
+          attempt: 1,
+          runNumber: 146,
+          name: "Claude Code Review",
+          head: currentHead,
+          createdAt: requestCreatedAt,
+          status: "completed",
+          conclusion: "skipped",
+          event: "pull_request",
+        },
+        runOnReady: {
+          id: 9502,
+          attempt: 1,
+          runNumber: 147,
+          name: "Claude Code Review",
+          head: currentHead,
+          createdAt: requestCreatedAt,
+          status: "in_progress",
+          conclusion: "null",
+          event: "pull_request",
+        },
       }),
       [
         `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
@@ -1771,12 +1800,16 @@ async function main() {
         "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
         "fi",
         "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
+        "ship_workflow_trigger 'Claude Code Review'",
+        "printf 'trigger=%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_RUN_ID\"",
       ].join("\n"),
     );
     assert.equal(changedDraftRequest.state.prDraft, false,
       "a changed existing draft must become ready after its new head is pushed");
     assert.match(changedDraftRequest.stdout, /^event=pull_request$/m);
     assert.equal(changedDraftRequest.log.filter(isWorkflowDispatch).length, 0);
+    assert.match(changedDraftRequest.stdout, /^trigger=STARTED,9502$/m,
+      "the ready_for_review run must supersede a same-second skipped draft synchronize run");
     requireBefore(changedDraftRequest.log, isGitPush, ready,
       "a draft synchronize must remain skipped until the new head is ready for review");
     requireBefore(changedDraftRequest.log, addRequest, ready,
@@ -2759,21 +2792,39 @@ async function main() {
 
     for (const runs of [
       [
-        { id: 9310, attempt: 1, name: "Claude Code Review", head: currentHead, createdAt: requestCreatedAt, status: "completed", conclusion: "success" },
-        { id: 9311, attempt: 1, name: "Claude Code Review", head: currentHead, createdAt: requestCreatedAt, status: "in_progress", conclusion: "null" },
+        { id: 9310, attempt: 1, runNumber: 80, name: "Claude Code Review", head: currentHead, createdAt: requestCreatedAt, status: "completed", conclusion: "success" },
+        { id: 9311, attempt: 1, runNumber: 81, name: "Claude Code Review", head: currentHead, createdAt: requestCreatedAt, status: "in_progress", conclusion: "null" },
       ],
       [
-        { id: 9311, attempt: 1, name: "Claude Code Review", head: currentHead, createdAt: requestCreatedAt, status: "in_progress", conclusion: "null" },
-        { id: 9310, attempt: 1, name: "Claude Code Review", head: currentHead, createdAt: requestCreatedAt, status: "completed", conclusion: "success" },
+        { id: 9311, attempt: 1, runNumber: 81, name: "Claude Code Review", head: currentHead, createdAt: requestCreatedAt, status: "in_progress", conclusion: "null" },
+        { id: 9310, attempt: 1, runNumber: 80, name: "Claude Code Review", head: currentHead, createdAt: requestCreatedAt, status: "completed", conclusion: "success" },
       ],
     ]) {
-      const sameSecondWorkflowAmbiguity = await run(
+      const sameSecondWorkflowSequence = await run(
         baseState({ runs }),
-        "ship_workflow_trigger 'Claude Code Review'\nprintf '%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_TRIGGER_REASON\"",
+        "ship_workflow_trigger 'Claude Code Review'\nprintf '%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_RUN_ID\"",
       );
-      assert.equal(sameSecondWorkflowAmbiguity.stdout.trim(), "TRIGGER_FAILED,ambiguous_current_head_runs",
-        "same-second workflow candidates must fail closed independent of API order");
+      assert.equal(sameSecondWorkflowSequence.stdout.trim(), "STARTED,9311",
+        "the higher workflow run number must select the later same-second event independent of API order");
     }
+
+    const duplicateRunNumber = await run(
+      baseState({
+        runs: [9312, 9313].map((id) => ({
+          id,
+          attempt: 1,
+          runNumber: 82,
+          name: "Claude Code Review",
+          head: currentHead,
+          createdAt: requestCreatedAt,
+          status: "in_progress",
+          conclusion: "null",
+        })),
+      }),
+      "ship_workflow_trigger 'Claude Code Review'\nprintf '%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_TRIGGER_REASON\"",
+    );
+    assert.equal(duplicateRunNumber.stdout.trim(), "TRIGGER_FAILED,ambiguous_current_head_runs",
+      "different run IDs sharing one workflow run number must fail closed");
 
     const missingPollFloor = await run(
       baseState(),
