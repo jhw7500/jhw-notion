@@ -354,9 +354,24 @@ jhw_issue_is_utc_timestamp() {
   [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 }
 
+jhw_issue_codex_canary_response_successful() {
+  node -e '
+const encoded = require("node:fs").readFileSync(0, "utf8").trim();
+if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) process.exit(1);
+const body = Buffer.from(encoded, "base64").toString("utf8");
+const runtimeFailureLine = /^(?:(?:(?:the|your|my|our|its)\s+)?(?:usage limits?|quota)(?:\s+(?:for|on)\s+(?:this|the|your)\s+account)?\s+(?:(?:has|had)\s+been\s+|(?:was|were|is|are)\s+)?(?:reached|hit|exceeded|exhausted)|(?:(?:you|i|we)(?:[\x27’]ve)?\s+)(?:(?:have|has|had)\s+)?(?:reached|hit|exceeded)\s+(?:(?:the|your|my|our)\s+)?(?:usage limit|quota)|(?:the\s+)?(?:provider|connector|environment)\s+(?:(?:is|was|became)\s+)?(?:unavailable|failed|errored))[.!]?$/i;
+const explicitFailureLine = /^(?:unable to (?:review|process)(?:\b.*)?|cannot review(?:\b.*)?|failed to (?:start|review)(?:\b.*)?|create an environment(?:\b.*)?|(?:the\s+)?connector\s+(?:(?:is|was|became|has)\s+)?(?:failure|error|unavailable|failed|errored|rejected)(?:\b.*)?)[.!]?$/i;
+const failed = body.split(/\r?\n/)
+  .map((line) => line.trim())
+  .filter(Boolean)
+  .some((line) => runtimeFailureLine.test(line) || explicitFailureLine.test(line));
+process.exit(failed ? 1 : 0);
+'
+}
+
 jhw_issue_codex_canary_eligible() {
   local canary_url="$1" canary_repo canary_issue actor endpoint query raw line
-  local request_id request_at extra response_id response_actor response_at response_url response_success identity=""
+  local request_id request_at extra response_id response_actor response_at response_url response_body identity=""
   local -a requests=()
   [[ -n "$canary_url" ]] || return 1
   if [[ "$canary_url" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)/?$ ]]; then
@@ -384,9 +399,9 @@ jhw_issue_codex_canary_eligible() {
   IFS=$'\t' read -r request_id request_at extra <<<"${requests[0]}"
   [[ "$request_id" =~ ^[1-9][0-9]*$ && -n "$request_at" && -z "$extra" ]] || return 1
   jhw_issue_is_utc_timestamp "$request_at" || return 1
-  raw="$(gh api "$endpoint" --paginate --jq '.[] | [.id, .user.login, .created_at, .html_url, (((.body // "") | test("usage limits?|quota[^\\n]*(?:reached|hit|exceeded|exhausted)|(?:provider|environment)[^\\n]*(?:unavailable|failed|errored)|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\\n]*(?:fail|error|unavailable|reject)"; "i")) | not)] | @tsv' 2>/dev/null)" || return 1
-  while IFS=$'\t' read -r response_id response_actor response_at response_url response_success extra; do
-    [[ "$response_id" =~ ^[1-9][0-9]*$ && "$response_success" == true && -z "$extra" ]] || continue
+  raw="$(gh api "$endpoint" --paginate --jq '.[] | [.id, .user.login, .created_at, .html_url, ((.body // "") | @base64)] | @tsv' 2>/dev/null)" || return 1
+  while IFS=$'\t' read -r response_id response_actor response_at response_url response_body extra; do
+    [[ "$response_id" =~ ^[1-9][0-9]*$ && -n "$response_body" && -z "$extra" ]] || continue
     case "$response_actor" in
       chatgpt-codex-connector|chatgpt-codex-connector'[bot]') ;;
       *) continue ;;
@@ -395,6 +410,7 @@ jhw_issue_codex_canary_eligible() {
     [[ "$response_at" > "$request_at" ||
       ( "$response_at" == "$request_at" && "$response_id" -gt "$request_id" ) ]] || continue
     [[ -n "$response_url" ]] || continue
+    jhw_issue_codex_canary_response_successful <<<"$response_body" || continue
     if [[ -n "$identity" && "$identity" != "$response_actor" ]]; then
       echo "ambiguous Codex bot identity" >&2
       return 1
@@ -906,10 +922,15 @@ const isCurrentRunComment = (comment) => {
   return followsAttemptStart &&
     latestRunReference?.test(comment.body || "") === true;
 };
-const currentComments = latestRunEpoch === null
+const awaitingWorkflowRun = workflowName !== "" && latestRunEpoch === null;
+const currentComments = awaitingWorkflowRun
+  ? []
+  : latestRunEpoch === null
   ? comments
   : comments.filter((comment) => isCurrentRunComment(comment));
-const currentReactions = latestRunEpoch === null
+const currentReactions = awaitingWorkflowRun
+  ? []
+  : latestRunEpoch === null
   ? reactions
   : reactions.filter((reaction) => epoch(reaction.created_at) > latestRunEpoch);
 const orderedComments = [...currentComments].sort((left, right) =>
@@ -961,8 +982,8 @@ if (verdictComment && feedbackPattern.test(verdictComment.body || "")) {
 }
 if (verdictComment) emit("FEEDBACK", verdictComment.url, "unclassified_substantive_response");
 
-const acknowledged = acknowledgments.length > 0 ||
-  reactions.some((reaction) => ["eyes", "+1", "heart"].includes(reaction.content)) ||
+const acknowledged = (!awaitingWorkflowRun && acknowledgments.length > 0) ||
+  currentReactions.some((reaction) => ["eyes", "+1", "heart"].includes(reaction.content)) ||
   runs.some((run) => ["queued", "in_progress", "completed"].includes(run.status));
 if (acknowledged && now >= reviewDeadline) emit("TIMEOUT", request.url, "review_timeout");
 if (!acknowledged && now >= triggerDeadline) emit("FAILED", request.url, "trigger_unacknowledged");

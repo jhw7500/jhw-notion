@@ -230,14 +230,13 @@ if (commentMatch) {
     }
     process.exit(0);
   }
-  if (query.includes("[.id, .user.login, .created_at, .html_url") && query.includes("test(")) {
-    const failurePattern = /usage limits?|quota[^\n]*(?:reached|hit|exceeded|exhausted)|(?:provider|environment)[^\n]*(?:unavailable|failed|errored)|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\n]*(?:fail|error|unavailable|reject)/i;
+  if (query.includes("[.id, .user.login, .created_at, .html_url") && query.includes("@base64")) {
     rows(allComments.map((item) => [
       item.id,
       item.actor,
       item.createdAt,
       item.url || "",
-      failurePattern.test(item.body || "") ? "false" : "true",
+      Buffer.from(item.body || "", "utf8").toString("base64"),
     ].join("\t")));
     process.exit(0);
   }
@@ -824,6 +823,21 @@ async function main() {
         `a canary response that reports review failure (${body}) cannot prove Codex capability`);
     }
 
+    for (const body of [
+      "[HIGH] Define expected behavior when an account quota is exceeded.",
+      "[HIGH] Define expected behavior when the provider is unavailable.",
+    ]) {
+      const substantiveCanary = await runIssue(
+        issueState({
+          canaryComments: [canaryRequest, { ...canaryResponse, body }],
+        }),
+        "jhw_issue_discover_reviewers request true",
+        { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
+      );
+      assert.equal(substantiveCanary.stdout.trim(), "codex",
+        `a canary review that discusses provider failure behavior (${body}) must remain capability evidence`);
+    }
+
     await setRepoFixture({
       claude: true,
       config: "review:\n  auto: true\nworkflows:\n  claude:\n    enabled: true\n",
@@ -958,9 +972,47 @@ async function main() {
       ...overrides,
     });
 
-    async function classify(state, reviewer, nowEpoch, overrides = {}) {
+    const bindDefaultWorkflowRun = (state, reviewer) => {
+      if (reviewer === "codex" || state.runs.length > 0) return state;
+      const runId = 490;
+      const runUrl = `https://github.com/example/repo/actions/runs/${runId}`;
+      const decorate = (comment) => {
+        const isBot = comment.actorType === "Bot" || comment.actor.endsWith("[bot]");
+        const isAcknowledgment = /received your request/i.test(comment.body || "");
+        if (!isBot || Number(comment.id) <= 1001 || isAcknowledgment || (comment.body || "").includes(runUrl)) {
+          return comment;
+        }
+        return {
+          ...comment,
+          body: `**Claude finished the review** —— [View job](${runUrl})\n\n${comment.body || ""}`,
+        };
+      };
+      return {
+        ...state,
+        issueComments: state.issueComments.map(decorate),
+        issueCommentPages: state.issueCommentPages?.map((page) => page.map(decorate)),
+        runs: [{
+          id: runId,
+          name: reviewer === "claude" ? "Claude Code" : "Gemini Dispatch",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "success",
+          createdAt: requestCreatedAt,
+          runStartedAt: requestCreatedAt,
+          url: runUrl,
+          displayTitle: "jhw-review-comment-1001",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      };
+    };
+
+    async function classify(state, reviewer, nowEpoch, overrides = {}, options = {}) {
+      const boundState = options.bindWorkflowRun === false
+        ? state
+        : bindDefaultWorkflowRun(state, reviewer);
       return runIssue(
-        state,
+        boundState,
         [
           `signal_file="$(jhw_issue_create_signal_file)" || exit $?`,
           `jhw_issue_collect_signals 99 1001 '${issueCreatedAt}' "$signal_file" || exit $?`,
@@ -1023,6 +1075,44 @@ async function main() {
     );
     assert.equal(sameSecondClean.stdout.split("\n")[0], "CLEAN",
       "a reviewer comment with a later ID in the request second must be accepted");
+
+    const unboundWorkflowResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("No blockers found.")],
+        runs: [{
+          id: 499,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "success",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: "https://github.com/example/repo/actions/runs/499",
+          displayTitle: "jhw-review-comment-9999",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(unboundWorkflowResponse.stdout.split("\n")[0], "PENDING",
+      "a workflow reviewer response must wait for the exact request-scoped run");
+    assert.match(unboundWorkflowResponse.stdout, /awaiting_acknowledgment/);
+
+    const unboundWorkflowResponseExpired = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("No blockers found.")],
+      }),
+      "claude",
+      triggerDeadline + 1,
+      {},
+      { bindWorkflowRun: false },
+    );
+    assert.equal(unboundWorkflowResponseExpired.stdout.split("\n")[0], "FAILED",
+      "an unrelated workflow response must not suppress trigger timeout");
+    assert.match(unboundWorkflowResponseExpired.stdout, /trigger_unacknowledged/);
 
     const sameSecondRunResponse = await classify(
       issueState({
@@ -1834,6 +1924,8 @@ async function main() {
       issueState({ issueExists: true, issueComments: [requestComment] }),
       "claude",
       triggerDeadline + 1,
+      {},
+      { bindWorkflowRun: false },
     );
     assert.equal(unacknowledged.stdout.split("\n")[0], "FAILED");
     assert.match(unacknowledged.stdout, /trigger_unacknowledged/);
@@ -1977,19 +2069,36 @@ async function main() {
     const largeRunHistory = await classify(
       issueState({
         issueExists: true,
-        issueComments: [requestComment, response("No blocking findings.")],
-        runs: Array.from({ length: 900 }, (_, index) => ({
-          id: 3000 + index,
-          name: "Claude Code",
-          event: "issue_comment",
-          status: "completed",
-          conclusion: "success",
-          createdAt: "2026-09-01T00:02:00Z",
-          url: `https://github.com/example/repo/actions/runs/${3000 + index}`,
-          displayTitle: `Other Issue ${index}`,
-          actor: "jhw7500",
-          triggeringActor: "jhw7500",
-        })),
+        issueComments: [
+          requestComment,
+          response("**Claude finished the review** —— [View job](https://github.com/example/repo/actions/runs/5000)\n\nNo blocking findings."),
+        ],
+        runs: [
+          ...Array.from({ length: 900 }, (_, index) => ({
+            id: 3000 + index,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "success",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: `https://github.com/example/repo/actions/runs/${3000 + index}`,
+            displayTitle: `Other Issue ${index}`,
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          })),
+          {
+            id: 5000,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "success",
+            createdAt: requestCreatedAt,
+            url: "https://github.com/example/repo/actions/runs/5000",
+            displayTitle: "jhw-review-comment-1001",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+        ],
       }),
       "claude",
       triggerDeadline - 1,
@@ -2129,11 +2238,37 @@ async function main() {
       "overflowing polling input must not leave a private signal snapshot");
 
     const executeResponses = [
-      response("No blocking requirements gaps.", { id: 2001, actor: "claude-review[bot]" }),
-      response("The proposal is complete and ready for implementation.", { id: 2002, actor: "gemini-review[bot]" }),
+      response("**Claude finished the review** —— [View job](https://github.com/example/repo/actions/runs/6101)\n\nNo blocking requirements gaps.", { id: 2001, actor: "claude-review[bot]" }),
+      response("**Claude finished the review** —— [View job](https://github.com/example/repo/actions/runs/6102)\n\nThe proposal is complete and ready for implementation.", { id: 2002, actor: "gemini-review[bot]" }),
+    ];
+    const executeRuns = [
+      {
+        id: 6101,
+        name: "Claude Code",
+        event: "issue_comment",
+        status: "completed",
+        conclusion: "success",
+        createdAt: requestCreatedAt,
+        url: "https://github.com/example/repo/actions/runs/6101",
+        displayTitle: "jhw-review-comment-1001",
+        actor: "jhw7500",
+        triggeringActor: "jhw7500",
+      },
+      {
+        id: 6102,
+        name: "Gemini Dispatch",
+        event: "issue_comment",
+        status: "completed",
+        conclusion: "success",
+        createdAt: requestCreatedAt,
+        url: "https://github.com/example/repo/actions/runs/6102",
+        displayTitle: "jhw-review-comment-1002",
+        actor: "jhw7500",
+        triggeringActor: "jhw7500",
+      },
     ];
     const executed = await runIssue(
-      issueState({ issueComments: executeResponses }),
+      issueState({ issueComments: executeResponses, runs: executeRuns }),
       `jhw_issue_execute 'Review this' 'Body text' request 20`,
       {
         JHW_ISSUE_STATE_FILE: "",
@@ -2152,10 +2287,22 @@ async function main() {
 
     const partial = await runIssue(
       issueState({
-        issueComments: [response("No blocking requirements gaps.", {
+        issueComments: [response("**Claude finished the review** —— [View job](https://github.com/example/repo/actions/runs/6201)\n\nNo blocking requirements gaps.", {
           id: 2101,
           actor: "claude-review[bot]",
         })],
+        runs: [{
+          id: 6201,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "success",
+          createdAt: requestCreatedAt,
+          url: "https://github.com/example/repo/actions/runs/6201",
+          displayTitle: "jhw-review-comment-1001",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
         failCommentReviewers: ["gemini"],
       }),
       `jhw_issue_execute 'Review this' 'Body text' request 20`,
