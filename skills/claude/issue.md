@@ -360,7 +360,7 @@ const encoded = require("node:fs").readFileSync(0, "utf8").trim();
 if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) process.exit(1);
 const body = Buffer.from(encoded, "base64").toString("utf8");
 const runtimeFailureLine = /^(?:(?:(?:the|your|my|our|its)\s+)?(?:usage limits?|quota)(?:\s+(?:for|on)\s+(?:this|the|your)\s+account)?\s+(?:(?:has|had)\s+been\s+|(?:was|were|is|are)\s+)?(?:reached|hit|exceeded|exhausted)|(?:(?:you|i|we)(?:[\x27’]ve)?\s+)(?:(?:have|has|had)\s+)?(?:reached|hit|exceeded)\s+(?:(?:the|your|my|our)\s+)?(?:usage limit|quota)|(?:the\s+)?(?:provider|connector|environment)\s+(?:(?:is|was|became)\s+)?(?:unavailable|failed|errored))[.!]?$/i;
-const explicitFailureLine = /^(?:unable to (?:review|process)(?:\b.*)?|cannot review(?:\b.*)?|failed to (?:start|review)(?:\b.*)?|create an environment(?:\b.*)?|(?:the\s+)?connector\s+(?:(?:is|was|became|has)\s+)?(?:failure|error|unavailable|failed|errored|rejected)(?:\b.*)?)[.!]?$/i;
+const explicitFailureLine = /^(?:unable to (?:review|process)(?:\b.*)?|cannot review(?:\b.*)?|failed to (?:start|review)(?:\b.*)?|(?:(?:i|we|codex)\s+)?(?:could not|cannot|failed to|was unable to|unable to)\s+create\s+an?\s+environment(?:\s+.*)?|(?:the\s+)?connector\s+(?:(?:is|was|became|has)\s+)?(?:failure|error|unavailable|failed|errored|rejected)(?:\b.*)?)[.!]?$/i;
 const failed = body.split(/\r?\n/)
   .map((line) => line.trim())
   .filter(Boolean)

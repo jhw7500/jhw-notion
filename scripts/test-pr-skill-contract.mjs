@@ -1330,6 +1330,38 @@ async function main() {
     assert.equal(quotaReviewFeedbackCanary.stdout.trim(), "chatgpt-codex-connector[bot]",
       "review feedback about quota behavior must remain valid App capability evidence");
 
+    for (const body of [
+      "Add coverage for usage limit handling.",
+      "Create an environment-variable regression test.",
+    ]) {
+      const runtimeRequirementCanary = await run(
+        baseState({
+          appComments: [{
+            actor: "chatgpt-codex-connector[bot]",
+            body,
+            url: "https://github.com/example/repo/pull/88#issuecomment-9",
+          }],
+        }),
+        "jhw_pr_repo_has_app_canary codex",
+      );
+      assert.equal(runtimeRequirementCanary.stdout.trim(), "chatgpt-codex-connector[bot]",
+        `review feedback about runtime setup (${body}) must remain valid App capability evidence`);
+    }
+
+    const environmentFailureCanary = await runResult(
+      baseState({
+        appComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          body: "Codex could not create an environment for this review.",
+          url: "https://github.com/example/repo/pull/88#issuecomment-10",
+        }],
+      }),
+      "jhw_pr_repo_has_app_canary codex",
+    );
+    assert.equal(environmentFailureCanary.code, 3);
+    assert.equal(environmentFailureCanary.stdout.trim(), "",
+      "an App response that could not create its review environment must not prove capability");
+
     const noEligibleApps = await run(
       baseState({ appComments: [] }),
       [

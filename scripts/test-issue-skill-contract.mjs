@@ -826,6 +826,7 @@ async function main() {
     for (const body of [
       "[HIGH] Define expected behavior when an account quota is exceeded.",
       "[HIGH] Define expected behavior when the provider is unavailable.",
+      "Create an environment-variable regression test.",
     ]) {
       const substantiveCanary = await runIssue(
         issueState({
