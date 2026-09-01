@@ -1312,6 +1312,42 @@ async function main() {
     assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
       "TERM must remove the private summary state alongside the active snapshot");
 
+    const invalidPollingInterval = await runIssueResult(
+      issueState(),
+      `jhw_issue_execute 'Review this' 'Body text' request 20`,
+      {
+        JHW_ISSUE_POLL_SECONDS: "0",
+        JHW_ISSUE_STATE_FILE: "",
+      },
+    );
+    assert.equal(invalidPollingInterval.code, 2);
+    assert.equal(invalidPollingInterval.stdout, "",
+      "an invalid polling interval must fail before printing a created Issue URL");
+    assert.deepEqual(invalidPollingInterval.state.mutations, [],
+      "an invalid polling interval must fail before every GitHub mutation");
+    assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
+      "invalid polling input must not leave private execution state");
+    assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\.signal\..*\.json$/.test(name)), false,
+      "invalid polling input must not leave a private signal snapshot");
+
+    const overflowingPollingInterval = await runIssueResult(
+      issueState(),
+      `jhw_issue_execute 'Review this' 'Body text' request 1`,
+      {
+        JHW_ISSUE_POLL_SECONDS: "18446744073709551617",
+        JHW_ISSUE_STATE_FILE: "",
+      },
+    );
+    assert.equal(overflowingPollingInterval.code, 2);
+    assert.equal(overflowingPollingInterval.stdout, "",
+      "an overflowing polling interval must fail before printing a created Issue URL");
+    assert.deepEqual(overflowingPollingInterval.state.mutations, [],
+      "an overflowing polling interval must fail before every GitHub mutation");
+    assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
+      "overflowing polling input must not leave private execution state");
+    assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\.signal\..*\.json$/.test(name)), false,
+      "overflowing polling input must not leave a private signal snapshot");
+
     const executeResponses = [
       response("No blocking requirements gaps.", { id: 2001, actor: "claude-review[bot]" }),
       response("The proposal is complete and ready for implementation.", { id: 2002, actor: "gemini-review[bot]" }),

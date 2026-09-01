@@ -1199,6 +1199,11 @@ jhw_issue_poll_once() {
 jhw_issue_execute() {
   local title="$1" body="$2" mode="$3" timeout="$4"
   local start_epoch trigger_deadline review_deadline interval poll_status render_status=0
+  interval="${JHW_ISSUE_POLL_SECONDS:-60}"
+  case "$interval" in
+    [1-9]|[1-5][0-9]|60) ;;
+    *) return 2 ;;
+  esac
   JHW_ISSUE_STATE_FILE="$(jhw_issue_create_state_file)" || return 1
   JHW_ISSUE_ACTIVE_SIGNAL_FILE=''
   export JHW_ISSUE_STATE_FILE JHW_ISSUE_ACTIVE_SIGNAL_FILE
@@ -1218,8 +1223,6 @@ jhw_issue_execute() {
   trigger_deadline=$(( start_epoch + 180 ))
   review_deadline=$(( start_epoch + JHW_ISSUE_TIMEOUT_MIN * 60 ))
   (( trigger_deadline <= review_deadline )) || trigger_deadline="$review_deadline"
-  interval="${JHW_ISSUE_POLL_SECONDS:-60}"
-  [[ "$interval" =~ ^[1-9][0-9]*$ ]] && (( interval <= 60 )) || return 2
   while true; do
     jhw_issue_poll_once "$JHW_ISSUE_STATE_FILE" "$trigger_deadline" "$review_deadline"
     poll_status=$?

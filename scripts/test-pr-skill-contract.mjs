@@ -752,6 +752,26 @@ async function main() {
     assert.equal(failedCodexCanary.stdout.trim(), "gemini-assist",
       "a canary comment reporting connector failure cannot prove Codex capability");
 
+    const failedGeminiCanary = await run(
+      baseState({
+        appComments: [
+          {
+            actor: "chatgpt-codex-connector[bot]",
+            body: "Codex review completed without blockers.",
+            url: "https://github.com/example/repo/pull/88#issuecomment-4",
+          },
+          {
+            actor: "gemini-code-assist[bot]",
+            body: "Unable to review because usage limits were reached.",
+            url: "https://github.com/example/repo/pull/88#issuecomment-5",
+          },
+        ],
+      }),
+      "jhw_pr_prepare_review_plan request\nprintf '%s\\n' \"$JHW_PR_ELIGIBLE_APPS\"",
+    );
+    assert.equal(failedGeminiCanary.stdout.trim(), "codex",
+      "a Gemini canary reporting review failure cannot prove App capability");
+
     const noEligibleApps = await run(
       baseState({ appComments: [] }),
       [
