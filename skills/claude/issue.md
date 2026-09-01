@@ -668,8 +668,14 @@ if (verdictComment && feedbackPattern.test(verdictComment.body || "")) {
   emit("FEEDBACK", verdictComment.url, "actionable_feedback");
 }
 const cleanLine = /^(?:no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|(?:the\s+)?(?:requirements?|proposal)\s+(?:(?:look|looks|are|is)\s+)?complete(?:\s+and\s+ready for implementation)?(?:[.;]\s*(?:no blockers?(?:\s+found)?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)))?|looks good|ready for implementation|review clean|lgtm)[.!]?$/i;
-const hasExplicitCleanVerdict = (body) => String(body || "").split(/\r?\n/)
-  .map((line) => line.trim()).filter(Boolean).some((line) => cleanLine.test(line));
+const cleanVerdictLines = (body) => String(body || "").split(/\r?\n/)
+  .map((line) => line.trim())
+  .filter(Boolean)
+  .filter((line) => !/^\*\*Claude finished\b/.test(line));
+const hasExplicitCleanVerdict = (body) => {
+  const lines = cleanVerdictLines(body);
+  return lines.length > 0 && lines.every((line) => cleanLine.test(line));
+};
 if (verdictComment && hasExplicitCleanVerdict(verdictComment.body)) {
   emit("CLEAN", verdictComment.url, "substantive_response");
 }
@@ -790,6 +796,51 @@ jhw_issue_cleanup_state_file() {
   [[ ! -e "$state_file" || -f "$state_file" ]] || return 1
   [[ -e "$state_file" ]] || return 0
   rm -f -- "$state_file"
+}
+
+jhw_issue_cleanup_execution_files() {
+  local cleanup_status=0
+  if [[ -n "${JHW_ISSUE_ACTIVE_SIGNAL_FILE:-}" ]]; then
+    if [[ -e "$JHW_ISSUE_ACTIVE_SIGNAL_FILE" || -L "$JHW_ISSUE_ACTIVE_SIGNAL_FILE" ]]; then
+      if jhw_issue_cleanup_signal_file "$JHW_ISSUE_ACTIVE_SIGNAL_FILE"; then
+        JHW_ISSUE_ACTIVE_SIGNAL_FILE=''
+      else
+        cleanup_status=1
+      fi
+    else
+      JHW_ISSUE_ACTIVE_SIGNAL_FILE=''
+    fi
+  fi
+  if [[ -n "${JHW_ISSUE_STATE_FILE:-}" ]]; then
+    if [[ -e "$JHW_ISSUE_STATE_FILE" || -L "$JHW_ISSUE_STATE_FILE" ]]; then
+      if jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE"; then
+        JHW_ISSUE_STATE_FILE=''
+      else
+        cleanup_status=1
+      fi
+    else
+      JHW_ISSUE_STATE_FILE=''
+    fi
+  fi
+  return "$cleanup_status"
+}
+
+jhw_issue_handle_execution_signal() {
+  local status="$1"
+  jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  exit "$status"
+}
+
+jhw_issue_install_execution_cleanup() {
+  trap 'jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true' EXIT
+  trap 'jhw_issue_handle_execution_signal 129' HUP
+  trap 'jhw_issue_handle_execution_signal 130' INT
+  trap 'jhw_issue_handle_execution_signal 143' TERM
+}
+
+jhw_issue_clear_execution_cleanup() {
+  trap - EXIT HUP INT TERM
 }
 
 jhw_issue_initialize_state_file() {
@@ -949,6 +1000,7 @@ jhw_issue_poll_once() {
       jhw_issue_update_result "$state_file" "$reviewer" FAILED '' signal_file_create_failed || return 1
       continue
     fi
+    JHW_ISSUE_ACTIVE_SIGNAL_FILE="$signal_file"
     update_status=0
     if jhw_issue_collect_signals "$issue" "$request_id" "$issue_created_at" "$signal_file"; then
       if jhw_issue_classify_reviewer "$reviewer" "$now_epoch" "$trigger_deadline" "$review_deadline" \
@@ -961,7 +1013,11 @@ jhw_issue_poll_once() {
     else
       jhw_issue_update_result "$state_file" "$reviewer" FAILED '' signal_collection_failed || update_status=1
     fi
-    jhw_issue_cleanup_signal_file "$signal_file" || update_status=1
+    if jhw_issue_cleanup_signal_file "$signal_file"; then
+      JHW_ISSUE_ACTIVE_SIGNAL_FILE=''
+    else
+      update_status=1
+    fi
     (( update_status == 0 )) || return 1
   done <<<"$pending"
   remaining="$(jhw_issue_pending_count "$state_file")" || return 1
@@ -974,16 +1030,17 @@ jhw_issue_execute() {
   local title="$1" body="$2" mode="$3" timeout="$4"
   local start_epoch trigger_deadline review_deadline interval poll_status render_status=0
   JHW_ISSUE_STATE_FILE="$(jhw_issue_create_state_file)" || return 1
-  export JHW_ISSUE_STATE_FILE
-  trap 'jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE" >/dev/null 2>&1 || true' EXIT
+  JHW_ISSUE_ACTIVE_SIGNAL_FILE=''
+  export JHW_ISSUE_STATE_FILE JHW_ISSUE_ACTIVE_SIGNAL_FILE
+  jhw_issue_install_execution_cleanup
   if ! jhw_issue_create "$title" "$body" "$mode" "$timeout"; then
-    jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE" >/dev/null 2>&1 || true
-    trap - EXIT
+    jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
+    jhw_issue_clear_execution_cleanup
     return 1
   fi
   jhw_issue_initialize_state_file "$JHW_ISSUE_STATE_FILE" || {
-    jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE" >/dev/null 2>&1 || true
-    trap - EXIT
+    jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
+    jhw_issue_clear_execution_cleanup
     return 1
   }
   start_epoch="$(date +%s)" || return 1
@@ -1011,16 +1068,16 @@ jhw_issue_execute() {
     esac
   done
   jhw_issue_render_summary "$JHW_ISSUE_URL" "$JHW_ISSUE_STATE_FILE" || render_status=$?
-  jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE" || render_status=1
-  trap - EXIT
+  jhw_issue_cleanup_execution_files || render_status=1
+  jhw_issue_clear_execution_cleanup
   return "$render_status"
 }
 ```
 <!-- issue-review-wait-contract:end -->
 
-실행 시작 시 `JHW_ISSUE_STATE_FILE="$(jhw_issue_create_state_file)"`로 private state를 만들고 export한
-뒤 `trap 'jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE"' EXIT`를 등록한다. partial failure와
-timeout에서도 summary와 Issue URL을 먼저 출력하고 trap으로 state만 제거한다.
+실행 시작 시 private summary state와 현재 활성 signal snapshot 좌표를 추적하고
+`jhw_issue_install_execution_cleanup`으로 `EXIT/HUP/INT/TERM` 정리를 등록한다. partial failure,
+timeout, 중단 신호에서도 summary state와 0600 signal snapshot만 제거하며 생성된 Issue는 보존한다.
 
 ## 실행 규칙
 

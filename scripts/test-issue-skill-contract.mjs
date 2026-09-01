@@ -779,6 +779,21 @@ async function main() {
       "the newest substantive response must supersede an older CLEAN response");
     assert.match(cleanThenCorrection.stdout, /issuecomment-1003/);
 
+    const mixedCleanAndConcern = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("No blockers found.\nAuthentication behavior is underspecified; add failure cases."),
+        ],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(mixedCleanAndConcern.stdout.split("\n")[0], "FEEDBACK",
+      "an exact clean line cannot override additional unclassified substantive content");
+
     const failedRun = await classify(
       issueState({
         issueExists: true,
@@ -973,7 +988,7 @@ async function main() {
         issueExists: true,
         issueComments: [
           requestComment,
-          response(`No blocking findings.\n${"review detail ".repeat(30000)}`),
+          response(`${" \n".repeat(150000)}No blocking findings.`),
         ],
       }),
       "claude",
@@ -996,6 +1011,25 @@ async function main() {
         "",
       ].join("\n"),
     });
+    const interruptedCleanup = await runIssueResult(
+      issueState(),
+      [
+        `JHW_ISSUE_STATE_FILE="$(jhw_issue_create_state_file)" || exit $?`,
+        `JHW_ISSUE_ACTIVE_SIGNAL_FILE="$(jhw_issue_create_signal_file)" || exit $?`,
+        "export JHW_ISSUE_STATE_FILE JHW_ISSUE_ACTIVE_SIGNAL_FILE",
+        "jhw_issue_install_execution_cleanup || exit $?",
+        `kill -TERM "$$"`,
+        "exit 99",
+      ].join("\n"),
+      { JHW_ISSUE_STATE_FILE: "" },
+    );
+    assert.equal(interruptedCleanup.code, 143,
+      "TERM must preserve a non-success status after private-file cleanup");
+    assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\.signal\..*\.json$/.test(name)), false,
+      "TERM must remove the active private signal snapshot");
+    assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
+      "TERM must remove the private summary state alongside the active snapshot");
+
     const executeResponses = [
       response("No blocking requirements gaps.", { id: 2001, actor: "claude-review[bot]" }),
       response("The proposal is complete and ready for implementation.", { id: 2002, actor: "gemini-review[bot]" }),
