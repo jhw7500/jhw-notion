@@ -231,7 +231,7 @@ if (commentMatch) {
     process.exit(0);
   }
   if (query.includes("[.id, .user.login, .created_at, .html_url") && query.includes("test(")) {
-    const failurePattern = /usage limits?|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\n]*(?:fail|error|unavailable|reject)/i;
+    const failurePattern = /usage limits?|quota[^\n]*(?:reached|hit|exceeded|exhausted)|(?:provider|environment)[^\n]*(?:unavailable|failed|errored)|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\n]*(?:fail|error|unavailable|reject)/i;
     rows(allComments.map((item) => [
       item.id,
       item.actor,
@@ -804,18 +804,21 @@ async function main() {
     );
     assert.equal(malformedTimestampCanary.stdout.trim(), "",
       "malformed timestamps cannot prove that a Codex response followed the request");
-    const failedResponseCanary = await runIssue(
-      issueState({
-        canaryComments: [
-          canaryRequest,
-          { ...canaryResponse, body: "Unable to review because usage limits were reached." },
-        ],
-      }),
-      "jhw_issue_discover_reviewers request true",
-      { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
-    );
-    assert.equal(failedResponseCanary.stdout.trim(), "",
-      "a canary response that reports review failure cannot prove Codex capability");
+    for (const body of [
+      "Unable to review because usage limits were reached.",
+      "Quota exceeded.",
+      "Provider unavailable.",
+    ]) {
+      const failedResponseCanary = await runIssue(
+        issueState({
+          canaryComments: [canaryRequest, { ...canaryResponse, body }],
+        }),
+        "jhw_issue_discover_reviewers request true",
+        { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
+      );
+      assert.equal(failedResponseCanary.stdout.trim(), "",
+        `a canary response that reports review failure (${body}) cannot prove Codex capability`);
+    }
 
     await setRepoFixture({
       claude: true,
@@ -1624,6 +1627,34 @@ async function main() {
     );
     assert.equal(rejected.stdout.split("\n")[0], "FAILED");
     assert.match(rejected.stdout, /connector_rejected/);
+
+    for (const body of ["Usage limit reached.", "Quota exceeded.", "Provider unavailable."]) {
+      const quotaFailure = await classify(
+        issueState({
+          issueExists: true,
+          issueComments: [requestComment, response(body)],
+        }),
+        "claude",
+        triggerDeadline - 1,
+      );
+      assert.equal(quotaFailure.stdout.split("\n")[0], "FAILED",
+        `a provider response (${body}) must be classified as reviewer failure`);
+      assert.match(quotaFailure.stdout, /connector_rejected/);
+    }
+
+    const quotaRequirementFeedback = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("[HIGH] Define expected behavior when an account quota is exceeded."),
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(quotaRequirementFeedback.stdout.split("\n")[0], "FEEDBACK",
+      "implementation feedback about quota behavior must not become a provider failure");
 
     const staleRejectedReaction = await classify(
       issueState({

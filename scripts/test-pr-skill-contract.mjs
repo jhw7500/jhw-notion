@@ -751,6 +751,7 @@ async function main() {
   const statePath = join(tempRoot, "gh-state.json");
   const logPath = join(tempRoot, "gh-log.jsonl");
   const roundStatePath = join(tempRoot, "round.state");
+  const roundStateVictimPath = join(tempRoot, "round-state-victim");
   const nowEpochPath = join(tempRoot, "now-epoch");
 
   await writeFile(fakeGh, fakeGhSource);
@@ -2480,6 +2481,20 @@ async function main() {
     assert.match(idempotent.roundState, new RegExp(`requested_at=${requestCreatedAt}`));
     assert.match(idempotent.roundState, new RegExp(`target_head=${currentHead}`));
     assert.match(idempotent.roundState, new RegExp(`target_base_oid=${currentBaseOid}`));
+
+    await writeFile(roundStateVictimPath, "victim-data\n");
+    await run(
+      baseState(),
+      [
+        "ln -s \"$JHW_STATE_VICTIM\" \"${SHIP_ROUND_STATE_FILE}.$$\"",
+        "ship_codex_trigger",
+      ].join("\n"),
+      { JHW_STATE_VICTIM: roundStateVictimPath },
+    );
+    assert.equal(await readFile(roundStateVictimPath, "utf8"), "victim-data\n",
+      "a predictable temporary-state symlink must never overwrite its target");
+    assert.equal(lstatSync(roundStatePath).isSymbolicLink(), false,
+      "the committed round state must remain a regular file after a symlink attack");
 
     const failedPost = await run(
       baseState({ failPost: true }),

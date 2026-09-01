@@ -384,7 +384,7 @@ jhw_issue_codex_canary_eligible() {
   IFS=$'\t' read -r request_id request_at extra <<<"${requests[0]}"
   [[ "$request_id" =~ ^[1-9][0-9]*$ && -n "$request_at" && -z "$extra" ]] || return 1
   jhw_issue_is_utc_timestamp "$request_at" || return 1
-  raw="$(gh api "$endpoint" --paginate --jq '.[] | [.id, .user.login, .created_at, .html_url, (((.body // "") | test("usage limits?|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\\n]*(?:fail|error|unavailable|reject)"; "i")) | not)] | @tsv' 2>/dev/null)" || return 1
+  raw="$(gh api "$endpoint" --paginate --jq '.[] | [.id, .user.login, .created_at, .html_url, (((.body // "") | test("usage limits?|quota[^\\n]*(?:reached|hit|exceeded|exhausted)|(?:provider|environment)[^\\n]*(?:unavailable|failed|errored)|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\\n]*(?:fail|error|unavailable|reject)"; "i")) | not)] | @tsv' 2>/dev/null)" || return 1
   while IFS=$'\t' read -r response_id response_actor response_at response_url response_success extra; do
     [[ "$response_id" =~ ^[1-9][0-9]*$ && "$response_success" == true && -z "$extra" ]] || continue
     case "$response_actor" in
@@ -906,8 +906,14 @@ if (rejectedReaction &&
     (!verdictComment || epoch(rejectedReaction.created_at) > epoch(verdictComment.created_at))) {
   emit("FAILED", rejectedReaction.url, "connector_rejected");
 }
+const runtimeFailureLine = /^(?:(?:(?:the|your|my|our|its)\s+)?(?:usage limits?|quota)(?:\s+(?:for|on)\s+(?:this|the|your)\s+account)?\s+(?:(?:has|had)\s+been\s+|(?:was|were|is|are)\s+)?(?:reached|hit|exceeded|exhausted)|(?:(?:you|i|we)(?:['’]ve)?\s+)(?:(?:have|has|had)\s+)?(?:reached|hit|exceeded)\s+(?:(?:the|your|my|our)\s+)?(?:usage limit|quota)|(?:the\s+)?(?:provider|connector|environment)\s+(?:(?:is|was|became)\s+)?(?:unavailable|failed|errored))[.!]?$/i;
+const hasRuntimeFailure = (body) => String(body || "").split(/\r?\n/)
+  .map((line) => line.trim())
+  .filter(Boolean)
+  .some((line) => runtimeFailureLine.test(line));
 if (verdictComment &&
-    /Claude encountered an error|unable to (?:review|process)|cannot review|connector[^\n]*(?:reject|denied)|failed to (?:start|review)/i.test(verdictComment.body || "")) {
+    (/Claude encountered an error|unable to (?:review|process)|cannot review|connector[^\n]*(?:reject|denied)|failed to (?:start|review)/i.test(verdictComment.body || "") ||
+    hasRuntimeFailure(verdictComment.body))) {
   emit("FAILED", verdictComment.url, "connector_rejected");
 }
 const feedbackPattern = /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i;
@@ -1431,6 +1437,8 @@ safe integer가 아니면 정렬 권한을 정할 수 없어 classifier가 fail-
 순서의 최신 substantive 댓글만 판정하며, 거절 reaction은 그 댓글이 없거나 더 나중일 때만 우선한다.
 선택된 run 이후의 bot 댓글은 시각 차이와 무관하게 본문이 그 run의 검증된 `html_url`을 정확히
 참조할 때만 verdict로 인정한다. 좌표 없는 댓글과 run 좌표를 담을 수 없는 reaction은 인정하지 않는다.
+선택된 reviewer 응답의 usage-limit·quota 소진 또는 provider/connector/environment 실패는 구현
+지적이 아니므로 `FEEDBACK`이 아니라 `FAILED(connector_rejected)`로 분류한다.
 댓글과 reaction이 같은 초면 교차 타입 순서를 증명할 수 없어 `PENDING`으로 재poll한다. 최신 retry
 run보다 오래되거나 같은 초지만 상관 좌표가 없는 댓글·reaction도 terminal 신호에서 제외한다. 요청 reviewer가 없고 capability
 부재로 unavailable reviewer가 있으면 highest disposition은 `UNAVAILABLE`이다. 명시적 skip이나

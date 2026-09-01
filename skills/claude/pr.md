@@ -1161,7 +1161,7 @@ jhw_pr_apply_existing_pr_policy() {
 
 ## auto-fix 라운드 트리거 계약
 
-이 계약은 **재푸시 라운드(2+)에서만** 실행한다. `ROUND_STARTED_AT`은 push 직전 필터 경계, `ROUND_PUSHED_AT`은 성공한 push 직후 생성 유예 경계이고, `ROUND_HEAD`와 `ROUND_BASE_OID`는 push/base reconcile 후의 정확한 40자리 SHA다. App 요청 상태 파일은 요청 코멘트 ID·GitHub가 반환한 생성 시각·대상 HEAD·base OID를 보존하며, 같은 HEAD/base OID를 재시도할 때만 숨은 마커로 기존 요청을 재사용한다. Claude/Gemini workflow는 push 완료 후 3회 폴링에 해당하는 180초 동안 현재 HEAD의 새 run 생성을 확인하고, 그 뒤에도 없으면 `TRIGGER_FAILED`다. 20분 `SHIP_TIMEOUT_MIN`은 **시작된 리뷰의 응답 대기**에만 적용한다.
+이 계약은 **재푸시 라운드(2+)에서만** 실행한다. `ROUND_STARTED_AT`은 push 직전 필터 경계, `ROUND_PUSHED_AT`은 성공한 push 직후 생성 유예 경계이고, `ROUND_HEAD`와 `ROUND_BASE_OID`는 push/base reconcile 후의 정확한 40자리 SHA다. App 요청 상태 파일은 요청 코멘트 ID·GitHub가 반환한 생성 시각·대상 HEAD·base OID를 보존하며, 같은 HEAD/base OID를 재시도할 때만 숨은 마커로 기존 요청을 재사용한다. 상태 갱신은 검증된 부모 디렉터리에서 `mktemp`로 배타 생성한 0600 regular file을 쓴 뒤 원자적으로 교체하며, 심링크·비정규 target은 거부한다. Claude/Gemini workflow는 push 완료 후 3회 폴링에 해당하는 180초 동안 현재 HEAD의 새 run 생성을 확인하고, 그 뒤에도 없으면 `TRIGGER_FAILED`다. 20분 `SHIP_TIMEOUT_MIN`은 **시작된 리뷰의 응답 대기**에만 적용한다.
 
 <!-- pr-round-contract: trigger-and-scope:begin -->
 ```bash
@@ -1324,8 +1324,33 @@ $marker"
 }
 
 ship_write_codex_trigger_state() {
-  local temp_state="${SHIP_ROUND_STATE_FILE}.$$"
+  local requested_state="${SHIP_ROUND_STATE_FILE:-}" state_dir state_name state_path
+  local temp_state='' old_umask create_status
+  [[ -n "$requested_state" && "$requested_state" == /* && "$requested_state" != / ]] || return 1
+  state_dir="${requested_state%/*}"
+  state_name="${requested_state##*/}"
+  [[ -n "$state_dir" && "$state_dir" != / && -d "$state_dir" ]] || return 1
+  [[ -n "$state_name" && "$state_name" != . && "$state_name" != .. &&
+    "$state_name" != *$'\n'* && "$state_name" != *$'\r'* ]] || return 1
+  state_dir="$(cd -P -- "$state_dir" 2>/dev/null && pwd -P)" || return 1
+  [[ -n "$state_dir" && "$state_dir" == /* && "$state_dir" != / ]] || return 1
+  state_path="$state_dir/$state_name"
+  [[ ! -L "$state_path" ]] || return 1
+  [[ ! -e "$state_path" || -f "$state_path" ]] || return 1
+  old_umask="$(umask)" || return 1
   umask 077
+  temp_state="$(mktemp "$state_dir/.${state_name}.XXXXXXXX")"
+  create_status=$?
+  umask "$old_umask" || {
+    (( create_status != 0 )) || rm -f -- "$temp_state"
+    return 1
+  }
+  (( create_status == 0 )) || return 1
+  [[ "${temp_state%/*}" == "$state_dir" && -f "$temp_state" && ! -L "$temp_state" ]] || {
+    [[ -n "$temp_state" && ! -L "$temp_state" ]] && rm -f -- "$temp_state"
+    return 1
+  }
+  chmod 600 -- "$temp_state" || { rm -f -- "$temp_state"; return 1; }
   {
     printf 'round=%s\n' "$ROUND"
     printf 'reviewer=codex\n'
@@ -1335,7 +1360,13 @@ ship_write_codex_trigger_state() {
     printf 'requested_at=%s\n' "${SHIP_CODEX_REQUESTED_AT:-}"
     printf 'target_head=%s\n' "$ROUND_HEAD"
     printf 'target_base_oid=%s\n' "$ROUND_BASE_OID"
-  } >"$temp_state" && mv -f -- "$temp_state" "$SHIP_ROUND_STATE_FILE"
+  } >"$temp_state" || { rm -f -- "$temp_state"; return 1; }
+  [[ ! -L "$state_path" ]] || { rm -f -- "$temp_state"; return 1; }
+  [[ ! -e "$state_path" || -f "$state_path" ]] || { rm -f -- "$temp_state"; return 1; }
+  mv -f -- "$temp_state" "$state_path" || { rm -f -- "$temp_state"; return 1; }
+  [[ -f "$state_path" && ! -L "$state_path" ]] || return 1
+  SHIP_ROUND_STATE_FILE="$state_path"
+  export SHIP_ROUND_STATE_FILE
 }
 
 jhw_pr_request_eligible_apps() {
