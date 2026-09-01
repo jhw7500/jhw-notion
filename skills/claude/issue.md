@@ -823,8 +823,12 @@ const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
   run.display_title === snapshot.issue_title &&
   (run.triggering_actor === snapshot.request_actor || run.actor === snapshot.request_actor));
 
-const failedRun = runs.find((run) => run.status === "completed" && !["success", "neutral", "skipped"].includes(run.conclusion));
-if (failedRun) emit("FAILED", failedRun.url, "workflow_failed");
+const orderedRuns = [...runs].sort((left, right) =>
+  epoch(right.created_at) - epoch(left.created_at) || Number(right.id) - Number(left.id));
+const latestRun = orderedRuns[0];
+if (latestRun?.status === "completed" && !["success", "neutral", "skipped"].includes(latestRun.conclusion)) {
+  emit("FAILED", latestRun.url, "workflow_failed");
+}
 const rejectedReaction = reactions.find((reaction) => ["-1", "confused"].includes(reaction.content));
 if (rejectedReaction) emit("FAILED", rejectedReaction.url, "connector_rejected");
 const rejectedComment = comments.find((comment) =>
@@ -939,8 +943,9 @@ for (const result of state.results) {
 if (state.requested.some((reviewer) => !seen.has(reviewer))) fail("requested reviewer result missing");
 const cell = (value) => (value || "-").replace(/[\r\n|]+/g, " ").trim() || "-";
 const rank = { PENDING: 0, UNAVAILABLE: 0, CLEAN: 1, FEEDBACK: 2, TIMEOUT: 3, FAILED: 4 };
-let highest = "CLEAN";
-for (const result of state.results.filter((item) => state.requested.includes(item.reviewer))) {
+const requestedResults = state.results.filter((item) => state.requested.includes(item.reviewer));
+let highest = requestedResults.length === 0 ? "UNAVAILABLE" : requestedResults[0].status;
+for (const result of requestedResults.slice(1)) {
   if (rank[result.status] > rank[highest]) highest = result.status;
 }
 const lines = [
@@ -1257,6 +1262,9 @@ GitHub의 UTC 시각은 초 단위이므로 요청과 응답이 같은 초에 �
 요청 댓글보다 큰 comment ID만 후속 신호로 인정하고, reaction은 정확한 요청 댓글의 reactions
 endpoint에 종속되므로 같은 초를 허용한다. workflow run에는 요청 comment ID가 없어서 같은 초의
 다른 멘션 run과 구분할 수 없으므로 요청 시각보다 엄격히 뒤인 run만 인정한다.
+같은 요청에 여러 relevant workflow run이 있으면 `created_at`, run ID 순으로 가장 최신 run만
+workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다. 요청된 reviewer가 하나도
+없으면 summary의 highest disposition은 `CLEAN`이 아니라 `UNAVAILABLE`이다.
 
 ## 실행 규칙
 

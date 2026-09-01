@@ -1080,6 +1080,51 @@ async function main() {
     assert.equal(failedRun.stdout.split("\n")[0], "FAILED");
     assert.match(failedRun.stdout, /actions\/runs\/501/);
 
+    const supersededFailedRun = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("Requirements look complete; no blockers found.", {
+            id: 1004,
+            createdAt: "2026-09-01T00:04:00Z",
+            url: "https://github.com/example/repo/issues/99#issuecomment-1004",
+          }),
+        ],
+        runs: [
+          {
+            id: 504,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "failure",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/504",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+          {
+            id: 505,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "success",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/505",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(supersededFailedRun.stdout.split("\n")[0], "CLEAN",
+      "a higher-ID successful retry must supersede an older same-second failed workflow run");
+    assert.match(supersededFailedRun.stdout, /issuecomment-1004/);
+
     const sameSecondFailedRun = await classify(
       issueState({
         issueExists: true,
@@ -1515,6 +1560,25 @@ async function main() {
     assert.deepEqual(summary.state.mutations, []);
     assert.equal(summary.log.length, 0, "rendering and cleanup must not call GitHub");
     await assert.rejects(readFile(summaryStatePath, "utf8"), { code: "ENOENT" });
+
+    await setRepoFixture({ config: "review:\n  auto: true\n" });
+    const noReviewerExecution = await runIssue(
+      issueState(),
+      `jhw_issue_execute 'Review this' 'Body text' auto 20`,
+      { JHW_ISSUE_STATE_FILE: "" },
+    );
+    assert.equal(noReviewerExecution.stdout.split("\n")[0],
+      "https://github.com/example/repo/issues/99");
+    assert.match(noReviewerExecution.stdout, /^Requested reviewers: none$/m);
+    assert.match(noReviewerExecution.stdout, /^Unavailable reviewers: claude, gemini, codex$/m);
+    assert.match(noReviewerExecution.stdout, /^Highest disposition: UNAVAILABLE$/m,
+      "a run with no requested reviewer must not report CLEAN");
+    assert.equal(noReviewerExecution.state.mutations.filter((item) => item === "comment:post").length, 0,
+      "auto mode must not mention an unavailable reviewer");
+    assert.equal(noReviewerExecution.log.filter((args) => args[0] === "sleep").length, 0,
+      "auto mode with no requested reviewer must finish without polling");
+    assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
+      "no-reviewer execution must remove its private summary state");
 
     console.log("issue skill contract: ok");
   } finally {
