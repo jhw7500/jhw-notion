@@ -823,20 +823,43 @@ const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
   run.display_title === snapshot.issue_title &&
   (run.triggering_actor === snapshot.request_actor || run.actor === snapshot.request_actor));
 
+const runIds = runs.map((run) => Number(run.id));
+if (runIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+  process.stderr.write("invalid workflow run id\n");
+  process.exit(1);
+}
 const orderedRuns = [...runs].sort((left, right) =>
   epoch(right.created_at) - epoch(left.created_at) || Number(right.id) - Number(left.id));
 const latestRun = orderedRuns[0];
 if (latestRun?.status === "completed" && !["success", "neutral", "skipped"].includes(latestRun.conclusion)) {
   emit("FAILED", latestRun.url, "workflow_failed");
 }
-const rejectedReaction = reactions.find((reaction) => ["-1", "confused"].includes(reaction.content));
-if (rejectedReaction) emit("FAILED", rejectedReaction.url, "connector_rejected");
-const rejectedComment = comments.find((comment) =>
-  /Claude encountered an error|unable to (?:review|process)|cannot review|connector[^\n]*(?:reject|denied)|failed to (?:start|review)/i.test(comment.body || ""));
-if (rejectedComment) emit("FAILED", rejectedComment.url, "connector_rejected");
-const orderedComments = [...comments].sort((left, right) =>
+const latestRunEpoch = latestRun ? epoch(latestRun.created_at) : null;
+const currentComments = latestRunEpoch === null
+  ? comments
+  : comments.filter((comment) => epoch(comment.created_at) > latestRunEpoch);
+const currentReactions = latestRunEpoch === null
+  ? reactions
+  : reactions.filter((reaction) => epoch(reaction.created_at) > latestRunEpoch);
+const orderedComments = [...currentComments].sort((left, right) =>
   epoch(right.created_at) - epoch(left.created_at) || Number(right.id) - Number(left.id));
 const verdictComment = orderedComments[0];
+const rejectedReaction = currentReactions
+  .filter((reaction) => ["-1", "confused"].includes(reaction.content))
+  .sort((left, right) => epoch(right.created_at) - epoch(left.created_at))[0];
+if (rejectedReaction && verdictComment &&
+    epoch(rejectedReaction.created_at) === epoch(verdictComment.created_at)) {
+  if (now >= reviewDeadline) emit("TIMEOUT", request.url, "review_timeout");
+  emit("PENDING", request.url, "ambiguous_same_second_signal");
+}
+if (rejectedReaction &&
+    (!verdictComment || epoch(rejectedReaction.created_at) > epoch(verdictComment.created_at))) {
+  emit("FAILED", rejectedReaction.url, "connector_rejected");
+}
+if (verdictComment &&
+    /Claude encountered an error|unable to (?:review|process)|cannot review|connector[^\n]*(?:reject|denied)|failed to (?:start|review)/i.test(verdictComment.body || "")) {
+  emit("FAILED", verdictComment.url, "connector_rejected");
+}
 const feedbackPattern = /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i;
 const cleanLine = /^(?:no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|(?:the\s+)?(?:requirements?|proposal)\s+(?:(?:look|looks|are|is)\s+)?complete(?:\s+and\s+ready for implementation)?(?:[.;]\s*(?:no blockers?(?:\s+found)?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)))?|looks good|ready for implementation|review clean|lgtm)[.!]?$/i;
 const negatedFindingLine = /^no (?:(?:missing requirements?|implementation risks?)(?:\s+(?:or|and)\s+(?:missing requirements?|implementation risks?))*|(?:\[(?:CRITICAL|HIGH)\]|P[01])\s+(?:issues?|findings?))[.!]?$/i;
@@ -944,7 +967,9 @@ if (state.requested.some((reviewer) => !seen.has(reviewer))) fail("requested rev
 const cell = (value) => (value || "-").replace(/[\r\n|]+/g, " ").trim() || "-";
 const rank = { PENDING: 0, UNAVAILABLE: 0, CLEAN: 1, FEEDBACK: 2, TIMEOUT: 3, FAILED: 4 };
 const requestedResults = state.results.filter((item) => state.requested.includes(item.reviewer));
-let highest = requestedResults.length === 0 ? "UNAVAILABLE" : requestedResults[0].status;
+let highest = requestedResults.length === 0
+  ? (state.unavailable.length > 0 ? "UNAVAILABLE" : "CLEAN")
+  : requestedResults[0].status;
 for (const result of requestedResults.slice(1)) {
   if (rank[result.status] > rank[highest]) highest = result.status;
 }
@@ -1263,8 +1288,13 @@ GitHub의 UTC 시각은 초 단위이므로 요청과 응답이 같은 초에 �
 endpoint에 종속되므로 같은 초를 허용한다. workflow run에는 요청 comment ID가 없어서 같은 초의
 다른 멘션 run과 구분할 수 없으므로 요청 시각보다 엄격히 뒤인 run만 인정한다.
 같은 요청에 여러 relevant workflow run이 있으면 `created_at`, run ID 순으로 가장 최신 run만
-workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다. 요청된 reviewer가 하나도
-없으면 summary의 highest disposition은 `CLEAN`이 아니라 `UNAVAILABLE`이다.
+workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다. relevant run ID가 양의
+safe integer가 아니면 정렬 권한을 정할 수 없어 classifier가 fail-closed한다. bot 댓글도 같은
+순서의 최신 substantive 댓글만 판정하며, 거절 reaction은 그 댓글이 없거나 더 나중일 때만 우선한다.
+댓글과 reaction이 같은 초면 교차 타입 순서를 증명할 수 없어 `PENDING`으로 재poll한다. 최신 retry
+run과 같거나 오래된 댓글·reaction도 terminal 신호에서 제외한다. 요청 reviewer가 없고 capability
+부재로 unavailable reviewer가 있으면 highest disposition은 `UNAVAILABLE`이다. 명시적 skip이나
+`review.auto=false`처럼 unavailable도 없는 의도적 no-review는 기존 `CLEAN`을 유지한다.
 
 ## 실행 규칙
 

@@ -241,8 +241,39 @@ jhw_pr_wait_required_checks() {
   [[ "$actual_base" == "$base_ref" ]] || return 3
 }
 
+jhw_pr_merge_review_gate() {
+  local policy="${1-}" status
+  (( $# >= 1 )) || return 2
+  shift
+  case "$policy" in
+    skip)
+      (( $# == 0 )) || { echo "skip merge gate received reviewer status" >&2; return 2; }
+      return 0
+      ;;
+    request|auto=true)
+      (( $# > 0 )) || { echo "no eligible PR reviewer reached CLEAN" >&2; return 1; }
+      for status in "$@"; do
+        case "$status" in
+          CLEAN) ;;
+          PENDING|FEEDBACK|FAILED|TRIGGER_FAILED|TIMEOUT|UNAVAILABLE)
+            echo "PR reviewer is not CLEAN: $status" >&2
+            return 1
+            ;;
+          *) echo "invalid PR reviewer status" >&2; return 2 ;;
+        esac
+      done
+      ;;
+    auto=false)
+      echo "AI review is disabled; use --no-review --merge to exempt the AI gate" >&2
+      return 1
+      ;;
+    *) echo "invalid effective review policy" >&2; return 2 ;;
+  esac
+}
+
 jhw_pr_merge_reviewed_head() {
-  local pr="$1" reviewed_head="$2" method="$3" strategy_flag
+  local pr="${1-}" reviewed_head="${2-}" method="${3-}" policy="${4-}" strategy_flag
+  (( $# >= 4 )) || return 2
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$reviewed_head" =~ ^[0-9a-f]{40}$ ]] || return 2
@@ -252,6 +283,8 @@ jhw_pr_merge_reviewed_head() {
     rebase) strategy_flag='--rebase' ;;
     *) echo "unsupported merge method" >&2; return 2 ;;
   esac
+  shift 4
+  jhw_pr_merge_review_gate "$policy" "$@" || return
   gh pr merge "$pr" --repo "$REPO_NWO" --match-head-commit "$reviewed_head" \
     "$strategy_flag" --delete-branch
 }
@@ -981,10 +1014,11 @@ jhw_pr_apply_existing_pr_policy() {
 4. **리뷰 라운드 트리거 + 폴링** — `request`는 활성 중앙 workflow를 같은 head에서 재사용/dispatch하고 eligible App을 명시적으로 요청한다. `auto=true`는 일반 event run을 사용하면서 eligible App을 현재 head에 명시적으로 요청한다. `--auto-fix` 재푸시 라운드도 같은 head-scoped App helper와 현재-head workflow 계약을 반복하며, 각 expected 리뷰어가 terminal 신호를 낼 때까지 (또는 timeout) 폴링한다:
    - 워크플로우 리뷰어: `actions/runs?head_sha=$SHA`(주 감지, PAT에서 동작) + `gh run watch <run-id> --exit-status`(BG, 라이브 대기). `gh pr checks`/`commits/{sha}/check-runs`는 토큰 Checks-read 권한 없으면 403이라 의존하지 않는다.
    - 앱/봇 리뷰어: 매 간격 `reviews`/`comments`/`issue-comments`/`reactions` 수집
-5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다.
+5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다. planned reviewer별 terminal 상태를 `ROUND_REVIEW_STATUSES` 배열에 정확히 한 개씩 보존하며, reviewer가 하나도 계획되지 않았으면 빈 배열을 임의의 `CLEAN`으로 바꾸지 않는다.
 6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. **push 직전에** `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 캡처하고 재푸시 → 성공 직후 `ROUND_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"` 캡처 → **`ROUND_HEAD="$(git rev-parse HEAD)"` 및 `SHA="$ROUND_HEAD"` 재계산** → 아래 라운드 계약 실행 → 4로 복귀한다. `ROUND_STARTED_AT`은 run 필터 경계이고, 180초 생성 유예는 느린 push 시간을 제외하도록 `ROUND_PUSHED_AT`부터 잰다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 5) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
-7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" <merge|squash|rebase>`. 이 helper는 `gh pr merge --match-head-commit "$ROUND_HEAD"`로 최종 mutation 자체를 검토된 SHA에 원자적으로 묶는다.
+7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" <merge|squash|rebase> "$EFFECTIVE_REVIEW_POLICY" "${ROUND_REVIEW_STATUSES[@]}"`. 이 helper는 review-on policy에서 상태가 0개인 vacuous CLEAN을 거부하고 모든 상태가 `CLEAN`인지 확인한 뒤, `gh pr merge --match-head-commit "$ROUND_HEAD"`로 최종 mutation 자체를 검토된 SHA에 원자적으로 묶는다.
    - 명시적 `--no-review --merge`에서는 AI gate만 면제한다. required CI, 타겟, 현재 head, mergeability와 merge method 검증은 그대로 유지하고 `AI review: explicitly skipped (--no-review; review:skip)` receipt를 남긴다.
+   - `review.auto=false`인 implicit auto mode는 zero-review merge exemption이 아니다. 자동 머지를 원하면 사용자가 명시적으로 `--no-review --merge`를 선택해야 한다.
    - 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT}` 중 하나이거나 타겟 `FAIL`이면 **머지하지 않고** 보고
    - **루프는 반드시 종료**: (a) 전원 CLEAN(블로킹 0) → 머지/종료, (b) `--max-rounds`(기본 5) 도달 → 남은 블로킹 보고 후 종료, (c) 트리거 유예 만료 → TRIGGER_FAILED 보고, (d) `--timeout` → 시작 후 미응답 TIMEOUT 보고. 종료 조건이 "지적 0건"이 아니라 "블로킹 0건"이라 nit 무한생성에도 끝난다.
    - 리포가 squash/rebase를 강제하면 `--merge` 대신 `--squash`/`--rebase` 사용 (`gh repo view --json mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed`로 감지)
@@ -1722,7 +1756,7 @@ if [ -z "$(printf '%s' "${TARGET_CMD:-}" | tr -d '[:space:]')" ]; then echo "TAR
 
 ## 규칙
 
-- **머지 안전** — 머지는 되돌리기 어려우므로 **required CI 성공 + 현재 head 불변 + 전원 CLEAN + (요청 시)타겟 PASS + mergeable/supported method**일 때만. 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT}`, required CI 실패, head 변경 또는 타겟 FAIL이면 중단·보고 (전역 규칙: 롤백 불가 작업 사전 확인). 여기서 CLEAN은 **'블로킹 0건'**이며, 블로킹 미만 nit은 보고만 하고 머지를 막지 않는다. 명시적 `--no-review --merge`만 AI CLEAN 항목을 면제하고 다른 항목은 그대로 적용한다.
+- **머지 안전** — 머지는 되돌리기 어려우므로 **required CI 성공 + 현재 head 불변 + reviewer 상태 1개 이상 + 전원 CLEAN + (요청 시)타겟 PASS + mergeable/supported method**일 때만. 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT, UNAVAILABLE}`, reviewer 상태 0개, required CI 실패, head 변경 또는 타겟 FAIL이면 중단·보고 (전역 규칙: 롤백 불가 작업 사전 확인). 여기서 CLEAN은 **'블로킹 0건'**이며, 블로킹 미만 nit은 보고만 하고 머지를 막지 않는다. 명시적 `--no-review --merge`만 AI CLEAN 항목을 면제하고 다른 항목은 그대로 적용한다.
 - **리액션 타입 구분** — `+1`(👍)/`heart`=긍정(CLEAN 신호; Codex의 문서화된 무지적 신호는 `+1`), `hooray`/`rocket`=정보성(**CLEAN 판정에 사용 안 함**), `eyes`(👀)=확인중(PENDING 유지), `-1`/`confused`=부정(FEEDBACK 취급).
 - **봇 신원 보정 (동적 감지가 canonical)** — 본문 표의 신원은 이 리포 기준 **예시**. 앱은 동일 저장소의 PR 댓글·inline·review 또는 head-scoped 요청의 clean reaction canary로 증명하며, quota·connector·review 불가 응답은 capability 증거에서 제외한다. Codex는 `chatgpt-codex-connector`/`chatgpt-codex-connector[bot]` 중 유효한 actor가 정확히 하나일 때 그 값을 현재 invocation에 고정한다. 두 identity가 함께 보이면 추정하지 않고 `UNAVAILABLE`이다. 워크플로우는 `.github/workflow-config.yml`의 enabled 설정, Actions metadata의 exact `.github/workflows/<file>` 경로·고정 표시 이름·active 상태, `actions/runs`의 같은 표시 이름으로 식별한다. 모르는 `*[bot]` 응답은 expected reviewer로 승격하지 않고 보고에만 포함한다.
 - **워크플로우 실패 ≠ 지적** — auto-review run이 `failure`여도(예: API 키 문제) 같은 역할의 앱 리뷰가 있으면 그쪽을 신뢰. run 실패만으로 머지 차단하지 않되 보고에 명시.

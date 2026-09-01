@@ -588,6 +588,11 @@ async function main() {
   assert.match(prText, /jhw_pr_dispatch_same_head opencode-auto-review\.yml 'OpenCode Auto PR Review' "\$head"/);
   assert.match(prText, /jhw_pr_wait_required_checks "\$PR" "\$ROUND_HEAD"/);
   assert.match(prText, /gh pr merge .*--match-head-commit/);
+  assert.match(
+    prText,
+    /jhw_pr_merge_reviewed_head "\$PR" "\$ROUND_HEAD" <merge\|squash\|rebase> "\$EFFECTIVE_REVIEW_POLICY" "\$\{ROUND_REVIEW_STATUSES\[@\]\}"/,
+    "the documented merge path must pass effective policy and non-vacuous reviewer statuses",
+  );
   assert.match(prText, /jhw_pr_prepare_review_plan "\$mode"/,
     "reviewer capability planning must run before PR policy mutation");
   assert.match(prText, /jhw_pr_request_eligible_apps "\$ROUND_HEAD"/,
@@ -1767,9 +1772,63 @@ async function main() {
     assert.equal(baseChangedDuringChecks.code, 3,
       "a base change during required checks must invalidate the policy scope");
 
+    const emptyReviewMerge = await runResult(
+      baseState({ prHead: currentHead }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge request`,
+    );
+    assert.notEqual(emptyReviewMerge.code, 0,
+      "explicit review must not merge when no reviewer reached CLEAN");
+    assert.equal(emptyReviewMerge.state.prMerged, false);
+
+    const noEligibleReviewMerge = await runResult(
+      baseState({
+        prHead: currentHead,
+        workflowStates: {
+          "claude-code-review.yml": "disabled_manually",
+          "gemini-auto-review.yml": "disabled_manually",
+          "opencode-auto-review.yml": "disabled_manually",
+        },
+        appComments: [],
+        appPullComments: [],
+        appRequestComments: [],
+        appReviews: [],
+        appPrReactions: [],
+      }),
+      [
+        "jhw_pr_prepare_review_plan request",
+        "printf 'available=%s\\neligible=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_ELIGIBLE_APPS\"",
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} merge request`,
+      ].join("\n"),
+    );
+    assert.notEqual(noEligibleReviewMerge.code, 0);
+    assert.match(noEligibleReviewMerge.stdout, /^available=$/m);
+    assert.match(noEligibleReviewMerge.stdout, /^eligible=$/m);
+    assert.equal(noEligibleReviewMerge.state.prMerged, false,
+      "an all-unavailable preflight must not become a vacuous CLEAN merge");
+    assert.equal(
+      noEligibleReviewMerge.log.some((args) => args[0] === "pr" && args[1] === "merge"),
+      false,
+    );
+
+    const nonCleanReviewMerge = await runResult(
+      baseState({ prHead: currentHead }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge request CLEAN UNAVAILABLE`,
+    );
+    assert.notEqual(nonCleanReviewMerge.code, 0,
+      "every planned reviewer status must be CLEAN before merge");
+    assert.equal(nonCleanReviewMerge.state.prMerged, false);
+
+    const autoDisabledMerge = await runResult(
+      baseState({ prHead: currentHead }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge auto=false`,
+    );
+    assert.notEqual(autoDisabledMerge.code, 0,
+      "auto=false must require an explicit --no-review exemption before merge");
+    assert.equal(autoDisabledMerge.state.prMerged, false);
+
     const atomicMerge = await run(
       baseState({ prHead: currentHead }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge`,
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge request CLEAN CLEAN`,
     );
     assert.equal(atomicMerge.state.prMerged, true);
     assert.deepEqual(
@@ -1782,11 +1841,18 @@ async function main() {
 
     const mergeRace = await runResult(
       baseState({ prHead: currentHead, headBeforeMerge: oldHead }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge`,
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge request CLEAN`,
     );
     assert.notEqual(mergeRace.code, 0,
       "a remote head change immediately before merge must reject the merge atomically");
     assert.equal(mergeRace.state.prMerged, false);
+
+    const explicitSkipMerge = await run(
+      baseState({ prHead: currentHead }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} merge skip`,
+    );
+    assert.equal(explicitSkipMerge.state.prMerged, true,
+      "explicit --no-review remains the sole zero-review merge exemption");
 
     const skipWaitPlan = await run(baseState(), "jhw_pr_mode_wait_plan skip true");
     assert.equal(

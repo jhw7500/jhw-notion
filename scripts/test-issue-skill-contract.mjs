@@ -1085,6 +1085,7 @@ async function main() {
         issueExists: true,
         issueComments: [
           requestComment,
+          response("Claude encountered an error while reviewing."),
           response("Requirements look complete; no blockers found.", {
             id: 1004,
             createdAt: "2026-09-01T00:04:00Z",
@@ -1125,6 +1126,44 @@ async function main() {
       "a higher-ID successful retry must supersede an older same-second failed workflow run");
     assert.match(supersededFailedRun.stdout, /issuecomment-1004/);
 
+    const retryAwaitingResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("Claude encountered an error while reviewing.")],
+        runs: [
+          {
+            id: 506,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "failure",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/506",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+          {
+            id: 507,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "in_progress",
+            conclusion: "null",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/507",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(retryAwaitingResponse.stdout.split("\n")[0], "PENDING",
+      "a higher-ID same-second retry must keep an uncorrelated error pending");
+    assert.match(retryAwaitingResponse.stdout, /acknowledged/);
+
     const sameSecondFailedRun = await classify(
       issueState({
         issueExists: true,
@@ -1147,6 +1186,34 @@ async function main() {
     );
     assert.equal(sameSecondFailedRun.stdout.split("\n")[0], "PENDING",
       "a same-second workflow run without a request-comment ID cannot prove causality");
+
+    await assert.rejects(
+      classify(
+        issueState({
+          issueExists: true,
+          issueComments: [requestComment],
+          runs: [{
+            id: "9007199254740993",
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "in_progress",
+            conclusion: "null",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/unsafe",
+            displayTitle: "Review this",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          }],
+        }),
+        "claude",
+        triggerDeadline - 1,
+      ),
+      (error) => {
+        assert.match(error.stderr, /invalid workflow run id/);
+        return true;
+      },
+      "an unsafe workflow run ID must fail closed before same-second ordering",
+    );
 
     const unrelatedFailedRun = await classify(
       issueState({
@@ -1181,6 +1248,73 @@ async function main() {
     );
     assert.equal(rejected.stdout.split("\n")[0], "FAILED");
     assert.match(rejected.stdout, /connector_rejected/);
+
+    const staleRejectedReaction = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("Requirements look complete; no blockers found.", {
+            id: 1004,
+            createdAt: "2026-09-01T00:04:00Z",
+            url: "https://github.com/example/repo/issues/99#issuecomment-1004",
+          }),
+        ],
+        commentReactions: [{
+          actor: expectedBot,
+          content: "confused",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: requestComment.url,
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(staleRejectedReaction.stdout.split("\n")[0], "CLEAN",
+      "a later substantive response must supersede an older rejection reaction");
+
+    const latestRejectedReaction = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("Requirements look complete; no blockers found.")],
+        commentReactions: [{
+          actor: expectedBot,
+          content: "confused",
+          createdAt: "2026-09-01T00:03:00Z",
+          url: requestComment.url,
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(latestRejectedReaction.stdout.split("\n")[0], "FAILED",
+      "a rejection reaction newer than the latest response must remain terminal");
+    assert.match(latestRejectedReaction.stdout, /connector_rejected/);
+
+    const sameSecondRejectedReaction = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("Requirements look complete; no blockers found.", {
+            id: 1004,
+            createdAt: "2026-09-01T00:03:00Z",
+            url: "https://github.com/example/repo/issues/99#issuecomment-1004",
+          }),
+        ],
+        commentReactions: [{
+          actor: expectedBot,
+          content: "confused",
+          createdAt: "2026-09-01T00:03:00Z",
+          url: requestComment.url,
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(sameSecondRejectedReaction.stdout.split("\n")[0], "PENDING",
+      "same-second cross-type terminal signals must remain pending without ordering proof");
+    assert.match(sameSecondRejectedReaction.stdout, /ambiguous_same_second_signal/);
 
     const unacknowledged = await classify(
       issueState({ issueExists: true, issueComments: [requestComment] }),
@@ -1579,6 +1713,21 @@ async function main() {
       "auto mode with no requested reviewer must finish without polling");
     assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
       "no-reviewer execution must remove its private summary state");
+
+    await setRepoFixture({ config: "review:\n  auto: false\n" });
+    for (const [mode, title] of [["skip", "Skip review"], ["auto", "Auto disabled"]]) {
+      const intentionallyUnreviewed = await runIssue(
+        issueState(),
+        `jhw_issue_execute '${title}' 'Body text' ${mode} 20`,
+        { JHW_ISSUE_STATE_FILE: "" },
+      );
+      assert.match(intentionallyUnreviewed.stdout, /^Requested reviewers: none$/m);
+      assert.match(intentionallyUnreviewed.stdout, /^Unavailable reviewers: none$/m);
+      assert.match(intentionallyUnreviewed.stdout, /^Highest disposition: CLEAN$/m,
+        `${mode} mode must preserve the intentional no-review disposition`);
+      assert.equal(intentionallyUnreviewed.state.issueComments.length, 0);
+      assert.equal(intentionallyUnreviewed.log.filter((args) => args[0] === "sleep").length, 0);
+    }
 
     console.log("issue skill contract: ok");
   } finally {
