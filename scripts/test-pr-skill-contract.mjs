@@ -2766,6 +2766,40 @@ async function main() {
     assert.equal(sameSecondUnscopedReaction.stdout.trim(), "PENDING",
       "a PR-root reaction from the request timestamp second is not request-scoped and must remain pending");
 
+    for (const [label, artifacts] of [
+      ["review", {
+        reviews: [{
+          id: 5240,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: requestCreatedAt,
+          body: "No P1 findings.",
+        }],
+      }],
+      ["inline comment", {
+        pullComments: [{
+          id: 6240,
+          actor: "chatgpt-codex-connector[bot]",
+          reviewId: 0,
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: requestCreatedAt,
+          body: "P1: stale same-second finding.",
+        }],
+      }],
+    ]) {
+      const sameSecondUnscopedArtifact = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          ...artifacts,
+        }),
+        "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+        { SHIP_NOW_EPOCH: String(requestEpoch + 300) },
+      );
+      assert.equal(sameSecondUnscopedArtifact.stdout.trim(), "PENDING",
+        `a same-second ${label} without a request coordinate must remain out of scope`);
+    }
+
     const laterUnscopedReaction = await run(
       baseState({
         issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],

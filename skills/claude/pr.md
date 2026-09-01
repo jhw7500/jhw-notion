@@ -1957,7 +1957,9 @@ ship_codex_signal_status() {
     occurred_epoch="$(ship_timestamp_epoch "$occurred_at")" || {
       SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
     }
-    (( occurred_epoch >= request_epoch )) || continue
+    # Reviews have no request-comment coordinate. Same-second artifacts may
+    # predate this round, so require strict chronology.
+    (( occurred_epoch > request_epoch )) || continue
     [[ "$review_id" =~ ^[1-9][0-9]*$ ]] || {
       SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
     }
@@ -2000,7 +2002,8 @@ ship_codex_signal_status() {
     occurred_epoch="$(ship_timestamp_epoch "$occurred_at")" || {
       SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
     }
-    (( occurred_epoch >= request_epoch )) || continue
+    # Inline comments are likewise not request-scoped; equality is ambiguous.
+    (( occurred_epoch > request_epoch )) || continue
     [[ "$comment_id" =~ ^[1-9][0-9]*$ && ( "$review_id" == 0 || "$review_id" =~ ^[1-9][0-9]*$ ) ]] || {
       SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
     }
@@ -2434,7 +2437,7 @@ ship_signal_cleanup_finish || return
 ### 리뷰어별 terminal 판정 규칙
 
 - **워크플로우 이름·event 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. 현재 라운드는 `head_sha == ROUND_HEAD`, `event == JHW_PR_WORKFLOW_TRIGGER_EVENT`, `created_at >= ROUND_STARTED_AT`, `run_id > 사전 캡처 floor`를 모두 만족해야 한다. 그래서 같은 초에 PR event와 명시 dispatch가 함께 있어도 현재 라운드가 선택한 event만 판정한다. 같은 event의 최신 시각에 서로 다른 run ID가 둘 이상이면 API 순서로 고르지 않고 `TRIGGER_FAILED(ambiguous_current_head_runs)`다. push 완료 시각인 `ROUND_PUSHED_AT`부터 180초 안에 run이 없으면 **TRIGGER_FAILED**이며, 시작된 run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**이다.
-- **Codex**: auto-fix 라운드에서는 성공적으로 기록된 현재 head/base OID 요청 댓글의 `created_at` 이후 신호만 본다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **열린 블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**이며, 더 늦은 `+1`은 이를 해소하지 못한다. 블로커는 review dismissal 또는 새 head로 scope 밖이 된 경우에만 제거된다. `No P1 findings`처럼 명시적으로 부정된 priority/severity 문구는 제거한 뒤 남은 affirmative 라벨만 센다. 현재-head 리뷰/diff코멘트가 quota·connector·환경 생성 실패나 review 불가를 보고하면 블로킹 라벨 유무와 무관하게 **FAILED**다. (a) 그 외 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) 열린 블로커가 없고 PR 루트에는 요청 시각보다 엄격히 나중인 `chatgpt-codex-connector[bot] +1`, 정확한 요청 댓글에는 요청 시각과 같거나 나중인 `+1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
+- **Codex**: auto-fix 라운드에서는 성공적으로 기록된 현재 head/base OID 요청 댓글의 `created_at` 이후 신호만 본다. 요청 좌표가 없는 review·diff코멘트·PR 루트 reaction은 요청 시각보다 **엄격히 나중**이어야 하고, 정확한 요청 댓글의 reaction만 같은 초를 허용한다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **열린 블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**이며, 더 늦은 `+1`은 이를 해소하지 못한다. 블로커는 review dismissal 또는 새 head로 scope 밖이 된 경우에만 제거된다. `No P1 findings`처럼 명시적으로 부정된 priority/severity 문구는 제거한 뒤 남은 affirmative 라벨만 센다. 현재-head 리뷰/diff코멘트가 quota·connector·환경 생성 실패나 review 불가를 보고하면 블로킹 라벨 유무와 무관하게 **FAILED**다. (a) 그 외 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) 열린 블로커가 없고 PR 루트에는 요청 시각보다 엄격히 나중인 `chatgpt-codex-connector[bot] +1`, 정확한 요청 댓글에는 요청 시각과 같거나 나중인 `+1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
 - **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
 - **Claude/Gemini schema-3 공통 판정**: reviewer별로 가장 최근에 시작된 현재-head run을 고르고, 위 state 계약과 그 run의 동일 ID/attempt를 가진 v3 봇 코멘트가 정확히 하나이며 run이 `completed`여야 terminal이다. 다른 head/run의 historical v3 코멘트는 선택 대상이 아니다. 성공 state이면 canonical 본문의 `### New findings`와 `### Still open` 아래에서만 정확한 `#### RVW-<12hex> [SEVERITY] title` heading을 센다. `### Resolved`/`### Retracted`, 일반 산문의 bracket 문자열, `filtered_max_severity`는 활성 지적이 아니다. `accepted_count`와 활성 heading 수가 다르거나 state/표시 메타가 불일치하면 성공으로 간주하지 않고 FAILED로 보고한다.
 - **Claude 리뷰**: 유효한 현재-head v3 성공에서 활성 `[CRITICAL]`/`[HIGH]`이 있으면 FEEDBACK, 없으면 CLEAN이다. 유효한 현재-head 실패 state는 FAILED(재실행 후보). run이 `in_progress`면 PENDING. 워크플로우 파일을 바꾸는 PR에서 claude-code-action의 default-branch 동일성 검증으로 모델이 의도적으로 스킵된 경우도 FAILED로 명시하되, 같은 역할의 앱 대체 신호 적용 여부는 아래 규칙을 따른다. **TIMEOUT_MIN을 초과한 in_progress run**은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체한다.
