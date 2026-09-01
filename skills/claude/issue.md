@@ -716,6 +716,8 @@ const snapshot = {
       event: item?.event,
       status: item?.status,
       conclusion: item?.conclusion || "null",
+      run_attempt: item?.run_attempt,
+      run_started_at: item?.run_started_at,
       created_at: item?.created_at,
       url: item?.html_url || "",
       display_title: item?.display_title || "",
@@ -852,19 +854,36 @@ const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
   run.display_title === expectedRunTitle &&
   (run.triggering_actor === snapshot.request_actor || run.actor === snapshot.request_actor));
 
-const runIds = runs.map((run) => Number(run.id));
-if (runIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+const invalidRunId = runs.some((run) => {
+  const id = Number(run.id);
+  return !Number.isSafeInteger(id) || id <= 0;
+});
+if (invalidRunId) {
   process.stderr.write("invalid workflow run id\n");
   process.exit(1);
 }
+const invalidRunCoordinate = runs.some((run) => {
+  const attempt = Number(run.run_attempt);
+  const created = epoch(run.created_at);
+  const started = epoch(run.run_started_at);
+  return !Number.isSafeInteger(attempt) || attempt <= 0 ||
+    created === null || started === null || started < created;
+});
+if (invalidRunCoordinate) {
+  process.stderr.write("invalid workflow run coordinate\n");
+  process.exit(1);
+}
 const orderedRuns = [...runs].sort((left, right) =>
+  epoch(right.run_started_at) - epoch(left.run_started_at) ||
+  Number(right.run_attempt) - Number(left.run_attempt) ||
   epoch(right.created_at) - epoch(left.created_at) || Number(right.id) - Number(left.id));
 const latestRun = orderedRuns[0];
 if (latestRun?.status === "completed" && !["success", "neutral", "skipped"].includes(latestRun.conclusion)) {
   emit("FAILED", latestRun.url, "workflow_failed");
 }
-const latestRunEpoch = latestRun ? epoch(latestRun.created_at) : null;
+const latestRunEpoch = latestRun ? epoch(latestRun.run_started_at) : null;
 const latestRunId = latestRun ? Number(latestRun.id) : null;
+const latestRunAttempt = latestRun ? Number(latestRun.run_attempt) : null;
 let latestRunReference = null;
 if (latestRun) {
   const runUrl = typeof latestRun.url === "string" ? latestRun.url : "";
@@ -882,7 +901,9 @@ if (latestRun) {
 }
 const isCurrentRunComment = (comment) => {
   const parsed = epoch(comment.created_at);
-  return parsed !== null && parsed >= latestRunEpoch &&
+  const followsAttemptStart = parsed !== null &&
+    (parsed > latestRunEpoch || (latestRunAttempt === 1 && parsed === latestRunEpoch));
+  return followsAttemptStart &&
     latestRunReference?.test(comment.body || "") === true;
 };
 const currentComments = latestRunEpoch === null
@@ -1435,12 +1456,15 @@ GitHub의 UTC 시각은 초 단위이므로 요청과 응답이 같은 초에 �
 요청 댓글보다 큰 comment ID만 후속 신호로 인정하고, reaction은 정확한 요청 댓글의 reactions
 endpoint에 종속되므로 같은 초를 허용한다. workflow run도 정확한 request comment ID를
 `display_title`에 담으므로 요청 시각과 같은 초부터 인정하되, 다른 멘션의 run은 제외한다.
-같은 요청에 여러 relevant workflow run이 있으면 `created_at`, run ID 순으로 가장 최신 run만
-workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다. relevant run ID가 양의
-safe integer가 아니면 정렬 권한을 정할 수 없어 classifier가 fail-closed한다. bot 댓글도 같은
+같은 요청에 여러 relevant workflow run이 있으면 `run_started_at`, `run_attempt`, `created_at`, run ID
+순으로 가장 최신 attempt만 workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다.
+relevant run ID·attempt가 양의 safe integer가 아니거나 attempt 시작 시각이 유효하지 않으면 정렬 권한을
+정할 수 없어 classifier가 fail-closed한다. bot 댓글도 같은
 순서의 최신 substantive 댓글만 판정하며, 거절 reaction은 그 댓글이 없거나 더 나중일 때만 우선한다.
 선택된 run 이후의 bot 댓글은 시각 차이와 무관하게 본문이 그 run의 검증된 `html_url`을 정확히
 참조할 때만 verdict로 인정한다. 좌표 없는 댓글과 run 좌표를 담을 수 없는 reaction은 인정하지 않는다.
+첫 attempt는 run 시작과 같은 초의 정확한 run-link 댓글을 허용하지만, re-run은 이전 attempt 댓글과
+초 단위로 구분할 수 없으므로 최신 attempt 시작 시각보다 엄격히 뒤의 댓글만 인정한다.
 run 좌표를 담은 non-failure verdict도 선택된 run이 완료되기 전에는 terminal로 판정하지 않고
 `PENDING(workflow_in_progress)`으로 재poll한다.
 선택된 reviewer 응답의 usage-limit·quota 소진 또는 provider/connector/environment 실패는 구현

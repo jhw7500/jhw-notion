@@ -299,6 +299,8 @@ if (endpoint === "repos/example/repo/actions/runs") {
       event: item.event,
       status: item.status,
       conclusion: item.conclusion,
+      run_attempt: item.runAttempt ?? 1,
+      run_started_at: item.runStartedAt || item.createdAt,
       created_at: item.createdAt,
       html_url: item.url || "",
       display_title: item.displayTitle || "",
@@ -314,6 +316,8 @@ if (endpoint === "repos/example/repo/actions/runs") {
     event: item.event,
     status: item.status,
     conclusion: item.conclusion,
+    run_attempt: item.runAttempt ?? 1,
+    run_started_at: item.runStartedAt || item.createdAt,
     created_at: item.createdAt,
     url: item.url || "",
     display_title: item.displayTitle || "",
@@ -1080,6 +1084,78 @@ async function main() {
     assert.equal(inProgressRunResponse.stdout.split("\n")[0], "PENDING",
       "a run-linked verdict must not become terminal before its selected workflow run completes");
     assert.match(inProgressRunResponse.stdout, /workflow_in_progress/);
+
+    const retryRun = {
+      id: 500,
+      name: "Claude Code",
+      event: "issue_comment",
+      status: "completed",
+      conclusion: "success",
+      runAttempt: 2,
+      runStartedAt: "2026-09-01T00:03:00Z",
+      createdAt: "2026-09-01T00:01:30Z",
+      url: "https://github.com/example/repo/actions/runs/500",
+      displayTitle: "jhw-review-comment-1001",
+      actor: "jhw7500",
+      triggeringActor: "jhw7500",
+    };
+
+    const stalePriorAttemptResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response([
+            "**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/500)",
+            "",
+            "No blockers found.",
+          ].join("\n"), { createdAt: "2026-09-01T00:02:00Z" }),
+        ],
+        runs: [retryRun],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(stalePriorAttemptResponse.stdout.split("\n")[0], "PENDING",
+      "a prior attempt verdict sharing the rerun ID and URL must not satisfy the latest attempt");
+
+    const currentRetryResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response([
+            "**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/500)",
+            "",
+            "No blockers found.",
+          ].join("\n"), { createdAt: "2026-09-01T00:03:01Z" }),
+        ],
+        runs: [retryRun],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(currentRetryResponse.stdout.split("\n")[0], "CLEAN",
+      "a rerun verdict posted after the selected attempt starts must remain admissible");
+
+    const sameSecondRetryResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response([
+            "**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/500)",
+            "",
+            "No blockers found.",
+          ].join("\n"), { createdAt: retryRun.runStartedAt }),
+        ],
+        runs: [retryRun],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(sameSecondRetryResponse.stdout.split("\n")[0], "PENDING",
+      "a same-second rerun verdict cannot be attributed to the latest attempt");
 
     const sameSecondUncorrelatedResponse = await classify(
       issueState({
