@@ -1039,6 +1039,20 @@ async function main() {
     assert.equal(clean.stdout.split("\n")[0], "CLEAN");
     assert.match(clean.stdout, /issuecomment-1002/);
 
+    for (const verdict of ["No findings.", "No issues found."]) {
+      const explicitNoFindings = await classify(
+        issueState({
+          issueExists: true,
+          issueComments: [requestComment, response(verdict)],
+          commentReactions: [acknowledgment],
+        }),
+        "claude",
+        triggerDeadline - 1,
+      );
+      assert.equal(explicitNoFindings.stdout.split("\n")[0], "CLEAN",
+        `an explicit terminal verdict (${verdict}) must remain CLEAN`);
+    }
+
     const negatedRiskFindings = await classify(
       issueState({
         issueExists: true,

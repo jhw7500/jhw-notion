@@ -963,7 +963,7 @@ if (verdictComment && latestRun && latestRun.status !== "completed") {
   emit("PENDING", latestRun.url, "workflow_in_progress");
 }
 const feedbackPattern = /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i;
-const cleanLine = /^(?:no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|(?:the\s+)?(?:requirements?|proposal)\s+(?:(?:look|looks|are|is)\s+)?complete(?:\s+and\s+ready for implementation)?(?:[.;]\s*(?:no blockers?(?:\s+found)?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)))?|looks good|ready for implementation|review clean|lgtm)[.!]?$/i;
+const cleanLine = /^(?:no (?:findings?|issues?)(?:\s+(?:found|identified))?|no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|(?:the\s+)?(?:requirements?|proposal)\s+(?:(?:look|looks|are|is)\s+)?complete(?:\s+and\s+ready for implementation)?(?:[.;]\s*(?:no blockers?(?:\s+found)?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)))?|looks good|ready for implementation|review clean|lgtm)[.!]?$/i;
 const negatedFindingLine = /^no (?:(?:missing requirements?|implementation risks?)(?:\s+(?:or|and)\s+(?:missing requirements?|implementation risks?))*|(?:\[(?:CRITICAL|HIGH)\]|P[01])\s+(?:issues?|findings?))[.!]?$/i;
 const cleanVerdictLines = (body) => String(body || "").split(/\r?\n/)
   .map((line) => line.trim())

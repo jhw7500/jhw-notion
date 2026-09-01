@@ -25,6 +25,7 @@ const currentHead = "a".repeat(40);
 const oldHead = "b".repeat(40);
 const currentBaseOid = "c".repeat(40);
 const oldBaseOid = "d".repeat(40);
+const mergeCommit = "e".repeat(40);
 const roundStartedAt = "2026-08-29T00:00:00Z";
 const requestCreatedAt = "2026-08-29T00:01:00Z";
 const startEpoch = Date.parse(roundStartedAt) / 1000;
@@ -124,7 +125,12 @@ function optionValue(name) {
 }
 
 if (argv[0] === "repo" && argv[1] === "view") {
-  process.stdout.write((state.viewerPermission || "READ") + "\n");
+  const query = optionValue("--jq") || optionValue("-q") || "";
+  if (query === ".mergeCommitAllowed") {
+    process.stdout.write(String(state.mergeCommitAllowed ?? true) + "\n");
+  } else {
+    process.stdout.write((state.viewerPermission || "READ") + "\n");
+  }
   process.exit(0);
 }
 
@@ -159,7 +165,11 @@ if (argv[0] === "pr" && argv[1] === "view") {
   if (!state.prExists) process.exit(1);
   const fields = optionValue("--json") || "";
   const query = optionValue("--jq") || optionValue("-q") || "";
-  if (query.includes(".headRefOid") && query.includes(".headRefName") &&
+  if (query.includes(".state") && query.includes(".mergeCommit.oid") && query.includes("@tsv")) {
+    process.stdout.write((state.prMerged && !state.hideMergeConfirmation ? "MERGED" : "OPEN") + "\t" +
+      (state.prMerged && !state.hideMergeConfirmation ? state.mergeCommit : "") + "\n");
+  }
+  else if (query.includes(".headRefOid") && query.includes(".headRefName") &&
       query.includes(".isCrossRepository") && query.includes("@tsv")) {
     process.stdout.write([
       state.prHead,
@@ -249,20 +259,6 @@ if (argv[0] === "pr" && argv[1] === "checks") {
   }
   if (state.requiredChecksMessage) process.stderr.write(state.requiredChecksMessage);
   process.exit(state.requiredChecksExit || 0);
-}
-
-if (argv[0] === "pr" && argv[1] === "merge") {
-  if (!state.prExists) process.exit(1);
-  if (state.headBeforeMerge) state.prHead = state.headBeforeMerge;
-  const expectedHead = optionValue("--match-head-commit");
-  const strategies = ["--merge", "--squash", "--rebase"].filter((flag) => argv.includes(flag));
-  if (expectedHead !== state.prHead || strategies.length !== 1 || !argv.includes("--delete-branch")) {
-    save();
-    process.exit(1);
-  }
-  state.prMerged = true;
-  save();
-  process.exit(0);
 }
 
 if (argv[0] === "workflow" && argv[1] === "view") {
@@ -522,6 +518,10 @@ const argv = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
 fs.appendFileSync(logPath, JSON.stringify(["git", ...argv]) + "\n");
 
+function save() {
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+}
+
 if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
   process.stdout.write(state.localHead + "\n");
   process.exit(0);
@@ -529,6 +529,37 @@ if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
 
 if (argv[0] === "rev-parse" && argv[1] === "--show-toplevel") {
   process.stdout.write(process.env.FAKE_GIT_TOPLEVEL + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "remote" && argv[1] === "get-url" && argv[2] === "--all" && argv[3] === "origin") {
+  process.stdout.write((state.originFetchUrls || ["https://github.com/example/repo.git"]).join("\n") + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "remote" && argv[1] === "get-url" && argv[2] === "--push" &&
+    argv[3] === "--all" && argv[4] === "origin") {
+  process.stdout.write((state.originPushUrls || ["https://github.com/example/repo.git"]).join("\n") + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "ls-remote" && argv[1] === "--refs" && argv[2] === "origin" &&
+    argv[3] === "refs/pull/" + state.prNumber + "/merge") {
+  if (state.failMergeRefLookup) process.exit(1);
+  process.stdout.write(state.mergeCommit + "\trefs/pull/" + state.prNumber + "/merge\n");
+  process.exit(0);
+}
+
+if (argv[0] === "fetch" && argv[1] === "--no-tags" && argv[2] === "--quiet" &&
+    argv[3] === "origin" && argv[4] === "refs/pull/" + state.prNumber + "/merge") {
+  if (state.failMergeFetch) process.exit(1);
+  state.fetchHead = state.mergeCommit;
+  save();
+  process.exit(0);
+}
+
+if (argv[0] === "show" && argv[1] === "-s" && argv[2] === "--format=%P" && argv[3] === state.mergeCommit) {
+  process.stdout.write((state.mergeParents || []).join(" ") + "\n");
   process.exit(0);
 }
 
@@ -542,6 +573,34 @@ if (argv[0] === "check-ref-format" && argv[1] === "--branch") {
 }
 
 if (argv[0] === "push") {
+  if (argv.includes("--atomic")) {
+    if (state.baseOidBeforeAtomicPush) state.prBaseOid = state.baseOidBeforeAtomicPush;
+    if (state.headBeforeAtomicPush) state.prHead = state.headBeforeAtomicPush;
+    const baseLease = "--force-with-lease=refs/heads/" + state.prBase + ":" + state.reviewedBaseOid;
+    const headLease = "--force-with-lease=refs/heads/" + state.prHeadRefName + ":" + state.reviewedHead;
+    const baseUpdate = state.mergeCommit + ":refs/heads/" + state.prBase;
+    const headUpdate = state.mergeCommit + ":refs/heads/" + state.prHeadRefName;
+    const valid = !state.failPush && state.prBaseOid === state.reviewedBaseOid &&
+      state.prHead === state.reviewedHead && argv.includes(baseLease) && argv.includes(headLease) &&
+      argv.includes(baseUpdate) && argv.includes(headUpdate);
+    if (!valid) {
+      save();
+      process.exit(1);
+    }
+    state.prBaseOid = state.mergeCommit;
+    state.prHead = state.mergeCommit;
+    state.prMerged = true;
+    save();
+    process.exit(0);
+  }
+  const branchDeleteLease = "--force-with-lease=refs/heads/" + state.prHeadRefName + ":" + state.mergeCommit;
+  const branchDelete = ":refs/heads/" + state.prHeadRefName;
+  if (argv.includes(branchDeleteLease) && argv.includes(branchDelete)) {
+    if (state.failBranchDelete || state.prHead !== state.mergeCommit) process.exit(1);
+    state.remoteBranchDeleted = true;
+    save();
+    process.exit(0);
+  }
   if (state.failPush) process.exit(1);
   state.remoteBranchHead = state.localHead;
   if (state.prExists && state.pushUpdatesPrHead !== false) state.prHead = state.localHead;
@@ -550,7 +609,7 @@ if (argv[0] === "push") {
     if (nextRun) state.runs.push(nextRun);
     if (!Array.isArray(state.runOnPush)) delete state.runOnPush;
   }
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  save();
   process.exit(0);
 }
 
@@ -604,6 +663,10 @@ function baseState(overrides = {}) {
     isCrossRepository: false,
     prBase: "main",
     prBaseOid: currentBaseOid,
+    reviewedBaseOid: currentBaseOid,
+    reviewedHead: currentHead,
+    mergeCommit,
+    mergeParents: [currentBaseOid, currentHead],
     baseOids: { main: currentBaseOid, release: oldBaseOid },
     pushUpdatesPrHead: true,
     nextId: 9002,
@@ -621,6 +684,7 @@ function baseState(overrides = {}) {
     },
     dispatchedWorkflows: [],
     requiredChecksExit: 0,
+    mergeCommitAllowed: true,
     branchMetadata: {
       protected: false,
       protection: {
@@ -691,10 +755,14 @@ async function main() {
   assert.match(prText, /\(\( run_id > floor \)\) \|\| continue/,
     "workflow polling must ignore runs that existed before the round floor");
   assert.match(prText, /jhw_pr_wait_required_checks "\$PR" "\$ROUND_HEAD" "\$ROUND_BASE_OID"/);
-  assert.match(prText, /gh pr merge .*--match-head-commit/);
+  assert.match(prText, /git push --atomic/);
+  assert.match(prText, /--force-with-lease=refs\/heads\/\$base_ref:\$reviewed_base_oid/);
+  assert.match(prText, /--force-with-lease=refs\/heads\/\$head_ref:\$reviewed_head/);
+  assert.doesNotMatch(policyContractBlock(prText), /gh pr merge/,
+    "the reviewed-base merge path must not fall back to a head-only GitHub API merge");
   assert.match(
     prText,
-    /jhw_pr_merge_reviewed_head "\$PR" "\$ROUND_HEAD" "\$ROUND_BASE_OID" <merge\|squash\|rebase> "\$EFFECTIVE_REVIEW_POLICY" "\$\{ROUND_REVIEW_STATUSES\[@\]\}"/,
+    /jhw_pr_merge_reviewed_head "\$PR" "\$ROUND_HEAD" "\$ROUND_BASE_OID" <merge> "\$EFFECTIVE_REVIEW_POLICY" "\$\{ROUND_REVIEW_STATUSES\[@\]\}"/,
     "the documented merge path must pass effective policy and non-vacuous reviewer statuses",
   );
   assert.match(prText, /jhw_pr_prepare_review_plan "\$mode"/,
@@ -2601,12 +2669,45 @@ async function main() {
     );
     assert.equal(atomicMerge.state.prMerged, true);
     assert.deepEqual(
-      atomicMerge.log.filter((args) => args[0] === "pr" && args[1] === "merge"),
+      atomicMerge.log.filter((args) => args[0] === "git" && args[1] === "push" && args.includes("--atomic")),
       [[
-        "pr", "merge", "42", "--repo", "example/repo", "--match-head-commit", currentHead,
-        "--merge", "--delete-branch",
+        "git", "push", "--atomic",
+        `--force-with-lease=refs/heads/main:${currentBaseOid}`,
+        `--force-with-lease=refs/heads/task/f28bfecee9de-jhw7500-jhw-notion-99:${currentHead}`,
+        "origin", `${mergeCommit}:refs/heads/main`,
+        `${mergeCommit}:refs/heads/task/f28bfecee9de-jhw7500-jhw-notion-99`,
       ]],
     );
+    assert.deepEqual(
+      atomicMerge.log.filter((args) =>
+        args[0] === "git" && args[1] === "push" && !args.includes("--atomic") &&
+        args.includes(":refs/heads/task/f28bfecee9de-jhw7500-jhw-notion-99")),
+      [[
+        "git", "push",
+        `--force-with-lease=refs/heads/task/f28bfecee9de-jhw7500-jhw-notion-99:${mergeCommit}`,
+        "origin", ":refs/heads/task/f28bfecee9de-jhw7500-jhw-notion-99",
+      ]],
+      "the head branch may be deleted only after GitHub confirms the exact merge commit",
+    );
+    assert.equal(atomicMerge.state.remoteBranchDeleted, true);
+
+    for (const [name, overrides] of [
+      ["pending GitHub confirmation", { hideMergeConfirmation: true }],
+      ["rejected branch cleanup", { failBranchDelete: true }],
+    ]) {
+      const retainedAfterMerge = await run(
+        baseState({ prHead: currentHead, ...overrides }),
+        [
+          `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+          "printf 'delete=%s\\n' \"$JHW_PR_BRANCH_DELETE_STATUS\"",
+        ].join("\n"),
+      );
+      assert.equal(retainedAfterMerge.state.prMerged, true,
+        `${name} must not misreport or undo the completed atomic merge`);
+      assert.notEqual(retainedAfterMerge.state.remoteBranchDeleted, true,
+        `${name} must retain the head branch safely`);
+      assert.match(retainedAfterMerge.stdout, /^delete=RETAINED$/m);
+    }
 
     const mergeQueueBranch = await runResult(
       baseState({
@@ -2627,29 +2728,64 @@ async function main() {
     assert.equal(
       mergeQueueBranch.log.some((args) => args[0] === "pr" && args[1] === "merge"),
       false,
-      "merge-queue rejection must happen before gh pr merge can enqueue the PR",
+      "merge-queue rejection must happen before an atomic merge push",
     );
 
     for (const [name, overrides] of [
-      ["unavailable", { failEndpoints: ["/rules/branches/main"] }],
-      ["malformed", { effectiveRules: [{ type: 7 }] }],
+      ["classic branch protection", {
+        branchMetadata: {
+          protected: true,
+          protection: {
+            enabled: true,
+            required_status_checks: {
+              enforcement_level: "non_admins",
+              contexts: [],
+              checks: [],
+            },
+          },
+        },
+      }],
+      ["non-queue active rule", {
+        effectiveRules: [{
+          type: "required_signatures",
+          ruleset_source_type: "Repository",
+          ruleset_source: "example/repo",
+          ruleset_id: 47,
+        }],
+      }],
+      ["disabled merge commits", { mergeCommitAllowed: false }],
     ]) {
-      const uncertainMergeQueue = await runResult(
+      const policyManagedBase = await runResult(
         baseState({ prHead: currentHead, ...overrides }),
         `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
       );
-      assert.notEqual(uncertainMergeQueue.code, 0,
-        `${name} merge-queue metadata must fail closed`);
-      assert.equal(uncertainMergeQueue.state.prMerged, false);
+      assert.equal(policyManagedBase.code, 3, `${name} must require a manual policy-aware merge`);
+      assert.equal(policyManagedBase.state.prMerged, false);
+    }
+
+    for (const [name, overrides] of [
+      ["unavailable classic", { failEndpoints: ["/branches/main"] }],
+      ["malformed classic", { branchMetadata: { protected: "false" } }],
+      ["unavailable ruleset", { failEndpoints: ["/rules/branches/main"] }],
+      ["malformed ruleset", { effectiveRules: [{ type: 7 }] }],
+    ]) {
+      const uncertainBranchPolicy = await runResult(
+        baseState({ prHead: currentHead, ...overrides }),
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+      );
+      assert.notEqual(uncertainBranchPolicy.code, 0,
+        `${name} atomic branch-policy metadata must fail closed`);
+      assert.equal(uncertainBranchPolicy.state.prMerged, false);
       assert.equal(
-        uncertainMergeQueue.log.some((args) => args[0] === "pr" && args[1] === "merge"),
+        uncertainBranchPolicy.log.some((args) =>
+          args[0] === "git" && args[1] === "push" && args.includes("--atomic")),
         false,
-        `${name} merge-queue metadata must fail before gh pr merge`,
+        `${name} branch-policy metadata must fail before an atomic merge push`,
       );
     }
 
     const mergeRace = await runResult(
-      baseState({ prHead: currentHead, headBeforeMerge: oldHead }),
+      baseState({ prHead: currentHead, headBeforeAtomicPush: oldHead }),
       `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
     );
     assert.notEqual(mergeRace.code, 0,
@@ -2663,6 +2799,57 @@ async function main() {
     assert.equal(baseOidMergeRace.code, 3,
       "a base OID change before merge must invalidate the reviewed diff");
     assert.equal(baseOidMergeRace.state.prMerged, false);
+
+    const baseOidAtMergeRace = await runResult(
+      baseState({ prHead: currentHead, baseOidBeforeAtomicPush: oldBaseOid }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+    );
+    assert.notEqual(baseOidAtMergeRace.code, 0,
+      "a base OID change after the final read must be rejected by the merge operation itself");
+    assert.equal(baseOidAtMergeRace.state.prMerged, false,
+      "the merge path must bind the reviewed base OID atomically");
+
+    const staleMergeRef = await runResult(
+      baseState({ prHead: currentHead, mergeParents: [currentBaseOid, oldHead] }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+    );
+    assert.equal(staleMergeRef.code, 3,
+      "the GitHub merge ref must have the exact reviewed base and head as its two parents");
+    assert.equal(staleMergeRef.state.prMerged, false);
+
+    for (const [name, overrides] of [
+      ["cross-repository head", { isCrossRepository: true }],
+      ["mismatched fetch remote", { originFetchUrls: ["https://github.com/example/other.git"] }],
+      ["multiple push remotes", {
+        originPushUrls: [
+          "https://github.com/example/repo.git",
+          "https://github.com/example/mirror.git",
+        ],
+      }],
+    ]) {
+      const unsafeAtomicRemote = await runResult(
+        baseState({ prHead: currentHead, ...overrides }),
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+      );
+      assert.notEqual(unsafeAtomicRemote.code, 0, `${name} must fail closed`);
+      assert.equal(unsafeAtomicRemote.state.prMerged, false);
+      assert.equal(
+        unsafeAtomicRemote.log.some((args) =>
+          args[0] === "git" && args[1] === "push" && args.includes("--atomic")),
+        false,
+        `${name} must be rejected before the atomic push`,
+      );
+    }
+
+    for (const method of ["squash", "rebase"]) {
+      const unsupportedAtomicMethod = await runResult(
+        baseState({ prHead: currentHead }),
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} ${method} request CLEAN`,
+      );
+      assert.equal(unsupportedAtomicMethod.code, 3,
+        `${method} must be rejected when it cannot bind the reviewed base atomically`);
+      assert.equal(unsupportedAtomicMethod.state.prMerged, false);
+    }
 
     const explicitSkipMerge = await run(
       baseState({ prHead: currentHead }),
