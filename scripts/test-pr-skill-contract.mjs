@@ -598,6 +598,11 @@ async function main() {
   assert.match(prText, /jhw-\(pr\|ship\):codex-review round=/);
   assert.match(aliasText, /deprecated/i);
   assert.match(aliasText, /\/jhw:pr/);
+  assert.match(
+    aliasText,
+    /Codex[\s\S]*\$jhw-pr[\s\S]*references\/pr\.md/,
+    "Codex ship alias must resolve the canonical PR skill reference explicitly",
+  );
   assert.doesNotMatch(aliasText, /pr-round-contract: trigger-and-scope:begin/);
   assert.match(prText, /\| Effective command policy \| Managed workflows \| Apps \| AI wait \|/);
   assert.doesNotMatch(prText, /기본 (?:\*\*)?3(?:라운드|\b)/);
