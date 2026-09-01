@@ -200,6 +200,10 @@ if (commentMatch) {
     }
     process.exit(0);
   }
+  if (query.includes("[.id, .user.login, .created_at, .html_url]")) {
+    rows(allComments.map((item) => [item.id, item.actor, item.createdAt, item.url || ""].join("\t")));
+    process.exit(0);
+  }
   if (query.includes("[.user.login, .created_at, .html_url]")) {
     rows(allComments.map((item) => [item.actor, item.createdAt, item.url || ""].join("\t")));
     process.exit(0);
@@ -581,6 +585,28 @@ async function main() {
     );
     assert.equal(bracketedCanaryIdentity.stdout.trim(), "chatgpt-codex-connector[bot]",
       "successful canary proof must return the unique actor identity it authenticated");
+    const sameSecondCanaryIdentity = await runIssue(
+      issueState({
+        canaryComments: [
+          canaryRequest,
+          { ...canaryResponse, createdAt: canaryRequest.createdAt },
+        ],
+      }),
+      `jhw_issue_codex_canary_eligible '${canaryUrl}'`,
+    );
+    assert.equal(sameSecondCanaryIdentity.stdout.trim(), "chatgpt-codex-connector[bot]",
+      "a later comment ID must prove ordering when GitHub timestamps share one second");
+    const nonLaterSameSecondCanary = await runIssueResult(
+      issueState({
+        canaryComments: [
+          canaryRequest,
+          { ...canaryResponse, id: 7000, createdAt: canaryRequest.createdAt },
+        ],
+      }),
+      `jhw_issue_codex_canary_eligible '${canaryUrl}'`,
+    );
+    assert.notEqual(nonLaterSameSecondCanary.code, 0,
+      "a same-second comment without a later ID cannot prove request ordering");
     const codexOnly = await runIssue(
       issueState({
         labels: ["review:request", "review:skip"],
@@ -747,6 +773,47 @@ async function main() {
     assert.equal(clean.stdout.split("\n")[0], "CLEAN");
     assert.match(clean.stdout, /issuecomment-1002/);
 
+    const sameSecondClean = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("No blockers found.", { createdAt: requestCreatedAt }),
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(sameSecondClean.stdout.split("\n")[0], "CLEAN",
+      "a reviewer comment with a later ID in the request second must be accepted");
+
+    const sameSecondEarlierComment = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("No blockers found.", { id: 1000, createdAt: requestCreatedAt }),
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(sameSecondEarlierComment.stdout.split("\n")[0], "PENDING",
+      "a same-second comment without a later ID must remain excluded");
+
+    const sameSecondReaction = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment],
+        commentReactions: [{ ...acknowledgment, createdAt: requestCreatedAt }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(sameSecondReaction.stdout.split("\n")[0], "PENDING");
+    assert.match(sameSecondReaction.stdout, /acknowledged/,
+      "a reaction scoped to the request comment is valid in the request second");
+
     const feedback = await classify(
       issueState({
         issueExists: true,
@@ -845,6 +912,29 @@ async function main() {
     );
     assert.equal(failedRun.stdout.split("\n")[0], "FAILED");
     assert.match(failedRun.stdout, /actions\/runs\/501/);
+
+    const sameSecondFailedRun = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment],
+        runs: [{
+          id: 503,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "failure",
+          createdAt: requestCreatedAt,
+          url: "https://github.com/example/repo/actions/runs/503",
+          displayTitle: "Review this",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(sameSecondFailedRun.stdout.split("\n")[0], "PENDING",
+      "a same-second workflow run without a request-comment ID cannot prove causality");
 
     const unrelatedFailedRun = await classify(
       issueState({

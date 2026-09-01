@@ -109,6 +109,7 @@ if (argv[0] === "pr" && argv[1] === "create") {
   state.prExists = true;
   state.prDraft = state.forceReadyOnCreate ? false : true;
   state.prHead = state.remoteBranchHead;
+  state.prBase = optionValue("--base");
   save();
   process.stdout.write(state.prUrl + "\n");
   process.exit(0);
@@ -137,6 +138,10 @@ if (argv[0] === "pr" && argv[1] === "view") {
 
 if (argv[0] === "pr" && argv[1] === "edit") {
   if (!state.prExists || state.failPrEdit) process.exit(1);
+  if (argv.includes("--base")) {
+    if (state.failBaseEdit) process.exit(1);
+    if (!state.freezeBase) state.prBase = optionValue("--base");
+  }
   if (!state.freezeLabels) {
     for (let index = 0; index < argv.length; index += 1) {
       if (argv[index] === "--remove-label") {
@@ -324,6 +329,15 @@ fs.appendFileSync(logPath, JSON.stringify(["git", ...argv]) + "\n");
 if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
   process.stdout.write(state.localHead + "\n");
   process.exit(0);
+}
+
+if (argv[0] === "check-ref-format" && argv[1] === "--branch") {
+  const branch = argv[2] || "";
+  const valid = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) &&
+    !branch.includes("..") && !branch.includes("//") && !branch.includes("@{") &&
+    !branch.endsWith("/") && !branch.endsWith(".") && !branch.endsWith(".lock");
+  if (valid) process.stdout.write(branch + "\n");
+  process.exit(valid ? 0 : 1);
 }
 
 if (argv[0] === "push") {
@@ -732,6 +746,25 @@ async function main() {
     assert.equal(newPr.state.prHead, currentHead);
     assert.equal(newPr.state.prDraft, false);
 
+    const newPrWithBase = await run(
+      baseState({ prExists: false }),
+      "jhw_pr_apply_new_pr_policy auto",
+      { JHW_PR_BASE: "release/v2" },
+    );
+    assert.equal(newPrWithBase.state.prBase, "release/v2",
+      "new PR creation must retain the explicitly requested base");
+    assert.equal(newPrWithBase.log.some((args) =>
+      isGh(args, "pr", "create") && hasOption(args, "--base", "release/v2")), true);
+
+    const invalidBase = await runResult(
+      baseState({ repoLabels: [], prExists: false }),
+      "jhw_pr_apply_new_pr_policy auto",
+      { JHW_PR_BASE: "../release" },
+    );
+    assert.notEqual(invalidBase.code, 0);
+    assert.deepEqual(mutationCalls(invalidBase.log), [],
+      "an invalid base must fail before labels, push, or PR creation");
+
     const existingPr = await run(
       baseState({ prLabels: ["review:request"] }),
       `jhw_pr_apply_existing_pr_policy skip ${currentHead}`,
@@ -742,6 +775,30 @@ async function main() {
     requireBefore(existingPr.log, addSkip, isGitPush, "skip policy must be applied before synchronize push");
     assert.deepEqual(existingPr.state.prLabels, ["review:skip"]);
     assert.equal(existingPr.state.prHead, currentHead);
+
+    const existingPrWithDifferentBase = await run(
+      baseState({ prLabels: ["review:request"], prBase: "main" }),
+      `jhw_pr_apply_existing_pr_policy skip ${currentHead}`,
+      { JHW_PR_BASE: "release/v2" },
+    );
+    const editBase = (args) => isGh(args, "pr", "edit") && hasOption(args, "--base", "release/v2");
+    requireBefore(existingPrWithDifferentBase.log, editBase, removeRequest,
+      "an existing PR base must be reconciled before review-triggering label changes");
+    requireBefore(existingPrWithDifferentBase.log, editBase, isGitPush,
+      "an existing PR base must be reconciled before synchronize");
+    assert.equal(existingPrWithDifferentBase.state.prBase, "release/v2",
+      "--base must apply to an already-open PR");
+
+    const frozenBase = await runResult(
+      baseState({ prLabels: ["review:request"], prBase: "main", freezeBase: true }),
+      `jhw_pr_apply_existing_pr_policy skip ${currentHead}`,
+      { JHW_PR_BASE: "release/v2" },
+    );
+    assert.notEqual(frozenBase.code, 0);
+    assert.deepEqual(frozenBase.state.prLabels, ["review:request"],
+      "failed base read-back must stop before review policy mutation");
+    assert.equal(frozenBase.log.some(isGitPush), false,
+      "failed base read-back must stop before synchronize");
 
     const sameHeadExistingPr = await run(
       baseState({
@@ -754,6 +811,9 @@ async function main() {
     assert.deepEqual(sameHeadExistingPr.state.prLabels, ["review:request"]);
     assert.equal(sameHeadExistingPr.log.filter(isGitPush).length, 0,
       "an unchanged existing PR head must reconcile policy without a synchronize push");
+    assert.equal(sameHeadExistingPr.log.some((args) =>
+      isGh(args, "pr", "edit") && args.includes("--base")), false,
+    "an already-correct base must not receive a redundant edit");
 
     const autoExisting = await run(
       baseState({ prLabels: ["review:request", "review:skip"] }),

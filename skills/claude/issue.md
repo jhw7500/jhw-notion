@@ -202,7 +202,7 @@ jhw_issue_is_utc_timestamp() {
 
 jhw_issue_codex_canary_eligible() {
   local canary_url="$1" canary_repo canary_issue actor endpoint query raw line
-  local request_id request_at extra response_actor response_at response_url identity=""
+  local request_id request_at extra response_id response_actor response_at response_url identity=""
   local -a requests=()
   [[ -n "$canary_url" ]] || return 1
   if [[ "$canary_url" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)/?$ ]]; then
@@ -230,14 +230,17 @@ jhw_issue_codex_canary_eligible() {
   IFS=$'\t' read -r request_id request_at extra <<<"${requests[0]}"
   [[ "$request_id" =~ ^[1-9][0-9]*$ && -n "$request_at" && -z "$extra" ]] || return 1
   jhw_issue_is_utc_timestamp "$request_at" || return 1
-  raw="$(gh api "$endpoint" --paginate --jq '.[] | [.user.login, .created_at, .html_url] | @tsv' 2>/dev/null)" || return 1
-  while IFS=$'\t' read -r response_actor response_at response_url; do
+  raw="$(gh api "$endpoint" --paginate --jq '.[] | [.id, .user.login, .created_at, .html_url] | @tsv' 2>/dev/null)" || return 1
+  while IFS=$'\t' read -r response_id response_actor response_at response_url extra; do
+    [[ "$response_id" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || continue
     case "$response_actor" in
       chatgpt-codex-connector|chatgpt-codex-connector'[bot]') ;;
       *) continue ;;
     esac
     jhw_issue_is_utc_timestamp "$response_at" || continue
-    [[ "$response_at" > "$request_at" && -n "$response_url" ]] || continue
+    [[ "$response_at" > "$request_at" ||
+      ( "$response_at" == "$request_at" && "$response_id" -gt "$request_id" ) ]] || continue
+    [[ -n "$response_url" ]] || continue
     if [[ -n "$identity" && "$identity" != "$response_actor" ]]; then
       echo "ambiguous Codex bot identity" >&2
       return 1
@@ -645,12 +648,24 @@ if (requests.length !== 1) {
 }
 const request = requests[0];
 const requestEpoch = epoch(request.created_at);
-const later = (value) => {
+const requestId = Number(request.id);
+const atOrAfterRequest = (value) => {
+  const parsed = epoch(value);
+  return parsed !== null && parsed >= requestEpoch && parsed >= issueEpoch;
+};
+const afterRequest = (value) => {
   const parsed = epoch(value);
   return parsed !== null && parsed > requestEpoch && parsed >= issueEpoch;
 };
+const laterComment = (comment) => {
+  const parsed = epoch(comment.created_at);
+  const id = Number(comment.id);
+  return parsed !== null && Number.isSafeInteger(id) && id > 0 &&
+    parsed >= issueEpoch &&
+    (parsed > requestEpoch || (parsed === requestEpoch && id > requestId));
+};
 const laterBotComments = snapshot.comments.filter((comment) =>
-  comment.actor_type === "Bot" && later(comment.created_at));
+  comment.actor_type === "Bot" && laterComment(comment));
 let effectiveBot = expectedBot;
 let acknowledgments = [];
 if (!effectiveBot && reviewer === "claude") {
@@ -674,9 +689,9 @@ const isGeminiAcknowledgment = (comment) => reviewer === "gemini" &&
 const comments = effectiveBot ? laterBotComments.filter((comment) =>
   comment.actor === effectiveBot && !isGeminiAcknowledgment(comment)) : [];
 const reactions = effectiveBot ? snapshot.reactions.filter((reaction) =>
-  reaction.actor === effectiveBot && later(reaction.created_at)) : [];
+  reaction.actor === effectiveBot && atOrAfterRequest(reaction.created_at)) : [];
 const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
-  run.name === workflowName && run.event === "issue_comment" && later(run.created_at) &&
+  run.name === workflowName && run.event === "issue_comment" && afterRequest(run.created_at) &&
   run.display_title === snapshot.issue_title &&
   (run.triggering_actor === snapshot.request_actor || run.actor === snapshot.request_actor));
 
@@ -1105,6 +1120,10 @@ jhw_issue_execute() {
 실행 시작 시 private summary state와 현재 활성 signal snapshot 좌표를 추적하고
 `jhw_issue_install_execution_cleanup`으로 `EXIT/HUP/INT/TERM` 정리를 등록한다. partial failure,
 timeout, 중단 신호에서도 summary state와 0600 signal snapshot만 제거하며 생성된 Issue는 보존한다.
+GitHub의 UTC 시각은 초 단위이므로 요청과 응답이 같은 초에 기록될 수 있다. 댓글은 같은 초일 때
+요청 댓글보다 큰 comment ID만 후속 신호로 인정하고, reaction은 정확한 요청 댓글의 reactions
+endpoint에 종속되므로 같은 초를 허용한다. workflow run에는 요청 comment ID가 없어서 같은 초의
+다른 멘션 run과 구분할 수 없으므로 요청 시각보다 엄격히 뒤인 run만 인정한다.
 
 ## 실행 규칙
 

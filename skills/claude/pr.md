@@ -617,9 +617,27 @@ jhw_pr_reconcile_review_labels() {
   return 0
 }
 
+jhw_pr_expected_base() {
+  local base="${JHW_PR_BASE:-main}"
+  [[ -n "$base" && "$base" != *$'\n'* && "$base" != *$'\r'* ]] || {
+    echo "invalid PR base" >&2
+    return 2
+  }
+  git check-ref-format --branch "$base" >/dev/null 2>&1 || {
+    echo "invalid PR base" >&2
+    return 2
+  }
+  printf '%s\n' "$base"
+}
+
 jhw_pr_verify_remote_policy() {
-  local mode="$1" expected_head="$2" labels actual_head has_request=0 has_skip=0
+  local mode="$1" expected_head="$2" expected_base="$3"
+  local labels actual_head actual_base has_request=0 has_skip=0
   [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid expected head" >&2; return 2; }
+  [[ -n "$expected_base" && "$expected_base" != *$'\n'* && "$expected_base" != *$'\r'* ]] || {
+    echo "invalid expected base" >&2
+    return 2
+  }
   labels="$(gh pr view "$PR" --repo "$REPO_NWO" --json labels --jq '.labels[].name')" || return 1
   grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels" && has_request=1
   grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels" && has_skip=1
@@ -632,46 +650,62 @@ jhw_pr_verify_remote_policy() {
   esac
   actual_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
   [[ "$actual_head" == "$expected_head" ]] || { echo "remote PR head mismatch" >&2; return 1; }
+  actual_base="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefName --jq .baseRefName)" || return 1
+  [[ "$actual_base" == "$expected_base" ]] || { echo "remote PR base mismatch" >&2; return 1; }
 }
 
 jhw_pr_apply_new_pr_policy() {
-  local mode="$1" local_head draft
+  local mode="$1" local_head draft expected_base
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
+  expected_base="$(jhw_pr_expected_base)" || return
   jhw_pr_require_write_permission || return
   jhw_pr_prepare_review_plan "$mode" || return
   jhw_pr_ensure_review_labels || return
   git push -u origin HEAD || return 1
   local_head="$(git rev-parse HEAD)" || return 1
   [[ "$local_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid local head" >&2; return 2; }
-  gh pr create --repo "$REPO_NWO" --base "${JHW_PR_BASE:-main}" --draft >/dev/null || return 1
+  gh pr create --repo "$REPO_NWO" --base "$expected_base" --draft >/dev/null || return 1
   PR="$(gh pr view --repo "$REPO_NWO" --json number --jq .number)" || return 1
   [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid created PR" >&2; return 1; }
   jhw_pr_reconcile_review_labels "$mode" || return
-  jhw_pr_verify_remote_policy "$mode" "$local_head" || return
+  jhw_pr_verify_remote_policy "$mode" "$local_head" "$expected_base" || return
   draft="$(gh pr view "$PR" --repo "$REPO_NWO" --json isDraft --jq .isDraft)" || return 1
   [[ "$draft" == true ]] || { echo "new PR left draft before policy verification" >&2; return 1; }
   gh pr ready "$PR" --repo "$REPO_NWO" >/dev/null || return 1
 }
 
 jhw_pr_apply_existing_pr_policy() {
-  local mode="$1" expected_local_head="$2" remote_head actual_local_head
+  local mode="$1" expected_local_head="$2"
+  local remote_head remote_base actual_local_head expected_base
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
   [[ "${PR:-}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2; }
   [[ "$expected_local_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid local head" >&2; return 2; }
   actual_local_head="$(git rev-parse HEAD)" || return 1
   [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed before policy reconciliation" >&2; return 1; }
+  expected_base="$(jhw_pr_expected_base)" || return
   jhw_pr_require_write_permission || return
   jhw_pr_prepare_review_plan "$mode" || return
   jhw_pr_ensure_review_labels || return
   remote_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
   [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid remote head" >&2; return 1; }
+  remote_base="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefName --jq .baseRefName)" || return 1
+  [[ -n "$remote_base" ]] || { echo "invalid remote base" >&2; return 1; }
+  if [[ "$remote_base" != "$expected_base" ]]; then
+    gh pr edit "$PR" --repo "$REPO_NWO" --base "$expected_base" >/dev/null || return 1
+    remote_base="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefName --jq .baseRefName)" || return 1
+    [[ "$remote_base" == "$expected_base" ]] || { echo "remote PR base reconciliation failed" >&2; return 1; }
+    actual_local_head="$(git rev-parse HEAD)" || return 1
+    [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed during base reconciliation" >&2; return 1; }
+    remote_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
+    [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid remote head" >&2; return 1; }
+  fi
   jhw_pr_reconcile_review_labels "$mode" || return
-  jhw_pr_verify_remote_policy "$mode" "$remote_head" || return
+  jhw_pr_verify_remote_policy "$mode" "$remote_head" "$expected_base" || return
   [[ "$remote_head" == "$expected_local_head" ]] && return
   git push -u origin HEAD || return 1
   actual_local_head="$(git rev-parse HEAD)" || return 1
   [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed during push" >&2; return 1; }
-  jhw_pr_verify_remote_policy "$mode" "$expected_local_head" || return
+  jhw_pr_verify_remote_policy "$mode" "$expected_local_head" "$expected_base" || return
 }
 ```
 <!-- pr-review-mode-contract:end -->
@@ -685,8 +719,9 @@ jhw_pr_apply_existing_pr_policy() {
    - 현재 브랜치가 base(`main`)이면 **브랜치 생성 후** 진행 (전역 규칙: 기본 브랜치 직접 PR 금지)
    - `REPO_NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # Owner/Repo (nameWithOwner)`
 2. **PR 생성 또는 감지**
-   - 새 PR: push → `gh pr create --draft` → mode 라벨 reconcile/read-back → head/draft 검증 → ready 순서다.
-   - 기존 PR의 새 head: mode 라벨 reconcile/read-back → push → 새 원격 head 검증 순서다.
+   - `--base`는 새 PR과 기존 PR 모두에 적용한다. 기존 PR의 base가 다르면 review-triggering 라벨 변경이나 push 전에 `gh pr edit --base`로 맞추고 `baseRefName`을 재조회한다. 수정·재조회가 실패하면 리뷰를 요청하지 않는다.
+   - 새 PR: push → `gh pr create --draft` → mode 라벨 reconcile/read-back → head/base/draft 검증 → ready 순서다.
+   - 기존 PR의 새 head: base reconcile/read-back → mode 라벨 reconcile/read-back → push → 새 원격 head/base 검증 순서다.
    - 같은 head의 명시적 `request`는 synchronize push를 생략하고 라벨 read-back 뒤 Task 3의 head별 idempotent 요청 계약을 사용한다.
    - `PR=<번호>`, `SHA="$(git rev-parse HEAD)"` (push 후 기준 — 재푸시마다 갱신)
 3. **병렬 게이트 시작**
