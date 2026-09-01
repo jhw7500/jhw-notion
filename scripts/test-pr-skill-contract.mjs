@@ -2317,6 +2317,37 @@ async function main() {
     assert.equal(oldSignals.stdout.trim(), "PENDING",
       "old-head review, remapped inline comment, and pre-request +1 must not terminate the round");
 
+    const sameSecondUnscopedReaction = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        issueReactions: [{
+          id: 8201,
+          actor: "chatgpt-codex-connector[bot]",
+          content: "+1",
+          createdAt: requestCreatedAt,
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+      { SHIP_NOW_EPOCH: String(requestEpoch + 300) },
+    );
+    assert.equal(sameSecondUnscopedReaction.stdout.trim(), "PENDING",
+      "a PR-root reaction from the request timestamp second is not request-scoped and must remain pending");
+
+    const laterUnscopedReaction = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        issueReactions: [{
+          id: 8202,
+          actor: "chatgpt-codex-connector[bot]",
+          content: "+1",
+          createdAt: "2026-08-29T00:02:01Z",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(laterUnscopedReaction.stdout.trim(), "CLEAN",
+      "a PR-root reaction from a strictly later timestamp second remains valid");
+
     const currentReview = await run(
       baseState({
         issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
