@@ -882,8 +882,8 @@ if (latestRun) {
 }
 const isCurrentRunComment = (comment) => {
   const parsed = epoch(comment.created_at);
-  return parsed !== null && (parsed > latestRunEpoch ||
-    (parsed === latestRunEpoch && latestRunReference.test(comment.body || "")));
+  return parsed !== null && parsed >= latestRunEpoch &&
+    latestRunReference?.test(comment.body || "") === true;
 };
 const currentComments = latestRunEpoch === null
   ? comments
@@ -1429,8 +1429,8 @@ endpoint에 종속되므로 같은 초를 허용한다. workflow run도 정확�
 workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다. relevant run ID가 양의
 safe integer가 아니면 정렬 권한을 정할 수 없어 classifier가 fail-closed한다. bot 댓글도 같은
 순서의 최신 substantive 댓글만 판정하며, 거절 reaction은 그 댓글이 없거나 더 나중일 때만 우선한다.
-최신 run과 같은 초의 bot 댓글은 본문이 그 run의 검증된 `html_url`을 정확히 참조할 때만
-fast response로 인정한다. 좌표 없는 같은 초 댓글과 run 좌표를 담을 수 없는 reaction은 인정하지 않는다.
+선택된 run 이후의 bot 댓글은 시각 차이와 무관하게 본문이 그 run의 검증된 `html_url`을 정확히
+참조할 때만 verdict로 인정한다. 좌표 없는 댓글과 run 좌표를 담을 수 없는 reaction은 인정하지 않는다.
 댓글과 reaction이 같은 초면 교차 타입 순서를 증명할 수 없어 `PENDING`으로 재poll한다. 최신 retry
 run보다 오래되거나 같은 초지만 상관 좌표가 없는 댓글·reaction도 terminal 신호에서 제외한다. 요청 reviewer가 없고 capability
 부재로 unavailable reviewer가 있으면 highest disposition은 `UNAVAILABLE`이다. 명시적 skip이나

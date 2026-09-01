@@ -64,6 +64,14 @@ const fullReviewWorkflowContract = [
   "      force_review:",
   "",
 ].join("\n");
+const pullRequestOnlyWorkflowContract = [
+  "name: Review",
+  "",
+  "on:",
+  "  pull_request:",
+  "    types: [opened, synchronize, ready_for_review]",
+  "",
+].join("\n");
 
 function contractBlock(markdown) {
   const match = markdown.match(
@@ -151,7 +159,15 @@ if (argv[0] === "pr" && argv[1] === "view") {
   if (!state.prExists) process.exit(1);
   const fields = optionValue("--json") || "";
   const query = optionValue("--jq") || optionValue("-q") || "";
-  if (query === ".number") process.stdout.write(String(state.prNumber) + "\n");
+  if (query.includes(".headRefOid") && query.includes(".headRefName") &&
+      query.includes(".isCrossRepository") && query.includes("@tsv")) {
+    process.stdout.write([
+      state.prHead,
+      state.prHeadRefName,
+      String(state.isCrossRepository),
+    ].join("\t") + "\n");
+  }
+  else if (query === ".number") process.stdout.write(String(state.prNumber) + "\n");
   else if (query === ".headRefOid") process.stdout.write(state.prHead + "\n");
   else if (query === ".baseRefName") process.stdout.write(state.prBase + "\n");
   else if (query === ".baseRefOid") {
@@ -162,6 +178,8 @@ if (argv[0] === "pr" && argv[1] === "view") {
     }
     process.stdout.write(state.prBaseOid + "\n");
   }
+  else if (query === ".headRefName") process.stdout.write(state.prHeadRefName + "\n");
+  else if (query === ".isCrossRepository") process.stdout.write(String(state.isCrossRepository) + "\n");
   else if (query === ".isDraft") process.stdout.write(String(state.prDraft) + "\n");
   else if (query.includes(".labels")) rows(state.prLabels || []);
   else {
@@ -170,6 +188,8 @@ if (argv[0] === "pr" && argv[1] === "view") {
     if (fields.includes("headRefOid")) payload.headRefOid = state.prHead;
     if (fields.includes("baseRefName")) payload.baseRefName = state.prBase;
     if (fields.includes("baseRefOid")) payload.baseRefOid = state.prBaseOid;
+    if (fields.includes("headRefName")) payload.headRefName = state.prHeadRefName;
+    if (fields.includes("isCrossRepository")) payload.isCrossRepository = state.isCrossRepository;
     if (fields.includes("isDraft")) payload.isDraft = state.prDraft;
     if (fields.includes("labels")) payload.labels = (state.prLabels || []).map((name) => ({ name }));
     process.stdout.write(JSON.stringify(payload) + "\n");
@@ -476,7 +496,7 @@ if (endpoint.includes("/actions/runs?")) {
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
   rows(state.runs.map((item) => {
     const fields = [item.id, item.attempt, item.name, item.head, item.createdAt, item.status, item.conclusion];
-    if (query.includes(".event")) fields.push(item.event || "push");
+    if (query.includes(".event")) fields.push(item.event || "pull_request");
     return fields.join("\t");
   }));
   process.exit(0);
@@ -573,6 +593,8 @@ function baseState(overrides = {}) {
     localHead: currentHead,
     remoteBranchHead: oldHead,
     prHead: oldHead,
+    prHeadRefName: "task/f28bfecee9de-jhw7500-jhw-notion-99",
+    isCrossRepository: false,
     prBase: "main",
     prBaseOid: currentBaseOid,
     baseOids: { main: currentBaseOid, release: oldBaseOid },
@@ -789,6 +811,7 @@ async function main() {
         "Gemini Auto PR Review\t0",
         "OpenCode Auto PR Review\t0",
       ].join("\n"),
+      JHW_PR_WORKFLOW_TRIGGER_EVENT: "pull_request",
       SHIP_ROUND_STATE_FILE: roundStatePath,
       SHIP_NOW_EPOCH: String(startEpoch + 60),
       JHW_PR_REPO_ROOT: fixtureRoot,
@@ -872,6 +895,7 @@ async function main() {
     assert.notEqual((await runResult(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).code, 0);
 
     const isGitPush = (args) => args[0] === "git" && args[1] === "push";
+    const isWorkflowDispatch = (args) => args[0] === "workflow" && args[1] === "run";
     const isGh = (args, group, command) => args[0] === group && args[1] === command;
     const isWorkflowFloorLookup = (args) =>
       args[0] === "api" && args[1]?.includes(`/actions/runs?head_sha=${currentHead}&per_page=100`);
@@ -1643,6 +1667,48 @@ async function main() {
       isGh(args, "pr", "edit") && args.includes("--base")), false,
     "an already-correct base must not receive a redundant edit");
 
+    const unchangedAuto = await run(
+      baseState({
+        prHead: currentHead,
+        remoteBranchHead: currentHead,
+      }),
+      [
+        `jhw_pr_apply_existing_pr_policy auto ${currentHead}`,
+        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
+        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
+        "fi",
+        "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
+      ].join("\n"),
+    );
+    assert.match(unchangedAuto.stdout, /^event=workflow_dispatch$/m,
+      "an unchanged ready PR in auto mode must select an explicit dispatch round");
+    assert.equal(unchangedAuto.log.filter(isWorkflowDispatch).length, 2,
+      "each available managed reviewer must be dispatched when no PR event was emitted");
+    assert.ok(unchangedAuto.log.filter(isWorkflowDispatch).every((args) =>
+      hasOption(args, "--ref", "task/f28bfecee9de-jhw7500-jhw-notion-99")),
+    "head-scoped dispatches must run from the verified PR branch ref");
+
+    const unchangedAutoWithoutDispatchContract = await run(
+      baseState({
+        prHead: currentHead,
+        remoteBranchHead: currentHead,
+        remoteWorkflowContents: {
+          "claude-code-review.yml": pullRequestOnlyWorkflowContract,
+          "gemini-auto-review.yml": pullRequestOnlyWorkflowContract,
+        },
+      }),
+      [
+        `jhw_pr_apply_existing_pr_policy auto ${currentHead}`,
+        "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+      ].join("\n"),
+    );
+    assert.match(unchangedAutoWithoutDispatchContract.stdout, /^available=$/m,
+      "an unchanged auto round must not plan workflows that cannot be dispatched");
+    assert.match(unchangedAutoWithoutDispatchContract.stdout,
+      /claude-code-review\.yml\tworkflow_event_contract_unsupported/);
+    assert.match(unchangedAutoWithoutDispatchContract.stdout,
+      /gemini-auto-review\.yml\tworkflow_event_contract_unsupported/);
+
     const autoExisting = await run(
       baseState({ prLabels: ["review:request", "review:skip"] }),
       `jhw_pr_apply_existing_pr_policy auto ${currentHead}`,
@@ -1800,9 +1866,9 @@ async function main() {
     assert.match(codexMixedCompatibilityDuplicate.stderr, /TRIGGER_FAILED/);
     assert.equal(countPosts(codexMixedCompatibilityDuplicate), 0);
 
-    const isWorkflowDispatch = (args) => args[0] === "workflow" && args[1] === "run";
     const sameHeadWorkflow = await run(
       baseState({
+        prHead: currentHead,
         runs: [
           {
             id: 9301,
@@ -1826,6 +1892,7 @@ async function main() {
 
     const priorRoundSameHeadWorkflow = await run(
       baseState({
+        prHead: currentHead,
         runs: [
           {
             id: 9306,
@@ -1850,6 +1917,7 @@ async function main() {
 
     const sameSecondPriorRoundWorkflow = await run(
       baseState({
+        prHead: currentHead,
         runs: [{
           id: 9307,
           attempt: 1,
@@ -1873,6 +1941,7 @@ async function main() {
 
     const sameSecondDispatchRetry = await run(
       baseState({
+        prHead: currentHead,
         runs: [{
           id: 9307,
           attempt: 1,
@@ -1919,6 +1988,7 @@ async function main() {
 
     const exactDispatch = await run(
       baseState({
+        prHead: currentHead,
         runs: [
           {
             id: 9302,
@@ -1952,18 +2022,20 @@ async function main() {
       exactDispatch.log.filter(isWorkflowDispatch),
       [[
         "workflow", "run", "gemini-auto-review.yml", "--repo", "example/repo",
+        "--ref", "task/f28bfecee9de-jhw7500-jhw-notion-99",
         "-f", "pr_number=42", "-f", "force_review=true",
       ]],
     );
 
     const openCodeDispatch = await run(
-      baseState(),
+      baseState({ prHead: currentHead }),
       `jhw_pr_dispatch_same_head opencode-auto-review.yml 'OpenCode Auto PR Review' ${currentHead}`,
     );
     assert.deepEqual(
       openCodeDispatch.log.filter(isWorkflowDispatch),
       [[
         "workflow", "run", "opencode-auto-review.yml", "--repo", "example/repo",
+        "--ref", "task/f28bfecee9de-jhw7500-jhw-notion-99",
         "-f", "pr_number=42", "-f", "force_review=true",
       ]],
     );
@@ -2500,6 +2572,37 @@ async function main() {
     );
     assert.equal(bsdTimestamp.stdout.trim(), "STARTED,9002",
       "GitHub timestamps must parse with the BSD date available on macOS");
+
+    const explicitDispatchCollision = await run(
+      baseState({
+        runs: [
+          {
+            id: 9309,
+            attempt: 1,
+            name: "Claude Code Review",
+            head: currentHead,
+            createdAt: requestCreatedAt,
+            status: "in_progress",
+            conclusion: "null",
+            event: "pull_request",
+          },
+          {
+            id: 9310,
+            attempt: 1,
+            name: "Claude Code Review",
+            head: currentHead,
+            createdAt: requestCreatedAt,
+            status: "in_progress",
+            conclusion: "null",
+            event: "workflow_dispatch",
+          },
+        ],
+      }),
+      "ship_workflow_trigger 'Claude Code Review'\nprintf '%s,%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_RUN_ID\" \"$SHIP_WORKFLOW_RUN_EVENT\"",
+      { JHW_PR_WORKFLOW_TRIGGER_EVENT: "workflow_dispatch" },
+    );
+    assert.equal(explicitDispatchCollision.stdout.trim(), "STARTED,9310,workflow_dispatch",
+      "an explicit round must select its dispatch run when a PR-event run shares the timestamp");
 
     for (const runs of [
       [

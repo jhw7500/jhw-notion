@@ -1371,13 +1371,97 @@ async function main() {
       "only the workflow run named with this reviewer request comment may acknowledge it");
     assert.doesNotMatch(requestScopedRun.stdout, /actions\/runs\/509/);
 
+    const laterUncorrelatedRunResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("No blockers found.", {
+            id: 1004,
+            createdAt: "2026-09-01T00:04:00Z",
+            url: "https://github.com/example/repo/issues/99#issuecomment-1004",
+          }),
+        ],
+        runs: [
+          {
+            id: 508,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "success",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/508",
+            displayTitle: "jhw-review-comment-1001",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+          {
+            id: 509,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "success",
+            createdAt: "2026-09-01T00:03:00Z",
+            url: "https://github.com/example/repo/actions/runs/509",
+            displayTitle: "jhw-review-comment-1002",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(laterUncorrelatedRunResponse.stdout.split("\n")[0], "PENDING",
+      "a later bot verdict without the selected run URL must remain uncorrelated");
+    assert.doesNotMatch(laterUncorrelatedRunResponse.stdout, /issuecomment-1004/);
+
+    const laterCorrelatedRunResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response([
+            "**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/508)",
+            "",
+            "No blockers found.",
+          ].join("\n"), {
+            id: 1004,
+            createdAt: "2026-09-01T00:04:00Z",
+            url: "https://github.com/example/repo/issues/99#issuecomment-1004",
+          }),
+        ],
+        runs: [{
+          id: 508,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "success",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: "https://github.com/example/repo/actions/runs/508",
+          displayTitle: "jhw-review-comment-1001",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(laterCorrelatedRunResponse.stdout.split("\n")[0], "CLEAN",
+      "a later bot verdict that names the selected run must remain eligible");
+    assert.match(laterCorrelatedRunResponse.stdout, /issuecomment-1004/);
+
     const supersededFailedRun = await classify(
       issueState({
         issueExists: true,
         issueComments: [
           requestComment,
           response("Claude encountered an error while reviewing."),
-          response("Requirements look complete; no blockers found.", {
+          response([
+            "**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/505)",
+            "",
+            "Requirements look complete; no blockers found.",
+          ].join("\n"), {
             id: 1004,
             createdAt: "2026-09-01T00:04:00Z",
             url: "https://github.com/example/repo/issues/99#issuecomment-1004",
