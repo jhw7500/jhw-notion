@@ -251,6 +251,12 @@ async function main() {
   assert.match(readmeText, /Codex.*동일 저장소.*canary/);
   assert.match(readmeText, /Gemini Assist.*OpenCode.*PR-only/);
   assert.match(readmeText, /Issue를 수정·닫기.*구현/);
+  assert.match(issueText, /gemini\) command='@gemini-cli /,
+    "standalone Issue requests must use the pinned Gemini dispatcher command");
+  assert.doesNotMatch(issueText, /gemini\) command='@gemini /,
+    "the unsupported @gemini command must not be emitted");
+  assert.match(issueText, /workflow_name='Claude Code'/);
+  assert.match(issueText, /workflow_name='Gemini Dispatch'/);
   assert.ok(existsSync(codexIssueSkill));
   assert.ok(lstatSync(codexIssueReference).isSymbolicLink());
   const contract = `${createContractBlock(issueText)}\n${waitContractBlock(issueText)}`;
@@ -378,7 +384,7 @@ async function main() {
       reviewed.state.issueComments.map((item) => item.body),
       [
         "@claude 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.\n<!-- jhw-issue:review-request reviewer=claude -->",
-        "@gemini 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.\n<!-- jhw-issue:review-request reviewer=gemini -->",
+        "@gemini-cli 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.\n<!-- jhw-issue:review-request reviewer=gemini -->",
       ],
     );
     assert.deepEqual(reviewed.state.mutations, [
@@ -596,7 +602,7 @@ async function main() {
         issueComments: [requestComment],
         runs: [{
           id: 501,
-          name: "Claude Issue Review",
+          name: "Claude Code",
           event: "issue_comment",
           status: "completed",
           conclusion: "failure",

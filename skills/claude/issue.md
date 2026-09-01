@@ -308,7 +308,7 @@ jhw_issue_request_reviewer() {
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
   case "$reviewer" in
     claude) command='@claude 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.' ;;
-    gemini) command='@gemini 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.' ;;
+    gemini) command='@gemini-cli 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.' ;;
     codex) command='@codex 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.' ;;
     *) echo "unsupported Issue reviewer" >&2; return 2 ;;
   esac
@@ -445,11 +445,11 @@ jhw_issue_classify_reviewer() {
   case "$reviewer" in
     claude)
       expected_bot="${JHW_ISSUE_EXPECTED_CLAUDE_BOT:-claude-review[bot]}"
-      workflow_name='Claude Issue Review'
+      workflow_name='Claude Code'
       ;;
     gemini)
       expected_bot="${JHW_ISSUE_EXPECTED_GEMINI_BOT:-gemini-review[bot]}"
-      workflow_name='Gemini Issue Review'
+      workflow_name='Gemini Dispatch'
       ;;
     codex)
       expected_bot="${JHW_ISSUE_EXPECTED_CODEX_BOT:-chatgpt-codex-connector[bot]}"
