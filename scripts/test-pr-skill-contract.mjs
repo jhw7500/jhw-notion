@@ -641,6 +641,42 @@ async function main() {
     assert.equal(noEligibleApps.log.filter((args) => args.includes("POST")).length, 0,
       "an App without same-repository capability evidence must not be mentioned");
 
+    const aggregateAppCoordinates = await run(
+      baseState({
+        commentReactions: [{
+          actor: "chatgpt-codex-connector[bot]",
+          content: "+1",
+          createdAt: requestCreatedAt,
+        }],
+      }),
+      [
+        "apps=$'codex\\ngemini-assist'",
+        `jhw_pr_request_eligible_apps ${currentHead} "$apps"`,
+        "ship_codex_signal_status",
+        "printf 'generic=%s\\n' \"$JHW_PR_APP_REQUEST_COMMENT_ID\"",
+        "printf 'codex=%s,%s,%s,%s\\n' \"$SHIP_CODEX_REQUEST_COMMENT_ID\" \"$SHIP_CODEX_REQUESTED_AT\" \"$SHIP_CODEX_TARGET_HEAD\" \"$SHIP_CODEX_REVIEW_STATUS\"",
+        "printf 'records=%s\\n' \"$JHW_PR_APP_REQUEST_RESULTS\"",
+      ].join("\n"),
+    );
+    assert.match(aggregateAppCoordinates.stdout, /generic=9003/,
+      "the generic App result may point at the last requested reviewer");
+    assert.match(
+      aggregateAppCoordinates.stdout,
+      new RegExp(`codex=9002,${requestCreatedAt},${currentHead},CLEAN`),
+      "Codex polling must retain its own coordinates after Gemini overwrites the generic result",
+    );
+    assert.match(
+      aggregateAppCoordinates.stdout,
+      new RegExp(`records=codex\\tSTARTED\\t-\\t9002\\t${requestCreatedAt}\\ttrue\\t${currentHead}`),
+      "the aggregate must preserve every App request's polling coordinates",
+    );
+    assert.match(
+      aggregateAppCoordinates.stdout,
+      new RegExp(`gemini-assist\\tSTARTED\\t-\\t9003\\t${requestCreatedAt}\\ttrue\\t${currentHead}`),
+    );
+    assert.match(aggregateAppCoordinates.roundState, /request_comment_id=9002/,
+      "the durable Codex round state must be written before another App request runs");
+
     await writeFile(
       join(fixtureWorkflowDir, "claude-code-review.yml"),
       "on:\n  workflow_dispatch:\n    inputs:\n      pr_number:\n",

@@ -244,12 +244,15 @@ jhw_issue_codex_canary_eligible() {
     fi
     identity="$response_actor"
   done <<<"$raw"
-  [[ -n "$identity" ]]
+  [[ -n "$identity" ]] || return 1
+  printf '%s\n' "$identity"
 }
 
 jhw_issue_discover_reviewers() {
   local mode="$1" auto_enabled="$2" root="${JHW_ISSUE_REPO_ROOT:-.}"
   local config_path="${JHW_ISSUE_CONFIG_PATH:-$root/.github/workflow-config.yml}"
+  local codex_identity="${3-}" codex_identity_supplied=false
+  if (( $# >= 3 )); then codex_identity_supplied=true; fi
   case "$mode" in request|skip|auto) ;; *) return 2 ;; esac
   case "$auto_enabled" in true|false) ;; *) return 2 ;; esac
   [[ "$mode" == request || ( "$mode" == auto && "$auto_enabled" == true ) ]] || return 0
@@ -261,7 +264,13 @@ jhw_issue_discover_reviewers() {
     [[ "$(jhw_issue_workflow_enabled gemini-dispatch "$config_path")" == true ]]; then
     printf 'gemini\n'
   fi
-  if jhw_issue_codex_canary_eligible "${JHW_ISSUE_CODEX_CANARY_URL:-}"; then
+  if [[ "$codex_identity_supplied" == true ]]; then
+    case "$codex_identity" in
+      chatgpt-codex-connector|chatgpt-codex-connector'[bot]') printf 'codex\n' ;;
+      '') ;;
+      *) return 2 ;;
+    esac
+  elif codex_identity="$(jhw_issue_codex_canary_eligible "${JHW_ISSUE_CODEX_CANARY_URL:-}")"; then
     printf 'codex\n'
   fi
 }
@@ -370,6 +379,7 @@ $marker"
 jhw_issue_create() {
   local title="$1" body="$2" mode="$3" timeout="$4"
   local auto_enabled=false reviewers unavailable issue_url issue issue_created_at request_id reviewer
+  local codex_identity=""
   JHW_ISSUE_NUMBER=''
   JHW_ISSUE_URL=''
   JHW_ISSUE_CREATED_AT=''
@@ -377,6 +387,7 @@ jhw_issue_create() {
   JHW_ISSUE_UNAVAILABLE_REVIEWERS=''
   JHW_ISSUE_REQUEST_RECORDS=''
   JHW_ISSUE_REQUEST_FAILURES=''
+  JHW_ISSUE_EXPECTED_CODEX_BOT=''
   [[ -n "${title//[[:space:]]/}" ]] || { echo "Issue title is required" >&2; return 2; }
   [[ -n "${body//[[:space:]]/}" ]] || { echo "Issue body is required" >&2; return 2; }
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
@@ -390,7 +401,22 @@ jhw_issue_create() {
   elif [[ "$mode" == request ]]; then
     auto_enabled=true
   fi
-  reviewers="$(jhw_issue_discover_reviewers "$mode" "$auto_enabled")" || return
+  if [[ "$mode" == request || ( "$mode" == auto && "$auto_enabled" == true ) ]]; then
+    if codex_identity="$(jhw_issue_codex_canary_eligible "${JHW_ISSUE_CODEX_CANARY_URL:-}")"; then
+      :
+    else
+      codex_identity=''
+    fi
+  fi
+  reviewers="$(jhw_issue_discover_reviewers "$mode" "$auto_enabled" "$codex_identity")" || return
+  if grep -Fqx -- codex <<<"$reviewers"; then
+    case "$codex_identity" in
+      chatgpt-codex-connector|chatgpt-codex-connector'[bot]') ;;
+      *) echo "invalid Codex canary identity" >&2; return 1 ;;
+    esac
+    JHW_ISSUE_EXPECTED_CODEX_BOT="$codex_identity"
+  fi
+  export JHW_ISSUE_EXPECTED_CODEX_BOT
   unavailable="$(jhw_issue_unavailable_reviewers "$mode" "$auto_enabled" "$reviewers")" || return
   if [[ "$mode" == request && -z "$reviewers" ]]; then
     echo "no eligible Issue reviewer" >&2
@@ -574,7 +600,8 @@ jhw_issue_classify_reviewer() {
       workflow_name='Gemini Dispatch'
       ;;
     codex)
-      expected_bot="${JHW_ISSUE_EXPECTED_CODEX_BOT:-chatgpt-codex-connector[bot]}"
+      expected_bot="${JHW_ISSUE_EXPECTED_CODEX_BOT-}"
+      [[ -n "$expected_bot" ]] || return 2
       workflow_name=''
       ;;
     *) return 2 ;;

@@ -865,8 +865,22 @@ $marker"
   JHW_PR_APP_REQUEST_HEAD="$head"
 }
 
+ship_write_codex_trigger_state() {
+  local temp_state="${SHIP_ROUND_STATE_FILE}.$$"
+  umask 077
+  {
+    printf 'round=%s\n' "$ROUND"
+    printf 'reviewer=codex\n'
+    printf 'status=%s\n' "$SHIP_CODEX_TRIGGER_STATUS"
+    printf 'reason=%s\n' "${SHIP_CODEX_TRIGGER_REASON:-}"
+    printf 'request_comment_id=%s\n' "${SHIP_CODEX_REQUEST_COMMENT_ID:-}"
+    printf 'requested_at=%s\n' "${SHIP_CODEX_REQUESTED_AT:-}"
+    printf 'target_head=%s\n' "$ROUND_HEAD"
+  } >"$temp_state" && mv -f -- "$temp_state" "$SHIP_ROUND_STATE_FILE"
+}
+
 jhw_pr_request_eligible_apps() {
-  local head="$1" eligible="$2" reviewer status reason
+  local head="$1" eligible="$2" reviewer status reason comment_id requested_at created
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
   JHW_PR_APP_REQUEST_RESULTS=''
   while IFS= read -r reviewer; do
@@ -882,8 +896,23 @@ jhw_pr_request_eligible_apps() {
     esac
     status="${JHW_PR_APP_REQUEST_STATUS:-FAILED}"
     reason="${JHW_PR_APP_REQUEST_REASON:--}"
+    comment_id="${JHW_PR_APP_REQUEST_COMMENT_ID:--}"
+    requested_at="${JHW_PR_APP_REQUESTED_AT:--}"
+    created="${JHW_PR_APP_REQUEST_CREATED:-false}"
     [[ -z "$JHW_PR_APP_REQUEST_RESULTS" ]] || JHW_PR_APP_REQUEST_RESULTS+=$'\n'
-    JHW_PR_APP_REQUEST_RESULTS+="$reviewer"$'\t'"$status"$'\t'"$reason"
+    JHW_PR_APP_REQUEST_RESULTS+="$reviewer"$'\t'"$status"$'\t'"$reason"$'\t'"$comment_id"$'\t'"$requested_at"$'\t'"$created"$'\t'"$head"
+    if [[ "$reviewer" == codex ]]; then
+      case "$status" in STARTED|TRIGGER_FAILED) ;; *) return 1 ;; esac
+      SHIP_CODEX_TRIGGER_STATUS="$status"
+      SHIP_CODEX_TRIGGER_REASON="${JHW_PR_APP_REQUEST_REASON:-}"
+      SHIP_CODEX_REQUEST_COMMENT_ID="${JHW_PR_APP_REQUEST_COMMENT_ID:-}"
+      SHIP_CODEX_REQUESTED_AT="${JHW_PR_APP_REQUESTED_AT:-}"
+      SHIP_CODEX_TARGET_HEAD="$head"
+      SHIP_CODEX_REQUEST_CREATED="$created"
+      if [[ -n "${SHIP_ROUND_STATE_FILE:-}" ]]; then
+        ship_write_codex_trigger_state || return 1
+      fi
+    fi
   done <<<"$eligible"
   export JHW_PR_APP_REQUEST_RESULTS
   return 0
@@ -985,20 +1014,6 @@ jhw_pr_dispatch_preflighted_workflows() {
       *) return 2 ;;
     esac
   done <<<"$workflows"
-}
-
-ship_write_codex_trigger_state() {
-  local temp_state="${SHIP_ROUND_STATE_FILE}.$$"
-  umask 077
-  {
-    printf 'round=%s\n' "$ROUND"
-    printf 'reviewer=codex\n'
-    printf 'status=%s\n' "$SHIP_CODEX_TRIGGER_STATUS"
-    printf 'reason=%s\n' "${SHIP_CODEX_TRIGGER_REASON:-}"
-    printf 'request_comment_id=%s\n' "${SHIP_CODEX_REQUEST_COMMENT_ID:-}"
-    printf 'requested_at=%s\n' "${SHIP_CODEX_REQUESTED_AT:-}"
-    printf 'target_head=%s\n' "$ROUND_HEAD"
-  } >"$temp_state" && mv -f -- "$temp_state" "$SHIP_ROUND_STATE_FILE"
 }
 
 ship_codex_trigger_failed() {
@@ -1214,7 +1229,7 @@ case "$?" in
 esac
 ```
 
-`jhw_pr_request_app_review codex`의 결과를 Codex 신호 폴링에 연결할 때 request comment ID·요청 시각·head를 라운드 상태에 복사한다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다. 중앙 workflow가 `UNAVAILABLE`이면 보고하고 다른 planned reviewer를 계속하되, dispatch 거절·모호한 같은-head run은 `TRIGGER_FAILED`다. 시작된 run이 `SHIP_TIMEOUT_MIN`을 넘기면 `TIMEOUT`이다.
+`jhw_pr_request_eligible_apps`는 각 요청을 `reviewer/status/reason/comment_id/requested_at/created/head` 행으로 보존한다. Codex 행은 다음 App을 요청하기 전에 request comment ID·요청 시각·head를 Codex 폴링 및 라운드 상태에 즉시 복사하므로 Gemini 결과가 generic 변수를 덮어써도 좌표가 유지된다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다. 중앙 workflow가 `UNAVAILABLE`이면 보고하고 다른 planned reviewer를 계속하되, dispatch 거절·모호한 같은-head run은 `TRIGGER_FAILED`다. 시작된 run이 `SHIP_TIMEOUT_MIN`을 넘기면 `TIMEOUT`이다.
 
 legacy v2 코멘트를 읽을 때도 `jhw_pr_reviewed_receipt "$ROUND_HEAD"`가 만드는 정확한 `- Reviewed: <40-sha>`와 완전히 같은 행만 현재-head 증거로 인정한다. 축약 SHA, branch 이름, 이전 head는 인정하지 않는다.
 

@@ -575,12 +575,21 @@ async function main() {
       { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
     );
     assert.equal(codexDiscovery.stdout.trim(), "codex");
+    const bracketedCanaryIdentity = await runIssue(
+      issueState({ canaryComments: [canaryRequest, canaryResponse] }),
+      `jhw_issue_codex_canary_eligible '${canaryUrl}'`,
+    );
+    assert.equal(bracketedCanaryIdentity.stdout.trim(), "chatgpt-codex-connector[bot]",
+      "successful canary proof must return the unique actor identity it authenticated");
     const codexOnly = await runIssue(
       issueState({
         labels: ["review:request", "review:skip"],
         canaryComments: [canaryRequest, canaryResponse],
       }),
-      `jhw_issue_create 'Codex review' 'Body text' request 20`,
+      [
+        `jhw_issue_create 'Codex review' 'Body text' request 20`,
+        "printf 'expected=%s\\n' \"$JHW_ISSUE_EXPECTED_CODEX_BOT\"",
+      ].join("\n"),
       { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
     );
     assert.equal(codexOnly.state.issueComments.length, 1);
@@ -588,6 +597,26 @@ async function main() {
       codexOnly.state.issueComments[0].body,
       "@codex 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.\n<!-- jhw-issue:review-request reviewer=codex -->",
     );
+    assert.match(codexOnly.stdout, /expected=chatgpt-codex-connector\[bot\]/,
+      "Issue creation must propagate the canary-proven actor into later classification");
+
+    const unbracketedCanaryResponse = {
+      ...canaryResponse,
+      actor: "chatgpt-codex-connector",
+    };
+    const unbracketedCodexOnly = await runIssue(
+      issueState({
+        labels: ["review:request", "review:skip"],
+        canaryComments: [canaryRequest, unbracketedCanaryResponse],
+      }),
+      [
+        `jhw_issue_create 'Unbracketed Codex review' 'Body text' request 20`,
+        "printf 'expected=%s\\n' \"$JHW_ISSUE_EXPECTED_CODEX_BOT\"",
+      ].join("\n"),
+      { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
+    );
+    assert.match(unbracketedCodexOnly.stdout, /expected=chatgpt-codex-connector$/m,
+      "the exact unbracketed canary actor must not be replaced by a fixed default");
 
     const wrongRepoCanary = await runIssue(
       issueState({ canaryComments: [canaryRequest, canaryResponse] }),
@@ -946,6 +975,41 @@ async function main() {
     );
     assert.equal(wrongGeminiActor.stdout.split("\n")[0], "PENDING",
       "a different bot cannot satisfy a Gemini request after actor pinning");
+
+    const codexRequestComment = {
+      ...requestComment,
+      body: "@codex 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.\n<!-- jhw-issue:review-request reviewer=codex -->",
+    };
+    const unbracketedCodexFinal = response("Requirements are complete; no blockers found.", {
+      actor: "chatgpt-codex-connector",
+      actorType: "Bot",
+    });
+    const dynamicCodex = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [codexRequestComment, unbracketedCodexFinal],
+      }),
+      "codex",
+      triggerDeadline - 1,
+      { JHW_ISSUE_EXPECTED_CODEX_BOT: "chatgpt-codex-connector" },
+    );
+    assert.equal(dynamicCodex.stdout.split("\n")[0], "CLEAN",
+      "Codex classification must use the exact actor identity authenticated by the canary");
+
+    const wrongCodexActor = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          codexRequestComment,
+          { ...unbracketedCodexFinal, actor: "chatgpt-codex-connector[bot]" },
+        ],
+      }),
+      "codex",
+      triggerDeadline - 1,
+      { JHW_ISSUE_EXPECTED_CODEX_BOT: "chatgpt-codex-connector" },
+    );
+    assert.equal(wrongCodexActor.stdout.split("\n")[0], "PENDING",
+      "a different accepted Codex spelling cannot replace the uniquely proven canary actor");
 
     const secondPageResponse = response("Requirements are complete; no blocking risks.");
     const paginated = await classify(
