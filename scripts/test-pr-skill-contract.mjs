@@ -1283,6 +1283,41 @@ async function main() {
     assert.equal(failedGeminiCanary.stdout.trim(), "codex",
       "a Gemini canary reporting review failure cannot prove App capability");
 
+    for (const body of ["Quota exceeded.", "Provider unavailable."]) {
+      const failedCodexRuntimeCanary = await run(
+        baseState({
+          appComments: [
+            {
+              actor: "chatgpt-codex-connector[bot]",
+              body,
+              url: "https://github.com/example/repo/pull/88#issuecomment-6",
+            },
+            {
+              actor: "gemini-code-assist[bot]",
+              body: "Gemini review completed.",
+              url: "https://github.com/example/repo/pull/88#issuecomment-7",
+            },
+          ],
+        }),
+        "jhw_pr_prepare_review_plan request\nprintf '%s\\n' \"$JHW_PR_ELIGIBLE_APPS\"",
+      );
+      assert.equal(failedCodexRuntimeCanary.stdout.trim(), "gemini-assist",
+        `a Codex canary reporting runtime failure cannot prove App capability: ${body}`);
+    }
+
+    const quotaReviewFeedbackCanary = await run(
+      baseState({
+        appComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          body: "Review completed. Add a test for behavior when provider quota is exceeded.",
+          url: "https://github.com/example/repo/pull/88#issuecomment-8",
+        }],
+      }),
+      "jhw_pr_repo_has_app_canary codex",
+    );
+    assert.equal(quotaReviewFeedbackCanary.stdout.trim(), "chatgpt-codex-connector[bot]",
+      "review feedback about quota behavior must remain valid App capability evidence");
+
     const noEligibleApps = await run(
       baseState({ appComments: [] }),
       [

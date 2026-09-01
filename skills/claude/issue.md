@@ -916,6 +916,10 @@ if (verdictComment &&
     hasRuntimeFailure(verdictComment.body))) {
   emit("FAILED", verdictComment.url, "connector_rejected");
 }
+if (verdictComment && latestRun && latestRun.status !== "completed") {
+  if (now >= reviewDeadline) emit("TIMEOUT", request.url, "review_timeout");
+  emit("PENDING", latestRun.url, "workflow_in_progress");
+}
 const feedbackPattern = /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i;
 const cleanLine = /^(?:no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|(?:the\s+)?(?:requirements?|proposal)\s+(?:(?:look|looks|are|is)\s+)?complete(?:\s+and\s+ready for implementation)?(?:[.;]\s*(?:no blockers?(?:\s+found)?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)))?|looks good|ready for implementation|review clean|lgtm)[.!]?$/i;
 const negatedFindingLine = /^no (?:(?:missing requirements?|implementation risks?)(?:\s+(?:or|and)\s+(?:missing requirements?|implementation risks?))*|(?:\[(?:CRITICAL|HIGH)\]|P[01])\s+(?:issues?|findings?))[.!]?$/i;
@@ -1437,6 +1441,8 @@ safe integer가 아니면 정렬 권한을 정할 수 없어 classifier가 fail-
 순서의 최신 substantive 댓글만 판정하며, 거절 reaction은 그 댓글이 없거나 더 나중일 때만 우선한다.
 선택된 run 이후의 bot 댓글은 시각 차이와 무관하게 본문이 그 run의 검증된 `html_url`을 정확히
 참조할 때만 verdict로 인정한다. 좌표 없는 댓글과 run 좌표를 담을 수 없는 reaction은 인정하지 않는다.
+run 좌표를 담은 non-failure verdict도 선택된 run이 완료되기 전에는 terminal로 판정하지 않고
+`PENDING(workflow_in_progress)`으로 재poll한다.
 선택된 reviewer 응답의 usage-limit·quota 소진 또는 provider/connector/environment 실패는 구현
 지적이 아니므로 `FEEDBACK`이 아니라 `FAILED(connector_rejected)`로 분류한다.
 댓글과 reaction이 같은 초면 교차 타입 순서를 증명할 수 없어 `PENDING`으로 재poll한다. 최신 retry

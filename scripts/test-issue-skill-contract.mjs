@@ -1050,6 +1050,37 @@ async function main() {
     assert.equal(sameSecondRunResponse.stdout.split("\n")[0], "CLEAN",
       "a fast reviewer response that names its workflow run must be accepted in the same timestamp second");
 
+    const inProgressRunResponse = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response([
+            "**Claude finished @jhw7500's task** —— [View job](https://github.com/example/repo/actions/runs/500)",
+            "",
+            "No blockers found.",
+          ].join("\n"), { createdAt: "2026-09-01T00:02:00Z" }),
+        ],
+        runs: [{
+          id: 500,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "in_progress",
+          conclusion: "null",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: "https://github.com/example/repo/actions/runs/500",
+          displayTitle: "jhw-review-comment-1001",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(inProgressRunResponse.stdout.split("\n")[0], "PENDING",
+      "a run-linked verdict must not become terminal before its selected workflow run completes");
+    assert.match(inProgressRunResponse.stdout, /workflow_in_progress/);
+
     const sameSecondUncorrelatedResponse = await classify(
       issueState({
         issueExists: true,

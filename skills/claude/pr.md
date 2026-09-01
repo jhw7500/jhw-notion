@@ -480,6 +480,11 @@ for (const line of encoded) {
 const escapedRepo = repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const pullUrl = new RegExp(`^https://github\\.com/${escapedRepo}/pull/[1-9][0-9]*(?:#.*)?$`);
 const failurePattern = /usage limits?|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\n]*(?:fail|error|unavailable|reject)/i;
+const runtimeFailureLine = /^(?:(?:(?:the|your|my|our|its)\s+)?(?:usage limits?|quota)(?:\s+(?:for|on)\s+(?:this|the|your)\s+account)?\s+(?:(?:has|had)\s+been\s+|(?:was|were|is|are)\s+)?(?:reached|hit|exceeded|exhausted)|(?:(?:you|i|we)(?:[\u0027’]ve)?\s+)(?:(?:have|has|had)\s+)?(?:reached|hit|exceeded)\s+(?:(?:the|your|my|our)\s+)?(?:usage limit|quota)|(?:the\s+)?(?:provider|connector|environment)\s+(?:(?:is|was|became)\s+)?(?:unavailable|failed|errored))[.!]?$/i;
+const hasRuntimeFailure = (body) => String(body || "").split(/\r?\n/)
+  .map((line) => line.trim())
+  .filter(Boolean)
+  .some((line) => runtimeFailureLine.test(line));
 const accepted = reviewer === "codex"
   ? new Set(["chatgpt-codex-connector", "chatgpt-codex-connector[bot]"])
   : new Set(["gemini-code-assist[bot]"]);
@@ -491,7 +496,8 @@ const valid = candidates.filter((candidate) => {
   }
   return ["comment", "inline", "review"].includes(candidate.kind) &&
     pullUrl.test(candidate.url || "") && typeof candidate.body === "string" &&
-    candidate.body.trim() !== "" && !failurePattern.test(candidate.body);
+    candidate.body.trim() !== "" && !failurePattern.test(candidate.body) &&
+    !hasRuntimeFailure(candidate.body);
 });
 const identities = [...new Set(valid.map((candidate) => candidate.actor))];
 if (identities.length > 1) process.exit(1);
