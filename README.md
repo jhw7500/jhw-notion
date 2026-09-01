@@ -117,6 +117,7 @@ TUI에서 `/jhw:` 접두사로 사용. 통합 진입점 위주:
 /jhw:import   — Notion 검색 결과를 로컬 memory로 불러오기
 /jhw:cclog    — Claude Code 세션 대화 기록 조회 (Notion 아님)
 /jhw:pr       — PR 생성·head-scoped AI 리뷰·필수 게이트·조건부 머지
+/jhw:issue    — 좁은 GitHub Issue 생성·지원 reviewer 요청·bounded wait
 ```
 
 PR 리뷰 정책 예시:
@@ -129,6 +130,18 @@ PR 리뷰 정책 예시:
 ```
 
 `--review`/`--no-review`를 생략하면 저장소 설정을 따르며, 현재 설정과 호환 기본값은 review-on이다.
+
+Issue 리뷰 정책 예시:
+
+```text
+/jhw:issue <내용> --review --timeout 20 — 지원 확인 reviewer 요청·bounded wait
+/jhw:issue <내용> --no-review           — review:skip 적용, mention 없음
+/jhw:issue <내용>                       — 저장소 review.auto를 따름
+```
+
+현재처럼 전역 `review.auto`가 없으면 호환 기본값 `true`를 사용한다. Codex는 동일 저장소 Issue canary 성공 증거가 있어야 eligible이다.
+Gemini Assist와 OpenCode는 standalone Issue에서 PR-only이므로 요청하거나 기다리지 않는다.
+이 명령은 리뷰 결과를 받아도 Issue를 수정·닫기·삭제하거나 feedback을 자동 구현하지 않는다.
 
 > deprecated alias(다음 메이저 릴리스에서 삭제): `/jhw:record`·`/jhw:note`·`/jhw:delete`→`/jhw:save`, `/jhw:search`·`/jhw:context`·`/jhw:history`→`/jhw:recall`, `/jhw:start`·`/jhw:close`→`/jhw:project`, `/jhw:ship`→`/jhw:pr`.
 

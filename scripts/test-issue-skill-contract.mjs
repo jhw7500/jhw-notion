@@ -4,6 +4,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync, lstatSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -14,6 +15,10 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const canonicalIssue = join(repoRoot, "skills", "claude", "issue.md");
 const installSafetyPath = join(repoRoot, "scripts", "test-install-safety.sh");
+const agentsPath = join(repoRoot, "skills", "claude", "AGENTS.md");
+const readmePath = join(repoRoot, "README.md");
+const codexIssueSkill = join(repoRoot, "skills", "codex", "jhw-issue", "SKILL.md");
+const codexIssueReference = join(repoRoot, "skills", "codex", "jhw-issue", "references", "issue.md");
 const issueCreatedAt = "2026-09-01T00:00:00Z";
 const requestCreatedAt = "2026-09-01T00:01:00Z";
 
@@ -231,12 +236,23 @@ function issueState(overrides = {}) {
 async function main() {
   const issueText = await readFile(canonicalIssue, "utf8");
   const installSafetyText = await readFile(installSafetyPath, "utf8");
+  const agentsText = await readFile(agentsPath, "utf8");
+  const readmeText = await readFile(readmePath, "utf8");
   assert.match(issueText, /^description: "GitHub 이슈 생성 · --review 지원 리뷰어 요청·대기·요약 · --no-review 리뷰 생략 · --timeout 대기한도"/m);
   assert.match(issueText, /^argument-hint: "\[title\/body\] \[--review\|--no-review\] \[--timeout <min>\]"/m);
   assert.match(
     installSafetyText,
     /test-pr-skill-contract\.mjs"\nnode "\$REPO_ROOT\/scripts\/test-issue-skill-contract\.mjs"/,
   );
+  assert.match(agentsText, /\| `issue\.md` \|/);
+  assert.match(readmeText, /\/jhw:issue .*--review.*--timeout 20/);
+  assert.match(readmeText, /\/jhw:issue .*--no-review/);
+  assert.match(readmeText, /\/jhw:issue <내용>\s+— 저장소 review\.auto를 따름/);
+  assert.match(readmeText, /Codex.*동일 저장소.*canary/);
+  assert.match(readmeText, /Gemini Assist.*OpenCode.*PR-only/);
+  assert.match(readmeText, /Issue를 수정·닫기.*구현/);
+  assert.ok(existsSync(codexIssueSkill));
+  assert.ok(lstatSync(codexIssueReference).isSymbolicLink());
   const contract = `${createContractBlock(issueText)}\n${waitContractBlock(issueText)}`;
 
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-issue-contract-"));
