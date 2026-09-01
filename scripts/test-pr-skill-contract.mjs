@@ -162,6 +162,7 @@ if (argv[0] === "pr" && argv[1] === "checks") {
     state.prHead = state.headAfterRequiredChecks;
     save();
   }
+  if (state.requiredChecksMessage) process.stderr.write(state.requiredChecksMessage);
   process.exit(state.requiredChecksExit || 0);
 }
 
@@ -947,10 +948,24 @@ async function main() {
       [["pr", "checks", "42", "--repo", "example/repo", "--required", "--watch", "--interval", "10"]],
     );
     const requiredChecksFailed = await runResult(
-      baseState({ prHead: currentHead, requiredChecksExit: 1 }),
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "required check failed\n",
+      }),
       `jhw_pr_wait_required_checks 42 ${currentHead}`,
     );
     assert.equal(requiredChecksFailed.code, 1);
+    const noRequiredChecks = await run(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(noRequiredChecks.state.prHead, currentHead,
+      "an explicitly empty required-check set must satisfy the required-check gate");
     const changedDuringChecks = await runResult(
       baseState({ prHead: currentHead, headAfterRequiredChecks: oldHead }),
       `jhw_pr_wait_required_checks 42 ${currentHead}`,

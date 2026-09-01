@@ -148,13 +148,21 @@ jhw_pr_mode_wait_plan() {
 }
 
 jhw_pr_wait_required_checks() {
-  local pr="$1" expected_head="$2" actual_head
+  local pr="$1" expected_head="$2" actual_head check_output check_status
+  local no_required_pattern="^no required checks reported on the '[^']+' branch$"
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || return 2
   actual_head="$(gh pr view "$pr" --repo "$REPO_NWO" --json headRefOid -q .headRefOid)" || return 1
   [[ "$actual_head" == "$expected_head" ]] || return 3
-  gh pr checks "$pr" --repo "$REPO_NWO" --required --watch --interval 10 || return 1
+  check_output="$(LC_ALL=C gh pr checks "$pr" --repo "$REPO_NWO" --required --watch --interval 10 2>&1)"
+  check_status=$?
+  if (( check_status != 0 )); then
+    if (( check_status != 1 )) || [[ ! "$check_output" =~ $no_required_pattern ]]; then
+      [[ -z "$check_output" ]] || printf '%s\n' "$check_output" >&2
+      return 1
+    fi
+  fi
   actual_head="$(gh pr view "$pr" --repo "$REPO_NWO" --json headRefOid -q .headRefOid)" || return 1
   [[ "$actual_head" == "$expected_head" ]] || return 3
 }
