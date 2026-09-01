@@ -92,11 +92,10 @@ function rows(values) {
   if (values.length > 0) process.stdout.write(values.join("\n") + "\n");
 }
 
-function isBlocking(item) {
-  if (typeof item.blocking === "boolean") return item.blocking;
-  const queryIndex = argv.indexOf("--jq");
-  const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
-  return typeof item.severity === "string" && query.includes(item.severity.toUpperCase());
+function reviewBody(item) {
+  if (typeof item.body === "string") return item.body;
+  if (typeof item.severity === "string") return item.severity + " finding";
+  return item.blocking === true ? "P1 finding" : "Review completed.";
 }
 
 function optionValue(name) {
@@ -395,25 +394,27 @@ if (/\/issues\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
 }
 
 if (/\/pulls\/\d+\/reviews\?per_page=100$/.test(endpoint)) {
+  if (!(optionValue("--jq") || "").includes("@base64")) process.exit(2);
   rows(state.reviews.map((item, index) => [
     item.actor,
     item.id || 5000 + index,
     item.commitId,
     item.submittedAt,
     item.state || "COMMENTED",
-    isBlocking(item) ? "true" : "false",
+    typeof item.bodyBase64 === "string" ? item.bodyBase64 : Buffer.from(reviewBody(item)).toString("base64"),
   ].join("\t")));
   process.exit(0);
 }
 
 if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
+  if (!(optionValue("--jq") || "").includes("@base64")) process.exit(2);
   rows(state.pullComments.map((item) => [
     item.actor,
     item.reviewId || 0,
     item.commitId,
     item.originalCommitId,
     item.createdAt,
-    isBlocking(item) ? "true" : "false",
+    typeof item.bodyBase64 === "string" ? item.bodyBase64 : Buffer.from(reviewBody(item)).toString("base64"),
   ].join("\t")));
   process.exit(0);
 }
@@ -2017,6 +2018,273 @@ async function main() {
       "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
     );
     assert.equal(currentReview.stdout.trim(), "CLEAN");
+
+    const negatedPriorityReview = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "No P1 findings.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(negatedPriorityReview.stdout.trim(), "CLEAN",
+      "an explicitly negated Codex priority must not become a blocker");
+
+    const negatedPriorityInline = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        pullComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "2026-08-29T00:03:00Z",
+          body: "No P0/P1 issues.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(negatedPriorityInline.stdout.trim(), "CLEAN",
+      "negated priority lists in inline comments must remain non-blocking");
+
+    const negatedSeverityReview = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "No [HIGH] or P1 issues.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(negatedSeverityReview.stdout.trim(), "CLEAN",
+      "a negated mixed severity/priority list must remain non-blocking");
+
+    const correctedNegations = [
+      "No P1 findings is incorrect.",
+      "The earlier claim “No P1 findings” is false.",
+      "It is not true that there are no P1 blockers.",
+      "No P1 issues, except the migration can lose data.",
+    ];
+    for (const body of correctedNegations) {
+      const correctedNegation = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          reviews: [{
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            body,
+          }],
+        }),
+        "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+      );
+      assert.equal(correctedNegation.stdout.trim(), "FEEDBACK",
+        `a corrected or qualified negation must preserve its blocker: ${body}`);
+    }
+
+    const adjacentCorrections = [
+      "No P1 findings. Correction: that statement is false.",
+      "No P1 findings.\nThis conclusion is incorrect.",
+      "No P1 findings. However, one blocking data-loss issue remains.",
+      "No P1 findings. Correction: one issue remains.",
+      "No P1 findings. However, an authentication bypass remains.",
+      "No P1 findings. Except one race remains.",
+      "No P1 findings. **Correction:** one issue remains.",
+      "No P1 findings. **However,** an authentication bypass remains.",
+      "No P1 findings. _Correction:_ one race remains.",
+      "No P1 findings. **Correction**: one issue remains.",
+      "No P1 findings. *However*: an authentication bypass remains.",
+      "No P1 findings. _Correction: one race remains._",
+      "No P1 findings. *However, an authentication bypass remains.*",
+      "No P1 findings. **Correction: one issue remains**.",
+    ];
+    for (const body of adjacentCorrections) {
+      const adjacentCorrection = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          reviews: [{
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            body,
+          }],
+        }),
+        "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+      );
+      assert.equal(adjacentCorrection.stdout.trim(), "FEEDBACK",
+        `an adjacent correction must revoke the clean sentence: ${body}`);
+    }
+
+    const lowerPriorityQualification = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "No P1 findings. However, only P2 suggestions remain.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(lowerPriorityQualification.stdout.trim(), "CLEAN",
+      "an explicit lower-priority qualification must not revoke a valid P1 clean sentence");
+
+    const emphasizedLowerPriorityQualification = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "No P1 findings. **However,** only P2 suggestions remain.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(emphasizedLowerPriorityQualification.stdout.trim(), "CLEAN",
+      "Markdown emphasis must not change a lower-priority-only qualification");
+
+    const italicCleanSentence = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "_No P1 findings._",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(italicCleanSentence.stdout.trim(), "CLEAN",
+      "single-emphasis around an explicit clean sentence must not create a blocker");
+
+    const italicCleanSentenceWithOuterPunctuation = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "_No P1 findings_.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(italicCleanSentenceWithOuterPunctuation.stdout.trim(), "CLEAN",
+      "punctuation outside single emphasis must remain part of the clean sentence");
+
+    const shouldFixP3Qualification = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "No P2 findings. However, only P3 suggestions remain.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+      { SHIP_BLOCK_ON: "should-fix" },
+    );
+    assert.equal(shouldFixP3Qualification.stdout.trim(), "CLEAN",
+      "the should-fix threshold may retain an explicit P3-only qualification");
+
+    const neutralQuotedExample = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "A P2 parser note may use `No P1 findings` as a non-actionable example.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(neutralQuotedExample.stdout.trim(), "CLEAN",
+      "a negated priority quoted only as inline-code documentation must not become a blocker");
+
+    const correctedInlineCodeNegations = [
+      "Correction: `No P1 findings`; one issue remains.",
+      "Correction: `No P1 findings` was the old assessment; one issue remains.",
+      "However, `No P1 findings`; an authentication bypass remains.",
+      "The prior output was `No P1 findings`. Correction: one issue remains.",
+    ];
+    for (const body of correctedInlineCodeNegations) {
+      const correctedInlineCode = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          reviews: [{
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            body,
+          }],
+        }),
+        "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+      );
+      assert.equal(correctedInlineCode.stdout.trim(), "FEEDBACK",
+        `a correction must preserve its inline-code priority evidence: ${body}`);
+    }
+
+    const inlineCodeWithLowerPriorityQualification = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "The prior output was `No P1 findings`. However, only P2 suggestions remain.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(inlineCodeWithLowerPriorityQualification.stdout.trim(), "CLEAN",
+      "an adjacent lower-priority-only qualification must keep inline-code documentation non-blocking");
+
+    const negatedThenAffirmative = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "No P1 findings, but P0 data-loss behavior remains.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(negatedThenAffirmative.stdout.trim(), "FEEDBACK",
+      "a negated label must not hide a separate affirmative blocker");
+
+    for (const [shape, bodyBase64] of [["invalid base64", "%%%"], ["invalid UTF-8", "/w=="]]) {
+      const malformedReviewBody = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          reviews: [{
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            bodyBase64,
+          }],
+        }),
+        [
+          "ship_codex_trigger",
+          "ship_codex_signal_status",
+          "printf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+        ].join("\n"),
+      );
+      assert.equal(malformedReviewBody.stdout.trim(), "FAILED,signal_contract_invalid",
+        `${shape} review bodies must fail closed`);
+    }
 
     const currentBlockingReview = await run(
       baseState({

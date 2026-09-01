@@ -1408,9 +1408,79 @@ ship_codex_author_matches() {
   [[ "$1" == "$SHIP_CODEX_LOGIN" ]]
 }
 
+ship_codex_body_is_blocking() {
+  local encoded="$1"
+  printf '%s' "$encoded" | node -e '
+const fs = require("node:fs");
+const pattern = process.argv[1];
+const allowed = new Set([
+  "(^|[^A-Za-z0-9])(P0|P1)([^0-9]|$)",
+  "(^|[^A-Za-z0-9])(P0|P1|P2)([^0-9]|$)",
+]);
+if (!allowed.has(pattern)) process.exit(2);
+const encoded = fs.readFileSync(0, "utf8");
+if (/\s/.test(encoded) || (encoded !== "" &&
+    (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)))) process.exit(2);
+const bytes = Buffer.from(encoded, "base64");
+if (bytes.toString("base64") !== encoded) process.exit(2);
+let body;
+try { body = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { process.exit(2); }
+const label = "(?:\\[(?:CRITICAL|HIGH|MEDIUM|LOW)\\]|P[0-3])";
+const negatedText = "no\\s+" + label +
+  "(?:\\s*(?:\\/|,|\\bor\\b|\\band\\b)\\s*" + label +
+  ")*\\s+(?:issues?|findings?|blockers?)";
+const explicitClean = new RegExp("^" + negatedText + "[.!]?$", "i");
+const negatedMention = new RegExp("\\b" + negatedText + "\\b", "i");
+const correction = /\b(?:false|incorrect|wrong|inaccurate|misleading)\b|\bnot\s+(?:true|correct)\b/i;
+const blocking = new RegExp(pattern, "i");
+const normalizeMarkdown = (input) => {
+  let value = input.trim().replace(/^(?:[-*+>]|#{1,6})\s+/, "");
+  value = value.replace(
+    /^(\*\*|__|\*|_)(Correction|However|But|Although|Except)([:;,]?)\1([:;,]?)(?=\s|$)\s*/i,
+    (whole, wrapper, lead, inside, outside) => `${lead}${inside || outside} `,
+  );
+  const wrapper = value.match(/^(\*\*|__|\*|_)([\s\S]*)\1([.!?]?)$/);
+  if (wrapper) value = (wrapper[2] + wrapper[3]).trim();
+  return value;
+};
+const statements = body.split(/\r?\n/)
+  .flatMap((line) => line.split(/(?<=[.!?])\s+/))
+  .map(normalizeMarkdown)
+  .filter(Boolean);
+const correctionLead = /^(?:correction\s*:|(?:(?:this|that)|the(?:\s+(?:previous|preceding|earlier))?)\s+(?:statement|claim|conclusion|assessment)\b)/i;
+const qualificationLead = /^(?:however|but|although|except)\b/i;
+const lowerLabel = pattern.includes("P0|P1|P2") ? "P3" : "(?:P2|P3)";
+const lowerOnlyQualification = new RegExp(
+  "^(?:(?:however|but|although|except)\\b[,;:]?|correction\\s*:)?\\s*only\\s+" + lowerLabel +
+  "(?:\\s*(?:\\/|,|\\bor\\b|\\band\\b)\\s*" + lowerLabel +
+  ")*\\s+(?:suggestions?|findings?|issues?|nits?|comments?)(?:\\s+(?:remain|remains))?[.!]?$",
+  "i",
+);
+const revokesClean = (value) =>
+  (correctionLead.test(value) || qualificationLead.test(value)) &&
+  !lowerOnlyQualification.test(value);
+for (let index = 0; index < statements.length; index += 1) {
+  const normalized = statements[index];
+  const adjacent = [statements[index - 1], statements[index + 1]].filter(Boolean);
+  const contextualRevocation = revokesClean(normalized) || adjacent.some(revokesClean);
+  if (explicitClean.test(normalized)) {
+    if (!contextualRevocation) continue;
+  }
+  let searchable = normalized;
+  if (!(negatedMention.test(normalized) &&
+      (correction.test(normalized) || contextualRevocation))) {
+    searchable = searchable.replace(/`([^`\r\n]*)`/g, (whole, inner) =>
+      explicitClean.test(inner.trim()) ? " " : inner);
+  }
+  if (blocking.test(searchable)) process.exit(0);
+}
+process.exit(1);
+' "$SHIP_CODEX_BLOCKING_PATTERN"
+}
+
 ship_codex_signal_status() {
   local reviews pull_comments issue_reactions comment_reactions request_epoch now_epoch deadline
-  local actor review_id review_state commit_id original_commit_id occurred_at blocking content
+  local actor review_id review_state commit_id original_commit_id occurred_at body_b64 body_status content
   local dismissed_review_ids=""
   local has_response=false has_blocking=false has_positive=false has_negative=false has_eyes=false
 
@@ -1421,11 +1491,11 @@ ship_codex_signal_status() {
   fi
 
   reviews="$(gh api "repos/$REPO_NWO/pulls/$PR/reviews?per_page=100" --paginate \
-    --jq ".[] | [.user.login, (.id | tostring), (.commit_id // \"-\"), (.submitted_at // \"-\"), (.state // \"UNKNOWN\"), (((.body // \"\") | test(\"$SHIP_CODEX_BLOCKING_PATTERN\"; \"i\")))] | @tsv" 2>/dev/null)" || {
+    --jq '.[] | [.user.login, (.id | tostring), (.commit_id // "-"), (.submitted_at // "-"), (.state // "UNKNOWN"), ((.body // "") | @base64)] | @tsv' 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   pull_comments="$(gh api "repos/$REPO_NWO/pulls/$PR/comments?per_page=100" --paginate \
-    --jq ".[] | [.user.login, ((.pull_request_review_id // 0) | tostring), (.commit_id // \"-\"), (.original_commit_id // .commit_id // \"-\"), (.created_at // \"-\"), (((.body // \"\") | test(\"$SHIP_CODEX_BLOCKING_PATTERN\"; \"i\")))] | @tsv" 2>/dev/null)" || {
+    --jq '.[] | [.user.login, ((.pull_request_review_id // 0) | tostring), (.commit_id // "-"), (.original_commit_id // .commit_id // "-"), (.created_at // "-"), ((.body // "") | @base64)] | @tsv' 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   issue_reactions="$(gh api "repos/$REPO_NWO/issues/$PR/reactions?per_page=100" --paginate \
@@ -1437,7 +1507,7 @@ ship_codex_signal_status() {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
 
-  while IFS=$'\t' read -r actor review_id commit_id occurred_at review_state blocking; do
+  while IFS=$'\t' read -r actor review_id commit_id occurred_at review_state body_b64; do
     ship_codex_author_matches "$actor" || continue
     [[ "$review_id" =~ ^[1-9][0-9]*$ ]] || continue
     case "$review_state" in
@@ -1452,12 +1522,19 @@ ship_codex_signal_status() {
     [[ "$commit_id" == "$ROUND_HEAD" ]] || continue
     ship_at_or_after "$occurred_at" "$SHIP_CODEX_REQUESTED_AT" || continue
     has_response=true
-    if [[ "$review_state" != DISMISSED && "$blocking" == true ]]; then
-      has_blocking=true
+    if [[ "$review_state" != DISMISSED ]]; then
+      if ship_codex_body_is_blocking "$body_b64"; then
+        has_blocking=true
+      else
+        body_status=$?
+        if [[ "$body_status" != 1 ]]; then
+          SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return
+        fi
+      fi
     fi
   done <<<"$reviews"
 
-  while IFS=$'\t' read -r actor review_id commit_id original_commit_id occurred_at blocking; do
+  while IFS=$'\t' read -r actor review_id commit_id original_commit_id occurred_at body_b64; do
     ship_codex_author_matches "$actor" || continue
     [[ "$commit_id" == "$ROUND_HEAD" && "$original_commit_id" == "$ROUND_HEAD" ]] || continue
     ship_at_or_after "$occurred_at" "$SHIP_CODEX_REQUESTED_AT" || continue
@@ -1466,7 +1543,14 @@ ship_codex_signal_status() {
       continue
     fi
     has_response=true
-    [[ "$blocking" == true ]] && has_blocking=true
+    if ship_codex_body_is_blocking "$body_b64"; then
+      has_blocking=true
+    else
+      body_status=$?
+      if [[ "$body_status" != 1 ]]; then
+        SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return
+      fi
+    fi
   done <<<"$pull_comments"
 
   for reactions in "$issue_reactions" "$comment_reactions"; do
@@ -1598,7 +1682,7 @@ collect > /tmp/jhw-pr-signals.$PR   # 매 호출 1회분. 에이전트가 읽어
 ### 리뷰어별 terminal 판정 규칙
 
 - **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. auto-fix 라운드에서는 `head_sha == ROUND_HEAD`이고 `created_at >= ROUND_STARTED_AT`인 run만 해당 라운드 실행이다. push 완료 시각인 `ROUND_PUSHED_AT`부터 180초 안에 이 run이 없으면 **TRIGGER_FAILED**이며, 시작된 run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**이다.
-- **Codex**: auto-fix 라운드에서는 성공적으로 기록된 요청 댓글의 `created_at` 이후 신호만 본다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**. (a) 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) PR 또는 정확한 요청 댓글에 요청 시각 이후 `chatgpt-codex-connector[bot] +1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
+- **Codex**: auto-fix 라운드에서는 성공적으로 기록된 요청 댓글의 `created_at` 이후 신호만 본다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**하되, `No P1 findings`처럼 명시적으로 부정된 priority/severity 문구는 제거한 뒤 남은 affirmative 라벨만 센다. (a) 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) PR 또는 정확한 요청 댓글에 요청 시각 이후 `chatgpt-codex-connector[bot] +1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
 - **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
 - **Claude/Gemini schema-3 공통 판정**: reviewer별로 가장 최근에 시작된 현재-head run을 고르고, 위 state 계약과 그 run의 동일 ID/attempt를 가진 v3 봇 코멘트가 정확히 하나이며 run이 `completed`여야 terminal이다. 다른 head/run의 historical v3 코멘트는 선택 대상이 아니다. 성공 state이면 canonical 본문의 `### New findings`와 `### Still open` 아래에서만 정확한 `#### RVW-<12hex> [SEVERITY] title` heading을 센다. `### Resolved`/`### Retracted`, 일반 산문의 bracket 문자열, `filtered_max_severity`는 활성 지적이 아니다. `accepted_count`와 활성 heading 수가 다르거나 state/표시 메타가 불일치하면 성공으로 간주하지 않고 FAILED로 보고한다.
 - **Claude 리뷰**: 유효한 현재-head v3 성공에서 활성 `[CRITICAL]`/`[HIGH]`이 있으면 FEEDBACK, 없으면 CLEAN이다. 유효한 현재-head 실패 state는 FAILED(재실행 후보). run이 `in_progress`면 PENDING. 워크플로우 파일을 바꾸는 PR에서 claude-code-action의 default-branch 동일성 검증으로 모델이 의도적으로 스킵된 경우도 FAILED로 명시하되, 같은 역할의 앱 대체 신호 적용 여부는 아래 규칙을 따른다. **TIMEOUT_MIN을 초과한 in_progress run**은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체한다.
