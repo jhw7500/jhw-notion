@@ -27,6 +27,13 @@ const legacyRequestMarker = `<!-- jhw-ship:codex-review round=2 head=${currentHe
 const legacyRequestBody = `@codex review\n\n${legacyRequestMarker}`;
 const oldLegacyRequestMarker = `<!-- jhw-ship:codex-review round=2 head=${oldHead} -->`;
 const oldLegacyRequestBody = `@codex review\n\n${oldLegacyRequestMarker}`;
+const otherRoundRequestBody = `@codex review\n\n<!-- jhw-pr:codex-review round=7 head=${currentHead} -->`;
+const genericCodexMarker = `<!-- jhw-pr:review-request reviewer=codex head=${currentHead} -->`;
+const genericCodexBody = `@codex review\n\n${genericCodexMarker}`;
+const oldGenericCodexMarker = `<!-- jhw-pr:review-request reviewer=codex head=${oldHead} -->`;
+const oldGenericCodexBody = `@codex review\n\n${oldGenericCodexMarker}`;
+const genericGeminiMarker = `<!-- jhw-pr:review-request reviewer=gemini-assist head=${currentHead} -->`;
+const genericGeminiBody = `/gemini review\n\n${genericGeminiMarker}`;
 
 function contractBlock(markdown) {
   const match = markdown.match(
@@ -104,7 +111,7 @@ if (argv[0] === "pr" && argv[1] === "create") {
 if (argv[0] === "pr" && argv[1] === "view") {
   if (!state.prExists) process.exit(1);
   const fields = optionValue("--json") || "";
-  const query = optionValue("--jq") || "";
+  const query = optionValue("--jq") || optionValue("-q") || "";
   if (query === ".number") process.stdout.write(String(state.prNumber) + "\n");
   else if (query === ".headRefOid") process.stdout.write(state.prHead + "\n");
   else if (query === ".isDraft") process.stdout.write(String(state.prDraft) + "\n");
@@ -143,6 +150,30 @@ if (argv[0] === "pr" && argv[1] === "ready") {
   process.exit(0);
 }
 
+if (argv[0] === "pr" && argv[1] === "checks") {
+  if (!state.prExists) process.exit(1);
+  if (state.headAfterRequiredChecks) {
+    state.prHead = state.headAfterRequiredChecks;
+    save();
+  }
+  process.exit(state.requiredChecksExit || 0);
+}
+
+if (argv[0] === "workflow" && argv[1] === "view") {
+  const workflow = argv[2];
+  if (state.failWorkflowView || !state.workflowStates?.[workflow]) process.exit(1);
+  process.stdout.write(state.workflowStates[workflow] + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "workflow" && argv[1] === "run") {
+  const workflow = argv[2];
+  if (state.failWorkflowDispatch || state.workflowStates?.[workflow] !== "active") process.exit(1);
+  state.dispatchedWorkflows.push({ workflow, args: argv.slice(3) });
+  save();
+  process.exit(0);
+}
+
 if (argv[0] !== "api" || !argv[1]) process.exit(2);
 const endpoint = argv[1];
 if ((state.failEndpoints || []).some((part) => endpoint.includes(part))) process.exit(1);
@@ -173,9 +204,13 @@ if (/\/issues\/\d+\/comments\?per_page=100$/.test(endpoint)) {
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
   const actor = query.match(/\.user\.login == "([^"]+)"/)?.[1];
   const markers = [...query.matchAll(/contains\("([^"]+)"\)/g)].map((match) => match[1]);
+  const testPatterns = [...query.matchAll(/test\("([^"]+)"\)/g)]
+    .map((match) => new RegExp(match[1]));
   const matching = state.issueComments.filter((item) =>
     (!actor || item.actor === actor) &&
-    (markers.length === 0 || markers.some((marker) => item.body.includes(marker))));
+    (markers.length + testPatterns.length === 0 ||
+      markers.some((marker) => item.body.includes(marker)) ||
+      testPatterns.some((pattern) => pattern.test(item.body))));
   rows(matching.map((item) => String(item.id) + "\t" + item.createdAt));
   process.exit(0);
 }
@@ -201,7 +236,13 @@ if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
 }
 
 if (endpoint.includes("/actions/runs?")) {
-  rows(state.runs.map((item) => [item.id, item.attempt, item.name, item.head, item.createdAt, item.status, item.conclusion].join("\t")));
+  const queryIndex = argv.indexOf("--jq");
+  const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
+  rows(state.runs.map((item) => {
+    const fields = [item.id, item.attempt, item.name, item.head, item.createdAt, item.status, item.conclusion];
+    if (query.includes(".event")) fields.push(item.event || "push");
+    return fields.join("\t");
+  }));
   process.exit(0);
 }
 
@@ -285,6 +326,13 @@ function baseState(overrides = {}) {
     issueReactions: [],
     commentReactions: [],
     runs: [],
+    workflowStates: {
+      "claude-code-review.yml": "active",
+      "gemini-auto-review.yml": "active",
+      "opencode-auto-review.yml": "active",
+    },
+    dispatchedWorkflows: [],
+    requiredChecksExit: 0,
     failEndpoints: [],
     failPost: false,
     ...overrides,
@@ -295,10 +343,20 @@ async function main() {
   const prText = await readFile(canonicalPr, "utf8");
   const aliasText = await readFile(shipAlias, "utf8");
   assert.match(prText, /^# \/jhw:pr — PR 생성/m);
-  assert.match(prText, /<!-- jhw-pr:codex-review round=/);
+  assert.match(prText, /<!-- jhw-pr:review-request reviewer=\$\{reviewer\} head=\$\{head\} -->/);
+  assert.match(prText, /jhw-\(pr\|ship\):codex-review round=/);
   assert.match(aliasText, /deprecated/i);
   assert.match(aliasText, /\/jhw:pr/);
   assert.doesNotMatch(aliasText, /pr-round-contract: trigger-and-scope:begin/);
+  assert.match(prText, /\| Effective command policy \| Managed workflows \| Apps \| AI wait \|/);
+  assert.doesNotMatch(prText, /기본 (?:\*\*)?3(?:라운드|\b)/);
+  assert.doesNotMatch(prText, /최초 PR 라운드는 기존 자동 트리거/);
+  assert.match(prText, /jhw_pr_request_app_review codex "\$ROUND_HEAD"/);
+  assert.match(prText, /jhw_pr_request_app_review gemini-assist "\$ROUND_HEAD"/);
+  assert.match(prText, /jhw_pr_dispatch_same_head claude-code-review\.yml 'Claude Code Review' "\$ROUND_HEAD"/);
+  assert.match(prText, /jhw_pr_dispatch_same_head gemini-auto-review\.yml 'Gemini Auto PR Review' "\$ROUND_HEAD"/);
+  assert.match(prText, /jhw_pr_dispatch_same_head opencode-auto-review\.yml 'OpenCode Auto PR Review' "\$ROUND_HEAD"/);
+  assert.match(prText, /jhw_pr_wait_required_checks "\$PR" "\$ROUND_HEAD"/);
   const contract = `${contractBlock(prText)}\n${policyContractBlock(prText)}`;
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-pr-contract-"));
   const fakeGh = join(tempRoot, "gh");
@@ -501,6 +559,256 @@ async function main() {
     assert.equal(unexpectedlyReady.log.some(ready), false,
       "a PR that is already ready must fail verification instead of issuing another ready mutation");
 
+    const countPosts = (result) => result.log.filter((args) => args.includes("POST")).length;
+    const currentCodexRequest = {
+      id: 9101,
+      actor: "jhw7500",
+      createdAt: requestCreatedAt,
+      body: genericCodexBody,
+    };
+    const codexRequest = await run(
+      baseState(),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    const geminiRequest = await run(
+      baseState(),
+      `jhw_pr_request_app_review gemini-assist ${currentHead}`,
+    );
+    const codexResume = await run(
+      baseState({ issueComments: [currentCodexRequest] }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    const codexOldHead = await run(
+      baseState({
+        issueComments: [{ ...currentCodexRequest, id: 9103, body: oldGenericCodexBody }],
+      }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    const codexDuplicate = await runResult(
+      baseState({
+        issueComments: [currentCodexRequest, { ...currentCodexRequest, id: 9102 }],
+      }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    const unsupportedApp = await runResult(
+      baseState(),
+      `jhw_pr_request_app_review unknown-reviewer ${currentHead}`,
+    );
+    assert.equal(countPosts(codexRequest), 1);
+    assert.equal(countPosts(geminiRequest), 1);
+    assert.equal(countPosts(codexResume), 0);
+    assert.equal(countPosts(codexOldHead), 1);
+    assert.notEqual(codexDuplicate.code, 0);
+    assert.match(codexDuplicate.stderr, /TRIGGER_FAILED/);
+    assert.notEqual(unsupportedApp.code, 0);
+    assert.equal(countPosts(unsupportedApp), 0);
+    assert.equal(codexRequest.state.issueComments.at(-1).body, genericCodexBody);
+    assert.equal(geminiRequest.state.issueComments.at(-1).body, genericGeminiBody);
+
+    const codexPrimaryCompatibility = await run(
+      baseState({
+        issueComments: [
+          { id: 9201, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody },
+        ],
+      }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    const codexLegacyCompatibility = await run(
+      baseState({
+        issueComments: [
+          { id: 9202, actor: "jhw7500", createdAt: requestCreatedAt, body: legacyRequestBody },
+        ],
+      }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    const codexOtherRoundCompatibility = await run(
+      baseState({
+        issueComments: [
+          { id: 9204, actor: "jhw7500", createdAt: requestCreatedAt, body: otherRoundRequestBody },
+        ],
+      }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    const codexMixedCompatibilityDuplicate = await runResult(
+      baseState({
+        issueComments: [
+          currentCodexRequest,
+          { id: 9203, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody },
+        ],
+      }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    assert.equal(countPosts(codexPrimaryCompatibility), 0,
+      "one actor-owned canonical round marker for the current head must be reused");
+    assert.equal(countPosts(codexLegacyCompatibility), 0,
+      "one actor-owned legacy ship marker for the current head must be reused");
+    assert.equal(countPosts(codexOtherRoundCompatibility), 0,
+      "a canonical Codex round marker for the current head must be reused regardless of round number");
+    assert.notEqual(codexMixedCompatibilityDuplicate.code, 0);
+    assert.match(codexMixedCompatibilityDuplicate.stderr, /TRIGGER_FAILED/);
+    assert.equal(countPosts(codexMixedCompatibilityDuplicate), 0);
+
+    const isWorkflowDispatch = (args) => args[0] === "workflow" && args[1] === "run";
+    const sameHeadWorkflow = await run(
+      baseState({
+        runs: [
+          {
+            id: 9301,
+            attempt: 1,
+            name: "Claude Code Review",
+            head: currentHead,
+            createdAt: requestCreatedAt,
+            status: "queued",
+            conclusion: "null",
+            event: "workflow_dispatch",
+          },
+        ],
+      }),
+      [
+        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
+        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_RUN_ID\"",
+      ].join("\n"),
+    );
+    assert.equal(sameHeadWorkflow.stdout.trim(), "REUSED,9301");
+    assert.equal(sameHeadWorkflow.log.filter(isWorkflowDispatch).length, 0);
+
+    const exactDispatch = await run(
+      baseState({
+        runs: [
+          {
+            id: 9302,
+            attempt: 1,
+            name: "Gemini Auto PR Review",
+            head: currentHead,
+            createdAt: requestCreatedAt,
+            status: "completed",
+            conclusion: "success",
+            event: "push",
+          },
+          {
+            id: 9303,
+            attempt: 1,
+            name: "Gemini Auto PR Review",
+            head: oldHead,
+            createdAt: requestCreatedAt,
+            status: "in_progress",
+            conclusion: "null",
+            event: "workflow_dispatch",
+          },
+        ],
+      }),
+      [
+        `jhw_pr_dispatch_same_head gemini-auto-review.yml 'Gemini Auto PR Review' ${currentHead}`,
+        "printf '%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\"",
+      ].join("\n"),
+    );
+    assert.equal(exactDispatch.stdout.trim(), "DISPATCHED");
+    assert.deepEqual(
+      exactDispatch.log.filter(isWorkflowDispatch),
+      [[
+        "workflow", "run", "gemini-auto-review.yml", "--repo", "example/repo",
+        "-f", "pr_number=42", "-f", "force_review=true",
+      ]],
+    );
+
+    const openCodeDispatch = await run(
+      baseState(),
+      `jhw_pr_dispatch_same_head opencode-auto-review.yml 'OpenCode Auto PR Review' ${currentHead}`,
+    );
+    assert.deepEqual(
+      openCodeDispatch.log.filter(isWorkflowDispatch),
+      [[
+        "workflow", "run", "opencode-auto-review.yml", "--repo", "example/repo",
+        "-f", "pr_number=42", "-f", "force_review=true",
+      ]],
+    );
+
+    const ambiguousWorkflow = await runResult(
+      baseState({
+        runs: [9304, 9305].map((id) => ({
+          id,
+          attempt: 1,
+          name: "Claude Code Review",
+          head: currentHead,
+          createdAt: requestCreatedAt,
+          status: "in_progress",
+          conclusion: "null",
+          event: "workflow_dispatch",
+        })),
+      }),
+      `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
+    );
+    assert.notEqual(ambiguousWorkflow.code, 0);
+    assert.match(ambiguousWorkflow.stderr, /TRIGGER_FAILED/);
+    assert.equal(ambiguousWorkflow.log.filter(isWorkflowDispatch).length, 0);
+
+    const unavailableWorkflow = await run(
+      baseState({ workflowStates: {} }),
+      [
+        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
+        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_REQUEST_REASON\"",
+      ].join("\n"),
+    );
+    assert.equal(unavailableWorkflow.stdout.trim(), "UNAVAILABLE,workflow_unavailable");
+    assert.equal(unavailableWorkflow.log.filter(isWorkflowDispatch).length, 0);
+
+    const disabledWorkflow = await run(
+      baseState({ workflowStates: { "claude-code-review.yml": "disabled_manually" } }),
+      [
+        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
+        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_REQUEST_REASON\"",
+      ].join("\n"),
+    );
+    assert.equal(disabledWorkflow.stdout.trim(), "UNAVAILABLE,workflow_disabled");
+    assert.equal(disabledWorkflow.log.filter(isWorkflowDispatch).length, 0);
+
+    const requiredChecks = await run(
+      baseState({ prHead: currentHead }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.deepEqual(
+      requiredChecks.log.filter((args) => args[0] === "pr" && args[1] === "checks"),
+      [["pr", "checks", "42", "--repo", "example/repo", "--required", "--watch", "--interval", "10"]],
+    );
+    const requiredChecksFailed = await runResult(
+      baseState({ prHead: currentHead, requiredChecksExit: 1 }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(requiredChecksFailed.code, 1);
+    const changedDuringChecks = await runResult(
+      baseState({ prHead: currentHead, headAfterRequiredChecks: oldHead }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(changedDuringChecks.code, 3,
+      "a head change during required checks must invalidate all collected results");
+
+    const skipWaitPlan = await run(baseState(), "jhw_pr_mode_wait_plan skip true");
+    assert.equal(
+      skipWaitPlan.stdout,
+      "required-checks\ntarget-if-requested\nverify-current-head\nverify-mergeability\n",
+    );
+    assert.equal(countPosts(skipWaitPlan), 0);
+    assert.equal(skipWaitPlan.log.filter(isWorkflowDispatch).length, 0);
+    assert.doesNotMatch(skipWaitPlan.stdout, /ai-wait/);
+    assert.equal(
+      (await run(baseState(), "jhw_pr_mode_wait_plan request false")).stdout,
+      "managed-workflows\napps\nai-wait\nrequired-checks\ntarget-if-requested\nverify-current-head\nverify-mergeability\n",
+    );
+    assert.equal(
+      (await run(baseState(), "jhw_pr_mode_wait_plan auto true")).stdout,
+      "event-workflows\napps\nai-wait\nrequired-checks\ntarget-if-requested\nverify-current-head\nverify-mergeability\n",
+    );
+    assert.equal(
+      (await run(baseState(), "jhw_pr_mode_wait_plan auto false")).stdout,
+      skipWaitPlan.stdout,
+    );
+
+    assert.equal(
+      (await run(baseState(), `jhw_pr_reviewed_receipt ${currentHead}`)).stdout.trim(),
+      `- Reviewed: ${currentHead}`,
+    );
+    assert.notEqual((await runResult(baseState(), "jhw_pr_reviewed_receipt HEAD")).code, 0);
+
     const idempotent = await run(
       baseState({
         issueComments: [
@@ -518,8 +826,11 @@ async function main() {
     assert.match(idempotent.stdout, new RegExp(`second=STARTED,9002,${currentHead},false`));
     assert.equal(idempotent.log.filter((args) => args.includes("POST")).length, 1,
       "a round/head must create exactly one Codex request");
-    assert.match(idempotent.state.issueComments.find((item) => item.id === 9002).body,
-      /^@codex review\n\n<!-- jhw-pr:codex-review round=2 head=[a-f0-9]{40} -->$/);
+    assert.equal(
+      idempotent.state.issueComments.find((item) => item.id === 9002).body,
+      genericCodexBody,
+      "auto-fix rounds must create the same canonical head-scoped Codex request as the first round",
+    );
     assert.match(idempotent.roundState, /request_comment_id=9002/);
     assert.match(idempotent.roundState, new RegExp(`requested_at=${requestCreatedAt}`));
     assert.match(idempotent.roundState, new RegExp(`target_head=${currentHead}`));
