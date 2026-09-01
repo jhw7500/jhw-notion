@@ -107,7 +107,10 @@ if (argv[0] === "issue" && argv[1] === "view") {
   const query = optionValue("--jq", "-q") || "";
   if (query === ".number") process.stdout.write(String(state.issueNumber) + "\n");
   else if (query === ".url") process.stdout.write(state.issueUrl + "\n");
-  else if (query === ".createdAt") process.stdout.write(state.issueCreatedAt + "\n");
+  else if (query === ".createdAt") {
+    if (state.failIssueCreatedAtRead) process.exit(1);
+    process.stdout.write(state.issueCreatedAt + "\n");
+  }
   else if (query === ".title") process.stdout.write(state.issueTitle + "\n");
   else if (query.includes(".labels")) rows(state.issueLabels);
   else process.exit(2);
@@ -234,8 +237,16 @@ if (/\/issues\/comments\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
   process.exit(0);
 }
 
-if (endpoint === "repos/example/repo/actions/runs?per_page=100") {
+if (endpoint === "repos/example/repo/actions/runs") {
   const query = optionValue("--jq", "-q") || "";
+  const fields = argv.reduce((values, value, index) => {
+    if (value === "-f" || value === "-F") values.push(argv[index + 1]);
+    return values;
+  }, []);
+  if (!argv.includes("--method") || optionValue("--method") !== "GET" ||
+      !fields.includes("per_page=100") || !fields.includes("event=issue_comment") ||
+      !fields.includes("actor=" + state.actor) ||
+      !fields.includes("created=>=" + state.issueCreatedAt)) process.exit(2);
   if (argv.includes("--slurp") && query === "") {
     process.stdout.write(JSON.stringify([{ workflow_runs: state.runs.map((item) => ({
       id: item.id,
@@ -341,6 +352,8 @@ async function main() {
   assert.match(issueText, /workflow_name='Gemini Dispatch'/);
   assert.match(issueText, /jhw_issue_execute\(\)/,
     "the public Issue command must connect creation to bounded review waiting");
+  assert.doesNotMatch(issueText, /JHW_ISSUE_(?:COMMENT|REACTION|RUN)_PAGES_JSON=/,
+    "raw paginated payloads must not cross the exec environment boundary");
   assert.ok(existsSync(codexIssueSkill));
   assert.ok(lstatSync(codexIssueReference).isSymbolicLink());
   const contract = `${createContractBlock(issueText)}\n${waitContractBlock(issueText)}`;
@@ -489,6 +502,20 @@ async function main() {
       "comment:post",
       "comment:post",
     ]);
+
+    const metadataFailure = await runIssueResult(
+      issueState({ failIssueCreatedAtRead: true }),
+      `jhw_issue_create 'Review this' 'Body text' request 20`,
+    );
+    assert.notEqual(metadataFailure.code, 0);
+    assert.equal(
+      metadataFailure.stdout.split("\n")[0],
+      "https://github.com/example/repo/issues/99",
+      "a created Issue URL must be emitted before fallible metadata reads",
+    );
+    assert.equal(metadataFailure.state.issueExists, true);
+    assert.equal(metadataFailure.state.mutations.includes("issue:edit"), false,
+      "metadata failure after creation must not mutate the Issue further");
 
     await setRepoFixture({ config: "review:\n  auto: false\nworkflows: {}\n" });
     const skipped = await runIssue(
@@ -697,6 +724,22 @@ async function main() {
     assert.equal(feedback.stdout.split("\n")[0], "FEEDBACK");
     assert.match(feedback.stdout, /actionable_feedback/);
 
+    const unclassifiedSubstantive = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("Authentication behavior is underspecified; add failure cases."),
+        ],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(unclassifiedSubstantive.stdout.split("\n")[0], "FEEDBACK",
+      "unmatched substantive reviewer prose must not be inferred CLEAN");
+    assert.match(unclassifiedSubstantive.stdout, /unclassified_substantive_response/);
+
     const failedRun = await classify(
       issueState({
         issueExists: true,
@@ -862,6 +905,29 @@ async function main() {
     );
     assert.equal(paginated.stdout.split("\n")[0], "CLEAN",
       "paginated comment arrays must be flattened before JSON parsing");
+
+    const largeRunHistory = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("No blocking findings.")],
+        runs: Array.from({ length: 900 }, (_, index) => ({
+          id: 3000 + index,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "success",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: `https://github.com/example/repo/actions/runs/${3000 + index}`,
+          displayTitle: `Other Issue ${index}`,
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        })),
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(largeRunHistory.stdout.split("\n")[0], "CLEAN",
+      "large filtered run history must be streamed without environment-size failure");
 
     await setRepoFixture({
       claude: true,

@@ -397,16 +397,16 @@ jhw_issue_create() {
     return 1
   fi
   issue_url="$(gh issue create --repo "$REPO_NWO" --title "$title" --body "$body")" || return 1
+  JHW_ISSUE_URL="$issue_url"
+  printf '%s\n' "$issue_url"
   issue="$(gh issue view "$issue_url" --repo "$REPO_NWO" --json number --jq .number)" || return 1
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || { echo "invalid created Issue" >&2; return 1; }
   issue_created_at="$(gh issue view "$issue" --repo "$REPO_NWO" --json createdAt --jq .createdAt)" || return 1
   jhw_issue_is_utc_timestamp "$issue_created_at" || { echo "invalid created Issue timestamp" >&2; return 1; }
   JHW_ISSUE_NUMBER="$issue"
-  JHW_ISSUE_URL="$issue_url"
   JHW_ISSUE_CREATED_AT="$issue_created_at"
   JHW_ISSUE_REQUESTED_REVIEWERS="$reviewers"
   JHW_ISSUE_UNAVAILABLE_REVIEWERS="$unavailable"
-  printf '%s\n' "$issue_url"
   jhw_issue_reconcile_and_verify_policy "$issue" "$mode" || return
   if [[ -n "$reviewers" ]]; then
     while IFS= read -r reviewer; do
@@ -434,9 +434,9 @@ agent harness가 약 60초 간격으로 모든 요청 reviewer가 terminal이거
 
 <!-- issue-review-wait-contract:begin -->
 ```bash
-jhw_issue_collect_signals() {
+jhw_issue_collect_signals() (
   local issue="$1" request_comment_id="$2" issue_created_at="$3"
-  local actor issue_title comments reactions runs
+  local actor issue_title signal_dir comments_path reactions_path runs_path
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$request_comment_id" =~ ^[1-9][0-9]*$ ]] || return 2
   jhw_issue_is_utc_timestamp "$issue_created_at" || return 2
@@ -444,34 +444,55 @@ jhw_issue_collect_signals() {
   [[ "$actor" =~ ^[A-Za-z0-9-]+$ ]] || return 1
   issue_title="$(gh issue view "$issue" --repo "$REPO_NWO" --json title --jq .title)" || return 1
   [[ -n "${issue_title//[[:space:]]/}" ]] || return 1
-  comments="$(gh api "repos/$REPO_NWO/issues/$issue/comments?per_page=100" --paginate --slurp 2>/dev/null)" || return 1
-  reactions="$(gh api "repos/$REPO_NWO/issues/comments/$request_comment_id/reactions?per_page=100" --paginate --slurp 2>/dev/null)" || return 1
-  runs="$(gh api "repos/$REPO_NWO/actions/runs?per_page=100" --paginate --slurp 2>/dev/null)" || return 1
-  JHW_ISSUE_COMMENT_PAGES_JSON="$comments" \
-  JHW_ISSUE_REACTION_PAGES_JSON="$reactions" \
-  JHW_ISSUE_RUN_PAGES_JSON="$runs" \
-  node - "$issue" "$request_comment_id" "$issue_created_at" "$actor" "$issue_title" <<'NODE'
-const [issue, requestCommentId, issueCreatedAt, requestActor, issueTitle] = process.argv.slice(2);
+  umask 077
+  signal_dir="$(mktemp -d "${TMPDIR:-/tmp}/jhw-issue-signals.XXXXXXXX")" || return 1
+  comments_path="$signal_dir/comments.json"
+  reactions_path="$signal_dir/reactions.json"
+  runs_path="$signal_dir/runs.json"
+  trap 'rm -f -- "$comments_path" "$reactions_path" "$runs_path"; rmdir -- "$signal_dir" 2>/dev/null || true' EXIT HUP INT TERM
+  gh api "repos/$REPO_NWO/issues/$issue/comments?per_page=100" \
+    --paginate --slurp >"$comments_path" 2>/dev/null || return 1
+  gh api "repos/$REPO_NWO/issues/comments/$request_comment_id/reactions?per_page=100" \
+    --paginate --slurp >"$reactions_path" 2>/dev/null || return 1
+  gh api "repos/$REPO_NWO/actions/runs" --method GET \
+    -f per_page=100 \
+    -f event=issue_comment \
+    -f "actor=$actor" \
+    -f "created=>=$issue_created_at" \
+    --paginate --slurp >"$runs_path" 2>/dev/null || return 1
+  node - "$issue" "$request_comment_id" "$issue_created_at" "$actor" "$issue_title" \
+    "$comments_path" "$reactions_path" "$runs_path" <<'NODE'
+const fs = require("node:fs");
+const [
+  issue,
+  requestCommentId,
+  issueCreatedAt,
+  requestActor,
+  issueTitle,
+  commentsPath,
+  reactionsPath,
+  runsPath,
+] = process.argv.slice(2);
 const fail = (message) => { process.stderr.write(message + "\n"); process.exit(1); };
-const parseJson = (name) => {
+const parseJsonFile = (path, name) => {
   try {
-    return JSON.parse(process.env[name] || "");
+    return JSON.parse(fs.readFileSync(path, "utf8"));
   } catch {
     fail(`${name} is invalid JSON`);
   }
 };
-const arrayPages = (name) => {
-  const pages = parseJson(name);
+const arrayPages = (path, name) => {
+  const pages = parseJsonFile(path, name);
   if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
     fail(`${name} must contain array pages`);
   }
   return pages.flat();
 };
-const commentRows = arrayPages("JHW_ISSUE_COMMENT_PAGES_JSON");
-const reactionRows = arrayPages("JHW_ISSUE_REACTION_PAGES_JSON");
-const runPages = parseJson("JHW_ISSUE_RUN_PAGES_JSON");
+const commentRows = arrayPages(commentsPath, "comment pages");
+const reactionRows = arrayPages(reactionsPath, "reaction pages");
+const runPages = parseJsonFile(runsPath, "workflow run pages");
 if (!Array.isArray(runPages) || runPages.some((page) => !page || !Array.isArray(page.workflow_runs))) {
-  fail("JHW_ISSUE_RUN_PAGES_JSON must contain workflow run pages");
+  fail("workflow run pages must contain workflow_runs arrays");
 }
 const snapshot = {
   issue: Number(issue),
@@ -494,22 +515,26 @@ const snapshot = {
     created_at: item?.created_at,
     url: item?.html_url || "",
   })),
-  runs: runPages.flatMap((page) => page.workflow_runs).map((item) => ({
-    id: item?.id,
-    name: item?.name,
-    event: item?.event,
-    status: item?.status,
-    conclusion: item?.conclusion || "null",
-    created_at: item?.created_at,
-    url: item?.html_url || "",
-    display_title: item?.display_title || "",
-    actor: item?.actor?.login || "",
-    triggering_actor: item?.triggering_actor?.login || "",
-  })),
+  runs: runPages.flatMap((page) => page.workflow_runs)
+    .filter((item) => item?.event === "issue_comment" &&
+      item?.display_title === issueTitle &&
+      (item?.actor?.login === requestActor || item?.triggering_actor?.login === requestActor))
+    .map((item) => ({
+      id: item?.id,
+      name: item?.name,
+      event: item?.event,
+      status: item?.status,
+      conclusion: item?.conclusion || "null",
+      created_at: item?.created_at,
+      url: item?.html_url || "",
+      display_title: item?.display_title || "",
+      actor: item?.actor?.login || "",
+      triggering_actor: item?.triggering_actor?.login || "",
+    })),
 };
 process.stdout.write(JSON.stringify(snapshot) + "\n");
 NODE
-}
+)
 
 jhw_issue_classify_reviewer() {
   local reviewer="$1" now_epoch="$2" trigger_deadline="$3" review_deadline="$4"
@@ -616,7 +641,10 @@ if (rejectedComment) emit("FAILED", rejectedComment.url, "connector_rejected");
 const feedbackComment = comments.find((comment) =>
   /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i.test(comment.body || ""));
 if (feedbackComment) emit("FEEDBACK", feedbackComment.url, "actionable_feedback");
-if (comments.length > 0) emit("CLEAN", comments[0].url, "substantive_response");
+const cleanComment = comments.find((comment) =>
+  /\b(?:no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|looks good|ready for implementation|review clean|lgtm)\b/i.test(comment.body || ""));
+if (cleanComment) emit("CLEAN", cleanComment.url, "substantive_response");
+if (comments.length > 0) emit("FEEDBACK", comments[0].url, "unclassified_substantive_response");
 
 const acknowledged = acknowledgments.length > 0 ||
   reactions.some((reaction) => ["eyes", "+1", "heart"].includes(reaction.content)) ||
