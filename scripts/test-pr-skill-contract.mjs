@@ -732,6 +732,26 @@ async function main() {
       "ambiguous Codex canary identities must not be guessed");
     assert.match(ambiguousCodexActors.stdout, /^actor=$/m);
 
+    const failedCodexCanary = await run(
+      baseState({
+        appComments: [
+          {
+            actor: "chatgpt-codex-connector[bot]",
+            body: "Connector failed to start the review.",
+            url: "https://github.com/example/repo/pull/88#issuecomment-4",
+          },
+          {
+            actor: "gemini-code-assist[bot]",
+            body: "Gemini review completed.",
+            url: "https://github.com/example/repo/pull/88#issuecomment-5",
+          },
+        ],
+      }),
+      "jhw_pr_prepare_review_plan request\nprintf '%s\\n' \"$JHW_PR_ELIGIBLE_APPS\"",
+    );
+    assert.equal(failedCodexCanary.stdout.trim(), "gemini-assist",
+      "a canary comment reporting connector failure cannot prove Codex capability");
+
     const noEligibleApps = await run(
       baseState({ appComments: [] }),
       [

@@ -409,7 +409,7 @@ if (reviewer === "codex") {
   const accepted = new Set(["chatgpt-codex-connector", "chatgpt-codex-connector[bot]"]);
   const identities = [...new Set(valid
     .filter((comment) => accepted.has(comment.actor) &&
-      !/usage limits|create an environment|unable to review/i.test(comment.body))
+      !/usage limits?|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\n]*(?:fail|error|unavailable|reject)/i.test(comment.body))
     .map((comment) => comment.actor))];
   if (identities.length !== 1) process.exit(1);
   process.stdout.write(identities[0] + "\n");

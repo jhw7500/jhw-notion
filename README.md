@@ -142,7 +142,8 @@ Issue 리뷰 정책 예시:
 /jhw:issue <내용>                       — 저장소 review.auto를 따름
 ```
 
-현재처럼 전역 `review.auto`가 없으면 호환 기본값 `true`를 사용한다. Codex는 동일 저장소 Issue canary 성공 증거가 있어야 eligible이다.
+현재처럼 전역 `review.auto`가 없으면 호환 기본값 `true`를 사용한다. Codex는 동일 저장소 Issue canary의 성공 응답 증거가 있어야 eligible이다.
+Claude/Gemini Issue reviewer는 로컬 설정뿐 아니라 GitHub 기본 브랜치 workflow의 active 상태와 `issue_comment` event 계약도 확인한다.
 Gemini Assist와 OpenCode는 standalone Issue에서 PR-only이므로 요청하거나 기다리지 않는다.
 이 명령은 리뷰 결과를 받아도 Issue를 수정·닫기·삭제하거나 feedback을 자동 구현하지 않는다.
 

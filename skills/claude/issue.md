@@ -20,13 +20,13 @@ eligible reviewer가 0명이면 Issue 생성 전에 중단한다.
 
 | Reviewer | Required evidence |
 | --- | --- |
-| Claude | `.github/workflows/claude.yml` regular file + `workflows.claude.enabled: true` |
-| Gemini | `.github/workflows/gemini-dispatch.yml` regular file + `workflows.gemini-dispatch.enabled: true` |
-| Codex | 동일 저장소 canary Issue에서 actor-owned Codex 요청 뒤 하나의 Codex bot identity가 응답 |
+| Claude | local `claude.yml` regular file + config enabled + 기본 브랜치의 `Claude Code` workflow가 active이고 `issue_comment` event 지원 |
+| Gemini | local `gemini-dispatch.yml` regular file + config enabled + 기본 브랜치의 `Gemini Dispatch` workflow가 active이고 `issue_comment` event 지원 |
+| Codex | 동일 저장소 canary Issue에서 actor-owned 요청 뒤 하나의 Codex bot identity가 실패가 아닌 응답을 반환 |
 
 Gemini Assist와 OpenCode는 PR-only라 Issue reviewer로 추정하지 않는다. secret 값은 조회하거나
 존재를 추정하지 않는다. Codex canary 증거는 이 invocation에서만 쓰고 파일·환경 프로필·DB에
-저장하지 않는다.
+저장하지 않는다. usage limit·connector 실패·review 불가를 보고한 canary 응답은 capability 증거가 아니다.
 
 <!-- issue-review-create-contract:begin -->
 ```bash
@@ -196,13 +196,139 @@ jhw_issue_ensure_review_labels() {
   fi
 }
 
+jhw_issue_remote_workflow_eligible() {
+  local workflow="$1" expected_name="$2" metadata content
+  case "$workflow" in claude.yml|gemini-dispatch.yml) ;; *) return 2 ;; esac
+  case "$expected_name" in 'Claude Code'|'Gemini Dispatch') ;; *) return 2 ;; esac
+  metadata="$(gh api "repos/$REPO_NWO/actions/workflows/$workflow" 2>/dev/null)" || return 1
+  printf '%s' "$metadata" | node -e '
+const fs = require("node:fs");
+const [workflow, expectedName] = process.argv.slice(1);
+let value;
+try { value = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(1); }
+const expectedPath = `.github/workflows/${workflow}`;
+process.exit(value?.state === "active" && value?.path === expectedPath &&
+  value?.name === expectedName ? 0 : 1);
+' "$workflow" "$expected_name" || return 1
+  content="$(gh api "repos/$REPO_NWO/contents/.github/workflows/$workflow" 2>/dev/null)" || return 1
+  printf '%s' "$content" | node -e '
+const fs = require("node:fs");
+const [workflow] = process.argv.slice(1);
+let value;
+try { value = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(1); }
+if (value?.type !== "file" || value?.path !== `.github/workflows/${workflow}` ||
+    value?.encoding !== "base64" || typeof value?.content !== "string") process.exit(1);
+const compact = value.content.replace(/\s+/g, "");
+if (compact === "" || compact.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) process.exit(1);
+const bytes = Buffer.from(compact, "base64");
+if (bytes.toString("base64").replace(/=+$/, "") !== compact.replace(/=+$/, "")) process.exit(1);
+const text = bytes.toString("utf8");
+const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
+let onIndex = -1;
+let supportsIssueComment = false;
+let issueCommentIndex = -1;
+for (let index = 0; index < lines.length; index += 1) {
+  const line = lines[index].replace(/\s+#.*$/, "");
+  if (/^on:\s*(?:issue_comment|\[[^\]]*\bissue_comment\b[^\]]*\])\s*$/.test(line)) {
+    supportsIssueComment = true;
+    continue;
+  }
+  if (/^on:\s*$/.test(line)) {
+    if (onIndex !== -1) process.exit(1);
+    onIndex = index;
+  }
+}
+if (!supportsIssueComment && onIndex !== -1) {
+  let onChildIndent = null;
+  for (let index = onIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index].replace(/\s+#.*$/, "");
+    if (line.trim() === "") continue;
+    const indentMatch = line.match(/^( +)/);
+    if (!indentMatch) break;
+    const indent = indentMatch[1].length;
+    if (onChildIndent === null) onChildIndent = indent;
+    if (indent === onChildIndent && /^ +issue_comment:\s*(?:\{.*\})?$/.test(line)) {
+      issueCommentIndex = index;
+      break;
+    }
+  }
+}
+if (!supportsIssueComment && issueCommentIndex !== -1) {
+  const eventLine = lines[issueCommentIndex].replace(/\s+#.*$/, "");
+  const eventIndent = eventLine.match(/^ */)[0].length;
+  const parseScalar = (value) => {
+    const match = value.trim().match(/^(?:"([A-Za-z0-9_-]+)"|\x27([A-Za-z0-9_-]+)\x27|([A-Za-z0-9_-]+))$/);
+    return match ? (match[1] || match[2] || match[3]) : null;
+  };
+  const parseFlowList = (value) => {
+    const match = value.trim().match(/^\[([^\[\]{}]*)\]$/);
+    if (!match) return null;
+    if (match[1].trim() === "") return [];
+    const result = [];
+    for (const item of match[1].split(",")) {
+      const parsed = parseScalar(item);
+      if (parsed === null) return null;
+      result.push(parsed);
+    }
+    return result;
+  };
+  const records = [];
+  for (let index = issueCommentIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index].replace(/\s+#.*$/, "");
+    if (line.trim() === "") continue;
+    const indent = line.match(/^ */)[0].length;
+    if (indent <= eventIndent) break;
+    records.push({ index, indent, line });
+  }
+  const inlineValue = eventLine.replace(/^ +issue_comment:\s*/, "");
+  if (inlineValue !== "") {
+    if (records.length !== 0) process.exit(1);
+    if (/^\{\s*\}$/.test(inlineValue)) {
+      supportsIssueComment = true;
+    } else {
+      const inlineTypes = inlineValue.match(/^\{\s*(?:"types"|\x27types\x27|types)\s*:\s*(\[[^\[\]{}]*\])\s*\}$/);
+      const values = inlineTypes ? parseFlowList(inlineTypes[1]) : null;
+      supportsIssueComment = values !== null && values.includes("created");
+    }
+  } else if (records.length === 0) {
+    supportsIssueComment = true;
+  } else {
+    const configIndent = Math.min(...records.map((record) => record.indent));
+    const direct = records.filter((record) => record.indent === configIndent);
+    if (direct.length !== 1) process.exit(1);
+    const types = direct[0].line.trim().match(/^(?:"types"|\x27types\x27|types)\s*:\s*(.*)$/);
+    if (!types) process.exit(1);
+    let values;
+    if (types[1] !== "") {
+      if (records.some((record) => record.indent > configIndent)) process.exit(1);
+      values = parseFlowList(types[1]);
+    } else {
+      const items = records.filter((record) => record.indent > configIndent);
+      if (items.length === 0) process.exit(1);
+      const itemIndent = Math.min(...items.map((record) => record.indent));
+      if (items.some((record) => record.indent !== itemIndent)) process.exit(1);
+      values = [];
+      for (const item of items) {
+        const match = item.line.trim().match(/^-\s+(.+)$/);
+        const parsed = match ? parseScalar(match[1]) : null;
+        if (parsed === null) process.exit(1);
+        values.push(parsed);
+      }
+    }
+    supportsIssueComment = values !== null && values.includes("created");
+  }
+}
+process.exit(supportsIssueComment ? 0 : 1);
+' "$workflow"
+}
+
 jhw_issue_is_utc_timestamp() {
   [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 }
 
 jhw_issue_codex_canary_eligible() {
   local canary_url="$1" canary_repo canary_issue actor endpoint query raw line
-  local request_id request_at extra response_id response_actor response_at response_url identity=""
+  local request_id request_at extra response_id response_actor response_at response_url response_success identity=""
   local -a requests=()
   [[ -n "$canary_url" ]] || return 1
   if [[ "$canary_url" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)/?$ ]]; then
@@ -230,9 +356,9 @@ jhw_issue_codex_canary_eligible() {
   IFS=$'\t' read -r request_id request_at extra <<<"${requests[0]}"
   [[ "$request_id" =~ ^[1-9][0-9]*$ && -n "$request_at" && -z "$extra" ]] || return 1
   jhw_issue_is_utc_timestamp "$request_at" || return 1
-  raw="$(gh api "$endpoint" --paginate --jq '.[] | [.id, .user.login, .created_at, .html_url] | @tsv' 2>/dev/null)" || return 1
-  while IFS=$'\t' read -r response_id response_actor response_at response_url extra; do
-    [[ "$response_id" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || continue
+  raw="$(gh api "$endpoint" --paginate --jq '.[] | [.id, .user.login, .created_at, .html_url, (((.body // "") | test("usage limits?|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\\n]*(?:fail|error|unavailable|reject)"; "i")) | not)] | @tsv' 2>/dev/null)" || return 1
+  while IFS=$'\t' read -r response_id response_actor response_at response_url response_success extra; do
+    [[ "$response_id" =~ ^[1-9][0-9]*$ && "$response_success" == true && -z "$extra" ]] || continue
     case "$response_actor" in
       chatgpt-codex-connector|chatgpt-codex-connector'[bot]') ;;
       *) continue ;;
@@ -260,11 +386,13 @@ jhw_issue_discover_reviewers() {
   case "$auto_enabled" in true|false) ;; *) return 2 ;; esac
   [[ "$mode" == request || ( "$mode" == auto && "$auto_enabled" == true ) ]] || return 0
   if [[ -f "$root/.github/workflows/claude.yml" && ! -L "$root/.github/workflows/claude.yml" ]] &&
-    [[ "$(jhw_issue_workflow_enabled claude "$config_path")" == true ]]; then
+    [[ "$(jhw_issue_workflow_enabled claude "$config_path")" == true ]] &&
+    jhw_issue_remote_workflow_eligible claude.yml 'Claude Code'; then
     printf 'claude\n'
   fi
   if [[ -f "$root/.github/workflows/gemini-dispatch.yml" && ! -L "$root/.github/workflows/gemini-dispatch.yml" ]] &&
-    [[ "$(jhw_issue_workflow_enabled gemini-dispatch "$config_path")" == true ]]; then
+    [[ "$(jhw_issue_workflow_enabled gemini-dispatch "$config_path")" == true ]] &&
+    jhw_issue_remote_workflow_eligible gemini-dispatch.yml 'Gemini Dispatch'; then
     printf 'gemini\n'
   fi
   if [[ "$codex_identity_supplied" == true ]]; then

@@ -141,6 +141,33 @@ if (endpoint === "user") {
   process.exit(0);
 }
 
+const workflowMatch = endpoint.match(/^repos\/example\/repo\/actions\/workflows\/([^/?]+)$/);
+if (workflowMatch) {
+  const workflow = decodeURIComponent(workflowMatch[1]);
+  const stateValue = state.workflowStates?.[workflow];
+  if (!stateValue) process.exit(1);
+  process.stdout.write(JSON.stringify({
+    state: stateValue,
+    path: ".github/workflows/" + workflow,
+    name: workflow === "claude.yml" ? "Claude Code" : "Gemini Dispatch",
+  }) + "\n");
+  process.exit(0);
+}
+
+const workflowContentMatch = endpoint.match(/^repos\/example\/repo\/contents\/\.github\/workflows\/([^/?]+)$/);
+if (workflowContentMatch) {
+  const workflow = decodeURIComponent(workflowContentMatch[1]);
+  const content = state.remoteWorkflowContents?.[workflow];
+  if (typeof content !== "string") process.exit(1);
+  process.stdout.write(JSON.stringify({
+    type: "file",
+    path: ".github/workflows/" + workflow,
+    encoding: "base64",
+    content: Buffer.from(content).toString("base64"),
+  }) + "\n");
+  process.exit(0);
+}
+
 const commentMatch = endpoint.match(/repos\/[^/]+\/[^/]+\/issues\/(\d+)\/comments\?per_page=100$/);
 if (commentMatch) {
   const issueNumber = Number(commentMatch[1]);
@@ -198,6 +225,17 @@ if (commentMatch) {
     } else {
       rows(commentPages.map((page) => JSON.stringify(page.map(mapComment))));
     }
+    process.exit(0);
+  }
+  if (query.includes("[.id, .user.login, .created_at, .html_url") && query.includes("test(")) {
+    const failurePattern = /usage limits?|create an environment|unable to review|cannot review|failed to (?:start|review)|connector[^\n]*(?:fail|error|unavailable|reject)/i;
+    rows(allComments.map((item) => [
+      item.id,
+      item.actor,
+      item.createdAt,
+      item.url || "",
+      failurePattern.test(item.body || "") ? "false" : "true",
+    ].join("\t")));
     process.exit(0);
   }
   if (query.includes("[.id, .user.login, .created_at, .html_url]")) {
@@ -322,6 +360,14 @@ function issueState(overrides = {}) {
     canaryComments: [],
     commentReactions: [],
     runs: [],
+    workflowStates: {
+      "claude.yml": "active",
+      "gemini-dispatch.yml": "active",
+    },
+    remoteWorkflowContents: {
+      "claude.yml": "name: Claude Code\n\non:\n  issue_comment:\n    types: [created]\n",
+      "gemini-dispatch.yml": "name: Gemini Dispatch\n\non:\n  issue_comment:\n    types: [created]\n",
+    },
     mutations: [],
     nextCommentId: 1001,
     failEndpoints: [],
@@ -690,6 +736,88 @@ async function main() {
     );
     assert.equal(malformedTimestampCanary.stdout.trim(), "",
       "malformed timestamps cannot prove that a Codex response followed the request");
+    const failedResponseCanary = await runIssue(
+      issueState({
+        canaryComments: [
+          canaryRequest,
+          { ...canaryResponse, body: "Unable to review because usage limits were reached." },
+        ],
+      }),
+      "jhw_issue_discover_reviewers request true",
+      { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
+    );
+    assert.equal(failedResponseCanary.stdout.trim(), "",
+      "a canary response that reports review failure cannot prove Codex capability");
+
+    await setRepoFixture({
+      claude: true,
+      config: "review:\n  auto: true\nworkflows:\n  claude:\n    enabled: true\n",
+    });
+    const remotelyDisabledWorkflow = await runIssue(
+      issueState({ workflowStates: { "claude.yml": "disabled_manually" } }),
+      "jhw_issue_discover_reviewers request true",
+    );
+    assert.equal(remotelyDisabledWorkflow.stdout.trim(), "",
+      "a locally present workflow disabled on GitHub cannot be eligible");
+    const remoteContractMismatch = await runIssue(
+      issueState({
+        remoteWorkflowContents: {
+          "claude.yml": "name: Claude Code\n\non:\n  pull_request:\n    types: [opened]\n",
+        },
+      }),
+      "jhw_issue_discover_reviewers request true",
+    );
+    assert.equal(remoteContractMismatch.stdout.trim(), "",
+      "the default-branch workflow must expose an issue_comment event contract");
+    const remoteActionMismatch = await runIssue(
+      issueState({
+        remoteWorkflowContents: {
+          "claude.yml": "name: Claude Code\n\non:\n  issue_comment:\n    types: [edited]\n",
+        },
+      }),
+      "jhw_issue_discover_reviewers request true",
+    );
+    assert.equal(remoteActionMismatch.stdout.trim(), "",
+      "an issue_comment workflow restricted away from created cannot receive a mention request");
+    const quotedActionMismatch = await runIssue(
+      issueState({
+        remoteWorkflowContents: {
+          "claude.yml": "name: Claude Code\n\non:\n  issue_comment:\n    \"types\": [edited]\n",
+        },
+      }),
+      "jhw_issue_discover_reviewers request true",
+    );
+    assert.equal(quotedActionMismatch.stdout.trim(), "",
+      "a quoted types key restricted away from created cannot receive a mention request");
+    const quotedInlineActionMismatch = await runIssue(
+      issueState({
+        remoteWorkflowContents: {
+          "claude.yml": "name: Claude Code\n\non:\n  issue_comment: {\"types\": [edited]}\n",
+        },
+      }),
+      "jhw_issue_discover_reviewers request true",
+    );
+    assert.equal(quotedInlineActionMismatch.stdout.trim(), "",
+      "a quoted inline types key restricted away from created cannot receive a mention request");
+    const nestedIssueCommentKey = await runIssue(
+      issueState({
+        remoteWorkflowContents: {
+          "claude.yml": [
+            "name: Claude Code",
+            "",
+            "on:",
+            "  workflow_dispatch:",
+            "    inputs:",
+            "      issue_comment:",
+            "        description: not an event",
+            "",
+          ].join("\n"),
+        },
+      }),
+      "jhw_issue_discover_reviewers request true",
+    );
+    assert.equal(nestedIssueCommentKey.stdout.trim(), "",
+      "a nested issue_comment key is not a direct event under on");
 
     const existingMarker = {
       id: 1001,
