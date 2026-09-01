@@ -347,6 +347,21 @@ jhw_pr_repo_root() {
   printf '%s\n' "$root"
 }
 
+jhw_pr_resolve_target_command() {
+  local root target_script
+  if [[ -n "${TARGET_CMD:-}" ]]; then
+    printf '%s\n' "$TARGET_CMD"
+    return
+  fi
+  root="$(jhw_pr_repo_root)" || return
+  target_script="$root/.jhw/ship-target.sh"
+  [[ -f "$target_script" ]] || {
+    echo "타겟 검증 명령을 지정하세요 (--target=<cmd> 또는 리포 루트의 .jhw/ship-target.sh)" >&2
+    return 1
+  }
+  printf 'bash %q\n' "$target_script"
+}
+
 jhw_pr_global_auto_enabled() {
   local config_path="${1-}" root
   if [[ -z "$config_path" ]]; then
@@ -2348,9 +2363,7 @@ LLM 자동 리뷰어는 라운드마다 새 nit을 만들어 "지적 0건"에 �
 
 ```bash
 # 값 해석
-if [ -n "${TARGET_CMD:-}" ]; then :;                              # --target=<cmd>
-elif [ -f .jhw/ship-target.sh ]; then TARGET_CMD="bash .jhw/ship-target.sh";   # exec 비트 비의존
-else echo "타겟 검증 명령을 지정하세요 (--target=<cmd> 또는 .jhw/ship-target.sh)"; fi
+TARGET_CMD="$(jhw_pr_resolve_target_command)" || return  # 명시값 또는 리포 루트 스크립트; exec 비트 비의존
 # 실행: 명령 문자열은 shell로 재파싱(따옴표·&&·| 보존). 빈 값/공백-only면 게이트가 조용히 PASS되지 않도록 FAIL.
 if [ -z "$(printf '%s' "${TARGET_CMD:-}" | tr -d '[:space:]')" ]; then echo "TARGET_EXIT=1"; else bash -c "$TARGET_CMD"; echo "TARGET_EXIT=$?"; fi   # 0=PASS, 비0=FAIL
 ```

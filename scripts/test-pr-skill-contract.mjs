@@ -721,6 +721,8 @@ async function main() {
   const configPath = join(tempRoot, "workflow-config.yml");
   const fixtureRoot = join(tempRoot, "repo");
   const fixtureNestedDir = join(fixtureRoot, "nested", "cwd");
+  const fixtureTargetDir = join(fixtureRoot, ".jhw");
+  const fixtureNestedTargetDir = join(fixtureNestedDir, ".jhw");
   const fixtureWorkflowDir = join(fixtureRoot, ".github", "workflows");
   const fixtureConfigPath = join(fixtureRoot, ".github", "workflow-config.yml");
   const geminiConfigPath = join(fixtureRoot, ".gemini", "config.yaml");
@@ -738,7 +740,11 @@ async function main() {
   await writeFile(contractPath, contract);
   await mkdir(fixtureWorkflowDir, { recursive: true });
   await mkdir(fixtureNestedDir, { recursive: true });
+  await mkdir(fixtureTargetDir, { recursive: true });
+  await mkdir(fixtureNestedTargetDir, { recursive: true });
   await mkdir(dirname(geminiConfigPath), { recursive: true });
+  await writeFile(join(fixtureTargetDir, "ship-target.sh"), "printf 'repo-target\\n'\n");
+  await writeFile(join(fixtureNestedTargetDir, "ship-target.sh"), "printf 'nested-target\\n'\n");
   await writeFile(join(fixtureWorkflowDir, "claude-code-review.yml"), dispatchContract);
   await writeFile(join(fixtureWorkflowDir, "gemini-auto-review.yml"), dispatchContract);
   const enabledReviewConfig = [
@@ -1598,6 +1604,18 @@ async function main() {
       "Gemini App config discovery must resolve from the Git top-level");
     assert.ok(nestedPreflight.log.filter((args) =>
       args[0] === "git" && args[1] === "rev-parse" && args[2] === "--show-toplevel").length >= 2);
+
+    const nestedTarget = await run(
+      baseState(),
+      [
+        "unset JHW_PR_REPO_ROOT TARGET_CMD",
+        "TARGET_CMD=\"$(jhw_pr_resolve_target_command)\" || exit",
+        "bash -c \"$TARGET_CMD\"",
+      ].join("\n"),
+      { JHW_TEST_CWD: fixtureNestedDir },
+    );
+    assert.equal(nestedTarget.stdout.trim(), "repo-target",
+      "the default target command must execute the repository-root script from a nested cwd");
 
     const frozenBase = await runResult(
       baseState({ prLabels: ["review:request"], prBase: "main", freezeBase: true }),

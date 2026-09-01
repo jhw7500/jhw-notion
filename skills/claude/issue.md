@@ -814,10 +814,6 @@ const atOrAfterRequest = (value) => {
   const parsed = epoch(value);
   return parsed !== null && parsed >= requestEpoch && parsed >= issueEpoch;
 };
-const afterRequest = (value) => {
-  const parsed = epoch(value);
-  return parsed !== null && parsed > requestEpoch && parsed >= issueEpoch;
-};
 const laterComment = (comment) => {
   const parsed = epoch(comment.created_at);
   const id = Number(comment.id);
@@ -852,7 +848,7 @@ const comments = effectiveBot ? laterBotComments.filter((comment) =>
 const reactions = effectiveBot ? snapshot.reactions.filter((reaction) =>
   reaction.actor === effectiveBot && atOrAfterRequest(reaction.created_at)) : [];
 const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
-  run.name === workflowName && run.event === "issue_comment" && afterRequest(run.created_at) &&
+  run.name === workflowName && run.event === "issue_comment" && atOrAfterRequest(run.created_at) &&
   run.display_title === expectedRunTitle &&
   (run.triggering_actor === snapshot.request_actor || run.actor === snapshot.request_actor));
 
@@ -1427,8 +1423,8 @@ timeout, 중단 신호에서도 summary state와 0600 signal snapshot만 제거�
 설치 전에 있던 caller-owned trap 사양은 정상 epilogue와 신호 처리 모두에서 그대로 복원한다.
 GitHub의 UTC 시각은 초 단위이므로 요청과 응답이 같은 초에 기록될 수 있다. 댓글은 같은 초일 때
 요청 댓글보다 큰 comment ID만 후속 신호로 인정하고, reaction은 정확한 요청 댓글의 reactions
-endpoint에 종속되므로 같은 초를 허용한다. workflow run에는 요청 comment ID가 없어서 같은 초의
-다른 멘션 run과 구분할 수 없으므로 요청 시각보다 엄격히 뒤인 run만 인정한다.
+endpoint에 종속되므로 같은 초를 허용한다. workflow run도 정확한 request comment ID를
+`display_title`에 담으므로 요청 시각과 같은 초부터 인정하되, 다른 멘션의 run은 제외한다.
 같은 요청에 여러 relevant workflow run이 있으면 `created_at`, run ID 순으로 가장 최신 run만
 workflow 실패 판정에 사용하므로 성공한 재시도는 이전 실패를 대체한다. relevant run ID가 양의
 safe integer가 아니면 정렬 권한을 정할 수 없어 classifier가 fail-closed한다. bot 댓글도 같은

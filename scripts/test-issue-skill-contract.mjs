@@ -1475,8 +1475,9 @@ async function main() {
       "claude",
       triggerDeadline - 1,
     );
-    assert.equal(sameSecondFailedRun.stdout.split("\n")[0], "PENDING",
-      "a same-second workflow run without a request-comment ID cannot prove causality");
+    assert.equal(sameSecondFailedRun.stdout.split("\n")[0], "FAILED",
+      "an exact request-comment coordinate makes a same-second workflow run causal");
+    assert.match(sameSecondFailedRun.stdout, /https:\/\/github\.com\/example\/repo\/actions\/runs\/503/);
 
     await assert.rejects(
       classify(
