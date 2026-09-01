@@ -1760,6 +1760,52 @@ async function main() {
     assert.equal(sameHeadExistingPr.log.filter(isWorkflowDispatch).length, 2,
       "an unchanged request round must dispatch each available managed reviewer");
 
+    const changedDraftRequest = await run(
+      baseState({
+        prDraft: true,
+        prLabels: ["review:skip"],
+      }),
+      [
+        `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
+        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
+        "fi",
+        "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
+      ].join("\n"),
+    );
+    assert.equal(changedDraftRequest.state.prDraft, false,
+      "a changed existing draft must become ready after its new head is pushed");
+    assert.match(changedDraftRequest.stdout, /^event=pull_request$/m);
+    assert.equal(changedDraftRequest.log.filter(isWorkflowDispatch).length, 0);
+    requireBefore(changedDraftRequest.log, isGitPush, ready,
+      "a draft synchronize must remain skipped until the new head is ready for review");
+    requireBefore(changedDraftRequest.log, addRequest, ready,
+      "request policy must be visible to the ready_for_review event");
+
+    const sameHeadDraftRequest = await run(
+      baseState({
+        prDraft: true,
+        prLabels: ["review:skip"],
+        prHead: currentHead,
+        remoteBranchHead: currentHead,
+      }),
+      [
+        `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
+        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
+        "fi",
+        "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
+      ].join("\n"),
+    );
+    assert.equal(sameHeadDraftRequest.state.prDraft, false,
+      "an unchanged existing draft must use ready_for_review as its review event");
+    assert.equal(sameHeadDraftRequest.log.filter(isGitPush).length, 0);
+    assert.match(sameHeadDraftRequest.stdout, /^event=pull_request$/m);
+    assert.equal(sameHeadDraftRequest.log.filter(isWorkflowDispatch).length, 0,
+      "readying an unchanged draft must not also dispatch same-head reviews");
+    requireBefore(sameHeadDraftRequest.log, addRequest, ready,
+      "request policy must be reconciled before readying an unchanged draft");
+
     const unchangedAuto = await run(
       baseState({
         prHead: currentHead,
