@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Consumer contract for /jhw:ship auto-fix review rounds. The canonical
-// Markdown exposes executable Bash helpers; a stateful fake gh verifies the
-// trigger and current-round signal boundaries without touching GitHub.
+// Consumer contract for canonical /jhw:pr review rounds and /jhw:ship alias.
+// The canonical Markdown exposes executable Bash helpers; a stateful fake gh
+// verifies trigger/current-round boundaries without touching GitHub.
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -13,21 +13,26 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const canonicalShip = join(repoRoot, "skills", "claude", "ship.md");
+const canonicalPr = join(repoRoot, "skills", "claude", "pr.md");
+const shipAlias = join(repoRoot, "skills", "claude", "ship.md");
 const currentHead = "a".repeat(40);
 const oldHead = "b".repeat(40);
 const roundStartedAt = "2026-08-29T00:00:00Z";
 const requestCreatedAt = "2026-08-29T00:01:00Z";
 const startEpoch = Date.parse(roundStartedAt) / 1000;
 const requestEpoch = Date.parse(requestCreatedAt) / 1000;
-const requestMarker = `<!-- jhw-ship:codex-review round=2 head=${currentHead} -->`;
+const requestMarker = `<!-- jhw-pr:codex-review round=2 head=${currentHead} -->`;
 const requestBody = `@codex review\n\n${requestMarker}`;
+const legacyRequestMarker = `<!-- jhw-ship:codex-review round=2 head=${currentHead} -->`;
+const legacyRequestBody = `@codex review\n\n${legacyRequestMarker}`;
+const oldLegacyRequestMarker = `<!-- jhw-ship:codex-review round=2 head=${oldHead} -->`;
+const oldLegacyRequestBody = `@codex review\n\n${oldLegacyRequestMarker}`;
 
 function contractBlock(markdown) {
   const match = markdown.match(
-    /<!-- ship-round-contract: trigger-and-scope:begin -->\n```bash\n([\s\S]*?)```\n<!-- ship-round-contract: trigger-and-scope:end -->/,
+    /<!-- pr-round-contract: trigger-and-scope:begin -->\n```bash\n([\s\S]*?)```\n<!-- pr-round-contract: trigger-and-scope:end -->/,
   );
-  assert.ok(match, "ship skill must expose an executable auto-fix round contract");
+  assert.ok(match, "pr skill must expose an executable auto-fix round contract");
   return match[1];
 }
 
@@ -84,9 +89,10 @@ if (/\/issues\/\d+\/comments\?per_page=100$/.test(endpoint)) {
   const queryIndex = argv.indexOf("--jq");
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
   const actor = query.match(/\.user\.login == "([^"]+)"/)?.[1];
-  const marker = query.match(/contains\("([^"]+)"\)/)?.[1];
+  const markers = [...query.matchAll(/contains\("([^"]+)"\)/g)].map((match) => match[1]);
   const matching = state.issueComments.filter((item) =>
-    (!actor || item.actor === actor) && (!marker || item.body.includes(marker)));
+    (!actor || item.actor === actor) &&
+    (markers.length === 0 || markers.some((marker) => item.body.includes(marker))));
   rows(matching.map((item) => String(item.id) + "\t" + item.createdAt));
   process.exit(0);
 }
@@ -166,9 +172,15 @@ function baseState(overrides = {}) {
 }
 
 async function main() {
-  const markdown = await readFile(canonicalShip, "utf8");
-  const contract = contractBlock(markdown);
-  const tempRoot = await mkdtemp(join(tmpdir(), "jhw-ship-contract-"));
+  const prText = await readFile(canonicalPr, "utf8");
+  const aliasText = await readFile(shipAlias, "utf8");
+  assert.match(prText, /^# \/jhw:pr — PR 생성/m);
+  assert.match(prText, /<!-- jhw-pr:codex-review round=/);
+  assert.match(aliasText, /deprecated/i);
+  assert.match(aliasText, /\/jhw:pr/);
+  assert.doesNotMatch(aliasText, /pr-round-contract: trigger-and-scope:begin/);
+  const contract = contractBlock(prText);
+  const tempRoot = await mkdtemp(join(tmpdir(), "jhw-pr-contract-"));
   const fakeGh = join(tempRoot, "gh");
   const fakeDate = join(tempRoot, "date");
   const contractPath = join(tempRoot, "contract.bash");
@@ -234,7 +246,7 @@ async function main() {
     assert.equal(idempotent.log.filter((args) => args.includes("POST")).length, 1,
       "a round/head must create exactly one Codex request");
     assert.match(idempotent.state.issueComments.find((item) => item.id === 9002).body,
-      /^@codex review\n\n<!-- jhw-ship:codex-review round=2 head=[a-f0-9]{40} -->$/);
+      /^@codex review\n\n<!-- jhw-pr:codex-review round=2 head=[a-f0-9]{40} -->$/);
     assert.match(idempotent.roundState, /request_comment_id=9002/);
     assert.match(idempotent.roundState, new RegExp(`requested_at=${requestCreatedAt}`));
     assert.match(idempotent.roundState, new RegExp(`target_head=${currentHead}`));
@@ -256,6 +268,41 @@ async function main() {
     );
     assert.equal(duplicate.stdout.trim(), "TRIGGER_FAILED,duplicate_request_marker");
     assert.equal(duplicate.log.filter((args) => args.includes("POST")).length, 0);
+
+    const legacyCurrentHead = await run(
+      baseState({
+        issueComments: [
+          { id: 12, actor: "jhw7500", createdAt: requestCreatedAt, body: legacyRequestBody },
+        ],
+      }),
+      "ship_codex_trigger\nprintf '%s,%s\n' \"$SHIP_CODEX_TRIGGER_STATUS\" \"$SHIP_CODEX_REQUEST_COMMENT_ID\"",
+    );
+    assert.equal(legacyCurrentHead.stdout.trim(), "STARTED,12");
+    assert.equal(legacyCurrentHead.log.filter((args) => args.includes("POST")).length, 0,
+      "one actor-owned legacy marker for the current head must be reused");
+
+    const legacyOldHead = await run(
+      baseState({
+        issueComments: [
+          { id: 13, actor: "jhw7500", createdAt: requestCreatedAt, body: oldLegacyRequestBody },
+        ],
+      }),
+      "ship_codex_trigger",
+    );
+    assert.equal(legacyOldHead.log.filter((args) => args.includes("POST")).length, 1,
+      "a legacy marker for an old head must not suppress the current request");
+
+    const mixedDuplicate = await run(
+      baseState({
+        issueComments: [
+          { id: 14, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody },
+          { id: 15, actor: "jhw7500", createdAt: requestCreatedAt, body: legacyRequestBody },
+        ],
+      }),
+      "ship_codex_trigger\nprintf '%s,%s\n' \"$SHIP_CODEX_TRIGGER_STATUS\" \"$SHIP_CODEX_TRIGGER_REASON\"",
+    );
+    assert.equal(mixedDuplicate.stdout.trim(), "TRIGGER_FAILED,duplicate_request_marker");
+    assert.equal(mixedDuplicate.log.filter((args) => args.includes("POST")).length, 0);
 
     const bashThreeCompatible = await run(
       baseState({
@@ -448,7 +495,7 @@ async function main() {
     );
     assert.equal(pushGate.stdout, "blocked\nready\nfailed-blocked\n");
 
-    console.log("ship skill contract: ok");
+    console.log("pr skill contract: ok");
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
