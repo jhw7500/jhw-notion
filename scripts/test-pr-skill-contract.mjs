@@ -2608,6 +2608,46 @@ async function main() {
       ]],
     );
 
+    const mergeQueueBranch = await runResult(
+      baseState({
+        prHead: currentHead,
+        effectiveRules: [{
+          type: "merge_queue",
+          ruleset_source_type: "Repository",
+          ruleset_source: "example/repo",
+          ruleset_id: 46,
+          parameters: { grouping_strategy: "ALLGREEN" },
+        }],
+      }),
+      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+    );
+    assert.notEqual(mergeQueueBranch.code, 0,
+      "a merge-queue branch must be rejected before the reviewed base can drift in queue");
+    assert.equal(mergeQueueBranch.state.prMerged, false);
+    assert.equal(
+      mergeQueueBranch.log.some((args) => args[0] === "pr" && args[1] === "merge"),
+      false,
+      "merge-queue rejection must happen before gh pr merge can enqueue the PR",
+    );
+
+    for (const [name, overrides] of [
+      ["unavailable", { failEndpoints: ["/rules/branches/main"] }],
+      ["malformed", { effectiveRules: [{ type: 7 }] }],
+    ]) {
+      const uncertainMergeQueue = await runResult(
+        baseState({ prHead: currentHead, ...overrides }),
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+      );
+      assert.notEqual(uncertainMergeQueue.code, 0,
+        `${name} merge-queue metadata must fail closed`);
+      assert.equal(uncertainMergeQueue.state.prMerged, false);
+      assert.equal(
+        uncertainMergeQueue.log.some((args) => args[0] === "pr" && args[1] === "merge"),
+        false,
+        `${name} merge-queue metadata must fail before gh pr merge`,
+      );
+    }
+
     const mergeRace = await runResult(
       baseState({ prHead: currentHead, headBeforeMerge: oldHead }),
       `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,

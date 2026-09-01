@@ -210,6 +210,33 @@ jhw_pr_base_has_no_required_checks() {
   fi
 }
 
+jhw_pr_base_requires_merge_queue() {
+  local base_ref="$1" encoded_base effective_json required
+  [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
+  [[ -n "$base_ref" && "$base_ref" != *$'\n'* && "$base_ref" != *$'\r'* ]] || return 2
+  if encoded_base="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$base_ref")"; then
+    [[ -n "$encoded_base" ]] || return 1
+  else
+    return 1
+  fi
+  effective_json="$(LC_ALL=C gh api \
+    "repos/$REPO_NWO/rules/branches/$encoded_base?per_page=100" --paginate --slurp)" || return 1
+  required="$(printf '%s' "$effective_json" | node -e '
+    const fs = require("node:fs");
+    const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+    let pages;
+    try { pages = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(2); }
+    if (!Array.isArray(pages) || !pages.every(Array.isArray)) process.exit(2);
+    let mergeQueue = false;
+    for (const rule of pages.flat()) {
+      if (!isObject(rule) || typeof rule.type !== "string") process.exit(2);
+      if (rule.type === "merge_queue") mergeQueue = true;
+    }
+    process.stdout.write(mergeQueue ? "true" : "false");
+  ')" || return 1
+  case "$required" in true|false) printf '%s\n' "$required" ;; *) return 1 ;; esac
+}
+
 jhw_pr_wait_required_checks() {
   local pr="$1" expected_head="$2" expected_base_oid="$3"
   local actual_head base_ref actual_base actual_base_oid check_output check_status
@@ -279,7 +306,7 @@ jhw_pr_merge_review_gate() {
 
 jhw_pr_merge_reviewed_head() {
   local pr="${1-}" reviewed_head="${2-}" reviewed_base_oid="${3-}" method="${4-}" policy="${5-}"
-  local strategy_flag actual_base_oid
+  local strategy_flag actual_base_ref actual_base_oid merge_queue_required
   (( $# >= 5 )) || return 2
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] || return 2
@@ -293,6 +320,22 @@ jhw_pr_merge_reviewed_head() {
   esac
   shift 5
   jhw_pr_merge_review_gate "$policy" "$@" || return
+  actual_base_ref="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefName -q .baseRefName)" || return 1
+  [[ -n "$actual_base_ref" ]] || return 1
+  actual_base_oid="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)" || return 1
+  [[ "$actual_base_oid" == "$reviewed_base_oid" ]] || {
+    echo "PR base changed after review" >&2
+    return 3
+  }
+  merge_queue_required="$(jhw_pr_base_requires_merge_queue "$actual_base_ref")" || return
+  [[ "$merge_queue_required" == false ]] || {
+    echo "merge queue branches require a new base-scoped review after queue integration" >&2
+    return 3
+  }
+  [[ "$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefName -q .baseRefName)" == "$actual_base_ref" ]] || {
+    echo "PR base changed after review" >&2
+    return 3
+  }
   actual_base_oid="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)" || return 1
   [[ "$actual_base_oid" == "$reviewed_base_oid" ]] || {
     echo "PR base changed after review" >&2
@@ -1163,7 +1206,7 @@ jhw_pr_apply_existing_pr_policy() {
    - 앱/봇 리뷰어: 매 간격 `reviews`/`comments`/`issue-comments`/`reactions` 수집
 5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다. planned reviewer별 terminal 상태를 `ROUND_REVIEW_STATUSES` 배열에 정확히 한 개씩 보존하며, reviewer가 하나도 계획되지 않았으면 빈 배열을 임의의 `CLEAN`으로 바꾸지 않는다.
 6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. 커밋 뒤 **push 전에** `ROUND_HEAD="$(git rev-parse HEAD)"`와 workflow run-ID floor를 캡처하고, 직후 `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 잡아 재푸시한다. 성공 직후 `ROUND_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`, `SHA="$ROUND_HEAD"`, `ROUND_BASE_OID="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)"`를 확정한 뒤 아래 라운드 계약을 실행하고 4로 복귀한다. `ROUND_STARTED_AT`은 run 필터 경계이고, ID floor가 같은 초의 이전 run을 분리하며, 180초 생성 유예는 느린 push 시간을 제외하도록 `ROUND_PUSHED_AT`부터 잰다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 5) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
-7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head/base OID 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" "$ROUND_BASE_OID" <merge|squash|rebase> "$EFFECTIVE_REVIEW_POLICY" "${ROUND_REVIEW_STATUSES[@]}"`. 이 helper는 review-on policy에서 상태가 0개인 vacuous CLEAN을 거부하고 모든 상태가 `CLEAN`인지 확인한 뒤, base OID를 즉시 재검증하고 `gh pr merge --match-head-commit "$ROUND_HEAD"`로 최종 mutation을 검토된 head에 묶는다.
+7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head/base OID 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" "$ROUND_BASE_OID" <merge|squash|rebase> "$EFFECTIVE_REVIEW_POLICY" "${ROUND_REVIEW_STATUSES[@]}"`. 이 helper는 review-on policy에서 상태가 0개인 vacuous CLEAN을 거부하고 모든 상태가 `CLEAN`인지 확인한 뒤, base OID를 즉시 재검증한다. 이어 active branch rules를 읽어 `merge_queue`가 있거나 rules metadata를 증명할 수 없으면 enqueue 전에 중단하고, direct merge만 `gh pr merge --match-head-commit "$ROUND_HEAD"`로 검토된 head에 묶는다.
    - 명시적 `--no-review --merge`에서는 AI gate만 면제한다. required CI, 타겟, 현재 head, mergeability와 merge method 검증은 그대로 유지하고 `AI review: explicitly skipped (--no-review; review:skip)` receipt를 남긴다.
    - `review.auto=false`인 implicit auto mode는 zero-review merge exemption이 아니다. 자동 머지를 원하면 사용자가 명시적으로 `--no-review --merge`를 선택해야 한다.
    - 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT}` 중 하나이거나 타겟 `FAIL`이면 **머지하지 않고** 보고
@@ -2485,7 +2528,7 @@ if [ -z "$(printf '%s' "${TARGET_CMD:-}" | tr -d '[:space:]')" ]; then echo "TAR
 
 ## 규칙
 
-- **머지 안전** — 머지는 되돌리기 어려우므로 **required CI 성공 + 현재 head 불변 + reviewer 상태 1개 이상 + 전원 CLEAN + (요청 시)타겟 PASS + mergeable/supported method**일 때만. 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT, UNAVAILABLE}`, reviewer 상태 0개, required CI 실패, head 변경 또는 타겟 FAIL이면 중단·보고 (전역 규칙: 롤백 불가 작업 사전 확인). 여기서 CLEAN은 **'블로킹 0건'**이며, 블로킹 미만 nit은 보고만 하고 머지를 막지 않는다. 명시적 `--no-review --merge`만 AI CLEAN 항목을 면제하고 다른 항목은 그대로 적용한다.
+- **머지 안전** — 머지는 되돌리기 어려우므로 **required CI 성공 + 현재 head 불변 + reviewer 상태 1개 이상 + 전원 CLEAN + (요청 시)타겟 PASS + mergeable/supported method**일 때만. 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT, UNAVAILABLE}`, reviewer 상태 0개, required CI 실패, head 변경 또는 타겟 FAIL이면 중단·보고 (전역 규칙: 롤백 불가 작업 사전 확인). 여기서 CLEAN은 **'블로킹 0건'**이며, 블로킹 미만 nit은 보고만 하고 머지를 막지 않는다. 명시적 `--no-review --merge`만 AI CLEAN 항목을 면제하고 다른 항목은 그대로 적용한다. merge queue는 review 이후 더 최신 base와 결합할 수 있으므로 자동 enqueue하지 않고 fail-closed한다.
 - **리액션 타입 구분** — `+1`(👍)/`heart`=긍정(CLEAN 신호; Codex의 문서화된 무지적 신호는 `+1`), `hooray`/`rocket`=정보성(**CLEAN 판정에 사용 안 함**), `eyes`(👀)=확인중(PENDING 유지), `-1`/`confused`=부정(FEEDBACK 취급).
 - **봇 신원 보정 (동적 감지가 canonical)** — 본문 표의 신원은 이 리포 기준 **예시**. 앱은 동일 저장소의 PR 댓글·inline·review 또는 head-scoped 요청의 clean reaction canary로 증명하며, quota·connector·review 불가 응답은 capability 증거에서 제외한다. Codex는 `chatgpt-codex-connector`/`chatgpt-codex-connector[bot]` 중 유효한 actor가 정확히 하나일 때 그 값을 현재 invocation에 고정한다. 두 identity가 함께 보이면 추정하지 않고 `UNAVAILABLE`이다. 워크플로우는 `.github/workflow-config.yml`의 enabled 설정, Actions metadata의 exact `.github/workflows/<file>` 경로·고정 표시 이름·active 상태, `actions/runs`의 같은 표시 이름으로 식별한다. 모르는 `*[bot]` 응답은 expected reviewer로 승격하지 않고 보고에만 포함한다.
 - **워크플로우 실패 ≠ 지적** — auto-review run이 `failure`여도(예: API 키 문제) 같은 역할의 앱 리뷰가 있으면 그쪽을 신뢰. run 실패만으로 머지 차단하지 않되 보고에 명시.
