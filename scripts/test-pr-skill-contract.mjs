@@ -293,12 +293,26 @@ if (/\/issues\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
 }
 
 if (/\/pulls\/\d+\/reviews\?per_page=100$/.test(endpoint)) {
-  rows(state.reviews.map((item) => [item.actor, item.commitId, item.submittedAt, isBlocking(item) ? "true" : "false"].join("\t")));
+  rows(state.reviews.map((item, index) => [
+    item.actor,
+    item.id || 5000 + index,
+    item.commitId,
+    item.submittedAt,
+    item.state || "COMMENTED",
+    isBlocking(item) ? "true" : "false",
+  ].join("\t")));
   process.exit(0);
 }
 
 if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
-  rows(state.pullComments.map((item) => [item.actor, item.commitId, item.originalCommitId, item.createdAt, isBlocking(item) ? "true" : "false"].join("\t")));
+  rows(state.pullComments.map((item) => [
+    item.actor,
+    item.reviewId || 0,
+    item.commitId,
+    item.originalCommitId,
+    item.createdAt,
+    isBlocking(item) ? "true" : "false",
+  ].join("\t")));
   process.exit(0);
 }
 
@@ -1567,6 +1581,56 @@ async function main() {
       "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
     );
     assert.equal(currentBlockingReview.stdout.trim(), "FEEDBACK");
+
+    const dismissedBlockingReview = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          id: 5101,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          state: "DISMISSED",
+          blocking: true,
+        }],
+        pullComments: [{
+          reviewId: 5101,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "2026-08-29T00:03:01Z",
+          blocking: true,
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(dismissedBlockingReview.stdout.trim(), "CLEAN",
+      "a dismissed current-head review and its linked inline findings are no longer open blockers");
+
+    const activeLinkedInline = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          id: 5102,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          state: "COMMENTED",
+          blocking: false,
+        }],
+        pullComments: [{
+          reviewId: 5102,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "2026-08-29T00:03:01Z",
+          blocking: true,
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+    );
+    assert.equal(activeLinkedInline.stdout.trim(), "FEEDBACK",
+      "an inline finding linked to an active review must remain blocking");
 
     const currentP0Review = await run(
       baseState({

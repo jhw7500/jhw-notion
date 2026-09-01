@@ -29,6 +29,7 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 
 - v3 state는 `schema == 3`, reviewer/PR 일치, 양의 `run_id`/`run_attempt`, 현재 `attempt_head`, 허용된 `attempt_status`/`diff_mode`, 일관된 성공·실패 의미를 모두 만족해야 한다. 대응하는 현재-head Actions run의 ID/attempt도 같아야 한다.
 - 같은 reviewer의 historical v3 코멘트는 남아 있을 수 있다. 현재 head에서 가장 최근에 시작된 해당 workflow run을 먼저 고른 뒤 그 `run_id`/`run_attempt`와 일치하는 state만 선택하며, 일치 후보가 정확히 하나가 아니면 ambiguous FAILED다. 과거 head/run state의 개수만으로 실패시키지 않는다.
+- Codex review가 `DISMISSED`이면 응답 사실은 유지하되 그 review 본문과 같은 `pull_request_review_id`에 연결된 inline 지적은 열린 블로커에서 제외한다. 다른 active review나 연결되지 않은 inline 지적은 그대로 판정한다.
 - 성공은 `attempt_status == "success"`, `successful_head == attempt_head == 현재 SHA`, `quality_schema == 1`, 비음수 정수 `accepted_count`/`filtered_count`/`normalized_count`, 허용된 `filtered_max_severity`가 모두 확인된 경우뿐이다.
 - 현재-head state가 `attempt_status == "failure"`이면 이전 `successful_head`와 canonical 본문이 보존돼 있어도 이번 라운드는 FAILED다. 보존 본문을 현재 리뷰 판정에 재사용하지 않는다.
 - `filtered_count`와 `normalized_count`는 반드시 보고할 품질 경고다. `filtered_max_severity`가 HIGH/CRITICAL이어도 거부된 후보의 주장일 뿐이므로 단독으로 FEEDBACK을 만들지 않는다.
@@ -1149,7 +1150,8 @@ ship_codex_author_matches() {
 
 ship_codex_signal_status() {
   local reviews pull_comments issue_reactions comment_reactions request_epoch now_epoch deadline
-  local actor commit_id original_commit_id occurred_at blocking content
+  local actor review_id review_state commit_id original_commit_id occurred_at blocking content
+  local dismissed_review_ids=""
   local has_response=false has_blocking=false has_positive=false has_negative=false has_eyes=false
 
   if [[ "$SHIP_CODEX_TRIGGER_STATUS" != STARTED ]]; then
@@ -1159,11 +1161,11 @@ ship_codex_signal_status() {
   fi
 
   reviews="$(gh api "repos/$REPO_NWO/pulls/$PR/reviews?per_page=100" --paginate \
-    --jq ".[] | [.user.login, (.commit_id // \"\"), (.submitted_at // \"\"), (((.body // \"\") | test(\"$SHIP_CODEX_BLOCKING_PATTERN\"; \"i\")))] | @tsv" 2>/dev/null)" || {
+    --jq ".[] | [.user.login, (.id | tostring), (.commit_id // \"-\"), (.submitted_at // \"-\"), (.state // \"UNKNOWN\"), (((.body // \"\") | test(\"$SHIP_CODEX_BLOCKING_PATTERN\"; \"i\")))] | @tsv" 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   pull_comments="$(gh api "repos/$REPO_NWO/pulls/$PR/comments?per_page=100" --paginate \
-    --jq ".[] | [.user.login, (.commit_id // \"\"), (.original_commit_id // .commit_id // \"\"), (.created_at // \"\"), (((.body // \"\") | test(\"$SHIP_CODEX_BLOCKING_PATTERN\"; \"i\")))] | @tsv" 2>/dev/null)" || {
+    --jq ".[] | [.user.login, ((.pull_request_review_id // 0) | tostring), (.commit_id // \"-\"), (.original_commit_id // .commit_id // \"-\"), (.created_at // \"-\"), (((.body // \"\") | test(\"$SHIP_CODEX_BLOCKING_PATTERN\"; \"i\")))] | @tsv" 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   issue_reactions="$(gh api "repos/$REPO_NWO/issues/$PR/reactions?per_page=100" --paginate \
@@ -1175,18 +1177,34 @@ ship_codex_signal_status() {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
 
-  while IFS=$'\t' read -r actor commit_id occurred_at blocking; do
+  while IFS=$'\t' read -r actor review_id commit_id occurred_at review_state blocking; do
     ship_codex_author_matches "$actor" || continue
+    [[ "$review_id" =~ ^[1-9][0-9]*$ ]] || continue
+    case "$review_state" in
+      COMMENTED|APPROVED|CHANGES_REQUESTED|DISMISSED) ;;
+      PENDING) continue ;;
+      *) continue ;;
+    esac
+    if [[ "$review_state" == DISMISSED ]]; then
+      [[ -z "$dismissed_review_ids" ]] || dismissed_review_ids+=$'\n'
+      dismissed_review_ids+="$review_id"
+    fi
     [[ "$commit_id" == "$ROUND_HEAD" ]] || continue
     ship_at_or_after "$occurred_at" "$SHIP_CODEX_REQUESTED_AT" || continue
     has_response=true
-    [[ "$blocking" == true ]] && has_blocking=true
+    if [[ "$review_state" != DISMISSED && "$blocking" == true ]]; then
+      has_blocking=true
+    fi
   done <<<"$reviews"
 
-  while IFS=$'\t' read -r actor commit_id original_commit_id occurred_at blocking; do
+  while IFS=$'\t' read -r actor review_id commit_id original_commit_id occurred_at blocking; do
     ship_codex_author_matches "$actor" || continue
     [[ "$commit_id" == "$ROUND_HEAD" && "$original_commit_id" == "$ROUND_HEAD" ]] || continue
     ship_at_or_after "$occurred_at" "$SHIP_CODEX_REQUESTED_AT" || continue
+    if [[ "$review_id" =~ ^[1-9][0-9]*$ && -n "$dismissed_review_ids" ]] &&
+      grep -Fqx -- "$review_id" <<<"$dismissed_review_ids"; then
+      continue
+    fi
     has_response=true
     [[ "$blocking" == true ]] && has_blocking=true
   done <<<"$pull_comments"
