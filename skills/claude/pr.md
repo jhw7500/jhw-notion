@@ -147,24 +147,96 @@ jhw_pr_mode_wait_plan() {
   printf '%s\n' required-checks target-if-requested verify-current-head verify-mergeability
 }
 
+jhw_pr_base_has_no_required_checks() {
+  local base_ref="$1" encoded_base branch_json classic_empty effective_json effective_empty
+  [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
+  [[ -n "$base_ref" && "$base_ref" != *$'\n'* && "$base_ref" != *$'\r'* ]] || return 2
+  if encoded_base="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$base_ref")"; then
+    [[ -n "$encoded_base" ]] || return 1
+  else
+    return 1
+  fi
+  if branch_json="$(LC_ALL=C gh api "repos/$REPO_NWO/branches/$encoded_base")"; then
+    :
+  else
+    return 1
+  fi
+  if classic_empty="$(printf '%s' "$branch_json" | node -e '
+    const fs = require("node:fs");
+    const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+    let branch;
+    try { branch = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(2); }
+    const policy = isObject(branch) && isObject(branch.protection)
+      ? branch.protection.required_status_checks
+      : null;
+    if (!isObject(policy) || !Array.isArray(policy.contexts) || !Array.isArray(policy.checks)) {
+      process.exit(2);
+    }
+    process.stdout.write(policy.contexts.length === 0 && policy.checks.length === 0 ? "true" : "false");
+  ')"; then
+    [[ "$classic_empty" == true ]] || return 1
+  else
+    return 1
+  fi
+  if effective_json="$(LC_ALL=C gh api \
+    "repos/$REPO_NWO/rules/branches/$encoded_base?per_page=100" --paginate --slurp)"; then
+    :
+  else
+    return 1
+  fi
+  if effective_empty="$(printf '%s' "$effective_json" | node -e '
+    const fs = require("node:fs");
+    const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+    let pages;
+    try { pages = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(2); }
+    if (!Array.isArray(pages) || !pages.every(Array.isArray)) process.exit(2);
+    let empty = true;
+    for (const rule of pages.flat()) {
+      if (!isObject(rule) || typeof rule.type !== "string") process.exit(2);
+      const key = rule.type === "required_status_checks"
+        ? "required_status_checks"
+        : rule.type === "workflows" ? "workflows" : null;
+      if (key === null) continue;
+      if (!isObject(rule.parameters) || !Array.isArray(rule.parameters[key])) process.exit(2);
+      if (rule.parameters[key].length > 0) empty = false;
+    }
+    process.stdout.write(empty ? "true" : "false");
+  ')"; then
+    [[ "$effective_empty" == true ]] || return 1
+  else
+    return 1
+  fi
+}
+
 jhw_pr_wait_required_checks() {
-  local pr="$1" expected_head="$2" actual_head check_output check_status
+  local pr="$1" expected_head="$2" actual_head base_ref actual_base check_output check_status
   local no_required_pattern="^no required checks reported on the '[^']+' branch$"
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || return 2
   actual_head="$(gh pr view "$pr" --repo "$REPO_NWO" --json headRefOid -q .headRefOid)" || return 1
   [[ "$actual_head" == "$expected_head" ]] || return 3
-  check_output="$(LC_ALL=C gh pr checks "$pr" --repo "$REPO_NWO" --required --watch --interval 10 2>&1)"
-  check_status=$?
+  base_ref="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefName -q .baseRefName)" || return 1
+  [[ -n "$base_ref" ]] || return 1
+  if check_output="$(LC_ALL=C gh pr checks "$pr" --repo "$REPO_NWO" --required --watch --interval 10 2>&1)"; then
+    check_status=0
+  else
+    check_status=$?
+  fi
   if (( check_status != 0 )); then
     if (( check_status != 1 )) || [[ ! "$check_output" =~ $no_required_pattern ]]; then
+      [[ -z "$check_output" ]] || printf '%s\n' "$check_output" >&2
+      return 1
+    fi
+    if ! jhw_pr_base_has_no_required_checks "$base_ref"; then
       [[ -z "$check_output" ]] || printf '%s\n' "$check_output" >&2
       return 1
     fi
   fi
   actual_head="$(gh pr view "$pr" --repo "$REPO_NWO" --json headRefOid -q .headRefOid)" || return 1
   [[ "$actual_head" == "$expected_head" ]] || return 3
+  actual_base="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefName -q .baseRefName)" || return 1
+  [[ "$actual_base" == "$base_ref" ]] || return 3
 }
 
 jhw_pr_merge_reviewed_head() {

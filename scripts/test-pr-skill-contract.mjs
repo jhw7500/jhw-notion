@@ -120,12 +120,14 @@ if (argv[0] === "pr" && argv[1] === "view") {
   const query = optionValue("--jq") || optionValue("-q") || "";
   if (query === ".number") process.stdout.write(String(state.prNumber) + "\n");
   else if (query === ".headRefOid") process.stdout.write(state.prHead + "\n");
+  else if (query === ".baseRefName") process.stdout.write(state.prBase + "\n");
   else if (query === ".isDraft") process.stdout.write(String(state.prDraft) + "\n");
   else if (query.includes(".labels")) rows(state.prLabels || []);
   else {
     const payload = {};
     if (fields.includes("number")) payload.number = state.prNumber;
     if (fields.includes("headRefOid")) payload.headRefOid = state.prHead;
+    if (fields.includes("baseRefName")) payload.baseRefName = state.prBase;
     if (fields.includes("isDraft")) payload.isDraft = state.prDraft;
     if (fields.includes("labels")) payload.labels = (state.prLabels || []).map((name) => ({ name }));
     process.stdout.write(JSON.stringify(payload) + "\n");
@@ -160,6 +162,10 @@ if (argv[0] === "pr" && argv[1] === "checks") {
   if (!state.prExists) process.exit(1);
   if (state.headAfterRequiredChecks) {
     state.prHead = state.headAfterRequiredChecks;
+    save();
+  }
+  if (state.baseAfterRequiredChecks) {
+    state.prBase = state.baseAfterRequiredChecks;
     save();
   }
   if (state.requiredChecksMessage) process.stderr.write(state.requiredChecksMessage);
@@ -201,6 +207,18 @@ if ((state.failEndpoints || []).some((part) => endpoint.includes(part))) process
 
 if (endpoint === "user") {
   process.stdout.write(state.actor + "\n");
+  process.exit(0);
+}
+
+if (endpoint === "repos/example/repo/branches/main") {
+  if (optionValue("--jq")) process.exit(2);
+  process.stdout.write(JSON.stringify(state.branchMetadata) + "\n");
+  process.exit(0);
+}
+
+if (endpoint === "repos/example/repo/rules/branches/main?per_page=100") {
+  if (!argv.includes("--paginate") || !argv.includes("--slurp") || optionValue("--jq")) process.exit(2);
+  process.stdout.write(JSON.stringify([state.effectiveRules]) + "\n");
   process.exit(0);
 }
 
@@ -362,6 +380,7 @@ function baseState(overrides = {}) {
     localHead: currentHead,
     remoteBranchHead: oldHead,
     prHead: oldHead,
+    prBase: "main",
     pushUpdatesPrHead: true,
     nextId: 9002,
     postCreatedAt: requestCreatedAt,
@@ -378,6 +397,18 @@ function baseState(overrides = {}) {
     },
     dispatchedWorkflows: [],
     requiredChecksExit: 0,
+    branchMetadata: {
+      protected: false,
+      protection: {
+        enabled: false,
+        required_status_checks: {
+          enforcement_level: "off",
+          contexts: [],
+          checks: [],
+        },
+      },
+    },
+    effectiveRules: [],
     appComments: [
       {
         actor: "chatgpt-codex-connector[bot]",
@@ -965,13 +996,218 @@ async function main() {
       `jhw_pr_wait_required_checks 42 ${currentHead}`,
     );
     assert.equal(noRequiredChecks.state.prHead, currentHead,
-      "an explicitly empty required-check set must satisfy the required-check gate");
+      "authoritative classic/ruleset metadata proving an empty policy must satisfy the gate");
+    assert.deepEqual(
+      noRequiredChecks.log
+        .filter((args) => args[0] === "api")
+        .map((args) => args[1]),
+      [
+        "repos/example/repo/branches/main",
+        "repos/example/repo/rules/branches/main?per_page=100",
+      ],
+      "the CLI diagnostic alone must not stand in for required-check policy metadata",
+    );
+
+    const requiredCheckRegistrationGap = await runResult(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        branchMetadata: {
+          protected: true,
+          protection: {
+            enabled: true,
+            required_status_checks: {
+              enforcement_level: "non_admins",
+              contexts: ["ci/test"],
+              checks: [{ context: "ci/test", app_id: 17 }],
+            },
+          },
+        },
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(requiredCheckRegistrationGap.code, 1,
+      "a configured required check that has not registered yet must fail closed");
+
+    const requiredCheckMetadataUnavailable = await runResult(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        failEndpoints: ["/branches/main"],
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(requiredCheckMetadataUnavailable.code, 1,
+      "unavailable protection metadata must fail closed");
+
+    const requiredCheckRulesetPresent = await runResult(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        effectiveRules: [{
+          type: "required_status_checks",
+          ruleset_source_type: "Repository",
+          ruleset_source: "example/repo",
+          ruleset_id: 42,
+          parameters: {
+            do_not_enforce_on_create: false,
+            required_status_checks: [{ context: "ci/ruleset", integration_id: 17 }],
+            strict_required_status_checks_policy: true,
+          },
+        }],
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(requiredCheckRulesetPresent.code, 1,
+      "an effective ruleset-required status check must fail closed before it reports");
+
+    const requiredWorkflowRulesetPresent = await runResult(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        effectiveRules: [{
+          type: "workflows",
+          ruleset_source_type: "Organization",
+          ruleset_source: "example",
+          ruleset_id: 43,
+          parameters: {
+            do_not_enforce_on_create: false,
+            workflows: [{ path: ".github/workflows/policy.yml", repository_id: 99 }],
+          },
+        }],
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(requiredWorkflowRulesetPresent.code, 1,
+      "an effective required-workflow rule must fail closed before it reports");
+
+    const reviewOnlyProtection = await run(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        branchMetadata: {
+          protected: true,
+          protection: {
+            enabled: true,
+            required_status_checks: {
+              enforcement_level: "off",
+              contexts: [],
+              checks: [],
+            },
+          },
+        },
+        effectiveRules: [{
+          type: "pull_request",
+          ruleset_source_type: "Repository",
+          ruleset_source: "example/repo",
+          ruleset_id: 44,
+          parameters: { required_approving_review_count: 1 },
+        }],
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(reviewOnlyProtection.state.prHead, currentHead,
+      "review-only classic/ruleset protection must not invent a required status check");
+
+    const nonCiEffectiveRules = await run(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        effectiveRules: [
+          {
+            type: "commit_message_pattern",
+            ruleset_source_type: "Repository",
+            ruleset_source: "example/repo",
+            ruleset_id: 45,
+            parameters: { operator: "starts_with", pattern: "feat:" },
+          },
+          {
+            type: "required_signatures",
+            ruleset_source_type: "Organization",
+            ruleset_source: "example",
+            ruleset_id: 46,
+          },
+        ],
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(nonCiEffectiveRules.state.prHead, currentHead,
+      "effective non-CI rules must not block an authoritatively empty status-check gate");
+
+    const malformedClassicMetadata = await runResult(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        branchMetadata: {
+          protected: false,
+          protection: {
+            enabled: false,
+            required_status_checks: { enforcement_level: "off", contexts: [] },
+          },
+        },
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(malformedClassicMetadata.code, 1,
+      "malformed classic status-check metadata must fail closed");
+
+    const malformedEffectiveRules = await runResult(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        effectiveRules: [{ type: "required_status_checks", parameters: {} }],
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(malformedEffectiveRules.code, 1,
+      "malformed effective rule metadata must fail closed");
+
+    const effectiveRuleMetadataUnavailable = await runResult(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+        failEndpoints: ["/rules/branches/main"],
+      }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(effectiveRuleMetadataUnavailable.code, 1,
+      "unavailable effective-rule metadata must fail closed");
+
+    const noRequiredChecksStrictMode = await run(
+      baseState({
+        prHead: currentHead,
+        requiredChecksExit: 1,
+        requiredChecksMessage: "no required checks reported on the 'task/example' branch\n",
+      }),
+      [
+        "set -e",
+        `jhw_pr_wait_required_checks 42 ${currentHead}`,
+        "printf 'strict-ok\\n'",
+      ].join("\n"),
+    );
+    assert.equal(noRequiredChecksStrictMode.stdout, "strict-ok\n",
+      "the expected gh status 1 path must remain inspectable under set -e");
     const changedDuringChecks = await runResult(
       baseState({ prHead: currentHead, headAfterRequiredChecks: oldHead }),
       `jhw_pr_wait_required_checks 42 ${currentHead}`,
     );
     assert.equal(changedDuringChecks.code, 3,
       "a head change during required checks must invalidate all collected results");
+    const baseChangedDuringChecks = await runResult(
+      baseState({ prHead: currentHead, baseAfterRequiredChecks: "release" }),
+      `jhw_pr_wait_required_checks 42 ${currentHead}`,
+    );
+    assert.equal(baseChangedDuringChecks.code, 3,
+      "a base change during required checks must invalidate the policy scope");
 
     const atomicMerge = await run(
       baseState({ prHead: currentHead }),
