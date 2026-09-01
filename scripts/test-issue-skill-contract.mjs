@@ -25,6 +25,14 @@ function createContractBlock(markdown) {
   return match[1];
 }
 
+function waitContractBlock(markdown) {
+  const match = markdown.match(
+    /<!-- issue-review-wait-contract:begin -->\n```bash\n([\s\S]*?)```\n<!-- issue-review-wait-contract:end -->/,
+  );
+  assert.ok(match, "issue skill must expose an executable review-wait contract");
+  return match[1];
+}
+
 const fakeGhSource = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
 
@@ -143,6 +151,16 @@ if (commentMatch) {
   }
 
   const query = optionValue("--jq", "-q") || "";
+  if (query.includes("{id, actor:.user.login")) {
+    process.stdout.write(JSON.stringify(comments.map((item) => ({
+      id: item.id,
+      actor: item.actor,
+      created_at: item.createdAt,
+      body: item.body,
+      url: item.url || "",
+    }))) + "\n");
+    process.exit(0);
+  }
   if (query.includes("[.user.login, .created_at, .html_url]")) {
     rows(comments.map((item) => [item.actor, item.createdAt, item.url || ""].join("\t")));
     process.exit(0);
@@ -153,6 +171,33 @@ if (commentMatch) {
     (!actor || item.actor === actor) &&
     (markers.length === 0 || markers.some((marker) => item.body.includes(marker))));
   rows(matching.map((item) => String(item.id) + "\t" + item.createdAt));
+  process.exit(0);
+}
+
+if (/\/issues\/comments\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
+  const query = optionValue("--jq", "-q") || "";
+  if (!query.includes("{actor:.user.login")) process.exit(2);
+  process.stdout.write(JSON.stringify(state.commentReactions.map((item) => ({
+    actor: item.actor,
+    content: item.content,
+    created_at: item.createdAt,
+    url: item.url || "",
+  }))) + "\n");
+  process.exit(0);
+}
+
+if (endpoint === "repos/example/repo/actions/runs?per_page=100") {
+  const query = optionValue("--jq", "-q") || "";
+  if (!query.includes("{id, name:.name")) process.exit(2);
+  process.stdout.write(JSON.stringify(state.runs.map((item) => ({
+    id: item.id,
+    name: item.name,
+    event: item.event,
+    status: item.status,
+    conclusion: item.conclusion,
+    created_at: item.createdAt,
+    url: item.url || "",
+  }))) + "\n");
   process.exit(0);
 }
 
@@ -174,6 +219,8 @@ function issueState(overrides = {}) {
     requestCreatedAt,
     issueComments: [],
     canaryComments: [],
+    commentReactions: [],
+    runs: [],
     mutations: [],
     nextCommentId: 1001,
     failEndpoints: [],
@@ -190,13 +237,14 @@ async function main() {
     installSafetyText,
     /test-pr-skill-contract\.mjs"\nnode "\$REPO_ROOT\/scripts\/test-issue-skill-contract\.mjs"/,
   );
-  const contract = createContractBlock(issueText);
+  const contract = `${createContractBlock(issueText)}\n${waitContractBlock(issueText)}`;
 
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-issue-contract-"));
   const fakeGh = join(tempRoot, "gh");
   const contractPath = join(tempRoot, "contract.bash");
   const statePath = join(tempRoot, "gh-state.json");
   const logPath = join(tempRoot, "gh-log.jsonl");
+  const summaryStatePath = join(tempRoot, "jhw-issue.summary.state");
   const fixtureRoot = join(tempRoot, "repo");
   const workflowDir = join(fixtureRoot, ".github", "workflows");
   const configPath = join(fixtureRoot, ".github", "workflow-config.yml");
@@ -226,6 +274,8 @@ async function main() {
       JHW_ISSUE_CONFIG_PATH: configPath,
       JHW_ISSUE_TIMEOUT_MIN: "20",
       JHW_ISSUE_CODEX_CANARY_URL: "",
+      JHW_ISSUE_STATE_DIR: tempRoot,
+      JHW_ISSUE_STATE_FILE: summaryStatePath,
       ...overrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
@@ -462,6 +512,194 @@ async function main() {
     assert.notEqual(postFailure.code, 0);
     assert.equal(postFailure.state.mutations.some((item) => item.startsWith("issue:")), false,
       "a reviewer request failure must not edit, close, delete, or patch the Issue");
+
+    const triggerDeadline = 1788221100;
+    const reviewDeadline = 1788222000;
+    const requestComment = {
+      id: 1001,
+      actor: "jhw7500",
+      createdAt: requestCreatedAt,
+      body: "@claude 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.\n<!-- jhw-issue:review-request reviewer=claude -->",
+      url: "https://github.com/example/repo/issues/99#issuecomment-1001",
+    };
+    const expectedBot = "claude-review[bot]";
+    const acknowledgment = {
+      actor: expectedBot,
+      content: "eyes",
+      createdAt: "2026-09-01T00:01:30Z",
+      url: requestComment.url,
+    };
+    const response = (body, overrides = {}) => ({
+      id: 1002,
+      actor: expectedBot,
+      createdAt: "2026-09-01T00:02:00Z",
+      body,
+      url: "https://github.com/example/repo/issues/99#issuecomment-1002",
+      ...overrides,
+    });
+
+    async function classify(state, reviewer, nowEpoch, overrides = {}) {
+      return runIssue(
+        state,
+        [
+          `export JHW_ISSUE_SIGNAL_JSON="$(jhw_issue_collect_signals 99 1001 '${issueCreatedAt}')"`,
+          `jhw_issue_classify_reviewer ${reviewer} ${nowEpoch} ${triggerDeadline} ${reviewDeadline} || exit $?`,
+          "printf 'meta=%s|%s\\n' \"$JHW_ISSUE_REVIEW_RESPONSE\" \"$JHW_ISSUE_REVIEW_DIAGNOSTIC\"",
+        ].join("\n"),
+        { JHW_ISSUE_EXPECTED_CLAUDE_BOT: expectedBot, ...overrides },
+      );
+    }
+
+    const clean = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("Requirements look complete; no blockers found.")],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(clean.stdout.split("\n")[0], "CLEAN");
+    assert.match(clean.stdout, /issuecomment-1002/);
+
+    const feedback = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("[HIGH] Missing requirement: define authentication failure behavior.")],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(feedback.stdout.split("\n")[0], "FEEDBACK");
+    assert.match(feedback.stdout, /actionable_feedback/);
+
+    const failedRun = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment],
+        runs: [{
+          id: 501,
+          name: "Claude Issue Review",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "failure",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: "https://github.com/example/repo/actions/runs/501",
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(failedRun.stdout.split("\n")[0], "FAILED");
+    assert.match(failedRun.stdout, /actions\/runs\/501/);
+
+    const rejected = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("Unable to review: connector rejected the request.")],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(rejected.stdout.split("\n")[0], "FAILED");
+    assert.match(rejected.stdout, /connector_rejected/);
+
+    const unacknowledged = await classify(
+      issueState({ issueExists: true, issueComments: [requestComment] }),
+      "claude",
+      triggerDeadline + 1,
+    );
+    assert.equal(unacknowledged.stdout.split("\n")[0], "FAILED");
+    assert.match(unacknowledged.stdout, /trigger_unacknowledged/);
+
+    const timedOut = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      reviewDeadline + 1,
+    );
+    assert.equal(timedOut.stdout.split("\n")[0], "TIMEOUT");
+    assert.match(timedOut.stdout, /review_timeout/);
+
+    const unavailable = await classify(
+      issueState({ issueExists: true, issueComments: [requestComment] }),
+      "claude",
+      triggerDeadline - 1,
+      { JHW_ISSUE_REVIEWER_ELIGIBLE: "false" },
+    );
+    assert.equal(unavailable.stdout.split("\n")[0], "UNAVAILABLE");
+
+    const oldOrWrong = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("[HIGH] old", { createdAt: "2026-08-31T23:59:00Z" }),
+          response("[HIGH] wrong actor", { id: 1003, actor: "other-bot" }),
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(oldOrWrong.stdout.split("\n")[0], "PENDING");
+
+    assert.equal(
+      (await runIssue(issueState(), "jhw_issue_highest_disposition CLEAN FEEDBACK")).stdout.trim(),
+      "FEEDBACK",
+    );
+    assert.equal(
+      (await runIssue(issueState(), "jhw_issue_highest_disposition CLEAN TIMEOUT")).stdout.trim(),
+      "TIMEOUT",
+    );
+    assert.equal(
+      (await runIssue(issueState(), "jhw_issue_highest_disposition FEEDBACK FAILED")).stdout.trim(),
+      "FAILED",
+    );
+
+    await writeFile(summaryStatePath, JSON.stringify({
+      requested: ["claude", "gemini"],
+      unavailable: ["codex"],
+      results: [
+        {
+          reviewer: "claude",
+          status: "CLEAN",
+          response: "https://github.com/example/repo/issues/99#issuecomment-1002",
+          diagnostic: "substantive_response",
+        },
+        {
+          reviewer: "gemini",
+          status: "TIMEOUT",
+          response: "https://github.com/example/repo/issues/99#issuecomment-1003",
+          diagnostic: "review_timeout",
+        },
+        {
+          reviewer: "codex",
+          status: "UNAVAILABLE",
+          response: "",
+          diagnostic: "preflight_unavailable",
+        },
+      ],
+    }, null, 2), { mode: 0o600 });
+    const summary = await runIssue(
+      issueState({ issueExists: true }),
+      [
+        `jhw_issue_render_summary 'https://github.com/example/repo/issues/99' ${JSON.stringify(summaryStatePath)}`,
+        `jhw_issue_cleanup_state_file ${JSON.stringify(summaryStatePath)}`,
+      ].join("\n"),
+    );
+    assert.match(summary.stdout, /^Issue URL: https:\/\/github\.com\/example\/repo\/issues\/99$/m);
+    assert.match(summary.stdout, /^Requested reviewers: claude, gemini$/m);
+    assert.match(summary.stdout, /^Unavailable reviewers: codex$/m);
+    assert.match(summary.stdout, /^Reviewer \| Status \| Response \| Diagnostic$/m);
+    assert.match(summary.stdout, /^gemini \| TIMEOUT \| .*issuecomment-1003 \| review_timeout$/m);
+    assert.match(summary.stdout, /^Highest disposition: TIMEOUT$/m);
+    assert.deepEqual(summary.state.mutations, []);
+    assert.equal(summary.log.length, 0, "rendering and cleanup must not call GitHub");
+    await assert.rejects(readFile(summaryStatePath, "utf8"), { code: "ENOENT" });
 
     console.log("issue skill contract: ok");
   } finally {

@@ -385,6 +385,260 @@ jhw_issue_create() {
 ```
 <!-- issue-review-create-contract:end -->
 
+## bounded review wait 계약
+
+요청된 reviewer만 private invocation state에서 추적한다. 한 번의 collect/classify pass는 read-only이며,
+agent harness가 약 60초 간격으로 모든 요청 reviewer가 terminal이거나 전체 deadline에 도달할 때까지
+반복한다. untracked `&`/`nohup`과 60초를 넘는 foreground sleep은 사용하지 않는다.
+
+<!-- issue-review-wait-contract:begin -->
+```bash
+jhw_issue_collect_signals() {
+  local issue="$1" request_comment_id="$2" issue_created_at="$3"
+  local actor comments reactions runs
+  [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
+  [[ "$request_comment_id" =~ ^[1-9][0-9]*$ ]] || return 2
+  jhw_issue_is_utc_timestamp "$issue_created_at" || return 2
+  actor="$(gh api user --jq '.login' 2>/dev/null)" || return 1
+  [[ "$actor" =~ ^[A-Za-z0-9-]+$ ]] || return 1
+  comments="$(gh api "repos/$REPO_NWO/issues/$issue/comments?per_page=100" --paginate \
+    --jq '[.[] | {id, actor:.user.login, created_at:.created_at, body:(.body // ""), url:.html_url}]' 2>/dev/null)" || return 1
+  reactions="$(gh api "repos/$REPO_NWO/issues/comments/$request_comment_id/reactions?per_page=100" --paginate \
+    --jq '[.[] | {actor:.user.login, content:.content, created_at:.created_at, url:.html_url}]' 2>/dev/null)" || return 1
+  runs="$(gh api "repos/$REPO_NWO/actions/runs?per_page=100" --paginate \
+    --jq '[.workflow_runs[] | {id, name:.name, event:.event, status:.status, conclusion:(.conclusion // "null"), created_at:.created_at, url:.html_url}]' 2>/dev/null)" || return 1
+  JHW_ISSUE_COMMENTS_JSON="$comments" \
+  JHW_ISSUE_REACTIONS_JSON="$reactions" \
+  JHW_ISSUE_RUNS_JSON="$runs" \
+  node - "$issue" "$request_comment_id" "$issue_created_at" "$actor" <<'NODE'
+const [issue, requestCommentId, issueCreatedAt, requestActor] = process.argv.slice(2);
+const fail = (message) => { process.stderr.write(message + "\n"); process.exit(1); };
+const parseArray = (name) => {
+  try {
+    const value = JSON.parse(process.env[name] || "");
+    if (!Array.isArray(value)) fail(`${name} must be an array`);
+    return value;
+  } catch {
+    fail(`${name} is invalid JSON`);
+  }
+};
+const snapshot = {
+  issue: Number(issue),
+  request_comment_id: Number(requestCommentId),
+  issue_created_at: issueCreatedAt,
+  request_actor: requestActor,
+  comments: parseArray("JHW_ISSUE_COMMENTS_JSON"),
+  reactions: parseArray("JHW_ISSUE_REACTIONS_JSON"),
+  runs: parseArray("JHW_ISSUE_RUNS_JSON"),
+};
+process.stdout.write(JSON.stringify(snapshot) + "\n");
+NODE
+}
+
+jhw_issue_classify_reviewer() {
+  local reviewer="$1" now_epoch="$2" trigger_deadline="$3" review_deadline="$4"
+  local expected_bot workflow_name result state response diagnostic extra eligible
+  [[ "$now_epoch" =~ ^[0-9]+$ && "$trigger_deadline" =~ ^[0-9]+$ && "$review_deadline" =~ ^[0-9]+$ ]] || return 2
+  (( review_deadline >= trigger_deadline )) || return 2
+  eligible="${JHW_ISSUE_REVIEWER_ELIGIBLE:-true}"
+  case "$eligible" in true|false) ;; *) return 2 ;; esac
+  case "$reviewer" in
+    claude)
+      expected_bot="${JHW_ISSUE_EXPECTED_CLAUDE_BOT:-claude-review[bot]}"
+      workflow_name='Claude Issue Review'
+      ;;
+    gemini)
+      expected_bot="${JHW_ISSUE_EXPECTED_GEMINI_BOT:-gemini-review[bot]}"
+      workflow_name='Gemini Issue Review'
+      ;;
+    codex)
+      expected_bot="${JHW_ISSUE_EXPECTED_CODEX_BOT:-chatgpt-codex-connector[bot]}"
+      workflow_name=''
+      ;;
+    *) return 2 ;;
+  esac
+  [[ "$expected_bot" =~ ^[A-Za-z0-9_.-]+(\[bot\])?$ ]] || return 2
+  result="$(node - "$reviewer" "$now_epoch" "$trigger_deadline" "$review_deadline" \
+    "$expected_bot" "$workflow_name" "$eligible" <<'NODE'
+const [reviewer, nowRaw, triggerRaw, reviewRaw, expectedBot, workflowName, eligibleRaw] = process.argv.slice(2);
+const now = Number(nowRaw);
+const triggerDeadline = Number(triggerRaw);
+const reviewDeadline = Number(reviewRaw);
+const emit = (state, response, diagnostic) => {
+  process.stdout.write([state, response || "-", diagnostic].join("\t") + "\n");
+  process.exit(0);
+};
+if (eligibleRaw === "false") emit("UNAVAILABLE", "", "preflight_unavailable");
+let snapshot;
+try { snapshot = JSON.parse(process.env.JHW_ISSUE_SIGNAL_JSON || ""); }
+catch { process.stderr.write("invalid signal snapshot\n"); process.exit(1); }
+if (!snapshot || !Array.isArray(snapshot.comments) || !Array.isArray(snapshot.reactions) || !Array.isArray(snapshot.runs)) {
+  process.stderr.write("invalid signal snapshot\n"); process.exit(1);
+}
+const epoch = (value) => {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) return null;
+  const parsed = Date.parse(value) / 1000;
+  return Number.isInteger(parsed) ? parsed : null;
+};
+const issueEpoch = epoch(snapshot.issue_created_at);
+if (issueEpoch === null) { process.stderr.write("invalid Issue timestamp\n"); process.exit(1); }
+const marker = `<!-- jhw-issue:review-request reviewer=${reviewer} -->`;
+const requests = snapshot.comments.filter((comment) =>
+  Number(comment.id) === Number(snapshot.request_comment_id) &&
+  comment.actor === snapshot.request_actor &&
+  typeof comment.body === "string" && comment.body.includes(marker) &&
+  epoch(comment.created_at) !== null && epoch(comment.created_at) >= issueEpoch);
+if (requests.length !== 1) {
+  if (now >= triggerDeadline) emit("FAILED", "", "request_marker_invalid");
+  emit("PENDING", "", "request_marker_pending");
+}
+const request = requests[0];
+const requestEpoch = epoch(request.created_at);
+const later = (value) => {
+  const parsed = epoch(value);
+  return parsed !== null && parsed > requestEpoch && parsed >= issueEpoch;
+};
+const comments = snapshot.comments.filter((comment) =>
+  comment.actor === expectedBot && later(comment.created_at));
+const reactions = snapshot.reactions.filter((reaction) =>
+  reaction.actor === expectedBot && later(reaction.created_at));
+const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
+  run.name === workflowName && ["issue_comment", "issues", "workflow_dispatch"].includes(run.event) && later(run.created_at));
+
+const failedRun = runs.find((run) => run.status === "completed" && !["success", "neutral", "skipped"].includes(run.conclusion));
+if (failedRun) emit("FAILED", failedRun.url, "workflow_failed");
+const rejectedReaction = reactions.find((reaction) => ["-1", "confused"].includes(reaction.content));
+if (rejectedReaction) emit("FAILED", rejectedReaction.url, "connector_rejected");
+const rejectedComment = comments.find((comment) =>
+  /unable to review|cannot review|connector[^\n]*(?:reject|denied)|failed to (?:start|review)/i.test(comment.body || ""));
+if (rejectedComment) emit("FAILED", rejectedComment.url, "connector_rejected");
+const feedbackComment = comments.find((comment) =>
+  /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i.test(comment.body || ""));
+if (feedbackComment) emit("FEEDBACK", feedbackComment.url, "actionable_feedback");
+if (comments.length > 0) emit("CLEAN", comments[0].url, "substantive_response");
+
+const acknowledged = reactions.some((reaction) => ["eyes", "+1", "heart"].includes(reaction.content)) ||
+  runs.some((run) => ["queued", "in_progress", "completed"].includes(run.status));
+if (acknowledged && now >= reviewDeadline) emit("TIMEOUT", request.url, "review_timeout");
+if (!acknowledged && now >= triggerDeadline) emit("FAILED", request.url, "trigger_unacknowledged");
+emit("PENDING", request.url, acknowledged ? "acknowledged" : "awaiting_acknowledgment");
+NODE
+)" || return 1
+  IFS=$'\t' read -r state response diagnostic extra <<<"$result"
+  case "$state" in PENDING|CLEAN|FEEDBACK|FAILED|TIMEOUT|UNAVAILABLE) ;; *) return 1 ;; esac
+  [[ -n "$response" && -n "$diagnostic" && -z "$extra" ]] || return 1
+  [[ "$response" == - ]] && response=""
+  JHW_ISSUE_REVIEW_STATUS="$state"
+  JHW_ISSUE_REVIEW_RESPONSE="$response"
+  JHW_ISSUE_REVIEW_DIAGNOSTIC="$diagnostic"
+  printf '%s\n' "$state"
+}
+
+jhw_issue_highest_disposition() {
+  local state rank best_rank=0 best=CLEAN
+  (( $# > 0 )) || return 2
+  for state in "$@"; do
+    case "$state" in
+      CLEAN) rank=1 ;;
+      FEEDBACK) rank=2 ;;
+      TIMEOUT) rank=3 ;;
+      FAILED) rank=4 ;;
+      PENDING|UNAVAILABLE) rank=0 ;;
+      *) return 2 ;;
+    esac
+    if (( rank > best_rank )); then
+      best_rank="$rank"
+      best="$state"
+    fi
+  done
+  printf '%s\n' "$best"
+}
+
+jhw_issue_create_state_file() {
+  local state_dir="${JHW_ISSUE_STATE_DIR:-${TMPDIR:-/tmp}}" file
+  [[ -d "$state_dir" && ! -L "$state_dir" ]] || return 1
+  umask 077
+  file="$(mktemp "$state_dir/jhw-issue.XXXXXX.state")" || return 1
+  chmod 600 "$file" || return 1
+  printf '%s\n' "$file"
+}
+
+jhw_issue_render_summary() {
+  local issue_url="$1" state_file="$2" issue_repo
+  if [[ "$issue_url" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/[1-9][0-9]*$ ]]; then
+    issue_repo="${BASH_REMATCH[1]}"
+  else
+    return 2
+  fi
+  [[ "$issue_repo" == "$REPO_NWO" ]] || return 2
+  [[ -n "${JHW_ISSUE_STATE_FILE:-}" && "$state_file" == "$JHW_ISSUE_STATE_FILE" ]] || return 2
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  node - "$issue_url" "$state_file" <<'NODE'
+const fs = require("node:fs");
+const [issueUrl, stateFile] = process.argv.slice(2);
+const fail = (message) => { process.stderr.write(message + "\n"); process.exit(1); };
+let state;
+try { state = JSON.parse(fs.readFileSync(stateFile, "utf8")); }
+catch { fail("invalid Issue review state"); }
+if (!state || !Array.isArray(state.requested) || !Array.isArray(state.unavailable) || !Array.isArray(state.results)) {
+  fail("invalid Issue review state");
+}
+const reviewers = new Set(["claude", "gemini", "codex"]);
+const statuses = new Set(["PENDING", "CLEAN", "FEEDBACK", "FAILED", "TIMEOUT", "UNAVAILABLE"]);
+const uniqueReviewers = (values, field) => {
+  if (values.some((value) => typeof value !== "string" || !reviewers.has(value))) fail(`invalid ${field}`);
+  if (new Set(values).size !== values.length) fail(`duplicate ${field}`);
+};
+uniqueReviewers(state.requested, "requested reviewer");
+uniqueReviewers(state.unavailable, "unavailable reviewer");
+if (state.requested.some((reviewer) => state.unavailable.includes(reviewer))) fail("reviewer cannot be requested and unavailable");
+const seen = new Set();
+for (const result of state.results) {
+  if (!result || !reviewers.has(result.reviewer) || !statuses.has(result.status)) fail("invalid reviewer result");
+  if (seen.has(result.reviewer)) fail("duplicate reviewer result");
+  seen.add(result.reviewer);
+  if (typeof result.response !== "string" || typeof result.diagnostic !== "string") fail("invalid reviewer result fields");
+}
+if (state.requested.some((reviewer) => !seen.has(reviewer))) fail("requested reviewer result missing");
+const cell = (value) => (value || "-").replace(/[\r\n|]+/g, " ").trim() || "-";
+const rank = { PENDING: 0, UNAVAILABLE: 0, CLEAN: 1, FEEDBACK: 2, TIMEOUT: 3, FAILED: 4 };
+let highest = "CLEAN";
+for (const result of state.results.filter((item) => state.requested.includes(item.reviewer))) {
+  if (rank[result.status] > rank[highest]) highest = result.status;
+}
+const lines = [
+  `Issue URL: ${issueUrl}`,
+  `Requested reviewers: ${state.requested.length ? state.requested.join(", ") : "none"}`,
+  `Unavailable reviewers: ${state.unavailable.length ? state.unavailable.join(", ") : "none"}`,
+  "Reviewer | Status | Response | Diagnostic",
+  "--- | --- | --- | ---",
+  ...state.results.map((result) =>
+    `${result.reviewer} | ${result.status} | ${cell(result.response)} | ${cell(result.diagnostic)}`),
+  `Highest disposition: ${highest}`,
+];
+process.stdout.write(lines.join("\n") + "\n");
+NODE
+}
+
+jhw_issue_cleanup_state_file() {
+  local state_file="$1" state_dir="${JHW_ISSUE_STATE_DIR:-${TMPDIR:-/tmp}}"
+  local parent base
+  [[ -n "${JHW_ISSUE_STATE_FILE:-}" && "$state_file" == "$JHW_ISSUE_STATE_FILE" ]] || return 2
+  parent="${state_file%/*}"
+  base="${state_file##*/}"
+  [[ "$parent" == "$state_dir" && "$base" == jhw-issue.*.state ]] || return 2
+  [[ ! -L "$state_file" ]] || return 1
+  [[ ! -e "$state_file" || -f "$state_file" ]] || return 1
+  [[ -e "$state_file" ]] || return 0
+  rm -f -- "$state_file"
+}
+```
+<!-- issue-review-wait-contract:end -->
+
+실행 시작 시 `JHW_ISSUE_STATE_FILE="$(jhw_issue_create_state_file)"`로 private state를 만들고 export한
+뒤 `trap 'jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE"' EXIT`를 등록한다. partial failure와
+timeout에서도 summary와 Issue URL을 먼저 출력하고 trap으로 state만 제거한다.
+
 ## 실행 규칙
 
 - title/body를 먼저 확정한다. 내용이 모호하면 생성 전에 한 번만 질문한다.
