@@ -36,6 +36,14 @@ function contractBlock(markdown) {
   return match[1];
 }
 
+function policyContractBlock(markdown) {
+  const match = markdown.match(
+    /<!-- pr-review-mode-contract:begin -->\n```bash\n([\s\S]*?)```\n<!-- pr-review-mode-contract:end -->/,
+  );
+  assert.ok(match, "pr skill must expose an executable review-mode contract");
+  return match[1];
+}
+
 const fakeGhSource = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
 
@@ -58,6 +66,81 @@ function isBlocking(item) {
   const queryIndex = argv.indexOf("--jq");
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
   return typeof item.severity === "string" && query.includes(item.severity.toUpperCase());
+}
+
+function optionValue(name) {
+  const index = argv.indexOf(name);
+  return index >= 0 ? argv[index + 1] : undefined;
+}
+
+if (argv[0] === "repo" && argv[1] === "view") {
+  process.stdout.write((state.viewerPermission || "READ") + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "label" && argv[1] === "list") {
+  rows(state.repoLabels || []);
+  process.exit(0);
+}
+
+if (argv[0] === "label" && argv[1] === "create") {
+  const name = argv[2];
+  if (state.failLabelCreate) process.exit(1);
+  if (!state.repoLabels.includes(name)) state.repoLabels.push(name);
+  save();
+  process.exit(0);
+}
+
+if (argv[0] === "pr" && argv[1] === "create") {
+  if (!argv.includes("--draft") || state.failPrCreate) process.exit(1);
+  state.prExists = true;
+  state.prDraft = state.forceReadyOnCreate ? false : true;
+  state.prHead = state.remoteBranchHead;
+  save();
+  process.stdout.write(state.prUrl + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "pr" && argv[1] === "view") {
+  if (!state.prExists) process.exit(1);
+  const fields = optionValue("--json") || "";
+  const query = optionValue("--jq") || "";
+  if (query === ".number") process.stdout.write(String(state.prNumber) + "\n");
+  else if (query === ".headRefOid") process.stdout.write(state.prHead + "\n");
+  else if (query === ".isDraft") process.stdout.write(String(state.prDraft) + "\n");
+  else if (query.includes(".labels")) rows(state.prLabels || []);
+  else {
+    const payload = {};
+    if (fields.includes("number")) payload.number = state.prNumber;
+    if (fields.includes("headRefOid")) payload.headRefOid = state.prHead;
+    if (fields.includes("isDraft")) payload.isDraft = state.prDraft;
+    if (fields.includes("labels")) payload.labels = (state.prLabels || []).map((name) => ({ name }));
+    process.stdout.write(JSON.stringify(payload) + "\n");
+  }
+  process.exit(0);
+}
+
+if (argv[0] === "pr" && argv[1] === "edit") {
+  if (!state.prExists || state.failPrEdit) process.exit(1);
+  if (!state.freezeLabels) {
+    for (let index = 0; index < argv.length; index += 1) {
+      if (argv[index] === "--remove-label") {
+        state.prLabels = state.prLabels.filter((name) => name !== argv[index + 1]);
+      }
+      if (argv[index] === "--add-label" && !state.prLabels.includes(argv[index + 1])) {
+        state.prLabels.push(argv[index + 1]);
+      }
+    }
+  }
+  save();
+  process.exit(0);
+}
+
+if (argv[0] === "pr" && argv[1] === "ready") {
+  if (!state.prExists || state.failPrReady) process.exit(1);
+  state.prDraft = false;
+  save();
+  process.exit(0);
 }
 
 if (argv[0] !== "api" || !argv[1]) process.exit(2);
@@ -126,6 +209,32 @@ process.stderr.write("unexpected fake gh endpoint: " + endpoint + "\n");
 process.exit(2);
 `;
 
+const fakeGitSource = String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+
+const statePath = process.env.FAKE_GH_STATE;
+const logPath = process.env.FAKE_GH_LOG;
+const argv = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+fs.appendFileSync(logPath, JSON.stringify(["git", ...argv]) + "\n");
+
+if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
+  process.stdout.write(state.localHead + "\n");
+  process.exit(0);
+}
+
+if (argv[0] === "push") {
+  if (state.failPush) process.exit(1);
+  state.remoteBranchHead = state.localHead;
+  if (state.prExists && state.pushUpdatesPrHead !== false) state.prHead = state.localHead;
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  process.exit(0);
+}
+
+process.stderr.write("unexpected fake git command: " + argv.join(" ") + "\n");
+process.exit(2);
+`;
+
 const fakeDateSource = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
 
@@ -157,6 +266,17 @@ process.exit(1);
 function baseState(overrides = {}) {
   return {
     actor: "jhw7500",
+    viewerPermission: "WRITE",
+    repoLabels: ["review:request", "review:skip"],
+    prLabels: [],
+    prExists: true,
+    prNumber: 42,
+    prUrl: "https://github.com/example/repo/pull/42",
+    prDraft: false,
+    localHead: currentHead,
+    remoteBranchHead: oldHead,
+    prHead: oldHead,
+    pushUpdatesPrHead: true,
     nextId: 9002,
     postCreatedAt: requestCreatedAt,
     issueComments: [],
@@ -179,11 +299,13 @@ async function main() {
   assert.match(aliasText, /deprecated/i);
   assert.match(aliasText, /\/jhw:pr/);
   assert.doesNotMatch(aliasText, /pr-round-contract: trigger-and-scope:begin/);
-  const contract = contractBlock(prText);
+  const contract = `${contractBlock(prText)}\n${policyContractBlock(prText)}`;
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-pr-contract-"));
   const fakeGh = join(tempRoot, "gh");
+  const fakeGit = join(tempRoot, "git");
   const fakeDate = join(tempRoot, "date");
   const contractPath = join(tempRoot, "contract.bash");
+  const configPath = join(tempRoot, "workflow-config.yml");
   const statePath = join(tempRoot, "gh-state.json");
   const logPath = join(tempRoot, "gh-log.jsonl");
   const roundStatePath = join(tempRoot, "round.state");
@@ -191,6 +313,8 @@ async function main() {
 
   await writeFile(fakeGh, fakeGhSource);
   await chmod(fakeGh, 0o755);
+  await writeFile(fakeGit, fakeGitSource);
+  await chmod(fakeGit, 0o755);
   await writeFile(fakeDate, fakeDateSource);
   await chmod(fakeDate, 0o755);
   await writeFile(contractPath, contract);
@@ -227,7 +351,156 @@ async function main() {
     };
   }
 
+  async function runResult(state, commands, overrides = {}) {
+    try {
+      return { code: 0, ...(await run(state, commands, overrides)) };
+    } catch (error) {
+      return {
+        code: Number.isInteger(error.code) ? error.code : 1,
+        stdout: error.stdout ?? "",
+        stderr: error.stderr ?? "",
+        state: JSON.parse(await readFile(statePath, "utf8")),
+        log: (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse),
+      };
+    }
+  }
+
   try {
+    const requestMode = await run(baseState(), "jhw_pr_review_mode_from_args --review");
+    const skipMode = await run(baseState(), "jhw_pr_review_mode_from_args --no-review");
+    const autoMode = await run(baseState(), "jhw_pr_review_mode_from_args --merge --target");
+    const conflictMode = await runResult(
+      baseState(),
+      "jhw_pr_review_mode_from_args --review --no-review",
+    );
+    assert.equal(requestMode.stdout.trim(), "request");
+    assert.equal(skipMode.stdout.trim(), "skip");
+    assert.equal(autoMode.stdout.trim(), "auto");
+    assert.notEqual(conflictMode.code, 0);
+    assert.equal(conflictMode.log.length, 0,
+      "conflicting review options must fail before any gh or git command");
+
+    assert.equal((await run(baseState(), "jhw_pr_merge_ai_policy_from_args --no-review --merge")).stdout.trim(), "skip");
+    assert.equal((await run(baseState(), "jhw_pr_merge_ai_policy_from_args --review --merge")).stdout.trim(), "request");
+    assert.equal((await run(baseState(), "jhw_pr_merge_ai_policy_from_args --merge")).stdout.trim(), "auto");
+    assert.equal((await run(baseState(), "jhw_pr_merge_ai_policy_from_args --no-review")).stdout.trim(), "no-merge");
+    assert.equal(
+      (await run(baseState(), "jhw_pr_skip_merge_receipt")).stdout.trim(),
+      "AI review: explicitly skipped (--no-review; review:skip)",
+    );
+
+    assert.equal((await run(baseState(), "jhw_pr_max_rounds_from_args")).stdout.trim(), "5");
+    assert.equal((await run(baseState(), "jhw_pr_max_rounds_from_args --auto-fix --max-rounds 7")).stdout.trim(), "7");
+    assert.notEqual((await runResult(baseState(), "jhw_pr_max_rounds_from_args --max-rounds 0")).code, 0);
+
+    await writeFile(configPath, "review:\n  auto: true\n");
+    assert.equal((await run(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "true");
+    await writeFile(configPath, "review:\n  auto: false\n");
+    assert.equal((await run(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "false");
+    await writeFile(configPath, "workflows: {}\n");
+    assert.equal((await run(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "true");
+    await writeFile(configPath, "review:\n  auto: yes\n");
+    assert.notEqual((await runResult(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).code, 0);
+
+    const isGitPush = (args) => args[0] === "git" && args[1] === "push";
+    const isGh = (args, group, command) => args[0] === group && args[1] === command;
+    const hasOption = (args, name, value) => {
+      const index = args.indexOf(name);
+      return index >= 0 && args[index + 1] === value;
+    };
+    const callIndex = (log, predicate, start = 0) => {
+      const relative = log.slice(start).findIndex(predicate);
+      return relative < 0 ? -1 : start + relative;
+    };
+    const requireBefore = (log, first, second, message) => {
+      const firstIndex = callIndex(log, first);
+      const secondIndex = callIndex(log, second);
+      assert.ok(firstIndex >= 0, `${message}: first call missing`);
+      assert.ok(secondIndex >= 0, `${message}: second call missing`);
+      assert.ok(firstIndex < secondIndex, message);
+    };
+    const mutationCalls = (log) => log.filter((args) =>
+      isGitPush(args) ||
+      isGh(args, "label", "create") ||
+      (args[0] === "pr" && ["create", "edit", "ready", "merge"].includes(args[1])) ||
+      (args[0] === "api" && args.includes("POST")));
+
+    const readOnly = await runResult(
+      baseState({ viewerPermission: "READ", prExists: false }),
+      "jhw_pr_apply_new_pr_policy request",
+    );
+    assert.notEqual(readOnly.code, 0);
+    assert.deepEqual(mutationCalls(readOnly.log), []);
+
+    const newPr = await run(
+      baseState({
+        repoLabels: [],
+        prLabels: ["review:skip"],
+        prExists: false,
+      }),
+      "jhw_pr_apply_new_pr_policy request",
+    );
+    const requestLabelCreate = (args) => isGh(args, "label", "create") && args[2] === "review:request";
+    const skipLabelCreate = (args) => isGh(args, "label", "create") && args[2] === "review:skip";
+    const createDraft = (args) => isGh(args, "pr", "create") && args.includes("--draft");
+    const removeSkip = (args) => isGh(args, "pr", "edit") && hasOption(args, "--remove-label", "review:skip");
+    const addRequest = (args) => isGh(args, "pr", "edit") && hasOption(args, "--add-label", "review:request");
+    const ready = (args) => isGh(args, "pr", "ready");
+    requireBefore(newPr.log, requestLabelCreate, isGitPush, "request label definition must precede push");
+    requireBefore(newPr.log, skipLabelCreate, isGitPush, "skip label definition must precede push");
+    requireBefore(newPr.log, isGitPush, createDraft, "new PR push must precede draft creation");
+    requireBefore(newPr.log, createDraft, removeSkip, "draft creation must precede policy reconciliation");
+    requireBefore(newPr.log, removeSkip, addRequest, "opposite label must be removed before request label is added");
+    requireBefore(newPr.log, addRequest, ready, "verified request policy must precede ready transition");
+    assert.deepEqual(newPr.state.prLabels, ["review:request"]);
+    assert.equal(newPr.state.prHead, currentHead);
+    assert.equal(newPr.state.prDraft, false);
+
+    const existingPr = await run(
+      baseState({ prLabels: ["review:request"] }),
+      `jhw_pr_apply_existing_pr_policy skip ${currentHead}`,
+    );
+    const removeRequest = (args) => isGh(args, "pr", "edit") && hasOption(args, "--remove-label", "review:request");
+    const addSkip = (args) => isGh(args, "pr", "edit") && hasOption(args, "--add-label", "review:skip");
+    requireBefore(existingPr.log, removeRequest, addSkip, "request label must be removed before skip is added");
+    requireBefore(existingPr.log, addSkip, isGitPush, "skip policy must be applied before synchronize push");
+    assert.deepEqual(existingPr.state.prLabels, ["review:skip"]);
+    assert.equal(existingPr.state.prHead, currentHead);
+
+    const autoExisting = await run(
+      baseState({ prLabels: ["review:request", "review:skip"] }),
+      `jhw_pr_apply_existing_pr_policy auto ${currentHead}`,
+    );
+    const autoRemoveRequest = callIndex(autoExisting.log, removeRequest);
+    const autoRemoveSkip = callIndex(autoExisting.log, removeSkip, autoRemoveRequest + 1);
+    const autoPush = callIndex(autoExisting.log, isGitPush);
+    assert.ok(autoRemoveRequest >= 0 && autoRemoveSkip > autoRemoveRequest && autoPush > autoRemoveSkip,
+      "auto mode must remove both overrides before push");
+    assert.deepEqual(autoExisting.state.prLabels, []);
+
+    const frozenPolicy = await runResult(
+      baseState({ prLabels: ["review:skip"], freezeLabels: true }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+    );
+    assert.notEqual(frozenPolicy.code, 0);
+    assert.equal(frozenPolicy.log.some(isGitPush), false,
+      "failed remote policy verification must stop before existing-PR push");
+
+    const staleHead = await runResult(
+      baseState({ prLabels: ["review:request"], pushUpdatesPrHead: false }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+    );
+    assert.notEqual(staleHead.code, 0);
+    assert.equal(staleHead.log.filter(isGitPush).length, 1);
+
+    const unexpectedlyReady = await runResult(
+      baseState({ prExists: false, forceReadyOnCreate: true }),
+      "jhw_pr_apply_new_pr_policy skip",
+    );
+    assert.notEqual(unexpectedlyReady.code, 0);
+    assert.equal(unexpectedlyReady.log.some(ready), false,
+      "a PR that is already ready must fail verification instead of issuing another ready mutation");
+
     const idempotent = await run(
       baseState({
         issueComments: [

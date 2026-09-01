@@ -332,43 +332,7 @@ jhw_pr_review_mode_from_args() {
 }
 ```
 
-Implement `jhw_pr_global_auto_enabled` with Ruby standard `YAML.safe_load`:
-
-```bash
-jhw_pr_global_auto_enabled() {
-  local config_path="${1:-.github/workflow-config.yml}"
-  if [[ ! -e "$config_path" ]]; then
-    printf 'true\n'
-    return
-  fi
-  [[ -f "$config_path" && ! -L "$config_path" ]] || {
-    echo "workflow config must be a regular file" >&2
-    return 2
-  }
-  ruby -ryaml -e '
-    root = YAML.safe_load(File.read(ARGV.fetch(0)), permitted_classes: [], aliases: false)
-    root = {} if root.nil?
-    abort "workflow config root must be a map" unless root.is_a?(Hash)
-    unless root.key?("review")
-      puts "true"
-      exit 0
-    end
-    review = root["review"]
-    abort "review must be a map" unless review.is_a?(Hash)
-    unless review.key?("auto")
-      puts "true"
-      exit 0
-    end
-    case review["auto"]
-    when true then puts "true"
-    when false then puts "false"
-    else abort "review.auto must be boolean"
-    end
-  ' "$config_path" || return 2
-}
-```
-
-It reads only global `review.auto`, prints compatibility `true` when the file/key is absent, and exits 2 for a non-map structure or any present non-Boolean value. Per-workflow `auto` remains owned by automation callers and is not recomputed by this helper.
+The target host has Node but no Ruby or `yq`. Implement `jhw_pr_global_auto_enabled` as a dependency-free bounded Node parser embedded in `pr-review-mode-contract`. It accepts only a top-level block mapping named `review` and a direct-child unquoted scalar `auto: true|false`. A missing file, `review`, or `review.auto` prints compatibility `true`; symlinks, tabs in indentation, duplicate keys, quoted/inline `review`, nested `auto`, and any present non-Boolean value exit 2. Per-workflow `auto` remains owned by automation callers and is not recomputed by this helper.
 
 Add `--review` and `--no-review` to frontmatter, argument table, flow and receipts. Change all documented and executable `--max-rounds` defaults from `3` to `5`; keep a positive-integer per-run override.
 

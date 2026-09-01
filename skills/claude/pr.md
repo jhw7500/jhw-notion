@@ -1,6 +1,6 @@
 ---
-description: "--merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix)"
-argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--reviewers a,b] [--timeout <min>] [--max-rounds <n>] [--block-on must-fix|should-fix]"
+description: "--review 리뷰요청 · --no-review 리뷰생략 · --merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix)"
+argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--reviewers a,b] [--timeout <min>] [--max-rounds <n>] [--block-on must-fix|should-fix]"
 ---
 
 # /jhw:pr — PR 생성 + 리뷰 라운드 모니터링 + 조건부 머지
@@ -42,13 +42,15 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 
 | 옵션 | 역할 | 기본값 |
 |---|---|---|
+| `--review` | 현재 PR head의 AI 리뷰를 명시적으로 요청 | 저장소 설정 |
+| `--no-review` | `review:skip`을 적용하고 AI 요청·대기를 생략 | 저장소 설정 |
 | `--merge` | 머지 게이트 충족 시 자동 머지(+브랜치 삭제). 없으면 모니터링·보고만 | off (보고만) |
 | `--target[=<cmd>]` | 타겟 장치 검증을 머지 게이트에 추가(리뷰와 병렬). PASS여야 머지 | off |
 | `--auto-fix` | actionable 지적을 고쳐 재푸시 → 재리뷰 라운드 반복 | off (보고만) |
 | `--base <branch>` | PR 대상(base) 브랜치 | `main` |
 | `--reviewers <list>` | 대기할 리뷰어 부분집합 (예: `codex,gemini-assist`) | 감지된 전체 채널 |
 | `--timeout <min>` | **한 라운드**의 폴링 최대 대기 (간격 ~60s) | 20분 |
-| `--max-rounds <n>` | `--auto-fix` 재리뷰 라운드 상한 | 3 |
+| `--max-rounds <n>` | `--auto-fix` 재리뷰 라운드 상한 | 5 |
 
 각 옵션 상세:
 
@@ -58,21 +60,268 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
   2. 값 없이 `--target` → 리포의 `.jhw/ship-target.sh` 실행 (있으면; `bash`로 실행해 +x 비의존)
   3. 둘 다 없으면 사용자에게 1회 질의 후 `.jhw/ship-target.sh`로 저장 제안 (실행 비트 +x 포함해 생성)
   - **exit 0 = PASS**(게이트 통과), 비0 = FAIL(머지 차단·보고). 리뷰 라운드와 **병렬** 실행.
-- `--auto-fix` — actionable 지적을 고쳐 재푸시 → **재리뷰 라운드 반복**(기본 **최대 3라운드**, `--max-rounds`로 조정). 기본 off(모니터+보고만). N라운드 후에도 FEEDBACK이면 보고하고 머지 안 함.
+- `--review` — `review:request`만 적용해 현재 head 리뷰를 명시적으로 요청. `--no-review`와 함께 쓸 수 없다.
+- `--no-review` — `review:skip`만 적용하고 AI 요청·AI 대기를 생략. `--review`와 함께 쓸 수 없다.
+- 두 옵션 생략 — 두 override 라벨을 제거하고 저장소 설정을 따른다. 현재 이 저장소는 Claude/Gemini `auto: true`이고 전역 `review.auto`가 없어 호환 기본값을 포함해 review-on이다.
+- `--auto-fix` — actionable 지적을 고쳐 재푸시 → **재리뷰 라운드 반복**(기본 **최대 5라운드**, `--max-rounds`로 조정). 기본 off(모니터+보고만). N라운드 후에도 FEEDBACK이면 보고하고 머지 안 함.
 - `--base <branch>` — PR base. 기본 `main`(리포 기본 브랜치).
 - `--reviewers <list>` — 대기할 리뷰어 부분집합(예: `codex,gemini-assist`). 기본 전체.
 - `--timeout <min>` — **한 라운드**의 폴링 최대 대기. 기본 20분, 폴링 간격 ~60s.
-- `--max-rounds <n>` — `--auto-fix` 시 재리뷰 라운드 상한(기본 3). `--timeout`이 한 라운드 한도라면, 이 값은 라운드 수를 제한.
+- `--max-rounds <n>` — `--auto-fix` 시 재리뷰 라운드 상한(기본 5). `--timeout`이 한 라운드 한도라면, 이 값은 라운드 수를 제한.
 - `--block-on <severity>` — CLEAN 판정의 **블로킹 심각도 임계**(기본 `must-fix`). 이 미만 지적(should-fix/minor/nit 등)은 보고만 하고 머지/종료를 막지 않는다. `should-fix`로 올리면 더 엄격.
+
+## 리뷰 mode·라벨·event ordering 실행 계약
+
+이 블록은 모든 GitHub mutation 전에 mode를 확정하고, 고정 라벨을 review-triggering event보다 먼저
+검증한다. 생성 전제 mutation은 누락된 라벨 정의 생성뿐이며 기존 라벨의 색·설명은 바꾸지 않는다.
+
+<!-- pr-review-mode-contract:begin -->
+```bash
+JHW_REVIEW_REQUEST_LABEL='review:request'
+JHW_REVIEW_SKIP_LABEL='review:skip'
+JHW_REVIEW_REQUEST_COLOR='0E8A16'
+JHW_REVIEW_SKIP_COLOR='B60205'
+JHW_REVIEW_REQUEST_DESCRIPTION='Explicitly request AI review'
+JHW_REVIEW_SKIP_DESCRIPTION='Explicitly skip AI review'
+
+jhw_pr_review_mode_from_args() {
+  local arg saw_review=0 saw_no_review=0
+  for arg in "$@"; do
+    case "$arg" in
+      --review) saw_review=1 ;;
+      --no-review) saw_no_review=1 ;;
+    esac
+  done
+  (( saw_review == 0 || saw_no_review == 0 )) || {
+    echo "--review and --no-review are mutually exclusive" >&2
+    return 2
+  }
+  (( saw_review == 1 )) && { printf 'request\n'; return; }
+  (( saw_no_review == 1 )) && { printf 'skip\n'; return; }
+  printf 'auto\n'
+}
+
+jhw_pr_merge_ai_policy_from_args() {
+  local arg mode saw_merge=0
+  mode="$(jhw_pr_review_mode_from_args "$@")" || return
+  for arg in "$@"; do
+    [[ "$arg" == --merge ]] && saw_merge=1
+  done
+  (( saw_merge == 1 )) || { printf 'no-merge\n'; return; }
+  printf '%s\n' "$mode"
+}
+
+jhw_pr_skip_merge_receipt() {
+  printf '%s\n' 'AI review: explicitly skipped (--no-review; review:skip)'
+}
+
+jhw_pr_max_rounds_from_args() {
+  local value=5 saw=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --max-rounds)
+        (( saw == 0 && $# >= 2 )) || { echo "invalid --max-rounds" >&2; return 2; }
+        saw=1
+        value="$2"
+        shift 2
+        continue
+        ;;
+      --max-rounds=*)
+        (( saw == 0 )) || { echo "duplicate --max-rounds" >&2; return 2; }
+        saw=1
+        value="${1#--max-rounds=}"
+        ;;
+    esac
+    shift
+  done
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "invalid --max-rounds" >&2; return 2; }
+  printf '%s\n' "$value"
+}
+
+jhw_pr_global_auto_enabled() {
+  local config_path="${1:-.github/workflow-config.yml}"
+  if [[ ! -e "$config_path" ]]; then
+    printf 'true\n'
+    return
+  fi
+  [[ -f "$config_path" && ! -L "$config_path" ]] || {
+    echo "workflow config must be a regular file" >&2
+    return 2
+  }
+  node - "$config_path" <<'NODE'
+const fs = require("node:fs");
+const path = process.argv[2];
+const fail = (message) => { process.stderr.write(message + "\n"); process.exit(2); };
+let text;
+try {
+  text = fs.readFileSync(path, "utf8").replace(/^\uFEFF/, "");
+} catch {
+  fail("workflow config read failed");
+}
+let seenReview = false;
+let inReview = false;
+let childIndent = null;
+let seenAuto = false;
+let autoValue = null;
+for (const rawLine of text.split(/\r?\n/)) {
+  if (/\t/.test(rawLine.match(/^\s*/)?.[0] || "")) fail("workflow config tabs are unsupported");
+  const trimmed = rawLine.trim();
+  if (trimmed === "" || trimmed.startsWith("#")) continue;
+  const indent = rawLine.length - rawLine.trimStart().length;
+  if (indent === 0) {
+    inReview = false;
+    childIndent = null;
+    const top = trimmed.match(/^([A-Za-z0-9_.-]+)\s*:(.*)$/);
+    if (!top) {
+      if (/^["']review["']\s*:/.test(trimmed)) fail("quoted review key is unsupported");
+      continue;
+    }
+    if (top[1] !== "review") continue;
+    if (seenReview) fail("duplicate review key");
+    seenReview = true;
+    if (top[2].replace(/\s+#.*$/, "").trim() !== "") fail("inline review mapping is unsupported");
+    inReview = true;
+    continue;
+  }
+  if (!inReview) continue;
+  if (childIndent === null) childIndent = indent;
+  if (indent !== childIndent) continue;
+  const child = trimmed.match(/^([A-Za-z0-9_.-]+)\s*:(.*)$/);
+  if (!child || child[1] !== "auto") continue;
+  if (seenAuto) fail("duplicate review.auto key");
+  seenAuto = true;
+  const value = child[2].replace(/\s+#.*$/, "").trim();
+  if (value !== "true" && value !== "false") fail("review.auto must be boolean");
+  autoValue = value;
+}
+process.stdout.write((seenAuto ? autoValue : "true") + "\n");
+NODE
+}
+
+jhw_pr_validate_context() {
+  [[ "${REPO_NWO:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+    echo "invalid REPO_NWO" >&2
+    return 2
+  }
+}
+
+jhw_pr_require_write_permission() {
+  local permission
+  jhw_pr_validate_context || return
+  permission="$(gh repo view "$REPO_NWO" --json viewerPermission -q .viewerPermission)" || return 1
+  case "$permission" in
+    ADMIN|MAINTAIN|WRITE) ;;
+    *) echo "repository write permission required" >&2; return 1 ;;
+  esac
+}
+
+jhw_pr_ensure_review_labels() {
+  local labels
+  jhw_pr_validate_context || return
+  labels="$(gh label list --repo "$REPO_NWO" --limit 1000 --json name --jq '.[].name')" || return 1
+  if ! grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels"; then
+    gh label create "$JHW_REVIEW_REQUEST_LABEL" --repo "$REPO_NWO" \
+      --color "$JHW_REVIEW_REQUEST_COLOR" --description "$JHW_REVIEW_REQUEST_DESCRIPTION" >/dev/null || return 1
+  fi
+  if ! grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels"; then
+    gh label create "$JHW_REVIEW_SKIP_LABEL" --repo "$REPO_NWO" \
+      --color "$JHW_REVIEW_SKIP_COLOR" --description "$JHW_REVIEW_SKIP_DESCRIPTION" >/dev/null || return 1
+  fi
+}
+
+jhw_pr_reconcile_review_labels() {
+  local mode="$1" labels
+  [[ "${PR:-}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2; }
+  labels="$(gh pr view "$PR" --repo "$REPO_NWO" --json labels --jq '.labels[].name')" || return 1
+  case "$mode" in
+    request)
+      grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels" &&
+        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null
+      grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels" ||
+        gh pr edit "$PR" --repo "$REPO_NWO" --add-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null
+      ;;
+    skip)
+      grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels" &&
+        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null
+      grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels" ||
+        gh pr edit "$PR" --repo "$REPO_NWO" --add-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null
+      ;;
+    auto)
+      grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels" &&
+        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_REQUEST_LABEL" >/dev/null
+      grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels" &&
+        gh pr edit "$PR" --repo "$REPO_NWO" --remove-label "$JHW_REVIEW_SKIP_LABEL" >/dev/null
+      ;;
+    *) echo "invalid review mode" >&2; return 2 ;;
+  esac
+}
+
+jhw_pr_verify_remote_policy() {
+  local mode="$1" expected_head="$2" labels actual_head has_request=0 has_skip=0
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid expected head" >&2; return 2; }
+  labels="$(gh pr view "$PR" --repo "$REPO_NWO" --json labels --jq '.labels[].name')" || return 1
+  grep -Fqx -- "$JHW_REVIEW_REQUEST_LABEL" <<<"$labels" && has_request=1
+  grep -Fqx -- "$JHW_REVIEW_SKIP_LABEL" <<<"$labels" && has_skip=1
+  (( has_request == 0 || has_skip == 0 )) || { echo "conflicting review labels" >&2; return 1; }
+  case "$mode" in
+    request) (( has_request == 1 && has_skip == 0 )) || { echo "request policy verification failed" >&2; return 1; } ;;
+    skip) (( has_request == 0 && has_skip == 1 )) || { echo "skip policy verification failed" >&2; return 1; } ;;
+    auto) (( has_request == 0 && has_skip == 0 )) || { echo "auto policy verification failed" >&2; return 1; } ;;
+    *) echo "invalid review mode" >&2; return 2 ;;
+  esac
+  actual_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
+  [[ "$actual_head" == "$expected_head" ]] || { echo "remote PR head mismatch" >&2; return 1; }
+}
+
+jhw_pr_apply_new_pr_policy() {
+  local mode="$1" local_head draft
+  case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
+  jhw_pr_require_write_permission || return
+  jhw_pr_ensure_review_labels || return
+  git push -u origin HEAD || return 1
+  local_head="$(git rev-parse HEAD)" || return 1
+  [[ "$local_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid local head" >&2; return 2; }
+  gh pr create --repo "$REPO_NWO" --base "${JHW_PR_BASE:-main}" --draft >/dev/null || return 1
+  PR="$(gh pr view --repo "$REPO_NWO" --json number --jq .number)" || return 1
+  [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid created PR" >&2; return 1; }
+  jhw_pr_reconcile_review_labels "$mode" || return
+  jhw_pr_verify_remote_policy "$mode" "$local_head" || return
+  draft="$(gh pr view "$PR" --repo "$REPO_NWO" --json isDraft --jq .isDraft)" || return 1
+  [[ "$draft" == true ]] || { echo "new PR left draft before policy verification" >&2; return 1; }
+  gh pr ready "$PR" --repo "$REPO_NWO" >/dev/null || return 1
+}
+
+jhw_pr_apply_existing_pr_policy() {
+  local mode="$1" expected_local_head="$2" remote_head actual_local_head
+  case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
+  [[ "${PR:-}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2; }
+  [[ "$expected_local_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid local head" >&2; return 2; }
+  jhw_pr_require_write_permission || return
+  jhw_pr_ensure_review_labels || return
+  remote_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
+  [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid remote head" >&2; return 1; }
+  jhw_pr_reconcile_review_labels "$mode" || return
+  jhw_pr_verify_remote_policy "$mode" "$remote_head" || return
+  git push -u origin HEAD || return 1
+  actual_local_head="$(git rev-parse HEAD)" || return 1
+  [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed during push" >&2; return 1; }
+  jhw_pr_verify_remote_policy "$mode" "$expected_local_head" || return
+}
+```
+<!-- pr-review-mode-contract:end -->
 
 ## 동작 순서
 
 1. **사전 점검**
+   - 첫 mutation 전에 `jhw_pr_review_mode_from_args "$@"`로 `request|skip|auto`를 확정한다. `--review --no-review`는 즉시 실패한다.
+   - write permission과 고정 라벨 정의를 확인한다. 누락 라벨 생성 외에는 아직 변경하지 않는다.
    - `git status` — 커밋되지 않은 변경 있으면 먼저 커밋(없으면 "변경 없음" 중단)
    - 현재 브랜치가 base(`main`)이면 **브랜치 생성 후** 진행 (전역 규칙: 기본 브랜치 직접 PR 금지)
    - `REPO_NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # Owner/Repo (nameWithOwner)`
 2. **PR 생성 또는 감지**
-   - `gh pr view --json number,url` 로 현재 브랜치 PR 확인. 없으면 `gh pr create --base <base>` (push 선행)
+   - 새 PR: push → `gh pr create --draft` → mode 라벨 reconcile/read-back → head/draft 검증 → ready 순서다.
+   - 기존 PR의 새 head: mode 라벨 reconcile/read-back → push → 새 원격 head 검증 순서다.
+   - 같은 head의 명시적 `request`는 Task 3의 head별 idempotent 요청 계약을 사용한다.
    - `PR=<번호>`, `SHA="$(git rev-parse HEAD)"` (push 후 기준 — 재푸시마다 갱신)
 3. **병렬 게이트 시작**
    - (a) **리뷰 라운드 모니터링** (아래 구현)
@@ -83,8 +332,9 @@ argument-hint: "[--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--r
 5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다.
 6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. **push 직전에** `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 캡처하고 재푸시 → 성공 직후 `ROUND_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"` 캡처 → **`ROUND_HEAD="$(git rev-parse HEAD)"` 및 `SHA="$ROUND_HEAD"` 재계산** → 아래 라운드 계약 실행 → 4로 복귀한다. `ROUND_STARTED_AT`은 run 필터 경계이고, 180초 생성 유예는 느린 push 시간을 제외하도록 `ROUND_PUSHED_AT`부터 잰다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 3) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
 7. **머지 게이트** — `--merge` AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) → `gh pr merge $PR --merge --delete-branch`
+   - 명시적 `--no-review --merge`에서는 AI gate만 면제한다. required CI, 타겟, 현재 head, mergeability와 merge method 검증은 그대로 유지하고 `AI review: explicitly skipped (--no-review; review:skip)` receipt를 남긴다.
    - 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT}` 중 하나이거나 타겟 `FAIL`이면 **머지하지 않고** 보고
-   - **루프는 반드시 종료**: (a) 전원 CLEAN(블로킹 0) → 머지/종료, (b) `--max-rounds` 도달 → 남은 블로킹 보고 후 종료, (c) 트리거 유예 만료 → TRIGGER_FAILED 보고, (d) `--timeout` → 시작 후 미응답 TIMEOUT 보고. 종료 조건이 "지적 0건"이 아니라 "블로킹 0건"이라 nit 무한생성에도 끝난다.
+   - **루프는 반드시 종료**: (a) 전원 CLEAN(블로킹 0) → 머지/종료, (b) `--max-rounds`(기본 5) 도달 → 남은 블로킹 보고 후 종료, (c) 트리거 유예 만료 → TRIGGER_FAILED 보고, (d) `--timeout` → 시작 후 미응답 TIMEOUT 보고. 종료 조건이 "지적 0건"이 아니라 "블로킹 0건"이라 nit 무한생성에도 끝난다.
    - 리포가 squash/rebase를 강제하면 `--merge` 대신 `--squash`/`--rebase` 사용 (`gh repo view --json mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed`로 감지)
 8. **보고** — 리뷰어별 상태 표 + 타겟 결과 + 머지 결과/URL (각 봇 지적은 요약 표로)
 
