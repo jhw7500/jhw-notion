@@ -266,28 +266,46 @@ jhw_issue_discover_reviewers() {
   fi
 }
 
+jhw_issue_unavailable_reviewers() {
+  local mode="$1" auto_enabled="$2" eligible="$3" reviewer
+  case "$mode" in request|skip|auto) ;; *) return 2 ;; esac
+  case "$auto_enabled" in true|false) ;; *) return 2 ;; esac
+  [[ "$mode" == request || ( "$mode" == auto && "$auto_enabled" == true ) ]] || return 0
+  for reviewer in claude gemini codex; do
+    if ! grep -Fqx -- "$reviewer" <<<"$eligible"; then
+      printf '%s\n' "$reviewer"
+    fi
+  done
+}
+
 jhw_issue_reconcile_and_verify_policy() {
   local issue="$1" mode="$2" labels has_request=0 has_skip=0
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
   labels="$(gh issue view "$issue" --repo "$REPO_NWO" --json labels --jq '.labels[].name')" || return 1
   case "$mode" in
     request)
-      grep -Fqx -- "$JHW_ISSUE_REVIEW_SKIP_LABEL" <<<"$labels" &&
-        gh issue edit "$issue" --repo "$REPO_NWO" --remove-label "$JHW_ISSUE_REVIEW_SKIP_LABEL" >/dev/null
-      grep -Fqx -- "$JHW_ISSUE_REVIEW_REQUEST_LABEL" <<<"$labels" ||
-        gh issue edit "$issue" --repo "$REPO_NWO" --add-label "$JHW_ISSUE_REVIEW_REQUEST_LABEL" >/dev/null
+      if grep -Fqx -- "$JHW_ISSUE_REVIEW_SKIP_LABEL" <<<"$labels"; then
+        gh issue edit "$issue" --repo "$REPO_NWO" --remove-label "$JHW_ISSUE_REVIEW_SKIP_LABEL" >/dev/null || return 1
+      fi
+      if ! grep -Fqx -- "$JHW_ISSUE_REVIEW_REQUEST_LABEL" <<<"$labels"; then
+        gh issue edit "$issue" --repo "$REPO_NWO" --add-label "$JHW_ISSUE_REVIEW_REQUEST_LABEL" >/dev/null || return 1
+      fi
       ;;
     skip)
-      grep -Fqx -- "$JHW_ISSUE_REVIEW_REQUEST_LABEL" <<<"$labels" &&
-        gh issue edit "$issue" --repo "$REPO_NWO" --remove-label "$JHW_ISSUE_REVIEW_REQUEST_LABEL" >/dev/null
-      grep -Fqx -- "$JHW_ISSUE_REVIEW_SKIP_LABEL" <<<"$labels" ||
-        gh issue edit "$issue" --repo "$REPO_NWO" --add-label "$JHW_ISSUE_REVIEW_SKIP_LABEL" >/dev/null
+      if grep -Fqx -- "$JHW_ISSUE_REVIEW_REQUEST_LABEL" <<<"$labels"; then
+        gh issue edit "$issue" --repo "$REPO_NWO" --remove-label "$JHW_ISSUE_REVIEW_REQUEST_LABEL" >/dev/null || return 1
+      fi
+      if ! grep -Fqx -- "$JHW_ISSUE_REVIEW_SKIP_LABEL" <<<"$labels"; then
+        gh issue edit "$issue" --repo "$REPO_NWO" --add-label "$JHW_ISSUE_REVIEW_SKIP_LABEL" >/dev/null || return 1
+      fi
       ;;
     auto)
-      grep -Fqx -- "$JHW_ISSUE_REVIEW_REQUEST_LABEL" <<<"$labels" &&
-        gh issue edit "$issue" --repo "$REPO_NWO" --remove-label "$JHW_ISSUE_REVIEW_REQUEST_LABEL" >/dev/null
-      grep -Fqx -- "$JHW_ISSUE_REVIEW_SKIP_LABEL" <<<"$labels" &&
-        gh issue edit "$issue" --repo "$REPO_NWO" --remove-label "$JHW_ISSUE_REVIEW_SKIP_LABEL" >/dev/null
+      if grep -Fqx -- "$JHW_ISSUE_REVIEW_REQUEST_LABEL" <<<"$labels"; then
+        gh issue edit "$issue" --repo "$REPO_NWO" --remove-label "$JHW_ISSUE_REVIEW_REQUEST_LABEL" >/dev/null || return 1
+      fi
+      if grep -Fqx -- "$JHW_ISSUE_REVIEW_SKIP_LABEL" <<<"$labels"; then
+        gh issue edit "$issue" --repo "$REPO_NWO" --remove-label "$JHW_ISSUE_REVIEW_SKIP_LABEL" >/dev/null || return 1
+      fi
       ;;
     *) return 2 ;;
   esac
@@ -300,6 +318,7 @@ jhw_issue_reconcile_and_verify_policy() {
     skip) (( has_request == 0 && has_skip == 1 )) || return 1 ;;
     auto) (( has_request == 0 && has_skip == 0 )) || return 1 ;;
   esac
+  return 0
 }
 
 jhw_issue_request_reviewer() {
@@ -350,7 +369,14 @@ $marker"
 
 jhw_issue_create() {
   local title="$1" body="$2" mode="$3" timeout="$4"
-  local auto_enabled=false reviewers issue_url issue request_id reviewer
+  local auto_enabled=false reviewers unavailable issue_url issue issue_created_at request_id reviewer
+  JHW_ISSUE_NUMBER=''
+  JHW_ISSUE_URL=''
+  JHW_ISSUE_CREATED_AT=''
+  JHW_ISSUE_REQUESTED_REVIEWERS=''
+  JHW_ISSUE_UNAVAILABLE_REVIEWERS=''
+  JHW_ISSUE_REQUEST_RECORDS=''
+  JHW_ISSUE_REQUEST_FAILURES=''
   [[ -n "${title//[[:space:]]/}" ]] || { echo "Issue title is required" >&2; return 2; }
   [[ -n "${body//[[:space:]]/}" ]] || { echo "Issue body is required" >&2; return 2; }
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
@@ -365,6 +391,7 @@ jhw_issue_create() {
     auto_enabled=true
   fi
   reviewers="$(jhw_issue_discover_reviewers "$mode" "$auto_enabled")" || return
+  unavailable="$(jhw_issue_unavailable_reviewers "$mode" "$auto_enabled" "$reviewers")" || return
   if [[ "$mode" == request && -z "$reviewers" ]]; then
     echo "no eligible Issue reviewer" >&2
     return 1
@@ -372,15 +399,29 @@ jhw_issue_create() {
   issue_url="$(gh issue create --repo "$REPO_NWO" --title "$title" --body "$body")" || return 1
   issue="$(gh issue view "$issue_url" --repo "$REPO_NWO" --json number --jq .number)" || return 1
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || { echo "invalid created Issue" >&2; return 1; }
+  issue_created_at="$(gh issue view "$issue" --repo "$REPO_NWO" --json createdAt --jq .createdAt)" || return 1
+  jhw_issue_is_utc_timestamp "$issue_created_at" || { echo "invalid created Issue timestamp" >&2; return 1; }
+  JHW_ISSUE_NUMBER="$issue"
+  JHW_ISSUE_URL="$issue_url"
+  JHW_ISSUE_CREATED_AT="$issue_created_at"
+  JHW_ISSUE_REQUESTED_REVIEWERS="$reviewers"
+  JHW_ISSUE_UNAVAILABLE_REVIEWERS="$unavailable"
+  printf '%s\n' "$issue_url"
   jhw_issue_reconcile_and_verify_policy "$issue" "$mode" || return
   if [[ -n "$reviewers" ]]; then
     while IFS= read -r reviewer; do
       [[ -n "$reviewer" ]] || continue
-      request_id="$(jhw_issue_request_reviewer "$issue" "$reviewer")" || return
-      [[ "$request_id" =~ ^[1-9][0-9]*$ ]] || return 1
+      if request_id="$(jhw_issue_request_reviewer "$issue" "$reviewer")" &&
+        [[ "$request_id" =~ ^[1-9][0-9]*$ ]]; then
+        [[ -z "$JHW_ISSUE_REQUEST_RECORDS" ]] || JHW_ISSUE_REQUEST_RECORDS+=$'\n'
+        JHW_ISSUE_REQUEST_RECORDS+="$reviewer"$'\t'"$request_id"
+      else
+        [[ -z "$JHW_ISSUE_REQUEST_FAILURES" ]] || JHW_ISSUE_REQUEST_FAILURES+=$'\n'
+        JHW_ISSUE_REQUEST_FAILURES+="$reviewer"$'\t'request_failed
+      fi
     done <<<"$reviewers"
   fi
-  printf '%s\n' "$issue_url"
+  return 0
 }
 ```
 <!-- issue-review-create-contract:end -->
@@ -479,11 +520,11 @@ jhw_issue_classify_reviewer() {
   case "$eligible" in true|false) ;; *) return 2 ;; esac
   case "$reviewer" in
     claude)
-      expected_bot="${JHW_ISSUE_EXPECTED_CLAUDE_BOT:-claude-review[bot]}"
+      expected_bot="${JHW_ISSUE_EXPECTED_CLAUDE_BOT-}"
       workflow_name='Claude Code'
       ;;
     gemini)
-      expected_bot="${JHW_ISSUE_EXPECTED_GEMINI_BOT:-gemini-review[bot]}"
+      expected_bot="${JHW_ISSUE_EXPECTED_GEMINI_BOT-}"
       workflow_name='Gemini Dispatch'
       ;;
     codex)
@@ -492,7 +533,7 @@ jhw_issue_classify_reviewer() {
       ;;
     *) return 2 ;;
   esac
-  [[ "$expected_bot" =~ ^[A-Za-z0-9_.-]+(\[bot\])?$ ]] || return 2
+  [[ -z "$expected_bot" || "$expected_bot" =~ ^[A-Za-z0-9_.-]+(\[bot\])?$ ]] || return 2
   result="$(node - "$reviewer" "$now_epoch" "$trigger_deadline" "$review_deadline" \
     "$expected_bot" "$workflow_name" "$eligible" <<'NODE'
 const [reviewer, nowRaw, triggerRaw, reviewRaw, expectedBot, workflowName, eligibleRaw] = process.argv.slice(2);
@@ -534,10 +575,32 @@ const later = (value) => {
   const parsed = epoch(value);
   return parsed !== null && parsed > requestEpoch && parsed >= issueEpoch;
 };
-const comments = snapshot.comments.filter((comment) =>
-  comment.actor === expectedBot && later(comment.created_at));
-const reactions = snapshot.reactions.filter((reaction) =>
-  reaction.actor === expectedBot && later(reaction.created_at));
+const laterBotComments = snapshot.comments.filter((comment) =>
+  comment.actor_type === "Bot" && later(comment.created_at));
+let effectiveBot = expectedBot;
+let acknowledgments = [];
+if (!effectiveBot && reviewer === "claude") {
+  const signed = laterBotComments.filter((comment) =>
+    /^\*\*Claude (?:finished|encountered an error)\b/.test(comment.body || ""));
+  const identities = [...new Set(signed.map((comment) => comment.actor))];
+  if (identities.length > 1) emit("FAILED", "", "ambiguous_bot_identity");
+  if (identities.length === 1) effectiveBot = identities[0];
+}
+if (!effectiveBot && reviewer === "gemini") {
+  acknowledgments = laterBotComments.filter((comment) =>
+    /^## 🤖 Gemini CLI \(명령어 기반\)/.test(comment.body || "") &&
+    /received your request/i.test(comment.body || ""));
+  const identities = [...new Set(acknowledgments.map((comment) => comment.actor))];
+  if (identities.length > 1) emit("FAILED", "", "ambiguous_bot_identity");
+  if (identities.length === 1) effectiveBot = identities[0];
+}
+const isGeminiAcknowledgment = (comment) => reviewer === "gemini" &&
+  /^## 🤖 Gemini CLI \(명령어 기반\)/.test(comment.body || "") &&
+  /received your request/i.test(comment.body || "");
+const comments = effectiveBot ? laterBotComments.filter((comment) =>
+  comment.actor === effectiveBot && !isGeminiAcknowledgment(comment)) : [];
+const reactions = effectiveBot ? snapshot.reactions.filter((reaction) =>
+  reaction.actor === effectiveBot && later(reaction.created_at)) : [];
 const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
   run.name === workflowName && run.event === "issue_comment" && later(run.created_at) &&
   run.display_title === snapshot.issue_title &&
@@ -548,14 +611,15 @@ if (failedRun) emit("FAILED", failedRun.url, "workflow_failed");
 const rejectedReaction = reactions.find((reaction) => ["-1", "confused"].includes(reaction.content));
 if (rejectedReaction) emit("FAILED", rejectedReaction.url, "connector_rejected");
 const rejectedComment = comments.find((comment) =>
-  /unable to review|cannot review|connector[^\n]*(?:reject|denied)|failed to (?:start|review)/i.test(comment.body || ""));
+  /Claude encountered an error|unable to (?:review|process)|cannot review|connector[^\n]*(?:reject|denied)|failed to (?:start|review)/i.test(comment.body || ""));
 if (rejectedComment) emit("FAILED", rejectedComment.url, "connector_rejected");
 const feedbackComment = comments.find((comment) =>
   /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i.test(comment.body || ""));
 if (feedbackComment) emit("FEEDBACK", feedbackComment.url, "actionable_feedback");
 if (comments.length > 0) emit("CLEAN", comments[0].url, "substantive_response");
 
-const acknowledged = reactions.some((reaction) => ["eyes", "+1", "heart"].includes(reaction.content)) ||
+const acknowledged = acknowledgments.length > 0 ||
+  reactions.some((reaction) => ["eyes", "+1", "heart"].includes(reaction.content)) ||
   runs.some((run) => ["queued", "in_progress", "completed"].includes(run.status));
 if (acknowledged && now >= reviewDeadline) emit("TIMEOUT", request.url, "review_timeout");
 if (!acknowledged && now >= triggerDeadline) emit("FAILED", request.url, "trigger_unacknowledged");
@@ -669,6 +733,223 @@ jhw_issue_cleanup_state_file() {
   [[ ! -e "$state_file" || -f "$state_file" ]] || return 1
   [[ -e "$state_file" ]] || return 0
   rm -f -- "$state_file"
+}
+
+jhw_issue_initialize_state_file() {
+  local state_file="$1"
+  [[ -n "${JHW_ISSUE_STATE_FILE:-}" && "$state_file" == "$JHW_ISSUE_STATE_FILE" ]] || return 2
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  JHW_ISSUE_INIT_NUMBER="$JHW_ISSUE_NUMBER" \
+  JHW_ISSUE_INIT_URL="$JHW_ISSUE_URL" \
+  JHW_ISSUE_INIT_CREATED_AT="$JHW_ISSUE_CREATED_AT" \
+  JHW_ISSUE_INIT_REQUESTED="$JHW_ISSUE_REQUESTED_REVIEWERS" \
+  JHW_ISSUE_INIT_UNAVAILABLE="$JHW_ISSUE_UNAVAILABLE_REVIEWERS" \
+  JHW_ISSUE_INIT_REQUESTS="$JHW_ISSUE_REQUEST_RECORDS" \
+  JHW_ISSUE_INIT_FAILURES="$JHW_ISSUE_REQUEST_FAILURES" \
+  node - "$state_file" <<'NODE'
+const fs = require("node:fs");
+const stateFile = process.argv[2];
+const fail = (message) => { process.stderr.write(message + "\n"); process.exit(1); };
+const reviewers = new Set(["claude", "gemini", "codex"]);
+const lines = (name) => (process.env[name] || "").split("\n").filter(Boolean);
+const uniqueReviewers = (name) => {
+  const values = lines(name);
+  if (values.some((value) => !reviewers.has(value)) || new Set(values).size !== values.length) {
+    fail(`invalid ${name}`);
+  }
+  return values;
+};
+const records = (name, valuePattern) => {
+  const result = new Map();
+  for (const line of lines(name)) {
+    const fields = line.split("\t");
+    if (fields.length !== 2 || !reviewers.has(fields[0]) || !valuePattern.test(fields[1]) || result.has(fields[0])) {
+      fail(`invalid ${name}`);
+    }
+    result.set(fields[0], fields[1]);
+  }
+  return result;
+};
+const issue = Number(process.env.JHW_ISSUE_INIT_NUMBER);
+const issueUrl = process.env.JHW_ISSUE_INIT_URL || "";
+const issueCreatedAt = process.env.JHW_ISSUE_INIT_CREATED_AT || "";
+if (!Number.isSafeInteger(issue) || issue <= 0) fail("invalid Issue number");
+if (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/issues\/[1-9][0-9]*$/.test(issueUrl)) fail("invalid Issue URL");
+if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(issueCreatedAt)) fail("invalid Issue timestamp");
+const requested = uniqueReviewers("JHW_ISSUE_INIT_REQUESTED");
+const unavailable = uniqueReviewers("JHW_ISSUE_INIT_UNAVAILABLE");
+if (requested.some((reviewer) => unavailable.includes(reviewer))) fail("reviewer plan overlap");
+const requestRecords = records("JHW_ISSUE_INIT_REQUESTS", /^[1-9][0-9]*$/);
+const failures = records("JHW_ISSUE_INIT_FAILURES", /^request_failed$/);
+for (const reviewer of requested) {
+  if (Number(requestRecords.has(reviewer)) + Number(failures.has(reviewer)) !== 1) {
+    fail("requested reviewer must have one request result");
+  }
+}
+if ([...requestRecords.keys(), ...failures.keys()].some((reviewer) => !requested.includes(reviewer))) {
+  fail("request result outside reviewer plan");
+}
+const results = requested.map((reviewer) => requestRecords.has(reviewer)
+  ? { reviewer, status: "PENDING", response: "", diagnostic: "awaiting_response" }
+  : { reviewer, status: "FAILED", response: "", diagnostic: "request_failed" });
+for (const reviewer of unavailable) {
+  results.push({ reviewer, status: "UNAVAILABLE", response: "", diagnostic: "preflight_unavailable" });
+}
+const state = {
+  issue,
+  issue_url: issueUrl,
+  issue_created_at: issueCreatedAt,
+  requested,
+  unavailable,
+  requests: [...requestRecords].map(([reviewer, id]) => ({ reviewer, id: Number(id) })),
+  results,
+};
+fs.writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+fs.chmodSync(stateFile, 0o600);
+NODE
+}
+
+jhw_issue_state_metadata() {
+  local state_file="$1"
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  node - "$state_file" <<'NODE'
+const fs = require("node:fs");
+const state = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (!Number.isSafeInteger(state.issue) || state.issue <= 0 ||
+    typeof state.issue_url !== "string" || typeof state.issue_created_at !== "string") process.exit(1);
+process.stdout.write(`${state.issue}\t${state.issue_url}\t${state.issue_created_at}\n`);
+NODE
+}
+
+jhw_issue_pending_requests() {
+  local state_file="$1"
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  node - "$state_file" <<'NODE'
+const fs = require("node:fs");
+const state = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (!Array.isArray(state.requests) || !Array.isArray(state.results)) process.exit(1);
+const statuses = new Map(state.results.map((item) => [item.reviewer, item.status]));
+for (const request of state.requests) {
+  if (statuses.get(request.reviewer) === "PENDING") {
+    process.stdout.write(`${request.reviewer}\t${request.id}\n`);
+  }
+}
+NODE
+}
+
+jhw_issue_update_result() {
+  local state_file="$1" reviewer="$2" status="$3" response="$4" diagnostic="$5"
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  node - "$state_file" "$reviewer" "$status" "$response" "$diagnostic" <<'NODE'
+const fs = require("node:fs");
+const [stateFile, reviewer, status, response, diagnostic] = process.argv.slice(2);
+const reviewers = new Set(["claude", "gemini", "codex"]);
+const statuses = new Set(["PENDING", "CLEAN", "FEEDBACK", "FAILED", "TIMEOUT"]);
+if (!reviewers.has(reviewer) || !statuses.has(status) || typeof response !== "string" || !diagnostic) process.exit(1);
+const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+if (!Array.isArray(state.requested) || !state.requested.includes(reviewer) || !Array.isArray(state.results)) process.exit(1);
+const matches = state.results.filter((item) => item.reviewer === reviewer);
+if (matches.length !== 1) process.exit(1);
+Object.assign(matches[0], { status, response, diagnostic });
+fs.writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+fs.chmodSync(stateFile, 0o600);
+NODE
+}
+
+jhw_issue_pending_count() {
+  local state_file="$1"
+  [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+  node - "$state_file" <<'NODE'
+const fs = require("node:fs");
+const state = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (!Array.isArray(state.results)) process.exit(1);
+process.stdout.write(String(state.results.filter((item) => item.status === "PENDING").length) + "\n");
+NODE
+}
+
+jhw_issue_fail_pending() {
+  local state_file="$1" diagnostic="$2" pending reviewer request_id
+  pending="$(jhw_issue_pending_requests "$state_file")" || return 1
+  while IFS=$'\t' read -r reviewer request_id; do
+    [[ -n "$reviewer" ]] || continue
+    jhw_issue_update_result "$state_file" "$reviewer" FAILED '' "$diagnostic" || return 1
+  done <<<"$pending"
+}
+
+jhw_issue_poll_once() {
+  local state_file="$1" trigger_deadline="$2" review_deadline="$3"
+  local metadata issue issue_url issue_created_at extra pending reviewer request_id snapshot now_epoch remaining
+  [[ "$trigger_deadline" =~ ^[0-9]+$ && "$review_deadline" =~ ^[0-9]+$ ]] || return 2
+  metadata="$(jhw_issue_state_metadata "$state_file")" || return 1
+  IFS=$'\t' read -r issue issue_url issue_created_at extra <<<"$metadata"
+  [[ "$issue" =~ ^[1-9][0-9]*$ && -n "$issue_url" && -n "$issue_created_at" && -z "$extra" ]] || return 1
+  now_epoch="${JHW_ISSUE_NOW_EPOCH:-$(date +%s)}"
+  [[ "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+  pending="$(jhw_issue_pending_requests "$state_file")" || return 1
+  while IFS=$'\t' read -r reviewer request_id; do
+    [[ -n "$reviewer" ]] || continue
+    if snapshot="$(jhw_issue_collect_signals "$issue" "$request_id" "$issue_created_at")"; then
+      export JHW_ISSUE_SIGNAL_JSON="$snapshot"
+      if jhw_issue_classify_reviewer "$reviewer" "$now_epoch" "$trigger_deadline" "$review_deadline" >/dev/null; then
+        jhw_issue_update_result "$state_file" "$reviewer" "$JHW_ISSUE_REVIEW_STATUS" \
+          "$JHW_ISSUE_REVIEW_RESPONSE" "$JHW_ISSUE_REVIEW_DIAGNOSTIC" || return 1
+      else
+        jhw_issue_update_result "$state_file" "$reviewer" FAILED '' classifier_failed || return 1
+      fi
+    else
+      jhw_issue_update_result "$state_file" "$reviewer" FAILED '' signal_collection_failed || return 1
+    fi
+  done <<<"$pending"
+  remaining="$(jhw_issue_pending_count "$state_file")" || return 1
+  [[ "$remaining" =~ ^[0-9]+$ ]] || return 1
+  (( remaining == 0 )) && return 0
+  return 3
+}
+
+jhw_issue_execute() {
+  local title="$1" body="$2" mode="$3" timeout="$4"
+  local start_epoch trigger_deadline review_deadline interval poll_status render_status=0
+  JHW_ISSUE_STATE_FILE="$(jhw_issue_create_state_file)" || return 1
+  export JHW_ISSUE_STATE_FILE
+  trap 'jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE" >/dev/null 2>&1 || true' EXIT
+  if ! jhw_issue_create "$title" "$body" "$mode" "$timeout"; then
+    jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE" >/dev/null 2>&1 || true
+    trap - EXIT
+    return 1
+  fi
+  jhw_issue_initialize_state_file "$JHW_ISSUE_STATE_FILE" || {
+    jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE" >/dev/null 2>&1 || true
+    trap - EXIT
+    return 1
+  }
+  start_epoch="$(date +%s)" || return 1
+  [[ "$start_epoch" =~ ^[0-9]+$ ]] || return 1
+  trigger_deadline=$(( start_epoch + 180 ))
+  review_deadline=$(( start_epoch + JHW_ISSUE_TIMEOUT_MIN * 60 ))
+  (( trigger_deadline <= review_deadline )) || trigger_deadline="$review_deadline"
+  interval="${JHW_ISSUE_POLL_SECONDS:-60}"
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] && (( interval <= 60 )) || return 2
+  while true; do
+    jhw_issue_poll_once "$JHW_ISSUE_STATE_FILE" "$trigger_deadline" "$review_deadline"
+    poll_status=$?
+    case "$poll_status" in
+      0) break ;;
+      3)
+        if ! sleep "$interval"; then
+          jhw_issue_fail_pending "$JHW_ISSUE_STATE_FILE" wait_failed || return 1
+          break
+        fi
+        ;;
+      *)
+        jhw_issue_fail_pending "$JHW_ISSUE_STATE_FILE" poll_failed || return 1
+        break
+        ;;
+    esac
+  done
+  jhw_issue_render_summary "$JHW_ISSUE_URL" "$JHW_ISSUE_STATE_FILE" || render_status=$?
+  jhw_issue_cleanup_state_file "$JHW_ISSUE_STATE_FILE" || render_status=1
+  trap - EXIT
+  return "$render_status"
 }
 ```
 <!-- issue-review-wait-contract:end -->

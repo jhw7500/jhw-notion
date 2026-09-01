@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync, lstatSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,7 @@ const codexIssueSkill = join(repoRoot, "skills", "codex", "jhw-issue", "SKILL.md
 const codexIssueReference = join(repoRoot, "skills", "codex", "jhw-issue", "references", "issue.md");
 const issueCreatedAt = "2026-09-01T00:00:00Z";
 const requestCreatedAt = "2026-09-01T00:01:00Z";
+const requestEpoch = Date.parse(requestCreatedAt) / 1000;
 
 function createContractBlock(markdown) {
   const match = markdown.match(
@@ -150,6 +151,8 @@ if (commentMatch) {
     const fieldIndex = argv.indexOf("-f");
     const bodyArg = fieldIndex >= 0 ? argv[fieldIndex + 1] : "";
     const body = bodyArg.startsWith("body=") ? bodyArg.slice(5) : "";
+    const requestedReviewer = body.match(/jhw-issue:review-request reviewer=([a-z-]+)/)?.[1] || "";
+    if ((state.failCommentReviewers || []).includes(requestedReviewer)) process.exit(1);
     const comment = {
       id: state.nextCommentId++,
       actor: state.actor,
@@ -268,6 +271,25 @@ process.stderr.write("unexpected fake gh command: " + argv.join(" ") + "\n");
 process.exit(2);
 `;
 
+const fakeDateSource = String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+if (process.argv.length === 3 && process.argv[2] === "+%s") {
+  process.stdout.write(fs.readFileSync(process.env.FAKE_DATE_EPOCH_FILE, "utf8").trim() + "\n");
+  process.exit(0);
+}
+process.exit(1);
+`;
+
+const fakeSleepSource = String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+const value = process.argv[2] || "";
+if (!/^[1-9][0-9]*$/.test(value)) process.exit(1);
+const seconds = Number(value);
+const current = Number(fs.readFileSync(process.env.FAKE_DATE_EPOCH_FILE, "utf8").trim());
+fs.writeFileSync(process.env.FAKE_DATE_EPOCH_FILE, String(current + seconds));
+fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(["sleep", value]) + "\n");
+`;
+
 function issueState(overrides = {}) {
   return {
     actor: "jhw7500",
@@ -288,6 +310,7 @@ function issueState(overrides = {}) {
     mutations: [],
     nextCommentId: 1001,
     failEndpoints: [],
+    failCommentReviewers: [],
     ...overrides,
   };
 }
@@ -316,22 +339,31 @@ async function main() {
     "the unsupported @gemini command must not be emitted");
   assert.match(issueText, /workflow_name='Claude Code'/);
   assert.match(issueText, /workflow_name='Gemini Dispatch'/);
+  assert.match(issueText, /jhw_issue_execute\(\)/,
+    "the public Issue command must connect creation to bounded review waiting");
   assert.ok(existsSync(codexIssueSkill));
   assert.ok(lstatSync(codexIssueReference).isSymbolicLink());
   const contract = `${createContractBlock(issueText)}\n${waitContractBlock(issueText)}`;
 
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-issue-contract-"));
   const fakeGh = join(tempRoot, "gh");
+  const fakeDate = join(tempRoot, "date");
+  const fakeSleep = join(tempRoot, "sleep");
   const contractPath = join(tempRoot, "contract.bash");
   const statePath = join(tempRoot, "gh-state.json");
   const logPath = join(tempRoot, "gh-log.jsonl");
   const summaryStatePath = join(tempRoot, "jhw-issue.summary.state");
+  const nowEpochPath = join(tempRoot, "now-epoch");
   const fixtureRoot = join(tempRoot, "repo");
   const workflowDir = join(fixtureRoot, ".github", "workflows");
   const configPath = join(fixtureRoot, ".github", "workflow-config.yml");
 
   await writeFile(fakeGh, fakeGhSource);
   await chmod(fakeGh, 0o755);
+  await writeFile(fakeDate, fakeDateSource);
+  await chmod(fakeDate, 0o755);
+  await writeFile(fakeSleep, fakeSleepSource);
+  await chmod(fakeSleep, 0o755);
   await writeFile(contractPath, contract);
 
   async function setRepoFixture({ claude = false, gemini = false, config = "" } = {}) {
@@ -343,13 +375,16 @@ async function main() {
   }
 
   async function runIssue(state, commands, overrides = {}) {
+    const { FAKE_DATE_INITIAL_EPOCH = requestEpoch, ...envOverrides } = overrides;
     await writeFile(statePath, JSON.stringify(state, null, 2));
     await writeFile(logPath, "");
+    await writeFile(nowEpochPath, String(FAKE_DATE_INITIAL_EPOCH));
     const env = {
       ...process.env,
       PATH: `${tempRoot}:${process.env.PATH}`,
       FAKE_GH_STATE: statePath,
       FAKE_GH_LOG: logPath,
+      FAKE_DATE_EPOCH_FILE: nowEpochPath,
       REPO_NWO: "example/repo",
       JHW_ISSUE_REPO_ROOT: fixtureRoot,
       JHW_ISSUE_CONFIG_PATH: configPath,
@@ -357,7 +392,7 @@ async function main() {
       JHW_ISSUE_CODEX_CANARY_URL: "",
       JHW_ISSUE_STATE_DIR: tempRoot,
       JHW_ISSUE_STATE_FILE: summaryStatePath,
-      ...overrides,
+      ...envOverrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
     const result = await execFileAsync("bash", ["-c", script], { env, maxBuffer: 1024 * 1024 });
@@ -469,6 +504,13 @@ async function main() {
     );
     assert.deepEqual(autoDisabled.state.issueLabels, []);
     assert.equal(autoDisabled.state.issueComments.length, 0);
+
+    const autoNoLabels = await runIssue(
+      issueState({ labels: ["review:request", "review:skip"] }),
+      `jhw_issue_create 'Auto no labels' 'Body text' auto 20`,
+    );
+    assert.deepEqual(autoNoLabels.state.issueLabels, [],
+      "auto mode must succeed when the new Issue has no override labels");
 
     await setRepoFixture({
       claude: true,
@@ -754,6 +796,60 @@ async function main() {
     );
     assert.equal(oldOrWrong.stdout.split("\n")[0], "PENDING");
 
+    const realClaudeSignature = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("**Claude finished @jhw7500's task in 1m** —— [View job](https://github.com/example/repo/actions/runs/700)\n\nNo blocking findings.", {
+            actor: "claude[bot]",
+          }),
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+      { JHW_ISSUE_EXPECTED_CLAUDE_BOT: "" },
+    );
+    assert.equal(realClaudeSignature.stdout.split("\n")[0], "CLEAN",
+      "Claude bot identity must be derived from the pinned caller's signed response shape");
+
+    const geminiRequestComment = {
+      ...requestComment,
+      body: "@gemini-cli 이 이슈의 요구사항·누락 조건·구현 위험을 검토해 주세요.\n<!-- jhw-issue:review-request reviewer=gemini -->",
+    };
+    const geminiAck = response("## 🤖 Gemini CLI (명령어 기반)\n\nHi @jhw7500, I've received your request, and I'm working on it now!", {
+      id: 1101,
+      actor: "custom-gemini-app[bot]",
+      createdAt: "2026-09-01T00:01:30Z",
+    });
+    const geminiFinal = response("The requirements are complete; no blockers found.", {
+      id: 1102,
+      actor: "custom-gemini-app[bot]",
+    });
+    const dynamicGemini = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [geminiRequestComment, geminiAck, geminiFinal],
+      }),
+      "gemini",
+      triggerDeadline - 1,
+      { JHW_ISSUE_EXPECTED_GEMINI_BOT: "" },
+    );
+    assert.equal(dynamicGemini.stdout.split("\n")[0], "CLEAN",
+      "Gemini response identity must be pinned to the bot that emitted the exact dispatcher acknowledgment");
+
+    const wrongGeminiActor = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [geminiRequestComment, geminiAck, { ...geminiFinal, actor: "other-bot[bot]" }],
+      }),
+      "gemini",
+      triggerDeadline - 1,
+      { JHW_ISSUE_EXPECTED_GEMINI_BOT: "" },
+    );
+    assert.equal(wrongGeminiActor.stdout.split("\n")[0], "PENDING",
+      "a different bot cannot satisfy a Gemini request after actor pinning");
+
     const secondPageResponse = response("Requirements are complete; no blocking risks.");
     const paginated = await classify(
       issueState({
@@ -766,6 +862,95 @@ async function main() {
     );
     assert.equal(paginated.stdout.split("\n")[0], "CLEAN",
       "paginated comment arrays must be flattened before JSON parsing");
+
+    await setRepoFixture({
+      claude: true,
+      gemini: true,
+      config: [
+        "review:",
+        "  auto: true",
+        "workflows:",
+        "  claude:",
+        "    enabled: true",
+        "  gemini-dispatch:",
+        "    enabled: true",
+        "",
+      ].join("\n"),
+    });
+    const executeResponses = [
+      response("No blocking requirements gaps.", { id: 2001, actor: "claude-review[bot]" }),
+      response("The proposal is complete and ready for implementation.", { id: 2002, actor: "gemini-review[bot]" }),
+    ];
+    const executed = await runIssue(
+      issueState({ issueComments: executeResponses }),
+      `jhw_issue_execute 'Review this' 'Body text' request 20`,
+      {
+        JHW_ISSUE_STATE_FILE: "",
+        JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]",
+        JHW_ISSUE_EXPECTED_GEMINI_BOT: "gemini-review[bot]",
+      },
+    );
+    assert.equal(executed.stdout.split("\n")[0], "https://github.com/example/repo/issues/99",
+      "the preserved Issue URL must be printed before review results");
+    assert.match(executed.stdout, /^Requested reviewers: claude, gemini$/m);
+    assert.match(executed.stdout, /^claude \| CLEAN \|/m);
+    assert.match(executed.stdout, /^gemini \| CLEAN \|/m);
+    assert.match(executed.stdout, /^codex \| UNAVAILABLE \|/m);
+    assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
+      "terminal execution must remove only its private state file");
+
+    const partial = await runIssue(
+      issueState({
+        issueComments: [response("No blocking requirements gaps.", {
+          id: 2101,
+          actor: "claude-review[bot]",
+        })],
+        failCommentReviewers: ["gemini"],
+      }),
+      `jhw_issue_execute 'Review this' 'Body text' request 20`,
+      {
+        JHW_ISSUE_STATE_FILE: "",
+        JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]",
+        JHW_ISSUE_EXPECTED_GEMINI_BOT: "gemini-review[bot]",
+      },
+    );
+    assert.equal(partial.stdout.split("\n")[0], "https://github.com/example/repo/issues/99");
+    assert.match(partial.stdout, /^claude \| CLEAN \|/m);
+    assert.match(partial.stdout, /^gemini \| FAILED \| - \| request_failed$/m);
+    assert.equal(partial.state.issueExists, true);
+    assert.equal(partial.state.mutations.filter((item) => item === "comment:post").length, 1,
+      "one reviewer request failure must not block another eligible reviewer");
+    assert.equal(partial.state.mutations.filter((item) => item === "issue:edit").length, 1,
+      "review failure must not edit the Issue beyond creation-time policy reconciliation");
+
+    await setRepoFixture({
+      claude: true,
+      config: "review:\n  auto: true\nworkflows:\n  claude:\n    enabled: true\n",
+    });
+    const timedExecution = await runIssue(
+      issueState({
+        runs: [{
+          id: 601,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "in_progress",
+          conclusion: "null",
+          createdAt: "2026-09-01T00:01:30Z",
+          url: "https://github.com/example/repo/actions/runs/601",
+          displayTitle: "Review this",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      `jhw_issue_execute 'Review this' 'Body text' request 1`,
+      {
+        JHW_ISSUE_STATE_FILE: "",
+        JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]",
+      },
+    );
+    assert.match(timedExecution.stdout, /^claude \| TIMEOUT \| .* \| review_timeout$/m);
+    assert.equal(timedExecution.log.filter((args) => args[0] === "sleep").length, 1,
+      "the bounded loop must poll once after a single 60-second interval");
 
     assert.equal(
       (await runIssue(issueState(), "jhw_issue_highest_disposition CLEAN FEEDBACK")).stdout.trim(),
