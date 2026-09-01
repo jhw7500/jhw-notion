@@ -1530,6 +1530,29 @@ async function main() {
     assert.equal((await readdir(tempRoot)).some((name) => /^jhw-issue\..*\.state$/.test(name)), false,
       "TERM must remove the private summary state alongside the active snapshot");
 
+    const corruptPollRecovery = await runIssueResult(
+      issueState(),
+      [
+        "jhw_issue_poll_once() { printf '{' > \"$1\"; return 1; }",
+        "jhw_issue_execute 'Review this' 'Body text' request 20",
+        "status=$?",
+        "if [[ -n \"${JHW_ISSUE_STATE_FILE:-}\" && ( -e \"$JHW_ISSUE_STATE_FILE\" || -L \"$JHW_ISSUE_STATE_FILE\" ) ]]; then echo state=present; else echo state=gone; fi",
+        "if [[ -n \"$(trap -p EXIT HUP INT TERM)\" ]]; then echo traps=present; else echo traps=clear; fi",
+        "exit \"$status\"",
+      ].join("\n"),
+      {
+        JHW_ISSUE_STATE_FILE: "",
+        JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]",
+        JHW_ISSUE_EXPECTED_GEMINI_BOT: "gemini-review[bot]",
+      },
+    );
+    assert.equal(corruptPollRecovery.code, 1,
+      "a corrupt private summary must keep the execution failed");
+    assert.match(corruptPollRecovery.stdout, /^state=gone$/m,
+      "poll recovery failure must still remove the private summary state before returning");
+    assert.match(corruptPollRecovery.stdout, /^traps=clear$/m,
+      "poll recovery failure must clear the execution-owned signal traps before returning");
+
     const invalidPollingInterval = await runIssueResult(
       issueState(),
       `jhw_issue_execute 'Review this' 'Body text' request 20`,
@@ -1640,6 +1663,37 @@ async function main() {
     assert.match(timedExecution.stdout, /^claude \| TIMEOUT \| .* \| review_timeout$/m);
     assert.equal(timedExecution.log.filter((args) => args[0] === "sleep").length, 1,
       "the bounded loop must poll once after a single 60-second interval");
+
+    const strictTimedExecution = await runIssue(
+      issueState({
+        runs: [{
+          id: 602,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "in_progress",
+          conclusion: "null",
+          createdAt: "2026-09-01T00:01:30Z",
+          url: "https://github.com/example/repo/actions/runs/602",
+          displayTitle: "Review this",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      [
+        "set -e",
+        "jhw_issue_execute 'Review this' 'Body text' request 1",
+        "printf 'strict-poll-complete\\n'",
+      ].join("\n"),
+      {
+        JHW_ISSUE_STATE_FILE: "",
+        JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]",
+      },
+    );
+    assert.match(strictTimedExecution.stdout, /^claude \| TIMEOUT \| .* \| review_timeout$/m,
+      "strict-shell execution must complete the bounded PENDING poll");
+    assert.match(strictTimedExecution.stdout, /^strict-poll-complete$/m);
+    assert.equal(strictTimedExecution.log.filter((args) => args[0] === "sleep").length, 1,
+      "strict-shell execution must not exit on the expected PENDING poll status");
 
     assert.equal(
       (await runIssue(issueState(), "jhw_issue_highest_disposition CLEAN FEEDBACK")).stdout.trim(),

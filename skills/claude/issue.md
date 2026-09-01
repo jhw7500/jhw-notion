@@ -1241,38 +1241,39 @@ jhw_issue_execute() {
   export JHW_ISSUE_STATE_FILE JHW_ISSUE_ACTIVE_SIGNAL_FILE
   jhw_issue_install_execution_cleanup
   if ! jhw_issue_create "$title" "$body" "$mode" "$timeout"; then
-    jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
-    jhw_issue_clear_execution_cleanup
-    return 1
-  fi
-  jhw_issue_initialize_state_file "$JHW_ISSUE_STATE_FILE" || {
-    jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
-    jhw_issue_clear_execution_cleanup
-    return 1
-  }
-  start_epoch="$(date +%s)" || return 1
-  [[ "$start_epoch" =~ ^[0-9]+$ ]] || return 1
-  trigger_deadline=$(( start_epoch + 180 ))
-  review_deadline=$(( start_epoch + JHW_ISSUE_TIMEOUT_MIN * 60 ))
-  (( trigger_deadline <= review_deadline )) || trigger_deadline="$review_deadline"
-  while true; do
-    jhw_issue_poll_once "$JHW_ISSUE_STATE_FILE" "$trigger_deadline" "$review_deadline"
-    poll_status=$?
-    case "$poll_status" in
-      0) break ;;
-      3)
-        if ! sleep "$interval"; then
-          jhw_issue_fail_pending "$JHW_ISSUE_STATE_FILE" wait_failed || return 1
+    render_status=1
+  elif ! jhw_issue_initialize_state_file "$JHW_ISSUE_STATE_FILE"; then
+    render_status=1
+  elif ! start_epoch="$(date +%s)" || [[ ! "$start_epoch" =~ ^[0-9]+$ ]]; then
+    render_status=1
+  else
+    trigger_deadline=$(( start_epoch + 180 ))
+    review_deadline=$(( start_epoch + JHW_ISSUE_TIMEOUT_MIN * 60 ))
+    (( trigger_deadline <= review_deadline )) || trigger_deadline="$review_deadline"
+    while true; do
+      if jhw_issue_poll_once "$JHW_ISSUE_STATE_FILE" "$trigger_deadline" "$review_deadline"; then
+        poll_status=0
+      else
+        poll_status=$?
+      fi
+      case "$poll_status" in
+        0) break ;;
+        3)
+          if ! sleep "$interval"; then
+            jhw_issue_fail_pending "$JHW_ISSUE_STATE_FILE" wait_failed || render_status=1
+            break
+          fi
+          ;;
+        *)
+          jhw_issue_fail_pending "$JHW_ISSUE_STATE_FILE" poll_failed || render_status=1
           break
-        fi
-        ;;
-      *)
-        jhw_issue_fail_pending "$JHW_ISSUE_STATE_FILE" poll_failed || return 1
-        break
-        ;;
-    esac
-  done
-  jhw_issue_render_summary "$JHW_ISSUE_URL" "$JHW_ISSUE_STATE_FILE" || render_status=$?
+          ;;
+      esac
+    done
+    if (( render_status == 0 )); then
+      jhw_issue_render_summary "$JHW_ISSUE_URL" "$JHW_ISSUE_STATE_FILE" || render_status=$?
+    fi
+  fi
   jhw_issue_cleanup_execution_files || render_status=1
   jhw_issue_clear_execution_cleanup
   return "$render_status"

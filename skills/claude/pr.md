@@ -1068,8 +1068,10 @@ ship_now_epoch() {
 }
 
 ship_timestamp_epoch() {
-  date -u -d "$1" +%s 2>/dev/null ||
-    date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  date -u -d "$value" +%s 2>/dev/null ||
+    date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$value" +%s 2>/dev/null
 }
 
 ship_at_or_after() {
@@ -1512,53 +1514,218 @@ process.exit(1);
 ' "$SHIP_CODEX_BLOCKING_PATTERN"
 }
 
+ship_codex_body_is_failure() {
+  local encoded="$1"
+  printf '%s' "$encoded" | node -e '
+const fs = require("node:fs");
+const encoded = fs.readFileSync(0, "utf8");
+if (/\s/.test(encoded) || (encoded !== "" &&
+    (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)))) process.exit(2);
+const bytes = Buffer.from(encoded, "base64");
+if (bytes.toString("base64") !== encoded) process.exit(2);
+let body;
+try { body = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { process.exit(2); }
+const normalize = (line) => {
+  let normalized = line.trim();
+  let previous;
+  do {
+    previous = normalized;
+    normalized = normalized
+      .replace(/^(?:[-*+>]|[0-9]+[.)]|\[[ xX]\]|#{1,6})\s+/, "")
+      .trimStart();
+  } while (normalized !== previous);
+  do {
+    previous = normalized;
+    normalized = normalized.replace(
+      /(\*{1,3}|_{1,3})(\S(?:[\s\S]*?\S)?)\1/g,
+      "$2",
+    );
+  } while (normalized !== previous);
+  normalized = normalized
+    .replace(/\bI(?:\x27|’)m\b/gi, "I am")
+    .replace(/\b(we|you|they)(?:\x27|’)re\b/gi, "$1 are")
+    .replace(/\b(I|we|you|they)(?:\x27|’)ve\b/gi, "$1 have")
+    .replace(/\bcan(?:\x27|’)t\b/gi, "cannot")
+    .replace(/\b(could|was|is|has|had|are|were|have)n(?:\x27|’)t\b/gi, "$1 not");
+  return normalized.trim();
+};
+const failureEnd = String.raw`(?:[.!]|$)`;
+const failureReason = String.raw`(?:(?:the\s+)?(?:provider|connector|environment)\s+(?:(?:is|was|became|being)\s+)?(?:unavailable|failed|errored)|(?:the\s+)?(?:usage limits?|quota)\s+(?:(?:has|had)\s+been\s+|(?:was|were|is|are)\s+)?(?:reached|hit|exceeded|exhausted)|(?:an?|the)\s+(?:provider|connector|environment|quota)\s+(?:error|failure)|(?:the\s+)?(?:usage limit|quota))`;
+const failureCause = String.raw`(?:\s+|\s*,\s*)(?:because|due to)\s+${failureReason}(?:\s+(?:for|on)\s+(?:this|the|your)\s+(?:account|request|review))?${failureEnd}`;
+const failureContinuation = String.raw`\s*[,;:]\s+(?:(?:(?:so|therefore|thus)\s+)?no\s+(?:review|findings?)(?:\s+(?:is|are|was|were)\s+(?:available|provided))?${failureEnd}|(?:please\s+)?(?:retry|try again)(?:\s+later)?${failureEnd}|(?:the\s+)?(?:provider|connector|environment)\s+(?:(?:is|was)\s+)?(?:unavailable|failed|errored)${failureEnd}|(?:the\s+)?(?:usage limit|quota)\s+(?:(?:has|had)\s+been\s+|(?:was|is)\s+)?(?:reached|hit|exceeded|exhausted)${failureEnd})`;
+const failureScope = String.raw`\s+(?:in|for|during|on)\s+(?:this|the|your|a)\s+(?:environment|run|attempt|session|request|pull request|pr|change|code|commit|review)(?:${failureEnd}|${failureCause}|${failureContinuation})`;
+const statusTail = String.raw`(?:${failureEnd}|${failureCause}|${failureScope}|${failureContinuation})`;
+const reviewTarget = String.raw`(?:(?:this|the|your|a)\s+(?:pull request|pr|change|code|commit|review|request)|(?:pull request|pr)\s+#?\d+)`;
+const environmentObject = String.raw`(?:(?:an?|the)\s+)?environment`;
+const actionTail = String.raw`(?:${failureEnd}|${failureCause}|${failureContinuation}|\s+${reviewTarget}(?:\s+yet)?(?:${failureEnd}|${failureCause}|${failureScope}|${failureContinuation}))`;
+const environmentTail = String.raw`(?:${failureEnd}|${failureCause}|${failureContinuation}|\s+for\s+${reviewTarget}(?:${failureEnd}|${failureCause}|${failureContinuation})|\s+to\s+(?:review|continue|proceed)(?:${failureEnd}|${failureCause}|${failureContinuation}))`;
+const actor = String.raw`(?:i|we|codex|this reviewer|the reviewer)`;
+const actorAdverbs = String.raw`(?:(?:currently|temporarily|still|now|unfortunately)\s+){0,3}`;
+const apostrophe = String.raw`(?:\x27|’)`;
+const actorFailure = String.raw`(?:${actorAdverbs}(?:(?:(?:was|were|am|is|are|have been|has been|had been)\s+${actorAdverbs}(?:unable|not able)|(?:have|has|had)\s+not\s+(?:yet\s+)?been\s+${actorAdverbs}able|(?:(?:have|has|had)\s+)?failed)\s+to|(?:cannot|can${apostrophe}t|could not|couldn${apostrophe}t)))`;
+const reviewStatus = String.raw`(?:(?:(?:was|is)\s+)?(?:failed|unavailable|not (?:performed|completed|submitted|started))|(?:wasn${apostrophe}t|isn${apostrophe}t)\s+(?:performed|completed|submitted|started)|(?:has|had)\s+(?:failed|been (?:failed|unavailable)|not been (?:performed|completed|submitted|started))|(?:hasn${apostrophe}t|hadn${apostrophe}t)\s+been (?:performed|completed|submitted|started))`;
+const quotaTail = String.raw`(?:${failureEnd}|${failureCause}|${failureScope}|${failureContinuation}|\s+(?:for|on)\s+(?:this|the|your)\s+account(?:${failureEnd}|${failureCause}|${failureContinuation}))`;
+const connectorReviewOperation = String.raw`(?:processing\s+(?:the|this)\s+review|(?:(?:the|this)\s+)?review(?:\s+(?:could|could not|couldn${apostrophe}t|cannot|can${apostrophe}t)\s+(?:start|complete|run|proceed)|\s+setup)?|reviewing(?:\s+${reviewTarget})?)`;
+const connectorOperationTail = String.raw`\s+(?:while|during|before)\s+${connectorReviewOperation}(?:${failureEnd}|${failureCause}|${failureContinuation})`;
+const failurePatterns = [
+  new RegExp(String.raw`^(?:failed|unavailable|not performed)${statusTail}`, "i"),
+  new RegExp(String.raw`^(?:this\s+|the\s+|a\s+)?review\s+${reviewStatus}${statusTail}`, "i"),
+  new RegExp(String.raw`^no\s+review\s+(?:(?:was|is|has been|had been)\s+)?(?:performed|completed|submitted|started)${statusTail}`, "i"),
+  new RegExp(String.raw`^review (?:status|result)\s*[:=-]\s*(?:failed|unavailable|not performed)${statusTail}`, "i"),
+  new RegExp(String.raw`^(?:sorry[,: -]*)?(?:(?:unable|not able|failed)\s+to|(?:cannot|can${apostrophe}t|could not|couldn${apostrophe}t))\s+(?:review|start|complete|perform|submit|conduct)${actionTail}`, "i"),
+  new RegExp(String.raw`^(?:sorry[,: -]*)?(?:(?:unable|not able|failed)\s+to|(?:cannot|can${apostrophe}t|could not|couldn${apostrophe}t))\s+create\s+${environmentObject}${environmentTail}`, "i"),
+  new RegExp(String.raw`^(?:sorry[,: -]*)?${actor}\s+${actorFailure}\s+(?:review|start|complete|perform|submit|conduct)${actionTail}`, "i"),
+  new RegExp(String.raw`^(?:sorry[,: -]*)?${actor}\s+${actorFailure}\s+create\s+${environmentObject}${environmentTail}`, "i"),
+  new RegExp(String.raw`^(?:this\s+|the\s+|a\s+)?review\s+(?:(?:could not|couldn${apostrophe}t|cannot|can${apostrophe}t)\s+be|failed to be)\s+(?:completed|performed|submitted|started)${statusTail}`, "i"),
+  new RegExp(String.raw`^(?:the\s+)?(?:codex\s+)?connector\s+(?:(?:has|had)\s+)?failed\s+to\s+(?:start|complete|perform|submit|review)${actionTail}`, "i"),
+  new RegExp(String.raw`^(?:the\s+)?(?:codex\s+)?connector\s+(?:(?:is|was|became)\s+)?unavailable${statusTail}`, "i"),
+  new RegExp(String.raw`^(?:the\s+)?(?:codex\s+)?connector\s+(?:rejected|denied)\s+(?:the\s+)?(?:review\s+)?request${statusTail}`, "i"),
+  new RegExp(String.raw`^(?:the\s+)?(?:codex\s+)?connector\s+(?:errored|returned an error)(?:${failureEnd}|${failureCause}|${failureContinuation}|${connectorOperationTail})`, "i"),
+  new RegExp(String.raw`^(?:the\s+)?(?:codex\s+)?connector error\s*:\s*(?:${reviewStatus}${statusTail}|review\s+${reviewStatus}${statusTail}|(?:(?:unable|not able|failed)\s+to|(?:cannot|can${apostrophe}t|could not|couldn${apostrophe}t))\s+(?:review|start|complete|perform|submit|conduct)${actionTail}|(?:usage limit|quota)\s+(?:(?:has|had)\s+been\s+|(?:was|is)\s+)?(?:reached|hit|exceeded|exhausted)${quotaTail}|create\s+${environmentObject}${environmentTail})`, "i"),
+  new RegExp(String.raw`^(?:(?:you|i|we)(?:${apostrophe}ve)?|codex)\s+(?:(?:have|has|had)\s+)?(?:reached|hit|exceeded)\s+(?:(?:the|your|my|our|its)\s+)?(?:usage limit|quota)${quotaTail}`, "i"),
+  new RegExp(String.raw`^(?:(?:the|your|my|our|its)\s+)?(?:usage limit|quota)(?:\s+(?:for|on)\s+(?:this|the|your)\s+account)?\s+(?:(?:has|had)\s+been\s+|(?:was|is)\s+)?(?:reached|hit|exceeded|exhausted)${quotaTail}`, "i"),
+  new RegExp(String.raw`^environment creation\s+(?:(?:has|had)\s+)?failed${statusTail}`, "i"),
+  new RegExp(String.raw`^(?:please\s+)?create\s+${environmentObject}(?:${failureEnd}|${failureContinuation}|\s+(?:to|before)\s+(?:review|start|continue|proceed)${failureEnd})`, "i"),
+];
+const statements = body.split(/\r?\n/)
+  .map(normalize)
+  .flatMap((line) => line.split(/(?<=[.!?])\s+/))
+  .map((statement) => statement.trim())
+  .filter(Boolean);
+const explicitFixtureCorrection = /^(?:this|that)\s+is\s+(?:the|a)\s+(?:regression|test)\s+(?:fixture|example)\s*;\s*(?:the\s+)?(?:current|actual|present)\s+review\s+(?:completed successfully|succeeded|is clean)(?:[.!]|$)/i;
+const hasUncorrectedFailure = statements.some((statement, index) =>
+  failurePatterns.some((pattern) => pattern.test(statement)) &&
+  !explicitFixtureCorrection.test(statements[index + 1] || ""));
+process.exit(hasUncorrectedFailure ? 0 : 1);
+'
+}
+
+ship_codex_signal_event() {
+  local source="$1" safe_id="$2" group="$3" occurred_at="$4" outcome="$5"
+  case "$source" in
+    review|pull_comment|issue_reaction|comment_reaction) ;;
+    *) return 2 ;;
+  esac
+  [[ "$safe_id" =~ ^[1-9][0-9]*$ ]] || return 2
+  [[ "$group" =~ ^(review|pull_comment|issue_reaction|comment_reaction):[1-9][0-9]*$ ]] || return 2
+  case "$outcome" in
+    CLEAN|FEEDBACK|FAILED|EYES) ;;
+    *) return 2 ;;
+  esac
+  ship_timestamp_epoch "$occurred_at" >/dev/null || return 2
+  printf '%s\t%s\t%s\t%s\t%s\n' "$source" "$safe_id" "$group" "$occurred_at" "$outcome"
+}
+
+ship_codex_latest_signal() {
+  node -e '
+const fs = require("node:fs");
+const input = fs.readFileSync(0, "utf8").replace(/\n$/, "");
+if (input === "") { process.stdout.write("NONE\n"); process.exit(0); }
+const allowedSources = new Set(["review", "pull_comment", "issue_reaction", "comment_reaction"]);
+const allowedOutcomes = new Set(["CLEAN", "FEEDBACK", "FAILED", "EYES"]);
+const severity = { EYES: 0, CLEAN: 1, FEEDBACK: 2, FAILED: 3 };
+const groups = new Map();
+for (const line of input.split("\n")) {
+  const fields = line.split("\t");
+  if (fields.length !== 5) process.exit(2);
+  const [source, idText, group, occurredAt, outcome] = fields;
+  if (!allowedSources.has(source) || !allowedOutcomes.has(outcome) ||
+      !/^[1-9][0-9]*$/.test(idText) ||
+      !/^(?:review|pull_comment|issue_reaction|comment_reaction):[1-9][0-9]*$/.test(group) ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(occurredAt)) process.exit(2);
+  const id = BigInt(idText);
+  const epoch = Date.parse(occurredAt);
+  if (!Number.isFinite(epoch)) process.exit(2);
+  const prior = groups.get(group);
+  if (prior && (prior.source !== source || prior.id !== id)) process.exit(2);
+  if (!prior) {
+    groups.set(group, { source, id, epoch, outcome });
+  } else {
+    if (epoch > prior.epoch) prior.epoch = epoch;
+    if (severity[outcome] > severity[prior.outcome]) prior.outcome = outcome;
+  }
+}
+const values = [...groups.values()];
+const terminalValues = values.filter((event) => event.outcome !== "EYES");
+const orderedValues = terminalValues.length > 0 ? terminalValues : values;
+const latestEpoch = Math.max(...orderedValues.map((event) => event.epoch));
+const bySource = new Map();
+for (const event of orderedValues.filter((candidate) => candidate.epoch === latestEpoch)) {
+  const prior = bySource.get(event.source);
+  if (!prior || event.id > prior.id) bySource.set(event.source, event);
+  else if (event.id === prior.id && event.outcome !== prior.outcome) process.exit(2);
+}
+const latest = [...bySource.values()];
+const outcomes = new Set(latest.map((event) => event.outcome));
+process.stdout.write((outcomes.size === 1 ? latest[0].outcome : "AMBIGUOUS") + "\n");
+'
+}
+
 ship_codex_signal_status() {
-  local reviews pull_comments issue_reactions comment_reactions request_epoch now_epoch deadline
-  local actor review_id review_state commit_id original_commit_id occurred_at body_b64 body_status content
+  local reviews pull_comments issue_reactions comment_reactions request_epoch occurred_epoch now_epoch deadline
+  local actor review_id comment_id reaction_id review_state commit_id original_commit_id occurred_at body_b64 body_status content
+  local outcome source safe_id group event_line latest_status
   local dismissed_review_ids=""
-  local has_response=false has_blocking=false has_positive=false has_negative=false has_eyes=false
+  local signal_events="" has_eyes=false
 
   if [[ "$SHIP_CODEX_TRIGGER_STATUS" != STARTED ]]; then
     SHIP_CODEX_REVIEW_STATUS="${SHIP_CODEX_TRIGGER_STATUS:-TRIGGER_FAILED}"
     SHIP_CODEX_REVIEW_REASON="${SHIP_CODEX_TRIGGER_REASON:-request_not_started}"
     return
   fi
+  SHIP_CODEX_REVIEW_REASON=''
+  request_epoch="$(ship_timestamp_epoch "$SHIP_CODEX_REQUESTED_AT")" || {
+    SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=invalid_request_timestamp; return;
+  }
 
   reviews="$(gh api "repos/$REPO_NWO/pulls/$PR/reviews?per_page=100" --paginate \
     --jq '.[] | [.user.login, (.id | tostring), (.commit_id // "-"), (.submitted_at // "-"), (.state // "UNKNOWN"), ((.body // "") | @base64)] | @tsv' 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   pull_comments="$(gh api "repos/$REPO_NWO/pulls/$PR/comments?per_page=100" --paginate \
-    --jq '.[] | [.user.login, ((.pull_request_review_id // 0) | tostring), (.commit_id // "-"), (.original_commit_id // .commit_id // "-"), (.created_at // "-"), ((.body // "") | @base64)] | @tsv' 2>/dev/null)" || {
+    --jq '.[] | [.user.login, (.id | tostring), ((.pull_request_review_id // 0) | tostring), (.commit_id // "-"), (.original_commit_id // .commit_id // "-"), (.created_at // "-"), ((.body // "") | @base64)] | @tsv' 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   issue_reactions="$(gh api "repos/$REPO_NWO/issues/$PR/reactions?per_page=100" --paginate \
-    --jq '.[] | [.user.login, .content, .created_at] | @tsv' 2>/dev/null)" || {
+    --jq '.[] | [.user.login, (.id | tostring), .content, .created_at] | @tsv' 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
   comment_reactions="$(gh api "repos/$REPO_NWO/issues/comments/$SHIP_CODEX_REQUEST_COMMENT_ID/reactions?per_page=100" --paginate \
-    --jq '.[] | [.user.login, .content, .created_at] | @tsv' 2>/dev/null)" || {
+    --jq '.[] | [.user.login, (.id | tostring), .content, .created_at] | @tsv' 2>/dev/null)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
   }
 
   while IFS=$'\t' read -r actor review_id commit_id occurred_at review_state body_b64; do
     ship_codex_author_matches "$actor" || continue
-    [[ "$review_id" =~ ^[1-9][0-9]*$ ]] || continue
     case "$review_state" in
       COMMENTED|APPROVED|CHANGES_REQUESTED|DISMISSED) ;;
       PENDING) continue ;;
       *) continue ;;
     esac
+    [[ "$commit_id" == "$ROUND_HEAD" ]] || continue
+    occurred_epoch="$(ship_timestamp_epoch "$occurred_at")" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    (( occurred_epoch >= request_epoch )) || continue
+    [[ "$review_id" =~ ^[1-9][0-9]*$ ]] || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    outcome=CLEAN
+    if ship_codex_body_is_failure "$body_b64"; then
+      outcome=FAILED
+    else
+      body_status=$?
+      if [[ "$body_status" != 1 ]]; then
+        SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return
+      fi
+    fi
     if [[ "$review_state" == DISMISSED ]]; then
       [[ -z "$dismissed_review_ids" ]] || dismissed_review_ids+=$'\n'
       dismissed_review_ids+="$review_id"
     fi
-    [[ "$commit_id" == "$ROUND_HEAD" ]] || continue
-    ship_at_or_after "$occurred_at" "$SHIP_CODEX_REQUESTED_AT" || continue
-    has_response=true
     if [[ "$review_state" != DISMISSED ]]; then
       if ship_codex_body_is_blocking "$body_b64"; then
-        has_blocking=true
+        [[ "$outcome" == FAILED ]] || outcome=FEEDBACK
       else
         body_status=$?
         if [[ "$body_status" != 1 ]]; then
@@ -1566,47 +1733,128 @@ ship_codex_signal_status() {
         fi
       fi
     fi
+    event_line="$(ship_codex_signal_event review "$review_id" "review:$review_id" "$occurred_at" "$outcome")" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    [[ -z "$signal_events" ]] || signal_events+=$'\n'
+    signal_events+="$event_line"
   done <<<"$reviews"
 
-  while IFS=$'\t' read -r actor review_id commit_id original_commit_id occurred_at body_b64; do
+  while IFS=$'\t' read -r actor comment_id review_id commit_id original_commit_id occurred_at body_b64; do
     ship_codex_author_matches "$actor" || continue
     [[ "$commit_id" == "$ROUND_HEAD" && "$original_commit_id" == "$ROUND_HEAD" ]] || continue
-    ship_at_or_after "$occurred_at" "$SHIP_CODEX_REQUESTED_AT" || continue
-    if [[ "$review_id" =~ ^[1-9][0-9]*$ && -n "$dismissed_review_ids" ]] &&
-      grep -Fqx -- "$review_id" <<<"$dismissed_review_ids"; then
-      continue
-    fi
-    has_response=true
-    if ship_codex_body_is_blocking "$body_b64"; then
-      has_blocking=true
+    occurred_epoch="$(ship_timestamp_epoch "$occurred_at")" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    (( occurred_epoch >= request_epoch )) || continue
+    [[ "$comment_id" =~ ^[1-9][0-9]*$ && ( "$review_id" == 0 || "$review_id" =~ ^[1-9][0-9]*$ ) ]] || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    outcome=CLEAN
+    if ship_codex_body_is_failure "$body_b64"; then
+      outcome=FAILED
     else
       body_status=$?
       if [[ "$body_status" != 1 ]]; then
         SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return
       fi
     fi
+    if [[ "$review_id" =~ ^[1-9][0-9]*$ && -n "$dismissed_review_ids" ]] &&
+      grep -Fqx -- "$review_id" <<<"$dismissed_review_ids" && [[ "$outcome" != FAILED ]]; then
+      continue
+    fi
+    if ship_codex_body_is_blocking "$body_b64"; then
+      [[ "$outcome" == FAILED ]] || outcome=FEEDBACK
+    else
+      body_status=$?
+      if [[ "$body_status" != 1 ]]; then
+        SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return
+      fi
+    fi
+    if [[ "$review_id" =~ ^[1-9][0-9]*$ ]]; then
+      source=review
+      safe_id="$review_id"
+      group="review:$review_id"
+    elif [[ "$review_id" == 0 ]]; then
+      source=pull_comment
+      safe_id="$comment_id"
+      group="pull_comment:$comment_id"
+    else
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return
+    fi
+    event_line="$(ship_codex_signal_event "$source" "$safe_id" "$group" "$occurred_at" "$outcome")" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    [[ -z "$signal_events" ]] || signal_events+=$'\n'
+    signal_events+="$event_line"
   done <<<"$pull_comments"
 
-  for reactions in "$issue_reactions" "$comment_reactions"; do
-    while IFS=$'\t' read -r actor content occurred_at; do
-      ship_codex_author_matches "$actor" || continue
-      ship_at_or_after "$occurred_at" "$SHIP_CODEX_REQUESTED_AT" || continue
-      case "$content" in
-        +1) has_positive=true ;;
-        eyes) has_eyes=true ;;
-        -1|confused) has_negative=true ;;
-      esac
-    done <<<"$reactions"
-  done
-
-  if [[ "$has_blocking" == true || "$has_negative" == true ]]; then
-    SHIP_CODEX_REVIEW_STATUS=FEEDBACK
-  elif [[ "$has_response" == true || "$has_positive" == true ]]; then
-    SHIP_CODEX_REVIEW_STATUS=CLEAN
-  else
-    request_epoch="$(ship_timestamp_epoch "$SHIP_CODEX_REQUESTED_AT")" || {
-      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=invalid_request_timestamp; return;
+  while IFS=$'\t' read -r actor reaction_id content occurred_at; do
+    ship_codex_author_matches "$actor" || continue
+    case "$content" in
+      +1) outcome=CLEAN ;;
+      eyes) outcome=EYES ;;
+      -1|confused) outcome=FEEDBACK ;;
+      *) continue ;;
+    esac
+    occurred_epoch="$(ship_timestamp_epoch "$occurred_at")" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
     }
+    (( occurred_epoch >= request_epoch )) || continue
+    [[ "$reaction_id" =~ ^[1-9][0-9]*$ ]] || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    event_line="$(ship_codex_signal_event issue_reaction "$reaction_id" "issue_reaction:$reaction_id" "$occurred_at" "$outcome")" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    [[ -z "$signal_events" ]] || signal_events+=$'\n'
+    signal_events+="$event_line"
+  done <<<"$issue_reactions"
+
+  while IFS=$'\t' read -r actor reaction_id content occurred_at; do
+    ship_codex_author_matches "$actor" || continue
+    case "$content" in
+      +1) outcome=CLEAN ;;
+      eyes) outcome=EYES ;;
+      -1|confused) outcome=FEEDBACK ;;
+      *) continue ;;
+    esac
+    occurred_epoch="$(ship_timestamp_epoch "$occurred_at")" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    (( occurred_epoch >= request_epoch )) || continue
+    [[ "$reaction_id" =~ ^[1-9][0-9]*$ ]] || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    event_line="$(ship_codex_signal_event comment_reaction "$reaction_id" "comment_reaction:$reaction_id" "$occurred_at" "$outcome")" || {
+      SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+    }
+    [[ -z "$signal_events" ]] || signal_events+=$'\n'
+    signal_events+="$event_line"
+  done <<<"$comment_reactions"
+
+  latest_status="$(printf '%s' "$signal_events" | ship_codex_latest_signal)" || {
+    SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
+  }
+  case "$latest_status" in
+    CLEAN) SHIP_CODEX_REVIEW_STATUS=CLEAN; return ;;
+    FEEDBACK) SHIP_CODEX_REVIEW_STATUS=FEEDBACK; return ;;
+    FAILED)
+      SHIP_CODEX_REVIEW_STATUS=FAILED
+      SHIP_CODEX_REVIEW_REASON=reviewer_response_failed
+      return
+      ;;
+    AMBIGUOUS)
+      SHIP_CODEX_REVIEW_STATUS=FAILED
+      SHIP_CODEX_REVIEW_REASON=signal_order_ambiguous
+      return
+      ;;
+    EYES) has_eyes=true ;;
+    NONE) ;;
+    *) SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return ;;
+  esac
+
+  if [[ "$latest_status" == EYES || "$latest_status" == NONE ]]; then
     now_epoch="$(ship_now_epoch)" || {
       SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=clock_lookup_failed; return;
     }
@@ -1618,6 +1866,184 @@ ship_codex_signal_status() {
       [[ "$has_eyes" == true ]] && SHIP_CODEX_REVIEW_REASON=acknowledged
     fi
   fi
+}
+
+ship_signal_dirs_match() {
+  local logical_dir="$1" physical_dir="$2" platform="$3"
+  [[ -n "$logical_dir" && -n "$physical_dir" ]] || return 2
+  [[ "$logical_dir" == "$physical_dir" ]] && return 0
+  [[ "$platform" == Darwin ]] || return 1
+  case "$logical_dir" in
+    /tmp|/tmp/*|/var|/var/*) [[ "$physical_dir" == "/private$logical_dir" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+ship_signal_file_prepare() {
+  local configured_dir="${TMPDIR:-}" signal_dir logical_dir physical_dir platform='' old_umask path create_status
+  [[ -z "${SHIP_SIGNAL_FILE:-}" && -z "${SHIP_SIGNAL_DIR:-}" ]] || return 2
+  if [[ -n "$configured_dir" ]]; then
+    signal_dir="$configured_dir"
+    while [[ "$signal_dir" != / ]]; do
+      case "$signal_dir" in
+        */) signal_dir="${signal_dir%/}" ;;
+        */.) signal_dir="${signal_dir%/.}" ;;
+        *) break ;;
+      esac
+    done
+  else
+    signal_dir=/tmp
+  fi
+  [[ -n "$signal_dir" && "$signal_dir" == /* && "$signal_dir" != / && -d "$signal_dir" ]] || return 1
+  logical_dir="$(cd -L -- "$signal_dir" 2>/dev/null && pwd -L)" || return 1
+  physical_dir="$(cd -P -- "$signal_dir" 2>/dev/null && pwd -P)" || return 1
+  if [[ "$logical_dir" != "$physical_dir" ]]; then
+    platform="$(uname -s 2>/dev/null)" || return 1
+  fi
+  ship_signal_dirs_match "$logical_dir" "$physical_dir" "$platform" || return 1
+  signal_dir="$physical_dir"
+  signal_dir="${signal_dir%/}"
+  [[ -n "$signal_dir" && "$signal_dir" == /* && "$signal_dir" != / && -d "$signal_dir" ]] || return 1
+  old_umask="$(umask)" || return 1
+  umask 077
+  path="$(mktemp "$signal_dir/jhw-pr-signals.XXXXXXXX")"
+  create_status=$?
+  umask "$old_umask" || {
+    (( create_status != 0 )) || rm -f -- "$path"
+    return 1
+  }
+  (( create_status == 0 )) || return 1
+  [[ -f "$path" && ! -L "$path" ]] || {
+    [[ -n "$path" && ! -L "$path" ]] && rm -f -- "$path"
+    return 1
+  }
+  chmod 600 -- "$path" || { rm -f -- "$path"; return 1; }
+  SHIP_SIGNAL_DIR="$signal_dir"
+  SHIP_SIGNAL_FILE="$path"
+}
+
+ship_signal_file_cleanup() {
+  local signal_file="$1" signal_dir="$2" parent base
+  [[ -n "$signal_file" && -n "$signal_dir" && "$signal_dir" == /* && "$signal_dir" != / ]] || return 2
+  parent="${signal_file%/*}"
+  base="${signal_file##*/}"
+  [[ "$parent" == "$signal_dir" && "$base" =~ ^jhw-pr-signals\.[A-Za-z0-9]+$ ]] || return 2
+  [[ ! -L "$signal_file" ]] || return 1
+  [[ ! -e "$signal_file" || -f "$signal_file" ]] || return 1
+  [[ -e "$signal_file" ]] || return 0
+  rm -f -- "$signal_file"
+}
+
+ship_signal_cleanup_all() {
+  if [[ -n "${SHIP_SIGNAL_FILE:-}" ]]; then
+    if [[ -e "$SHIP_SIGNAL_FILE" || -L "$SHIP_SIGNAL_FILE" ]]; then
+      ship_signal_file_cleanup "$SHIP_SIGNAL_FILE" "${SHIP_SIGNAL_DIR:-}" || return 1
+    fi
+    SHIP_SIGNAL_FILE=''
+    SHIP_SIGNAL_DIR=''
+  fi
+}
+
+ship_signal_trap_handler_from_spec() {
+  local spec="$1" signal="$2" expected
+  case "$signal" in
+    EXIT) expected=EXIT ;;
+    HUP) expected=SIGHUP ;;
+    INT) expected=SIGINT ;;
+    TERM) expected=SIGTERM ;;
+    *) return 2 ;;
+  esac
+  [[ "$spec" == "trap -- "* ]] || return 1
+  spec="${spec#trap -- }"
+  # `spec` comes only from Bash `trap -p`; eval reconstructs its shell-quoted argv.
+  eval "set -- $spec"
+  (( $# == 2 )) || return 1
+  [[ "$2" == "$expected" ]] || return 1
+  printf '%s' "$1"
+}
+
+ship_signal_current_trap_spec() {
+  local signal="$1" spec
+  case "$signal" in EXIT|HUP|INT|TERM) ;; *) return 2 ;; esac
+  spec="$(trap -p "$signal")" || return 1
+  if [[ -n "$spec" ]]; then
+    ship_signal_trap_handler_from_spec "$spec" "$signal" >/dev/null || return 1
+  fi
+  printf '%s' "$spec"
+}
+
+ship_signal_restore_trap_spec() {
+  local spec="$1" signal="$2"
+  case "$signal" in EXIT|HUP|INT|TERM) ;; *) return 2 ;; esac
+  if [[ -n "$spec" ]]; then
+    ship_signal_trap_handler_from_spec "$spec" "$signal" >/dev/null || return 1
+    # The validated command was emitted by Bash itself and restores the exact caller handler.
+    eval "$spec"
+  else
+    trap - "$signal"
+  fi
+}
+
+ship_signal_restore_traps() {
+  local restore_status=0
+  ship_signal_restore_trap_spec "${SHIP_SIGNAL_PREV_EXIT_TRAP:-}" EXIT || restore_status=1
+  ship_signal_restore_trap_spec "${SHIP_SIGNAL_PREV_HUP_TRAP:-}" HUP || restore_status=1
+  ship_signal_restore_trap_spec "${SHIP_SIGNAL_PREV_INT_TRAP:-}" INT || restore_status=1
+  ship_signal_restore_trap_spec "${SHIP_SIGNAL_PREV_TERM_TRAP:-}" TERM || restore_status=1
+  return "$restore_status"
+}
+
+ship_signal_cleanup_on_exit() {
+  local status="$1" previous_spec="${SHIP_SIGNAL_PREV_EXIT_TRAP:-}"
+  ship_signal_cleanup_all >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  SHIP_SIGNAL_CLEANUP_INSTALLED=false
+  if [[ -n "$previous_spec" ]]; then
+    # Run the caller EXIT trap once in a child exit context so its `$?` remains the original status.
+    ( eval "$previous_spec"; exit "$status" ) || true
+  fi
+  exit "$status"
+}
+
+ship_signal_handle_signal() {
+  local signal="$1" status="$2" previous_spec=''
+  case "$signal" in
+    HUP) previous_spec="${SHIP_SIGNAL_PREV_HUP_TRAP:-}" ;;
+    INT) previous_spec="${SHIP_SIGNAL_PREV_INT_TRAP:-}" ;;
+    TERM) previous_spec="${SHIP_SIGNAL_PREV_TERM_TRAP:-}" ;;
+    *) return 2 ;;
+  esac
+  ship_signal_cleanup_all >/dev/null 2>&1 || true
+  ship_signal_restore_traps >/dev/null 2>&1 || trap - EXIT HUP INT TERM
+  SHIP_SIGNAL_CLEANUP_INSTALLED=false
+  [[ -z "$previous_spec" ]] || kill -s "$signal" "$$"
+  exit "$status"
+}
+
+ship_signal_cleanup_install() {
+  [[ "${SHIP_SIGNAL_CLEANUP_INSTALLED:-false}" == false ]] || return 2
+  SHIP_SIGNAL_PREV_EXIT_TRAP="$(ship_signal_current_trap_spec EXIT)" || return 1
+  SHIP_SIGNAL_PREV_HUP_TRAP="$(ship_signal_current_trap_spec HUP)" || return 1
+  SHIP_SIGNAL_PREV_INT_TRAP="$(ship_signal_current_trap_spec INT)" || return 1
+  SHIP_SIGNAL_PREV_TERM_TRAP="$(ship_signal_current_trap_spec TERM)" || return 1
+  trap 'ship_signal_cleanup_on_exit "$?"' EXIT
+  trap 'ship_signal_handle_signal HUP 129' HUP
+  trap 'ship_signal_handle_signal INT 130' INT
+  trap 'ship_signal_handle_signal TERM 143' TERM
+  SHIP_SIGNAL_CLEANUP_INSTALLED=true
+}
+
+ship_signal_cleanup_finish() {
+  local cleanup_status=0
+  [[ "${SHIP_SIGNAL_CLEANUP_INSTALLED:-false}" == true ]] || return 2
+  ship_signal_cleanup_all || cleanup_status=1
+  ship_signal_restore_traps || cleanup_status=1
+  SHIP_SIGNAL_CLEANUP_INSTALLED=false
+  SHIP_SIGNAL_PREV_EXIT_TRAP=''
+  SHIP_SIGNAL_PREV_HUP_TRAP=''
+  SHIP_SIGNAL_PREV_INT_TRAP=''
+  SHIP_SIGNAL_PREV_TERM_TRAP=''
+  return "$cleanup_status"
 }
 
 ship_auto_fix_push_ready() {
@@ -1673,26 +2099,27 @@ REPO_NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # Owner/Repo
 PR="$1"   # PR 번호
 BR="$(git rev-parse --abbrev-ref HEAD)"; SHA="$(git rev-parse HEAD)"   # 푸시(생성·재푸시)마다 SHA 재계산 필수
 
-collect() {   # CLEAN/FEEDBACK 분류엔 본문이 필요하므로 reviews/comments는 body까지 수집한다.
-  echo "## reviews";   gh api "repos/$REPO_NWO/pulls/$PR/reviews"   -q '.[] | "\(.user.login)\t\(.state)\t\(.commit_id)\t\(.submitted_at)\t\((.body//"")|gsub("[\n\t]";" ")|.[0:200])"' 2>/dev/null
-  echo "## pcomments"; gh api "repos/$REPO_NWO/pulls/$PR/comments"  -q '.[] | "\(.user.login)\t\(.commit_id)\t\(.original_commit_id//.commit_id)\t\(.created_at)\t\((.body//"")|gsub("[\n\t]";" ")|.[0:200])"' 2>/dev/null
-  echo "## icomments"; gh api "repos/$REPO_NWO/issues/$PR/comments" -q '.[] | "\(.id)\t\(.user.login)\t\(.created_at)\t\((.body//"")|gsub("[\n\t]";" ")|.[0:200])"' 2>/dev/null
-  # v3 state와 canonical 활성 섹션은 200자 요약으로 판정할 수 없다. 해당 봇 코멘트는
-  # JSON 문자열 이스케이프를 보존한 전체 객체로 별도 수집한다.
-  echo "## workflow_comments"; gh api "repos/$REPO_NWO/issues/$PR/comments" \
-    -q '.[] | select((.user.type//"") == "Bot")
+collect() {   # CLEAN/FEEDBACK 분류엔 본문이 필요하므로 reviews/comments는 body 전체를 base64로 수집한다.
+  echo "## reviews";   gh api "repos/$REPO_NWO/pulls/$PR/reviews?per_page=100" --paginate --jq '.[] | [.user.login, .state, .commit_id, .submitted_at, ((.body // "") | @base64)] | @tsv' 2>/dev/null || return 1
+  echo "## pcomments"; gh api "repos/$REPO_NWO/pulls/$PR/comments?per_page=100" --paginate --jq '.[] | [.user.login, .commit_id, (.original_commit_id // .commit_id), .created_at, ((.body // "") | @base64)] | @tsv' 2>/dev/null || return 1
+  echo "## icomments"; gh api "repos/$REPO_NWO/issues/$PR/comments?per_page=100" --paginate --jq '.[] | [.id, .user.login, .created_at, ((.body // "") | @base64)] | @tsv' 2>/dev/null || return 1
+  # v3 state와 canonical 활성 섹션은 요약으로 판정할 수 없다. 해당 봇 코멘트는
+  # JSON 문자열 이스케이프를 보존한 전체 객체로 별도 수집한다. App body도 terminal 판정까지
+  # base64 원문을 유지하고, 사람이 보는 최종 요약을 렌더링할 때만 자른다.
+  echo "## workflow_comments"; gh api "repos/$REPO_NWO/issues/$PR/comments?per_page=100" --paginate \
+    --jq '.[] | select((.user.type//"") == "Bot")
         | select((.body//"") | contains("<!-- automation:claude-code-review:v3 -->")
           or contains("<!-- automation:gemini-auto-review:v3 -->")
           or contains("<!-- automation:claude-code-review -->")
           or contains("<!-- automation:gemini-auto-review -->"))
-        | {id, author:.user.login, type:.user.type, created_at, updated_at, body}' 2>/dev/null
-  echo "## reactions"; gh api "repos/$REPO_NWO/issues/$PR/reactions" -q '.[] | "\(.user.login)\t\(.content)\t\(.created_at)"' 2>/dev/null   # +1/heart=긍정, eyes=확인중, -1/confused=부정. created_at로 라운드 스코프.
+        | {id, author:.user.login, type:.user.type, created_at, updated_at, body}' 2>/dev/null || return 1
+  echo "## reactions"; gh api "repos/$REPO_NWO/issues/$PR/reactions?per_page=100" --paginate --jq '.[] | [.user.login, .content, .created_at] | @tsv' 2>/dev/null || return 1   # +1/heart=긍정, eyes=확인중, -1/confused=부정. created_at로 라운드 스코프.
   if [ -n "${SHIP_CODEX_REQUEST_COMMENT_ID:-}" ]; then
-    echo "## codex_request_reactions"; gh api "repos/$REPO_NWO/issues/comments/$SHIP_CODEX_REQUEST_COMMENT_ID/reactions" \
-      -q '.[] | "\(.user.login)\t\(.content)\t\(.created_at)"' 2>/dev/null
+    echo "## codex_request_reactions"; gh api "repos/$REPO_NWO/issues/comments/$SHIP_CODEX_REQUEST_COMMENT_ID/reactions?per_page=100" \
+      --paginate --jq '.[] | [.user.login, .content, .created_at] | @tsv' 2>/dev/null || return 1
   fi
-  echo "## runs";      gh api "repos/$REPO_NWO/actions/runs?head_sha=$SHA" \
-                         -q '.workflow_runs[] | "\(.id)\t\(.run_attempt)\t\(.name)\t\(.head_sha)\t\(.created_at)\t\(.updated_at)\t\(.status)\t\(.conclusion)\t\(.html_url)"' 2>/dev/null
+  echo "## runs";      gh api "repos/$REPO_NWO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
+                         --jq '.workflow_runs[] | [.id, .run_attempt, .name, .head_sha, .created_at, .updated_at, .status, .conclusion, .html_url] | @tsv' 2>/dev/null || return 1
                          # head_sha 스코프(브랜치 삭제 후에도 동작). state의 run_id/run_attempt와 결합한다.
                          # conclusion 미정은 리터럴 "null"=non-terminal.
 }
@@ -1705,7 +2132,20 @@ collect
 INTERVAL=60; DEADLINE=$(( $(date +%s) + ${TIMEOUT_MIN:-20}*60 ))
 # 폴링은 "한 번 collect → 에이전트가 판정"의 반복이다. 긴 foreground sleep이 막히면
 # break 하지 말고 **에이전트가 다음 차례에 collect()를 다시 호출**(≈INTERVAL 간격)해 DEADLINE까지 반복한다.
-collect > /tmp/jhw-pr-signals.$PR   # 매 호출 1회분. 에이전트가 읽어 리뷰어별 terminal 판정.
+SHIP_SIGNAL_FILE=''; SHIP_SIGNAL_DIR=''
+ship_signal_file_prepare || return
+if ! ship_signal_cleanup_install; then
+  ship_signal_cleanup_all >/dev/null 2>&1 || true
+  return 1
+fi
+if ! collect > "$SHIP_SIGNAL_FILE"; then
+  ship_signal_cleanup_finish >/dev/null 2>&1 || true
+  echo "PR signal collection failed" >&2
+  return 1
+fi
+# 매 호출 1회분인 $SHIP_SIGNAL_FILE을 읽어 reviewer별 terminal을 판정한다. 한 endpoint라도
+# 실패하면 partial snapshot을 판정하지 않는다. terminal 보고 또는 다른 return 직전 공통 epilogue에서:
+ship_signal_cleanup_finish || return
 # 워크플로우 리뷰어는 Bash 도구의 run_in_background:true로 `gh run watch <run-id> --exit-status`를
 # 실행해 라이브 대기(완료 시 task-notification). 셸 `&`/nohup이 아니라 하니스가 추적하는 BG.
 # 모든 expected 리뷰어가 terminal(CLEAN/FEEDBACK/FAILED/TRIGGER_FAILED)이거나
@@ -1716,7 +2156,7 @@ collect > /tmp/jhw-pr-signals.$PR   # 매 호출 1회분. 에이전트가 읽어
 ### 리뷰어별 terminal 판정 규칙
 
 - **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. auto-fix 라운드에서는 `head_sha == ROUND_HEAD`이고 `created_at >= ROUND_STARTED_AT`인 run만 해당 라운드 실행이다. push 완료 시각인 `ROUND_PUSHED_AT`부터 180초 안에 이 run이 없으면 **TRIGGER_FAILED**이며, 시작된 run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**이다.
-- **Codex**: auto-fix 라운드에서는 성공적으로 기록된 요청 댓글의 `created_at` 이후 신호만 본다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**하되, `No P1 findings`처럼 명시적으로 부정된 priority/severity 문구는 제거한 뒤 남은 affirmative 라벨만 센다. (a) 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) PR 또는 정확한 요청 댓글에 요청 시각 이후 `chatgpt-codex-connector[bot] +1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
+- **Codex**: auto-fix 라운드에서는 성공적으로 기록된 요청 댓글의 `created_at` 이후 신호만 본다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**하되, `No P1 findings`처럼 명시적으로 부정된 priority/severity 문구는 제거한 뒤 남은 affirmative 라벨만 센다. 현재-head 리뷰/diff코멘트가 quota·connector·환경 생성 실패나 review 불가를 보고하면 블로킹 라벨 유무와 무관하게 **FAILED**다. (a) 그 외 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) PR 또는 정확한 요청 댓글에 요청 시각 이후 `chatgpt-codex-connector[bot] +1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
 - **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
 - **Claude/Gemini schema-3 공통 판정**: reviewer별로 가장 최근에 시작된 현재-head run을 고르고, 위 state 계약과 그 run의 동일 ID/attempt를 가진 v3 봇 코멘트가 정확히 하나이며 run이 `completed`여야 terminal이다. 다른 head/run의 historical v3 코멘트는 선택 대상이 아니다. 성공 state이면 canonical 본문의 `### New findings`와 `### Still open` 아래에서만 정확한 `#### RVW-<12hex> [SEVERITY] title` heading을 센다. `### Resolved`/`### Retracted`, 일반 산문의 bracket 문자열, `filtered_max_severity`는 활성 지적이 아니다. `accepted_count`와 활성 heading 수가 다르거나 state/표시 메타가 불일치하면 성공으로 간주하지 않고 FAILED로 보고한다.
 - **Claude 리뷰**: 유효한 현재-head v3 성공에서 활성 `[CRITICAL]`/`[HIGH]`이 있으면 FEEDBACK, 없으면 CLEAN이다. 유효한 현재-head 실패 state는 FAILED(재실행 후보). run이 `in_progress`면 PENDING. 워크플로우 파일을 바꾸는 PR에서 claude-code-action의 default-branch 동일성 검증으로 모델이 의도적으로 스킵된 경우도 FAILED로 명시하되, 같은 역할의 앱 대체 신호 적용 여부는 아래 규칙을 따른다. **TIMEOUT_MIN을 초과한 in_progress run**은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체한다.

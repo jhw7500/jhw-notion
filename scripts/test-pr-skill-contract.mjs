@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync, lstatSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,6 +72,12 @@ function policyContractBlock(markdown) {
     /<!-- pr-review-mode-contract:begin -->\n```bash\n([\s\S]*?)```\n<!-- pr-review-mode-contract:end -->/,
   );
   assert.ok(match, "pr skill must expose an executable review-mode contract");
+  return match[1];
+}
+
+function collectorContractBlock(markdown) {
+  const match = markdown.match(/\n(collect\(\) \{[\s\S]*?\n\})\ncollect\n/);
+  assert.ok(match, "pr skill must expose one executable signal collector");
   return match[1];
 }
 
@@ -384,17 +390,30 @@ if (/\/issues\/comments\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
     })).toString("base64")));
     process.exit(0);
   }
-  rows(state.commentReactions.map((item) => [item.actor, item.content, item.createdAt].join("\t")));
+  if (!(optionValue("--jq") || "").includes("(.id | tostring)")) process.exit(2);
+  rows(state.commentReactions.map((item, index) => [
+    item.actor,
+    item.id || 7000 + index,
+    item.content,
+    item.createdAt,
+  ].join("\t")));
   process.exit(0);
 }
 
 if (/\/issues\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
-  rows(state.issueReactions.map((item) => [item.actor, item.content, item.createdAt].join("\t")));
+  if (!(optionValue("--jq") || "").includes("(.id | tostring)")) process.exit(2);
+  rows(state.issueReactions.map((item, index) => [
+    item.actor,
+    item.id || 8000 + index,
+    item.content,
+    item.createdAt,
+  ].join("\t")));
   process.exit(0);
 }
 
 if (/\/pulls\/\d+\/reviews\?per_page=100$/.test(endpoint)) {
-  if (!(optionValue("--jq") || "").includes("@base64")) process.exit(2);
+  const query = optionValue("--jq") || "";
+  if (!query.includes("@base64") || !query.includes("(.id | tostring)")) process.exit(2);
   rows(state.reviews.map((item, index) => [
     item.actor,
     item.id || 5000 + index,
@@ -407,9 +426,11 @@ if (/\/pulls\/\d+\/reviews\?per_page=100$/.test(endpoint)) {
 }
 
 if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
-  if (!(optionValue("--jq") || "").includes("@base64")) process.exit(2);
-  rows(state.pullComments.map((item) => [
+  const query = optionValue("--jq") || "";
+  if (!query.includes("@base64") || !query.includes("(.id | tostring)")) process.exit(2);
+  rows(state.pullComments.map((item, index) => [
     item.actor,
+    item.id || 6000 + index,
     item.reviewId || 0,
     item.commitId,
     item.originalCommitId,
@@ -599,6 +620,30 @@ async function main() {
     "the executable review flow must request only its preflighted App plan");
   assert.doesNotMatch(prText, /gh workflow view .*--json state/,
     "workflow state detection must not depend on unsupported gh workflow --json flags");
+  const collectText = collectorContractBlock(prText);
+  for (const endpoint of [
+    'pulls/$PR/reviews?per_page=100',
+    'pulls/$PR/comments?per_page=100',
+    'issues/$PR/comments?per_page=100',
+    'issues/$PR/reactions?per_page=100',
+    'issues/comments/$SHIP_CODEX_REQUEST_COMMENT_ID/reactions?per_page=100',
+    'actions/runs?head_sha=$SHA&per_page=100',
+  ]) {
+    assert.ok(collectText.includes(endpoint),
+      `the signal collector must request a full page before paginating ${endpoint}`);
+  }
+  assert.equal((collectText.match(/--paginate/g) || []).length, 7,
+    "every list request in the signal collector must paginate");
+  assert.doesNotMatch(collectText, /\.\[0:200\]/,
+    "review bodies must remain complete until terminal classification");
+  assert.ok((collectText.match(/\| @base64/g) || []).length >= 3,
+    "App review and comment bodies must use a lossless line-safe projection");
+  assert.doesNotMatch(prText, /\/tmp\/jhw-pr-signals\.\$PR/,
+    "full review bodies must not be written through a predictable shared-temp path");
+  assert.match(prText, /ship_signal_file_prepare \|\| return/,
+    "the polling loop must allocate a private signal snapshot");
+  assert.match(prText, /ship_signal_cleanup_install/,
+    "the private signal snapshot must have invocation-wide cleanup");
   assert.match(agentsText, /\| `pr\.md` \|/);
   assert.match(agentsText, /ship\.md.*deprecated/i);
   assert.match(readmeText, /\/jhw:pr --review/);
@@ -613,7 +658,7 @@ async function main() {
   assert.ok(lstatSync(codexPrReference).isSymbolicLink(),
     "generated Codex jhw-pr reference must be a relative symlink");
   assert.match(await readFile(codexShipSkill, "utf8"), /deprecated/i);
-  const contract = `${contractBlock(prText)}\n${policyContractBlock(prText)}`;
+  const contract = `${contractBlock(prText)}\n${policyContractBlock(prText)}\n${collectorContractBlock(prText)}`;
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-pr-contract-"));
   const fakeGh = join(tempRoot, "gh");
   const fakeGit = join(tempRoot, "git");
@@ -760,6 +805,161 @@ async function main() {
       isGh(args, "label", "create") ||
       (args[0] === "pr" && ["create", "edit", "ready", "merge"].includes(args[1])) ||
       (args[0] === "api" && args.includes("POST")));
+
+    const partialSignalCollection = await runResult(
+      baseState({ failEndpoints: ["/pulls/42/comments"] }),
+      "collect >/dev/null",
+      { SHA: currentHead },
+    );
+    assert.notEqual(partialSignalCollection.code, 0,
+      "one failed list endpoint must fail the whole signal snapshot");
+    assert.equal(
+      partialSignalCollection.log.some((args) => args[0] === "api" && args[1]?.includes("/actions/runs?")),
+      false,
+      "collection must stop rather than mask a partial snapshot with a later successful endpoint",
+    );
+
+    const privateSignal = await run(
+      baseState(),
+      "ship_signal_file_prepare || exit $?\nprintf '%s\\n' \"$SHIP_SIGNAL_FILE\"",
+      { TMPDIR: tempRoot },
+    );
+    const privateSignalPath = privateSignal.stdout.trim();
+    assert.equal(dirname(privateSignalPath), tempRoot);
+    assert.match(privateSignalPath.split("/").at(-1), /^jhw-pr-signals\.[A-Za-z0-9]+$/);
+    const privateSignalStat = lstatSync(privateSignalPath);
+    assert.equal(privateSignalStat.isFile(), true);
+    assert.equal(privateSignalStat.isSymbolicLink(), false);
+    assert.equal(privateSignalStat.mode & 0o777, 0o600,
+      "signal snapshots must be owner-readable and owner-writable only");
+    await rm(privateSignalPath);
+
+    const nounsetPrivateSignal = await run(
+      baseState(),
+      [
+        "set -u",
+        "ship_signal_file_prepare || exit $?",
+        'printf "%s\\n" "$SHIP_SIGNAL_FILE"',
+        'ship_signal_file_cleanup "$SHIP_SIGNAL_FILE" "$SHIP_SIGNAL_DIR" || exit $?',
+      ].join("\n"),
+      { TMPDIR: tempRoot },
+    );
+    assert.equal(existsSync(nounsetPrivateSignal.stdout.trim()), false,
+      "signal-file preparation and cleanup must remain safe under caller nounset mode");
+
+    const realSignalDir = join(tempRoot, "signal-real");
+    const linkedSignalDir = join(tempRoot, "signal-link");
+    await mkdir(realSignalDir);
+    await mkdir(join(realSignalDir, "child"));
+    await symlink(realSignalDir, linkedSignalDir, "dir");
+    for (const configuredTmpDir of [
+      linkedSignalDir,
+      `${linkedSignalDir}/`,
+      `${linkedSignalDir}//`,
+      `${linkedSignalDir}///`,
+      `${linkedSignalDir}/.`,
+      `${linkedSignalDir}/child/..`,
+      `${linkedSignalDir}/child/../`,
+      `${linkedSignalDir}/child/../.`,
+    ]) {
+      const symlinkTempDir = await runResult(
+        baseState(),
+        "ship_signal_file_prepare",
+        { TMPDIR: configuredTmpDir },
+      );
+      assert.notEqual(symlinkTempDir.code, 0,
+        `an explicitly configured symlink TMPDIR must be rejected before snapshot creation: ${configuredTmpDir}`);
+    }
+
+    const systemAliasPolicy = await run(
+      baseState(),
+      [
+        'ship_signal_dirs_match "/tmp" "/private/tmp" Darwin || exit $?',
+        'ship_signal_dirs_match "/var/folders/ab/T" "/private/var/folders/ab/T" Darwin || exit $?',
+        'ship_signal_dirs_match "/var/tmp" "/var/tmp" Linux || exit $?',
+        'if ship_signal_dirs_match "/tmp/user-link" "/private/tmp/real-target" Darwin; then exit 1; fi',
+        'if ship_signal_dirs_match "/var/folders/ab/T" "/private/var/folders/other/T" Darwin; then exit 1; fi',
+        'if ship_signal_dirs_match "/var/folders/ab/T" "/private/var/folders/ab/T" Linux; then exit 1; fi',
+        "printf 'trusted-system-alias-only\\n'",
+      ].join("\n"),
+    );
+    assert.equal(systemAliasPolicy.stdout, "trusted-system-alias-only\n",
+      "only exact macOS /tmp and /var physical aliases may bypass logical-path equality");
+
+    const trappedSignal = await runResult(
+      baseState(),
+      [
+        "ship_signal_file_prepare || exit $?",
+        "ship_signal_cleanup_install",
+        'printf "%s\\n" "$SHIP_SIGNAL_FILE"',
+        "exit 7",
+      ].join("\n"),
+      { TMPDIR: tempRoot },
+    );
+    assert.equal(trappedSignal.code, 7);
+    assert.equal(existsSync(trappedSignal.stdout.trim()), false,
+      "the invocation-wide EXIT trap must remove the private signal snapshot");
+
+    const callerExitMarker = join(tempRoot, "caller-exit-status");
+    const chainedExit = await runResult(
+      baseState(),
+      [
+        "trap 'printf \"%s\\n\" \"$?\" > \"$CALLER_EXIT_MARKER\"' EXIT",
+        "ship_signal_file_prepare || exit $?",
+        "ship_signal_cleanup_install || exit $?",
+        'printf "%s\\n" "$SHIP_SIGNAL_FILE"',
+        "exit 7",
+      ].join("\n"),
+      { TMPDIR: tempRoot, CALLER_EXIT_MARKER: callerExitMarker },
+    );
+    assert.equal(chainedExit.code, 7);
+    assert.equal(existsSync(chainedExit.stdout.trim()), false);
+    assert.equal(await readFile(callerExitMarker, "utf8"), "7\n",
+      "the invocation cleanup must chain the caller EXIT trap with its original status");
+
+    const restoredCallerTraps = await run(
+      baseState(),
+      [
+        "trap ':' EXIT",
+        "trap ':' HUP",
+        "trap ':' INT",
+        "trap ':' TERM",
+        'before_exit="$(trap -p EXIT)"',
+        'before_hup="$(trap -p HUP)"',
+        'before_int="$(trap -p INT)"',
+        'before_term="$(trap -p TERM)"',
+        "ship_signal_file_prepare || exit $?",
+        "ship_signal_cleanup_install || exit $?",
+        "ship_signal_cleanup_finish || exit $?",
+        '[[ "$(trap -p EXIT)" == "$before_exit" ]] || exit 1',
+        '[[ "$(trap -p HUP)" == "$before_hup" ]] || exit 1',
+        '[[ "$(trap -p INT)" == "$before_int" ]] || exit 1',
+        '[[ "$(trap -p TERM)" == "$before_term" ]] || exit 1',
+        "trap - EXIT HUP INT TERM",
+        "printf 'restored\\n'",
+      ].join("\n"),
+      { TMPDIR: tempRoot },
+    );
+    assert.equal(restoredCallerTraps.stdout, "restored\n",
+      "snapshot cleanup must restore every caller-owned trap");
+
+    for (const [signal, expectedCode] of [["HUP", 129], ["INT", 130], ["TERM", 143]]) {
+      const signaledSnapshot = await runResult(
+        baseState(),
+        [
+          "ship_signal_file_prepare || exit $?",
+          'printf "%s\\n" "$SHIP_SIGNAL_FILE"',
+          "ship_signal_cleanup_install || exit $?",
+          `kill -${signal} "$$"`,
+          "exit 99",
+        ].join("\n"),
+        { TMPDIR: tempRoot },
+      );
+      assert.equal(signaledSnapshot.code, expectedCode,
+        `${signal} must retain its conventional non-success exit status`);
+      assert.equal(existsSync(signaledSnapshot.stdout.trim()), false,
+        `${signal} must remove the private signal snapshot`);
+    }
 
     const readOnly = await runResult(
       baseState({ viewerPermission: "READ", prExists: false }),
@@ -1925,6 +2125,20 @@ async function main() {
     assert.equal(duplicate.stdout.trim(), "TRIGGER_FAILED,duplicate_request_marker");
     assert.equal(duplicate.log.filter((args) => args.includes("POST")).length, 0);
 
+    const parseableMalformedRequestTimestamp = await run(
+      baseState({
+        issueComments: [{
+          id: 16,
+          actor: "jhw7500",
+          createdAt: "1970-01-01",
+          body: requestBody,
+        }],
+      }),
+      "ship_codex_trigger\nprintf '%s,%s\\n' \"$SHIP_CODEX_TRIGGER_STATUS\" \"$SHIP_CODEX_TRIGGER_REASON\"",
+    );
+    assert.equal(parseableMalformedRequestTimestamp.stdout.trim(), "TRIGGER_FAILED,invalid_request_timestamp",
+      "a parseable non-RFC3339 request timestamp must fail before signal collection");
+
     const legacyCurrentHead = await run(
       baseState({
         issueComments: [
@@ -2084,6 +2298,707 @@ async function main() {
       "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
     );
     assert.equal(currentReview.stdout.trim(), "CLEAN");
+
+    for (const [surface, artifacts] of [
+      ["review", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Unable to review this pull request because the usage limit was reached.",
+        }],
+      }],
+      ["inline comment", {
+        pullComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "2026-08-29T00:03:00Z",
+          body: "The connector failed to review this change.",
+        }],
+      }],
+      ["direct cannot-review response", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Cannot review this pull request because the provider is unavailable.",
+        }],
+      }],
+      ["environment-creation response", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Codex could not create an environment for this review.",
+        }],
+      }],
+      ["passive provider failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review could not be completed because the provider is unavailable.",
+        }],
+      }],
+      ["standalone failed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review failed.",
+        }],
+      }],
+      ["standalone unavailable status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review unavailable.",
+        }],
+      }],
+      ["standalone not-performed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review not performed.",
+        }],
+      }],
+      ["passive not-performed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "The review was not performed.",
+        }],
+      }],
+      ["plural-actor failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "We were unable to review this pull request because the provider is unavailable.",
+        }],
+      }],
+      ["present-perfect failed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "The review has failed.",
+        }],
+      }],
+      ["qualified passive not-performed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "The review was not performed in this run.",
+        }],
+      }],
+      ["present-perfect not-performed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review has not been performed.",
+        }],
+      }],
+      ["contracted not-performed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "This review hasn't been performed.",
+        }],
+      }],
+      ["numbered pull-request target failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Could not review PR #101 because the provider is unavailable.",
+        }],
+      }],
+      ["environment-qualified unavailable status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review unavailable in this environment.",
+        }],
+      }],
+      ["no-review passive status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "No review was performed.",
+        }],
+      }],
+      ["not-able actor failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "We were not able to review this pull request.",
+        }],
+      }],
+      ["indefinite-article passive status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "A review was not performed.",
+        }],
+      }],
+      ["not-completed passive status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "The review was not completed.",
+        }],
+      }],
+      ["present-perfect not-completed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "The review has not been completed.",
+        }],
+      }],
+      ["comma-qualified failed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review failed, so no findings are available.",
+        }],
+      }],
+      ["bare connector unavailable status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Connector unavailable.",
+        }],
+      }],
+      ["connector-error unavailable status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Connector error: unavailable.",
+        }],
+      }],
+      ["connector-error quota status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Connector error: quota exceeded.",
+        }],
+      }],
+      ["retry-qualified failed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review failed, please retry.",
+        }],
+      }],
+      ["retry-qualified connector status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Connector unavailable; retry later.",
+        }],
+      }],
+      ["comma-before-cause failed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review failed, because the provider is unavailable.",
+        }],
+      }],
+      ["semicolon-retry failed status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review failed; please retry later.",
+        }],
+      }],
+      ["semicolon-quota action failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Unable to review this PR; quota reached.",
+        }],
+      }],
+      ["semicolon-retry connector failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Connector unavailable; please retry.",
+        }],
+      }],
+      ["processing-review connector failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "The connector returned an error while processing the review.",
+        }],
+      }],
+      ["review-start connector failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "The connector returned an error before the review could start.",
+        }],
+      }],
+      ["review-setup connector failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Connector errored during review setup.",
+        }],
+      }],
+      ["contracted-actor usage-limit failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "You've reached your usage limit.",
+        }],
+      }],
+      ["contracted-actor quota failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "We've hit the quota.",
+        }],
+      }],
+      ["environment-creation failure status", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Environment creation failed.",
+        }],
+      }],
+      ["articleless environment-creation failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Failed to create environment.",
+        }],
+      }],
+      ["definite-article environment-creation failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Could not create the environment.",
+        }],
+      }],
+      ["emphasized review failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "**Review failed**.",
+        }],
+      }],
+      ["emphasized inline failure", {
+        pullComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "2026-08-29T00:03:00Z",
+          body: "- **Unable to review this PR**.",
+        }],
+      }],
+      ["triple-emphasized review failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "***Review failed***.",
+        }],
+      }],
+      ["emphasized sentence with retry failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "**Review failed.** Please retry later.",
+        }],
+      }],
+      ["emphasized status with external retry failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "**Review failed**, please retry later.",
+        }],
+      }],
+      ["nested-quote emphasized failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "> - **Review failed**.",
+        }],
+      }],
+      ["underscored emphasized action failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "__Unable to review this PR.__ Please retry later.",
+        }],
+      }],
+      ["smart-apostrophe passive failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "This review hasn’t been performed.",
+        }],
+      }],
+      ["smart-apostrophe actor failure", {
+        pullComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "2026-08-29T00:03:00Z",
+          body: "We couldn’t review this PR because the provider is unavailable.",
+        }],
+      }],
+      ["task-list emphasized review failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "- [x] **Review failed**.",
+        }],
+      }],
+      ["nested numbered task-list action failure", {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "> 1. [x] __Unable to review this PR__.",
+        }],
+      }],
+      ["unchecked task-list unavailable failure", {
+        pullComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "2026-08-29T00:03:00Z",
+          body: "- [ ] Review unavailable.",
+        }],
+      }],
+      ...[
+        "I'm unable to review this PR because the provider is unavailable.",
+        "I’m unable to review this PR because the provider is unavailable.",
+        "We're unable to review this PR because the connector failed.",
+        "We’re unable to review this PR because the connector failed.",
+        "I've failed to review this PR because the usage limit was reached.",
+        "I’ve failed to review this PR because the usage limit was reached.",
+        "We aren't able to review this PR because the provider is unavailable.",
+        "We aren’t able to review this PR because the provider is unavailable.",
+        "I haven't been able to review this PR because the provider is unavailable.",
+        "I haven’t been able to review this PR because the provider is unavailable.",
+        "We haven't been able to review this PR because the connector failed.",
+        "We haven’t been able to review this PR because the connector failed.",
+        "I hadn't been able to review this PR because the usage limit was reached.",
+        "I hadn’t been able to review this PR because the usage limit was reached.",
+        "I haven't yet been able to review this PR because the provider is unavailable.",
+        "We haven’t yet been able to review this PR because the connector failed.",
+        "I haven't been able to review this PR yet because the provider is unavailable.",
+        "We haven’t been able to review this PR yet due to the connector being unavailable.",
+      ].map((body, index) => [`actor-contraction failure ${index + 1}`, {
+        reviews: [{
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body,
+        }],
+      }]),
+    ]) {
+      const failedArtifact = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          ...artifacts,
+        }),
+        [
+          "ship_codex_trigger",
+          "ship_codex_signal_status",
+          "printf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+        ].join("\n"),
+      );
+      assert.equal(failedArtifact.stdout.trim(), "FAILED,reviewer_response_failed",
+        `a current-head Codex ${surface} that reports provider failure must fail closed`);
+    }
+
+    for (const body of [
+      "No usage limits were encountered. No P1 findings.",
+      "The connector-unavailable error path is correctly tested. No P1 findings.",
+      "Review completed without connector errors. No P1 findings.",
+      "The connector failed test now passes. No P1 findings.",
+      "Unable to review handling is tested. No P1 findings.",
+      "The connector failed to review path is covered. No P1 findings.",
+      "We verified the case where Codex failed to review this PR is handled safely. No P1 findings.",
+      "We verified behavior when Codex hit the usage limit. No P1 findings.",
+      "Connector error: review fallback is covered. No P1 findings.",
+      "Connector error: failed test is now covered. No P1 findings.",
+      "Review failed: regression handling is now covered. No P1 findings.",
+      "Connector unavailable: fallback handling is now covered. No P1 findings.",
+      "The connector returned an error before review testing, and that case now passes. No P1 findings.",
+      "The connector returned an error because the test exercises that branch; the current review is clean. No P1 findings.",
+      "**Review failed.** This is the regression fixture; the current review completed successfully. No P1 findings.",
+    ]) {
+      const discussedFailureTerm = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          reviews: [{
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            body,
+          }],
+        }),
+        "ship_codex_trigger\nship_codex_signal_status\nprintf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+      );
+      assert.equal(discussedFailureTerm.stdout.trim(), "CLEAN",
+        `ordinary successful review prose must not look like a provider failure: ${body}`);
+    }
+
+    const olderFailureNewerClean = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [
+          {
+            id: 5202,
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:04:00Z",
+            body: "No P1 findings.",
+          },
+          {
+            id: 5201,
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            body: "Review failed, please retry.",
+          },
+        ],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+    );
+    assert.equal(olderFailureNewerClean.stdout.trim(), "CLEAN,",
+      "a newer successful current-head review must supersede an older transient provider failure");
+
+    const olderFailureNewerPositive = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          id: 5203,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review failed, please retry.",
+        }],
+        commentReactions: [{
+          id: 7201,
+          actor: "chatgpt-codex-connector[bot]",
+          content: "+1",
+          createdAt: "2026-08-29T00:04:00Z",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+    );
+    assert.equal(olderFailureNewerPositive.stdout.trim(), "CLEAN,",
+      "a newer request-scoped positive reaction must supersede an older transient provider failure");
+
+    const olderCleanNewerFailure = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [
+          {
+            id: 5204,
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            body: "No P1 findings.",
+          },
+          {
+            id: 5205,
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:04:00Z",
+            body: "Review failed, please retry.",
+          },
+        ],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+    );
+    assert.equal(olderCleanNewerFailure.stdout.trim(), "FAILED,reviewer_response_failed",
+      "a newer provider failure must supersede an older successful review");
+
+    const sameEndpointSameSecond = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [
+          {
+            id: 5212,
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            body: "No P1 findings.",
+          },
+          {
+            id: 5211,
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: "2026-08-29T00:03:00Z",
+            body: "Review failed, please retry.",
+          },
+        ],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+    );
+    assert.equal(sameEndpointSameSecond.stdout.trim(), "CLEAN,",
+      "same-endpoint, same-second responses must use the safe numeric id as a deterministic tiebreaker");
+
+    const crossEndpointSameSecond = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          id: 5213,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review failed, please retry.",
+        }],
+        commentReactions: [{
+          id: 7202,
+          actor: "chatgpt-codex-connector[bot]",
+          content: "+1",
+          createdAt: "2026-08-29T00:03:00Z",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+    );
+    assert.equal(crossEndpointSameSecond.stdout.trim(), "FAILED,signal_order_ambiguous",
+      "conflicting cross-endpoint signals in the same timestamp second must fail closed");
+
+    for (const [label, reviewBodyText, reviewAt, eyesAt, expected] of [
+      ["newer eyes after clean", "No P1 findings.", "2026-08-29T00:03:00Z", "2026-08-29T00:04:00Z", "CLEAN,"],
+      ["newer eyes after failure", "Review failed, please retry.", "2026-08-29T00:03:00Z", "2026-08-29T00:04:00Z", "FAILED,reviewer_response_failed"],
+      ["same-second eyes and clean", "No P1 findings.", "2026-08-29T00:03:00Z", "2026-08-29T00:03:00Z", "CLEAN,"],
+      ["older eyes before clean", "No P1 findings.", "2026-08-29T00:04:00Z", "2026-08-29T00:03:00Z", "CLEAN,"],
+    ]) {
+      const acknowledgmentCannotOverrideTerminal = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          reviews: [{
+            id: 5220,
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: reviewAt,
+            body: reviewBodyText,
+          }],
+          commentReactions: [{
+            id: 7220,
+            actor: "chatgpt-codex-connector[bot]",
+            content: "eyes",
+            createdAt: eyesAt,
+          }],
+        }),
+        "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+      );
+      assert.equal(acknowledgmentCannotOverrideTerminal.stdout.trim(), expected,
+        `a non-terminal eyes acknowledgment must not override terminal review evidence: ${label}`);
+    }
+
+    for (const [label, artifacts] of [
+      ["review id", {
+        reviews: [{
+          id: "invalid-id",
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "Review failed, please retry.",
+        }],
+      }],
+      ["review timestamp", {
+        reviews: [{
+          id: 5231,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "not-a-timestamp",
+          body: "Review failed, please retry.",
+        }],
+      }],
+      ["parseable non-RFC3339 review timestamp", {
+        reviews: [{
+          id: 5232,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "1970-01-01",
+          body: "Review failed, please retry.",
+        }],
+      }],
+      ["inline-comment timestamp", {
+        pullComments: [{
+          id: 6231,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "not-a-timestamp",
+          body: "Review failed, please retry.",
+        }],
+      }],
+      ["issue-reaction timestamp", {
+        issueReactions: [{
+          id: 8231,
+          actor: "chatgpt-codex-connector[bot]",
+          content: "-1",
+          createdAt: "not-a-timestamp",
+        }],
+      }],
+    ]) {
+      const malformedSignalWithNewerClean = await run(
+        baseState({
+          issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+          commentReactions: [{
+            id: 7231,
+            actor: "chatgpt-codex-connector[bot]",
+            content: "+1",
+            createdAt: "2026-08-29T00:04:00Z",
+          }],
+          ...artifacts,
+        }),
+        "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+      );
+      assert.equal(malformedSignalWithNewerClean.stdout.trim(), "FAILED,signal_contract_invalid",
+        `malformed in-scope ${label} metadata must fail closed even when a newer clean signal exists`);
+    }
 
     const negatedPriorityReview = await run(
       baseState({
@@ -2387,6 +3302,48 @@ async function main() {
     );
     assert.equal(dismissedBlockingReview.stdout.trim(), "CLEAN",
       "a dismissed current-head review and its linked inline findings are no longer open blockers");
+
+    const dismissedFailureReview = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          id: 5103,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          state: "DISMISSED",
+          body: "Unable to review because usage limits were reached.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+    );
+    assert.equal(dismissedFailureReview.stdout.trim(), "FAILED,reviewer_response_failed",
+      "dismissing a provider-failure artifact must not turn it into a successful response");
+
+    const dismissedLinkedFailure = await run(
+      baseState({
+        issueComments: [{ id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody }],
+        reviews: [{
+          id: 5104,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          state: "DISMISSED",
+          body: "Review completed.",
+        }],
+        pullComments: [{
+          reviewId: 5104,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: "2026-08-29T00:03:01Z",
+          body: "Unable to review because usage limits were reached.",
+        }],
+      }),
+      "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+    );
+    assert.equal(dismissedLinkedFailure.stdout.trim(), "FAILED,reviewer_response_failed",
+      "dismissing a review must suppress linked findings, not linked provider-failure evidence");
 
     const activeLinkedInline = await run(
       baseState({
