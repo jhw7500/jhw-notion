@@ -211,15 +211,19 @@ jhw_pr_base_has_no_required_checks() {
 }
 
 jhw_pr_wait_required_checks() {
-  local pr="$1" expected_head="$2" actual_head base_ref actual_base check_output check_status
+  local pr="$1" expected_head="$2" expected_base_oid="$3"
+  local actual_head base_ref actual_base actual_base_oid check_output check_status
   local no_required_pattern="^no required checks reported on the '[^']+' branch$"
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || return 2
+  [[ "$expected_base_oid" =~ ^[0-9a-f]{40}$ ]] || return 2
   actual_head="$(gh pr view "$pr" --repo "$REPO_NWO" --json headRefOid -q .headRefOid)" || return 1
   [[ "$actual_head" == "$expected_head" ]] || return 3
   base_ref="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefName -q .baseRefName)" || return 1
   [[ -n "$base_ref" ]] || return 1
+  actual_base_oid="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)" || return 1
+  [[ "$actual_base_oid" == "$expected_base_oid" ]] || return 3
   if check_output="$(LC_ALL=C gh pr checks "$pr" --repo "$REPO_NWO" --required --watch --interval 10 2>&1)"; then
     check_status=0
   else
@@ -239,6 +243,8 @@ jhw_pr_wait_required_checks() {
   [[ "$actual_head" == "$expected_head" ]] || return 3
   actual_base="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefName -q .baseRefName)" || return 1
   [[ "$actual_base" == "$base_ref" ]] || return 3
+  actual_base_oid="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)" || return 1
+  [[ "$actual_base_oid" == "$expected_base_oid" ]] || return 3
 }
 
 jhw_pr_merge_review_gate() {
@@ -272,19 +278,26 @@ jhw_pr_merge_review_gate() {
 }
 
 jhw_pr_merge_reviewed_head() {
-  local pr="${1-}" reviewed_head="${2-}" method="${3-}" policy="${4-}" strategy_flag
-  (( $# >= 4 )) || return 2
+  local pr="${1-}" reviewed_head="${2-}" reviewed_base_oid="${3-}" method="${4-}" policy="${5-}"
+  local strategy_flag actual_base_oid
+  (( $# >= 5 )) || return 2
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$reviewed_head" =~ ^[0-9a-f]{40}$ ]] || return 2
+  [[ "$reviewed_base_oid" =~ ^[0-9a-f]{40}$ ]] || return 2
   case "$method" in
     merge) strategy_flag='--merge' ;;
     squash) strategy_flag='--squash' ;;
     rebase) strategy_flag='--rebase' ;;
     *) echo "unsupported merge method" >&2; return 2 ;;
   esac
-  shift 4
+  shift 5
   jhw_pr_merge_review_gate "$policy" "$@" || return
+  actual_base_oid="$(gh pr view "$pr" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)" || return 1
+  [[ "$actual_base_oid" == "$reviewed_base_oid" ]] || {
+    echo "PR base changed after review" >&2
+    return 3
+  }
   gh pr merge "$pr" --repo "$REPO_NWO" --match-head-commit "$reviewed_head" \
     "$strategy_flag" --delete-branch
 }
@@ -460,13 +473,13 @@ jhw_pr_repo_has_app_canary() {
     codex)
       issue_query='.[] | select((.user.login == "chatgpt-codex-connector" or .user.login == "chatgpt-codex-connector[bot]") and .user.type == "Bot") | {kind:"comment", actor:.user.login, url:.html_url, body:(.body // "")} | @base64'
       inline_query='.[] | select((.user.login == "chatgpt-codex-connector" or .user.login == "chatgpt-codex-connector[bot]") and .user.type == "Bot") | {kind:"inline", actor:.user.login, url:.html_url, body:(.body // "")} | @base64'
-      request_query='.[] | select((.body // "") | test("<!-- jhw-pr:review-request reviewer=codex head=[0-9a-f]{40} -->|<!-- jhw-(pr|ship):codex-review round=[1-9][0-9]* head=[0-9a-f]{40} -->")) | [.id, .html_url] | @tsv'
+      request_query='.[] | select((.body // "") | test("<!-- jhw-pr:review-request reviewer=codex head=[0-9a-f]{40} base=[0-9a-f]{40} -->|<!-- jhw-pr:review-request reviewer=codex head=[0-9a-f]{40} -->|<!-- jhw-(pr|ship):codex-review round=[1-9][0-9]* head=[0-9a-f]{40} -->")) | [.id, .html_url] | @tsv'
       reaction_query='.[] | select((.user.login == "chatgpt-codex-connector" or .user.login == "chatgpt-codex-connector[bot]") and .user.type == "Bot" and .content == "+1") | {kind:"reaction", actor:.user.login, content:.content} | @base64'
       ;;
     gemini-assist)
       issue_query='.[] | select(.user.login == "gemini-code-assist[bot]" and .user.type == "Bot") | {kind:"comment", actor:.user.login, url:.html_url, body:(.body // "")} | @base64'
       inline_query='.[] | select(.user.login == "gemini-code-assist[bot]" and .user.type == "Bot") | {kind:"inline", actor:.user.login, url:.html_url, body:(.body // "")} | @base64'
-      request_query='.[] | select((.body // "") | test("<!-- jhw-pr:review-request reviewer=gemini-assist head=[0-9a-f]{40} -->")) | [.id, .html_url] | @tsv'
+      request_query='.[] | select((.body // "") | test("<!-- jhw-pr:review-request reviewer=gemini-assist head=[0-9a-f]{40} base=[0-9a-f]{40} -->|<!-- jhw-pr:review-request reviewer=gemini-assist head=[0-9a-f]{40} -->")) | [.id, .html_url] | @tsv'
       reaction_query='.[] | select(.user.login == "gemini-code-assist[bot]" and .user.type == "Bot" and .content == "+1") | {kind:"reaction", actor:.user.login, content:.content} | @base64'
       ;;
     *) return 2 ;;
@@ -1006,17 +1019,17 @@ jhw_pr_apply_existing_pr_policy() {
    - 새 PR: push → `gh pr create --draft --fill`(commit metadata로 비대화식 title/body 확정) → mode 라벨 reconcile/read-back → head/base/draft 검증 → ready 순서다.
    - 기존 PR의 새 head: base reconcile/read-back → mode 라벨 reconcile/read-back → push → 새 원격 head/base 검증 순서다.
    - 같은 head의 명시적 `request`는 synchronize push를 생략하고 라벨 read-back 뒤 Task 3의 head별 idempotent 요청 계약을 사용한다.
-   - `PR=<번호>`, `SHA="$(git rev-parse HEAD)"` (push 후 기준 — 재푸시마다 갱신)
+   - `PR=<번호>`, `SHA="$(git rev-parse HEAD)"`, `ROUND_BASE_OID="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)"` (push·base reconcile 후 기준 — 재푸시마다 갱신)
 3. **병렬 게이트 시작**
    - (a) 모든 mode에서 `jhw_pr_wait_required_checks`로 **required CI**를 감시한다.
    - (b) review-on이면 **리뷰 라운드 모니터링**을 시작한다(아래 구현). `skip`/`auto=false`이면 AI artifact를 읽지 않는다.
    - (c) `--target` 지정 시 **타겟 검증을 백그라운드로** 시작 (Claude Code Bash 도구의 `run_in_background:true` 파라미터 — bash 명령이 아님) — 종료 시 PASS/FAIL 수집
-4. **리뷰 라운드 트리거 + 폴링** — `request`는 활성 중앙 workflow를 같은 head에서 재사용/dispatch하고 eligible App을 명시적으로 요청한다. `auto=true`는 일반 event run을 사용하면서 eligible App을 현재 head에 명시적으로 요청한다. `--auto-fix` 재푸시 라운드도 같은 head-scoped App helper와 현재-head workflow 계약을 반복하며, 각 expected 리뷰어가 terminal 신호를 낼 때까지 (또는 timeout) 폴링한다:
+4. **리뷰 라운드 트리거 + 폴링** — review-triggering push/label/dispatch 전에 `jhw_pr_capture_workflow_run_floors "$ROUND_HEAD" "${JHW_PR_AVAILABLE_WORKFLOWS:-}"`로 workflow별 기존 최대 run ID를 캡처한다. `request`는 그 floor보다 큰 현재-round run만 재사용/dispatch하고 eligible App을 현재 head/base OID에 명시적으로 요청한다. `auto=true`도 floor 이후 일반 event run을 사용한다. `--auto-fix` 재푸시 라운드마다 같은 캡처와 App/workflow 계약을 반복하며, 각 expected 리뷰어가 terminal 신호를 낼 때까지 (또는 timeout) 폴링한다:
    - 워크플로우 리뷰어: `actions/runs?head_sha=$SHA`(주 감지, PAT에서 동작) + `gh run watch <run-id> --exit-status`(BG, 라이브 대기). `gh pr checks`/`commits/{sha}/check-runs`는 토큰 Checks-read 권한 없으면 403이라 의존하지 않는다.
    - 앱/봇 리뷰어: 매 간격 `reviews`/`comments`/`issue-comments`/`reactions` 수집
 5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다. planned reviewer별 terminal 상태를 `ROUND_REVIEW_STATUSES` 배열에 정확히 한 개씩 보존하며, reviewer가 하나도 계획되지 않았으면 빈 배열을 임의의 `CLEAN`으로 바꾸지 않는다.
-6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. **push 직전에** `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 캡처하고 재푸시 → 성공 직후 `ROUND_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"` 캡처 → **`ROUND_HEAD="$(git rev-parse HEAD)"` 및 `SHA="$ROUND_HEAD"` 재계산** → 아래 라운드 계약 실행 → 4로 복귀한다. `ROUND_STARTED_AT`은 run 필터 경계이고, 180초 생성 유예는 느린 push 시간을 제외하도록 `ROUND_PUSHED_AT`부터 잰다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 5) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
-7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" <merge|squash|rebase> "$EFFECTIVE_REVIEW_POLICY" "${ROUND_REVIEW_STATUSES[@]}"`. 이 helper는 review-on policy에서 상태가 0개인 vacuous CLEAN을 거부하고 모든 상태가 `CLEAN`인지 확인한 뒤, `gh pr merge --match-head-commit "$ROUND_HEAD"`로 최종 mutation 자체를 검토된 SHA에 원자적으로 묶는다.
+6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. 커밋 뒤 **push 전에** `ROUND_HEAD="$(git rev-parse HEAD)"`와 workflow run-ID floor를 캡처하고, 직후 `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 잡아 재푸시한다. 성공 직후 `ROUND_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`, `SHA="$ROUND_HEAD"`, `ROUND_BASE_OID="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)"`를 확정한 뒤 아래 라운드 계약을 실행하고 4로 복귀한다. `ROUND_STARTED_AT`은 run 필터 경계이고, ID floor가 같은 초의 이전 run을 분리하며, 180초 생성 유예는 느린 push 시간을 제외하도록 `ROUND_PUSHED_AT`부터 잰다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 5) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
+7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head/base OID 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" "$ROUND_BASE_OID" <merge|squash|rebase> "$EFFECTIVE_REVIEW_POLICY" "${ROUND_REVIEW_STATUSES[@]}"`. 이 helper는 review-on policy에서 상태가 0개인 vacuous CLEAN을 거부하고 모든 상태가 `CLEAN`인지 확인한 뒤, base OID를 즉시 재검증하고 `gh pr merge --match-head-commit "$ROUND_HEAD"`로 최종 mutation을 검토된 head에 묶는다.
    - 명시적 `--no-review --merge`에서는 AI gate만 면제한다. required CI, 타겟, 현재 head, mergeability와 merge method 검증은 그대로 유지하고 `AI review: explicitly skipped (--no-review; review:skip)` receipt를 남긴다.
    - `review.auto=false`인 implicit auto mode는 zero-review merge exemption이 아니다. 자동 머지를 원하면 사용자가 명시적으로 `--no-review --merge`를 선택해야 한다.
    - 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT}` 중 하나이거나 타겟 `FAIL`이면 **머지하지 않고** 보고
@@ -1026,7 +1039,7 @@ jhw_pr_apply_existing_pr_policy() {
 
 ## auto-fix 라운드 트리거 계약
 
-이 계약은 **재푸시 라운드(2+)에서만** 실행한다. `ROUND_STARTED_AT`은 push 직전 필터 경계, `ROUND_PUSHED_AT`은 성공한 push 직후 생성 유예 경계이고, `ROUND_HEAD`는 push 후 정확한 40자리 SHA다. Codex 요청 상태 파일은 요청 코멘트 ID·GitHub가 반환한 생성 시각·대상 HEAD를 보존하며, 같은 라운드/HEAD를 재시도하면 숨은 마커로 기존 요청을 재사용한다. Claude/Gemini workflow는 push 완료 후 3회 폴링에 해당하는 180초 동안 현재 HEAD의 새 run 생성을 확인하고, 그 뒤에도 없으면 `TRIGGER_FAILED`다. 20분 `SHIP_TIMEOUT_MIN`은 **시작된 리뷰의 응답 대기**에만 적용한다.
+이 계약은 **재푸시 라운드(2+)에서만** 실행한다. `ROUND_STARTED_AT`은 push 직전 필터 경계, `ROUND_PUSHED_AT`은 성공한 push 직후 생성 유예 경계이고, `ROUND_HEAD`와 `ROUND_BASE_OID`는 push/base reconcile 후의 정확한 40자리 SHA다. App 요청 상태 파일은 요청 코멘트 ID·GitHub가 반환한 생성 시각·대상 HEAD·base OID를 보존하며, 같은 HEAD/base OID를 재시도할 때만 숨은 마커로 기존 요청을 재사용한다. Claude/Gemini workflow는 push 완료 후 3회 폴링에 해당하는 180초 동안 현재 HEAD의 새 run 생성을 확인하고, 그 뒤에도 없으면 `TRIGGER_FAILED`다. 20분 `SHIP_TIMEOUT_MIN`은 **시작된 리뷰의 응답 대기**에만 적용한다.
 
 <!-- pr-round-contract: trigger-and-scope:begin -->
 ```bash
@@ -1034,11 +1047,13 @@ jhw_pr_apply_existing_pr_policy() {
 : "${PR:?PR 번호가 필요합니다}"
 : "${ROUND:?auto-fix 라운드 번호가 필요합니다}"
 : "${ROUND_HEAD:?push 후 HEAD가 필요합니다}"
+: "${ROUND_BASE_OID:?현재 PR base OID가 필요합니다}"
 : "${ROUND_STARTED_AT:?push 직전 UTC 시각이 필요합니다}"
 : "${ROUND_PUSHED_AT:?push 성공 직후 UTC 시각이 필요합니다}"
 [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2 2>/dev/null || exit 2; }
 [[ "$ROUND" =~ ^[1-9][0-9]*$ ]] || { echo "invalid ROUND" >&2; return 2 2>/dev/null || exit 2; }
 [[ "$ROUND_HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid ROUND_HEAD" >&2; return 2 2>/dev/null || exit 2; }
+[[ "$ROUND_BASE_OID" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid ROUND_BASE_OID" >&2; return 2 2>/dev/null || exit 2; }
 [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "invalid REPO_NWO" >&2; return 2 2>/dev/null || exit 2; }
 
 SHIP_TRIGGER_GRACE_SECONDS="${SHIP_TRIGGER_GRACE_SECONDS:-180}"
@@ -1086,6 +1101,7 @@ jhw_pr_app_request_failed() {
   JHW_PR_APP_REQUEST_REASON="$1"
   JHW_PR_APP_REQUEST_COMMENT_ID=""
   JHW_PR_APP_REQUESTED_AT=""
+  JHW_PR_APP_REQUEST_BASE_OID=""
   JHW_PR_APP_REQUEST_CREATED=false
   echo "TRIGGER_FAILED: $1" >&2
   return 1
@@ -1093,7 +1109,7 @@ jhw_pr_app_request_failed() {
 
 jhw_pr_request_app_review() {
   local reviewer="$1" head="$2" command actor marker body endpoint query raw line
-  local id created_at extra codex_compat_pattern
+  local id created_at extra
   local -a matches=()
 
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
@@ -1102,6 +1118,7 @@ jhw_pr_request_app_review() {
   }
   [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2; }
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid review head" >&2; return 2; }
+  [[ "$ROUND_BASE_OID" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid review base OID" >&2; return 2; }
   case "$reviewer" in
     codex) command='@codex review' ;;
     gemini-assist) command='/gemini review' ;;
@@ -1112,6 +1129,7 @@ jhw_pr_request_app_review() {
   JHW_PR_APP_REQUEST_REASON=""
   JHW_PR_APP_REQUEST_COMMENT_ID=""
   JHW_PR_APP_REQUESTED_AT=""
+  JHW_PR_APP_REQUEST_BASE_OID=""
   JHW_PR_APP_REQUEST_CREATED=false
   actor="$(gh api user --jq '.login' 2>/dev/null)" || {
     jhw_pr_app_request_failed actor_lookup_failed
@@ -1122,16 +1140,12 @@ jhw_pr_request_app_review() {
     return
   }
 
-  marker="<!-- jhw-pr:review-request reviewer=${reviewer} head=${head} -->"
+  marker="<!-- jhw-pr:review-request reviewer=${reviewer} head=${head} base=${ROUND_BASE_OID} -->"
   body="$command
 
 $marker"
   endpoint="repos/$REPO_NWO/issues/$PR/comments?per_page=100"
   query=".[] | select(.user.login == \"$actor\" and ((.body // \"\") | contains(\"$marker\"))) | [.id, .created_at] | @tsv"
-  if [[ "$reviewer" == codex ]]; then
-    codex_compat_pattern="<!-- jhw-(pr|ship):codex-review round=[1-9][0-9]* head=$head -->"
-    query=".[] | select(.user.login == \"$actor\" and ((((.body // \"\") | contains(\"$marker\"))) or (((.body // \"\") | test(\"$codex_compat_pattern\"))))) | [.id, .created_at] | @tsv"
-  fi
   raw="$(gh api "$endpoint" --paginate --jq "$query" 2>/dev/null)" || {
     jhw_pr_app_request_failed request_lookup_failed
     return
@@ -1184,6 +1198,7 @@ $marker"
   JHW_PR_APP_REQUESTED_AT="$created_at"
   JHW_PR_APP_REQUEST_REVIEWER="$reviewer"
   JHW_PR_APP_REQUEST_HEAD="$head"
+  JHW_PR_APP_REQUEST_BASE_OID="$ROUND_BASE_OID"
 }
 
 ship_write_codex_trigger_state() {
@@ -1197,11 +1212,12 @@ ship_write_codex_trigger_state() {
     printf 'request_comment_id=%s\n' "${SHIP_CODEX_REQUEST_COMMENT_ID:-}"
     printf 'requested_at=%s\n' "${SHIP_CODEX_REQUESTED_AT:-}"
     printf 'target_head=%s\n' "$ROUND_HEAD"
+    printf 'target_base_oid=%s\n' "$ROUND_BASE_OID"
   } >"$temp_state" && mv -f -- "$temp_state" "$SHIP_ROUND_STATE_FILE"
 }
 
 jhw_pr_request_eligible_apps() {
-  local head="$1" eligible="$2" reviewer status reason comment_id requested_at created
+  local head="$1" eligible="$2" reviewer status reason comment_id requested_at base_oid created
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
   if grep -Fqx -- codex <<<"$eligible"; then
     case "${JHW_PR_CODEX_APP_ACTOR:-$SHIP_CODEX_LOGIN}" in
@@ -1227,9 +1243,10 @@ jhw_pr_request_eligible_apps() {
     reason="${JHW_PR_APP_REQUEST_REASON:--}"
     comment_id="${JHW_PR_APP_REQUEST_COMMENT_ID:--}"
     requested_at="${JHW_PR_APP_REQUESTED_AT:--}"
+    base_oid="${JHW_PR_APP_REQUEST_BASE_OID:--}"
     created="${JHW_PR_APP_REQUEST_CREATED:-false}"
     [[ -z "$JHW_PR_APP_REQUEST_RESULTS" ]] || JHW_PR_APP_REQUEST_RESULTS+=$'\n'
-    JHW_PR_APP_REQUEST_RESULTS+="$reviewer"$'\t'"$status"$'\t'"$reason"$'\t'"$comment_id"$'\t'"$requested_at"$'\t'"$created"$'\t'"$head"
+    JHW_PR_APP_REQUEST_RESULTS+="$reviewer"$'\t'"$status"$'\t'"$reason"$'\t'"$comment_id"$'\t'"$requested_at"$'\t'"$created"$'\t'"$head"$'\t'"$base_oid"
     if [[ "$reviewer" == codex ]]; then
       case "$status" in STARTED|TRIGGER_FAILED) ;; *) return 1 ;; esac
       SHIP_CODEX_TRIGGER_STATUS="$status"
@@ -1237,6 +1254,7 @@ jhw_pr_request_eligible_apps() {
       SHIP_CODEX_REQUEST_COMMENT_ID="${JHW_PR_APP_REQUEST_COMMENT_ID:-}"
       SHIP_CODEX_REQUESTED_AT="${JHW_PR_APP_REQUESTED_AT:-}"
       SHIP_CODEX_TARGET_HEAD="$head"
+      SHIP_CODEX_TARGET_BASE_OID="${JHW_PR_APP_REQUEST_BASE_OID:-}"
       SHIP_CODEX_REQUEST_CREATED="$created"
       if [[ -n "${SHIP_ROUND_STATE_FILE:-}" ]]; then
         ship_write_codex_trigger_state || return 1
@@ -1255,9 +1273,54 @@ jhw_pr_workflow_request_failed() {
   return 1
 }
 
+jhw_pr_workflow_name_for_file() {
+  case "$1" in
+    claude-code-review.yml) printf '%s\n' 'Claude Code Review' ;;
+    gemini-auto-review.yml) printf '%s\n' 'Gemini Auto PR Review' ;;
+    opencode-auto-review.yml) printf '%s\n' 'OpenCode Auto PR Review' ;;
+    *) return 2 ;;
+  esac
+}
+
+jhw_pr_capture_workflow_run_floors() {
+  local head="$1" workflows="$2" workflow workflow_name raw
+  local id attempt name run_head created_at status conclusion event extra floor
+  local floors=''
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
+  raw="$(gh api "repos/$REPO_NWO/actions/runs?head_sha=$head&per_page=100" --paginate \
+    --jq '.workflow_runs[] | [.id, .run_attempt, .name, .head_sha, .created_at, .status, (.conclusion // "null"), .event] | @tsv' 2>/dev/null)" || return 1
+  while IFS= read -r workflow; do
+    [[ -n "$workflow" ]] || continue
+    workflow_name="$(jhw_pr_workflow_name_for_file "$workflow")" || return 2
+    floor=0
+    while IFS=$'\t' read -r id attempt name run_head created_at status conclusion event extra; do
+      [[ "$name" == "$workflow_name" && "$run_head" == "$head" ]] || continue
+      [[ "$id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || return 1
+      (( id > floor )) && floor="$id"
+    done <<<"$raw"
+    [[ -z "$floors" ]] || floors+=$'\n'
+    floors+="$workflow_name"$'\t'"$floor"
+  done <<<"$workflows"
+  JHW_PR_WORKFLOW_RUN_FLOORS="$floors"
+  export JHW_PR_WORKFLOW_RUN_FLOORS
+}
+
+jhw_pr_workflow_run_floor() {
+  local wanted="$1" name floor extra found=0 selected=''
+  while IFS=$'\t' read -r name floor extra; do
+    [[ "$name" == "$wanted" ]] || continue
+    [[ "$floor" =~ ^[0-9]+$ && -z "$extra" ]] || return 2
+    (( found == 0 )) || return 2
+    found=1
+    selected="$floor"
+  done <<<"${JHW_PR_WORKFLOW_RUN_FLOORS:-}"
+  (( found == 1 )) || return 1
+  printf '%s\n' "$selected"
+}
+
 jhw_pr_dispatch_same_head() {
   local workflow_file="$1" workflow_name="$2" head="$3"
-  local workflow_metadata_status endpoint raw line id attempt name run_head created_at status conclusion event extra
+  local workflow_metadata_status endpoint raw line id attempt name run_head created_at status conclusion event extra floor
   local -a matches=()
 
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
@@ -1293,6 +1356,10 @@ jhw_pr_dispatch_same_head() {
     esac
     return
   fi
+  floor="$(jhw_pr_workflow_run_floor "$workflow_name")" || {
+    jhw_pr_workflow_request_failed workflow_floor_missing
+    return
+  }
 
   endpoint="repos/$REPO_NWO/actions/runs?head_sha=$head&event=workflow_dispatch&per_page=100"
   raw="$(gh api "$endpoint" --paginate \
@@ -1304,6 +1371,7 @@ jhw_pr_dispatch_same_head() {
     [[ -n "$id" ]] || continue
     [[ "$id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ ]] || continue
     [[ "$name" == "$workflow_name" && "$run_head" == "$head" && "$event" == workflow_dispatch ]] || continue
+    (( id > floor )) || continue
     ship_at_or_after "$created_at" "$ROUND_STARTED_AT" || continue
     case "$status" in
       queued|in_progress|completed) ;;
@@ -1359,6 +1427,7 @@ ship_codex_trigger_failed() {
   SHIP_CODEX_REQUEST_COMMENT_ID=""
   SHIP_CODEX_REQUESTED_AT=""
   SHIP_CODEX_TARGET_HEAD="$ROUND_HEAD"
+  SHIP_CODEX_TARGET_BASE_OID="$ROUND_BASE_OID"
   SHIP_CODEX_REQUEST_CREATED=false
   ship_write_codex_trigger_state 2>/dev/null || true
 }
@@ -1375,6 +1444,7 @@ ship_codex_trigger() {
   SHIP_CODEX_REQUEST_COMMENT_ID="$JHW_PR_APP_REQUEST_COMMENT_ID"
   SHIP_CODEX_REQUESTED_AT="$JHW_PR_APP_REQUESTED_AT"
   SHIP_CODEX_TARGET_HEAD="$ROUND_HEAD"
+  SHIP_CODEX_TARGET_BASE_OID="$JHW_PR_APP_REQUEST_BASE_OID"
   SHIP_CODEX_REQUEST_CREATED="$JHW_PR_APP_REQUEST_CREATED"
   if ! ship_write_codex_trigger_state; then
     ship_codex_trigger_failed state_record_failed
@@ -1382,13 +1452,17 @@ ship_codex_trigger() {
 }
 
 ship_workflow_trigger() {
-  local workflow_name="$1" endpoint raw start_epoch pushed_epoch now_epoch elapsed
+  local workflow_name="$1" endpoint raw start_epoch pushed_epoch now_epoch elapsed floor
   local run_id attempt name head created_at status conclusion
-  local selected_id="" selected_created=""
+  local selected_id="" selected_created="" ambiguous=false
 
   SHIP_WORKFLOW_TRIGGER_STATUS=""
   SHIP_WORKFLOW_TRIGGER_REASON=""
   SHIP_WORKFLOW_RUN_ID=""
+  SHIP_WORKFLOW_RUN_ATTEMPT=""
+  SHIP_WORKFLOW_RUN_STATUS=""
+  SHIP_WORKFLOW_RUN_CONCLUSION=""
+  SHIP_WORKFLOW_RUN_CREATED_AT=""
   start_epoch="$(ship_timestamp_epoch "$ROUND_STARTED_AT")" || {
     SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
     SHIP_WORKFLOW_TRIGGER_REASON=invalid_round_started_at
@@ -1404,6 +1478,11 @@ ship_workflow_trigger() {
     SHIP_WORKFLOW_TRIGGER_REASON=invalid_round_pushed_at
     return
   fi
+  floor="$(jhw_pr_workflow_run_floor "$workflow_name")" || {
+    SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
+    SHIP_WORKFLOW_TRIGGER_REASON=workflow_floor_missing
+    return
+  }
   endpoint="repos/$REPO_NWO/actions/runs?head_sha=$ROUND_HEAD&per_page=100"
   raw="$(gh api "$endpoint" --paginate \
     --jq '.workflow_runs[] | [.id, .run_attempt, .name, .head_sha, .created_at, .status, (.conclusion // "null")] | @tsv' 2>/dev/null)" || {
@@ -1414,16 +1493,36 @@ ship_workflow_trigger() {
 
   while IFS=$'\t' read -r run_id attempt name head created_at status conclusion; do
     [[ "$name" == "$workflow_name" && "$head" == "$ROUND_HEAD" ]] || continue
+    [[ "$run_id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ ]] || {
+      SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
+      SHIP_WORKFLOW_TRIGGER_REASON=signal_contract_invalid
+      return
+    }
+    (( run_id > floor )) || continue
     ship_at_or_after "$created_at" "$ROUND_STARTED_AT" || continue
     if [[ -z "$selected_id" || "$created_at" > "$selected_created" ]]; then
       selected_id="$run_id"
       selected_created="$created_at"
+      ambiguous=false
       SHIP_WORKFLOW_RUN_ATTEMPT="$attempt"
       SHIP_WORKFLOW_RUN_STATUS="$status"
       SHIP_WORKFLOW_RUN_CONCLUSION="$conclusion"
+    elif [[ "$created_at" == "$selected_created" ]]; then
+      if [[ "$run_id" != "$selected_id" ]]; then
+        ambiguous=true
+      elif (( attempt > SHIP_WORKFLOW_RUN_ATTEMPT )); then
+        SHIP_WORKFLOW_RUN_ATTEMPT="$attempt"
+        SHIP_WORKFLOW_RUN_STATUS="$status"
+        SHIP_WORKFLOW_RUN_CONCLUSION="$conclusion"
+      fi
     fi
   done <<<"$raw"
 
+  if [[ "$ambiguous" == true ]]; then
+    SHIP_WORKFLOW_TRIGGER_STATUS=TRIGGER_FAILED
+    SHIP_WORKFLOW_TRIGGER_REASON=ambiguous_current_head_runs
+    return
+  fi
   if [[ -n "$selected_id" ]]; then
     SHIP_WORKFLOW_TRIGGER_STATUS=STARTED
     SHIP_WORKFLOW_RUN_ID="$selected_id"
@@ -1669,9 +1768,9 @@ process.stdout.write((outcomes.size === 1 ? latest[0].outcome : "AMBIGUOUS") + "
 ship_codex_signal_status() {
   local reviews pull_comments issue_reactions comment_reactions request_epoch occurred_epoch now_epoch deadline
   local actor review_id comment_id reaction_id review_state commit_id original_commit_id occurred_at body_b64 body_status content
-  local outcome source safe_id group event_line latest_status
+  local outcome source safe_id group event_line latest_status current_base_oid
   local dismissed_review_ids=""
-  local signal_events="" has_eyes=false
+  local signal_events="" has_eyes=false has_active_blocker=false
 
   if [[ "$SHIP_CODEX_TRIGGER_STATUS" != STARTED ]]; then
     SHIP_CODEX_REVIEW_STATUS="${SHIP_CODEX_TRIGGER_STATUS:-TRIGGER_FAILED}"
@@ -1679,6 +1778,16 @@ ship_codex_signal_status() {
     return
   fi
   SHIP_CODEX_REVIEW_REASON=''
+  if [[ "$SHIP_CODEX_TARGET_HEAD" != "$ROUND_HEAD" ||
+    "$SHIP_CODEX_TARGET_BASE_OID" != "$ROUND_BASE_OID" ]]; then
+    SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return
+  fi
+  current_base_oid="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid 2>/dev/null)" || {
+    SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_lookup_failed; return;
+  }
+  if [[ "$current_base_oid" != "$ROUND_BASE_OID" ]]; then
+    SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=review_scope_changed; return
+  fi
   request_epoch="$(ship_timestamp_epoch "$SHIP_CODEX_REQUESTED_AT")" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=invalid_request_timestamp; return;
   }
@@ -1730,7 +1839,10 @@ ship_codex_signal_status() {
     fi
     if [[ "$review_state" != DISMISSED ]]; then
       if ship_codex_body_is_blocking "$body_b64"; then
-        [[ "$outcome" == FAILED ]] || outcome=FEEDBACK
+        if [[ "$outcome" != FAILED ]]; then
+          outcome=FEEDBACK
+          has_active_blocker=true
+        fi
       else
         body_status=$?
         if [[ "$body_status" != 1 ]]; then
@@ -1769,7 +1881,10 @@ ship_codex_signal_status() {
       continue
     fi
     if ship_codex_body_is_blocking "$body_b64"; then
-      [[ "$outcome" == FAILED ]] || outcome=FEEDBACK
+      if [[ "$outcome" != FAILED ]]; then
+        outcome=FEEDBACK
+        has_active_blocker=true
+      fi
     else
       body_status=$?
       if [[ "$body_status" != 1 ]]; then
@@ -1840,6 +1955,14 @@ ship_codex_signal_status() {
     [[ -z "$signal_events" ]] || signal_events+=$'\n'
     signal_events+="$event_line"
   done <<<"$comment_reactions"
+
+  # A clean reaction is only a no-findings signal. It cannot resolve an active
+  # blocking review/comment; those remain FEEDBACK until dismissed or a new
+  # head makes them out of scope.
+  if [[ "$has_active_blocker" == true ]]; then
+    SHIP_CODEX_REVIEW_STATUS=FEEDBACK
+    return
+  fi
 
   latest_status="$(printf '%s' "$signal_events" | ship_codex_latest_signal)" || {
     SHIP_CODEX_REVIEW_STATUS=FAILED; SHIP_CODEX_REVIEW_REASON=signal_contract_invalid; return;
@@ -2069,7 +2192,7 @@ ship_auto_fix_push_ready() {
 ```
 <!-- pr-round-contract: trigger-and-scope:end -->
 
-실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_PUSHED_AT`, `ROUND_HEAD`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. 아래 호출은 문자열 입력을 명령으로 바꾸지 않는 닫힌 reviewer/workflow 집합이다. `request`는 활성 중앙 workflow의 현재 round에서 시작된 같은-head `workflow_dispatch` run을 재사용하거나 정확히 한 번 dispatch한다. 이전 round의 같은-head run은 재사용하지 않는다. `auto=true`는 일반 event run을 기다리되 App은 현재 head에 명시적으로 요청한다. `skip`과 `auto=false`는 AI 요청·dispatch·대기를 하지 않는다.
+실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_PUSHED_AT`, `ROUND_HEAD`, `ROUND_BASE_OID`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. review-triggering mutation 전에 `jhw_pr_capture_workflow_run_floors "$ROUND_HEAD" "${JHW_PR_AVAILABLE_WORKFLOWS:-}"`를 실행한다. 아래 호출은 문자열 입력을 명령으로 바꾸지 않는 닫힌 reviewer/workflow 집합이다. `request`는 캡처한 workflow별 최대 run ID보다 큰 같은-head `workflow_dispatch` run만 재사용하거나 정확히 한 번 dispatch한다. 이전 round의 같은-head run은 timestamp가 같아도 재사용하지 않는다. `auto=true`는 floor 이후 일반 event run을 기다리되 App은 현재 head/base OID에 명시적으로 요청한다. `skip`과 `auto=false`는 AI 요청·dispatch·대기를 하지 않는다.
 
 ```bash
 case "$EFFECTIVE_REVIEW_POLICY" in
@@ -2086,7 +2209,7 @@ if [[ "$EFFECTIVE_REVIEW_POLICY" == request || "$EFFECTIVE_REVIEW_POLICY" == aut
 fi
 
 # AI mode와 무관한 필수 gate. 3이면 head가 바뀐 것이므로 이번 결과를 폐기하고 policy부터 재시작한다.
-jhw_pr_wait_required_checks "$PR" "$ROUND_HEAD"
+jhw_pr_wait_required_checks "$PR" "$ROUND_HEAD" "$ROUND_BASE_OID"
 case "$?" in
   0) ;;
   3) echo "PR head changed; restart review policy" >&2; return 3 ;;
@@ -2094,7 +2217,7 @@ case "$?" in
 esac
 ```
 
-`jhw_pr_request_eligible_apps`는 각 요청을 `reviewer/status/reason/comment_id/requested_at/created/head` 행으로 보존한다. Codex 행은 다음 App을 요청하기 전에 request comment ID·요청 시각·head를 Codex 폴링 및 라운드 상태에 즉시 복사하므로 Gemini 결과가 generic 변수를 덮어써도 좌표가 유지된다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. PR 루트 reaction은 요청 좌표가 없으므로 요청 시각보다 엄격히 나중인 초만 인정하고, 정확한 요청 댓글 endpoint의 reaction은 같은 초도 그 요청에 귀속한다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다. 중앙 workflow가 `UNAVAILABLE`이면 보고하고 다른 planned reviewer를 계속하되, dispatch 거절·모호한 같은-head run은 `TRIGGER_FAILED`다. 시작된 run이 `SHIP_TIMEOUT_MIN`을 넘기면 `TIMEOUT`이다.
+`jhw_pr_request_eligible_apps`는 각 요청을 `reviewer/status/reason/comment_id/requested_at/created/head/base_oid` 행으로 보존한다. Codex 행은 다음 App을 요청하기 전에 request comment ID·요청 시각·head·base OID를 Codex 폴링 및 라운드 상태에 즉시 복사하므로 Gemini 결과가 generic 변수를 덮어써도 좌표가 유지된다. 같은 head라도 base OID가 바뀌면 기존 요청과 결과를 재사용하지 않으며 poll과 merge가 모두 scope drift로 실패한다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. PR 루트 reaction은 요청 좌표가 없으므로 요청 시각보다 엄격히 나중인 초만 인정하고, 정확한 요청 댓글 endpoint의 reaction은 같은 초도 그 요청에 귀속한다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다. 중앙 workflow가 `UNAVAILABLE`이면 보고하고 다른 planned reviewer를 계속하되, dispatch 거절·모호한 같은-head run은 `TRIGGER_FAILED`다. 시작된 run이 `SHIP_TIMEOUT_MIN`을 넘기면 `TIMEOUT`이다.
 
 legacy v2 코멘트를 읽을 때도 `jhw_pr_reviewed_receipt "$ROUND_HEAD"`가 만드는 정확한 `- Reviewed: <40-sha>`와 완전히 같은 행만 현재-head 증거로 인정한다. 축약 SHA, branch 이름, 이전 head는 인정하지 않는다.
 
@@ -2163,8 +2286,8 @@ ship_signal_cleanup_finish || return
 
 ### 리뷰어별 terminal 판정 규칙
 
-- **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. auto-fix 라운드에서는 `head_sha == ROUND_HEAD`이고 `created_at >= ROUND_STARTED_AT`인 run만 해당 라운드 실행이다. push 완료 시각인 `ROUND_PUSHED_AT`부터 180초 안에 이 run이 없으면 **TRIGGER_FAILED**이며, 시작된 run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**이다.
-- **Codex**: auto-fix 라운드에서는 성공적으로 기록된 요청 댓글의 `created_at` 이후 신호만 본다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**하되, `No P1 findings`처럼 명시적으로 부정된 priority/severity 문구는 제거한 뒤 남은 affirmative 라벨만 센다. 현재-head 리뷰/diff코멘트가 quota·connector·환경 생성 실패나 review 불가를 보고하면 블로킹 라벨 유무와 무관하게 **FAILED**다. (a) 그 외 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) PR 루트에는 요청 시각보다 엄격히 나중인 `chatgpt-codex-connector[bot] +1`, 정확한 요청 댓글에는 요청 시각과 같거나 나중인 `+1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
+- **워크플로우 이름 필터** — `runs`에서 **리뷰 워크플로우 이름만** 본다: `Claude Code Review`, `Gemini Auto PR Review`, `OpenCode Auto PR Review`(활성화된 리포). 트리거/디스패치(`Claude Code`, `🔀 Gemini Dispatch`, `Gemini Dispatch`)는 무시. 현재 라운드는 `head_sha == ROUND_HEAD`, `created_at >= ROUND_STARTED_AT`, `run_id > 사전 캡처 floor`를 모두 만족해야 한다. 최신 시각에 서로 다른 run ID가 둘 이상이면 API 순서로 고르지 않고 `TRIGGER_FAILED(ambiguous_current_head_runs)`다. push 완료 시각인 `ROUND_PUSHED_AT`부터 180초 안에 run이 없으면 **TRIGGER_FAILED**이며, 시작된 run이 `completed`(conclusion 채워짐)가 아니면(`queued`/`in_progress`/conclusion=`null`) **non-terminal=PENDING**이다.
+- **Codex**: auto-fix 라운드에서는 성공적으로 기록된 현재 head/base OID 요청 댓글의 `created_at` 이후 신호만 본다. 리뷰는 `commit_id == ROUND_HEAD`, diff코멘트는 `commit_id == original_commit_id == ROUND_HEAD`여야 한다. 따라서 과거 HEAD 리뷰와 새 위치로 재매핑된 inline 코멘트는 무시한다. 현재 라운드의 **열린 블로킹 지적**(`P1`↑ 또는 `--block-on` 임계 이상)이 하나라도 있으면 **FEEDBACK**이며, 더 늦은 `+1`은 이를 해소하지 못한다. 블로커는 review dismissal 또는 새 head로 scope 밖이 된 경우에만 제거된다. `No P1 findings`처럼 명시적으로 부정된 priority/severity 문구는 제거한 뒤 남은 affirmative 라벨만 센다. 현재-head 리뷰/diff코멘트가 quota·connector·환경 생성 실패나 review 불가를 보고하면 블로킹 라벨 유무와 무관하게 **FAILED**다. (a) 그 외 현재-head 리뷰/diff코멘트가 있으나 블로킹이 없으면(`P2`/`P3`·LGTM류) → **CLEAN**, (b) 열린 블로커가 없고 PR 루트에는 요청 시각보다 엄격히 나중인 `chatgpt-codex-connector[bot] +1`, 정확한 요청 댓글에는 요청 시각과 같거나 나중인 `+1` 리액션이 있으면 → **CLEAN**(무지적 신호), (c) `eyes`만 있으면 **PENDING**, (d) 시작된 요청에 terminal 신호가 없으면 20분 후 **TIMEOUT**이다.
 - **Gemini Assist**: `reviews`/inline `pcomments` 있으면 본문 심각도로 판정 — 블로킹(`high`/`critical`↑) 있으면 **FEEDBACK**, 없으면(`medium`/`low`만) → **CLEAN**. `eyes` 리액션만이면 아직 PENDING(확인중).
 - **Claude/Gemini schema-3 공통 판정**: reviewer별로 가장 최근에 시작된 현재-head run을 고르고, 위 state 계약과 그 run의 동일 ID/attempt를 가진 v3 봇 코멘트가 정확히 하나이며 run이 `completed`여야 terminal이다. 다른 head/run의 historical v3 코멘트는 선택 대상이 아니다. 성공 state이면 canonical 본문의 `### New findings`와 `### Still open` 아래에서만 정확한 `#### RVW-<12hex> [SEVERITY] title` heading을 센다. `### Resolved`/`### Retracted`, 일반 산문의 bracket 문자열, `filtered_max_severity`는 활성 지적이 아니다. `accepted_count`와 활성 heading 수가 다르거나 state/표시 메타가 불일치하면 성공으로 간주하지 않고 FAILED로 보고한다.
 - **Claude 리뷰**: 유효한 현재-head v3 성공에서 활성 `[CRITICAL]`/`[HIGH]`이 있으면 FEEDBACK, 없으면 CLEAN이다. 유효한 현재-head 실패 state는 FAILED(재실행 후보). run이 `in_progress`면 PENDING. 워크플로우 파일을 바꾸는 PR에서 claude-code-action의 default-branch 동일성 검증으로 모델이 의도적으로 스킵된 경우도 FAILED로 명시하되, 같은 역할의 앱 대체 신호 적용 여부는 아래 규칙을 따른다. **TIMEOUT_MIN을 초과한 in_progress run**은 무한 대기 말고 TIMEOUT 처리하고 앱/리액션 신호로 대체한다.
