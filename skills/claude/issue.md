@@ -435,11 +435,12 @@ agent harness가 약 60초 간격으로 모든 요청 reviewer가 terminal이거
 <!-- issue-review-wait-contract:begin -->
 ```bash
 jhw_issue_collect_signals() (
-  local issue="$1" request_comment_id="$2" issue_created_at="$3"
+  local issue="$1" request_comment_id="$2" issue_created_at="$3" snapshot_path="$4"
   local actor issue_title signal_dir comments_path reactions_path runs_path
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$request_comment_id" =~ ^[1-9][0-9]*$ ]] || return 2
   jhw_issue_is_utc_timestamp "$issue_created_at" || return 2
+  [[ -f "$snapshot_path" && ! -L "$snapshot_path" ]] || return 2
   actor="$(gh api user --jq '.login' 2>/dev/null)" || return 1
   [[ "$actor" =~ ^[A-Za-z0-9-]+$ ]] || return 1
   issue_title="$(gh issue view "$issue" --repo "$REPO_NWO" --json title --jq .title)" || return 1
@@ -461,7 +462,7 @@ jhw_issue_collect_signals() (
     -f "created=>=$issue_created_at" \
     --paginate --slurp >"$runs_path" 2>/dev/null || return 1
   node - "$issue" "$request_comment_id" "$issue_created_at" "$actor" "$issue_title" \
-    "$comments_path" "$reactions_path" "$runs_path" <<'NODE'
+    "$comments_path" "$reactions_path" "$runs_path" "$snapshot_path" <<'NODE'
 const fs = require("node:fs");
 const [
   issue,
@@ -472,6 +473,7 @@ const [
   commentsPath,
   reactionsPath,
   runsPath,
+  snapshotPath,
 ] = process.argv.slice(2);
 const fail = (message) => { process.stderr.write(message + "\n"); process.exit(1); };
 const parseJsonFile = (path, name) => {
@@ -532,15 +534,34 @@ const snapshot = {
       triggering_actor: item?.triggering_actor?.login || "",
     })),
 };
-process.stdout.write(JSON.stringify(snapshot) + "\n");
+fs.writeFileSync(snapshotPath, JSON.stringify(snapshot) + "\n", { mode: 0o600 });
+fs.chmodSync(snapshotPath, 0o600);
 NODE
 )
 
+jhw_issue_create_signal_file() {
+  local state_dir="${JHW_ISSUE_STATE_DIR:-${TMPDIR:-/tmp}}" file
+  [[ -d "$state_dir" && ! -L "$state_dir" ]] || return 1
+  umask 077
+  file="$(mktemp "$state_dir/jhw-issue.signal.XXXXXXXX.json")" || return 1
+  chmod 600 "$file" || return 1
+  printf '%s\n' "$file"
+}
+
+jhw_issue_cleanup_signal_file() {
+  local file="$1" state_dir="${JHW_ISSUE_STATE_DIR:-${TMPDIR:-/tmp}}"
+  [[ -d "$state_dir" && ! -L "$state_dir" ]] || return 1
+  [[ "$file" == "$state_dir"/jhw-issue.signal.*.json ]] || return 2
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  rm -f -- "$file"
+}
+
 jhw_issue_classify_reviewer() {
-  local reviewer="$1" now_epoch="$2" trigger_deadline="$3" review_deadline="$4"
+  local reviewer="$1" now_epoch="$2" trigger_deadline="$3" review_deadline="$4" signal_file="$5"
   local expected_bot workflow_name result state response diagnostic extra eligible
   [[ "$now_epoch" =~ ^[0-9]+$ && "$trigger_deadline" =~ ^[0-9]+$ && "$review_deadline" =~ ^[0-9]+$ ]] || return 2
   (( review_deadline >= trigger_deadline )) || return 2
+  [[ -f "$signal_file" && ! -L "$signal_file" ]] || return 2
   eligible="${JHW_ISSUE_REVIEWER_ELIGIBLE:-true}"
   case "$eligible" in true|false) ;; *) return 2 ;; esac
   case "$reviewer" in
@@ -560,8 +581,9 @@ jhw_issue_classify_reviewer() {
   esac
   [[ -z "$expected_bot" || "$expected_bot" =~ ^[A-Za-z0-9_.-]+(\[bot\])?$ ]] || return 2
   result="$(node - "$reviewer" "$now_epoch" "$trigger_deadline" "$review_deadline" \
-    "$expected_bot" "$workflow_name" "$eligible" <<'NODE'
-const [reviewer, nowRaw, triggerRaw, reviewRaw, expectedBot, workflowName, eligibleRaw] = process.argv.slice(2);
+    "$expected_bot" "$workflow_name" "$eligible" "$signal_file" <<'NODE'
+const fs = require("node:fs");
+const [reviewer, nowRaw, triggerRaw, reviewRaw, expectedBot, workflowName, eligibleRaw, signalFile] = process.argv.slice(2);
 const now = Number(nowRaw);
 const triggerDeadline = Number(triggerRaw);
 const reviewDeadline = Number(reviewRaw);
@@ -571,7 +593,7 @@ const emit = (state, response, diagnostic) => {
 };
 if (eligibleRaw === "false") emit("UNAVAILABLE", "", "preflight_unavailable");
 let snapshot;
-try { snapshot = JSON.parse(process.env.JHW_ISSUE_SIGNAL_JSON || ""); }
+try { snapshot = JSON.parse(fs.readFileSync(signalFile, "utf8")); }
 catch { process.stderr.write("invalid signal snapshot\n"); process.exit(1); }
 if (!snapshot || typeof snapshot.issue_title !== "string" || snapshot.issue_title.trim() === "" ||
     !Array.isArray(snapshot.comments) || !Array.isArray(snapshot.reactions) || !Array.isArray(snapshot.runs)) {
@@ -638,13 +660,20 @@ if (rejectedReaction) emit("FAILED", rejectedReaction.url, "connector_rejected")
 const rejectedComment = comments.find((comment) =>
   /Claude encountered an error|unable to (?:review|process)|cannot review|connector[^\n]*(?:reject|denied)|failed to (?:start|review)/i.test(comment.body || ""));
 if (rejectedComment) emit("FAILED", rejectedComment.url, "connector_rejected");
-const feedbackComment = comments.find((comment) =>
-  /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i.test(comment.body || ""));
-if (feedbackComment) emit("FEEDBACK", feedbackComment.url, "actionable_feedback");
-const cleanComment = comments.find((comment) =>
-  /\b(?:no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|looks good|ready for implementation|review clean|lgtm)\b/i.test(comment.body || ""));
-if (cleanComment) emit("CLEAN", cleanComment.url, "substantive_response");
-if (comments.length > 0) emit("FEEDBACK", comments[0].url, "unclassified_substantive_response");
+const orderedComments = [...comments].sort((left, right) =>
+  epoch(right.created_at) - epoch(left.created_at) || Number(right.id) - Number(left.id));
+const verdictComment = orderedComments[0];
+const feedbackPattern = /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i;
+if (verdictComment && feedbackPattern.test(verdictComment.body || "")) {
+  emit("FEEDBACK", verdictComment.url, "actionable_feedback");
+}
+const cleanLine = /^(?:no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|(?:the\s+)?(?:requirements?|proposal)\s+(?:(?:look|looks|are|is)\s+)?complete(?:\s+and\s+ready for implementation)?(?:[.;]\s*(?:no blockers?(?:\s+found)?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)))?|looks good|ready for implementation|review clean|lgtm)[.!]?$/i;
+const hasExplicitCleanVerdict = (body) => String(body || "").split(/\r?\n/)
+  .map((line) => line.trim()).filter(Boolean).some((line) => cleanLine.test(line));
+if (verdictComment && hasExplicitCleanVerdict(verdictComment.body)) {
+  emit("CLEAN", verdictComment.url, "substantive_response");
+}
+if (verdictComment) emit("FEEDBACK", verdictComment.url, "unclassified_substantive_response");
 
 const acknowledged = acknowledgments.length > 0 ||
   reactions.some((reaction) => ["eyes", "+1", "heart"].includes(reaction.content)) ||
@@ -906,7 +935,7 @@ jhw_issue_fail_pending() {
 
 jhw_issue_poll_once() {
   local state_file="$1" trigger_deadline="$2" review_deadline="$3"
-  local metadata issue issue_url issue_created_at extra pending reviewer request_id snapshot now_epoch remaining
+  local metadata issue issue_url issue_created_at extra pending reviewer request_id signal_file now_epoch remaining update_status
   [[ "$trigger_deadline" =~ ^[0-9]+$ && "$review_deadline" =~ ^[0-9]+$ ]] || return 2
   metadata="$(jhw_issue_state_metadata "$state_file")" || return 1
   IFS=$'\t' read -r issue issue_url issue_created_at extra <<<"$metadata"
@@ -916,17 +945,24 @@ jhw_issue_poll_once() {
   pending="$(jhw_issue_pending_requests "$state_file")" || return 1
   while IFS=$'\t' read -r reviewer request_id; do
     [[ -n "$reviewer" ]] || continue
-    if snapshot="$(jhw_issue_collect_signals "$issue" "$request_id" "$issue_created_at")"; then
-      export JHW_ISSUE_SIGNAL_JSON="$snapshot"
-      if jhw_issue_classify_reviewer "$reviewer" "$now_epoch" "$trigger_deadline" "$review_deadline" >/dev/null; then
+    if ! signal_file="$(jhw_issue_create_signal_file)"; then
+      jhw_issue_update_result "$state_file" "$reviewer" FAILED '' signal_file_create_failed || return 1
+      continue
+    fi
+    update_status=0
+    if jhw_issue_collect_signals "$issue" "$request_id" "$issue_created_at" "$signal_file"; then
+      if jhw_issue_classify_reviewer "$reviewer" "$now_epoch" "$trigger_deadline" "$review_deadline" \
+        "$signal_file" >/dev/null; then
         jhw_issue_update_result "$state_file" "$reviewer" "$JHW_ISSUE_REVIEW_STATUS" \
-          "$JHW_ISSUE_REVIEW_RESPONSE" "$JHW_ISSUE_REVIEW_DIAGNOSTIC" || return 1
+          "$JHW_ISSUE_REVIEW_RESPONSE" "$JHW_ISSUE_REVIEW_DIAGNOSTIC" || update_status=1
       else
-        jhw_issue_update_result "$state_file" "$reviewer" FAILED '' classifier_failed || return 1
+        jhw_issue_update_result "$state_file" "$reviewer" FAILED '' classifier_failed || update_status=1
       fi
     else
-      jhw_issue_update_result "$state_file" "$reviewer" FAILED '' signal_collection_failed || return 1
+      jhw_issue_update_result "$state_file" "$reviewer" FAILED '' signal_collection_failed || update_status=1
     fi
+    jhw_issue_cleanup_signal_file "$signal_file" || update_status=1
+    (( update_status == 0 )) || return 1
   done <<<"$pending"
   remaining="$(jhw_issue_pending_count "$state_file")" || return 1
   [[ "$remaining" =~ ^[0-9]+$ ]] || return 1

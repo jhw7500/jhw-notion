@@ -354,6 +354,8 @@ async function main() {
     "the public Issue command must connect creation to bounded review waiting");
   assert.doesNotMatch(issueText, /JHW_ISSUE_(?:COMMENT|REACTION|RUN)_PAGES_JSON=/,
     "raw paginated payloads must not cross the exec environment boundary");
+  assert.doesNotMatch(issueText, /JHW_ISSUE_SIGNAL_JSON/,
+    "the compact signal snapshot must not cross the exec environment boundary");
   assert.ok(existsSync(codexIssueSkill));
   assert.ok(lstatSync(codexIssueReference).isSymbolicLink());
   const contract = `${createContractBlock(issueText)}\n${waitContractBlock(issueText)}`;
@@ -692,8 +694,12 @@ async function main() {
       return runIssue(
         state,
         [
-          `export JHW_ISSUE_SIGNAL_JSON="$(jhw_issue_collect_signals 99 1001 '${issueCreatedAt}')"`,
-          `jhw_issue_classify_reviewer ${reviewer} ${nowEpoch} ${triggerDeadline} ${reviewDeadline} || exit $?`,
+          `signal_file="$(jhw_issue_create_signal_file)" || exit $?`,
+          `jhw_issue_collect_signals 99 1001 '${issueCreatedAt}' "$signal_file" || exit $?`,
+          `jhw_issue_classify_reviewer ${reviewer} ${nowEpoch} ${triggerDeadline} ${reviewDeadline} "$signal_file"`,
+          "classify_status=$?",
+          `jhw_issue_cleanup_signal_file "$signal_file" || exit $?`,
+          `(( classify_status == 0 )) || exit "$classify_status"`,
           "printf 'meta=%s|%s\\n' \"$JHW_ISSUE_REVIEW_RESPONSE\" \"$JHW_ISSUE_REVIEW_DIAGNOSTIC\"",
         ].join("\n"),
         { JHW_ISSUE_EXPECTED_CLAUDE_BOT: expectedBot, ...overrides },
@@ -739,6 +745,39 @@ async function main() {
     assert.equal(unclassifiedSubstantive.stdout.split("\n")[0], "FEEDBACK",
       "unmatched substantive reviewer prose must not be inferred CLEAN");
     assert.match(unclassifiedSubstantive.stdout, /unclassified_substantive_response/);
+
+    const negatedCleanPhrase = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("This is not ready for implementation.")],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(negatedCleanPhrase.stdout.split("\n")[0], "FEEDBACK",
+      "a negated clean phrase must not satisfy the CLEAN verdict");
+
+    const cleanThenCorrection = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("No blockers found."),
+          response("Authentication behavior is underspecified; add failure cases.", {
+            id: 1003,
+            createdAt: "2026-09-01T00:03:00Z",
+            url: "https://github.com/example/repo/issues/99#issuecomment-1003",
+          }),
+        ],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(cleanThenCorrection.stdout.split("\n")[0], "FEEDBACK",
+      "the newest substantive response must supersede an older CLEAN response");
+    assert.match(cleanThenCorrection.stdout, /issuecomment-1003/);
 
     const failedRun = await classify(
       issueState({
@@ -928,6 +967,20 @@ async function main() {
     );
     assert.equal(largeRunHistory.stdout.split("\n")[0], "CLEAN",
       "large filtered run history must be streamed without environment-size failure");
+
+    const largeRelevantComment = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response(`No blocking findings.\n${"review detail ".repeat(30000)}`),
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(largeRelevantComment.stdout.split("\n")[0], "CLEAN",
+      "a large relevant reviewer response must be classified without an environment-size failure");
 
     await setRepoFixture({
       claude: true,
