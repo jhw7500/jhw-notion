@@ -901,6 +901,30 @@ async function main() {
     assert.equal(clean.stdout.split("\n")[0], "CLEAN");
     assert.match(clean.stdout, /issuecomment-1002/);
 
+    const negatedRiskFindings = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("No missing requirements or implementation risks.")],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(negatedRiskFindings.stdout.split("\n")[0], "CLEAN",
+      "explicitly negated requirement and risk findings must remain CLEAN");
+
+    const negatedSeverityFindings = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, response("No [HIGH] issues.")],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(negatedSeverityFindings.stdout.split("\n")[0], "CLEAN",
+      "an explicitly negated blocking severity must remain CLEAN");
+
     const sameSecondClean = await classify(
       issueState({
         issueExists: true,
@@ -953,6 +977,21 @@ async function main() {
     );
     assert.equal(feedback.stdout.split("\n")[0], "FEEDBACK");
     assert.match(feedback.stdout, /actionable_feedback/);
+
+    const negatedSeverityWithFinding = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [
+          requestComment,
+          response("No [HIGH] issues, but [CRITICAL] authentication behavior is undefined."),
+        ],
+        commentReactions: [acknowledgment],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(negatedSeverityWithFinding.stdout.split("\n")[0], "FEEDBACK",
+      "a negated severity phrase must not hide a separate affirmative finding");
 
     const unclassifiedSubstantive = await classify(
       issueState({

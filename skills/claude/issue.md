@@ -834,20 +834,22 @@ const orderedComments = [...comments].sort((left, right) =>
   epoch(right.created_at) - epoch(left.created_at) || Number(right.id) - Number(left.id));
 const verdictComment = orderedComments[0];
 const feedbackPattern = /\[(?:CRITICAL|HIGH)\]|(?:^|[^A-Za-z0-9])P[01](?:[^0-9]|$)|missing requirement|implementation risk|risk:/i;
-if (verdictComment && feedbackPattern.test(verdictComment.body || "")) {
-  emit("FEEDBACK", verdictComment.url, "actionable_feedback");
-}
 const cleanLine = /^(?:no blockers?(?:\s+(?:found|identified|remaining))?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)|(?:the\s+)?(?:requirements?|proposal)\s+(?:(?:look|looks|are|is)\s+)?complete(?:\s+and\s+ready for implementation)?(?:[.;]\s*(?:no blockers?(?:\s+found)?|no blocking (?:findings?|issues?|risks?|requirements? gaps?|concerns?)))?|looks good|ready for implementation|review clean|lgtm)[.!]?$/i;
+const negatedFindingLine = /^no (?:(?:missing requirements?|implementation risks?)(?:\s+(?:or|and)\s+(?:missing requirements?|implementation risks?))*|(?:\[(?:CRITICAL|HIGH)\]|P[01])\s+(?:issues?|findings?))[.!]?$/i;
 const cleanVerdictLines = (body) => String(body || "").split(/\r?\n/)
   .map((line) => line.trim())
   .filter(Boolean)
   .filter((line) => !/^\*\*Claude finished\b/.test(line));
 const hasExplicitCleanVerdict = (body) => {
   const lines = cleanVerdictLines(body);
-  return lines.length > 0 && lines.every((line) => cleanLine.test(line));
+  return lines.length > 0 && lines.every((line) =>
+    cleanLine.test(line) || negatedFindingLine.test(line));
 };
 if (verdictComment && hasExplicitCleanVerdict(verdictComment.body)) {
   emit("CLEAN", verdictComment.url, "substantive_response");
+}
+if (verdictComment && feedbackPattern.test(verdictComment.body || "")) {
+  emit("FEEDBACK", verdictComment.url, "actionable_feedback");
 }
 if (verdictComment) emit("FEEDBACK", verdictComment.url, "unclassified_substantive_response");
 
