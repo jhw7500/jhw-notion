@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync, lstatSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -15,6 +16,11 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const canonicalPr = join(repoRoot, "skills", "claude", "pr.md");
 const shipAlias = join(repoRoot, "skills", "claude", "ship.md");
+const agentsPath = join(repoRoot, "skills", "claude", "AGENTS.md");
+const readmePath = join(repoRoot, "README.md");
+const codexPrSkill = join(repoRoot, "skills", "codex", "jhw-pr", "SKILL.md");
+const codexPrReference = join(repoRoot, "skills", "codex", "jhw-pr", "references", "pr.md");
+const codexShipSkill = join(repoRoot, "skills", "codex", "jhw-ship", "SKILL.md");
 const currentHead = "a".repeat(40);
 const oldHead = "b".repeat(40);
 const roundStartedAt = "2026-08-29T00:00:00Z";
@@ -342,6 +348,8 @@ function baseState(overrides = {}) {
 async function main() {
   const prText = await readFile(canonicalPr, "utf8");
   const aliasText = await readFile(shipAlias, "utf8");
+  const agentsText = await readFile(agentsPath, "utf8");
+  const readmeText = await readFile(readmePath, "utf8");
   assert.match(prText, /^# \/jhw:pr — PR 생성/m);
   assert.match(prText, /<!-- jhw-pr:review-request reviewer=\$\{reviewer\} head=\$\{head\} -->/);
   assert.match(prText, /jhw-\(pr\|ship\):codex-review round=/);
@@ -357,6 +365,17 @@ async function main() {
   assert.match(prText, /jhw_pr_dispatch_same_head gemini-auto-review\.yml 'Gemini Auto PR Review' "\$ROUND_HEAD"/);
   assert.match(prText, /jhw_pr_dispatch_same_head opencode-auto-review\.yml 'OpenCode Auto PR Review' "\$ROUND_HEAD"/);
   assert.match(prText, /jhw_pr_wait_required_checks "\$PR" "\$ROUND_HEAD"/);
+  assert.match(agentsText, /\| `pr\.md` \|/);
+  assert.match(agentsText, /ship\.md.*deprecated/i);
+  assert.match(readmeText, /\/jhw:pr --review/);
+  assert.match(readmeText, /\/jhw:pr --no-review/);
+  assert.match(readmeText, /\/jhw:pr --review --auto-fix/);
+  assert.match(readmeText, /\/jhw:ship.*\/jhw:pr/);
+  assert.match(readmeText, /생략.*review-on/);
+  assert.ok(existsSync(codexPrSkill), "generated Codex jhw-pr skill must exist");
+  assert.ok(lstatSync(codexPrReference).isSymbolicLink(),
+    "generated Codex jhw-pr reference must be a relative symlink");
+  assert.match(await readFile(codexShipSkill, "utf8"), /deprecated/i);
   const contract = `${contractBlock(prText)}\n${policyContractBlock(prText)}`;
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-pr-contract-"));
   const fakeGh = join(tempRoot, "gh");
@@ -524,6 +543,18 @@ async function main() {
     requireBefore(existingPr.log, addSkip, isGitPush, "skip policy must be applied before synchronize push");
     assert.deepEqual(existingPr.state.prLabels, ["review:skip"]);
     assert.equal(existingPr.state.prHead, currentHead);
+
+    const sameHeadExistingPr = await run(
+      baseState({
+        prLabels: ["review:skip"],
+        prHead: currentHead,
+        remoteBranchHead: currentHead,
+      }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+    );
+    assert.deepEqual(sameHeadExistingPr.state.prLabels, ["review:request"]);
+    assert.equal(sameHeadExistingPr.log.filter(isGitPush).length, 0,
+      "an unchanged existing PR head must reconcile policy without a synchronize push");
 
     const autoExisting = await run(
       baseState({ prLabels: ["review:request", "review:skip"] }),

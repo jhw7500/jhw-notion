@@ -1,6 +1,6 @@
 ---
 name: jhw-ship
-description: "--merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix) Use when the user invokes `/jhw:ship`, `$jhw-ship`, or asks to run the JHW ship command."
+description: "(deprecated) /jhw:pr 사용 — 모든 인자를 변경 없이 전달 Use when the user invokes `/jhw:ship`, `$jhw-ship`, or asks to run the JHW ship command."
 ---
 
 # jhw-ship

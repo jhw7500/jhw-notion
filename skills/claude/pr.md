@@ -346,12 +346,15 @@ jhw_pr_apply_existing_pr_policy() {
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
   [[ "${PR:-}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2; }
   [[ "$expected_local_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid local head" >&2; return 2; }
+  actual_local_head="$(git rev-parse HEAD)" || return 1
+  [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed before policy reconciliation" >&2; return 1; }
   jhw_pr_require_write_permission || return
   jhw_pr_ensure_review_labels || return
   remote_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
   [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid remote head" >&2; return 1; }
   jhw_pr_reconcile_review_labels "$mode" || return
   jhw_pr_verify_remote_policy "$mode" "$remote_head" || return
+  [[ "$remote_head" == "$expected_local_head" ]] && return
   git push -u origin HEAD || return 1
   actual_local_head="$(git rev-parse HEAD)" || return 1
   [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed during push" >&2; return 1; }
@@ -371,7 +374,7 @@ jhw_pr_apply_existing_pr_policy() {
 2. **PR 생성 또는 감지**
    - 새 PR: push → `gh pr create --draft` → mode 라벨 reconcile/read-back → head/draft 검증 → ready 순서다.
    - 기존 PR의 새 head: mode 라벨 reconcile/read-back → push → 새 원격 head 검증 순서다.
-   - 같은 head의 명시적 `request`는 Task 3의 head별 idempotent 요청 계약을 사용한다.
+   - 같은 head의 명시적 `request`는 synchronize push를 생략하고 라벨 read-back 뒤 Task 3의 head별 idempotent 요청 계약을 사용한다.
    - `PR=<번호>`, `SHA="$(git rev-parse HEAD)"` (push 후 기준 — 재푸시마다 갱신)
 3. **병렬 게이트 시작**
    - (a) 모든 mode에서 `jhw_pr_wait_required_checks`로 **required CI**를 감시한다.

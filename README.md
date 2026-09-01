@@ -116,9 +116,21 @@ TUI에서 `/jhw:` 접두사로 사용. 통합 진입점 위주:
 /jhw:status   — 워크스페이스 현황
 /jhw:import   — Notion 검색 결과를 로컬 memory로 불러오기
 /jhw:cclog    — Claude Code 세션 대화 기록 조회 (Notion 아님)
+/jhw:pr       — PR 생성·head-scoped AI 리뷰·필수 게이트·조건부 머지
 ```
 
-> deprecated alias(다음 메이저 릴리스에서 삭제): `/jhw:record`·`/jhw:note`·`/jhw:delete`→`/jhw:save`, `/jhw:search`·`/jhw:context`·`/jhw:history`→`/jhw:recall`, `/jhw:start`·`/jhw:close`→`/jhw:project`.
+PR 리뷰 정책 예시:
+
+```text
+/jhw:pr --review              — 저장소 설정과 무관하게 현재 head AI 리뷰 요청
+/jhw:pr --no-review           — review:skip 적용, AI 리뷰 생략
+/jhw:pr --review --auto-fix   — 최대 5라운드 수정·재리뷰
+/jhw:ship ...                 — deprecated; 같은 인자로 /jhw:pr 실행
+```
+
+`--review`/`--no-review`를 생략하면 저장소 설정을 따르며, 현재 설정과 호환 기본값은 review-on이다.
+
+> deprecated alias(다음 메이저 릴리스에서 삭제): `/jhw:record`·`/jhw:note`·`/jhw:delete`→`/jhw:save`, `/jhw:search`·`/jhw:context`·`/jhw:history`→`/jhw:recall`, `/jhw:start`·`/jhw:close`→`/jhw:project`, `/jhw:ship`→`/jhw:pr`.
 
 ## Project Control Phase 1A
 
