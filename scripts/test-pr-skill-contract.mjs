@@ -105,7 +105,9 @@ if (argv[0] === "label" && argv[1] === "create") {
 }
 
 if (argv[0] === "pr" && argv[1] === "create") {
-  if (!argv.includes("--draft") || state.failPrCreate) process.exit(1);
+  const hasMetadata = argv.includes("--fill") || argv.includes("--fill-first") ||
+    argv.includes("--fill-verbose") || (argv.includes("--title") && argv.includes("--body"));
+  if (!argv.includes("--draft") || !hasMetadata || state.failPrCreate) process.exit(1);
   state.prExists = true;
   state.prDraft = state.forceReadyOnCreate ? false : true;
   state.prHead = state.remoteBranchHead;
@@ -239,9 +241,9 @@ if (endpoint === "repos/example/repo/issues/comments?per_page=100") {
   if (!argv.includes("--paginate") || argv.includes("--slurp")) process.exit(2);
   const query = optionValue("--jq") || "";
   if (!query.includes("@base64")) process.exit(2);
-  const actor = query.match(/\.user\.login == "([^"]+)"/)?.[1];
+  const actors = [...query.matchAll(/\.user\.login == "([^"]+)"/g)].map((match) => match[1]);
   rows((state.appComments || [])
-    .filter((item) => !actor || item.actor === actor)
+    .filter((item) => actors.length === 0 || actors.includes(item.actor))
     .map((item) => Buffer.from(JSON.stringify({
       actor: item.actor,
       body: item.body,
@@ -659,6 +661,77 @@ async function main() {
     );
     assert.equal(eligibleApps.stdout, "codex\ngemini-assist\n");
 
+    const unbracketedCodex = await run(
+      baseState({
+        appComments: [{
+          actor: "chatgpt-codex-connector",
+          body: "Codex review completed without blockers.",
+          url: "https://github.com/example/repo/pull/88#issuecomment-3",
+        }],
+        commentReactions: [{
+          actor: "chatgpt-codex-connector",
+          content: "+1",
+          createdAt: requestCreatedAt,
+        }],
+      }),
+      [
+        "jhw_pr_prepare_review_plan request",
+        `jhw_pr_request_eligible_apps ${currentHead} "$JHW_PR_ELIGIBLE_APPS"`,
+        "ship_codex_signal_status",
+        "printf 'eligible=%s\\nactor=%s\\nship=%s\\nstatus=%s\\n' \"$JHW_PR_ELIGIBLE_APPS\" \"$JHW_PR_CODEX_APP_ACTOR\" \"$SHIP_CODEX_LOGIN\" \"$SHIP_CODEX_REVIEW_STATUS\"",
+      ].join("\n"),
+    );
+    assert.match(unbracketedCodex.stdout, /^eligible=codex$/m,
+      "the unbracketed Codex App identity must be eligible when it is the unique canary actor");
+    assert.match(unbracketedCodex.stdout, /^actor=chatgpt-codex-connector$/m);
+    assert.match(unbracketedCodex.stdout, /^ship=chatgpt-codex-connector$/m,
+      "the canary-proven actor must be propagated into current-round signal matching");
+    assert.match(unbracketedCodex.stdout, /^status=CLEAN$/m);
+
+    const wrongSpellingAfterPin = await run(
+      baseState({
+        appComments: [{
+          actor: "chatgpt-codex-connector",
+          body: "Codex review completed without blockers.",
+          url: "https://github.com/example/repo/pull/88#issuecomment-3",
+        }],
+        commentReactions: [{
+          actor: "chatgpt-codex-connector[bot]",
+          content: "+1",
+          createdAt: requestCreatedAt,
+        }],
+      }),
+      [
+        "jhw_pr_prepare_review_plan request",
+        `jhw_pr_request_eligible_apps ${currentHead} "$JHW_PR_ELIGIBLE_APPS"`,
+        "ship_codex_signal_status",
+        "printf '%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\"",
+      ].join("\n"),
+    );
+    assert.equal(wrongSpellingAfterPin.stdout.trim(), "PENDING",
+      "a different accepted Codex spelling cannot replace the uniquely proven canary actor");
+
+    const ambiguousCodexActors = await run(
+      baseState({
+        appComments: [
+          {
+            actor: "chatgpt-codex-connector",
+            body: "Codex review completed.",
+            url: "https://github.com/example/repo/pull/87#issuecomment-1",
+          },
+          {
+            actor: "chatgpt-codex-connector[bot]",
+            body: "Codex review completed.",
+            url: "https://github.com/example/repo/pull/88#issuecomment-2",
+          },
+        ],
+      }),
+      "jhw_pr_prepare_review_plan request\nprintf 'eligible=%s\\nactor=%s\\n' \"$JHW_PR_ELIGIBLE_APPS\" \"$JHW_PR_CODEX_APP_ACTOR\"",
+    );
+    assert.doesNotMatch(ambiguousCodexActors.stdout, /^eligible=.*codex/m,
+      "ambiguous Codex canary identities must not be guessed");
+    assert.match(ambiguousCodexActors.stdout, /^actor=$/m);
+
     const noEligibleApps = await run(
       baseState({ appComments: [] }),
       [
@@ -753,6 +826,8 @@ async function main() {
     requireBefore(newPr.log, requestLabelCreate, isGitPush, "request label definition must precede push");
     requireBefore(newPr.log, skipLabelCreate, isGitPush, "skip label definition must precede push");
     requireBefore(newPr.log, isGitPush, createDraft, "new PR push must precede draft creation");
+    assert.equal(newPr.log.some((args) => createDraft(args) && args.includes("--fill")), true,
+      "new PR creation must supply noninteractive title/body metadata");
     requireBefore(newPr.log, createDraft, removeSkip, "draft creation must precede policy reconciliation");
     requireBefore(newPr.log, removeSkip, addRequest, "opposite label must be removed before request label is added");
     requireBefore(newPr.log, addRequest, ready, "verified request policy must precede ready transition");
