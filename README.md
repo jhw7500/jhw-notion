@@ -130,6 +130,8 @@ PR 리뷰 정책 예시:
 ```
 
 `--review`/`--no-review`를 생략하면 저장소 설정을 따르며, 현재 설정과 호환 기본값은 review-on이다.
+review-on은 GitHub mutation 전에 관리 workflow의 enabled/dispatch 계약과 동일 저장소 App canary를 확인하고,
+증명되지 않은 workflow/App은 `UNAVAILABLE`로 남겨 mention하지 않는다.
 
 Issue 리뷰 정책 예시:
 

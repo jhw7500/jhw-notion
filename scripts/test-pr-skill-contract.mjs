@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync, lstatSync } from "node:fs";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -203,6 +203,29 @@ if (endpoint === "user") {
   process.exit(0);
 }
 
+const workflowStateMatch = endpoint.match(/^repos\/example\/repo\/actions\/workflows\/([^/?]+)$/);
+if (workflowStateMatch) {
+  const workflow = decodeURIComponent(workflowStateMatch[1]);
+  if (state.failWorkflowView || !state.workflowStates?.[workflow]) process.exit(1);
+  process.stdout.write(state.workflowStates[workflow] + "\n");
+  process.exit(0);
+}
+
+if (endpoint === "repos/example/repo/issues/comments?per_page=100") {
+  if (!argv.includes("--paginate") || argv.includes("--slurp")) process.exit(2);
+  const query = optionValue("--jq") || "";
+  if (!query.includes("@base64")) process.exit(2);
+  const actor = query.match(/\.user\.login == "([^"]+)"/)?.[1];
+  rows((state.appComments || [])
+    .filter((item) => !actor || item.actor === actor)
+    .map((item) => Buffer.from(JSON.stringify({
+      actor: item.actor,
+      body: item.body,
+      url: item.url,
+    })).toString("base64")));
+  process.exit(0);
+}
+
 if (/\/issues\/\d+\/comments\?per_page=100$/.test(endpoint)) {
   if (argv.includes("POST")) {
     if (state.failPost) process.exit(1);
@@ -354,6 +377,18 @@ function baseState(overrides = {}) {
     },
     dispatchedWorkflows: [],
     requiredChecksExit: 0,
+    appComments: [
+      {
+        actor: "chatgpt-codex-connector[bot]",
+        body: "Codex Review: Didn't find any major issues.",
+        url: "https://github.com/example/repo/pull/25#issuecomment-1",
+      },
+      {
+        actor: "gemini-code-assist[bot]",
+        body: "Gemini review completed.",
+        url: "https://github.com/example/repo/pull/4#issuecomment-2",
+      },
+    ],
     failEndpoints: [],
     failPost: false,
     ...overrides,
@@ -374,13 +409,19 @@ async function main() {
   assert.match(prText, /\| Effective command policy \| Managed workflows \| Apps \| AI wait \|/);
   assert.doesNotMatch(prText, /기본 (?:\*\*)?3(?:라운드|\b)/);
   assert.doesNotMatch(prText, /최초 PR 라운드는 기존 자동 트리거/);
-  assert.match(prText, /jhw_pr_request_app_review codex "\$ROUND_HEAD"/);
-  assert.match(prText, /jhw_pr_request_app_review gemini-assist "\$ROUND_HEAD"/);
-  assert.match(prText, /jhw_pr_dispatch_same_head claude-code-review\.yml 'Claude Code Review' "\$ROUND_HEAD"/);
-  assert.match(prText, /jhw_pr_dispatch_same_head gemini-auto-review\.yml 'Gemini Auto PR Review' "\$ROUND_HEAD"/);
-  assert.match(prText, /jhw_pr_dispatch_same_head opencode-auto-review\.yml 'OpenCode Auto PR Review' "\$ROUND_HEAD"/);
+  assert.match(prText, /jhw_pr_request_app_review codex "\$head"/);
+  assert.match(prText, /jhw_pr_request_app_review gemini-assist "\$head"/);
+  assert.match(prText, /jhw_pr_dispatch_same_head claude-code-review\.yml 'Claude Code Review' "\$head"/);
+  assert.match(prText, /jhw_pr_dispatch_same_head gemini-auto-review\.yml 'Gemini Auto PR Review' "\$head"/);
+  assert.match(prText, /jhw_pr_dispatch_same_head opencode-auto-review\.yml 'OpenCode Auto PR Review' "\$head"/);
   assert.match(prText, /jhw_pr_wait_required_checks "\$PR" "\$ROUND_HEAD"/);
   assert.match(prText, /gh pr merge .*--match-head-commit/);
+  assert.match(prText, /jhw_pr_prepare_review_plan "\$mode"/,
+    "reviewer capability planning must run before PR policy mutation");
+  assert.match(prText, /jhw_pr_request_eligible_apps "\$ROUND_HEAD"/,
+    "the executable review flow must request only its preflighted App plan");
+  assert.doesNotMatch(prText, /gh workflow view .*--json state/,
+    "workflow state detection must not depend on unsupported gh workflow --json flags");
   assert.match(agentsText, /\| `pr\.md` \|/);
   assert.match(agentsText, /ship\.md.*deprecated/i);
   assert.match(readmeText, /\/jhw:pr --review/);
@@ -388,6 +429,8 @@ async function main() {
   assert.match(readmeText, /\/jhw:pr --review --auto-fix/);
   assert.match(readmeText, /\/jhw:ship.*\/jhw:pr/);
   assert.match(readmeText, /생략.*review-on/);
+  assert.match(readmeText, /mutation 전에.*workflow.*App canary/);
+  assert.match(readmeText, /UNAVAILABLE.*mention하지 않는다/);
   assert.ok(existsSync(codexPrSkill), "generated Codex jhw-pr skill must exist");
   assert.ok(lstatSync(codexPrReference).isSymbolicLink(),
     "generated Codex jhw-pr reference must be a relative symlink");
@@ -399,6 +442,10 @@ async function main() {
   const fakeDate = join(tempRoot, "date");
   const contractPath = join(tempRoot, "contract.bash");
   const configPath = join(tempRoot, "workflow-config.yml");
+  const fixtureRoot = join(tempRoot, "repo");
+  const fixtureWorkflowDir = join(fixtureRoot, ".github", "workflows");
+  const fixtureConfigPath = join(fixtureRoot, ".github", "workflow-config.yml");
+  const geminiConfigPath = join(fixtureRoot, ".gemini", "config.yaml");
   const statePath = join(tempRoot, "gh-state.json");
   const logPath = join(tempRoot, "gh-log.jsonl");
   const roundStatePath = join(tempRoot, "round.state");
@@ -411,6 +458,23 @@ async function main() {
   await writeFile(fakeDate, fakeDateSource);
   await chmod(fakeDate, 0o755);
   await writeFile(contractPath, contract);
+  await mkdir(fixtureWorkflowDir, { recursive: true });
+  await mkdir(dirname(geminiConfigPath), { recursive: true });
+  const dispatchContract = "on:\n  workflow_dispatch:\n    inputs:\n      pr_number:\n      force_review:\n";
+  await writeFile(join(fixtureWorkflowDir, "claude-code-review.yml"), dispatchContract);
+  await writeFile(join(fixtureWorkflowDir, "gemini-auto-review.yml"), dispatchContract);
+  const enabledReviewConfig = [
+    "review:",
+    "  auto: true",
+    "workflows:",
+    "  claude-code-review:",
+    "    enabled: true",
+    "  gemini-auto-review:",
+    "    enabled: true",
+    "",
+  ].join("\n");
+  await writeFile(fixtureConfigPath, enabledReviewConfig);
+  await writeFile(geminiConfigPath, "code_review:\n  pull_request_opened:\n    code_review: false\n");
 
   async function run(state, commands, overrides = {}) {
     const { FAKE_DATE_INITIAL_EPOCH = startEpoch + 60, ...envOverrides } = overrides;
@@ -432,6 +496,8 @@ async function main() {
       ROUND_PUSHED_AT: roundStartedAt,
       SHIP_ROUND_STATE_FILE: roundStatePath,
       SHIP_NOW_EPOCH: String(startEpoch + 60),
+      JHW_PR_REPO_ROOT: fixtureRoot,
+      JHW_PR_CONFIG_PATH: fixtureConfigPath,
       ...envOverrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
@@ -524,6 +590,55 @@ async function main() {
     );
     assert.notEqual(readOnly.code, 0);
     assert.deepEqual(mutationCalls(readOnly.log), []);
+
+    await run(baseState(), "jhw_pr_gemini_manual_review_configured");
+    await run(baseState(), "jhw_pr_repo_has_app_canary gemini-assist");
+    const eligibleApps = await run(
+      baseState(),
+      "jhw_pr_discover_app_reviewers",
+    );
+    assert.equal(eligibleApps.stdout, "codex\ngemini-assist\n");
+
+    const noEligibleApps = await run(
+      baseState({ appComments: [] }),
+      [
+        "apps=\"$(jhw_pr_discover_app_reviewers)\"",
+        `jhw_pr_request_eligible_apps ${currentHead} "$apps"`,
+      ].join("\n"),
+    );
+    assert.equal(noEligibleApps.log.filter((args) => args.includes("POST")).length, 0,
+      "an App without same-repository capability evidence must not be mentioned");
+
+    await writeFile(
+      join(fixtureWorkflowDir, "claude-code-review.yml"),
+      "on:\n  workflow_dispatch:\n    inputs:\n      pr_number:\n",
+    );
+    const staleWorkflowContract = await runResult(
+      baseState({ repoLabels: [], prExists: false }),
+      "jhw_pr_apply_new_pr_policy request",
+    );
+    await writeFile(join(fixtureWorkflowDir, "claude-code-review.yml"), dispatchContract);
+    assert.notEqual(staleWorkflowContract.code, 0);
+    assert.deepEqual(mutationCalls(staleWorkflowContract.log), [],
+      "an unsupported force_review contract must stop before labels, push, or PR creation");
+
+    await writeFile(fixtureConfigPath, enabledReviewConfig.replace(
+      "  claude-code-review:\n    enabled: true",
+      "  claude-code-review:\n    enabled: false",
+    ));
+    const disabledByConfig = await run(
+      baseState(),
+      [
+        "jhw_pr_prepare_review_plan request",
+        "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+      ].join("\n"),
+    );
+    await writeFile(fixtureConfigPath, enabledReviewConfig);
+    assert.doesNotMatch(
+      disabledByConfig.stdout.slice(0, disabledByConfig.stdout.indexOf("unavailable=")),
+      /claude-code-review\.yml/,
+    );
+    assert.match(disabledByConfig.stdout, /claude-code-review\.yml\tworkflow_config_disabled/);
 
     const newPr = await run(
       baseState({

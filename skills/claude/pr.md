@@ -223,6 +223,7 @@ try {
 } catch {
   fail("workflow config read failed");
 }
+
 let seenReview = false;
 let inReview = false;
 let childIndent = null;
@@ -261,6 +262,214 @@ for (const rawLine of text.split(/\r?\n/)) {
 }
 process.stdout.write((seenAuto ? autoValue : "true") + "\n");
 NODE
+}
+
+jhw_pr_gemini_manual_review_configured() {
+  local root config
+  root="${JHW_PR_REPO_ROOT:-.}"
+  config="$root/.gemini/config.yaml"
+  [[ -f "$config" && ! -L "$config" ]] || return 1
+  node - "$config" <<'NODE'
+const fs = require("node:fs");
+const lines = fs.readFileSync(process.argv[2], "utf8").replace(/^\uFEFF/, "").split(/\r?\n/);
+let inCodeReview = false;
+let inPullRequestOpened = false;
+for (const raw of lines) {
+  const line = raw.replace(/\s+#.*$/, "");
+  if (/^code_review:\s*$/.test(line)) {
+    inCodeReview = true;
+    inPullRequestOpened = false;
+    continue;
+  }
+  if (/^[^\s#]/.test(line) && line.trim() !== "") {
+    inCodeReview = false;
+    inPullRequestOpened = false;
+  }
+  if (inCodeReview && /^  pull_request_opened:\s*$/.test(line)) {
+    inPullRequestOpened = true;
+    continue;
+  }
+  if (inPullRequestOpened && /^    code_review:\s*false\s*$/.test(line)) process.exit(0);
+  if (inPullRequestOpened && /^  [^\s#]/.test(line) && !/^  pull_request_opened:/.test(line)) {
+    inPullRequestOpened = false;
+  }
+}
+process.exit(1);
+NODE
+}
+
+jhw_pr_repo_has_app_canary() {
+  local reviewer="$1" raw actor query
+  case "$reviewer" in
+    codex) actor='chatgpt-codex-connector[bot]' ;;
+    gemini-assist) actor='gemini-code-assist[bot]' ;;
+    *) return 2 ;;
+  esac
+  jhw_pr_validate_context || return
+  query=".[] | select(.user.login == \"$actor\" and .user.type == \"Bot\") | {actor:.user.login, url:.html_url, body:(.body // \"\")} | @base64"
+  raw="$(gh api "repos/$REPO_NWO/issues/comments?per_page=100" --paginate --jq "$query" 2>/dev/null)" || return 1
+  node -e '
+const fs = require("node:fs");
+const [reviewer, repo] = process.argv.slice(1);
+const lines = fs.readFileSync(0, "utf8").split(/\r?\n/).filter(Boolean);
+const candidates = [];
+for (const line of lines) {
+  try { candidates.push(JSON.parse(Buffer.from(line, "base64").toString("utf8"))); }
+  catch { process.exit(1); }
+}
+const escapedRepo = repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const pullUrl = new RegExp(`^https://github\\.com/${escapedRepo}/pull/[1-9][0-9]*(?:#.*)?$`);
+const valid = candidates.filter((comment) => pullUrl.test(comment?.url || "") &&
+  typeof comment?.body === "string" && comment.body.trim() !== "");
+if (reviewer === "codex") {
+  const ok = valid.some((comment) => comment.actor === "chatgpt-codex-connector[bot]" &&
+    !/usage limits|create an environment|unable to review/i.test(comment.body));
+  process.exit(ok ? 0 : 1);
+}
+const ok = valid.some((comment) => comment.actor === "gemini-code-assist[bot]");
+process.exit(ok ? 0 : 1);
+' "$reviewer" "$REPO_NWO" <<<"$raw"
+}
+
+jhw_pr_discover_app_reviewers() {
+  if jhw_pr_repo_has_app_canary codex; then
+    printf 'codex\n'
+  fi
+  if jhw_pr_gemini_manual_review_configured && jhw_pr_repo_has_app_canary gemini-assist; then
+    printf 'gemini-assist\n'
+  fi
+}
+
+jhw_pr_workflow_enabled() {
+  local workflow="$1" config_path="${2:-${JHW_PR_CONFIG_PATH:-.github/workflow-config.yml}}"
+  case "$workflow" in
+    claude-code-review|gemini-auto-review|opencode-auto-review) ;;
+    *) return 2 ;;
+  esac
+  [[ -f "$config_path" && ! -L "$config_path" ]] || { printf 'false\n'; return; }
+  node - "$config_path" "$workflow" <<'NODE'
+const fs = require("node:fs");
+const [path, wanted] = process.argv.slice(2);
+const fail = (message) => { process.stderr.write(message + "\n"); process.exit(2); };
+let text;
+try { text = fs.readFileSync(path, "utf8").replace(/^\uFEFF/, ""); }
+catch { fail("workflow config read failed"); }
+const entries = [];
+for (const raw of text.split(/\r?\n/)) {
+  if (/\t/.test(raw.match(/^\s*/)?.[0] || "")) fail("workflow config tabs are unsupported");
+  const trimmed = raw.trim();
+  if (trimmed === "" || trimmed.startsWith("#")) continue;
+  const match = trimmed.match(/^([A-Za-z0-9_.-]+)\s*:(.*)$/);
+  if (!match) continue;
+  entries.push({
+    indent: raw.length - raw.trimStart().length,
+    key: match[1],
+    value: match[2].replace(/\s+#.*$/, "").trim(),
+  });
+}
+const roots = entries.filter((entry) => entry.indent === 0 && entry.key === "workflows");
+if (roots.length > 1) fail("duplicate workflows key");
+if (roots.length === 0 || roots[0].value !== "") { process.stdout.write("false\n"); process.exit(0); }
+const rootIndex = entries.indexOf(roots[0]);
+const afterRoot = entries.slice(rootIndex + 1);
+const rootEnd = afterRoot.findIndex((entry) => entry.indent === 0);
+const scope = rootEnd < 0 ? afterRoot : afterRoot.slice(0, rootEnd);
+const workflowEntries = scope.filter((entry) => entry.key === wanted && entry.value === "");
+if (workflowEntries.length > 1) fail("duplicate workflow key");
+if (workflowEntries.length === 0) { process.stdout.write("false\n"); process.exit(0); }
+const item = workflowEntries[0];
+const itemIndex = scope.indexOf(item);
+const afterItem = scope.slice(itemIndex + 1);
+const itemEnd = afterItem.findIndex((entry) => entry.indent <= item.indent);
+const itemScope = itemEnd < 0 ? afterItem : afterItem.slice(0, itemEnd);
+const enabled = itemScope.filter((entry) => entry.indent > item.indent && entry.key === "enabled");
+if (enabled.length > 1) fail("duplicate workflow enabled key");
+if (enabled.length === 0) { process.stdout.write("false\n"); process.exit(0); }
+if (enabled[0].value !== "true" && enabled[0].value !== "false") fail("workflow enabled must be boolean");
+process.stdout.write(enabled[0].value + "\n");
+NODE
+}
+
+jhw_pr_preflight_workflow() {
+  local workflow="$1" mode="$2" root="${JHW_PR_REPO_ROOT:-.}" path state enabled config_path workflow_key
+  case "$workflow" in
+    claude-code-review.yml|gemini-auto-review.yml|opencode-auto-review.yml) ;;
+    *) return 2 ;;
+  esac
+  case "$mode" in request|auto) ;; *) return 2 ;; esac
+  path="$root/.github/workflows/$workflow"
+  workflow_key="${workflow%.yml}"
+  config_path="${JHW_PR_CONFIG_PATH:-$root/.github/workflow-config.yml}"
+  enabled="$(jhw_pr_workflow_enabled "$workflow_key" "$config_path")" || return
+  if [[ "$enabled" != true ]]; then
+    printf 'UNAVAILABLE\t%s\tworkflow_config_disabled\n' "$workflow"
+    return 0
+  fi
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    printf 'UNAVAILABLE\t%s\tworkflow_file_unavailable\n' "$workflow"
+    return 0
+  fi
+  state="$(gh api "repos/$REPO_NWO/actions/workflows/$workflow" --jq .state 2>/dev/null)" || {
+    printf 'UNAVAILABLE\t%s\tworkflow_unavailable\n' "$workflow"
+    return 0
+  }
+  if [[ "$state" != active ]]; then
+    printf 'UNAVAILABLE\t%s\tworkflow_disabled\n' "$workflow"
+    return 0
+  fi
+  if [[ "$mode" == request ]]; then
+    node - "$path" <<'NODE' || {
+const fs = require("node:fs");
+const text = fs.readFileSync(process.argv[2], "utf8");
+const required = [/^\s{2}workflow_dispatch:\s*$/m, /^\s{6}pr_number:\s*$/m, /^\s{6}force_review:\s*$/m];
+process.exit(required.every((pattern) => pattern.test(text)) ? 0 : 1);
+NODE
+      echo "workflow dispatch contract unsupported: $workflow" >&2
+      return 1
+    }
+  fi
+  printf 'AVAILABLE\t%s\tverified\n' "$workflow"
+}
+
+jhw_pr_prepare_review_plan() {
+  local mode="$1" auto_enabled=false workflow row status name reason
+  JHW_PR_AVAILABLE_WORKFLOWS=''
+  JHW_PR_UNAVAILABLE_WORKFLOWS=''
+  JHW_PR_ELIGIBLE_APPS=''
+  JHW_PR_UNAVAILABLE_APPS=''
+  case "$mode" in request|skip|auto) ;; *) return 2 ;; esac
+  jhw_pr_validate_context || return
+  if [[ "$mode" == auto ]]; then
+    auto_enabled="$(jhw_pr_global_auto_enabled "${JHW_PR_CONFIG_PATH:-}")" || return
+  elif [[ "$mode" == request ]]; then
+    auto_enabled=true
+  fi
+  [[ "$mode" == request || ( "$mode" == auto && "$auto_enabled" == true ) ]] || return 0
+  for workflow in claude-code-review.yml gemini-auto-review.yml opencode-auto-review.yml; do
+    row="$(jhw_pr_preflight_workflow "$workflow" "$mode")" || return
+    IFS=$'\t' read -r status name reason <<<"$row"
+    [[ -n "$name" && -n "$reason" ]] || return 1
+    case "$status" in
+      AVAILABLE)
+        [[ -z "$JHW_PR_AVAILABLE_WORKFLOWS" ]] || JHW_PR_AVAILABLE_WORKFLOWS+=$'\n'
+        JHW_PR_AVAILABLE_WORKFLOWS+="$name"
+        ;;
+      UNAVAILABLE)
+        [[ -z "$JHW_PR_UNAVAILABLE_WORKFLOWS" ]] || JHW_PR_UNAVAILABLE_WORKFLOWS+=$'\n'
+        JHW_PR_UNAVAILABLE_WORKFLOWS+="$name"$'\t'"$reason"
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  JHW_PR_ELIGIBLE_APPS="$(jhw_pr_discover_app_reviewers)" || return
+  for name in codex gemini-assist; do
+    if ! grep -Fqx -- "$name" <<<"$JHW_PR_ELIGIBLE_APPS"; then
+      [[ -z "$JHW_PR_UNAVAILABLE_APPS" ]] || JHW_PR_UNAVAILABLE_APPS+=$'\n'
+      JHW_PR_UNAVAILABLE_APPS+="$name"$'\t'canary_unavailable
+    fi
+  done
+  export JHW_PR_AVAILABLE_WORKFLOWS JHW_PR_UNAVAILABLE_WORKFLOWS
+  export JHW_PR_ELIGIBLE_APPS JHW_PR_UNAVAILABLE_APPS
 }
 
 jhw_pr_validate_context() {
@@ -349,6 +558,7 @@ jhw_pr_apply_new_pr_policy() {
   local mode="$1" local_head draft
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
   jhw_pr_require_write_permission || return
+  jhw_pr_prepare_review_plan "$mode" || return
   jhw_pr_ensure_review_labels || return
   git push -u origin HEAD || return 1
   local_head="$(git rev-parse HEAD)" || return 1
@@ -371,6 +581,7 @@ jhw_pr_apply_existing_pr_policy() {
   actual_local_head="$(git rev-parse HEAD)" || return 1
   [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed before policy reconciliation" >&2; return 1; }
   jhw_pr_require_write_permission || return
+  jhw_pr_prepare_review_plan "$mode" || return
   jhw_pr_ensure_review_labels || return
   remote_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
   [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid remote head" >&2; return 1; }
@@ -574,6 +785,30 @@ $marker"
   JHW_PR_APP_REQUEST_HEAD="$head"
 }
 
+jhw_pr_request_eligible_apps() {
+  local head="$1" eligible="$2" reviewer status reason
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
+  JHW_PR_APP_REQUEST_RESULTS=''
+  while IFS= read -r reviewer; do
+    [[ -n "$reviewer" ]] || continue
+    case "$reviewer" in
+      codex)
+        jhw_pr_request_app_review codex "$head"
+        ;;
+      gemini-assist)
+        jhw_pr_request_app_review gemini-assist "$head"
+        ;;
+      *) return 2 ;;
+    esac
+    status="${JHW_PR_APP_REQUEST_STATUS:-FAILED}"
+    reason="${JHW_PR_APP_REQUEST_REASON:--}"
+    [[ -z "$JHW_PR_APP_REQUEST_RESULTS" ]] || JHW_PR_APP_REQUEST_RESULTS+=$'\n'
+    JHW_PR_APP_REQUEST_RESULTS+="$reviewer"$'\t'"$status"$'\t'"$reason"
+  done <<<"$eligible"
+  export JHW_PR_APP_REQUEST_RESULTS
+  return 0
+}
+
 jhw_pr_workflow_request_failed() {
   JHW_PR_WORKFLOW_REQUEST_STATUS=TRIGGER_FAILED
   JHW_PR_WORKFLOW_REQUEST_REASON="$1"
@@ -603,7 +838,7 @@ jhw_pr_dispatch_same_head() {
   JHW_PR_WORKFLOW_REQUEST_STATUS=""
   JHW_PR_WORKFLOW_REQUEST_REASON=""
   JHW_PR_WORKFLOW_RUN_ID=""
-  workflow_state="$(gh workflow view "$workflow_file" --repo "$REPO_NWO" --json state -q .state 2>/dev/null)" || {
+  workflow_state="$(gh api "repos/$REPO_NWO/actions/workflows/$workflow_file" --jq .state 2>/dev/null)" || {
     JHW_PR_WORKFLOW_REQUEST_STATUS=UNAVAILABLE
     JHW_PR_WORKFLOW_REQUEST_REASON=workflow_unavailable
     return
@@ -650,6 +885,26 @@ jhw_pr_dispatch_same_head() {
       return
       ;;
   esac
+}
+
+jhw_pr_dispatch_preflighted_workflows() {
+  local head="$1" workflows="$2" workflow
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
+  while IFS= read -r workflow; do
+    [[ -n "$workflow" ]] || continue
+    case "$workflow" in
+      claude-code-review.yml)
+        jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' "$head" || return
+        ;;
+      gemini-auto-review.yml)
+        jhw_pr_dispatch_same_head gemini-auto-review.yml 'Gemini Auto PR Review' "$head" || return
+        ;;
+      opencode-auto-review.yml)
+        jhw_pr_dispatch_same_head opencode-auto-review.yml 'OpenCode Auto PR Review' "$head" || return
+        ;;
+      *) return 2 ;;
+    esac
+  done <<<"$workflows"
 }
 
 ship_write_codex_trigger_state() {
@@ -859,9 +1114,7 @@ ship_auto_fix_push_ready() {
 ```bash
 case "$EFFECTIVE_REVIEW_POLICY" in
   request)
-    jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' "$ROUND_HEAD" || return
-    jhw_pr_dispatch_same_head gemini-auto-review.yml 'Gemini Auto PR Review' "$ROUND_HEAD" || return
-    jhw_pr_dispatch_same_head opencode-auto-review.yml 'OpenCode Auto PR Review' "$ROUND_HEAD" || return
+    jhw_pr_dispatch_preflighted_workflows "$ROUND_HEAD" "${JHW_PR_AVAILABLE_WORKFLOWS:-}" || return
     ;;
   auto=true|skip|auto=false) ;;
   *) echo "invalid effective review policy" >&2; return 2 ;;
@@ -869,8 +1122,7 @@ esac
 
 if [[ "$EFFECTIVE_REVIEW_POLICY" == request || "$EFFECTIVE_REVIEW_POLICY" == auto=true ]]; then
   # 실행 시 발견한 eligible App만 호출한다. --reviewers는 이 요청 집합이 아니라 대기 부분집합만 바꾼다.
-  jhw_pr_request_app_review codex "$ROUND_HEAD" || return
-  jhw_pr_request_app_review gemini-assist "$ROUND_HEAD" || return
+  jhw_pr_request_eligible_apps "$ROUND_HEAD" "${JHW_PR_ELIGIBLE_APPS:-}" || return
 fi
 
 # AI mode와 무관한 필수 gate. 3이면 head가 바뀐 것이므로 이번 결과를 폐기하고 policy부터 재시작한다.
