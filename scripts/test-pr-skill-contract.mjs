@@ -40,6 +40,24 @@ const oldGenericCodexMarker = `<!-- jhw-pr:review-request reviewer=codex head=${
 const oldGenericCodexBody = `@codex review\n\n${oldGenericCodexMarker}`;
 const genericGeminiMarker = `<!-- jhw-pr:review-request reviewer=gemini-assist head=${currentHead} -->`;
 const genericGeminiBody = `/gemini review\n\n${genericGeminiMarker}`;
+const workflowNames = {
+  "claude-code-review.yml": "Claude Code Review",
+  "gemini-auto-review.yml": "Gemini Auto PR Review",
+  "opencode-auto-review.yml": "OpenCode Auto PR Review",
+};
+const dispatchContract = "on:\n  workflow_dispatch:\n    inputs:\n      pr_number:\n      force_review:\n";
+const fullReviewWorkflowContract = [
+  "name: Review",
+  "",
+  "on:",
+  "  pull_request:",
+  "    types: [opened, synchronize, ready_for_review]",
+  "  workflow_dispatch:",
+  "    inputs:",
+  "      pr_number:",
+  "      force_review:",
+  "",
+].join("\n");
 
 function contractBlock(markdown) {
   const match = markdown.match(
@@ -233,18 +251,90 @@ const workflowStateMatch = endpoint.match(/^repos\/example\/repo\/actions\/workf
 if (workflowStateMatch) {
   const workflow = decodeURIComponent(workflowStateMatch[1]);
   if (state.failWorkflowView || !state.workflowStates?.[workflow]) process.exit(1);
-  process.stdout.write(state.workflowStates[workflow] + "\n");
+  const metadata = {
+    state: state.workflowStates[workflow],
+    path: ".github/workflows/" + workflow,
+    name: ${JSON.stringify(workflowNames)}[workflow],
+    ...(state.workflowMetadata?.[workflow] || {}),
+  };
+  const jq = optionValue("--jq");
+  if (jq !== undefined) {
+    if (jq !== ".state") process.exit(2);
+    process.stdout.write(String(metadata.state) + "\n");
+  } else {
+    process.stdout.write(JSON.stringify(metadata) + "\n");
+  }
+  process.exit(0);
+}
+
+const workflowContentMatch = endpoint.match(/^repos\/example\/repo\/contents\/\.github\/workflows\/([^/?]+)$/);
+if (workflowContentMatch) {
+  const workflow = decodeURIComponent(workflowContentMatch[1]);
+  const content = state.remoteWorkflowContents?.[workflow];
+  if (typeof content !== "string") process.exit(1);
+  process.stdout.write(JSON.stringify({
+    type: "file",
+    path: ".github/workflows/" + workflow,
+    encoding: "base64",
+    content: Buffer.from(content).toString("base64"),
+  }) + "\n");
+  process.exit(0);
+}
+
+if (endpoint === "graphql") {
+  if (!optionValue("-f") && !optionValue("-F")) process.exit(2);
+  rows([
+    ...(state.appReviews || []).map((item) => ({
+      kind: "review",
+      actor: item.actor.endsWith("[bot]") ? item.actor : item.actor + "[bot]",
+      body: item.body,
+      url: item.url,
+    })),
+    ...(state.appPrReactions || []).map((item) => ({
+      kind: "reaction",
+      actor: item.actor.endsWith("[bot]") ? item.actor : item.actor + "[bot]",
+      content: item.content,
+      url: item.url,
+    })),
+  ].map((item) => Buffer.from(JSON.stringify(item)).toString("base64")));
   process.exit(0);
 }
 
 if (endpoint === "repos/example/repo/issues/comments?per_page=100") {
   if (!argv.includes("--paginate") || argv.includes("--slurp")) process.exit(2);
   const query = optionValue("--jq") || "";
+  if (query.includes("@tsv")) {
+    if (!query.includes("head=[0-9a-f]{40}")) process.exit(2);
+    const marker = query.includes("reviewer=gemini-assist")
+      ? /<!-- jhw-pr:review-request reviewer=gemini-assist head=[0-9a-f]{40} -->/
+      : /<!-- jhw-(?:pr:review-request reviewer=codex|(?:pr|ship):codex-review(?: round=[1-9][0-9]*)?) head=[0-9a-f]{40} -->/;
+    rows((state.appRequestComments || [])
+      .filter((item) => marker.test(item.body || ""))
+      .map((item) => [item.id, item.url].join("\t")));
+    process.exit(0);
+  }
   if (!query.includes("@base64")) process.exit(2);
   const actors = [...query.matchAll(/\.user\.login == "([^"]+)"/g)].map((match) => match[1]);
   rows((state.appComments || [])
     .filter((item) => actors.length === 0 || actors.includes(item.actor))
     .map((item) => Buffer.from(JSON.stringify({
+      kind: "comment",
+      actor: item.actor,
+      body: item.body,
+      url: item.url,
+    })).toString("base64")));
+  process.exit(0);
+}
+
+if (endpoint === "repos/example/repo/pulls/comments?per_page=100") {
+  if (!argv.includes("--paginate") || argv.includes("--slurp")) process.exit(2);
+  const query = optionValue("--jq") || "";
+  if (!query.includes("@base64")) process.exit(2);
+  const actors = [...query.matchAll(/\.user\.login == "([^"]+)"/g)].map((match) => match[1]);
+  rows((state.appPullComments || [])
+    .filter((item) => actors.length === 0 || actors.includes(item.actor))
+    .map((item) => Buffer.from(JSON.stringify({
+      kind: "inline",
       actor: item.actor,
       body: item.body,
       url: item.url,
@@ -285,6 +375,16 @@ if (/\/issues\/\d+\/comments\?per_page=100$/.test(endpoint)) {
 }
 
 if (/\/issues\/comments\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
+  const commentId = endpoint.match(/\/issues\/comments\/(\d+)\/reactions/)?.[1];
+  const query = optionValue("--jq") || "";
+  if (query.includes("@base64")) {
+    rows((state.appCanaryReactions?.[commentId] || []).map((item) => Buffer.from(JSON.stringify({
+      kind: "reaction",
+      actor: item.actor,
+      content: item.content,
+    })).toString("base64")));
+    process.exit(0);
+  }
   rows(state.commentReactions.map((item) => [item.actor, item.content, item.createdAt].join("\t")));
   process.exit(0);
 }
@@ -451,6 +551,15 @@ function baseState(overrides = {}) {
         url: "https://github.com/example/repo/pull/4#issuecomment-2",
       },
     ],
+    appPullComments: [],
+    appRequestComments: [],
+    appCanaryReactions: {},
+    appReviews: [],
+    appPrReactions: [],
+    remoteWorkflowContents: {
+      "claude-code-review.yml": fullReviewWorkflowContract,
+      "gemini-auto-review.yml": fullReviewWorkflowContract,
+    },
     failEndpoints: [],
     failPost: false,
     ...overrides,
@@ -490,8 +599,9 @@ async function main() {
   assert.match(readmeText, /\/jhw:pr --no-review/);
   assert.match(readmeText, /\/jhw:pr --review --auto-fix/);
   assert.match(readmeText, /\/jhw:ship.*\/jhw:pr/);
-  assert.match(readmeText, /생략.*review-on/);
-  assert.match(readmeText, /mutation 전에.*workflow.*App canary/);
+    assert.match(readmeText, /생략.*review-on/);
+    assert.match(readmeText, /mutation 전에.*workflow.*App canary/);
+    assert.match(readmeText, /active 상태·고정 파일 경로·Actions 표시 이름/);
   assert.match(readmeText, /UNAVAILABLE.*mention하지 않는다/);
   assert.ok(existsSync(codexPrSkill), "generated Codex jhw-pr skill must exist");
   assert.ok(lstatSync(codexPrReference).isSymbolicLink(),
@@ -522,7 +632,6 @@ async function main() {
   await writeFile(contractPath, contract);
   await mkdir(fixtureWorkflowDir, { recursive: true });
   await mkdir(dirname(geminiConfigPath), { recursive: true });
-  const dispatchContract = "on:\n  workflow_dispatch:\n    inputs:\n      pr_number:\n      force_review:\n";
   await writeFile(join(fixtureWorkflowDir, "claude-code-review.yml"), dispatchContract);
   await writeFile(join(fixtureWorkflowDir, "gemini-auto-review.yml"), dispatchContract);
   const enabledReviewConfig = [
@@ -660,6 +769,87 @@ async function main() {
       "jhw_pr_discover_app_reviewers",
     );
     assert.equal(eligibleApps.stdout, "codex\ngemini-assist\n");
+
+    const reviewSurfaceCanaries = await run(
+      baseState({
+        appComments: [],
+        appPullComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          body: "[P2] Review comment delivered.",
+          url: "https://github.com/example/repo/pull/88#discussion_r123",
+        }],
+        appReviews: [{
+          actor: "gemini-code-assist",
+          body: "Gemini review completed without blocking findings.",
+          url: "https://github.com/example/repo/pull/88#pullrequestreview-456",
+        }],
+      }),
+      "jhw_pr_discover_app_reviewers",
+    );
+    assert.equal(reviewSurfaceCanaries.stdout, "codex\ngemini-assist\n",
+      "inline comments and PR reviews are valid same-repository App canary surfaces");
+
+    const codexReviewOnlyCanary = await run(
+      baseState({
+        appComments: [],
+        appReviews: [{
+          actor: "chatgpt-codex-connector",
+          body: "Codex review completed with suggestions.",
+          url: "https://github.com/example/repo/pull/89#pullrequestreview-457",
+        }],
+      }),
+      "jhw_pr_repo_has_app_canary codex",
+    );
+    assert.equal(codexReviewOnlyCanary.stdout.trim(), "chatgpt-codex-connector[bot]",
+      "GraphQL Bot identities must normalize to the REST identity used by round polling");
+
+    const cleanPrReactionCanary = await run(
+      baseState({
+        appComments: [],
+        appPrReactions: [{
+          actor: "chatgpt-codex-connector",
+          content: "+1",
+          url: "https://github.com/example/repo/pull/90",
+        }],
+      }),
+      "jhw_pr_repo_has_app_canary codex",
+    );
+    assert.equal(cleanPrReactionCanary.stdout.trim(), "chatgpt-codex-connector[bot]",
+      "a clean reaction on a recent PR is a normal Codex capability surface");
+
+    const cleanReactionCanary = await run(
+      baseState({
+        appComments: [],
+        appRequestComments: [{
+          id: 7001,
+          url: "https://github.com/example/repo/pull/88#issuecomment-7001",
+          body: genericCodexBody,
+        }],
+        appCanaryReactions: {
+          7001: [{ actor: "chatgpt-codex-connector[bot]", content: "+1" }],
+        },
+      }),
+      "jhw_pr_repo_has_app_canary codex",
+    );
+    assert.equal(cleanReactionCanary.stdout.trim(), "chatgpt-codex-connector[bot]",
+      "a clean reaction on a prior head-scoped request must prove Codex capability");
+
+    const unscopedReactionCanary = await runResult(
+      baseState({
+        appComments: [],
+        appRequestComments: [{
+          id: 7002,
+          url: "https://github.com/example/repo/pull/88#issuecomment-7002",
+          body: "@codex review\n\n<!-- jhw-pr:review-request reviewer=codex -->",
+        }],
+        appCanaryReactions: {
+          7002: [{ actor: "chatgpt-codex-connector[bot]", content: "+1" }],
+        },
+      }),
+      "jhw_pr_repo_has_app_canary codex",
+    );
+    assert.notEqual(unscopedReactionCanary.code, 0,
+      "a reaction without a valid head-scoped request marker cannot prove capability");
 
     const unbracketedCodex = await run(
       baseState({
@@ -848,6 +1038,135 @@ async function main() {
       /claude-code-review\.yml/,
     );
     assert.match(disabledByConfig.stdout, /claude-code-review\.yml\tworkflow_config_disabled/);
+
+    const missingRemoteAutoEvent = await run(
+      baseState({
+        remoteWorkflowContents: {
+          "claude-code-review.yml": dispatchContract,
+          "gemini-auto-review.yml": fullReviewWorkflowContract,
+        },
+      }),
+      [
+        "jhw_pr_prepare_review_plan auto",
+        "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+      ].join("\n"),
+    );
+    const autoAvailable = missingRemoteAutoEvent.stdout.slice(
+      0,
+      missingRemoteAutoEvent.stdout.indexOf("unavailable="),
+    );
+    assert.doesNotMatch(autoAvailable, /claude-code-review\.yml/,
+      "an auto workflow without a default-branch pull_request contract cannot be available");
+    assert.match(
+      missingRemoteAutoEvent.stdout,
+      /claude-code-review\.yml\tworkflow_event_contract_unsupported/,
+    );
+
+    const incompleteRemoteAutoActions = await run(
+      baseState({
+        remoteWorkflowContents: {
+          "claude-code-review.yml": fullReviewWorkflowContract.replace(
+            "types: [opened, synchronize, ready_for_review]",
+            "types: [opened]",
+          ),
+          "gemini-auto-review.yml": fullReviewWorkflowContract,
+        },
+      }),
+      [
+        "jhw_pr_prepare_review_plan auto",
+        "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+      ].join("\n"),
+    );
+    assert.match(
+      incompleteRemoteAutoActions.stdout,
+      /claude-code-review\.yml\tworkflow_event_contract_unsupported/,
+      "auto workflows must cover opened, synchronize, and ready_for_review",
+    );
+
+    const implicitPullRequestContracts = [
+      ["scalar", "name: Review\n\non: pull_request\n"],
+      ["flow list", "name: Review\n\non: [pull_request]\n"],
+      ["empty block", "name: Review\n\non:\n  pull_request:\n"],
+      ["empty map", "name: Review\n\non:\n  pull_request: {}\n"],
+    ];
+    for (const [shape, content] of implicitPullRequestContracts) {
+      const implicitContract = await run(
+        baseState({
+          remoteWorkflowContents: {
+            "claude-code-review.yml": content,
+            "gemini-auto-review.yml": fullReviewWorkflowContract,
+          },
+        }),
+        [
+          "jhw_pr_prepare_review_plan auto",
+          "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+        ].join("\n"),
+      );
+      assert.match(
+        implicitContract.stdout,
+        /claude-code-review\.yml\tworkflow_event_contract_unsupported/,
+        `${shape} pull_request uses GitHub default activities and cannot prove ready_for_review`,
+      );
+    }
+
+    for (const quote of ['"', "'"]) {
+      const duplicateOnContract = await run(
+        baseState({
+          remoteWorkflowContents: {
+            "claude-code-review.yml": `${fullReviewWorkflowContract}${quote}on${quote}: push\n`,
+            "gemini-auto-review.yml": fullReviewWorkflowContract,
+          },
+        }),
+        [
+          "jhw_pr_prepare_review_plan auto",
+          "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+        ].join("\n"),
+      );
+      assert.match(
+        duplicateOnContract.stdout,
+        /claude-code-review\.yml\tworkflow_event_contract_unsupported/,
+        `${quote}on${quote} must not bypass duplicate top-level event detection`,
+      );
+    }
+
+    const workflowMetadataDrift = [
+      ["name", { name: "Renamed Review" }],
+      ["path", { path: ".github/workflows/renamed-review.yml" }],
+    ];
+    for (const [field, metadata] of workflowMetadataDrift) {
+      const mismatchedWorkflow = await run(
+        baseState({
+          workflowMetadata: { "claude-code-review.yml": metadata },
+        }),
+        [
+          "jhw_pr_prepare_review_plan request",
+          "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+        ].join("\n"),
+      );
+      assert.match(
+        mismatchedWorkflow.stdout,
+        /claude-code-review\.yml\tworkflow_identity_mismatch/,
+        `remote workflow ${field} drift must fail before review-policy mutation`,
+      );
+    }
+
+    const missingRemoteDispatchInput = await run(
+      baseState({
+        remoteWorkflowContents: {
+          "claude-code-review.yml": fullReviewWorkflowContract.replace("      force_review:\n", ""),
+          "gemini-auto-review.yml": fullReviewWorkflowContract,
+        },
+      }),
+      [
+        "jhw_pr_prepare_review_plan request",
+        "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+      ].join("\n"),
+    );
+    assert.match(
+      missingRemoteDispatchInput.stdout,
+      /claude-code-review\.yml\tworkflow_event_contract_unsupported/,
+      "manual workflow dispatch must be supported by the default-branch contract",
+    );
 
     const newPr = await run(
       baseState({
@@ -1194,6 +1513,19 @@ async function main() {
     );
     assert.equal(disabledWorkflow.stdout.trim(), "UNAVAILABLE,workflow_disabled");
     assert.equal(disabledWorkflow.log.filter(isWorkflowDispatch).length, 0);
+
+    const renamedWorkflow = await run(
+      baseState({
+        workflowMetadata: { "claude-code-review.yml": { name: "Renamed Review" } },
+      }),
+      [
+        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
+        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_REQUEST_REASON\"",
+      ].join("\n"),
+    );
+    assert.equal(renamedWorkflow.stdout.trim(), "UNAVAILABLE,workflow_identity_mismatch");
+    assert.equal(renamedWorkflow.log.filter(isWorkflowDispatch).length, 0,
+      "a renamed workflow must not be dispatched under a stale run name");
 
     const requiredChecks = await run(
       baseState({ prHead: currentHead }),
