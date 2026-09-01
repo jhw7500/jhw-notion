@@ -19,6 +19,9 @@ const agentsPath = join(repoRoot, "skills", "claude", "AGENTS.md");
 const readmePath = join(repoRoot, "README.md");
 const codexIssueSkill = join(repoRoot, "skills", "codex", "jhw-issue", "SKILL.md");
 const codexIssueReference = join(repoRoot, "skills", "codex", "jhw-issue", "references", "issue.md");
+const claudeWorkflowPath = join(repoRoot, ".github", "workflows", "claude.yml");
+const geminiWorkflowPath = join(repoRoot, ".github", "workflows", "gemini-dispatch.yml");
+const requestScopedRunName = "run-name: jhw-review-comment-${{ github.event.comment.id || github.run_id }}";
 const issueCreatedAt = "2026-09-01T00:00:00Z";
 const requestCreatedAt = "2026-09-01T00:01:00Z";
 const requestEpoch = Date.parse(requestCreatedAt) / 1000;
@@ -376,8 +379,8 @@ function issueState(overrides = {}) {
       "gemini-dispatch.yml": "active",
     },
     remoteWorkflowContents: {
-      "claude.yml": "name: Claude Code\n\non:\n  issue_comment:\n    types: [created]\n",
-      "gemini-dispatch.yml": "name: Gemini Dispatch\n\non:\n  issue_comment:\n    types: [created]\n",
+      "claude.yml": `name: Claude Code\n${requestScopedRunName}\n\non:\n  issue_comment:\n    types: [created]\n`,
+      "gemini-dispatch.yml": `name: Gemini Dispatch\n${requestScopedRunName}\n\non:\n  issue_comment:\n    types: [created]\n`,
     },
     mutations: [],
     nextCommentId: 1001,
@@ -419,6 +422,14 @@ async function main() {
     "the compact signal snapshot must not cross the exec environment boundary");
   assert.ok(existsSync(codexIssueSkill));
   assert.ok(lstatSync(codexIssueReference).isSymbolicLink());
+  for (const workflowPath of [claudeWorkflowPath, geminiWorkflowPath]) {
+    const workflowText = await readFile(workflowPath, "utf8");
+    assert.equal(
+      workflowText.split(/\r?\n/).filter((line) => line === requestScopedRunName).length,
+      1,
+      `${workflowPath}: Issue-comment runs must expose the triggering comment ID in display_title`,
+    );
+  }
   const contract = `${createContractBlock(issueText)}\n${waitContractBlock(issueText)}`;
 
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-issue-contract-"));
@@ -826,6 +837,16 @@ async function main() {
     );
     assert.equal(remoteContractMismatch.stdout.trim(), "",
       "the default-branch workflow must expose an issue_comment event contract");
+    const remoteRunNameMismatch = await runIssue(
+      issueState({
+        remoteWorkflowContents: {
+          "claude.yml": "name: Claude Code\n\non:\n  issue_comment:\n    types: [created]\n",
+        },
+      }),
+      "jhw_issue_discover_reviewers request true",
+    );
+    assert.equal(remoteRunNameMismatch.stdout.trim(), "",
+      "a workflow without a request-comment run-name coordinate cannot be eligible");
     const remoteActionMismatch = await runIssue(
       issueState({
         remoteWorkflowContents: {
@@ -1015,7 +1036,7 @@ async function main() {
           conclusion: "success",
           createdAt: "2026-09-01T00:02:00Z",
           url: "https://github.com/example/repo/actions/runs/500",
-          displayTitle: "Review this",
+          displayTitle: "jhw-review-comment-1001",
           actor: "jhw7500",
           triggeringActor: "jhw7500",
         }],
@@ -1041,7 +1062,7 @@ async function main() {
           conclusion: "null",
           createdAt: "2026-09-01T00:02:00Z",
           url: "https://github.com/example/repo/actions/runs/500",
-          displayTitle: "Review this",
+          displayTitle: "jhw-review-comment-1001",
           actor: "jhw7500",
           triggeringActor: "jhw7500",
         }],
@@ -1078,7 +1099,7 @@ async function main() {
             conclusion: "null",
             createdAt: "2026-09-01T00:02:00Z",
             url: "https://github.com/example/repo/actions/runs/500",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           }],
@@ -1114,7 +1135,7 @@ async function main() {
             conclusion: "null",
             createdAt: "2026-09-01T00:02:00Z",
             url: "https://github.com/example/repo/actions/runs/500",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           }],
@@ -1146,7 +1167,7 @@ async function main() {
             conclusion: "success",
             createdAt: "2026-09-01T00:01:59Z",
             url: "https://github.com/example/repo/actions/runs/499",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           },
@@ -1158,7 +1179,7 @@ async function main() {
             conclusion: "null",
             createdAt: "2026-09-01T00:02:00Z",
             url: "https://github.com/example/repo/actions/runs/500",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           },
@@ -1300,7 +1321,7 @@ async function main() {
           conclusion: "failure",
           createdAt: "2026-09-01T00:02:00Z",
           url: "https://github.com/example/repo/actions/runs/501",
-          displayTitle: "Review this",
+          displayTitle: "jhw-review-comment-1001",
           actor: "jhw7500",
           triggeringActor: "jhw7500",
         }],
@@ -1310,6 +1331,45 @@ async function main() {
     );
     assert.equal(failedRun.stdout.split("\n")[0], "FAILED");
     assert.match(failedRun.stdout, /actions\/runs\/501/);
+
+    const requestScopedRun = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment],
+        runs: [
+          {
+            id: 508,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "in_progress",
+            conclusion: "null",
+            createdAt: "2026-09-01T00:02:00Z",
+            url: "https://github.com/example/repo/actions/runs/508",
+            displayTitle: "jhw-review-comment-1001",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+          {
+            id: 509,
+            name: "Claude Code",
+            event: "issue_comment",
+            status: "completed",
+            conclusion: "failure",
+            createdAt: "2026-09-01T00:03:00Z",
+            url: "https://github.com/example/repo/actions/runs/509",
+            displayTitle: "jhw-review-comment-1002",
+            actor: "jhw7500",
+            triggeringActor: "jhw7500",
+          },
+        ],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(requestScopedRun.stdout.split("\n")[0], "PENDING");
+    assert.match(requestScopedRun.stdout, /\|acknowledged/,
+      "only the workflow run named with this reviewer request comment may acknowledge it");
+    assert.doesNotMatch(requestScopedRun.stdout, /actions\/runs\/509/);
 
     const supersededFailedRun = await classify(
       issueState({
@@ -1332,7 +1392,7 @@ async function main() {
             conclusion: "failure",
             createdAt: "2026-09-01T00:02:00Z",
             url: "https://github.com/example/repo/actions/runs/504",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           },
@@ -1344,7 +1404,7 @@ async function main() {
             conclusion: "success",
             createdAt: "2026-09-01T00:02:00Z",
             url: "https://github.com/example/repo/actions/runs/505",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           },
@@ -1370,7 +1430,7 @@ async function main() {
             conclusion: "failure",
             createdAt: "2026-09-01T00:02:00Z",
             url: "https://github.com/example/repo/actions/runs/506",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           },
@@ -1382,7 +1442,7 @@ async function main() {
             conclusion: "null",
             createdAt: "2026-09-01T00:02:00Z",
             url: "https://github.com/example/repo/actions/runs/507",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           },
@@ -1407,7 +1467,7 @@ async function main() {
           conclusion: "failure",
           createdAt: requestCreatedAt,
           url: "https://github.com/example/repo/actions/runs/503",
-          displayTitle: "Review this",
+          displayTitle: "jhw-review-comment-1001",
           actor: "jhw7500",
           triggeringActor: "jhw7500",
         }],
@@ -1431,7 +1491,7 @@ async function main() {
             conclusion: "null",
             createdAt: "2026-09-01T00:02:00Z",
             url: "https://github.com/example/repo/actions/runs/unsafe",
-            displayTitle: "Review this",
+            displayTitle: "jhw-review-comment-1001",
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           }],
@@ -1458,7 +1518,7 @@ async function main() {
           conclusion: "failure",
           createdAt: "2026-09-01T00:02:00Z",
           url: "https://github.com/example/repo/actions/runs/502",
-          displayTitle: "A different Issue",
+          displayTitle: "jhw-review-comment-9999",
           actor: "jhw7500",
           triggeringActor: "jhw7500",
         }],
@@ -1905,7 +1965,7 @@ async function main() {
           conclusion: "null",
           createdAt: "2026-09-01T00:01:30Z",
           url: "https://github.com/example/repo/actions/runs/601",
-          displayTitle: "Review this",
+          displayTitle: "jhw-review-comment-1001",
           actor: "jhw7500",
           triggeringActor: "jhw7500",
         }],
@@ -1930,7 +1990,7 @@ async function main() {
           conclusion: "null",
           createdAt: "2026-09-01T00:01:30Z",
           url: "https://github.com/example/repo/actions/runs/602",
-          displayTitle: "Review this",
+          displayTitle: "jhw-review-comment-1001",
           actor: "jhw7500",
           triggeringActor: "jhw7500",
         }],

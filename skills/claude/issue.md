@@ -20,8 +20,8 @@ eligible reviewer가 0명이면 Issue 생성 전에 중단한다.
 
 | Reviewer | Required evidence |
 | --- | --- |
-| Claude | local `claude.yml` regular file + config enabled + 기본 브랜치의 `Claude Code` workflow가 active이고 `issue_comment` event 지원 |
-| Gemini | local `gemini-dispatch.yml` regular file + config enabled + 기본 브랜치의 `Gemini Dispatch` workflow가 active이고 `issue_comment` event 지원 |
+| Claude | local `claude.yml` regular file + config enabled + 기본 브랜치의 `Claude Code` workflow가 active이고 `issue_comment` event 및 request-comment `run-name` 좌표 지원 |
+| Gemini | local `gemini-dispatch.yml` regular file + config enabled + 기본 브랜치의 `Gemini Dispatch` workflow가 active이고 `issue_comment` event 및 request-comment `run-name` 좌표 지원 |
 | Codex | 동일 저장소 canary Issue에서 actor-owned 요청 뒤 하나의 Codex bot identity가 실패가 아닌 응답을 반환 |
 
 Gemini Assist와 OpenCode는 PR-only라 Issue reviewer로 추정하지 않는다. secret 값은 조회하거나
@@ -248,6 +248,10 @@ const bytes = Buffer.from(compact, "base64");
 if (bytes.toString("base64").replace(/=+$/, "") !== compact.replace(/=+$/, "")) process.exit(1);
 const text = bytes.toString("utf8");
 const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
+const requestScopedRunName = "run-name: jhw-review-comment-${{ github.event.comment.id || github.run_id }}";
+if (lines.filter((raw) => raw.replace(/\s+#.*$/, "") === requestScopedRunName).length !== 1) {
+  process.exit(1);
+}
 let onIndex = -1;
 let supportsIssueComment = false;
 let issueCommentIndex = -1;
@@ -613,6 +617,9 @@ jhw_issue_create() {
 요청된 reviewer만 private invocation state에서 추적한다. 한 번의 collect/classify pass는 read-only이며,
 agent harness가 약 60초 간격으로 모든 요청 reviewer가 terminal이거나 전체 deadline에 도달할 때까지
 반복한다. untracked `&`/`nohup`과 60초를 넘는 foreground sleep은 사용하지 않는다.
+workflow run은 `jhw-review-comment-<request_comment_id>`라는 정확한 `display_title`을 가진 경우에만
+그 reviewer 요청의 acknowledgment·failure 좌표로 사용한다. 뒤이은 다른 reviewer/Codex 멘션이 깨운
+같은 이름의 run은 request comment ID가 다르므로 현재 판정에서 제외한다.
 
 <!-- issue-review-wait-contract:begin -->
 ```bash
@@ -701,7 +708,7 @@ const snapshot = {
   })),
   runs: runPages.flatMap((page) => page.workflow_runs)
     .filter((item) => item?.event === "issue_comment" &&
-      item?.display_title === issueTitle &&
+      item?.display_title === `jhw-review-comment-${requestCommentId}` &&
       (item?.actor?.login === requestActor || item?.triggering_actor?.login === requestActor))
     .map((item) => ({
       id: item?.id,
@@ -802,6 +809,7 @@ if (requests.length !== 1) {
 const request = requests[0];
 const requestEpoch = epoch(request.created_at);
 const requestId = Number(request.id);
+const expectedRunTitle = `jhw-review-comment-${requestId}`;
 const atOrAfterRequest = (value) => {
   const parsed = epoch(value);
   return parsed !== null && parsed >= requestEpoch && parsed >= issueEpoch;
@@ -845,7 +853,7 @@ const reactions = effectiveBot ? snapshot.reactions.filter((reaction) =>
   reaction.actor === effectiveBot && atOrAfterRequest(reaction.created_at)) : [];
 const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
   run.name === workflowName && run.event === "issue_comment" && afterRequest(run.created_at) &&
-  run.display_title === snapshot.issue_title &&
+  run.display_title === expectedRunTitle &&
   (run.triggering_actor === snapshot.request_actor || run.actor === snapshot.request_actor));
 
 const runIds = runs.map((run) => Number(run.id));
