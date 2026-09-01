@@ -395,41 +395,76 @@ agent harness가 약 60초 간격으로 모든 요청 reviewer가 terminal이거
 ```bash
 jhw_issue_collect_signals() {
   local issue="$1" request_comment_id="$2" issue_created_at="$3"
-  local actor comments reactions runs
+  local actor issue_title comments reactions runs
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$request_comment_id" =~ ^[1-9][0-9]*$ ]] || return 2
   jhw_issue_is_utc_timestamp "$issue_created_at" || return 2
   actor="$(gh api user --jq '.login' 2>/dev/null)" || return 1
   [[ "$actor" =~ ^[A-Za-z0-9-]+$ ]] || return 1
-  comments="$(gh api "repos/$REPO_NWO/issues/$issue/comments?per_page=100" --paginate \
-    --jq '[.[] | {id, actor:.user.login, created_at:.created_at, body:(.body // ""), url:.html_url}]' 2>/dev/null)" || return 1
-  reactions="$(gh api "repos/$REPO_NWO/issues/comments/$request_comment_id/reactions?per_page=100" --paginate \
-    --jq '[.[] | {actor:.user.login, content:.content, created_at:.created_at, url:.html_url}]' 2>/dev/null)" || return 1
-  runs="$(gh api "repos/$REPO_NWO/actions/runs?per_page=100" --paginate \
-    --jq '[.workflow_runs[] | {id, name:.name, event:.event, status:.status, conclusion:(.conclusion // "null"), created_at:.created_at, url:.html_url}]' 2>/dev/null)" || return 1
-  JHW_ISSUE_COMMENTS_JSON="$comments" \
-  JHW_ISSUE_REACTIONS_JSON="$reactions" \
-  JHW_ISSUE_RUNS_JSON="$runs" \
-  node - "$issue" "$request_comment_id" "$issue_created_at" "$actor" <<'NODE'
-const [issue, requestCommentId, issueCreatedAt, requestActor] = process.argv.slice(2);
+  issue_title="$(gh issue view "$issue" --repo "$REPO_NWO" --json title --jq .title)" || return 1
+  [[ -n "${issue_title//[[:space:]]/}" ]] || return 1
+  comments="$(gh api "repos/$REPO_NWO/issues/$issue/comments?per_page=100" --paginate --slurp 2>/dev/null)" || return 1
+  reactions="$(gh api "repos/$REPO_NWO/issues/comments/$request_comment_id/reactions?per_page=100" --paginate --slurp 2>/dev/null)" || return 1
+  runs="$(gh api "repos/$REPO_NWO/actions/runs?per_page=100" --paginate --slurp 2>/dev/null)" || return 1
+  JHW_ISSUE_COMMENT_PAGES_JSON="$comments" \
+  JHW_ISSUE_REACTION_PAGES_JSON="$reactions" \
+  JHW_ISSUE_RUN_PAGES_JSON="$runs" \
+  node - "$issue" "$request_comment_id" "$issue_created_at" "$actor" "$issue_title" <<'NODE'
+const [issue, requestCommentId, issueCreatedAt, requestActor, issueTitle] = process.argv.slice(2);
 const fail = (message) => { process.stderr.write(message + "\n"); process.exit(1); };
-const parseArray = (name) => {
+const parseJson = (name) => {
   try {
-    const value = JSON.parse(process.env[name] || "");
-    if (!Array.isArray(value)) fail(`${name} must be an array`);
-    return value;
+    return JSON.parse(process.env[name] || "");
   } catch {
     fail(`${name} is invalid JSON`);
   }
 };
+const arrayPages = (name) => {
+  const pages = parseJson(name);
+  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
+    fail(`${name} must contain array pages`);
+  }
+  return pages.flat();
+};
+const commentRows = arrayPages("JHW_ISSUE_COMMENT_PAGES_JSON");
+const reactionRows = arrayPages("JHW_ISSUE_REACTION_PAGES_JSON");
+const runPages = parseJson("JHW_ISSUE_RUN_PAGES_JSON");
+if (!Array.isArray(runPages) || runPages.some((page) => !page || !Array.isArray(page.workflow_runs))) {
+  fail("JHW_ISSUE_RUN_PAGES_JSON must contain workflow run pages");
+}
 const snapshot = {
   issue: Number(issue),
   request_comment_id: Number(requestCommentId),
   issue_created_at: issueCreatedAt,
   request_actor: requestActor,
-  comments: parseArray("JHW_ISSUE_COMMENTS_JSON"),
-  reactions: parseArray("JHW_ISSUE_REACTIONS_JSON"),
-  runs: parseArray("JHW_ISSUE_RUNS_JSON"),
+  issue_title: issueTitle,
+  comments: commentRows.map((item) => ({
+    id: item?.id,
+    actor: item?.user?.login,
+    actor_type: item?.user?.type,
+    created_at: item?.created_at,
+    body: item?.body || "",
+    url: item?.html_url || "",
+  })),
+  reactions: reactionRows.map((item) => ({
+    actor: item?.user?.login,
+    actor_type: item?.user?.type,
+    content: item?.content,
+    created_at: item?.created_at,
+    url: item?.html_url || "",
+  })),
+  runs: runPages.flatMap((page) => page.workflow_runs).map((item) => ({
+    id: item?.id,
+    name: item?.name,
+    event: item?.event,
+    status: item?.status,
+    conclusion: item?.conclusion || "null",
+    created_at: item?.created_at,
+    url: item?.html_url || "",
+    display_title: item?.display_title || "",
+    actor: item?.actor?.login || "",
+    triggering_actor: item?.triggering_actor?.login || "",
+  })),
 };
 process.stdout.write(JSON.stringify(snapshot) + "\n");
 NODE
@@ -472,7 +507,8 @@ if (eligibleRaw === "false") emit("UNAVAILABLE", "", "preflight_unavailable");
 let snapshot;
 try { snapshot = JSON.parse(process.env.JHW_ISSUE_SIGNAL_JSON || ""); }
 catch { process.stderr.write("invalid signal snapshot\n"); process.exit(1); }
-if (!snapshot || !Array.isArray(snapshot.comments) || !Array.isArray(snapshot.reactions) || !Array.isArray(snapshot.runs)) {
+if (!snapshot || typeof snapshot.issue_title !== "string" || snapshot.issue_title.trim() === "" ||
+    !Array.isArray(snapshot.comments) || !Array.isArray(snapshot.reactions) || !Array.isArray(snapshot.runs)) {
   process.stderr.write("invalid signal snapshot\n"); process.exit(1);
 }
 const epoch = (value) => {
@@ -503,7 +539,9 @@ const comments = snapshot.comments.filter((comment) =>
 const reactions = snapshot.reactions.filter((reaction) =>
   reaction.actor === expectedBot && later(reaction.created_at));
 const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
-  run.name === workflowName && ["issue_comment", "issues", "workflow_dispatch"].includes(run.event) && later(run.created_at));
+  run.name === workflowName && run.event === "issue_comment" && later(run.created_at) &&
+  run.display_title === snapshot.issue_title &&
+  (run.triggering_actor === snapshot.request_actor || run.actor === snapshot.request_actor));
 
 const failedRun = runs.find((run) => run.status === "completed" && !["success", "neutral", "skipped"].includes(run.conclusion));
 if (failedRun) emit("FAILED", failedRun.url, "workflow_failed");

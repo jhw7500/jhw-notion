@@ -47,6 +47,10 @@ const argv = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
 fs.appendFileSync(logPath, JSON.stringify(argv) + "\n");
 
+if (argv.includes("--slurp") && (argv.includes("--jq") || argv.includes("--template"))) {
+  process.exit(1);
+}
+
 function save() {
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 }
@@ -103,6 +107,7 @@ if (argv[0] === "issue" && argv[1] === "view") {
   if (query === ".number") process.stdout.write(String(state.issueNumber) + "\n");
   else if (query === ".url") process.stdout.write(state.issueUrl + "\n");
   else if (query === ".createdAt") process.stdout.write(state.issueCreatedAt + "\n");
+  else if (query === ".title") process.stdout.write(state.issueTitle + "\n");
   else if (query.includes(".labels")) rows(state.issueLabels);
   else process.exit(2);
   process.exit(0);
@@ -136,6 +141,10 @@ const commentMatch = endpoint.match(/repos\/[^/]+\/[^/]+\/issues\/(\d+)\/comment
 if (commentMatch) {
   const issueNumber = Number(commentMatch[1]);
   const comments = issueNumber === state.issueNumber ? state.issueComments : state.canaryComments;
+  const commentPages = issueNumber === state.issueNumber && state.issueCommentPages
+    ? state.issueCommentPages
+    : [comments];
+  const allComments = commentPages.flat();
   if (argv.includes("POST")) {
     if (issueNumber !== state.issueNumber || state.failCommentPost) process.exit(1);
     const fieldIndex = argv.indexOf("-f");
@@ -156,23 +165,42 @@ if (commentMatch) {
   }
 
   const query = optionValue("--jq", "-q") || "";
-  if (query.includes("{id, actor:.user.login")) {
-    process.stdout.write(JSON.stringify(comments.map((item) => ({
+  if (argv.includes("--slurp") && query === "") {
+    process.stdout.write(JSON.stringify(commentPages.map((page) => page.map((item) => ({
+      id: item.id,
+      user: {
+        login: item.actor,
+        type: item.actorType || (item.actor.endsWith("[bot]") ? "Bot" : "User"),
+      },
+      created_at: item.createdAt,
+      body: item.body,
+      html_url: item.url || "",
+    })))) + "\n");
+    process.exit(0);
+  }
+  if (query.includes("actor:.user.login")) {
+    const mapComment = (item) => ({
       id: item.id,
       actor: item.actor,
+      actor_type: item.actorType || (item.actor.endsWith("[bot]") ? "Bot" : "User"),
       created_at: item.createdAt,
       body: item.body,
       url: item.url || "",
-    }))) + "\n");
+    });
+    if (argv.includes("--slurp")) {
+      process.stdout.write(JSON.stringify(allComments.map(mapComment)) + "\n");
+    } else {
+      rows(commentPages.map((page) => JSON.stringify(page.map(mapComment))));
+    }
     process.exit(0);
   }
   if (query.includes("[.user.login, .created_at, .html_url]")) {
-    rows(comments.map((item) => [item.actor, item.createdAt, item.url || ""].join("\t")));
+    rows(allComments.map((item) => [item.actor, item.createdAt, item.url || ""].join("\t")));
     process.exit(0);
   }
   const actor = query.match(/\.user\.login == "([^"]+)"/)?.[1];
   const markers = [...query.matchAll(/contains\("([^"]+)"\)/g)].map((match) => match[1]);
-  const matching = comments.filter((item) =>
+  const matching = allComments.filter((item) =>
     (!actor || item.actor === actor) &&
     (markers.length === 0 || markers.some((marker) => item.body.includes(marker))));
   rows(matching.map((item) => String(item.id) + "\t" + item.createdAt));
@@ -181,6 +209,18 @@ if (commentMatch) {
 
 if (/\/issues\/comments\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
   const query = optionValue("--jq", "-q") || "";
+  if (argv.includes("--slurp") && query === "") {
+    process.stdout.write(JSON.stringify([state.commentReactions.map((item) => ({
+      user: {
+        login: item.actor,
+        type: item.actorType || (item.actor.endsWith("[bot]") ? "Bot" : "User"),
+      },
+      content: item.content,
+      created_at: item.createdAt,
+      html_url: item.url || "",
+    }))]) + "\n");
+    process.exit(0);
+  }
   if (!query.includes("{actor:.user.login")) process.exit(2);
   process.stdout.write(JSON.stringify(state.commentReactions.map((item) => ({
     actor: item.actor,
@@ -193,6 +233,21 @@ if (/\/issues\/comments\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
 
 if (endpoint === "repos/example/repo/actions/runs?per_page=100") {
   const query = optionValue("--jq", "-q") || "";
+  if (argv.includes("--slurp") && query === "") {
+    process.stdout.write(JSON.stringify([{ workflow_runs: state.runs.map((item) => ({
+      id: item.id,
+      name: item.name,
+      event: item.event,
+      status: item.status,
+      conclusion: item.conclusion,
+      created_at: item.createdAt,
+      html_url: item.url || "",
+      display_title: item.displayTitle || "",
+      actor: { login: item.actor || "" },
+      triggering_actor: { login: item.triggeringActor || "" },
+    })) }]) + "\n");
+    process.exit(0);
+  }
   if (!query.includes("{id, name:.name")) process.exit(2);
   process.stdout.write(JSON.stringify(state.runs.map((item) => ({
     id: item.id,
@@ -202,6 +257,9 @@ if (endpoint === "repos/example/repo/actions/runs?per_page=100") {
     conclusion: item.conclusion,
     created_at: item.createdAt,
     url: item.url || "",
+    display_title: item.displayTitle || "",
+    actor: item.actor || "",
+    triggering_actor: item.triggeringActor || "",
   }))) + "\n");
   process.exit(0);
 }
@@ -220,6 +278,7 @@ function issueState(overrides = {}) {
     issueLabels: [],
     issueNumber: 99,
     issueUrl: "https://github.com/example/repo/issues/99",
+    issueTitle: "Review this",
     issueCreatedAt,
     requestCreatedAt,
     issueComments: [],
@@ -608,6 +667,9 @@ async function main() {
           conclusion: "failure",
           createdAt: "2026-09-01T00:02:00Z",
           url: "https://github.com/example/repo/actions/runs/501",
+          displayTitle: "Review this",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
         }],
       }),
       "claude",
@@ -615,6 +677,29 @@ async function main() {
     );
     assert.equal(failedRun.stdout.split("\n")[0], "FAILED");
     assert.match(failedRun.stdout, /actions\/runs\/501/);
+
+    const unrelatedFailedRun = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment],
+        runs: [{
+          id: 502,
+          name: "Claude Code",
+          event: "issue_comment",
+          status: "completed",
+          conclusion: "failure",
+          createdAt: "2026-09-01T00:02:00Z",
+          url: "https://github.com/example/repo/actions/runs/502",
+          displayTitle: "A different Issue",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(unrelatedFailedRun.stdout.split("\n")[0], "PENDING",
+      "a same-named workflow run for another Issue must not affect this request");
 
     const rejected = await classify(
       issueState({
@@ -668,6 +753,19 @@ async function main() {
       triggerDeadline - 1,
     );
     assert.equal(oldOrWrong.stdout.split("\n")[0], "PENDING");
+
+    const secondPageResponse = response("Requirements are complete; no blocking risks.");
+    const paginated = await classify(
+      issueState({
+        issueExists: true,
+        issueComments: [requestComment, secondPageResponse],
+        issueCommentPages: [[requestComment], [secondPageResponse]],
+      }),
+      "claude",
+      triggerDeadline - 1,
+    );
+    assert.equal(paginated.stdout.split("\n")[0], "CLEAN",
+      "paginated comment arrays must be flattened before JSON parsing");
 
     assert.equal(
       (await runIssue(issueState(), "jhw_issue_highest_disposition CLEAN FEEDBACK")).stdout.trim(),
