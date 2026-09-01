@@ -37,6 +37,22 @@ JHW_ISSUE_REVIEW_SKIP_COLOR='B60205'
 JHW_ISSUE_REVIEW_REQUEST_DESCRIPTION='Explicitly request AI review'
 JHW_ISSUE_REVIEW_SKIP_DESCRIPTION='Explicitly skip AI review'
 
+jhw_issue_repo_root() {
+  local root="${JHW_ISSUE_REPO_ROOT:-}"
+  if [[ -z "$root" ]]; then
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+      echo "Git repository root lookup failed" >&2
+      return 1
+    }
+  fi
+  [[ -n "$root" && "$root" != *$'\n'* && "$root" != *$'\r'* && -d "$root" ]] || {
+    echo "invalid repository root" >&2
+    return 2
+  }
+  root="$(cd -P -- "$root" 2>/dev/null && pwd -P)" || return 1
+  printf '%s\n' "$root"
+}
+
 jhw_issue_review_mode_from_args() {
   local arg saw_review=0 saw_no_review=0
   for arg in "$@"; do
@@ -64,7 +80,11 @@ jhw_issue_validate_timeout() {
 }
 
 jhw_issue_global_auto_enabled() {
-  local config_path="${1:-${JHW_ISSUE_CONFIG_PATH:-.github/workflow-config.yml}}"
+  local config_path="${1-}" root
+  if [[ -z "$config_path" ]]; then
+    root="$(jhw_issue_repo_root)" || return
+    config_path="${JHW_ISSUE_CONFIG_PATH:-$root/.github/workflow-config.yml}"
+  fi
   if [[ ! -e "$config_path" ]]; then
     printf 'true\n'
     return
@@ -124,8 +144,12 @@ NODE
 }
 
 jhw_issue_workflow_enabled() {
-  local workflow_key="$1" config_path="${2:-${JHW_ISSUE_CONFIG_PATH:-.github/workflow-config.yml}}"
+  local workflow_key="$1" config_path="${2-}" root
   case "$workflow_key" in claude|gemini-dispatch) ;; *) return 2 ;; esac
+  if [[ -z "$config_path" ]]; then
+    root="$(jhw_issue_repo_root)" || return
+    config_path="${JHW_ISSUE_CONFIG_PATH:-$root/.github/workflow-config.yml}"
+  fi
   [[ -f "$config_path" && ! -L "$config_path" ]] || { printf 'false\n'; return; }
   node - "$config_path" "$workflow_key" <<'NODE'
 const fs = require("node:fs");
@@ -378,13 +402,14 @@ jhw_issue_codex_canary_eligible() {
 }
 
 jhw_issue_discover_reviewers() {
-  local mode="$1" auto_enabled="$2" root="${JHW_ISSUE_REPO_ROOT:-.}"
-  local config_path="${JHW_ISSUE_CONFIG_PATH:-$root/.github/workflow-config.yml}"
+  local mode="$1" auto_enabled="$2" root config_path
   local codex_identity="${3-}" codex_identity_supplied=false
   if (( $# >= 3 )); then codex_identity_supplied=true; fi
   case "$mode" in request|skip|auto) ;; *) return 2 ;; esac
   case "$auto_enabled" in true|false) ;; *) return 2 ;; esac
   [[ "$mode" == request || ( "$mode" == auto && "$auto_enabled" == true ) ]] || return 0
+  root="$(jhw_issue_repo_root)" || return
+  config_path="${JHW_ISSUE_CONFIG_PATH:-$root/.github/workflow-config.yml}"
   if [[ -f "$root/.github/workflows/claude.yml" && ! -L "$root/.github/workflows/claude.yml" ]] &&
     [[ "$(jhw_issue_workflow_enabled claude "$config_path")" == true ]] &&
     jhw_issue_remote_workflow_eligible claude.yml 'Claude Code'; then

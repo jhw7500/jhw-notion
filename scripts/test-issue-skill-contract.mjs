@@ -343,6 +343,17 @@ fs.writeFileSync(process.env.FAKE_DATE_EPOCH_FILE, String(current + seconds));
 fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(["sleep", value]) + "\n");
 `;
 
+const fakeGitSource = String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(["git", ...argv]) + "\n");
+if (argv[0] === "rev-parse" && argv[1] === "--show-toplevel") {
+  process.stdout.write(process.env.FAKE_GIT_TOPLEVEL + "\n");
+  process.exit(0);
+}
+process.exit(2);
+`;
+
 function issueState(overrides = {}) {
   return {
     actor: "jhw7500",
@@ -414,12 +425,14 @@ async function main() {
   const fakeGh = join(tempRoot, "gh");
   const fakeDate = join(tempRoot, "date");
   const fakeSleep = join(tempRoot, "sleep");
+  const fakeGit = join(tempRoot, "git");
   const contractPath = join(tempRoot, "contract.bash");
   const statePath = join(tempRoot, "gh-state.json");
   const logPath = join(tempRoot, "gh-log.jsonl");
   const summaryStatePath = join(tempRoot, "jhw-issue.summary.state");
   const nowEpochPath = join(tempRoot, "now-epoch");
   const fixtureRoot = join(tempRoot, "repo");
+  const fixtureNestedDir = join(fixtureRoot, "nested", "cwd");
   const workflowDir = join(fixtureRoot, ".github", "workflows");
   const configPath = join(fixtureRoot, ".github", "workflow-config.yml");
 
@@ -429,18 +442,25 @@ async function main() {
   await chmod(fakeDate, 0o755);
   await writeFile(fakeSleep, fakeSleepSource);
   await chmod(fakeSleep, 0o755);
+  await writeFile(fakeGit, fakeGitSource);
+  await chmod(fakeGit, 0o755);
   await writeFile(contractPath, contract);
 
   async function setRepoFixture({ claude = false, gemini = false, config = "" } = {}) {
     await rm(join(fixtureRoot, ".github"), { recursive: true, force: true });
     await mkdir(workflowDir, { recursive: true });
+    await mkdir(fixtureNestedDir, { recursive: true });
     if (claude) await writeFile(join(workflowDir, "claude.yml"), "name: Claude\n");
     if (gemini) await writeFile(join(workflowDir, "gemini-dispatch.yml"), "name: Gemini\n");
     if (config !== null) await writeFile(configPath, config);
   }
 
   async function runIssue(state, commands, overrides = {}) {
-    const { FAKE_DATE_INITIAL_EPOCH = requestEpoch, ...envOverrides } = overrides;
+    const {
+      FAKE_DATE_INITIAL_EPOCH = requestEpoch,
+      JHW_TEST_CWD,
+      ...envOverrides
+    } = overrides;
     await writeFile(statePath, JSON.stringify(state, null, 2));
     await writeFile(logPath, "");
     await writeFile(nowEpochPath, String(FAKE_DATE_INITIAL_EPOCH));
@@ -450,6 +470,7 @@ async function main() {
       FAKE_GH_STATE: statePath,
       FAKE_GH_LOG: logPath,
       FAKE_DATE_EPOCH_FILE: nowEpochPath,
+      FAKE_GIT_TOPLEVEL: fixtureRoot,
       REPO_NWO: "example/repo",
       JHW_ISSUE_REPO_ROOT: fixtureRoot,
       JHW_ISSUE_CONFIG_PATH: configPath,
@@ -460,7 +481,11 @@ async function main() {
       ...envOverrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
-    const result = await execFileAsync("bash", ["-c", script], { env, maxBuffer: 1024 * 1024 });
+    const result = await execFileAsync("bash", ["-c", script], {
+      env,
+      cwd: JHW_TEST_CWD,
+      maxBuffer: 1024 * 1024,
+    });
     return {
       code: 0,
       ...result,
@@ -602,6 +627,38 @@ async function main() {
     assert.equal(oneEligible.state.issueComments.length, 1,
       "one eligible reviewer must allow creation even when other reviewers are unavailable");
     assert.match(oneEligible.state.issueComments[0].body, /reviewer=claude/);
+
+    await setRepoFixture({
+      claude: true,
+      gemini: true,
+      config: [
+        "review:",
+        "  auto: false",
+        "workflows:",
+        "  claude:",
+        "    enabled: true",
+        "  gemini-dispatch:",
+        "    enabled: true",
+        "",
+      ].join("\n"),
+    });
+    const nestedDiscovery = await runIssue(
+      issueState(),
+      [
+        "unset JHW_ISSUE_REPO_ROOT JHW_ISSUE_CONFIG_PATH",
+        "printf 'root=%s\\n' \"$(jhw_issue_repo_root)\"",
+        "printf 'auto=%s\\n' \"$(jhw_issue_global_auto_enabled)\"",
+        "printf 'explicit-auto=%s\\n' \"$(jhw_issue_global_auto_enabled \"$(jhw_issue_repo_root)/.github/workflow-config.yml\")\"",
+        "jhw_issue_discover_reviewers request true ''",
+      ].join("\n"),
+      { JHW_TEST_CWD: fixtureNestedDir },
+    );
+    assert.equal(
+      nestedDiscovery.stdout,
+      `root=${fixtureRoot}\nauto=false\nexplicit-auto=false\nclaude\ngemini\n`,
+      "Issue workflow discovery must resolve files from the Git top-level when invoked below it");
+    assert.ok(nestedDiscovery.log.some((args) =>
+      args[0] === "git" && args[1] === "rev-parse" && args[2] === "--show-toplevel"));
 
     await setRepoFixture({ config: "review:\n  auto: true\nworkflows: {}\n" });
     const canaryUrl = "https://github.com/example/repo/issues/77";

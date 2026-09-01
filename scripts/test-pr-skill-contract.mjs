@@ -500,6 +500,11 @@ if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
   process.exit(0);
 }
 
+if (argv[0] === "rev-parse" && argv[1] === "--show-toplevel") {
+  process.stdout.write(process.env.FAKE_GIT_TOPLEVEL + "\n");
+  process.exit(0);
+}
+
 if (argv[0] === "check-ref-format" && argv[1] === "--branch") {
   const branch = argv[2] || "";
   const valid = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) &&
@@ -513,6 +518,11 @@ if (argv[0] === "push") {
   if (state.failPush) process.exit(1);
   state.remoteBranchHead = state.localHead;
   if (state.prExists && state.pushUpdatesPrHead !== false) state.prHead = state.localHead;
+  if (state.runOnPush) {
+    const nextRun = Array.isArray(state.runOnPush) ? state.runOnPush.shift() : state.runOnPush;
+    if (nextRun) state.runs.push(nextRun);
+    if (!Array.isArray(state.runOnPush)) delete state.runOnPush;
+  }
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
   process.exit(0);
 }
@@ -710,6 +720,7 @@ async function main() {
   const contractPath = join(tempRoot, "contract.bash");
   const configPath = join(tempRoot, "workflow-config.yml");
   const fixtureRoot = join(tempRoot, "repo");
+  const fixtureNestedDir = join(fixtureRoot, "nested", "cwd");
   const fixtureWorkflowDir = join(fixtureRoot, ".github", "workflows");
   const fixtureConfigPath = join(fixtureRoot, ".github", "workflow-config.yml");
   const geminiConfigPath = join(fixtureRoot, ".gemini", "config.yaml");
@@ -726,6 +737,7 @@ async function main() {
   await chmod(fakeDate, 0o755);
   await writeFile(contractPath, contract);
   await mkdir(fixtureWorkflowDir, { recursive: true });
+  await mkdir(fixtureNestedDir, { recursive: true });
   await mkdir(dirname(geminiConfigPath), { recursive: true });
   await writeFile(join(fixtureWorkflowDir, "claude-code-review.yml"), dispatchContract);
   await writeFile(join(fixtureWorkflowDir, "gemini-auto-review.yml"), dispatchContract);
@@ -743,7 +755,11 @@ async function main() {
   await writeFile(geminiConfigPath, "code_review:\n  pull_request_opened:\n    code_review: false\n");
 
   async function run(state, commands, overrides = {}) {
-    const { FAKE_DATE_INITIAL_EPOCH = startEpoch + 60, ...envOverrides } = overrides;
+    const {
+      FAKE_DATE_INITIAL_EPOCH = startEpoch + 60,
+      JHW_TEST_CWD,
+      ...envOverrides
+    } = overrides;
     await writeFile(statePath, JSON.stringify(state, null, 2));
     await writeFile(logPath, "");
     await writeFile(nowEpochPath, String(FAKE_DATE_INITIAL_EPOCH));
@@ -754,6 +770,7 @@ async function main() {
       FAKE_GH_STATE: statePath,
       FAKE_GH_LOG: logPath,
       FAKE_DATE_EPOCH_FILE: nowEpochPath,
+      FAKE_GIT_TOPLEVEL: fixtureRoot,
       REPO_NWO: "example/repo",
       PR: "42",
       ROUND: "2",
@@ -773,7 +790,11 @@ async function main() {
       ...envOverrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
-    const result = await execFileAsync("bash", ["-c", script], { env, maxBuffer: 1024 * 1024 });
+    const result = await execFileAsync("bash", ["-c", script], {
+      env,
+      cwd: JHW_TEST_CWD,
+      maxBuffer: 1024 * 1024,
+    });
     return {
       ...result,
       state: JSON.parse(await readFile(statePath, "utf8")),
@@ -846,6 +867,8 @@ async function main() {
 
     const isGitPush = (args) => args[0] === "git" && args[1] === "push";
     const isGh = (args, group, command) => args[0] === group && args[1] === command;
+    const isWorkflowFloorLookup = (args) =>
+      args[0] === "api" && args[1]?.includes(`/actions/runs?head_sha=${currentHead}&per_page=100`);
     const hasOption = (args, name, value) => {
       const index = args.indexOf(name);
       return index >= 0 && args[index + 1] === value;
@@ -1452,15 +1475,52 @@ async function main() {
     const ready = (args) => isGh(args, "pr", "ready");
     requireBefore(newPr.log, requestLabelCreate, isGitPush, "request label definition must precede push");
     requireBefore(newPr.log, skipLabelCreate, isGitPush, "skip label definition must precede push");
+    requireBefore(newPr.log, isWorkflowFloorLookup, isGitPush,
+      "workflow run floors must be captured before the new-branch push event");
     requireBefore(newPr.log, isGitPush, createDraft, "new PR push must precede draft creation");
     assert.equal(newPr.log.some((args) => createDraft(args) && args.includes("--fill")), true,
       "new PR creation must supply noninteractive title/body metadata");
     requireBefore(newPr.log, createDraft, removeSkip, "draft creation must precede policy reconciliation");
     requireBefore(newPr.log, removeSkip, addRequest, "opposite label must be removed before request label is added");
     requireBefore(newPr.log, addRequest, ready, "verified request policy must precede ready transition");
+    requireBefore(newPr.log, isWorkflowFloorLookup, ready,
+      "workflow run floors must be captured before the ready_for_review event");
     assert.deepEqual(newPr.state.prLabels, ["review:request"]);
     assert.equal(newPr.state.prHead, currentHead);
     assert.equal(newPr.state.prDraft, false);
+
+    const newPrFloor = await run(
+      baseState({
+        prExists: false,
+        runs: [{
+          id: 9400,
+          attempt: 1,
+          name: "Claude Code Review",
+          head: currentHead,
+          createdAt: roundStartedAt,
+          status: "completed",
+          conclusion: "success",
+          event: "workflow_dispatch",
+        }],
+        runOnPush: {
+          id: 9401,
+          attempt: 1,
+          name: "Claude Code Review",
+          head: currentHead,
+          createdAt: roundStartedAt,
+          status: "queued",
+          conclusion: "null",
+          event: "push",
+        },
+      }),
+      [
+        "jhw_pr_apply_new_pr_policy auto",
+        "printf 'floors=%s\\n' \"$JHW_PR_WORKFLOW_RUN_FLOORS\"",
+      ].join("\n"),
+    );
+    assert.match(newPrFloor.stdout, /Claude Code Review\t9400/,
+      "a workflow launched by push must stay above the pre-mutation run floor");
+    assert.doesNotMatch(newPrFloor.stdout, /Claude Code Review\t9401/);
 
     const newPrWithBase = await run(
       baseState({ prExists: false }),
@@ -1492,6 +1552,15 @@ async function main() {
     assert.deepEqual(existingPr.state.prLabels, ["review:skip"]);
     assert.equal(existingPr.state.prHead, currentHead);
 
+    const existingReviewFloor = await run(
+      baseState({ prLabels: ["review:skip"] }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+    );
+    requireBefore(existingReviewFloor.log, isWorkflowFloorLookup, removeSkip,
+      "workflow run floors must precede review-triggering label reconciliation");
+    requireBefore(existingReviewFloor.log, isWorkflowFloorLookup, isGitPush,
+      "workflow run floors must precede an existing-PR synchronize push");
+
     const existingPrWithDifferentBase = await run(
       baseState({ prLabels: ["review:request"], prBase: "main" }),
       `jhw_pr_apply_existing_pr_policy skip ${currentHead}`,
@@ -1504,6 +1573,31 @@ async function main() {
       "an existing PR base must be reconciled before synchronize");
     assert.equal(existingPrWithDifferentBase.state.prBase, "release/v2",
       "--base must apply to an already-open PR");
+
+    await writeFile(
+      fixtureConfigPath,
+      enabledReviewConfig.replace("  auto: true", "  auto: false"),
+    );
+    const nestedPreflight = await run(
+      baseState(),
+      [
+        "unset JHW_PR_REPO_ROOT JHW_PR_CONFIG_PATH",
+        "printf 'auto=%s\\n' \"$(jhw_pr_global_auto_enabled)\"",
+        "jhw_pr_preflight_workflow claude-code-review.yml request",
+        "jhw_pr_gemini_manual_review_configured",
+        "printf 'gemini-root-ok\\n'",
+      ].join("\n"),
+      { JHW_TEST_CWD: fixtureNestedDir },
+    );
+    await writeFile(fixtureConfigPath, enabledReviewConfig);
+    assert.match(nestedPreflight.stdout, /^auto=false$/m,
+      "PR review.auto discovery must resolve config from the Git top-level");
+    assert.match(nestedPreflight.stdout, /^AVAILABLE\tclaude-code-review\.yml\tverified$/m,
+      "PR workflow preflight must resolve files from the Git top-level when invoked below it");
+    assert.match(nestedPreflight.stdout, /^gemini-root-ok$/m,
+      "Gemini App config discovery must resolve from the Git top-level");
+    assert.ok(nestedPreflight.log.filter((args) =>
+      args[0] === "git" && args[1] === "rev-parse" && args[2] === "--show-toplevel").length >= 2);
 
     const frozenBase = await runResult(
       baseState({ prLabels: ["review:request"], prBase: "main", freezeBase: true }),

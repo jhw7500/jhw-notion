@@ -331,8 +331,28 @@ jhw_pr_max_rounds_from_args() {
   printf '%s\n' "$value"
 }
 
+jhw_pr_repo_root() {
+  local root="${JHW_PR_REPO_ROOT:-}"
+  if [[ -z "$root" ]]; then
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+      echo "Git repository root lookup failed" >&2
+      return 1
+    }
+  fi
+  [[ -n "$root" && "$root" != *$'\n'* && "$root" != *$'\r'* && -d "$root" ]] || {
+    echo "invalid repository root" >&2
+    return 2
+  }
+  root="$(cd -P -- "$root" 2>/dev/null && pwd -P)" || return 1
+  printf '%s\n' "$root"
+}
+
 jhw_pr_global_auto_enabled() {
-  local config_path="${1:-.github/workflow-config.yml}"
+  local config_path="${1-}" root
+  if [[ -z "$config_path" ]]; then
+    root="$(jhw_pr_repo_root)" || return
+    config_path="${JHW_PR_CONFIG_PATH:-$root/.github/workflow-config.yml}"
+  fi
   if [[ ! -e "$config_path" ]]; then
     printf 'true\n'
     return
@@ -394,7 +414,7 @@ NODE
 
 jhw_pr_gemini_manual_review_configured() {
   local root config
-  root="${JHW_PR_REPO_ROOT:-.}"
+  root="$(jhw_pr_repo_root)" || return
   config="$root/.gemini/config.yaml"
   [[ -f "$config" && ! -L "$config" ]] || return 1
   node - "$config" <<'NODE'
@@ -538,11 +558,15 @@ jhw_pr_discover_app_reviewers() {
 }
 
 jhw_pr_workflow_enabled() {
-  local workflow="$1" config_path="${2:-${JHW_PR_CONFIG_PATH:-.github/workflow-config.yml}}"
+  local workflow="$1" config_path="${2-}" root
   case "$workflow" in
     claude-code-review|gemini-auto-review|opencode-auto-review) ;;
     *) return 2 ;;
   esac
+  if [[ -z "$config_path" ]]; then
+    root="$(jhw_pr_repo_root)" || return
+    config_path="${JHW_PR_CONFIG_PATH:-$root/.github/workflow-config.yml}"
+  fi
   [[ -f "$config_path" && ! -L "$config_path" ]] || { printf 'false\n'; return; }
   node - "$config_path" "$workflow" <<'NODE'
 const fs = require("node:fs");
@@ -743,12 +767,13 @@ process.exit(value.state === "active" ? 0 : 4);
 }
 
 jhw_pr_preflight_workflow() {
-  local workflow="$1" mode="$2" root="${JHW_PR_REPO_ROOT:-.}" path enabled config_path workflow_key contract_status metadata_status
+  local workflow="$1" mode="$2" root path enabled config_path workflow_key contract_status metadata_status
   case "$workflow" in
     claude-code-review.yml|gemini-auto-review.yml|opencode-auto-review.yml) ;;
     *) return 2 ;;
   esac
   case "$mode" in request|auto) ;; *) return 2 ;; esac
+  root="$(jhw_pr_repo_root)" || return
   path="$root/.github/workflows/$workflow"
   workflow_key="${workflow%.yml}"
   config_path="${JHW_PR_CONFIG_PATH:-$root/.github/workflow-config.yml}"
@@ -950,16 +975,69 @@ jhw_pr_verify_remote_policy() {
   [[ "$actual_base" == "$expected_base" ]] || { echo "remote PR base mismatch" >&2; return 1; }
 }
 
+jhw_pr_workflow_name_for_file() {
+  case "$1" in
+    claude-code-review.yml) printf '%s\n' 'Claude Code Review' ;;
+    gemini-auto-review.yml) printf '%s\n' 'Gemini Auto PR Review' ;;
+    opencode-auto-review.yml) printf '%s\n' 'OpenCode Auto PR Review' ;;
+    *) return 2 ;;
+  esac
+}
+
+jhw_pr_capture_workflow_run_floors() {
+  local head="$1" workflows="$2" workflow workflow_name raw
+  local id attempt name run_head created_at status conclusion event extra floor
+  local floors=''
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
+  if [[ -z "$workflows" ]]; then
+    JHW_PR_WORKFLOW_RUN_FLOORS=''
+    export JHW_PR_WORKFLOW_RUN_FLOORS
+    return 0
+  fi
+  raw="$(gh api "repos/$REPO_NWO/actions/runs?head_sha=$head&per_page=100" --paginate \
+    --jq '.workflow_runs[] | [.id, .run_attempt, .name, .head_sha, .created_at, .status, (.conclusion // "null"), .event] | @tsv' 2>/dev/null)" || return 1
+  while IFS= read -r workflow; do
+    [[ -n "$workflow" ]] || continue
+    workflow_name="$(jhw_pr_workflow_name_for_file "$workflow")" || return 2
+    floor=0
+    while IFS=$'\t' read -r id attempt name run_head created_at status conclusion event extra; do
+      [[ "$name" == "$workflow_name" && "$run_head" == "$head" ]] || continue
+      [[ "$id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || return 1
+      (( id > floor )) && floor="$id"
+    done <<<"$raw"
+    [[ -z "$floors" ]] || floors+=$'\n'
+    floors+="$workflow_name"$'\t'"$floor"
+  done <<<"$workflows"
+  JHW_PR_WORKFLOW_RUN_FLOORS="$floors"
+  export JHW_PR_WORKFLOW_RUN_FLOORS
+}
+
+jhw_pr_workflow_run_floor() {
+  local wanted="$1" name floor extra found=0 selected=''
+  while IFS=$'\t' read -r name floor extra; do
+    [[ "$name" == "$wanted" ]] || continue
+    [[ "$floor" =~ ^[0-9]+$ && -z "$extra" ]] || return 2
+    (( found == 0 )) || return 2
+    found=1
+    selected="$floor"
+  done <<<"${JHW_PR_WORKFLOW_RUN_FLOORS:-}"
+  (( found == 1 )) || return 1
+  printf '%s\n' "$selected"
+}
+
 jhw_pr_apply_new_pr_policy() {
-  local mode="$1" local_head draft expected_base
+  local mode="$1" local_head actual_local_head draft expected_base
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
   expected_base="$(jhw_pr_expected_base)" || return
   jhw_pr_require_write_permission || return
   jhw_pr_prepare_review_plan "$mode" || return
   jhw_pr_ensure_review_labels || return
-  git push -u origin HEAD || return 1
   local_head="$(git rev-parse HEAD)" || return 1
   [[ "$local_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid local head" >&2; return 2; }
+  jhw_pr_capture_workflow_run_floors "$local_head" "${JHW_PR_AVAILABLE_WORKFLOWS:-}" || return
+  git push -u origin HEAD || return 1
+  actual_local_head="$(git rev-parse HEAD)" || return 1
+  [[ "$actual_local_head" == "$local_head" ]] || { echo "local head changed during push" >&2; return 1; }
   gh pr create --repo "$REPO_NWO" --base "$expected_base" --draft --fill >/dev/null || return 1
   PR="$(gh pr view --repo "$REPO_NWO" --json number --jq .number)" || return 1
   [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid created PR" >&2; return 1; }
@@ -982,6 +1060,7 @@ jhw_pr_apply_existing_pr_policy() {
   jhw_pr_require_write_permission || return
   jhw_pr_prepare_review_plan "$mode" || return
   jhw_pr_ensure_review_labels || return
+  jhw_pr_capture_workflow_run_floors "$expected_local_head" "${JHW_PR_AVAILABLE_WORKFLOWS:-}" || return
   remote_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
   [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid remote head" >&2; return 1; }
   remote_base="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefName --jq .baseRefName)" || return 1
@@ -1016,15 +1095,15 @@ jhw_pr_apply_existing_pr_policy() {
    - `REPO_NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # Owner/Repo (nameWithOwner)`
 2. **PR 생성 또는 감지**
    - `--base`는 새 PR과 기존 PR 모두에 적용한다. 기존 PR의 base가 다르면 review-triggering 라벨 변경이나 push 전에 `gh pr edit --base`로 맞추고 `baseRefName`을 재조회한다. 수정·재조회가 실패하면 리뷰를 요청하지 않는다.
-   - 새 PR: push → `gh pr create --draft --fill`(commit metadata로 비대화식 title/body 확정) → mode 라벨 reconcile/read-back → head/base/draft 검증 → ready 순서다.
-   - 기존 PR의 새 head: base reconcile/read-back → mode 라벨 reconcile/read-back → push → 새 원격 head/base 검증 순서다.
+   - 새 PR: reviewer plan·현재 head workflow run-ID floor 캡처 → push → `gh pr create --draft --fill`(commit metadata로 비대화식 title/body 확정) → mode 라벨 reconcile/read-back → head/base/draft 검증 → ready 순서다. `jhw_pr_apply_new_pr_policy`가 push와 ready보다 먼저 floor를 잡는다.
+   - 기존 PR의 새 head: reviewer plan·현재 local head workflow run-ID floor 캡처 → base reconcile/read-back → mode 라벨 reconcile/read-back → push → 새 원격 head/base 검증 순서다. `jhw_pr_apply_existing_pr_policy`가 base/label/push mutation 전에 floor를 잡는다.
    - 같은 head의 명시적 `request`는 synchronize push를 생략하고 라벨 read-back 뒤 Task 3의 head별 idempotent 요청 계약을 사용한다.
    - `PR=<번호>`, `SHA="$(git rev-parse HEAD)"`, `ROUND_BASE_OID="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)"` (push·base reconcile 후 기준 — 재푸시마다 갱신)
 3. **병렬 게이트 시작**
    - (a) 모든 mode에서 `jhw_pr_wait_required_checks`로 **required CI**를 감시한다.
    - (b) review-on이면 **리뷰 라운드 모니터링**을 시작한다(아래 구현). `skip`/`auto=false`이면 AI artifact를 읽지 않는다.
    - (c) `--target` 지정 시 **타겟 검증을 백그라운드로** 시작 (Claude Code Bash 도구의 `run_in_background:true` 파라미터 — bash 명령이 아님) — 종료 시 PASS/FAIL 수집
-4. **리뷰 라운드 트리거 + 폴링** — review-triggering push/label/dispatch 전에 `jhw_pr_capture_workflow_run_floors "$ROUND_HEAD" "${JHW_PR_AVAILABLE_WORKFLOWS:-}"`로 workflow별 기존 최대 run ID를 캡처한다. `request`는 그 floor보다 큰 현재-round run만 재사용/dispatch하고 eligible App을 현재 head/base OID에 명시적으로 요청한다. `auto=true`도 floor 이후 일반 event run을 사용한다. `--auto-fix` 재푸시 라운드마다 같은 캡처와 App/workflow 계약을 반복하며, 각 expected 리뷰어가 terminal 신호를 낼 때까지 (또는 timeout) 폴링한다:
+4. **리뷰 라운드 트리거 + 폴링** — 최초 라운드는 위 policy helper가 review-triggering push/base/label/ready 전에 캡처해 보존한 workflow별 최대 run ID를 사용한다. mutation 뒤에 다시 캡처해 새 run을 floor 안으로 흡수하지 않는다. `request`는 그 floor보다 큰 현재-round run만 재사용/dispatch하고 eligible App을 현재 head/base OID에 명시적으로 요청한다. `auto=true`도 floor 이후 일반 event run을 사용한다. `--auto-fix` 재푸시 라운드는 push 전에 `jhw_pr_capture_workflow_run_floors "$ROUND_HEAD" "${JHW_PR_AVAILABLE_WORKFLOWS:-}"`를 실행해 같은 App/workflow 계약을 반복하며, 각 expected 리뷰어가 terminal 신호를 낼 때까지 (또는 timeout) 폴링한다:
    - 워크플로우 리뷰어: `actions/runs?head_sha=$SHA`(주 감지, PAT에서 동작) + `gh run watch <run-id> --exit-status`(BG, 라이브 대기). `gh pr checks`/`commits/{sha}/check-runs`는 토큰 Checks-read 권한 없으면 403이라 의존하지 않는다.
    - 앱/봇 리뷰어: 매 간격 `reviews`/`comments`/`issue-comments`/`reactions` 수집
 5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다. planned reviewer별 terminal 상태를 `ROUND_REVIEW_STATUSES` 배열에 정확히 한 개씩 보존하며, reviewer가 하나도 계획되지 않았으면 빈 배열을 임의의 `CLEAN`으로 바꾸지 않는다.
@@ -1271,51 +1350,6 @@ jhw_pr_workflow_request_failed() {
   JHW_PR_WORKFLOW_RUN_ID=""
   echo "TRIGGER_FAILED: $1" >&2
   return 1
-}
-
-jhw_pr_workflow_name_for_file() {
-  case "$1" in
-    claude-code-review.yml) printf '%s\n' 'Claude Code Review' ;;
-    gemini-auto-review.yml) printf '%s\n' 'Gemini Auto PR Review' ;;
-    opencode-auto-review.yml) printf '%s\n' 'OpenCode Auto PR Review' ;;
-    *) return 2 ;;
-  esac
-}
-
-jhw_pr_capture_workflow_run_floors() {
-  local head="$1" workflows="$2" workflow workflow_name raw
-  local id attempt name run_head created_at status conclusion event extra floor
-  local floors=''
-  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
-  raw="$(gh api "repos/$REPO_NWO/actions/runs?head_sha=$head&per_page=100" --paginate \
-    --jq '.workflow_runs[] | [.id, .run_attempt, .name, .head_sha, .created_at, .status, (.conclusion // "null"), .event] | @tsv' 2>/dev/null)" || return 1
-  while IFS= read -r workflow; do
-    [[ -n "$workflow" ]] || continue
-    workflow_name="$(jhw_pr_workflow_name_for_file "$workflow")" || return 2
-    floor=0
-    while IFS=$'\t' read -r id attempt name run_head created_at status conclusion event extra; do
-      [[ "$name" == "$workflow_name" && "$run_head" == "$head" ]] || continue
-      [[ "$id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || return 1
-      (( id > floor )) && floor="$id"
-    done <<<"$raw"
-    [[ -z "$floors" ]] || floors+=$'\n'
-    floors+="$workflow_name"$'\t'"$floor"
-  done <<<"$workflows"
-  JHW_PR_WORKFLOW_RUN_FLOORS="$floors"
-  export JHW_PR_WORKFLOW_RUN_FLOORS
-}
-
-jhw_pr_workflow_run_floor() {
-  local wanted="$1" name floor extra found=0 selected=''
-  while IFS=$'\t' read -r name floor extra; do
-    [[ "$name" == "$wanted" ]] || continue
-    [[ "$floor" =~ ^[0-9]+$ && -z "$extra" ]] || return 2
-    (( found == 0 )) || return 2
-    found=1
-    selected="$floor"
-  done <<<"${JHW_PR_WORKFLOW_RUN_FLOORS:-}"
-  (( found == 1 )) || return 1
-  printf '%s\n' "$selected"
 }
 
 jhw_pr_dispatch_same_head() {
@@ -2192,7 +2226,7 @@ ship_auto_fix_push_ready() {
 ```
 <!-- pr-round-contract: trigger-and-scope:end -->
 
-실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_PUSHED_AT`, `ROUND_HEAD`, `ROUND_BASE_OID`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. review-triggering mutation 전에 `jhw_pr_capture_workflow_run_floors "$ROUND_HEAD" "${JHW_PR_AVAILABLE_WORKFLOWS:-}"`를 실행한다. 아래 호출은 문자열 입력을 명령으로 바꾸지 않는 닫힌 reviewer/workflow 집합이다. `request`는 캡처한 workflow별 최대 run ID보다 큰 같은-head `workflow_dispatch` run만 재사용하거나 정확히 한 번 dispatch한다. 이전 round의 같은-head run은 timestamp가 같아도 재사용하지 않는다. `auto=true`는 floor 이후 일반 event run을 기다리되 App은 현재 head/base OID에 명시적으로 요청한다. `skip`과 `auto=false`는 AI 요청·dispatch·대기를 하지 않는다.
+실행 시 `ROUND`, `ROUND_STARTED_AT`, `ROUND_PUSHED_AT`, `ROUND_HEAD`, `ROUND_BASE_OID`, `SHIP_ROUND_STATE_FILE`을 라운드별로 새로 잡고, `--block-on` 값을 `SHIP_BLOCK_ON`에 전달한다. 최초 라운드는 `jhw_pr_apply_new_pr_policy` 또는 `jhw_pr_apply_existing_pr_policy`가 review-triggering mutation 전에 floor를 캡처한다. auto-fix 라운드는 push 전에 `jhw_pr_capture_workflow_run_floors "$ROUND_HEAD" "${JHW_PR_AVAILABLE_WORKFLOWS:-}"`를 실행한다. 아래 호출은 문자열 입력을 명령으로 바꾸지 않는 닫힌 reviewer/workflow 집합이다. `request`는 캡처한 workflow별 최대 run ID보다 큰 같은-head `workflow_dispatch` run만 재사용하거나 정확히 한 번 dispatch한다. 이전 round의 같은-head run은 timestamp가 같아도 재사용하지 않는다. `auto=true`는 floor 이후 일반 event run을 기다리되 App은 현재 head/base OID에 명시적으로 요청한다. `skip`과 `auto=false`는 AI 요청·dispatch·대기를 하지 않는다.
 
 ```bash
 case "$EFFECTIVE_REVIEW_POLICY" in
