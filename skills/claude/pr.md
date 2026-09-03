@@ -20,6 +20,14 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 
 `--review`는 `review:request` 라벨과 App mention을 함께 붙이므로 옵트인 비용은 한 번의 옵션이다.
 
+**라운드가 소진되면 `review-budget-override` 라벨이 필요하다.** 관리 리뷰어는 PR당 자동 라운드 상한
+(automation `v1.60`부터 `vars.REVIEW_MAX_ROUNDS`, 미설정 시 2)을 소진하면 더 실행되지 않는다. 한 번의
+bounded override는 그 저장소에 `review-budget-override` 라벨을 붙이고 해당 워크플로를 `workflow_dispatch`
++ `force_review=true`로 실행해야 얻는다 — 라벨 없이 `force_review`만 쓰면
+`force-review was not authorized by the bounded review budget`으로 거부된다. 이 스킬은 `review:request`와
+`review:skip`만 생성하므로 override 라벨은 저장소에 없을 수 있다(fleet 표준: `review-budget-override`,
+color `D93F0B`, "Authorize one bounded reviewer override round").
+
 핵심: 리뷰어는 지적이 없을 때 **코멘트 대신 👍 리액션만** 남길 수 있으므로, 코멘트뿐 아니라
 `issues/{n}/reactions` 와 Actions run 완료까지 종합해 "응답 완료"를 판정한다.
 
