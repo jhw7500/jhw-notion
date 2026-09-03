@@ -7,7 +7,8 @@ argument-hint: "[title/body] [--review|--no-review] [--timeout <min>]"
 
 한 개의 nonempty title/body로 현재 저장소에 Issue를 만든다. `--review`는 실행 시 증명된
 지원 reviewer만 요청하고, `--no-review`는 `review:skip`을 적용해 mention을 만들지 않는다.
-두 옵션을 생략하면 전역 `review.auto`를 따르며, 키가 없으면 호환 기본값 `true`다.
+두 옵션을 생략하면 전역 `review.auto`를 따르며, **키가 없으면 리뷰를 실행하지 않는다**
+(automation `v1.59`의 `default_auto_false`와 같은 정책).
 
 이 명령은 assignee, milestone, project, bulk edit를 지원하지 않는다. 리뷰 결과를 받아도 Issue를
 수정·닫기·삭제하거나 구현을 시작하지 않으며 URL과 reviewer별 결과만 보고한다.
@@ -86,7 +87,7 @@ jhw_issue_global_auto_enabled() {
     config_path="${JHW_ISSUE_CONFIG_PATH:-$root/.github/workflow-config.yml}"
   fi
   if [[ ! -e "$config_path" ]]; then
-    printf 'true\n'
+    printf 'false\n'
     return
   fi
   [[ -f "$config_path" && ! -L "$config_path" ]] || {
@@ -139,7 +140,7 @@ for (const rawLine of text.split(/\r?\n/)) {
   if (value !== "true" && value !== "false") fail("review.auto must be boolean");
   autoValue = value;
 }
-process.stdout.write((seenAuto ? autoValue : "true") + "\n");
+process.stdout.write((seenAuto ? autoValue : "false") + "\n");
 NODE
 }
 

@@ -8,6 +8,18 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 브랜치를 PR로 올리고, 리포의 **자동 리뷰어들이 응답을 마칠 때까지 모니터링**한 뒤,
 **블로킹 심각도 지적이 없으면**(전원 CLEAN) 선택적으로 머지한다. 임베디드 프로젝트는 **타겟 장치 테스트**를 머지 게이트에 추가할 수 있다.
 
+**관리 리뷰어는 옵트인이다.** automation `v1.59`부터 `workflows.<name>.auto`와 `review.auto`가 모두 없으면
+리뷰가 실행되지 않는다(`default_auto_false`). 따라서 `--merge`만 쓰면 reviewer 상태가 0개가 되어 머지 게이트에서
+중단된다 — 이건 fail-closed 설계이고 버그가 아니다. 세 가지 사용 방식은 이렇다.
+
+| 명령 | 결과 |
+|---|---|
+| `--merge` 단독 | 리뷰어 0개 → AI 게이트에서 중단·보고 |
+| `--review --merge` | 리뷰 요청 → 전원 CLEAN이면 머지 |
+| `--no-review --merge` | AI 게이트만 면제하고 머지(required CI·타겟·head/base는 그대로) |
+
+`--review`는 `review:request` 라벨과 App mention을 함께 붙이므로 옵트인 비용은 한 번의 옵션이다.
+
 핵심: 리뷰어는 지적이 없을 때 **코멘트 대신 👍 리액션만** 남길 수 있으므로, 코멘트뿐 아니라
 `issues/{n}/reactions` 와 Actions run 완료까지 종합해 "응답 완료"를 판정한다.
 
@@ -43,8 +55,8 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 
 | 옵션 | 역할 | 기본값 |
 |---|---|---|
-| `--review` | 현재 PR head의 AI 리뷰를 명시적으로 요청 | 저장소 설정 |
-| `--no-review` | `review:skip`을 적용하고 AI 요청·대기를 생략 | 저장소 설정 |
+| `--review` | 현재 PR head의 AI 리뷰를 명시적으로 요청 | 저장소 설정, 키가 없으면 **꺼짐** |
+| `--no-review` | `review:skip`을 적용하고 AI 요청·대기를 생략 | 저장소 설정, 키가 없으면 **꺼짐** |
 | `--merge` | 머지 게이트 충족 시 자동 머지(+브랜치 삭제). 없으면 모니터링·보고만 | off (보고만) |
 | `--target[=<cmd>]` | 타겟 장치 검증을 머지 게이트에 추가(리뷰와 병렬). PASS여야 머지 | off |
 | `--auto-fix` | actionable 지적을 고쳐 재푸시 → 재리뷰 라운드 반복 | off (보고만) |
@@ -93,7 +105,7 @@ review-triggering event보다 먼저 확인하며, 생성 전제 mutation은 누
 JHW_REVIEW_REQUEST_LABEL='review:request'
 JHW_REVIEW_SKIP_LABEL='review:skip'
 JHW_REVIEW_REQUEST_COLOR='0E8A16'
-JHW_REVIEW_SKIP_COLOR='B60205'
+JHW_REVIEW_SKIP_COLOR='BFDADC'
 JHW_REVIEW_REQUEST_DESCRIPTION='Explicitly request AI review'
 JHW_REVIEW_SKIP_DESCRIPTION='Explicitly skip AI review'
 
@@ -521,7 +533,7 @@ jhw_pr_global_auto_enabled() {
     config_path="${JHW_PR_CONFIG_PATH:-$root/.github/workflow-config.yml}"
   fi
   if [[ ! -e "$config_path" ]]; then
-    printf 'true\n'
+    printf 'false\n'
     return
   fi
   [[ -f "$config_path" && ! -L "$config_path" ]] || {
@@ -575,7 +587,7 @@ for (const rawLine of text.split(/\r?\n/)) {
   if (value !== "true" && value !== "false") fail("review.auto must be boolean");
   autoValue = value;
 }
-process.stdout.write((seenAuto ? autoValue : "true") + "\n");
+process.stdout.write((seenAuto ? autoValue : "false") + "\n");
 NODE
 }
 

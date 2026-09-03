@@ -971,7 +971,7 @@ async function main() {
     await writeFile(configPath, "review:\n  auto: false\n");
     assert.equal((await run(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "false");
     await writeFile(configPath, "workflows: {}\n");
-    assert.equal((await run(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "true");
+    assert.equal((await run(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "false");
     await writeFile(configPath, "review:\n  auto: yes\n");
     assert.notEqual((await runResult(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).code, 0);
 
