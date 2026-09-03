@@ -542,7 +542,7 @@ async function main() {
     await setRepoFixture({ config: "review:\n  auto: false\n" });
     assert.equal((await runIssue(issueState(), `jhw_issue_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "false");
     await setRepoFixture({ config: "workflows: {}\n" });
-    assert.equal((await runIssue(issueState(), `jhw_issue_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "true");
+    assert.equal((await runIssue(issueState(), `jhw_issue_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "false");
     await setRepoFixture({ config: "review:\n  auto: yes\n" });
     assert.notEqual((await runIssueResult(issueState(), `jhw_issue_global_auto_enabled ${JSON.stringify(configPath)}`)).code, 0);
 
