@@ -22,7 +22,9 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 
 **수동 호출 문법 (스킬 없이 부를 때 / 스킬이 실패했을 때).** PR 코멘트 멘션으로 각 리뷰어를
 직접 깨울 수 있다. 트리거 문자열과 **위치 조건**은 상류 워크플로우가 정하며, 아래는
-`jhw7500/automation@v1.61` 기준이다.
+`jhw7500/automation@v1.62` 기준이다(`claude.yml`·`opencode.yml`·`gemini-dispatch.yml`
+세 파일 모두 v1.61과 바이트 단위로 동일함을 확인). automation 을 올릴 때는 이 세 파일이
+바뀌었는지 함께 확인한다 — 이 표는 상류 동작의 특정 시점 스냅샷이다.
 
 | 리뷰어 | 트리거 | 위치 조건 | 판정 위치 |
 |---|---|---|---|
