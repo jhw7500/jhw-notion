@@ -20,6 +20,24 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 
 `--review`는 `review:request` 라벨과 App mention을 함께 붙이므로 옵트인 비용은 한 번의 옵션이다.
 
+**수동 호출 문법 (스킬 없이 부를 때 / 스킬이 실패했을 때).** PR 코멘트 멘션으로 각 리뷰어를
+직접 깨울 수 있다. 트리거 문자열과 **위치 조건**은 상류 워크플로우가 정하며, 아래는
+`jhw7500/automation@v1.61` 기준이다.
+
+| 리뷰어 | 트리거 | 위치 조건 | 판정 위치 |
+|---|---|---|---|
+| Claude | `@claude review` | — | `claude.yml` (`issue_comment`) |
+| OpenCode | `/oc` 또는 `/opencode` | 코멘트 **맨 앞**, 또는 **바로 앞이 공백** | `opencode.yml` job `if:` — `startsWith(body,'/oc') \|\| contains(body,' /oc')` |
+| Gemini | `@gemini-cli /review` | 코멘트 **맨 앞** | `gemini-dispatch.yml` — `request.startsWith("@gemini-cli /review")` |
+
+세 리뷰어 모두 작성자가 `OWNER`/`MEMBER`/`COLLABORATOR`여야 한다. 함정 둘:
+
+- **한 코멘트에 여러 멘션을 몰아 쓰면 첫 줄의 리뷰어만 반응한다.** OpenCode 조건은 `/oc` 앞의
+  **공백**을 요구하는데 줄바꿈은 공백이 아니라서, 둘째 줄 이후의 `/oc`는 매치되지 않는다.
+  리뷰어마다 **별도 코멘트**로, 트리거를 맨 앞에 두고 올린다.
+- **`@gemini`와 `@gemini-code-assist`(서비스 종료)는 둘 다 `command = 'noop'`이 된다.**
+  디스패처는 `@gemini-cli` 접두만 인식한다.
+
 **라운드가 소진되면 `review-budget-override` 라벨이 필요하다.** 관리 리뷰어는 PR당 자동 라운드 상한
 (automation `v1.60`부터 `vars.REVIEW_MAX_ROUNDS`, 미설정 시 2)을 소진하면 더 실행되지 않는다. 한 번의
 bounded override는 그 저장소에 `review-budget-override` 라벨을 붙이고 해당 워크플로를 `workflow_dispatch`
@@ -83,7 +101,7 @@ color `D93F0B`, "Authorize one bounded reviewer override round").
   - **exit 0 = PASS**(게이트 통과), 비0 = FAIL(머지 차단·보고). 리뷰 라운드와 **병렬** 실행.
 - `--review` — `review:request`만 적용해 현재 head 리뷰를 명시적으로 요청. `--no-review`와 함께 쓸 수 없다.
 - `--no-review` — `review:skip`만 적용하고 AI 요청·AI 대기를 생략. `--review`와 함께 쓸 수 없다.
-- 두 옵션 생략 — 두 override 라벨을 제거하고 저장소 설정을 따른다. 현재 이 저장소는 Claude/Gemini `auto: true`이고 전역 `review.auto`가 없어 호환 기본값을 포함해 review-on이다.
+- 두 옵션 생략 — 두 override 라벨을 제거하고 **그 저장소의 설정을 따른다**. 결과는 저장소마다 다르므로 `.github/workflow-config.yml`을 직접 확인한다: `workflows.<name>.auto`가 있으면 그 값, 없고 최상위 `review.auto`가 있으면 그 값, **둘 다 없으면 review-off**(`default_auto_false` — 위 "관리 리뷰어는 옵트인이다" 참조). 항목에 `enabled: true`만 있는 저장소는 **review-off**다 — `enabled`는 워크플로우 자체의 활성화(false면 수동 트리거도 불가)일 뿐 자동 실행 여부가 아니다. 자동 리뷰를 기대하고 대기하기 전에 이 값을 먼저 읽는다.
 - `--auto-fix` — actionable 지적을 고쳐 재푸시 → **재리뷰 라운드 반복**(기본 **최대 5라운드**, `--max-rounds`로 조정). 기본 off(모니터+보고만). N라운드 후에도 FEEDBACK이면 보고하고 머지 안 함.
 - `--base <branch>` — PR base. 기본 `main`(리포 기본 브랜치).
 - `--reviewers <list>` — 대기할 리뷰어 부분집합(예: `codex,gemini-assist`). 기본 전체.
