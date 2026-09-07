@@ -31,14 +31,24 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 | Claude | `@claude review` | — | `claude.yml` (`issue_comment`) |
 | OpenCode | `/oc` 또는 `/opencode` | 코멘트 **맨 앞**, 또는 **바로 앞이 공백** | `opencode.yml` job `if:` — `startsWith(body,'/oc') \|\| contains(body,' /oc')` |
 | Gemini | `@gemini-cli /review` | 코멘트 **맨 앞** | `gemini-dispatch.yml` — `request.startsWith("@gemini-cli /review")` |
+| Codex (앱) | `@codex review` | — | GitHub App (워크플로우 아님) |
 
-세 리뷰어 모두 작성자가 `OWNER`/`MEMBER`/`COLLABORATOR`여야 한다. 함정 둘:
+워크플로우 세 리뷰어는 작성자가 `OWNER`/`MEMBER`/`COLLABORATOR`여야 한다. Codex 는 대신
+**Codex workspace 에 연결된 GitHub 계정**이 멘션해야 한다. 함정 셋:
 
 - **한 코멘트에 여러 멘션을 몰아 쓰면 첫 줄의 리뷰어만 반응한다.** OpenCode 조건은 `/oc` 앞의
   **공백**을 요구하는데 줄바꿈은 공백이 아니라서, 둘째 줄 이후의 `/oc`는 매치되지 않는다.
   리뷰어마다 **별도 코멘트**로, 트리거를 맨 앞에 두고 올린다.
 - **`@gemini`와 `@gemini-code-assist`(서비스 종료)는 둘 다 `command = 'noop'`이 된다.**
   디스패처는 `@gemini-cli` 접두만 인식한다.
+- **Codex 는 멘션 없이는 자동으로 오지 않는다.** 앱이라 `workflow-config.yml` 토글도
+  `review:request` 라벨도 닿지 않는다 — 멘션이 유일한 옵트인이고, 자동 리뷰가 꺼져 있는 것은
+  고장이 아니라 설계다(automation `docs/workflows/contracts.md`, v1.62 기준).
+  **`--review` 경로에서는 스킬이 `jhw_pr_request_app_review` 로 head 범위 멘션을 대신
+  게시하므로**(아래 라운드 루프·auto-fix) 수동 멘션은 스킬 없이 부를 때만 필요하고, 그때는
+  **새 HEAD 마다** 다시 멘션한다. 지적이 없으면 코멘트 대신 👍 리액션으로 답한다(아래 판정 표).
+  다른 리뷰어가 clean 이어도 생략하지 말 것 — 2026-09-07 실측에서 Claude·Gemini 가
+  `findings 0` 을 낸 커밋에서 Codex 만 회귀를 잡았다.
 
 **라운드가 소진되면 `review-budget-override` 라벨이 필요하다.** 관리 리뷰어는 PR당 자동 라운드 상한
 (automation `v1.60`부터 `vars.REVIEW_MAX_ROUNDS`, 미설정 시 2)을 소진하면 더 실행되지 않는다. 한 번의
