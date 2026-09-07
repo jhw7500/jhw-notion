@@ -71,6 +71,7 @@ function scanBounded(value: unknown, inspect: (candidate: string) => void): void
 // over-redaction is harmless there, while content rejection here must not
 // fail on non-ASCII prose.
 const embeddedUnixPath = /(?:^|[^\p{L}\p{N}\p{M}_./-])\/(?!\/)(?![^\s"'`<>|/]*:[^\s"'`<>|/]*(?:[\s"'`<>|]|$))[^\s"'`<>|]+/u;
+const embeddedNetworkPath = /(?:^|[^\p{L}\p{N}\p{M}_./\\:-])(?:\\\\|\/\/)[^\\/\s"'`<>|]+[\\/][^\s"'`<>|]+/u;
 const embeddedWindowsPath = /(?:^|[^A-Za-z0-9_./\\-])[A-Za-z]:[\\/][^\s"'`<>|]+/u;
 // File URIs are host-path carriers regardless of surrounding punctuation.
 // Keep this aligned with the direct-error sanitizer rather than trying to
@@ -80,7 +81,12 @@ const embeddedFileUri = /file:\/\//iu;
 /** Rejects host-absolute paths only at content boundaries, never operational path arguments. */
 export function assertNoAbsoluteHostPaths(value: unknown): void {
   scanBounded(value, (candidate) => {
-    if (embeddedUnixPath.test(candidate) || embeddedWindowsPath.test(candidate) || embeddedFileUri.test(candidate)) throw rejected();
+    if (
+      embeddedUnixPath.test(candidate)
+      || embeddedNetworkPath.test(candidate)
+      || embeddedWindowsPath.test(candidate)
+      || embeddedFileUri.test(candidate)
+    ) throw rejected();
   });
 }
 

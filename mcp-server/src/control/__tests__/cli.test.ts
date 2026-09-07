@@ -1449,6 +1449,142 @@ describe("runCli", () => {
     expect(JSON.parse(result.stderr)).toEqual({ error: { code: "HANDOFF_RETRY_CONFLICT" } });
   });
 
+  it("emits only a bounded diagnostic summary for COMMAND_FAILED", () => {
+    const result = controlErrorResult(new ControlError(
+      "COMMAND_FAILED",
+      "raw internal message",
+      {
+        command: "git",
+        args: ["status", "--porcelain"],
+        exitCode: 128,
+        stdout: "not-for-operator",
+        stderr: `fatal: cannot open /private/repository\n${"한".repeat(300)}`,
+        cause: "low-level-cause",
+      },
+    ));
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: {
+        code: "COMMAND_FAILED",
+        detail: {
+          command: "git",
+          exit_code: 128,
+          stderr_head: `fatal: cannot open [REDACTED]\n${"한".repeat(160)}`,
+        },
+      },
+    });
+    expect(Buffer.byteLength(JSON.parse(result.stderr).error.detail.stderr_head, "utf8")).toBe(510);
+    expect(result.stderr).not.toContain("--porcelain");
+    expect(result.stderr).not.toContain("not-for-operator");
+    expect(result.stderr).not.toContain("low-level-cause");
+    expect(result.stderr).not.toContain("/private/repository");
+  });
+
+  it.each([512, 513])("caps COMMAND_FAILED stderr at 512 UTF-8 bytes for a %i-byte input", (length) => {
+    const result = controlErrorResult(new ControlError("COMMAND_FAILED", "git failed", {
+      command: "git",
+      args: [],
+      exitCode: 1,
+      stdout: "",
+      stderr: "x".repeat(length),
+    }));
+    const detail = JSON.parse(result.stderr).error.detail;
+
+    expect(detail.stderr_head).toBe("x".repeat(Math.min(length, 512)));
+    expect(Buffer.byteLength(detail.stderr_head, "utf8")).toBe(Math.min(length, 512));
+  });
+
+  it.each([
+    { command: "git", exitCode: 128, stderr: "untrusted stderr" },
+    { command: "git", args: ["status"], exitCode: 128, stderr: "untrusted stderr" },
+    { command: "git", args: ["status"], exitCode: null },
+  ])("does not project COMMAND_FAILED detail without a complete ProcessRunner failure shape: %j", (details) => {
+    const result = controlErrorResult(new ControlError("COMMAND_FAILED", "generic failure", details));
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "COMMAND_FAILED" } });
+    expect(result.stderr).not.toContain("untrusted stderr");
+  });
+
+  it("emits command and null exit code for a complete ProcessRunner spawn failure", () => {
+    const result = controlErrorResult(new ControlError("COMMAND_FAILED", "spawn failure", {
+      command: "git",
+      args: ["status"],
+      exitCode: null,
+      cause: "spawn ENOENT",
+    }));
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: {
+        code: "COMMAND_FAILED",
+        detail: { command: "git", exit_code: null },
+      },
+    });
+    expect(result.stderr).not.toContain("status");
+    expect(result.stderr).not.toContain("spawn ENOENT");
+  });
+
+  it("journals the emitted COMMAND_FAILED diagnostic summary", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-command-failed-"));
+    const privatePaths = [
+      String.raw`\\build-host\private\repository`,
+      String.raw`\\?\C:\private\repository`,
+      "//build-host/private/repository",
+    ];
+    const result = await runCli(["portfolio", "status"], makeCliDependencies({
+      stateDir,
+      portfolio: {
+        status: vi.fn().mockRejectedValue(new ControlError("COMMAND_FAILED", "git failed", {
+          command: "git",
+          args: ["status", "--porcelain"],
+          exitCode: 128,
+          stdout: "",
+          stderr: `fatal: ${privatePaths.join(" ")}`,
+        })),
+      },
+    }));
+    const journal = JSON.parse(await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8"));
+    const detail = {
+      command: "git",
+      exit_code: 128,
+      stderr_head: "fatal: [REDACTED] [REDACTED] [REDACTED]",
+    };
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: { code: "COMMAND_FAILED", detail },
+    });
+    expect(journal).toMatchObject({
+      command: "portfolio status",
+      ok: false,
+      error_code: "COMMAND_FAILED",
+      error_detail: detail,
+    });
+    for (const privatePath of privatePaths) {
+      expect(`${result.stderr}${JSON.stringify(journal)}`).not.toContain(privatePath);
+    }
+  });
+
+  it("keeps the escaped COMMAND_FAILED journal row within the 4 KiB line limit", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-command-failed-escaping-"));
+    const result = await runCli(["portfolio", "status"], makeCliDependencies({
+      stateDir,
+      portfolio: {
+        status: vi.fn().mockRejectedValue(new ControlError("COMMAND_FAILED", "git failed", {
+          command: "git",
+          args: [],
+          exitCode: 1,
+          stdout: "",
+          stderr: "\u0000".repeat(512),
+        })),
+      },
+    }));
+    const rawJournal = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
+    const journal = JSON.parse(rawJournal);
+
+    expect(result.stderr).not.toContain("journal_warning");
+    expect(Buffer.byteLength(rawJournal, "utf8")).toBeLessThanOrEqual(4096);
+    expect(journal.error_detail.stderr_head).toBe("\u0000".repeat(512));
+  });
+
   it("never emits conflicting_claim for unrelated errors", async () => {
     const result = await runCli(formalStartArgs(), makeCliDependencies({
       taskService: {

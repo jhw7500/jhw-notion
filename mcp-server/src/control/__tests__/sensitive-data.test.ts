@@ -74,6 +74,15 @@ describe("SensitiveDataPolicy", () => {
       .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
   });
 
+  it.each([
+    String.raw`\\build-host\private\source-checkout`,
+    String.raw`\\?\C:\private\source-checkout`,
+    "//build-host/private/source-checkout",
+  ])("rejects network and extended Windows host path %s", (privatePath) => {
+    expect(() => assertNoAbsoluteHostPaths(`inspect ${privatePath}`))
+      .toThrowError(expect.objectContaining({ code: "SENSITIVE_DATA_REJECTED" }));
+  });
+
   it("preserves URL and repository-slug text that is not a host path", () => {
     expect(() => assertNoAbsoluteHostPaths([
       "https://github.com/owner/repository/issues/1",
@@ -81,6 +90,26 @@ describe("SensitiveDataPolicy", () => {
       "docs/project-control/runbook.md",
       "<div>safe HTML",
     ])).not.toThrow();
+  });
+
+  it.each([
+    String.raw`\\build-host\private\source-checkout`,
+    String.raw`\\?\C:\private\source-checkout`,
+    "//build-host/private/source-checkout",
+  ])("redacts network and extended Windows paths from direct ControlError metadata: %s", (privatePath) => {
+    const error = new ControlError("SAFE_FAILURE", `failed ${privatePath}`, { evidence: privatePath });
+
+    expect(error.message).not.toContain(privatePath);
+    expect(JSON.stringify(error)).not.toContain(privatePath);
+    expect(error.details).toEqual({ evidence: "[REDACTED]" });
+  });
+
+  it("preserves recognized URLs in direct ControlError metadata", () => {
+    const url = "https://build-host.example/private/source-checkout";
+    const error = new ControlError("SAFE_FAILURE", `failed ${url}`, { evidence: url });
+
+    expect(error.message).toContain(url);
+    expect(error.details).toEqual({ evidence: url });
   });
 
   it.each([

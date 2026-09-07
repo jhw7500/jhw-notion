@@ -203,6 +203,8 @@ current-context는 같은 repository의 active Claim 중 `session_id`·adapter·
 
 measurement journal은 authority가 아니다. 성공 output에 `journal_warning.code=JOURNAL_WRITE_FAILED`가 붙어도 command는 이미 성공했으므로 재시도하지 않는다. 실패 command도 원래 exit/error를 유지한다.
 
+`COMMAND_FAILED`는 실패한 자식 process의 redacted 진단만 `error.detail`로 제공한다. 필드는 `command`, nullable `exit_code`, optional 최대 512 UTF-8 bytes의 `stderr_head`로 닫혀 있으며 args/stdout/raw cause와 일반 `ControlError` 메시지는 내보내지 않는다. 같은 detail은 measurement journal의 `error_detail`에 기록된다.
+
 설정, 안전한 credential 주입, stable exit code, 세 번의 자연 Task cycle, 중단 기준은 [Phase 1A runbook](docs/project-control/phase1a-runbook.md)을 따른다. Phase 1B/cutover는 별도 승인 계획이 필요하다.
 
 ## 업데이트

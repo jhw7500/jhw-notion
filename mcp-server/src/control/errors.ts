@@ -1,4 +1,5 @@
 const sensitiveEnvironmentKey = /(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL)/i;
+const networkHostPath = /(^|[^A-Za-z0-9_./\\:-])((?:\\\\|\/\/)[^\\/\s"'`<>|]+[\\/][^\s"'`<>|]+)/gu;
 const unixHostPath = /(^|[^A-Za-z0-9_./-])(\/(?!\/)[^\s"'`<>|]+)/gu;
 const windowsHostPath = /(^|[^A-Za-z0-9_./\\-])([A-Za-z]:[\\/][^\s"'`<>|]+)/gu;
 const fileUri = /file:\/\/[^\s"'`<>|]*/giu;
@@ -15,9 +16,10 @@ function protectedTerms(): string[] {
  * Deliberately conservative, and it costs nothing to be. A message is never
  * emitted — `controlErrorResult` sends the stable code, the claim coordinates
  * on a Claim conflict, a schema-pinned `reason` identifier where a throw site
- * sets one, and nothing else — so a slash command or non-ASCII prose mangled
- * here is read only by whoever is debugging. Anything an operator has to act
- * on belongs in the code or that bounded reason, not the message.
+ * sets one, and the separately validated bounded diagnostic for
+ * `COMMAND_FAILED`. A slash command or non-ASCII prose mangled here is still
+ * read only by whoever is debugging. Anything an operator has to act on
+ * belongs in those explicit output fields, not the message.
  *
  * What must survive is the other half: the coordinates that are emitted. Branch
  * names and worktree refs carry slashes, and a Claim conflict is useless
@@ -31,6 +33,7 @@ function sanitizeString(value: string, terms: readonly string[]): string {
   for (const term of terms) safe = safe.split(term).join("[REDACTED]");
   return safe
     .replace(fileUri, "[REDACTED]")
+    .replace(networkHostPath, (_match, prefix: string) => `${prefix}[REDACTED]`)
     .replace(unixHostPath, (_match, prefix: string) => `${prefix}[REDACTED]`)
     .replace(windowsHostPath, (_match, prefix: string) => `${prefix}[REDACTED]`);
 }
