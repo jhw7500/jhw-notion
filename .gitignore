@@ -11,3 +11,6 @@ tmp/
 
 # 로컬 개인 문서 (public 저장소 비공개 유지)
 docs/notion-architecture-review.md
+
+# pre-pr-tribunal 상태 (로컬 전용)
+.review/
