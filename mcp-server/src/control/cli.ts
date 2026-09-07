@@ -67,6 +67,8 @@ import {
   ActiveClaimSchema,
   BoardConflictSummarySchema,
   BoundedPortfolioPayloadSchema,
+  COMMAND_FAILURE_STDERR_HEAD_BYTES,
+  CommandFailureDetailSchema,
   ConflictingClaimSummarySchema,
   ClaimCoordinateSchema,
   GuardRequestSchema,
@@ -83,6 +85,7 @@ import {
   type BoardConflictSummary,
   type BoardMode,
   type BoundedPortfolioPayload,
+  type CommandFailureDetail,
   type ConflictingClaimSummary,
   type LockHolderSummary,
   type PreflightResult,
@@ -103,6 +106,25 @@ const REPO_ID = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const MAX_CLI_OUTPUT_BYTES = 12 * 1024;
 const CLI_RESULT_BUDGET = MAX_CLI_OUTPUT_BYTES - 256;
 const maximumGuardClaims = 4_096;
+
+const commandFailureSourceBase = {
+  command: ClaimCoordinateSchema,
+  args: z.array(z.string()),
+};
+const CommandFailureSourceSchema = z.union([
+  z.object({
+    ...commandFailureSourceBase,
+    exitCode: z.number().int().positive().safe().nullable(),
+    stdout: z.string(),
+    stderr: z.string(),
+    cause: z.string().optional(),
+  }).strict(),
+  z.object({
+    ...commandFailureSourceBase,
+    exitCode: z.null(),
+    cause: z.string(),
+  }).strict(),
+]);
 
 const GuardRequestInspectionSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("not_initialized"), requests: z.array(GuardRequestSchema).length(0) }).strict(),
@@ -1404,6 +1426,34 @@ function errorReason(cause: unknown): string | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
+function utf8Head(value: string, maximumBytes: number): string {
+  let bytes = 0;
+  let head = "";
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maximumBytes) break;
+    head += character;
+    bytes += characterBytes;
+  }
+  return head;
+}
+
+function commandFailureDetail(cause: unknown): CommandFailureDetail | undefined {
+  if (!(cause instanceof ControlError) || cause.code !== "COMMAND_FAILED") return undefined;
+  const parsed = CommandFailureSourceSchema.safeParse(cause.details);
+  if (!parsed.success) return undefined;
+  const stderr = "stderr" in parsed.data ? parsed.data.stderr : undefined;
+  const stderrHead = stderr === undefined
+    ? ""
+    : utf8Head(stderr, COMMAND_FAILURE_STDERR_HEAD_BYTES);
+  const detail = CommandFailureDetailSchema.safeParse({
+    command: parsed.data.command,
+    exit_code: parsed.data.exitCode,
+    ...(stderrHead ? { stderr_head: stderrHead } : {}),
+  });
+  return detail.success ? detail.data : undefined;
+}
+
 function lockHolder(cause: unknown): LockHolderSummary | undefined {
   if (!(cause instanceof ControlError) || cause.code !== "LOCK_CONTENDED") return undefined;
   const parsed = LockHolderSummarySchema.safeParse(cause.details.lock_holder);
@@ -1432,9 +1482,24 @@ function journalErrorFields(stderr: string): { error_code: string; error_reason?
   return { error_code: error.code, ...(error.reason ? { error_reason: error.reason } : {}) };
 }
 
+function pilotJournalErrorFields(stderr: string): {
+  error_code: string;
+  error_reason?: string;
+  error_detail?: CommandFailureDetail;
+} {
+  const error = JSON.parse(stderr).error as { code: string; reason?: string; detail?: unknown };
+  const detail = CommandFailureDetailSchema.safeParse(error.detail);
+  return {
+    error_code: error.code,
+    ...(error.reason ? { error_reason: error.reason } : {}),
+    ...(detail.success ? { error_detail: detail.data } : {}),
+  };
+}
+
 export function controlErrorResult(cause: unknown, command?: CommandName, retainedTaskValue?: unknown): CliResult {
   const code = errorCode(cause);
   const reason = errorReason(cause);
+  const detail = commandFailureDetail(cause);
   const holder = lockHolder(cause);
   const conflict = conflictingClaim(cause);
   const boardConflict = conflictingBoard(cause);
@@ -1443,6 +1508,7 @@ export function controlErrorResult(cause: unknown, command?: CommandName, retain
   const error = {
     code,
     ...(reason ? { reason } : {}),
+    ...(detail ? { detail } : {}),
     ...(holder ? { lock_holder: holder } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),
     ...(boardConflict ? { conflicting_board: boardConflict } : {}),
@@ -2470,7 +2536,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
       finished_at: finished.toISOString(),
       elapsed_ms: elapsed,
       ok: result.exitCode === 0,
-      ...(result.exitCode === 0 ? {} : journalErrorFields(result.stderr)),
+      ...(result.exitCode === 0 ? {} : pilotJournalErrorFields(result.stderr)),
       payload_bytes: Buffer.byteLength(result.stdout || result.stderr, "utf8"),
       ...metadata,
     });

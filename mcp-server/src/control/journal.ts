@@ -3,6 +3,7 @@ import { lstat, mkdir, open, rename, unlink, type FileHandle } from "node:fs/pro
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 import { ControlError } from "./errors.js";
+import type { CommandFailureDetail } from "./schemas.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 
 const MAX_JOURNAL_LINE_BYTES = 4096;
@@ -24,6 +25,7 @@ export interface JournalEvent {
   ok: boolean;
   error_code?: string;
   error_reason?: string;
+  error_detail?: CommandFailureDetail;
   bypass_reason?: string;
   payload_bytes: number;
   active_work_minutes?: number;
