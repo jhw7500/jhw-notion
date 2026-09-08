@@ -25,7 +25,7 @@ eligible reviewer가 0명이면 Issue 생성 전에 중단한다.
 | Gemini | local `gemini-dispatch.yml` regular file + config enabled + 기본 브랜치의 `Gemini Dispatch` workflow가 active이고 `issue_comment` event 및 request-comment `run-name` 좌표 지원 |
 | Codex | 동일 저장소 canary Issue에서 actor-owned 요청 뒤 하나의 Codex bot identity가 실패가 아닌 응답을 반환 |
 
-Gemini Assist와 OpenCode는 PR-only라 Issue reviewer로 추정하지 않는다. secret 값은 조회하거나
+Gemini Code Assist는 정책상 비활성이며 OpenCode와 함께 PR-only라 Issue reviewer로 추정하지 않는다. secret 값은 조회하거나
 존재를 추정하지 않는다. Codex canary 증거는 이 invocation에서만 쓰고 파일·환경 프로필·DB에
 저장하지 않는다. usage limit·connector 실패·review 불가를 보고한 canary 응답은 capability 증거가 아니다.
 
