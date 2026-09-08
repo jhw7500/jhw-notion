@@ -409,7 +409,8 @@ async function main() {
   assert.match(readmeText, /\/jhw:issue .*--no-review/);
   assert.match(readmeText, /\/jhw:issue <내용>\s+— 저장소 review\.auto를 따름/);
   assert.match(readmeText, /Codex.*동일 저장소.*canary/);
-  assert.match(readmeText, /Gemini Assist.*OpenCode.*PR-only/);
+  assert.match(readmeText, /Gemini Code Assist.*OpenCode.*PR-only/);
+  assert.match(issueText, /Gemini Code Assist.*정책상 비활성/);
   assert.match(readmeText, /Issue를 수정·닫기.*구현/);
   assert.match(issueText, /gemini\) command='@gemini-cli /,
     "standalone Issue requests must use the pinned Gemini dispatcher command");

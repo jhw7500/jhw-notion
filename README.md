@@ -129,11 +129,18 @@ PR 리뷰 정책 예시:
 /jhw:ship ...                 — deprecated; 같은 인자로 /jhw:pr 실행
 ```
 
-`--review`/`--no-review`를 생략하면 저장소 설정을 따르며, 현재 설정과 호환 기본값은 review-on이다.
+`--review`/`--no-review`를 생략하면 저장소 설정을 따르며, 현재 설정처럼 `review.auto`와
+`workflows.<name>.auto`가 모두 없으면 호환 기본값은 review-off다.
 review-on은 GitHub mutation 전에 관리 workflow의 active 상태·고정 파일 경로·Actions 표시 이름과 기본 브랜치 event/dispatch 계약, 동일 저장소 App canary를 확인하고,
 증명되지 않은 workflow/App은 `UNAVAILABLE`로 남겨 mention하지 않는다. Codex App canary가 bracketed/unbracketed
 actor 중 정확히 하나를 증명하면 그 identity만 현재 리뷰 라운드에 고정한다. App canary의 quota·connector·review 불가
 응답은 capability 증거로 인정하지 않으며, 정상 PR 댓글·inline·review·head-scoped clean reaction은 증거 표면에 포함한다.
+
+리뷰 채널에서 `gemini`는 managed Gemini CLI workflow(`Gemini Auto PR Review`, `@gemini-cli /review`)이고,
+`gemini-code-assist`는 별도의 Gemini Code Assist GitHub App(`gemini-code-assist[bot]`, `/gemini review`)이다.
+Code Assist App은 `.gemini/config.yaml`의 `code_review.disable: false`와 manual-only 설정이 모두 명시되고
+동일 저장소 canary도 유효할 때만 활성 후보가 된다. 현재는 `disable: true`라 요청·대기하지 않으며 unsolicited
+App 출력도 managed `gemini` 결과를 대체하지 않는다. 기존 `gemini-assist` 입력은 App의 legacy alias로만 정규화된다.
 
 Issue 리뷰 정책 예시:
 
@@ -145,7 +152,7 @@ Issue 리뷰 정책 예시:
 
 현재처럼 전역 `review.auto`가 없으면 호환 기본값 `true`를 사용한다. Codex는 동일 저장소 Issue canary의 성공 응답 증거가 있어야 eligible이다.
 Claude/Gemini Issue reviewer는 로컬 설정뿐 아니라 GitHub 기본 브랜치 workflow의 active 상태와 `issue_comment` event 계약도 확인한다.
-Gemini Assist와 OpenCode는 standalone Issue에서 PR-only이므로 요청하거나 기다리지 않는다.
+Gemini Code Assist와 OpenCode는 standalone Issue에서 PR-only이므로 요청하거나 기다리지 않는다. Code Assist는 PR에서도 현재 정책상 비활성이다.
 이 명령은 리뷰 결과를 받아도 Issue를 수정·닫기·삭제하거나 feedback을 자동 구현하지 않는다.
 
 > deprecated alias(다음 메이저 릴리스에서 삭제): `/jhw:record`·`/jhw:note`·`/jhw:delete`→`/jhw:save`, `/jhw:search`·`/jhw:context`·`/jhw:history`→`/jhw:recall`, `/jhw:start`·`/jhw:close`→`/jhw:project`, `/jhw:ship`→`/jhw:pr`.
