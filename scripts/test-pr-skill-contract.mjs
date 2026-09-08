@@ -30,6 +30,7 @@ const roundStartedAt = "2026-08-29T00:00:00Z";
 const requestCreatedAt = "2026-08-29T00:01:00Z";
 const startEpoch = Date.parse(roundStartedAt) / 1000;
 const requestEpoch = Date.parse(requestCreatedAt) / 1000;
+const namedCodexReview = "ROUND_EXPECTED_REVIEWERS=codex; export ROUND_EXPECTED_REVIEWERS; ";
 const requestMarker = `<!-- jhw-pr:review-request reviewer=codex head=${currentHead} base=${currentBaseOid} -->`;
 const requestBody = `@codex review\n\n${requestMarker}`;
 const legacyRequestMarker = `<!-- jhw-ship:codex-review round=2 head=${currentHead} -->`;
@@ -45,8 +46,19 @@ const oldGenericCodexMarker = `<!-- jhw-pr:review-request reviewer=codex head=${
 const oldGenericCodexBody = `@codex review\n\n${oldGenericCodexMarker}`;
 const oldBaseGenericCodexMarker = `<!-- jhw-pr:review-request reviewer=codex head=${currentHead} base=${oldBaseOid} -->`;
 const oldBaseGenericCodexBody = `@codex review\n\n${oldBaseGenericCodexMarker}`;
-const genericGeminiMarker = `<!-- jhw-pr:review-request reviewer=gemini-assist head=${currentHead} base=${currentBaseOid} -->`;
+const genericGeminiMarker = `<!-- jhw-pr:review-request reviewer=gemini-code-assist head=${currentHead} base=${currentBaseOid} -->`;
 const genericGeminiBody = `/gemini review\n\n${genericGeminiMarker}`;
+const disabledGeminiCodeAssistConfig = [
+  "code_review:",
+  "  disable: true",
+  "  pull_request_opened:",
+  "    code_review: false",
+  "",
+].join("\n");
+const enabledGeminiCodeAssistConfig = disabledGeminiCodeAssistConfig.replace(
+  "  disable: true",
+  "  disable: false",
+);
 const workflowNames = {
   "claude-code-review.yml": "Claude Code Review",
   "gemini-auto-review.yml": "Gemini Auto PR Review",
@@ -285,6 +297,12 @@ if (argv[0] === "workflow" && argv[1] === "run") {
 
 if (argv[0] !== "api" || !argv[1]) process.exit(2);
 const endpoint = argv[1];
+const visibleGenericSignals = (items, query) => {
+  const excludesGeminiCodeAssist = query.includes('.user.login != "gemini-code-assist[bot]"') &&
+    query.includes('.user.login != "gemini-code-assist"');
+  return (items || []).filter((item) => !excludesGeminiCodeAssist ||
+    (item.actor !== "gemini-code-assist[bot]" && item.actor !== "gemini-code-assist"));
+};
 if ((state.failEndpoints || []).some((part) => endpoint.includes(part))) process.exit(1);
 
 if (endpoint === "user") {
@@ -362,8 +380,8 @@ if (endpoint === "repos/example/repo/issues/comments?per_page=100") {
   const query = optionValue("--jq") || "";
   if (query.includes("@tsv")) {
     if (!query.includes("head=[0-9a-f]{40}") || !query.includes("base=[0-9a-f]{40}")) process.exit(2);
-    const marker = query.includes("reviewer=gemini-assist")
-      ? /<!-- jhw-pr:review-request reviewer=gemini-assist head=[0-9a-f]{40}(?: base=[0-9a-f]{40})? -->/
+    const marker = query.includes("reviewer=gemini-code-assist") || query.includes("reviewer=gemini-assist")
+      ? /<!-- jhw-pr:review-request reviewer=gemini-(?:code-)?assist head=[0-9a-f]{40}(?: base=[0-9a-f]{40})? -->/
       : /<!-- jhw-(?:pr:review-request reviewer=codex head=[0-9a-f]{40}(?: base=[0-9a-f]{40})?|(?:pr|ship):codex-review round=[1-9][0-9]* head=[0-9a-f]{40}) -->/;
     rows((state.appRequestComments || [])
       .filter((item) => marker.test(item.body || ""))
@@ -418,6 +436,30 @@ if (/\/issues\/\d+\/comments\?per_page=100$/.test(endpoint)) {
   }
   const queryIndex = argv.indexOf("--jq");
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
+  if (query.includes("{id, author:.user.login")) {
+    const markers = [...query.matchAll(/contains\("([^"]+)"\)/g)].map((match) => match[1]);
+    const matching = visibleGenericSignals(state.issueComments, query).filter((item) =>
+      item.actor.endsWith("[bot]") &&
+      markers.some((marker) => (item.body || "").includes(marker)));
+    rows(matching.map((item) => JSON.stringify({
+      id: item.id,
+      author: item.actor,
+      type: "Bot",
+      created_at: item.createdAt,
+      updated_at: item.updatedAt || item.createdAt,
+      body: item.body || "",
+    })));
+    process.exit(0);
+  }
+  if (query.includes("@base64")) {
+    rows(visibleGenericSignals(state.issueComments, query).map((item) => [
+      item.id,
+      item.actor,
+      item.createdAt,
+      Buffer.from(item.body || "").toString("base64"),
+    ].join("\t")));
+    process.exit(0);
+  }
   const actor = query.match(/\.user\.login == "([^"]+)"/)?.[1];
   const markers = [...query.matchAll(/contains\("([^"]+)"\)/g)].map((match) => match[1]);
   const testPatterns = [...query.matchAll(/test\("([^"]+)"\)/g)]
@@ -442,7 +484,14 @@ if (/\/issues\/comments\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
     })).toString("base64")));
     process.exit(0);
   }
-  if (!(optionValue("--jq") || "").includes("(.id | tostring)")) process.exit(2);
+  if (!(optionValue("--jq") || "").includes("(.id | tostring)")) {
+    rows(visibleGenericSignals(state.commentReactions, query).map((item) => [
+      item.actor,
+      item.content,
+      item.createdAt,
+    ].join("\t")));
+    process.exit(0);
+  }
   rows(state.commentReactions.map((item, index) => [
     item.actor,
     item.id || 7000 + index,
@@ -453,7 +502,15 @@ if (/\/issues\/comments\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
 }
 
 if (/\/issues\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
-  if (!(optionValue("--jq") || "").includes("(.id | tostring)")) process.exit(2);
+  const query = optionValue("--jq") || "";
+  if (!query.includes("(.id | tostring)")) {
+    rows(visibleGenericSignals(state.issueReactions, query).map((item) => [
+      item.actor,
+      item.content,
+      item.createdAt,
+    ].join("\t")));
+    process.exit(0);
+  }
   rows(state.issueReactions.map((item, index) => [
     item.actor,
     item.id || 8000 + index,
@@ -465,7 +522,17 @@ if (/\/issues\/\d+\/reactions\?per_page=100$/.test(endpoint)) {
 
 if (/\/pulls\/\d+\/reviews\?per_page=100$/.test(endpoint)) {
   const query = optionValue("--jq") || "";
-  if (!query.includes("@base64") || !query.includes("(.id | tostring)")) process.exit(2);
+  if (!query.includes("@base64")) process.exit(2);
+  if (!query.includes("(.id | tostring)")) {
+    rows(visibleGenericSignals(state.reviews, query).map((item) => [
+      item.actor,
+      item.state || "COMMENTED",
+      item.commitId,
+      item.submittedAt,
+      typeof item.bodyBase64 === "string" ? item.bodyBase64 : Buffer.from(reviewBody(item)).toString("base64"),
+    ].join("\t")));
+    process.exit(0);
+  }
   rows(state.reviews.map((item, index) => [
     item.actor,
     item.id || 5000 + index,
@@ -479,7 +546,17 @@ if (/\/pulls\/\d+\/reviews\?per_page=100$/.test(endpoint)) {
 
 if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
   const query = optionValue("--jq") || "";
-  if (!query.includes("@base64") || !query.includes("(.id | tostring)")) process.exit(2);
+  if (!query.includes("@base64")) process.exit(2);
+  if (!query.includes("(.id | tostring)")) {
+    rows(visibleGenericSignals(state.pullComments, query).map((item) => [
+      item.actor,
+      item.commitId,
+      item.originalCommitId,
+      item.createdAt,
+      typeof item.bodyBase64 === "string" ? item.bodyBase64 : Buffer.from(reviewBody(item)).toString("base64"),
+    ].join("\t")));
+    process.exit(0);
+  }
   rows(state.pullComments.map((item, index) => [
     item.actor,
     item.id || 6000 + index,
@@ -729,6 +806,7 @@ async function main() {
   const aliasText = await readFile(shipAlias, "utf8");
   const agentsText = await readFile(agentsPath, "utf8");
   const readmeText = await readFile(readmePath, "utf8");
+  const repositoryGeminiConfig = await readFile(join(repoRoot, ".gemini", "config.yaml"), "utf8");
   assert.match(prText, /^# \/jhw:pr — PR 생성/m);
   assert.match(prText, /<!-- jhw-pr:review-request reviewer=\$\{reviewer\} head=\$\{head\} base=\$\{ROUND_BASE_OID\} -->/);
   assert.match(aliasText, /deprecated/i);
@@ -743,7 +821,6 @@ async function main() {
   assert.doesNotMatch(prText, /기본 (?:\*\*)?3(?:라운드|\b)/);
   assert.doesNotMatch(prText, /최초 PR 라운드는 기존 자동 트리거/);
   assert.match(prText, /jhw_pr_request_app_review codex "\$head"/);
-  assert.match(prText, /jhw_pr_request_app_review gemini-assist "\$head"/);
   assert.match(prText, /jhw_pr_dispatch_same_head claude-code-review\.yml 'Claude Code Review' "\$head"/);
   assert.match(prText, /jhw_pr_dispatch_same_head gemini-auto-review\.yml 'Gemini Auto PR Review' "\$head"/);
   assert.match(prText, /jhw_pr_dispatch_same_head opencode-auto-review\.yml 'OpenCode Auto PR Review' "\$head"/);
@@ -771,7 +848,7 @@ async function main() {
     "the executable review flow must request only its preflighted App plan");
   assert.match(
     prText,
-    /case "\$EFFECTIVE_REVIEW_POLICY" in\n  request\|auto=true\)\n    case "\$JHW_PR_WORKFLOW_TRIGGER_EVENT" in[\s\S]*?      pull_request\) ;;/,
+    /case "\$EFFECTIVE_REVIEW_POLICY" in\n  request\|auto=true\)[\s\S]*?    case "\$JHW_PR_WORKFLOW_TRIGGER_EVENT" in[\s\S]*?      pull_request\) ;;/,
     "request rounds must dispatch only when no pull_request mutation event was emitted",
   );
   assert.doesNotMatch(prText, /gh workflow view .*--json state/,
@@ -806,7 +883,7 @@ async function main() {
   assert.match(readmeText, /\/jhw:pr --no-review/);
   assert.match(readmeText, /\/jhw:pr --review --auto-fix/);
   assert.match(readmeText, /\/jhw:ship.*\/jhw:pr/);
-    assert.match(readmeText, /생략.*review-on/);
+    assert.match(readmeText, /생략[\s\S]{0,200}review-off/);
     assert.match(readmeText, /mutation 전에.*workflow.*App canary/);
     assert.match(readmeText, /active 상태·고정 파일 경로·Actions 표시 이름/);
   assert.match(readmeText, /UNAVAILABLE.*mention하지 않는다/);
@@ -861,7 +938,7 @@ async function main() {
     "",
   ].join("\n");
   await writeFile(fixtureConfigPath, enabledReviewConfig);
-  await writeFile(geminiConfigPath, "code_review:\n  pull_request_opened:\n    code_review: false\n");
+  await writeFile(geminiConfigPath, disabledGeminiCodeAssistConfig);
 
   async function run(state, commands, overrides = {}) {
     const {
@@ -1014,6 +1091,88 @@ async function main() {
       "collection must stop rather than mask a partial snapshot with a later successful endpoint",
     );
 
+    const disabledAppSignalCollection = await run(
+      baseState({
+        issueComments: [{
+          id: 8101,
+          actor: "gemini-code-assist[bot]",
+          createdAt: requestCreatedAt,
+          body: "Unsolicited Gemini Code Assist issue comment.",
+        }, {
+          id: 8102,
+          actor: "gemini-code-assist[bot]",
+          createdAt: requestCreatedAt,
+          body: "<!-- automation:gemini-auto-review:v3 -->\nUnsolicited managed-workflow marker.",
+        }, {
+          id: 8103,
+          actor: "github-actions[bot]",
+          createdAt: requestCreatedAt,
+          body: "<!-- automation:gemini-auto-review:v3 -->\nLegitimate managed-workflow marker.",
+        }],
+        reviews: [
+          {
+            actor: "gemini-code-assist[bot]",
+            commitId: currentHead,
+            submittedAt: requestCreatedAt,
+            body: "Unsolicited Gemini Code Assist review.",
+          },
+          {
+            actor: "chatgpt-codex-connector[bot]",
+            commitId: currentHead,
+            submittedAt: requestCreatedAt,
+            body: "Independent Codex review.",
+          },
+        ],
+        pullComments: [{
+          actor: "gemini-code-assist[bot]",
+          commitId: currentHead,
+          originalCommitId: currentHead,
+          createdAt: requestCreatedAt,
+          body: "Unsolicited Gemini Code Assist inline comment.",
+        }],
+        issueReactions: [{
+          actor: "gemini-code-assist[bot]",
+          content: "eyes",
+          createdAt: requestCreatedAt,
+        }],
+        runs: [{
+          id: 8201,
+          attempt: 1,
+          name: "Gemini Auto PR Review",
+          head: currentHead,
+          createdAt: requestCreatedAt,
+          status: "completed",
+          conclusion: "success",
+        }],
+      }),
+      "ROUND_EXPECTED_REVIEWERS=gemini; export ROUND_EXPECTED_REVIEWERS; collect",
+      { SHA: currentHead },
+    );
+    assert.match(disabledAppSignalCollection.stdout, /Gemini Auto PR Review/,
+      "filtering the App must preserve managed Gemini workflow evidence");
+    assert.match(disabledAppSignalCollection.stdout, /github-actions\[bot\]/,
+      "filtering the App must preserve managed workflow marker comments");
+    assert.match(disabledAppSignalCollection.stdout, /chatgpt-codex-connector\[bot\]/,
+      "filtering the App must preserve independent reviewer evidence");
+    assert.doesNotMatch(disabledAppSignalCollection.stdout, /gemini-code-assist(?:\[bot\])?/,
+      "disabled and unplanned Gemini Code Assist artifacts must not reach the terminal snapshot");
+    await writeFile(geminiConfigPath, enabledGeminiCodeAssistConfig);
+    const enabledAppSignalCollection = await run(
+      baseState({
+        reviews: [{
+          actor: "gemini-code-assist[bot]",
+          commitId: currentHead,
+          submittedAt: requestCreatedAt,
+          body: "Explicitly planned Enterprise App review.",
+        }],
+      }),
+      "ROUND_EXPECTED_REVIEWERS=gemini-code-assist; export ROUND_EXPECTED_REVIEWERS; collect",
+      { SHA: currentHead },
+    );
+    assert.match(enabledAppSignalCollection.stdout, /gemini-code-assist\[bot\]/,
+      "an explicitly enabled and planned Enterprise App must remain visible to its own terminal path");
+    await writeFile(geminiConfigPath, disabledGeminiCodeAssistConfig);
+
     const privateSignal = await run(
       baseState(),
       "ship_signal_file_prepare || exit $?\nprintf '%s\\n' \"$SHIP_SIGNAL_FILE\"",
@@ -1163,13 +1322,160 @@ async function main() {
     assert.notEqual(readOnly.code, 0);
     assert.deepEqual(mutationCalls(readOnly.log), []);
 
-    await run(baseState(), "jhw_pr_gemini_manual_review_configured");
-    await run(baseState(), "jhw_pr_repo_has_app_canary gemini-assist");
+    const disabledGeminiPolicy = await runResult(
+      baseState(),
+      "jhw_pr_gemini_code_assist_enabled",
+    );
+    assert.notEqual(disabledGeminiPolicy.code, 0,
+      "code_review.disable=true must fail the explicit Enterprise enable predicate");
+    await rm(geminiConfigPath);
+    const missingGeminiConfig = await runResult(
+      baseState(),
+      "jhw_pr_gemini_code_assist_enabled",
+    );
+    assert.notEqual(missingGeminiConfig.code, 0,
+      "a missing Gemini Code Assist config must fail closed");
+    const linkedGeminiConfigTarget = join(tempRoot, "linked-gemini-config.yaml");
+    await writeFile(linkedGeminiConfigTarget, enabledGeminiCodeAssistConfig);
+    await symlink(linkedGeminiConfigTarget, geminiConfigPath);
+    const linkedGeminiConfig = await runResult(
+      baseState(),
+      "jhw_pr_gemini_code_assist_enabled",
+    );
+    assert.notEqual(linkedGeminiConfig.code, 0,
+      "a symlinked Gemini Code Assist config must fail closed");
+    await rm(geminiConfigPath);
+    const linkedGeminiConfigDir = join(tempRoot, "linked-gemini-config-dir");
+    await mkdir(linkedGeminiConfigDir);
+    await writeFile(join(linkedGeminiConfigDir, "config.yaml"), enabledGeminiCodeAssistConfig);
+    await rm(dirname(geminiConfigPath), { recursive: true });
+    await symlink(linkedGeminiConfigDir, dirname(geminiConfigPath));
+    const linkedGeminiDirectory = await runResult(
+      baseState(),
+      "jhw_pr_gemini_code_assist_enabled",
+    );
+    assert.notEqual(linkedGeminiDirectory.code, 0,
+      "a symlinked .gemini policy directory must fail closed");
+    await rm(dirname(geminiConfigPath));
+    await mkdir(dirname(geminiConfigPath));
+    for (const [shape, config] of [
+      ["missing disable", "code_review:\n  pull_request_opened:\n    code_review: false\n"],
+      ["malformed disable", "code_review:\n  disable: later\n  pull_request_opened:\n    code_review: false\n"],
+      ["duplicate disable", "code_review:\n  disable: false\n  disable: true\n  pull_request_opened:\n    code_review: false\n"],
+      ["quoted duplicate disable", "code_review:\n  disable: false\n  \"disable\": true\n  pull_request_opened:\n    code_review: false\n"],
+      ["YAML-escaped duplicate disable", "code_review:\n  disable: false\n  \"d\\x69sable\": true\n  pull_request_opened:\n    code_review: false\n"],
+      ["NEL-separated hidden duplicate", "code_review:\n  disable: false\n  pull_request_opened:\n    code_review: false\n# comment\u0085code_review:\u0085  disable: true\n"],
+      ["wrong-indented duplicate disable", "code_review:\n  disable: false\n    disable: true\n  pull_request_opened:\n    code_review: false\n"],
+      ["automatic PR-open review", "code_review:\n  disable: false\n  pull_request_opened:\n    code_review: true\n"],
+    ]) {
+      await writeFile(geminiConfigPath, config);
+      const rejectedConfig = await runResult(
+        baseState(),
+        "jhw_pr_gemini_code_assist_enabled",
+      );
+      assert.notEqual(rejectedConfig.code, 0, `${shape} must fail closed`);
+    }
+    await writeFile(geminiConfigPath, disabledGeminiCodeAssistConfig);
+    const disabledApps = await run(
+      baseState(),
+      "jhw_pr_discover_app_reviewers",
+    );
+    assert.equal(disabledApps.stdout, "codex\n",
+      "historical App canaries must not bypass the disabled policy");
+    assert.equal(
+      disabledApps.log.filter((args) => args.some((arg) => arg.includes("gemini-code-assist[bot]"))).length,
+      0,
+      "disabled discovery must stop before querying Gemini Code Assist canary surfaces",
+    );
+    await run(baseState(), "jhw_pr_repo_has_app_canary gemini-code-assist");
+
+    const disabledPlan = await run(
+      baseState(),
+      [
+        "jhw_pr_prepare_review_plan request",
+        "printf 'available=%s\\neligible=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_ELIGIBLE_APPS\" \"$JHW_PR_UNAVAILABLE_APPS\"",
+      ].join("\n"),
+    );
+    assert.match(disabledPlan.stdout, /^available=claude-code-review\.yml\ngemini-auto-review\.yml\neligible=/m,
+      "disabling Gemini Code Assist must preserve the managed Gemini reviewer");
+    assert.match(disabledPlan.stdout, /^eligible=codex$/m);
+    assert.match(disabledPlan.stdout, /gemini-code-assist\tpolicy_disabled/);
+    const disabledReviewerSelection = await run(
+      baseState(),
+      [
+        "jhw_pr_prepare_review_plan request",
+        'default_reviewers="$(jhw_pr_select_expected_reviewers)" || exit $?',
+        'managed_reviewer="$(jhw_pr_select_expected_reviewers gemini)" || exit $?',
+        'disabled_app="$(jhw_pr_select_expected_reviewers gemini-code-assist)" || exit $?',
+        'legacy_disabled_app="$(jhw_pr_select_expected_reviewers gemini-assist)" || exit $?',
+        "default_reviewers=\"${default_reviewers//$'\\n'/,}\"",
+        "printf 'default=%s\\nmanaged=%s\\napp=%s\\nlegacy=%s\\n' \"$default_reviewers\" \"$managed_reviewer\" \"$disabled_app\" \"$legacy_disabled_app\"",
+      ].join("\n"),
+    );
+    assert.equal(
+      disabledReviewerSelection.stdout,
+      "default=claude,gemini,codex\nmanaged=gemini\napp=\nlegacy=\n",
+      "the executable expected set must preserve managed Gemini and exclude both App spellings",
+    );
+
+    for (const reviewer of ["gemini-code-assist", "gemini-assist"]) {
+      const disabledRequest = await runResult(
+        baseState(),
+        `jhw_pr_request_app_review ${reviewer} ${currentHead}`,
+      );
+      assert.notEqual(disabledRequest.code, 0);
+      assert.match(disabledRequest.stderr, /TRIGGER_FAILED: policy_disabled/);
+      assert.deepEqual(disabledRequest.log.filter((args) => args[0] !== "git"), [],
+        `${reviewer} must be blocked before every GitHub lookup or POST`);
+    }
+
+    await writeFile(geminiConfigPath, enabledGeminiCodeAssistConfig);
+    await run(baseState(), "jhw_pr_gemini_code_assist_enabled");
+    const enabledWithoutCanary = await run(
+      baseState({
+        appComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          body: "Codex review completed without blockers.",
+          url: "https://github.com/example/repo/pull/88#issuecomment-3",
+        }],
+      }),
+      [
+        "jhw_pr_prepare_review_plan request",
+        "printf '%s\\n' \"$JHW_PR_UNAVAILABLE_APPS\"",
+      ].join("\n"),
+    );
+    assert.match(enabledWithoutCanary.stdout, /gemini-code-assist\tcanary_unavailable/);
+    const directEnabledWithoutCanary = await runResult(
+      baseState({
+        appComments: [{
+          actor: "chatgpt-codex-connector[bot]",
+          body: "Codex review completed without blockers.",
+          url: "https://github.com/example/repo/pull/88#issuecomment-3",
+        }],
+        appPullComments: [],
+        appRequestComments: [],
+        appReviews: [],
+        appPrReactions: [],
+      }),
+      `jhw_pr_request_app_review gemini-code-assist ${currentHead}`,
+    );
+    assert.notEqual(directEnabledWithoutCanary.code, 0,
+      "the final mutation boundary must recheck the Enterprise canary");
+    assert.match(directEnabledWithoutCanary.stderr, /TRIGGER_FAILED: canary_unavailable/);
+    assert.equal(directEnabledWithoutCanary.log.filter((args) => args.includes("POST")).length, 0,
+      "an enabled config without a valid App canary must never post /gemini review");
     const eligibleApps = await run(
       baseState(),
       "jhw_pr_discover_app_reviewers",
     );
-    assert.equal(eligibleApps.stdout, "codex\ngemini-assist\n");
+    assert.equal(eligibleApps.stdout, "codex\ngemini-code-assist\n",
+      "an explicit manual Enterprise opt-in plus canary must preserve the App path");
+    const enabledLegacySelection = await run(
+      baseState(),
+      "jhw_pr_prepare_review_plan request\njhw_pr_select_expected_reviewers gemini-assist",
+    );
+    assert.equal(enabledLegacySelection.stdout, "gemini-code-assist\n",
+      "the executable wait-set selector must normalize the legacy App alias");
 
     const reviewSurfaceCanaries = await run(
       baseState({
@@ -1187,7 +1493,7 @@ async function main() {
       }),
       "jhw_pr_discover_app_reviewers",
     );
-    assert.equal(reviewSurfaceCanaries.stdout, "codex\ngemini-assist\n",
+    assert.equal(reviewSurfaceCanaries.stdout, "codex\ngemini-code-assist\n",
       "inline comments and PR reviews are valid same-repository App canary surfaces");
 
     const codexReviewOnlyCanary = await run(
@@ -1340,7 +1646,7 @@ async function main() {
       }),
       "jhw_pr_prepare_review_plan request\nprintf '%s\\n' \"$JHW_PR_ELIGIBLE_APPS\"",
     );
-    assert.equal(failedCodexCanary.stdout.trim(), "gemini-assist",
+    assert.equal(failedCodexCanary.stdout.trim(), "gemini-code-assist",
       "a canary comment reporting connector failure cannot prove Codex capability");
 
     const failedGeminiCanary = await run(
@@ -1381,7 +1687,7 @@ async function main() {
         }),
         "jhw_pr_prepare_review_plan request\nprintf '%s\\n' \"$JHW_PR_ELIGIBLE_APPS\"",
       );
-      assert.equal(failedCodexRuntimeCanary.stdout.trim(), "gemini-assist",
+      assert.equal(failedCodexRuntimeCanary.stdout.trim(), "gemini-code-assist",
         `a Codex canary reporting runtime failure cannot prove App capability: ${body}`);
     }
 
@@ -1449,7 +1755,7 @@ async function main() {
         }],
       }),
       [
-        "apps=$'codex\\ngemini-assist'",
+        "apps=$'codex\\ngemini-code-assist'",
         `jhw_pr_request_eligible_apps ${currentHead} "$apps"`,
         "ship_codex_signal_status",
         "printf 'generic=%s\\n' \"$JHW_PR_APP_REQUEST_COMMENT_ID\"",
@@ -1471,7 +1777,7 @@ async function main() {
     );
     assert.match(
       aggregateAppCoordinates.stdout,
-      new RegExp(`gemini-assist\\tSTARTED\\t-\\t9003\\t${requestCreatedAt}\\ttrue\\t${currentHead}\\t${currentBaseOid}`),
+      new RegExp(`gemini-code-assist\\tSTARTED\\t-\\t9003\\t${requestCreatedAt}\\ttrue\\t${currentHead}\\t${currentBaseOid}`),
     );
     assert.match(aggregateAppCoordinates.roundState, /request_comment_id=9002/,
       "the durable Codex round state must be written before another App request runs");
@@ -1804,7 +2110,7 @@ async function main() {
         "unset JHW_PR_REPO_ROOT JHW_PR_CONFIG_PATH",
         "printf 'auto=%s\\n' \"$(jhw_pr_global_auto_enabled)\"",
         "jhw_pr_preflight_workflow claude-code-review.yml request",
-        "jhw_pr_gemini_manual_review_configured",
+        "jhw_pr_gemini_code_assist_enabled",
         "printf 'gemini-root-ok\\n'",
       ].join("\n"),
       { JHW_TEST_CWD: fixtureNestedDir },
@@ -2042,6 +2348,10 @@ async function main() {
     );
     const geminiRequest = await run(
       baseState(),
+      `jhw_pr_request_app_review gemini-code-assist ${currentHead}`,
+    );
+    const legacyGeminiRequest = await run(
+      baseState(),
       `jhw_pr_request_app_review gemini-assist ${currentHead}`,
     );
     const codexResume = await run(
@@ -2080,6 +2390,8 @@ async function main() {
     );
     assert.equal(countPosts(codexRequest), 1);
     assert.equal(countPosts(geminiRequest), 1);
+    assert.equal(countPosts(legacyGeminiRequest), 1,
+      "the legacy App alias must normalize to the canonical request path when explicitly enabled");
     assert.equal(countPosts(codexResume), 0);
     assert.equal(countPosts(codexOldBase), 1,
       "a same-head request for a different base OID must not be reused after the diff base changes");
@@ -2094,6 +2406,7 @@ async function main() {
     assert.equal(countPosts(unsupportedApp), 0);
     assert.equal(codexRequest.state.issueComments.at(-1).body, genericCodexBody);
     assert.equal(geminiRequest.state.issueComments.at(-1).body, genericGeminiBody);
+    assert.equal(legacyGeminiRequest.state.issueComments.at(-1).body, genericGeminiBody);
 
     const codexPrimaryCompatibility = await run(
       baseState({
@@ -2617,6 +2930,54 @@ async function main() {
       "explicit review must not merge when no reviewer reached CLEAN");
     assert.equal(emptyReviewMerge.state.prMerged, false);
 
+    const anonymousManagedStatus = await runResult(
+      baseState({ prHead: currentHead }),
+      `ROUND_EXPECTED_REVIEWERS=gemini; export ROUND_EXPECTED_REVIEWERS; jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+    );
+    assert.notEqual(anonymousManagedStatus.code, 0,
+      "an anonymous CLEAN must not satisfy the named managed Gemini reviewer");
+    assert.equal(anonymousManagedStatus.state.prMerged, false);
+
+    const substitutedManagedStatus = await runResult(
+      baseState({ prHead: currentHead }),
+      `ROUND_EXPECTED_REVIEWERS=gemini; export ROUND_EXPECTED_REVIEWERS; jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request gemini-code-assist=CLEAN`,
+    );
+    assert.notEqual(substitutedManagedStatus.code, 0,
+      "Gemini Code Assist CLEAN must not replace a missing managed Gemini status");
+    assert.equal(substitutedManagedStatus.state.prMerged, false);
+
+    const namedManagedStatus = await runResult(
+      baseState({ prHead: currentHead }),
+      "ROUND_EXPECTED_REVIEWERS=gemini; export ROUND_EXPECTED_REVIEWERS; jhw_pr_merge_review_gate request gemini=CLEAN",
+    );
+    assert.equal(namedManagedStatus.code, 0,
+      "a named managed Gemini CLEAN must satisfy only its own expected row");
+    const malformedNamedStatuses = await run(
+      baseState({ prHead: currentHead }),
+      [
+        "ROUND_EXPECTED_REVIEWERS=$'codex\\ngemini'; export ROUND_EXPECTED_REVIEWERS",
+        "if jhw_pr_merge_review_gate request codex=CLEAN; then echo unsafe-missing-merge; else echo missing-merge-blocked; fi",
+        "ROUND_EXPECTED_REVIEWERS=gemini; export ROUND_EXPECTED_REVIEWERS",
+        "if jhw_pr_merge_review_gate request gemini=CLEAN gemini=CLEAN; then echo unsafe-duplicate-merge; else echo duplicate-merge-blocked; fi",
+        "ROUND_EXPECTED_REVIEWERS=$'gemini\\ngemini'; export ROUND_EXPECTED_REVIEWERS",
+        "if jhw_pr_merge_review_gate request gemini=CLEAN; then echo unsafe-duplicate-expected; else echo duplicate-expected-blocked; fi",
+        "ROUND_EXPECTED_REVIEWERS=$'codex\\ngemini'; export ROUND_EXPECTED_REVIEWERS",
+        "if ship_auto_fix_push_ready codex=FEEDBACK; then echo unsafe-missing-autofix; else echo missing-autofix-blocked; fi",
+        "ROUND_EXPECTED_REVIEWERS=codex; export ROUND_EXPECTED_REVIEWERS",
+        "if ship_auto_fix_push_ready codex=FEEDBACK codex=CLEAN; then echo unsafe-duplicate-autofix; else echo duplicate-autofix-blocked; fi",
+      ].join("\n"),
+    );
+    assert.equal(malformedNamedStatuses.stdout,
+      "missing-merge-blocked\nduplicate-merge-blocked\nduplicate-expected-blocked\nmissing-autofix-blocked\nduplicate-autofix-blocked\n",
+      "merge and auto-fix gates must reject missing or duplicate named reviewer rows");
+    await writeFile(geminiConfigPath, disabledGeminiCodeAssistConfig);
+    const disabledAppStatus = await runResult(
+      baseState({ prHead: currentHead }),
+      "ROUND_EXPECTED_REVIEWERS=gemini-code-assist; export ROUND_EXPECTED_REVIEWERS; jhw_pr_merge_review_gate request gemini-code-assist=CLEAN",
+    );
+    assert.notEqual(disabledAppStatus.code, 0,
+      "a disabled App artifact must not become an expected merge-gate status");
+
     const noEligibleReviewMerge = await runResult(
       baseState({
         prHead: currentHead,
@@ -2649,7 +3010,7 @@ async function main() {
 
     const nonCleanReviewMerge = await runResult(
       baseState({ prHead: currentHead }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN UNAVAILABLE`,
+      `ROUND_EXPECTED_REVIEWERS=$'codex\ngemini'; export ROUND_EXPECTED_REVIEWERS; jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN gemini=UNAVAILABLE`,
     );
     assert.notEqual(nonCleanReviewMerge.code, 0,
       "every planned reviewer status must be CLEAN before merge");
@@ -2665,7 +3026,7 @@ async function main() {
 
     const atomicMerge = await run(
       baseState({ prHead: currentHead }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN CLEAN`,
+      `ROUND_EXPECTED_REVIEWERS=$'codex\nclaude'; export ROUND_EXPECTED_REVIEWERS; jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN claude=CLEAN`,
     );
     assert.equal(atomicMerge.state.prMerged, true);
     assert.deepEqual(
@@ -2698,7 +3059,7 @@ async function main() {
       const retainedAfterMerge = await run(
         baseState({ prHead: currentHead, ...overrides }),
         [
-          `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+          `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
           "printf 'delete=%s\\n' \"$JHW_PR_BRANCH_DELETE_STATUS\"",
         ].join("\n"),
       );
@@ -2720,7 +3081,7 @@ async function main() {
           parameters: { grouping_strategy: "ALLGREEN" },
         }],
       }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+      `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
     );
     assert.notEqual(mergeQueueBranch.code, 0,
       "a merge-queue branch must be rejected before the reviewed base can drift in queue");
@@ -2757,7 +3118,7 @@ async function main() {
     ]) {
       const policyManagedBase = await runResult(
         baseState({ prHead: currentHead, ...overrides }),
-        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+        `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
       );
       assert.equal(policyManagedBase.code, 3, `${name} must require a manual policy-aware merge`);
       assert.equal(policyManagedBase.state.prMerged, false);
@@ -2771,7 +3132,7 @@ async function main() {
     ]) {
       const uncertainBranchPolicy = await runResult(
         baseState({ prHead: currentHead, ...overrides }),
-        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+        `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
       );
       assert.notEqual(uncertainBranchPolicy.code, 0,
         `${name} atomic branch-policy metadata must fail closed`);
@@ -2786,7 +3147,7 @@ async function main() {
 
     const mergeRace = await runResult(
       baseState({ prHead: currentHead, headBeforeAtomicPush: oldHead }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+      `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
     );
     assert.notEqual(mergeRace.code, 0,
       "a remote head change immediately before merge must reject the merge atomically");
@@ -2794,7 +3155,7 @@ async function main() {
 
     const baseOidMergeRace = await runResult(
       baseState({ prHead: currentHead, baseOidBeforeView: oldBaseOid }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+      `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
     );
     assert.equal(baseOidMergeRace.code, 3,
       "a base OID change before merge must invalidate the reviewed diff");
@@ -2802,7 +3163,7 @@ async function main() {
 
     const baseOidAtMergeRace = await runResult(
       baseState({ prHead: currentHead, baseOidBeforeAtomicPush: oldBaseOid }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+      `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
     );
     assert.notEqual(baseOidAtMergeRace.code, 0,
       "a base OID change after the final read must be rejected by the merge operation itself");
@@ -2811,7 +3172,7 @@ async function main() {
 
     const staleMergeRef = await runResult(
       baseState({ prHead: currentHead, mergeParents: [currentBaseOid, oldHead] }),
-      `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+      `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
     );
     assert.equal(staleMergeRef.code, 3,
       "the GitHub merge ref must have the exact reviewed base and head as its two parents");
@@ -2829,7 +3190,7 @@ async function main() {
     ]) {
       const unsafeAtomicRemote = await runResult(
         baseState({ prHead: currentHead, ...overrides }),
-        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request CLEAN`,
+        `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
       );
       assert.notEqual(unsafeAtomicRemote.code, 0, `${name} must fail closed`);
       assert.equal(unsafeAtomicRemote.state.prMerged, false);
@@ -4415,12 +4776,33 @@ async function main() {
     const pushGate = await run(
       baseState(),
       [
-        "if ship_auto_fix_push_ready CLEAN PENDING FEEDBACK; then echo unsafe; else echo blocked; fi",
-        "if ship_auto_fix_push_ready CLEAN FEEDBACK; then echo ready; else echo wrong; fi",
-        "if ship_auto_fix_push_ready CLEAN TRIGGER_FAILED FEEDBACK; then echo unsafe; else echo failed-blocked; fi",
+        "ROUND_EXPECTED_REVIEWERS=$'codex\\ngemini\\nclaude'; export ROUND_EXPECTED_REVIEWERS",
+        "if ship_auto_fix_push_ready codex=CLEAN gemini=PENDING claude=FEEDBACK; then echo unsafe; else echo blocked; fi",
+        "ROUND_EXPECTED_REVIEWERS=$'codex\\ngemini'; export ROUND_EXPECTED_REVIEWERS",
+        "if ship_auto_fix_push_ready codex=CLEAN gemini=FEEDBACK; then echo ready; else echo wrong; fi",
+        "ROUND_EXPECTED_REVIEWERS=$'codex\\ngemini\\nclaude'; export ROUND_EXPECTED_REVIEWERS",
+        "if ship_auto_fix_push_ready codex=CLEAN gemini=TRIGGER_FAILED claude=FEEDBACK; then echo unsafe; else echo failed-blocked; fi",
       ].join("\n"),
     );
     assert.equal(pushGate.stdout, "blocked\nready\nfailed-blocked\n");
+
+    assert.match(prText, /jhw_pr_gemini_code_assist_enabled\(\)/);
+    assert.doesNotMatch(prText, /jhw_pr_gemini_manual_review_configured\(\)/);
+    assert.match(prText, /jhw_pr_request_app_review gemini-code-assist "\$head"/);
+    assert.match(prText, /jhw_pr_select_expected_reviewers\(\)/);
+    assert.match(prText, /jhw_pr_validate_review_status_rows\(\)/);
+    assert.match(prText, /\(preflight된 workflow ∪ JHW_PR_ELIGIBLE_APPS\) ∩ 요청한 reviewer/,
+      "the wait set must be the requested subset of policy-eligible reviewers");
+    assert.match(prText, /JHW_PR_UNAVAILABLE_APPS.*ROUND_REVIEW_STATUSES.*복사하지 않는다/s,
+      "disabled reviewers must remain report-only and never enter terminal status arrays");
+    assert.match(readmeText, /`gemini`.*managed Gemini CLI/);
+    assert.match(readmeText, /`gemini-code-assist`.*Gemini Code Assist GitHub App/);
+    assert.match(readmeText, /`--review`\/`--no-review`를 생략[\s\S]{0,200}review-off/,
+      "README PR defaults must match the executable default_auto_false contract");
+    assert.match(repositoryGeminiConfig, /^  disable: true$/m,
+      "the repository must explicitly disable Gemini Code Assist without deleting its config");
+    assert.match(repositoryGeminiConfig, /^    code_review: false$/m,
+      "future Gemini Code Assist reactivation must remain manual-only");
 
     console.log("pr skill contract: ok");
   } finally {

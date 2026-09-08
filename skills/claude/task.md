@@ -498,4 +498,5 @@ jhw-control guard preflight
 - `WORKTREE_DIRTY` + `handoff_copy_not_plain_file`: worktree 변경 문제가 아니라 local `.ai/handoff.md` 사본이 regular file이 아닌 malformed 상태다. 멈추고 local copy 형태를 복구한다.
 - `INVALID_WORKTREE_INSPECTION` + `duplicate_dirty_files`: inspection이 중복 dirty entry를 반환한 상태다. 멈추고 읽기 전용 status를 재실행하며, 반복되면 Git status 자체를 조사한다.
 - reason은 journal에도 `error_reason`으로 남아 사후 감사에서 같은 축을 쓴다.
+- `COMMAND_FAILED`의 optional `error.detail`은 실패한 자식 process의 redacted `command`, nullable `exit_code`, optional 최대 512 UTF-8 bytes의 `stderr_head`만 담는다. 같은 값은 journal의 `error_detail`에 남는다. 이 필드로 실패 경계를 식별하되 `stderr_head`를 전체 stderr로 간주하지 않고, detail이 없으면 자식 명령을 추측하지 않는다.
 - 다른 nonzero: stable `error.code`만 보고하고 secret/raw path를 출력하지 않는다.

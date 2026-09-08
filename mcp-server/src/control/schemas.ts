@@ -28,6 +28,13 @@ const boundedCoordinate = (maximumBytes: number) => z.string().min(1).max(maximu
   .refine((value) => Buffer.byteLength(value, "utf8") <= maximumBytes);
 const taskAlias = boundedCoordinate(160);
 export const ClaimCoordinateSchema = boundedCoordinate(255);
+export const COMMAND_FAILURE_STDERR_HEAD_BYTES = 512;
+export const CommandFailureDetailSchema = z.object({
+  command: ClaimCoordinateSchema,
+  exit_code: z.number().int().positive().safe().nullable(),
+  stderr_head: boundedUtf8(COMMAND_FAILURE_STDERR_HEAD_BYTES).optional(),
+}).strict();
+export type CommandFailureDetail = z.infer<typeof CommandFailureDetailSchema>;
 export const GithubNodeIdSchema = z.string().min(1).max(128).refine((value) => Buffer.byteLength(value, "utf8") <= 128);
 const githubApiId = z.string().min(1).max(256).refine((value) => Buffer.byteLength(value, "utf8") <= 256);
 export const SourceTaskRevisionSchema = boundedCoordinate(256);

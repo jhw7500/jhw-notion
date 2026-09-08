@@ -83,6 +83,29 @@ describe("board CLI wiring", () => {
     expect(requiresMutationLock(["board", "acquire", "wlan-01"])).toBe(false);
   });
 
+  it("keeps COMMAND_FAILED diagnostics out of the board journal", async () => {
+    const { dependencies, boardJournal } = makeDependencies({
+      boardService: {
+        list: vi.fn().mockRejectedValue(new ControlError("COMMAND_FAILED", "git failed", {
+          command: "git",
+          args: ["status"],
+          exitCode: 1,
+          stdout: "",
+          stderr: "fatal: unavailable",
+        })),
+      },
+    });
+
+    const result = await runCli(["board", "list"], dependencies);
+    const row = boardJournal.append.mock.calls[0]?.[0];
+
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: { code: "COMMAND_FAILED", detail: { command: "git", exit_code: 1 } },
+    });
+    expect(row).toMatchObject({ error_code: "COMMAND_FAILED" });
+    expect(row).not.toHaveProperty("error_detail");
+  });
+
   it("preserves a successful board result when its derived journal append fails", async () => {
     const { dependencies, boardJournal, boardService } = makeDependencies();
     boardJournal.append.mockRejectedValueOnce(new Error("injected board journal failure"));
