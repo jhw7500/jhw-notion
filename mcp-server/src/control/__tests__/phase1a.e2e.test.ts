@@ -2603,4 +2603,71 @@ describe("Phase 1A deterministic adversarial gate", () => {
       task_alias: secondIssue.alias,
     });
   }, 30_000);
+
+  it("29. task status falls back to the Claim base when its configured upstream ref is gone", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const dependencies = cliDependencies(graph);
+    const started = await runCli(
+      temporaryStartArgs("control:gone-upstream-status", fixture.sourceRepo, "gone-upstream-status"),
+      dependencies,
+    );
+    const { task, claim } = JSON.parse(started.stdout).result;
+    const mapping = JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
+      .worktrees[claim.worktree_ref] as { path: string };
+    await writeFile(join(mapping.path, "task-change.txt"), "task change\n", "utf8");
+    await git(mapping.path, "add", "task-change.txt");
+    await git(mapping.path, "commit", "-m", "Task change");
+    const taskHead = (await git(mapping.path, "rev-parse", "HEAD")).trim();
+    const upstream = `origin/${claim.branch}`;
+    const upstreamRef = `refs/remotes/${upstream}`;
+    await git(fixture.sourceRepo, "update-ref", upstreamRef, taskHead);
+    await git(mapping.path, "branch", "--set-upstream-to", upstream, claim.branch);
+    await git(fixture.sourceRepo, "update-ref", "-d", upstreamRef);
+
+    const status = await runCli([
+      "task", "status", "--task", task.task_id, "--claim", claim.claim_id,
+    ], dependencies);
+
+    expect(status.exitCode, status.stderr).toBe(0);
+    expect(JSON.parse(status.stdout).result.worktree).toMatchObject({
+      head_sha: taskHead,
+      ahead: 1,
+      behind: 0,
+    });
+  }, 15_000);
+
+  it("30. task finish removes an integrated worktree after its configured upstream ref is gone", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    const dependencies = cliDependencies(graph);
+    const started = await runCli(
+      temporaryStartArgs("control:gone-upstream-finish", fixture.sourceRepo, "gone-upstream-finish"),
+      dependencies,
+    );
+    const { task, claim } = JSON.parse(started.stdout).result;
+    const mapping = JSON.parse(await readFile(join(fixture.stateDir, "worktrees.json"), "utf8"))
+      .worktrees[claim.worktree_ref] as { path: string };
+    await writeFile(join(mapping.path, "task-change.txt"), "task change\n", "utf8");
+    await git(mapping.path, "add", "task-change.txt");
+    await git(mapping.path, "commit", "-m", "Task change");
+    const taskHead = (await git(mapping.path, "rev-parse", "HEAD")).trim();
+    const upstream = `origin/${claim.branch}`;
+    const upstreamRef = `refs/remotes/${upstream}`;
+    await git(fixture.sourceRepo, "update-ref", upstreamRef, taskHead);
+    await git(mapping.path, "branch", "--set-upstream-to", upstream, claim.branch);
+    await git(fixture.sourceRepo, "merge", "--ff-only", claim.branch);
+    await git(fixture.sourceRepo, "update-ref", "-d", upstreamRef);
+
+    const finished = await runCli(completedFinishArgs(task.task_id, claim.claim_id), dependencies);
+
+    expect(finished.exitCode, finished.stderr).toBe(0);
+    expect(JSON.parse(finished.stdout).result).toMatchObject({
+      task_id: task.task_id,
+      claim_id: claim.claim_id,
+      status: "completed",
+      worktree_removed: true,
+    });
+    expect(await exists(mapping.path)).toBe(false);
+  }, 15_000);
 });

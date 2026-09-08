@@ -905,15 +905,24 @@ export class WorktreeManager {
     const statusEntries = status.stdout.split("\n").filter(Boolean);
     const dirtyFiles = statusEntries.map((line) => line.slice(3));
     const head = (await this.git(["-C", mapping.path, "rev-parse", "HEAD"])).stdout.trim();
-    const upstream = (await this.git([
+    const configuredUpstream = (await this.git([
       "-C",
       mapping.path,
       "for-each-ref",
-      "--format=%(upstream:short)",
+      "--format=%(upstream)",
       `refs/heads/${claim.branch}`,
     ])).stdout.trim();
-    const counts = upstream
-      ? parseAheadBehind((await this.git(["-C", mapping.path, "rev-list", "--left-right", "--count", `${upstream}...HEAD`])).stdout)
+    const existingUpstream = configuredUpstream
+      ? (await this.git([
+          "-C",
+          mapping.path,
+          "for-each-ref",
+          "--format=%(refname)",
+          configuredUpstream,
+        ])).stdout.trim()
+      : "";
+    const counts = existingUpstream === configuredUpstream && existingUpstream !== ""
+      ? parseAheadBehind((await this.git(["-C", mapping.path, "rev-list", "--left-right", "--count", `${existingUpstream}...HEAD`])).stdout)
       : { behind: 0, ahead: parseCount((await this.git(["-C", mapping.path, "rev-list", "--count", `${mapping.base_sha}..HEAD`])).stdout, "INVALID_GIT_STATE") };
     return {
       inspection: {
