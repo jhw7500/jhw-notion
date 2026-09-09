@@ -951,7 +951,7 @@ describe("WorktreeManager", () => {
     expect(await readFile(statePath, "utf8")).toBe(before);
   });
 
-  it("refuses an unrelated active mapping whose checkout path is missing", async () => {
+  it("ignores a missing active mapping whose stored task, path, repository, and branch are unrelated", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const previous = claim();
     await manager.createOrReuse(previous, repoDir);
@@ -971,8 +971,37 @@ describe("WorktreeManager", () => {
     const before = await readFile(statePath, "utf8");
     const { history, successor } = takeover(previous);
 
-    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
-    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    await expect(manager.assertTakeoverEligible(previous)).resolves.toBeUndefined();
+    await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: true });
+    expect(await readFile(statePath, "utf8")).not.toBe(before);
+  });
+
+  it("refuses a missing mapping on the takeover branch when repository identity cannot prove it unrelated", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-missing-same-branch"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      repo_id: "repo-unrelated",
+      repository_identity: join(fixture.root, "missing-git-common"),
+      path: join(fixture.root, "worktrees", "wt-missing-same-branch"),
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_AMBIGUOUS",
+      details: { reason: "mapping_target_invalid", worktree_ref: "wt-missing-same-branch" },
+    });
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_AMBIGUOUS",
+    });
     expect(await readFile(statePath, "utf8")).toBe(before);
   });
 

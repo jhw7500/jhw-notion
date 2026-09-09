@@ -1020,18 +1020,33 @@ export class WorktreeManager {
         }
         continue;
       }
-      const physicalPath = await this.physicalMappingPath(mapping, root, ref);
-      const repositoryIdentity = await this.physicalRepositoryIdentity(mapping.repository_identity, ref);
       if (
         mapping.task_id === claim.task_id ||
-        resolve(mapping.path) === resolve(direct.path) ||
-        physicalPath === directPhysicalPath ||
-        (repositoryIdentity === directRepositoryIdentity && mapping.branch === direct.branch)
+        resolve(mapping.path) === resolve(direct.path)
       ) {
         throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover worktree mapping is duplicated or aliased", {
           reason: "mapping_duplicate",
           worktree_ref: ref,
         });
+      }
+      const physicalPath = await this.physicalUnrelatedMappingPath(mapping, root, ref);
+      if (physicalPath !== undefined && physicalPath === directPhysicalPath) {
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover worktree mapping is duplicated or aliased", {
+          reason: "mapping_duplicate",
+          worktree_ref: ref,
+        });
+      }
+      // Repository identity is relevant only when the branch could collide.
+      // A missing checkout on another branch is therefore provably unrelated
+      // without consulting its potentially stale repository identity.
+      if (mapping.branch === direct.branch) {
+        const repositoryIdentity = await this.physicalRepositoryIdentity(mapping.repository_identity, ref);
+        if (repositoryIdentity === directRepositoryIdentity) {
+          throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover worktree mapping is duplicated or aliased", {
+            reason: "mapping_duplicate",
+            worktree_ref: ref,
+          });
+        }
       }
     }
     return direct;
@@ -1087,6 +1102,29 @@ export class WorktreeManager {
         reason: "mapping_target_invalid",
         worktree_ref: worktreeRef,
       });
+    }
+  }
+
+  private async physicalUnrelatedMappingPath(
+    mapping: WorktreeMapping,
+    root: string,
+    worktreeRef: string,
+  ): Promise<string | undefined> {
+    try {
+      return await this.physicalMappingPath(mapping, root, worktreeRef);
+    } catch (cause) {
+      if (
+        cause instanceof ControlError &&
+        cause.code === "WORKTREE_MAPPING_AMBIGUOUS" &&
+        cause.details?.reason === "mapping_target_invalid"
+      ) {
+        try {
+          await lstat(mapping.path);
+        } catch (pathCause) {
+          if (isNotFound(pathCause)) return undefined;
+        }
+      }
+      throw cause;
     }
   }
 
