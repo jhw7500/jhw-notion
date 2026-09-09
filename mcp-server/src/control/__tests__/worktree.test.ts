@@ -987,6 +987,34 @@ describe("WorktreeManager", () => {
     expect(await readFile(statePath, "utf8")).not.toBe(before);
   });
 
+  it("refuses a missing unrelated mapping whose stored path is outside the worktree root", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees["wt-missing-outside"] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      branch: "task/unrelated",
+      repository_identity: join(fixture.root, "unrelated-git-common"),
+      path: join(fixture.root, "outside-worktrees", "wt-missing-outside"),
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+    const { history, successor } = takeover(previous);
+
+    const expected = {
+      code: "WORKTREE_MAPPING_AMBIGUOUS",
+      details: { reason: "mapping_target_invalid", worktree_ref: "wt-missing-outside" },
+    };
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject(expected);
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject(expected);
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
   it("refuses a missing mapping on the takeover branch when repository identity cannot prove it unrelated", async () => {
     const { fixture, repoDir, manager } = await worktreeFixture();
     const previous = claim();

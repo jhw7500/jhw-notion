@@ -31,7 +31,10 @@ import {
 import { MutationLock } from "./process.js";
 import { GuardDecisionSchema, type GuardDecision } from "./schemas.js";
 import { TaskService } from "./task-service.js";
-import { SessionEndRecorder, type SessionEndEvidenceResult } from "./session-end.js";
+import {
+  createProductionSessionEndRecorder,
+  type SessionEndEvidenceResult,
+} from "./session-end.js";
 
 export const MAX_HOOK_STDIN_BYTES = 128 * 1024;
 export const MAX_HOOK_OUTPUT_BYTES = 12 * 1024;
@@ -148,14 +151,17 @@ function parseSideResult(value: unknown, expected: "user_prompt_submit" | "post_
   return result;
 }
 
-async function resolveGuard(provider: HookGuardPort | (() => Promise<HookGuardPort>)): Promise<HookGuardPort> {
-  return typeof provider === "function" ? provider() : provider;
+async function resolveGuard(
+  provider: HookGuardPort | ((event: HookEventName) => Promise<HookGuardPort>),
+  event: HookEventName,
+): Promise<HookGuardPort> {
+  return typeof provider === "function" ? provider(event) : provider;
 }
 
 async function executeHookAdapter(
   argv: readonly string[],
   raw: string | Uint8Array,
-  provider: HookGuardPort | (() => Promise<HookGuardPort>),
+  provider: HookGuardPort | ((event: HookEventName) => Promise<HookGuardPort>),
 ): Promise<HookRunResult> {
   let selection: ReturnType<typeof parseHookCliArguments>;
   try {
@@ -173,7 +179,7 @@ async function executeHookAdapter(
 
   let rawResult: unknown;
   try {
-    const guard = await resolveGuard(provider);
+    const guard = await resolveGuard(provider, selection.event);
     if (selection.event === "UserPromptSubmit") {
       rawResult = await guard.submitUserPrompt(event);
     } else if (selection.event === "PreToolUse") {
@@ -244,20 +250,37 @@ async function createProductionHookGuard(environment: NodeJS.ProcessEnv): Promis
     },
   });
   const guard = composition.service;
-  const sessionEnd = new SessionEndRecorder({
-    host: environment.JHW_BUILD_HOST ?? "",
-    claims,
-    tasks: {
-      inspectForGuard: (taskId, claimId) => tasks.inspectForGuard(taskId, claimId),
-    },
-    journal: guardJournal,
-  });
   return Object.freeze({
     submitUserPrompt: (event: unknown) => guard.submitUserPrompt(event),
     evaluatePreTool: (event: unknown) => guard.evaluatePreTool(event),
     completePostTool: (event: unknown) => guard.completePostTool(event),
-    recordSessionEnd: (event: unknown) => sessionEnd.record(event),
+    recordSessionEnd: async () => {
+      throw new TypeError("SessionEnd requires the evidence-only production composition");
+    },
   });
+}
+
+function sessionEndOnlyGuard(environment: NodeJS.ProcessEnv): HookGuardPort {
+  const recorder = createProductionSessionEndRecorder(environment);
+  const unavailable = async (): Promise<never> => {
+    throw new TypeError("Enforcement event reached the SessionEnd-only composition");
+  };
+  return Object.freeze({
+    submitUserPrompt: unavailable,
+    evaluatePreTool: unavailable,
+    completePostTool: unavailable,
+    recordSessionEnd: (event: unknown) => recorder.record(event),
+  });
+}
+
+export async function runProductionHookAdapter(
+  argv: readonly string[],
+  raw: string | Uint8Array,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<HookRunResult> {
+  return executeHookAdapter(argv, raw, async (event) => event === "SessionEnd"
+    ? sessionEndOnlyGuard(environment)
+    : createProductionHookGuard(environment));
 }
 
 async function writeResult(stream: Writable, content: string): Promise<void> {
@@ -283,11 +306,7 @@ async function main(): Promise<void> {
     process.exitCode = 0;
     return;
   }
-  const result = await executeHookAdapter(
-    argv,
-    raw,
-    () => createProductionHookGuard(process.env),
-  );
+  const result = await runProductionHookAdapter(argv, raw, process.env);
   await writeResult(process.stdout, result.stdout);
   process.exitCode = result.exitCode;
 }

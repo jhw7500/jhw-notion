@@ -38,6 +38,11 @@ interface HookAdapterModule {
     raw: string | Uint8Array,
     guard: HookGuardPort,
   ): Promise<HookRunResult>;
+  runProductionHookAdapter(
+    argv: readonly string[],
+    raw: string | Uint8Array,
+    environment: NodeJS.ProcessEnv,
+  ): Promise<HookRunResult>;
 }
 
 const modulePath = "../hook-adapter.js";
@@ -298,6 +303,44 @@ describe("strict hook adapter executable core", () => {
       stderr: "",
     });
     expect(guard.calls.map((call) => call.method)).toEqual(["recordSessionEnd"]);
+  });
+
+  it("routes production SessionEnd without loading Guard digest or request state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-session-end-production-"));
+    paths.push(root);
+    const registry = join(root, "registry");
+    const worktrees = join(root, "worktrees");
+    const state = join(root, "state");
+    await Promise.all([
+      mkdir(join(registry, "claims", "active"), { recursive: true }),
+      mkdir(worktrees, { recursive: true }),
+      mkdir(state, { recursive: true }),
+    ]);
+    await symlink(join(root, "missing-digest-key"), join(state, "guard-digest.key"));
+
+    const { runProductionHookAdapter } = await loadAdapter();
+    const result = await runProductionHookAdapter(
+      ["--adapter", "codex", "--event", "SessionEnd"],
+      sessionEndPayload("codex").replace("/srv/worktrees/native-17", worktrees),
+      {
+        ...process.env,
+        HOME: root,
+        JHW_REGISTRY_DIR: registry,
+        JHW_WORKTREE_ROOT: worktrees,
+        JHW_CONTROL_STATE_DIR: state,
+        JHW_BUILD_HOST: "build-host",
+        JHW_GITHUB_OWNER: "example",
+        JHW_PROJECT_NUMBER: "1",
+        JHW_REGISTRY_REPOSITORY: "example/control-registry",
+        JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_session_end",
+        JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+      },
+    );
+
+    expect(result).toEqual({ exitCode: 0, stdout: "{}\n", stderr: "" });
+    expect((await lstat(join(state, "guard-digest.key"))).isSymbolicLink()).toBe(true);
+    await expect(lstat(join(state, "guard-requests.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(join(state, "guard-journal.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("renders malformed payload and event disagreement as protocol failures without calling Guard", async () => {

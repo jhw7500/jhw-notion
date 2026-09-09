@@ -1263,13 +1263,15 @@ export class WorktreeManager {
     root: string,
     worktreeRef: string,
   ): Promise<string | undefined> {
+    const expectedPath = this.worktreePath(root, worktreeRef);
     try {
       return await this.physicalMappingPath(mapping, root, worktreeRef);
     } catch (cause) {
       if (
         cause instanceof ControlError &&
         cause.code === "WORKTREE_MAPPING_AMBIGUOUS" &&
-        cause.details?.reason === "mapping_target_invalid"
+        cause.details?.reason === "mapping_target_invalid" &&
+        mapping.path === expectedPath
       ) {
         try {
           await lstat(mapping.path);
