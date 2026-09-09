@@ -1,0 +1,7 @@
+{
+  "session_id": "claude-contract-session-01",
+  "transcript_path": "/srv/sanitized/claude-transcript.jsonl",
+  "cwd": "/srv/worktrees/adapter-contract",
+  "hook_event_name": "SessionEnd",
+  "reason": "other"
+}

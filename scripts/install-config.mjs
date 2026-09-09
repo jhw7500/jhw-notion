@@ -111,7 +111,11 @@ function saveIfChanged(file, before, value, mode) {
   process.exit(CHANGED);
 }
 
-const CODEX_HOOK_EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse"];
+const CODEX_HOOK_EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"];
+
+function codexHookTimeout(eventName) {
+  return eventName === "SessionEnd" ? 3 : 12;
+}
 
 function codexHookCommand(eventName) {
   return `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${eventName}`;
@@ -133,7 +137,7 @@ function ownedCodexHookVariant(value, eventName) {
   if (!hasExactKeys(value, ["hooks"]) || !Array.isArray(value.hooks) || value.hooks.length !== 1) return false;
   const handler = value.hooks[0];
   if (!hasExactKeys(handler, ["type", "command", "timeout"]) ||
-      handler.type !== "command" || handler.timeout !== 12) return false;
+      handler.type !== "command" || handler.timeout !== codexHookTimeout(eventName)) return false;
   if (handler.command === codexHookCommand(eventName)) return "canonical";
   if (handler.command === legacyCodexHookCommand(eventName)) return "legacy";
   return false;
@@ -145,7 +149,7 @@ function isOwnedCodexHookGroup(value, eventName) {
 
 function ownedCodexHookGroup(eventName) {
   return {
-    hooks: [{ type: "command", command: codexHookCommand(eventName), timeout: 12 }],
+    hooks: [{ type: "command", command: codexHookCommand(eventName), timeout: codexHookTimeout(eventName) }],
   };
 }
 

@@ -12,7 +12,6 @@ import { encodeCanonicalJson, type GuardCommonEvent } from "./guard-protocol.js"
 import {
   createGuardServiceComposition,
   GuardSideEventResultSchema,
-  type GuardService,
   type GuardSideEventResult,
 } from "./guard-service.js";
 import { createProductionGuardJournal } from "./guard-journal.js";
@@ -32,6 +31,10 @@ import {
 import { MutationLock } from "./process.js";
 import { GuardDecisionSchema, type GuardDecision } from "./schemas.js";
 import { TaskService } from "./task-service.js";
+import {
+  createProductionSessionEndRecorder,
+  type SessionEndEvidenceResult,
+} from "./session-end.js";
 
 export const MAX_HOOK_STDIN_BYTES = 128 * 1024;
 export const MAX_HOOK_OUTPUT_BYTES = 12 * 1024;
@@ -43,6 +46,7 @@ export interface HookGuardPort {
   submitUserPrompt(event: unknown): Promise<GuardSideEventResult>;
   evaluatePreTool(event: unknown): Promise<GuardDecision>;
   completePostTool(event: unknown): Promise<GuardSideEventResult>;
+  recordSessionEnd(event: unknown): Promise<SessionEndEvidenceResult>;
 }
 
 export interface HookRunResult {
@@ -118,7 +122,7 @@ function serializeNative(event: HookEventName, value: unknown): string {
     event === "UserPromptSubmit" && !(
       "hookSpecificOutput" in parsed && parsed.hookSpecificOutput.hookEventName === "UserPromptSubmit"
     ) ||
-    event === "PostToolUse" && "hookSpecificOutput" in parsed
+    (event === "PostToolUse" || event === "SessionEnd") && "hookSpecificOutput" in parsed
   ) throw new TypeError("Native output does not match hook event");
   encodeCanonicalJson(parsed, { maximumBytes: MAX_HOOK_OUTPUT_BYTES - 1 });
   const line = `${JSON.stringify(parsed)}\n`;
@@ -147,14 +151,17 @@ function parseSideResult(value: unknown, expected: "user_prompt_submit" | "post_
   return result;
 }
 
-async function resolveGuard(provider: HookGuardPort | (() => Promise<HookGuardPort>)): Promise<HookGuardPort> {
-  return typeof provider === "function" ? provider() : provider;
+async function resolveGuard(
+  provider: HookGuardPort | ((event: HookEventName) => Promise<HookGuardPort>),
+  event: HookEventName,
+): Promise<HookGuardPort> {
+  return typeof provider === "function" ? provider(event) : provider;
 }
 
 async function executeHookAdapter(
   argv: readonly string[],
   raw: string | Uint8Array,
-  provider: HookGuardPort | (() => Promise<HookGuardPort>),
+  provider: HookGuardPort | ((event: HookEventName) => Promise<HookGuardPort>),
 ): Promise<HookRunResult> {
   let selection: ReturnType<typeof parseHookCliArguments>;
   try {
@@ -172,13 +179,15 @@ async function executeHookAdapter(
 
   let rawResult: unknown;
   try {
-    const guard = await resolveGuard(provider);
+    const guard = await resolveGuard(provider, selection.event);
     if (selection.event === "UserPromptSubmit") {
       rawResult = await guard.submitUserPrompt(event);
     } else if (selection.event === "PreToolUse") {
       rawResult = await guard.evaluatePreTool(event);
-    } else {
+    } else if (selection.event === "PostToolUse") {
       rawResult = await guard.completePostTool(event);
+    } else {
+      rawResult = await guard.recordSessionEnd(event);
     }
   } catch {
     return failureResult(selection.event, "GUARD_UNAVAILABLE");
@@ -189,7 +198,9 @@ async function executeHookAdapter(
       ? codec.renderPrompt(parseSideResult(rawResult, "user_prompt_submit"))
       : selection.event === "PreToolUse"
         ? codec.renderPreTool(GuardDecisionSchema.parse(rawResult))
-        : codec.renderPostTool(parseSideResult(rawResult, "post_tool_use"));
+        : selection.event === "PostToolUse"
+          ? codec.renderPostTool(parseSideResult(rawResult, "post_tool_use"))
+          : codec.renderSessionEnd(rawResult);
     return { exitCode: 0, stdout: serializeNative(selection.event, rendered), stderr: "" };
   } catch {
     return failureResult(selection.event, "GUARD_PROTOCOL_MISMATCH");
@@ -204,7 +215,7 @@ export async function runHookAdapter(
   return executeHookAdapter(argv, raw, guard);
 }
 
-async function createProductionHookGuard(environment: NodeJS.ProcessEnv): Promise<GuardService> {
+async function createProductionHookGuard(environment: NodeJS.ProcessEnv): Promise<HookGuardPort> {
   const dependencies = createCliDependencies(environment);
   const catalog = dependencies.catalog as unknown as Catalog;
   const claims = dependencies.guardClaims as unknown as ClaimService;
@@ -238,7 +249,38 @@ async function createProductionHookGuard(environment: NodeJS.ProcessEnv): Promis
       return key.status === "ready" && requests.status === "ready";
     },
   });
-  return composition.service;
+  const guard = composition.service;
+  return Object.freeze({
+    submitUserPrompt: (event: unknown) => guard.submitUserPrompt(event),
+    evaluatePreTool: (event: unknown) => guard.evaluatePreTool(event),
+    completePostTool: (event: unknown) => guard.completePostTool(event),
+    recordSessionEnd: async () => {
+      throw new TypeError("SessionEnd requires the evidence-only production composition");
+    },
+  });
+}
+
+function sessionEndOnlyGuard(environment: NodeJS.ProcessEnv): HookGuardPort {
+  const recorder = createProductionSessionEndRecorder(environment);
+  const unavailable = async (): Promise<never> => {
+    throw new TypeError("Enforcement event reached the SessionEnd-only composition");
+  };
+  return Object.freeze({
+    submitUserPrompt: unavailable,
+    evaluatePreTool: unavailable,
+    completePostTool: unavailable,
+    recordSessionEnd: (event: unknown) => recorder.record(event),
+  });
+}
+
+export async function runProductionHookAdapter(
+  argv: readonly string[],
+  raw: string | Uint8Array,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<HookRunResult> {
+  return executeHookAdapter(argv, raw, async (event) => event === "SessionEnd"
+    ? sessionEndOnlyGuard(environment)
+    : createProductionHookGuard(environment));
 }
 
 async function writeResult(stream: Writable, content: string): Promise<void> {
@@ -264,11 +306,7 @@ async function main(): Promise<void> {
     process.exitCode = 0;
     return;
   }
-  const result = await executeHookAdapter(
-    argv,
-    raw,
-    () => createProductionHookGuard(process.env),
-  );
+  const result = await runProductionHookAdapter(argv, raw, process.env);
   await writeResult(process.stdout, result.stdout);
   process.exitCode = result.exitCode;
 }

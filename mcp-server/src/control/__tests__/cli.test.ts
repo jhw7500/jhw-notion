@@ -453,19 +453,24 @@ function guardRequest(state: GuardRequestLifecycle, sequence: number): GuardRequ
   return { ...consumed, finished_at: "2026-08-13T00:03:00.000Z" };
 }
 
-const task3HookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse"] as const;
+const task3HookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"] as const;
 const task3RuntimeEventNames = {
   UserPromptSubmit: "userPromptSubmit",
   PreToolUse: "preToolUse",
   PostToolUse: "postToolUse",
+  SessionEnd: "sessionEnd",
 } as const;
+
+function task3HookTimeout(event: typeof task3HookEvents[number]): number {
+  return event === "SessionEnd" ? 3 : 12;
+}
 
 function task3OwnedHookGroup(event: typeof task3HookEvents[number]) {
   return {
     hooks: [{
       type: "command",
       command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
-      timeout: 12,
+      timeout: task3HookTimeout(event),
     }],
   };
 }
@@ -545,7 +550,7 @@ async function task3CodexHome(
         hooks: [{
           type: "command",
           command: `/private/foreign-secret --event ${event}`,
-          timeout: 12,
+          timeout: task3HookTimeout(event),
         }],
       }]])),
   };
@@ -567,7 +572,7 @@ function task3RuntimeEntries(hooksPath: string): Task3CodexCommandHookMetadata[]
     async: false,
     command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
     matcher: null,
-    timeoutSec: 12,
+    timeoutSec: task3HookTimeout(event),
     source: "user",
     sourcePath: hooksPath,
     isManaged: false,
@@ -1186,6 +1191,7 @@ describe("runCli", () => {
     ["exact Claim mixed in", [...recoveryDiscoveryArgs(), "--expect", CLAIM_ID]],
     ["session mixed in", [...recoveryDiscoveryArgs(), "--session", "private-session"]],
     ["adapter mixed in", [...recoveryDiscoveryArgs(), "--origin-adapter", "codex"]],
+    ["worktree ref mixed in", [...recoveryDiscoveryArgs(), "--worktree-ref", activeClaim.worktree_ref]],
     ["takeover action", recoveryDiscoveryArgs().map((value) => value === "status" ? "takeover" : value)],
     ["force-end action", recoveryDiscoveryArgs().map((value) => value === "status" ? "force-end" : value)],
   ] as const)("rejects recovery discovery with %s before calling source or Task ports", async (_name, argv) => {
@@ -2322,6 +2328,7 @@ describe("runCli", () => {
     expect(requiresMutationLock(["task", "finish"])).toBe(true);
     expect(requiresMutationLock(["task", "recover", "--action", "takeover"])).toBe(true);
     expect(requiresMutationLock(["task", "recover", "--action", "cleanup"])).toBe(true);
+    expect(requiresMutationLock(["task", "recover", "--action", "repair-mapping"])).toBe(true);
     expect(requiresMutationLock(["project", "register"])).toBe(true);
     expect(requiresMutationLock(["project", "update"])).toBe(true);
     expect(requiresMutationLock(["preflight"])).toBe(true);
@@ -2715,6 +2722,97 @@ describe("runCli", () => {
     });
     expect(JSON.parse(result.stdout)).toMatchObject({ result: { kind: "cleanup", task_id: TASK_ID } });
     expect(mutationLock.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes exact orphan mapping repair through the mutation lock and journals its bounded outcome", async () => {
+    const repair = {
+      kind: "repair-mapping" as const,
+      claim_id: CLAIM_ID,
+      worktree_ref: activeClaim.worktree_ref,
+      lifecycle: "removed" as const,
+      changed: true,
+    };
+    const mutationLock = { run: vi.fn(async <T>(callback: () => Promise<T>) => callback()) };
+    const journal = { append: vi.fn().mockResolvedValue(undefined) };
+    const dependencies = makeCliDependencies({
+      mutationLock,
+      journal,
+      taskService: { recover: vi.fn().mockResolvedValue(repair) },
+    });
+
+    const result = await runCli([
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID,
+      "--action", "repair-mapping", "--worktree-ref", activeClaim.worktree_ref,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.taskService.recover).toHaveBeenCalledWith({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      action: { kind: "repair-mapping", worktree_ref: activeClaim.worktree_ref },
+    });
+    expect(JSON.parse(result.stdout)).toEqual({
+      command: "task recover",
+      result: {
+        kind: "repair-mapping",
+        task_id: TASK_ID,
+        claim_id: CLAIM_ID,
+        worktree_ref: activeClaim.worktree_ref,
+        lifecycle: "removed",
+        changed: true,
+      },
+    });
+    expect(mutationLock.run).toHaveBeenCalledTimes(1);
+    expect(journal.append).toHaveBeenCalledWith(expect.objectContaining({
+      command: "task recover",
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      worktree_ref: activeClaim.worktree_ref,
+      recovery_action: "repair-mapping",
+      mapping_changed: true,
+      ok: true,
+    }));
+    expect(result.stdout).not.toContain("/srv/");
+    expect(result.stdout).not.toContain(activeClaim.session_id);
+  });
+
+  it.each([
+    ["missing exact ref", ["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "repair-mapping"]],
+    ["invalid exact ref", ["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "repair-mapping", "--worktree-ref", "../unsafe"]],
+    ["session authority", ["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "repair-mapping", "--worktree-ref", activeClaim.worktree_ref, "--session", "stale"]],
+    ["origin authority", ["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "repair-mapping", "--worktree-ref", activeClaim.worktree_ref, "--origin-adapter", "codex"]],
+  ] as const)("rejects repair-mapping with %s", async (_label, argv) => {
+    const dependencies = makeCliDependencies();
+
+    const result = await runCli([...argv], dependencies);
+
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.taskService.recover).not.toHaveBeenCalled();
+  });
+
+  it("emits only a registered bounded repair refusal reason and worktree ref", async () => {
+    const result = await runCli([
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID,
+      "--action", "repair-mapping", "--worktree-ref", activeClaim.worktree_ref,
+    ], makeCliDependencies({
+      taskService: {
+        recover: vi.fn().mockRejectedValue(new ControlError(
+          "WORKTREE_MAPPING_REPAIR_UNSAFE",
+          "private /srv/path changed",
+          { reason: "repair_state_changed", worktree_ref: activeClaim.worktree_ref, private_path: "/srv/path" },
+        )),
+      },
+    }));
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: {
+        code: "WORKTREE_MAPPING_REPAIR_UNSAFE",
+        reason: "repair_state_changed",
+        worktree_ref: activeClaim.worktree_ref,
+      },
+    });
+    expect(result.stderr).not.toContain("/srv/path");
   });
 
   it.each(['"', "error", "a"])("keeps JSON valid for hostile ambient secret value %j", async (secret) => {

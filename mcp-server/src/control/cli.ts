@@ -791,11 +791,12 @@ function validatedPortResult<T>(schema: ZodType<T>, raw: unknown, code: string):
   return parsed.data;
 }
 
-const codexHookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse"] as const;
+const codexHookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"] as const;
 const codexRuntimeEventNames = {
   UserPromptSubmit: "userPromptSubmit",
   PreToolUse: "preToolUse",
   PostToolUse: "postToolUse",
+  SessionEnd: "sessionEnd",
 } as const;
 const maximumCodexHooksBytes = 128 * 1024;
 const maximumCodexRuntimeEntries = 256;
@@ -856,11 +857,16 @@ function expectedCodexHookCommand(eventName: typeof codexHookEvents[number]): st
   return `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${eventName}`;
 }
 
+function expectedCodexHookTimeout(eventName: typeof codexHookEvents[number]): number {
+  return eventName === "SessionEnd" ? 3 : 12;
+}
+
 function isExactCodexHookGroup(value: unknown, eventName: typeof codexHookEvents[number]): boolean {
   if (!exactObjectKeys(value, ["hooks"]) || !Array.isArray(value.hooks) || value.hooks.length !== 1) return false;
   const handler = value.hooks[0];
   return exactObjectKeys(handler, ["type", "command", "timeout"]) &&
-    handler.type === "command" && handler.command === expectedCodexHookCommand(eventName) && handler.timeout === 12;
+    handler.type === "command" && handler.command === expectedCodexHookCommand(eventName) &&
+    handler.timeout === expectedCodexHookTimeout(eventName);
 }
 
 async function readBoundedNoFollowRegularFile(file: string, maximumBytes: number): Promise<Buffer | undefined> {
@@ -932,7 +938,7 @@ function isExactTrustedCodexRuntimeEntry(
     entry.async === false &&
     entry.command === expectedCodexHookCommand(eventName) &&
     entry.matcher === null &&
-    entry.timeoutSec === 12 &&
+    entry.timeoutSec === expectedCodexHookTimeout(eventName) &&
     entry.source === "user" &&
     entry.sourcePath === join(home, ".codex", "hooks.json") &&
     entry.isManaged === false &&
@@ -982,6 +988,7 @@ async function inspectAdapterCoverage(
     adapterContractResults.codex.fixture_axes.prompt_origin &&
     adapterContractResults.codex.fixture_axes.pre_tool_block &&
     adapterContractResults.codex.fixture_axes.post_tool_correlation &&
+    adapterContractResults.codex.fixture_axes.session_end_evidence &&
     await inspectExactCodexInstallation(
       dependencies.env.HOME,
       dependencies.codexRepositoryRoot ?? codexRepositoryRoot(),
@@ -1444,6 +1451,25 @@ function ambiguousMappingDiagnostic(cause: unknown): z.infer<typeof AmbiguousMap
   return parsed.success ? parsed.data : undefined;
 }
 
+const RepairMappingDiagnosticSchema = z.object({
+  reason: z.enum([
+    "repair_checkout_present",
+    "repair_checkout_unsafe",
+    "repair_lifecycle_uncertain",
+    "repair_state_changed",
+  ]),
+  worktree_ref: GuardWorktreeRefSchema,
+});
+
+function repairMappingDiagnostic(cause: unknown): z.infer<typeof RepairMappingDiagnosticSchema> | undefined {
+  if (!(cause instanceof ControlError) || cause.code !== "WORKTREE_MAPPING_REPAIR_UNSAFE") return undefined;
+  const parsed = RepairMappingDiagnosticSchema.safeParse({
+    reason: cause.details.reason,
+    worktree_ref: cause.details.worktree_ref,
+  });
+  return parsed.success ? parsed.data : undefined;
+}
+
 function utf8Head(value: string, maximumBytes: number): string {
   let bytes = 0;
   let head = "";
@@ -1517,7 +1543,10 @@ function pilotJournalErrorFields(stderr: string): {
 export function controlErrorResult(cause: unknown, command?: CommandName, retainedTaskValue?: unknown): CliResult {
   const code = errorCode(cause);
   const ambiguity = ambiguousMappingDiagnostic(cause);
-  const reason = code === "WORKTREE_MAPPING_AMBIGUOUS" ? undefined : errorReason(cause);
+  const repair = repairMappingDiagnostic(cause);
+  const reason = code === "WORKTREE_MAPPING_AMBIGUOUS" || code === "WORKTREE_MAPPING_REPAIR_UNSAFE"
+    ? undefined
+    : errorReason(cause);
   const detail = commandFailureDetail(cause);
   const holder = lockHolder(cause);
   const conflict = conflictingClaim(cause);
@@ -1528,6 +1557,7 @@ export function controlErrorResult(cause: unknown, command?: CommandName, retain
     code,
     ...(reason ? { reason } : {}),
     ...ambiguity,
+    ...repair,
     ...(detail ? { detail } : {}),
     ...(holder ? { lock_holder: holder } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),
@@ -1538,17 +1568,34 @@ export function controlErrorResult(cause: unknown, command?: CommandName, retain
   return { exitCode: exitCode(cause, command), stdout: "", stderr: `${JSON.stringify({ error })}\n` };
 }
 
-function journalMetadata(command: CommandName, flags: ParsedFlags | undefined): {
+function journalMetadata(command: CommandName, flags: ParsedFlags | undefined, result: CliResult): {
   task_id?: string;
   claim_id?: string;
+  worktree_ref?: string;
+  recovery_action?: "repair-mapping";
+  mapping_changed?: boolean;
   active_work_minutes?: number;
 } {
   if (!flags) return {};
   const rawTask = value(flags, "--task");
   const rawClaim = value(flags, "--claim") ?? value(flags, "--expect");
+  const rawWorktreeRef = value(flags, "--worktree-ref");
+  let repairOutcome: { kind?: unknown; changed?: unknown } = {};
+  if (command === "task recover" && result.exitCode === 0) {
+    try {
+      repairOutcome = (JSON.parse(result.stdout) as { result?: typeof repairOutcome }).result ?? {};
+    } catch {
+      repairOutcome = {};
+    }
+  }
+  const repair = repairOutcome.kind === "repair-mapping" && typeof repairOutcome.changed === "boolean";
   return {
     ...(rawTask && TASK_ID.test(rawTask) ? { task_id: rawTask } : {}),
     ...(rawClaim && CLAIM_ID.test(rawClaim) ? { claim_id: rawClaim } : {}),
+    ...(rawWorktreeRef && GuardWorktreeRefSchema.safeParse(rawWorktreeRef).success
+      ? { worktree_ref: rawWorktreeRef }
+      : {}),
+    ...(repair ? { recovery_action: "repair-mapping" as const, mapping_changed: repairOutcome.changed as boolean } : {}),
     ...(command === "task finish" ? { active_work_minutes: assertPositiveNumber(value(flags, "--active-work-minutes")) } : {}),
   };
 }
@@ -2213,7 +2260,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   if (command === "task recover") {
     const flags = parseFlags(argv.slice(2), new Set([
       "--task", "--expect", "--action", "--session", "--origin-adapter",
-      "--resolve-from-checkout", "--repo-path", "--issue-url",
+      "--resolve-from-checkout", "--repo-path", "--issue-url", "--worktree-ref",
     ]));
     assertSafeFlags(flags, dependencies);
     const actionName = required(flags, "--action");
@@ -2231,7 +2278,8 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         flags.has("--task") ||
         flags.has("--expect") ||
         flags.has("--session") ||
-        flags.has("--origin-adapter")
+        flags.has("--origin-adapter") ||
+        flags.has("--worktree-ref")
       ) {
         usage("Recovery discovery requires only checkout, Issue, and status");
       }
@@ -2291,6 +2339,9 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
     const task_id = requireTaskId(flags);
     const claim_id = requireClaimId(flags, "--expect");
     let action: TaskRecoverInput["action"];
+    if (actionName !== "repair-mapping" && flags.has("--worktree-ref")) {
+      usage("Only repair-mapping accepts --worktree-ref");
+    }
     if (actionName === "status" || actionName === "force-end" || actionName === "cleanup") {
       // The documented session is advisory for non-takeover recovery.
       action = { kind: actionName };
@@ -2300,6 +2351,13 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         origin_adapter: requireOriginAdapter(flags),
         session_id: requireClaimCoordinate(flags, "--session"),
       };
+    } else if (actionName === "repair-mapping") {
+      if (flags.has("--session") || flags.has("--origin-adapter")) {
+        usage("Mapping repair accepts no session authority");
+      }
+      const parsedRef = GuardWorktreeRefSchema.safeParse(required(flags, "--worktree-ref"));
+      if (!parsedRef.success) usage("Invalid worktree ref");
+      action = { kind: "repair-mapping", worktree_ref: parsedRef.data };
     } else {
       usage("Invalid recovery action");
     }
@@ -2321,6 +2379,12 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
             task_id: recovered.active.task_id,
             claim_id: recovered.active.claim_id,
           },
+        } : {}),
+        ...(recovered.kind === "repair-mapping" ? {
+          claim_id: recovered.claim_id,
+          worktree_ref: recovered.worktree_ref,
+          lifecycle: recovered.lifecycle,
+          changed: recovered.changed,
         } : {}),
       }),
     };
@@ -2549,7 +2613,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
       });
       return result;
     }
-    const metadata = journalMetadata(command, flags);
+    const metadata = journalMetadata(command, flags, result);
     await (dependencies.journal ?? new PilotJournal(dependencies.stateDir)).append({
       command,
       started_at: started.toISOString(),
@@ -2590,7 +2654,7 @@ function mutationLockCommand(argv: readonly string[]): RegistryMutationCommand |
       case "promote": return "task promote";
       case "recover": {
         const index = argv.indexOf("--action");
-        return new Set(["force-end", "takeover", "cleanup"]).has(argv[index + 1] ?? "")
+        return new Set(["force-end", "takeover", "cleanup", "repair-mapping"]).has(argv[index + 1] ?? "")
           ? "task recover"
           : undefined;
       }

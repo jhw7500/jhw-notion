@@ -255,6 +255,8 @@ Temporary Task를 verified Issue로 승격하라는 요청에는 Task ID를 보�
 
 사용자가 종료를 명시적으로 요청한 경우에만 실행한다. 모든 status에는 `--validation`이 1개 이상 필요하고 `completed`에는 `--outcome`도 필요하다. launcher가 secure store 주입과 hidden preflight를 담당하므로 별도 preflight를 실행하거나 raw config·credential을 읽지 않는다.
 
+native `SessionEnd`는 종료 authority가 아니라 evidence-only advisory hook이다. exact active Claim과 cwd/worktree가 검증될 때만 bounded Git 좌표를 derived journal에 남기며 session ID, absolute path, transcript 내용은 저장하지 않는다. `task finish`, Claim release, force-end, takeover, mapping repair를 호출하거나 대신하지 않는다. crash/kill/timeout이면 event가 없을 수 있으므로 새 세션에서는 아래 recovery status부터 다시 확인한다.
+
 Formal standalone/parent를 completed로 끝내기 전에는 같은 active Claim에 completion evidence를 먼저 기록한다. 이 command는 Issue를 닫거나 Claim을 release하지 않는다.
 
 ```bash
@@ -439,6 +441,18 @@ stale을 추정하지 않는다. `force-end`/`takeover`는 결과를 보여준 �
 
 Takeover 성공 시 반환된 새 `claim_id`로 `task status`를 다시 확인한다. old ID를 재사용하지 않는다.
 
+takeover는 direct target mapping을 먼저 완전 검증한다. 명백히 무관한 missing mapping은 차단하지 않지만 같은 Task, lexical/physical path alias, 같은 repository+branch, invalid direct target, removed checkout 재등장은 fail-closed한다. status의 `process_exists: false`나 SessionEnd journal만으로 takeover를 승인하거나 실행하지 않는다.
+
+Claim은 release됐지만 exact host mapping만 남고 checkout은 사라졌다면, takeover와 별개의 **실행 직전 사용자 승인**을 받은 뒤 status/error가 반환한 세 좌표를 그대로 사용한다.
+
+```bash
+"$HOME/.local/bin/jhw-control-host" task recover \
+  --task <tsk-id> --expect <released-claim-id> \
+  --action repair-mapping --worktree-ref <exact-worktree-ref>
+```
+
+이 action은 host-global mutation lock에서 committed Task/Claim history와 mapping snapshot을 대조하고 exact checkout 부재를 증명한 뒤 CAS로 mapping을 durable `removed` tombstone으로 바꾼다. Claim lifecycle은 수정하지 않는다. 세 좌표를 path, session, Handoff, transcript에서 추측하지 않으며 Registry/worktree state를 직접 삭제·편집하지 않는다. `WORKTREE_MAPPING_REPAIR_UNSAFE`이면 reason을 보고 멈춘다. 성공의 `mapping_changed: false`는 이미 같은 tombstone이어서 재시도가 idempotent였다는 뜻이다.
+
 이미 release된 Claim generation의 pending cleanup은 exact history ID로만 실행한다.
 
 ```bash
@@ -487,6 +501,10 @@ jhw-control guard preflight
 - `WORKTREE_MAPPING_AMBIGUOUS` + `removed_checkout_present`: `worktree_ref`의 removed tombstone 경로에 checkout이 다시 생긴 상태다. 해당 ref의 실제 사용 여부를 확인하고 격리·정리한다.
 - `WORKTREE_MAPPING_AMBIGUOUS` + `mapping_target_invalid`: `worktree_ref`가 가리키는 path 또는 repository identity가 없거나 안전한 디렉터리가 아니다. 해당 mapping target을 복구한다.
 - `WORKTREE_MAPPING_AMBIGUOUS` + `mapping_duplicate`: `worktree_ref`가 takeover 대상과 Task·path·repository/branch 좌표를 중복한다. 표시된 중복 mapping을 해소한다.
+- `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_checkout_present`: 정확한 repair 대상 checkout이 아직 존재한다. 삭제나 강제 전환 없이 해당 checkout의 작업 상태를 먼저 확인한다.
+- `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_checkout_unsafe`: 정확한 repair 대상 경로가 symlink 등 안전하지 않은 형태다. 경로의 실제 형태를 확인하고 자동 repair를 중단한다.
+- `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_lifecycle_uncertain`: mapping이 create/remove 중간 상태다. 해당 lifecycle 복구 절차를 먼저 수행한다.
+- `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_state_changed`: 검사와 CAS 사이 mapping bytes가 바뀌었다. 새 상태를 다시 진단하고 이전 요청을 재사용하지 않는다.
 - `LOCK_CONTENDED` + `registry_state_lock`이면 같은 호스트의 Registry writer가 최대 30초 대기 뒤에도 실행 중인 것이다. optional `lock_holder`의 `command`, `acquired_at`, `elapsed_ms`, `pid_state`만 보고하며 `registry.lock`을 삭제하거나 holder를 자동 종료하지 않는다.
 - Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.

@@ -4,13 +4,14 @@ import type { GuardCommonEvent } from "../guard-protocol.js";
 import type { GuardSideEventResult } from "../guard-service.js";
 import type { GuardDecision } from "../schemas.js";
 
-type HookEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse";
+type HookEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SessionEnd";
 
 interface HookCodecContract {
   decode(event: HookEventName, raw: unknown): GuardCommonEvent;
   renderPrompt(result: GuardSideEventResult): unknown;
   renderPreTool(result: GuardDecision): unknown;
   renderPostTool(result: GuardSideEventResult): unknown;
+  renderSessionEnd(result: unknown): unknown;
   renderFailure(
     event: HookEventName,
     code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH",
@@ -52,6 +53,13 @@ const nativePayload = {
     tool_input: { command: "git push origin HEAD" },
     tool_use_id: "call-native-17",
   },
+  SessionEnd: {
+    session_id: "native-session-17",
+    transcript_path: "/srv/transcripts/native-17.jsonl",
+    cwd: "/srv/worktrees/native-17",
+    hook_event_name: "SessionEnd",
+    reason: "other",
+  },
 } as const;
 
 function nativePayloadFor(adapter: "claude" | "codex") {
@@ -78,6 +86,10 @@ function nativePayloadFor(adapter: "claude" | "codex") {
       transcript_path: null,
       turn_id: "codex-turn-17",
       tool_response: { success: true },
+    },
+    SessionEnd: {
+      ...nativePayload.SessionEnd,
+      transcript_path: null,
     },
   };
 }
@@ -123,6 +135,13 @@ describe("native hook input codecs", () => {
       session_id: "native-session-17",
       tool_use_id: "call-native-17",
       ok: true,
+    });
+    expect(codec.decode("SessionEnd", payload.SessionEnd)).toEqual({
+      protocol_version: 1,
+      adapter,
+      event: "session_end",
+      session_id: "native-session-17",
+      cwd: "/srv/worktrees/native-17",
     });
   });
 
@@ -171,6 +190,11 @@ describe("native hook input codecs", () => {
         nativePayloadFor(adapter).PostToolUse,
         ["session_id", "cwd", "tool_name", "tool_input", "tool_use_id"],
       ],
+      [
+        "SessionEnd",
+        nativePayloadFor(adapter).SessionEnd,
+        ["session_id", "cwd", "reason"],
+      ],
     ];
     for (const [event, fixture, fields] of cases) {
       for (const field of fields) {
@@ -196,6 +220,11 @@ describe("native hook input codecs", () => {
 });
 
 describe("native hook response renderers", () => {
+  it.each(adapters)("renders %s SessionEnd as an authority-neutral object", async (_adapter, key) => {
+    const codec = (await loadCodecs())[key];
+    expect(codec.renderSessionEnd({ status: "RECORDED" })).toEqual({});
+  });
+
   it.each(adapters)("renders the exact %s hard-deny object", async (_adapter, key) => {
     // Break caught: a hard deny becomes an allow, advisory-only message, or non-native response shape.
     const codec = (await loadCodecs())[key];

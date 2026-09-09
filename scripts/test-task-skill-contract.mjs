@@ -762,7 +762,7 @@ const hostOnlyLifecycleCounts = new Map([
   ["promote", 1],
   ["status", 1],
   ["handoff", 1],
-  ["recover", 5],
+  ["recover", 6],
   ["assert-owner", 1],
 ]);
 

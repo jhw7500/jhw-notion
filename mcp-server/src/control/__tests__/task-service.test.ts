@@ -152,6 +152,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     assertForceEndEligible: vi.fn().mockResolvedValue(undefined),
     assertTakeoverEligible: vi.fn().mockResolvedValue(undefined),
     rebindTakeover: vi.fn().mockResolvedValue({ changed: true }),
+    repairOrphanedMapping: vi.fn(),
     claimsMappedToCheckout: vi.fn().mockResolvedValue(new Set<string>()),
   };
   const registry = {
@@ -910,6 +911,114 @@ describe("TaskService", () => {
     expect(worktrees.cleanupReleased).toHaveBeenCalledTimes(1);
   });
 
+  it("repairs only an exact released mapping without invoking Claim mutation", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const alias = task.aliases[0];
+    const taskPlan = worktreePlan(task.id, alias);
+    const released = {
+      ...currentContextClaim(task.id, { task_alias: alias, branch: taskPlan.branch, worktree_ref: taskPlan.worktree_ref }),
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "abandoned" as const,
+      outcome: "host checkout already absent",
+      head_sha: "a".repeat(40),
+      validation_summary: "orphan confirmed",
+    };
+    claims.getClaimHistory.mockResolvedValue(released);
+    worktrees.repairOrphanedMapping.mockResolvedValue({
+      kind: "repair-mapping",
+      claim_id: released.claim_id,
+      worktree_ref: released.worktree_ref,
+      lifecycle: "removed",
+      changed: true,
+    });
+
+    await expect(tasks.recover({
+      task_id: task.id,
+      claim_id: released.claim_id,
+      action: { kind: "repair-mapping", worktree_ref: released.worktree_ref },
+    })).resolves.toMatchObject({ kind: "repair-mapping", changed: true });
+
+    expect(claims.getActive).toHaveBeenCalledWith(task.id);
+    expect(claims.getClaimHistory).toHaveBeenCalledWith(task.id, released.claim_id);
+    expect(worktrees.repairOrphanedMapping).toHaveBeenCalledWith({
+      task_id: task.id,
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      claim_id: released.claim_id,
+      branch: taskPlan.branch,
+      worktree_ref: taskPlan.worktree_ref,
+    });
+    expect(claims.recoverClaim).not.toHaveBeenCalled();
+    expect(claims.finishClaim).not.toHaveBeenCalled();
+  });
+
+  it("repairs a Registry-absent Claim only from an exact Task alias plan", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const taskPlan = worktreePlan(task.id, task.aliases[0]);
+    claims.getClaimHistory.mockRejectedValue(new ControlError("CLAIM_HISTORY_NOT_FOUND", "absent"));
+    worktrees.repairOrphanedMapping.mockResolvedValue({
+      kind: "repair-mapping",
+      claim_id: CLAIM_ID,
+      worktree_ref: taskPlan.worktree_ref,
+      lifecycle: "removed",
+      changed: false,
+    });
+
+    await expect(tasks.recover({
+      task_id: task.id,
+      claim_id: CLAIM_ID,
+      action: { kind: "repair-mapping", worktree_ref: taskPlan.worktree_ref },
+    })).resolves.toMatchObject({ kind: "repair-mapping", changed: false });
+
+    expect(worktrees.repairOrphanedMapping).toHaveBeenCalledWith(expect.objectContaining({
+      task_id: task.id,
+      branch: taskPlan.branch,
+      worktree_ref: taskPlan.worktree_ref,
+    }));
+    expect(claims.recoverClaim).not.toHaveBeenCalled();
+  });
+
+  it("refuses mapping repair when any active Claim exists for the Task", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const taskPlan = worktreePlan(task.id, task.aliases[0]);
+    claims.getActive.mockResolvedValue(currentContextClaim(task.id));
+
+    await expect(tasks.recover({
+      task_id: task.id,
+      claim_id: CLAIM_ID,
+      action: { kind: "repair-mapping", worktree_ref: taskPlan.worktree_ref },
+    })).rejects.toMatchObject({ code: "WORKTREE_ACTIVE_SUCCESSOR" });
+
+    expect(claims.getClaimHistory).not.toHaveBeenCalled();
+    expect(worktrees.repairOrphanedMapping).not.toHaveBeenCalled();
+    expect(claims.recoverClaim).not.toHaveBeenCalled();
+  });
+
+  it("refuses mapping repair when released Claim coordinates disagree with the committed Task", async () => {
+    const { tasks, claims, worktrees, registerCurrentContextTask } = await taskFixture();
+    const task = await registerCurrentContextTask();
+    const taskPlan = worktreePlan(task.id, task.aliases[0]);
+    claims.getClaimHistory.mockResolvedValue({
+      ...currentContextClaim(task.id, { repo_id: "repo-other" }),
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "force-ended",
+      head_sha: "a".repeat(40),
+      validation_summary: "stale",
+    });
+
+    await expect(tasks.recover({
+      task_id: task.id,
+      claim_id: CLAIM_ID,
+      action: { kind: "repair-mapping", worktree_ref: taskPlan.worktree_ref },
+    })).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+
+    expect(worktrees.repairOrphanedMapping).not.toHaveBeenCalled();
+    expect(claims.recoverClaim).not.toHaveBeenCalled();
+  });
+
   it("blocks a successor after Claim release crashes before local cleanup, then resumes exact cleanup", async () => {
     const fixture = await makeRegistryFixture();
     fixtures.push(fixture);
@@ -949,6 +1058,7 @@ describe("TaskService", () => {
       assertForceEndEligible: worktrees.assertForceEndEligible.bind(worktrees),
       assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
       rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
+      repairOrphanedMapping: worktrees.repairOrphanedMapping.bind(worktrees),
       cleanupReleased: worktrees.cleanupReleased.bind(worktrees),
       claimsMappedToCheckout: worktrees.claimsMappedToCheckout.bind(worktrees),
     };
@@ -1572,6 +1682,7 @@ describe("TaskService", () => {
       assertForceEndEligible: worktrees.assertForceEndEligible.bind(worktrees),
       assertTakeoverEligible: worktrees.assertTakeoverEligible.bind(worktrees),
       rebindTakeover: worktrees.rebindTakeover.bind(worktrees),
+      repairOrphanedMapping: worktrees.repairOrphanedMapping.bind(worktrees),
       cleanupReleased: worktrees.cleanupReleased.bind(worktrees),
       claimsMappedToCheckout: worktrees.claimsMappedToCheckout.bind(worktrees),
     };
@@ -1995,6 +2106,7 @@ describe("TaskService", () => {
       assertForceEndEligible: vi.fn(),
       assertTakeoverEligible: vi.fn(),
       rebindTakeover: vi.fn(),
+      repairOrphanedMapping: vi.fn(),
       cleanupReleased: vi.fn(),
       claimsMappedToCheckout: vi.fn(),
     };
