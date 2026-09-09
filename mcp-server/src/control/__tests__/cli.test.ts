@@ -1435,6 +1435,56 @@ describe("runCli", () => {
     });
   });
 
+  it("emits a safe offending worktree ref for a mapped-worktree ambiguity", () => {
+    const result = controlErrorResult(new ControlError(
+      "WORKTREE_MAPPING_AMBIGUOUS",
+      "private diagnostic",
+      {
+        reason: "mapping_duplicate",
+        worktree_ref: "wt-duplicate-takeover",
+        path: "/private/repository",
+      },
+    ));
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: {
+        code: "WORKTREE_MAPPING_AMBIGUOUS",
+        reason: "mapping_duplicate",
+        worktree_ref: "wt-duplicate-takeover",
+      },
+    });
+    expect(result.stderr).not.toContain("/private/repository");
+  });
+
+  it.each([
+    "/private/repository",
+    "wt-control\nforged",
+    "not-a-worktree-ref",
+  ])("does not emit an unsafe ambiguity worktree ref: %s", (worktree_ref) => {
+    const result = controlErrorResult(new ControlError(
+      "WORKTREE_MAPPING_AMBIGUOUS",
+      "private diagnostic",
+      { reason: "mapping_target_invalid", worktree_ref },
+    ));
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: {
+        code: "WORKTREE_MAPPING_AMBIGUOUS",
+        reason: "mapping_target_invalid",
+      },
+    });
+  });
+
+  it("does not emit a worktree ref for an unrelated error code", () => {
+    const result = controlErrorResult(new ControlError(
+      "WORKTREE_DIRTY",
+      "private diagnostic",
+      { worktree_ref: "wt-safe-but-unrelated" },
+    ));
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "WORKTREE_DIRTY" } });
+  });
+
   it.each([
     42,
     "worktree moved underneath",

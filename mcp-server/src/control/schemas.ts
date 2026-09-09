@@ -311,6 +311,10 @@ export const ERROR_REASONS = [
   "duplicate_dirty_files",
   // WORKTREE_DIRTY
   "handoff_copy_not_plain_file",
+  // WORKTREE_MAPPING_AMBIGUOUS — three operator-facing recovery classes.
+  "removed_checkout_present",
+  "mapping_target_invalid",
+  "mapping_duplicate",
   // BOARD_BUSY — which holder class blocks, so the caller can tell "wait or
   // share" apart from "the blocker has already overstayed its lease".
   "exclusive_holder",

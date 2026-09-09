@@ -823,6 +823,7 @@ describe("WorktreeManager", () => {
     await manager.createOrReuse(previous, repoDir);
     const statePath = join(fixture.root, "state", "worktrees.json");
     const state = JSON.parse(await readFile(statePath, "utf8"));
+    await mkdir(join(fixture.root, "worktrees", "wt-duplicate-takeover"));
     state.worktrees["wt-duplicate-takeover"] = {
       ...state.worktrees[previous.worktree_ref],
       path: join(fixture.root, "worktrees", "wt-duplicate-takeover"),
@@ -834,6 +835,10 @@ describe("WorktreeManager", () => {
 
     await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({
       code: "WORKTREE_MAPPING_AMBIGUOUS",
+      details: {
+        reason: "mapping_duplicate",
+        worktree_ref: "wt-duplicate-takeover",
+      },
     });
     expect(await readFile(statePath, "utf8")).toBe(before);
   });
@@ -881,8 +886,15 @@ describe("WorktreeManager", () => {
     await chmod(statePath, 0o600);
     const { history, successor } = takeover(previous);
 
-    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
-    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject({ code: "WORKTREE_MAPPING_AMBIGUOUS" });
+    const expected = {
+      code: "WORKTREE_MAPPING_AMBIGUOUS",
+      details: {
+        reason: "mapping_target_invalid",
+        worktree_ref: "wt-physical-alias",
+      },
+    };
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject(expected);
+    await expect(manager.rebindTakeover(history, successor)).rejects.toMatchObject(expected);
   });
 
   it("refuses an unrelated active mapping whose physical path escapes through an outward symlink", async () => {
@@ -1053,6 +1065,36 @@ describe("WorktreeManager", () => {
 
     await expect(manager.assertTakeoverEligible(previous)).resolves.toBeUndefined();
     await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: true });
+  });
+
+  it("identifies the removed tombstone whose checkout has reappeared", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    const staleRef = "wt-removed-present";
+    const stalePath = join(fixture.root, "worktrees", staleRef);
+    await mkdir(stalePath);
+    state.worktrees[staleRef] = {
+      ...state.worktrees[previous.worktree_ref],
+      task_id: "tsk-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+      session_id: "codex-removed",
+      branch: "task/removed",
+      path: stalePath,
+      lifecycle: "removed",
+    };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+
+    await expect(manager.assertTakeoverEligible(previous)).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_AMBIGUOUS",
+      details: {
+        reason: "removed_checkout_present",
+        worktree_ref: staleRef,
+      },
+    });
   });
 
   it("refuses malformed base identity before laundering it through takeover", async () => {

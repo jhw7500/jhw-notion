@@ -24,7 +24,7 @@ import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
 import { ControlContractAuthority } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
-import { GuardAdapterSchema, type GuardAdapter } from "./guard-protocol.js";
+import { GuardAdapterSchema, GuardWorktreeRefSchema, type GuardAdapter } from "./guard-protocol.js";
 import { adapterContractResults, NativeHookOutputSchema, renderStaticHookFailure } from "./hook-codecs.js";
 import {
   createProductionGuardRequestStore,
@@ -1426,6 +1426,12 @@ function errorReason(cause: unknown): string | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
+function ambiguousWorktreeRef(cause: unknown): string | undefined {
+  if (!(cause instanceof ControlError) || cause.code !== "WORKTREE_MAPPING_AMBIGUOUS") return undefined;
+  const parsed = GuardWorktreeRefSchema.safeParse(cause.details.worktree_ref);
+  return parsed.success ? parsed.data : undefined;
+}
+
 function utf8Head(value: string, maximumBytes: number): string {
   let bytes = 0;
   let head = "";
@@ -1499,6 +1505,7 @@ function pilotJournalErrorFields(stderr: string): {
 export function controlErrorResult(cause: unknown, command?: CommandName, retainedTaskValue?: unknown): CliResult {
   const code = errorCode(cause);
   const reason = errorReason(cause);
+  const worktreeRef = ambiguousWorktreeRef(cause);
   const detail = commandFailureDetail(cause);
   const holder = lockHolder(cause);
   const conflict = conflictingClaim(cause);
@@ -1508,6 +1515,7 @@ export function controlErrorResult(cause: unknown, command?: CommandName, retain
   const error = {
     code,
     ...(reason ? { reason } : {}),
+    ...(worktreeRef ? { worktree_ref: worktreeRef } : {}),
     ...(detail ? { detail } : {}),
     ...(holder ? { lock_holder: holder } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),

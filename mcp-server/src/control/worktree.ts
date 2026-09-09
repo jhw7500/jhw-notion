@@ -1004,20 +1004,24 @@ export class WorktreeManager {
         worktree_ref: claim.worktree_ref,
       });
     }
-    const directPhysicalPath = await this.physicalMappingPath(direct, root);
-    const directRepositoryIdentity = await this.physicalRepositoryIdentity(direct.repository_identity);
+    const directPhysicalPath = await this.physicalMappingPath(direct, root, claim.worktree_ref);
+    const directRepositoryIdentity = await this.physicalRepositoryIdentity(
+      direct.repository_identity,
+      claim.worktree_ref,
+    );
     for (const [ref, mapping] of Object.entries(state.worktrees)) {
       if (ref === claim.worktree_ref) continue;
       if (mapping.lifecycle === "removed") {
         if (await this.mappedWorktreeExists(mapping.path, root)) {
           throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Removed worktree tombstone still has a checkout", {
+            reason: "removed_checkout_present",
             worktree_ref: ref,
           });
         }
         continue;
       }
-      const physicalPath = await this.physicalMappingPath(mapping, root);
-      const repositoryIdentity = await this.physicalRepositoryIdentity(mapping.repository_identity);
+      const physicalPath = await this.physicalMappingPath(mapping, root, ref);
+      const repositoryIdentity = await this.physicalRepositoryIdentity(mapping.repository_identity, ref);
       if (
         mapping.task_id === claim.task_id ||
         resolve(mapping.path) === resolve(direct.path) ||
@@ -1025,45 +1029,64 @@ export class WorktreeManager {
         (repositoryIdentity === directRepositoryIdentity && mapping.branch === direct.branch)
       ) {
         throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover worktree mapping is duplicated or aliased", {
-          worktree_ref: claim.worktree_ref,
+          reason: "mapping_duplicate",
+          worktree_ref: ref,
         });
       }
     }
     return direct;
   }
 
-  private async physicalRepositoryIdentity(identity: string): Promise<string> {
+  private async physicalRepositoryIdentity(identity: string, worktreeRef: string): Promise<string> {
     try {
       const entry = await lstat(identity);
       if (entry.isSymbolicLink() || !entry.isDirectory()) {
-        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover repository identity is not a regular directory");
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover repository identity is not a regular directory", {
+          reason: "mapping_target_invalid",
+          worktree_ref: worktreeRef,
+        });
       }
       return await realpath(identity);
     } catch (cause) {
       if (cause instanceof ControlError) throw cause;
-      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover repository identity could not be resolved");
+      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover repository identity could not be resolved", {
+        reason: "mapping_target_invalid",
+        worktree_ref: worktreeRef,
+      });
     }
   }
 
-  private async physicalMappingPath(mapping: WorktreeMapping, root: string): Promise<string> {
+  private async physicalMappingPath(mapping: WorktreeMapping, root: string, worktreeRef: string): Promise<string> {
     const { path } = mapping;
     if (!isAbsolute(path) || !isWithin(root, path)) {
-      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping contains an unsafe aliased path");
+      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping contains an unsafe aliased path", {
+        reason: "mapping_target_invalid",
+        worktree_ref: worktreeRef,
+      });
     }
     try {
       const entry = await lstat(path);
       if (entry.isSymbolicLink() || !entry.isDirectory()) {
-        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping path is not a regular directory");
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping path is not a regular directory", {
+          reason: "mapping_target_invalid",
+          worktree_ref: worktreeRef,
+        });
       }
       const physical = await realpath(path);
       if (!isWithin(root, physical)) {
-        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping resolves outside the configured root");
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping resolves outside the configured root", {
+          reason: "mapping_target_invalid",
+          worktree_ref: worktreeRef,
+        });
       }
       return physical;
     } catch (cause) {
       if (cause instanceof ControlError) throw cause;
       if (isNotFound(cause) && mapping.lifecycle !== "active") return resolve(path);
-      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping physical path could not be resolved");
+      throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Takeover mapping physical path could not be resolved", {
+        reason: "mapping_target_invalid",
+        worktree_ref: worktreeRef,
+      });
     }
   }
 
