@@ -1457,22 +1457,20 @@ describe("runCli", () => {
   });
 
   it.each([
-    "/private/repository",
-    "wt-control\nforged",
-    "not-a-worktree-ref",
-  ])("does not emit an unsafe ambiguity worktree ref: %s", (worktree_ref) => {
+    ["missing reason", { worktree_ref: "wt-missing-reason" }],
+    ["foreign registered reason", { reason: "git_identity_changed", worktree_ref: "wt-foreign-reason" }],
+    ["missing worktree ref", { reason: "mapping_duplicate" }],
+    ["absolute worktree ref", { reason: "mapping_target_invalid", worktree_ref: "/private/repository" }],
+    ["control character in worktree ref", { reason: "mapping_target_invalid", worktree_ref: "wt-control\nforged" }],
+    ["wrong worktree ref prefix", { reason: "mapping_target_invalid", worktree_ref: "not-a-worktree-ref" }],
+  ])("omits the whole ambiguity diagnostic for an invalid pair: %s", (_label, details) => {
     const result = controlErrorResult(new ControlError(
       "WORKTREE_MAPPING_AMBIGUOUS",
       "private diagnostic",
-      { reason: "mapping_target_invalid", worktree_ref },
+      details,
     ));
 
-    expect(JSON.parse(result.stderr)).toEqual({
-      error: {
-        code: "WORKTREE_MAPPING_AMBIGUOUS",
-        reason: "mapping_target_invalid",
-      },
-    });
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "WORKTREE_MAPPING_AMBIGUOUS" } });
   });
 
   it("does not emit a worktree ref for an unrelated error code", () => {

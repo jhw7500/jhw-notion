@@ -1426,9 +1426,21 @@ function errorReason(cause: unknown): string | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
-function ambiguousWorktreeRef(cause: unknown): string | undefined {
+const AmbiguousMappingDiagnosticSchema = z.object({
+  reason: z.enum([
+    "removed_checkout_present",
+    "mapping_target_invalid",
+    "mapping_duplicate",
+  ]),
+  worktree_ref: GuardWorktreeRefSchema,
+});
+
+function ambiguousMappingDiagnostic(cause: unknown): z.infer<typeof AmbiguousMappingDiagnosticSchema> | undefined {
   if (!(cause instanceof ControlError) || cause.code !== "WORKTREE_MAPPING_AMBIGUOUS") return undefined;
-  const parsed = GuardWorktreeRefSchema.safeParse(cause.details.worktree_ref);
+  const parsed = AmbiguousMappingDiagnosticSchema.safeParse({
+    reason: cause.details.reason,
+    worktree_ref: cause.details.worktree_ref,
+  });
   return parsed.success ? parsed.data : undefined;
 }
 
@@ -1504,8 +1516,8 @@ function pilotJournalErrorFields(stderr: string): {
 
 export function controlErrorResult(cause: unknown, command?: CommandName, retainedTaskValue?: unknown): CliResult {
   const code = errorCode(cause);
-  const reason = errorReason(cause);
-  const worktreeRef = ambiguousWorktreeRef(cause);
+  const ambiguity = ambiguousMappingDiagnostic(cause);
+  const reason = code === "WORKTREE_MAPPING_AMBIGUOUS" ? undefined : errorReason(cause);
   const detail = commandFailureDetail(cause);
   const holder = lockHolder(cause);
   const conflict = conflictingClaim(cause);
@@ -1515,7 +1527,7 @@ export function controlErrorResult(cause: unknown, command?: CommandName, retain
   const error = {
     code,
     ...(reason ? { reason } : {}),
-    ...(worktreeRef ? { worktree_ref: worktreeRef } : {}),
+    ...ambiguity,
     ...(detail ? { detail } : {}),
     ...(holder ? { lock_holder: holder } : {}),
     ...(conflict ? { conflicting_claim: conflict } : {}),
