@@ -1435,6 +1435,54 @@ describe("runCli", () => {
     });
   });
 
+  it("emits a safe offending worktree ref for a mapped-worktree ambiguity", () => {
+    const result = controlErrorResult(new ControlError(
+      "WORKTREE_MAPPING_AMBIGUOUS",
+      "private diagnostic",
+      {
+        reason: "mapping_duplicate",
+        worktree_ref: "wt-duplicate-takeover",
+        path: "/private/repository",
+      },
+    ));
+
+    expect(JSON.parse(result.stderr)).toEqual({
+      error: {
+        code: "WORKTREE_MAPPING_AMBIGUOUS",
+        reason: "mapping_duplicate",
+        worktree_ref: "wt-duplicate-takeover",
+      },
+    });
+    expect(result.stderr).not.toContain("/private/repository");
+  });
+
+  it.each([
+    ["missing reason", { worktree_ref: "wt-missing-reason" }],
+    ["foreign registered reason", { reason: "git_identity_changed", worktree_ref: "wt-foreign-reason" }],
+    ["missing worktree ref", { reason: "mapping_duplicate" }],
+    ["absolute worktree ref", { reason: "mapping_target_invalid", worktree_ref: "/private/repository" }],
+    ["control character in worktree ref", { reason: "mapping_target_invalid", worktree_ref: "wt-control\nforged" }],
+    ["wrong worktree ref prefix", { reason: "mapping_target_invalid", worktree_ref: "not-a-worktree-ref" }],
+  ])("omits the whole ambiguity diagnostic for an invalid pair: %s", (_label, details) => {
+    const result = controlErrorResult(new ControlError(
+      "WORKTREE_MAPPING_AMBIGUOUS",
+      "private diagnostic",
+      details,
+    ));
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "WORKTREE_MAPPING_AMBIGUOUS" } });
+  });
+
+  it("does not emit a worktree ref for an unrelated error code", () => {
+    const result = controlErrorResult(new ControlError(
+      "WORKTREE_DIRTY",
+      "private diagnostic",
+      { worktree_ref: "wt-safe-but-unrelated" },
+    ));
+
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "WORKTREE_DIRTY" } });
+  });
+
   it.each([
     42,
     "worktree moved underneath",
