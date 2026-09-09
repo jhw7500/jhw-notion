@@ -255,6 +255,8 @@ Temporary Task를 verified Issue로 승격하라는 요청에는 Task ID를 보�
 
 사용자가 종료를 명시적으로 요청한 경우에만 실행한다. 모든 status에는 `--validation`이 1개 이상 필요하고 `completed`에는 `--outcome`도 필요하다. launcher가 secure store 주입과 hidden preflight를 담당하므로 별도 preflight를 실행하거나 raw config·credential을 읽지 않는다.
 
+native `SessionEnd`는 종료 authority가 아니라 evidence-only advisory hook이다. exact active Claim과 cwd/worktree가 검증될 때만 bounded Git 좌표를 derived journal에 남기며 session ID, absolute path, transcript 내용은 저장하지 않는다. `task finish`, Claim release, force-end, takeover, mapping repair를 호출하거나 대신하지 않는다. crash/kill/timeout이면 event가 없을 수 있으므로 새 세션에서는 아래 recovery status부터 다시 확인한다.
+
 Formal standalone/parent를 completed로 끝내기 전에는 같은 active Claim에 completion evidence를 먼저 기록한다. 이 command는 Issue를 닫거나 Claim을 release하지 않는다.
 
 ```bash
@@ -438,6 +440,18 @@ stale을 추정하지 않는다. `force-end`/`takeover`는 결과를 보여준 �
 ```
 
 Takeover 성공 시 반환된 새 `claim_id`로 `task status`를 다시 확인한다. old ID를 재사용하지 않는다.
+
+takeover는 direct target mapping을 먼저 완전 검증한다. 명백히 무관한 missing mapping은 차단하지 않지만 같은 Task, lexical/physical path alias, 같은 repository+branch, invalid direct target, removed checkout 재등장은 fail-closed한다. status의 `process_exists: false`나 SessionEnd journal만으로 takeover를 승인하거나 실행하지 않는다.
+
+Claim은 release됐지만 exact host mapping만 남고 checkout은 사라졌다면, takeover와 별개의 **실행 직전 사용자 승인**을 받은 뒤 status/error가 반환한 세 좌표를 그대로 사용한다.
+
+```bash
+"$HOME/.local/bin/jhw-control-host" task recover \
+  --task <tsk-id> --expect <released-claim-id> \
+  --action repair-mapping --worktree-ref <exact-worktree-ref>
+```
+
+이 action은 host-global mutation lock에서 committed Task/Claim history와 mapping snapshot을 대조하고 exact checkout 부재를 증명한 뒤 CAS로 mapping을 durable `removed` tombstone으로 바꾼다. Claim lifecycle은 수정하지 않는다. 세 좌표를 path, session, Handoff, transcript에서 추측하지 않으며 Registry/worktree state를 직접 삭제·편집하지 않는다. `WORKTREE_MAPPING_REPAIR_UNSAFE`이면 reason을 보고 멈춘다. 성공의 `mapping_changed: false`는 이미 같은 tombstone이어서 재시도가 idempotent였다는 뜻이다.
 
 이미 release된 Claim generation의 pending cleanup은 exact history ID로만 실행한다.
 

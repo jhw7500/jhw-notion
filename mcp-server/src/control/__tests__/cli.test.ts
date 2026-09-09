@@ -1191,6 +1191,7 @@ describe("runCli", () => {
     ["exact Claim mixed in", [...recoveryDiscoveryArgs(), "--expect", CLAIM_ID]],
     ["session mixed in", [...recoveryDiscoveryArgs(), "--session", "private-session"]],
     ["adapter mixed in", [...recoveryDiscoveryArgs(), "--origin-adapter", "codex"]],
+    ["worktree ref mixed in", [...recoveryDiscoveryArgs(), "--worktree-ref", activeClaim.worktree_ref]],
     ["takeover action", recoveryDiscoveryArgs().map((value) => value === "status" ? "takeover" : value)],
     ["force-end action", recoveryDiscoveryArgs().map((value) => value === "status" ? "force-end" : value)],
   ] as const)("rejects recovery discovery with %s before calling source or Task ports", async (_name, argv) => {

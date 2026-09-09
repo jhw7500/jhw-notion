@@ -2278,7 +2278,8 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
         flags.has("--task") ||
         flags.has("--expect") ||
         flags.has("--session") ||
-        flags.has("--origin-adapter")
+        flags.has("--origin-adapter") ||
+        flags.has("--worktree-ref")
       ) {
         usage("Recovery discovery requires only checkout, Issue, and status");
       }

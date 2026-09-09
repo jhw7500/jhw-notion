@@ -85,9 +85,9 @@
 - Modify: `skills/claude/task.md`
 - Modify: generated Codex skill artifacts via `scripts/sync-codex-skills.mjs`
 
-- [ ] Document explicit takeover approval, exact repair syntax/refusals, tombstone semantics, and evidence-only SessionEnd behavior.
-- [ ] Run `node scripts/sync-codex-skills.mjs` and `node scripts/sync-codex-skills.mjs --check`.
-- [ ] Run focused concurrency/failure tests, then `npm run build`, `npm run typecheck`, and `npm test` in `mcp-server/`.
-- [ ] Run installer uninstall/reinstall validation without overwriting unrelated user configuration.
+- [x] Document explicit takeover approval, exact repair syntax/refusals, tombstone semantics, and evidence-only SessionEnd behavior.
+- [x] Run `node scripts/sync-codex-skills.mjs` and `node scripts/sync-codex-skills.mjs --check`.
+- [x] Run focused concurrency/failure tests, then `npm run build`, `npm run typecheck`, and `npm test` in `mcp-server/`.
+- [x] Run installer uninstall/reinstall validation without overwriting unrelated user configuration.
 - [ ] Review the final diff for absolute paths, session IDs, unregistered reasons, placeholder text, and accidental Claim mutation from SessionEnd/repair.
 - [ ] Run the required pre-PR tribunal with independently secured reviewer reports, finalize only after owner/type/mode verification, then create/merge the PR and deploy from the authoritative runtime checkout.

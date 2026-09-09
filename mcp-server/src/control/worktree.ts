@@ -104,6 +104,12 @@ export interface WorktreeMappingRepairResult {
   changed: boolean;
 }
 
+type WorktreeMappingRepairUnsafeReason =
+  | "repair_checkout_present"
+  | "repair_checkout_unsafe"
+  | "repair_lifecycle_uncertain"
+  | "repair_state_changed";
+
 /** A non-destructive view used by a future CLI to guide pending recovery. */
 export interface WorktreeRecoveryStatus {
   worktree_ref: string;
@@ -1118,7 +1124,7 @@ export class WorktreeManager {
     }
   }
 
-  private repairUnsafe(reason: string, worktreeRef: string): ControlError {
+  private repairUnsafe(reason: WorktreeMappingRepairUnsafeReason, worktreeRef: string): ControlError {
     return new ControlError("WORKTREE_MAPPING_REPAIR_UNSAFE", "Mapping repair cannot prove an orphan", {
       reason,
       worktree_ref: worktreeRef,

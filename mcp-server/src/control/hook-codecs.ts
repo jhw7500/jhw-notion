@@ -99,7 +99,7 @@ const ClaudeSessionEndSchema = z.object({
   reason: coordinate(64),
 }).strict();
 
-// Codex CLI 0.149.1 generated command-hook schemas require the metadata
+// Codex CLI 0.153.4 generated command-hook schemas require the metadata
 // below. The Guard keeps its narrower object-only tool input authority while
 // requiring each pinned native coordinate and rejecting every unknown field.
 const CodexUserPromptSubmitSchema = z.object({
