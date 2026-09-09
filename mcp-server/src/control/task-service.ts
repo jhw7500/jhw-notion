@@ -42,6 +42,8 @@ import {
   type RetainedWorktreeGeneration,
   type WorktreeCreateResult,
   type WorktreeInspection,
+  type WorktreeMappingRepairInput,
+  type WorktreeMappingRepairResult,
   type WorktreeRemovalResult,
 } from "./worktree.js";
 
@@ -75,6 +77,7 @@ export interface WorktreeManagerPort {
   assertForceEndEligible(previous: ActiveClaim): Promise<void>;
   assertTakeoverEligible(previous: ActiveClaim): Promise<void>;
   rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<{ changed: boolean }>;
+  repairOrphanedMapping(input: WorktreeMappingRepairInput): Promise<WorktreeMappingRepairResult>;
   cleanupReleased(history: ClaimHistory): Promise<WorktreeRemovalResult>;
   claimsMappedToCheckout(
     claims: readonly ActiveClaim[],
@@ -213,7 +216,7 @@ export type TaskRecoveryDiscovery =
 export interface TaskRecoverInput {
   task_id: string;
   claim_id: string;
-  action: RecoveryAction | { kind: "cleanup" };
+  action: RecoveryAction | { kind: "cleanup" } | { kind: "repair-mapping"; worktree_ref: string };
 }
 
 export interface TaskCleanupRecoveryResult {
@@ -222,7 +225,7 @@ export interface TaskCleanupRecoveryResult {
   worktree: WorktreeRemovalResult;
 }
 
-export type TaskRecoveryResult = RecoveryResult | TaskCleanupRecoveryResult;
+export type TaskRecoveryResult = RecoveryResult | TaskCleanupRecoveryResult | WorktreeMappingRepairResult;
 
 export interface TaskServiceHooks {
   afterClaim?: (claim: ActiveClaim) => void | Promise<void>;
@@ -872,6 +875,74 @@ export class TaskService {
 
   async recover(input: TaskRecoverInput): Promise<TaskRecoveryResult> {
     this.sensitiveData.assertSafe(input);
+    if (input.action.kind === "repair-mapping") {
+      const repairRef = input.action.worktree_ref;
+      const task = await this.records.readJson(
+        taskRelativePath(input.task_id),
+        TaskRecordSchema,
+        { field: "id", value: input.task_id },
+      );
+      const active = await this.claims.getActive(input.task_id);
+      if (active) {
+        throw new ControlError(
+          "WORKTREE_ACTIVE_SUCCESSOR",
+          "Refusing mapping repair while the Task has an active Claim generation",
+          { task_id: input.task_id, active_claim_id: active.claim_id },
+        );
+      }
+
+      let history: ClaimHistory | undefined;
+      try {
+        history = await this.claims.getClaimHistory(input.task_id, input.claim_id);
+      } catch (cause) {
+        if (!(cause instanceof ControlError && cause.code === "CLAIM_HISTORY_NOT_FOUND")) throw cause;
+      }
+
+      let branch: string | undefined;
+      if (history) {
+        if (
+          history.task_id !== task.id ||
+          history.claim_id !== input.claim_id ||
+          history.project_id !== task.project_id ||
+          history.repo_id !== task.repo_id ||
+          history.host !== this.config.buildHost ||
+          !history.task_alias ||
+          !task.aliases.includes(history.task_alias)
+        ) {
+          throw new ControlError("REGISTRY_CORRUPT", "Released Claim and Task repair coordinates disagree");
+        }
+        const plan = worktreePlan(task.id, history.task_alias);
+        if (history.branch !== plan.branch || history.worktree_ref !== plan.worktree_ref) {
+          throw new ControlError("REGISTRY_CORRUPT", "Released Claim contains a noncanonical worktree plan");
+        }
+        if (repairRef !== plan.worktree_ref) {
+          throw new ControlError("WORKTREE_PLAN_MISMATCH", "Repair ref does not match released Claim history", {
+            worktree_ref: repairRef,
+          });
+        }
+        branch = plan.branch;
+      } else {
+        const branches = new Set(task.aliases
+          .map((alias) => worktreePlan(task.id, alias))
+          .filter((plan) => plan.worktree_ref === repairRef)
+          .map((plan) => plan.branch));
+        if (branches.size !== 1) {
+          throw new ControlError("WORKTREE_PLAN_MISMATCH", "Repair ref does not match a committed Task alias", {
+            worktree_ref: repairRef,
+          });
+        }
+        [branch] = branches;
+      }
+      if (!branch) throw new ControlError("WORKTREE_PLAN_MISMATCH", "Repair branch is unavailable");
+      return this.worktrees.repairOrphanedMapping({
+        task_id: task.id,
+        project_id: task.project_id,
+        repo_id: task.repo_id,
+        claim_id: input.claim_id,
+        branch,
+        worktree_ref: repairRef,
+      });
+    }
     if (input.action.kind === "cleanup") {
       const history = await this.claims.getClaimHistory(input.task_id, input.claim_id);
       const active = await this.claims.getActive(input.task_id);

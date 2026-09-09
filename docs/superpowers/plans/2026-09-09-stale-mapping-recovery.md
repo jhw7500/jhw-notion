@@ -47,13 +47,13 @@
 - Modify: `mcp-server/src/control/schemas.ts`
 - Modify: `skills/claude/task.md`
 
-- [ ] Add failing manager tests for exact coordinate matching, absent checkout, idempotent tombstones, changed-state CAS, and byte-preserving refusals for live/symlink/alias/mismatch/pending cases.
-- [ ] Add failing service tests proving committed Task coordinates and Registry Claim absence/release are authoritative, and that repair never calls Claim mutation APIs.
-- [ ] Add failing CLI tests for `task recover --action repair-mapping --task <task> --expect <claim> --worktree-ref <ref>`, bounded output, required mutation lock, and safe journal metadata.
-- [ ] Implement the manager CAS tombstone transition and service orchestration with stable error codes/reasons.
-- [ ] Implement strict CLI parsing/output and include `repair-mapping` in the mutation-lock classifier.
-- [ ] Add an end-to-end orphan repair/retry case and re-run all focused tests.
-- [ ] Synchronize generated Codex skills and commit the slice.
+- [x] Add failing manager tests for exact coordinate matching, absent checkout, idempotent tombstones, changed-state CAS, and byte-preserving refusals for live/symlink/alias/mismatch/pending cases.
+- [x] Add failing service tests proving committed Task coordinates and Registry Claim absence/release are authoritative, and that repair never calls Claim mutation APIs.
+- [x] Add failing CLI tests for `task recover --action repair-mapping --task <task> --expect <claim> --worktree-ref <ref>`, bounded output, required mutation lock, and safe journal metadata.
+- [x] Implement the manager CAS tombstone transition and service orchestration with stable error codes/reasons.
+- [x] Implement strict CLI parsing/output and include `repair-mapping` in the mutation-lock classifier.
+- [x] Add an end-to-end orphan repair/retry case and re-run all focused tests.
+- [x] Synchronize generated Codex skills and commit the slice.
 
 ### Task 3: Record advisory SessionEnd evidence without authority
 

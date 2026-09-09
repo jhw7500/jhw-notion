@@ -19,6 +19,9 @@ export interface JournalEvent {
   command: string;
   task_id?: string;
   claim_id?: string;
+  worktree_ref?: string;
+  recovery_action?: "repair-mapping";
+  mapping_changed?: boolean;
   started_at: string;
   finished_at: string;
   elapsed_ms: number;

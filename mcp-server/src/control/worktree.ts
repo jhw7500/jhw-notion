@@ -87,6 +87,23 @@ export interface WorktreeRemovalResult {
   lifecycle: "removed";
 }
 
+export interface WorktreeMappingRepairInput {
+  task_id: string;
+  project_id: string;
+  repo_id: string;
+  claim_id: string;
+  branch: string;
+  worktree_ref: string;
+}
+
+export interface WorktreeMappingRepairResult {
+  kind: "repair-mapping";
+  claim_id: string;
+  worktree_ref: string;
+  lifecycle: "removed";
+  changed: boolean;
+}
+
 /** A non-destructive view used by a future CLI to guide pending recovery. */
 export interface WorktreeRecoveryStatus {
   worktree_ref: string;
@@ -119,6 +136,7 @@ export interface WorktreeStateHooks {
   syncPublishedFile?: (file: FileHandle) => void | Promise<void>;
   syncStateDirectory?: (directory: SecureStateDirectory) => void | Promise<void>;
   afterSave?: () => void | Promise<void>;
+  beforeRepairCompareAndSwap?: () => void | Promise<void>;
 }
 
 type WorktreeClaim = Pick<
@@ -641,6 +659,85 @@ export class WorktreeManager {
     return { changed: true };
   }
 
+  /**
+   * Converts one exact, Registry-proven orphan mapping into a durable removed
+   * tombstone. Registry authority is checked by TaskService before this host-
+   * local method is entered; this method intentionally has no Claim port.
+   */
+  async repairOrphanedMapping(input: WorktreeMappingRepairInput): Promise<WorktreeMappingRepairResult> {
+    if (
+      !canonicalTaskId.test(input.task_id) ||
+      !canonicalProjectId.test(input.project_id) ||
+      !canonicalRepositoryId.test(input.repo_id) ||
+      !canonicalClaimId.test(input.claim_id) ||
+      !logicalRef.test(input.worktree_ref) ||
+      !input.branch.trim()
+    ) {
+      throw new ControlError("INVALID_RECOVERY_ACTION", "Mapping repair requires canonical coordinates");
+    }
+    const suffix = taskSuffix(input.task_id);
+    if (
+      input.branch !== `task/${input.worktree_ref.slice("wt-".length)}` ||
+      !input.worktree_ref.startsWith(`wt-${suffix}-`)
+    ) {
+      throw new ControlError("WORKTREE_PLAN_MISMATCH", "Mapping repair coordinates do not match the Task plan", {
+        task_id: input.task_id,
+        worktree_ref: input.worktree_ref,
+      });
+    }
+
+    const state = await this.loadState();
+    const root = await this.worktreeRoot();
+    const mapping = state.worktrees[input.worktree_ref];
+    if (!mapping) {
+      throw new ControlError("WORKTREE_NOT_MAPPED", "Mapping repair target does not exist", {
+        worktree_ref: input.worktree_ref,
+      });
+    }
+    this.assertRepairCoordinates(mapping, input, root);
+    if (mapping.lifecycle !== "active" && mapping.lifecycle !== "removed") {
+      throw this.repairUnsafe("repair_lifecycle_uncertain", input.worktree_ref);
+    }
+    const repository = await this.repositoryInfo(mapping.repository_path);
+    if (
+      mapping.repository_path !== repository.root ||
+      mapping.repository_identity !== repository.identity
+    ) {
+      throw new ControlError("WORKTREE_REPOSITORY_MISMATCH", "Mapping repair repository identity changed", {
+        worktree_ref: input.worktree_ref,
+      });
+    }
+    await this.assertRepairCheckoutAbsent(mapping, root, input.worktree_ref);
+    if (mapping.lifecycle === "removed") {
+      return {
+        kind: "repair-mapping",
+        claim_id: input.claim_id,
+        worktree_ref: input.worktree_ref,
+        lifecycle: "removed",
+        changed: false,
+      };
+    }
+
+    const snapshot = JSON.stringify(mapping);
+    await this.stateHooks.beforeRepairCompareAndSwap?.();
+    const currentState = await this.loadState();
+    const current = currentState.worktrees[input.worktree_ref];
+    if (!current || JSON.stringify(current) !== snapshot) {
+      throw this.repairUnsafe("repair_state_changed", input.worktree_ref);
+    }
+    this.assertRepairCoordinates(current, input, root);
+    await this.assertRepairCheckoutAbsent(current, root, input.worktree_ref);
+    current.lifecycle = "removed";
+    await this.saveState(currentState);
+    return {
+      kind: "repair-mapping",
+      claim_id: input.claim_id,
+      worktree_ref: input.worktree_ref,
+      lifecycle: "removed",
+      changed: true,
+    };
+  }
+
   async removeIfSafe(claim: WorktreeClaim): Promise<WorktreeRemovalResult> {
     validateClaim(claim);
     this.assertLocalHost(claim);
@@ -993,6 +1090,56 @@ export class WorktreeManager {
       throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Takeover Claim records disagree on worktree coordinates", {
         worktree_ref: previous.worktree_ref,
       });
+    }
+  }
+
+  private assertRepairCoordinates(
+    mapping: WorktreeMapping,
+    input: WorktreeMappingRepairInput,
+    root: string,
+  ): void {
+    const expectedPath = this.worktreePath(root, input.worktree_ref);
+    if (mapping.claim_id !== input.claim_id) {
+      throw new ControlError("WORKTREE_CLAIM_MISMATCH", "Mapping repair targets another Claim generation", {
+        worktree_ref: input.worktree_ref,
+      });
+    }
+    if (
+      mapping.task_id !== input.task_id ||
+      mapping.project_id !== input.project_id ||
+      mapping.repo_id !== input.repo_id ||
+      mapping.host !== this.config.buildHost ||
+      mapping.branch !== input.branch ||
+      mapping.path !== expectedPath
+    ) {
+      throw new ControlError("WORKTREE_MAPPING_MISMATCH", "Mapping repair coordinates do not match", {
+        worktree_ref: input.worktree_ref,
+      });
+    }
+  }
+
+  private repairUnsafe(reason: string, worktreeRef: string): ControlError {
+    return new ControlError("WORKTREE_MAPPING_REPAIR_UNSAFE", "Mapping repair cannot prove an orphan", {
+      reason,
+      worktree_ref: worktreeRef,
+    });
+  }
+
+  private async assertRepairCheckoutAbsent(
+    mapping: WorktreeMapping,
+    root: string,
+    worktreeRef: string,
+  ): Promise<void> {
+    try {
+      if (await this.mappedWorktreeExists(mapping.path, root)) {
+        throw this.repairUnsafe("repair_checkout_present", worktreeRef);
+      }
+    } catch (cause) {
+      if (
+        cause instanceof ControlError &&
+        cause.code === "WORKTREE_MAPPING_REPAIR_UNSAFE"
+      ) throw cause;
+      throw this.repairUnsafe("repair_checkout_unsafe", worktreeRef);
     }
   }
 

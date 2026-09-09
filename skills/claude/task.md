@@ -487,6 +487,10 @@ jhw-control guard preflight
 - `WORKTREE_MAPPING_AMBIGUOUS` + `removed_checkout_present`: `worktree_ref`의 removed tombstone 경로에 checkout이 다시 생긴 상태다. 해당 ref의 실제 사용 여부를 확인하고 격리·정리한다.
 - `WORKTREE_MAPPING_AMBIGUOUS` + `mapping_target_invalid`: `worktree_ref`가 가리키는 path 또는 repository identity가 없거나 안전한 디렉터리가 아니다. 해당 mapping target을 복구한다.
 - `WORKTREE_MAPPING_AMBIGUOUS` + `mapping_duplicate`: `worktree_ref`가 takeover 대상과 Task·path·repository/branch 좌표를 중복한다. 표시된 중복 mapping을 해소한다.
+- `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_checkout_present`: 정확한 repair 대상 checkout이 아직 존재한다. 삭제나 강제 전환 없이 해당 checkout의 작업 상태를 먼저 확인한다.
+- `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_checkout_unsafe`: 정확한 repair 대상 경로가 symlink 등 안전하지 않은 형태다. 경로의 실제 형태를 확인하고 자동 repair를 중단한다.
+- `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_lifecycle_uncertain`: mapping이 create/remove 중간 상태다. 해당 lifecycle 복구 절차를 먼저 수행한다.
+- `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_state_changed`: 검사와 CAS 사이 mapping bytes가 바뀌었다. 새 상태를 다시 진단하고 이전 요청을 재사용하지 않는다.
 - `LOCK_CONTENDED` + `registry_state_lock`이면 같은 호스트의 Registry writer가 최대 30초 대기 뒤에도 실행 중인 것이다. optional `lock_holder`의 `command`, `acquired_at`, `elapsed_ms`, `pid_state`만 보고하며 `registry.lock`을 삭제하거나 holder를 자동 종료하지 않는다.
 - Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.

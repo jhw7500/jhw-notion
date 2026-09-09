@@ -51,6 +51,17 @@ function takeover(previous = claim(), overrides: Record<string, string> = {}) {
   return { history, successor };
 }
 
+function repairInput(previous = claim()) {
+  return {
+    task_id: previous.task_id,
+    project_id: previous.project_id,
+    repo_id: previous.repo_id,
+    claim_id: previous.claim_id,
+    branch: previous.branch,
+    worktree_ref: previous.worktree_ref,
+  };
+}
+
 async function worktreeFixture(): Promise<{
   fixture: RegistryFixture;
   repoDir: string;
@@ -1182,6 +1193,130 @@ describe("WorktreeManager", () => {
     const successorBytes = await readFile(statePath, "utf8");
     await expect(manager.rebindTakeover(history, successor)).resolves.toEqual({ changed: false });
     expect(await readFile(statePath, "utf8")).toBe(successorBytes);
+  });
+
+  it("repairs an exact orphaned active mapping to an idempotent removed tombstone", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    const created = await manager.createOrReuse(previous, repoDir);
+    await git(repoDir, "worktree", "remove", created.path);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+
+    await expect(manager.repairOrphanedMapping(repairInput(previous))).resolves.toEqual({
+      kind: "repair-mapping",
+      claim_id: previous.claim_id,
+      worktree_ref: previous.worktree_ref,
+      lifecycle: "removed",
+      changed: true,
+    });
+    const repaired = await readFile(statePath, "utf8");
+    expect(JSON.parse(repaired).worktrees[previous.worktree_ref].lifecycle).toBe("removed");
+
+    await expect(manager.repairOrphanedMapping(repairInput(previous))).resolves.toEqual({
+      kind: "repair-mapping",
+      claim_id: previous.claim_id,
+      worktree_ref: previous.worktree_ref,
+      lifecycle: "removed",
+      changed: false,
+    });
+    expect(await readFile(statePath, "utf8")).toBe(repaired);
+  });
+
+  it("refuses repair while the exact checkout is present and preserves state bytes", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    await manager.createOrReuse(previous, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const before = await readFile(statePath, "utf8");
+
+    await expect(manager.repairOrphanedMapping(repairInput(previous))).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_REPAIR_UNSAFE",
+      details: { reason: "repair_checkout_present", worktree_ref: previous.worktree_ref },
+    });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("refuses repair for a symlinked exact checkout and preserves state bytes", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    const created = await manager.createOrReuse(previous, repoDir);
+    await git(repoDir, "worktree", "remove", created.path);
+    const outside = join(fixture.root, "outside-repair-target");
+    await mkdir(outside);
+    await symlink(outside, created.path);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const before = await readFile(statePath, "utf8");
+
+    await expect(manager.repairOrphanedMapping(repairInput(previous))).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_REPAIR_UNSAFE",
+      details: { reason: "repair_checkout_unsafe", worktree_ref: previous.worktree_ref },
+    });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("refuses repair for mismatched or uncertain exact mapping coordinates", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const previous = claim();
+    const created = await manager.createOrReuse(previous, repoDir);
+    await git(repoDir, "worktree", "remove", created.path);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees[previous.worktree_ref].lifecycle = "pending-remove";
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const before = await readFile(statePath, "utf8");
+
+    await expect(manager.repairOrphanedMapping(repairInput(previous))).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_REPAIR_UNSAFE",
+      details: { reason: "repair_lifecycle_uncertain", worktree_ref: previous.worktree_ref },
+    });
+    await expect(manager.repairOrphanedMapping({
+      ...repairInput(previous),
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ad",
+    })).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
+    expect(await readFile(statePath, "utf8")).toBe(before);
+  });
+
+  it("detects a changed mapping at repair CAS and does not overwrite the newer bytes", async () => {
+    const fixture = await makeRegistryFixture();
+    fixtures.push(fixture);
+    const repoDir = join(fixture.root, "source-repository");
+    await git(fixture.root, "init", "--initial-branch=main", repoDir);
+    await git(repoDir, "config", "user.name", "Phase1A Test");
+    await git(repoDir, "config", "user.email", "phase1a@example.invalid");
+    await writeFile(join(repoDir, "README.md"), "# Source\n", "utf8");
+    await git(repoDir, "add", "README.md");
+    await git(repoDir, "commit", "-m", "Initial source");
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    let changeBeforeCas = false;
+    const Constructor = WorktreeManager as unknown as new (
+      config: ReturnType<typeof configFor>,
+      runner: undefined,
+      hooks: { beforeRepairCompareAndSwap?: () => void | Promise<void> },
+    ) => WorktreeManager;
+    const manager = new Constructor(configFor(fixture.registryDir), undefined, {
+      beforeRepairCompareAndSwap: async () => {
+        if (!changeBeforeCas) return;
+        changeBeforeCas = false;
+        const current = JSON.parse(await readFile(statePath, "utf8"));
+        current.worktrees[claim().worktree_ref].session_id = "newer-session";
+        await writeFile(statePath, `${JSON.stringify(current, null, 2)}\n`, "utf8");
+        await chmod(statePath, 0o600);
+      },
+    });
+    const created = await manager.createOrReuse(claim(), repoDir);
+    await git(repoDir, "worktree", "remove", created.path);
+    changeBeforeCas = true;
+
+    await expect(manager.repairOrphanedMapping(repairInput())).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_REPAIR_UNSAFE",
+      details: { reason: "repair_state_changed", worktree_ref: claim().worktree_ref },
+    });
+    const current = JSON.parse(await readFile(statePath, "utf8"));
+    expect(current.worktrees[claim().worktree_ref]).toMatchObject({
+      session_id: "newer-session",
+      lifecycle: "active",
+    });
   });
 
   it("rejects actual ahead commits as unpushed before removal", async () => {

@@ -2283,6 +2283,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
         assertForceEndEligible: graph.worktrees.assertForceEndEligible.bind(graph.worktrees),
         assertTakeoverEligible: graph.worktrees.assertTakeoverEligible.bind(graph.worktrees),
         rebindTakeover: graph.worktrees.rebindTakeover.bind(graph.worktrees),
+        repairOrphanedMapping: graph.worktrees.repairOrphanedMapping.bind(graph.worktrees),
         cleanupReleased: graph.worktrees.cleanupReleased.bind(graph.worktrees),
         claimsMappedToCheckout: graph.worktrees.claimsMappedToCheckout.bind(graph.worktrees),
       } : graph.worktrees;
@@ -2314,6 +2315,78 @@ describe("Phase 1A deterministic adversarial gate", () => {
       expect(successor.exitCode, boundary).toBe(0);
     }
   }, 40_000);
+
+  it("24b. exact repair tombstones an absent released mapping and unblocks a successor", async () => {
+    const fixture = await makeGateFixture();
+    const graph = graphFor(fixture, fixture.cloneA);
+    let failCleanup = true;
+    const worktrees = {
+      assertStartReady: graph.worktrees.assertStartReady.bind(graph.worktrees),
+      createOrReuse: graph.worktrees.createOrReuse.bind(graph.worktrees),
+      inspect: graph.worktrees.inspect.bind(graph.worktrees),
+      removeIfSafe: async (...args: Parameters<WorktreeManager["removeIfSafe"]>) => {
+        if (failCleanup) {
+          failCleanup = false;
+          throw new Error("injected post-release cleanup failure");
+        }
+        return graph.worktrees.removeIfSafe(...args);
+      },
+      assertForceEndEligible: graph.worktrees.assertForceEndEligible.bind(graph.worktrees),
+      assertTakeoverEligible: graph.worktrees.assertTakeoverEligible.bind(graph.worktrees),
+      rebindTakeover: graph.worktrees.rebindTakeover.bind(graph.worktrees),
+      repairOrphanedMapping: graph.worktrees.repairOrphanedMapping.bind(graph.worktrees),
+      cleanupReleased: graph.worktrees.cleanupReleased.bind(graph.worktrees),
+      claimsMappedToCheckout: graph.worktrees.claimsMappedToCheckout.bind(graph.worktrees),
+    };
+    const tasks = new TaskService(graph.config, graph.claims, worktrees, graph.registry);
+    const dependencies = cliDependencies(graph, { taskService: tasks });
+    const started = await runCli(
+      temporaryStartArgs("control:orphan-repair", fixture.sourceRepo, "session-orphan"),
+      dependencies,
+    );
+    const first = JSON.parse(started.stdout).result;
+    const finished = await runCli([
+      "task", "finish", "--task", first.task.task_id, "--claim", first.claim.claim_id,
+      "--status", "abandoned", "--validation", "release before injected cleanup crash",
+    ], dependencies);
+    expect(finished.exitCode).toBe(0);
+    expect(JSON.parse(finished.stdout).result.worktree_removed).toBe(false);
+    expect(await graph.claims.getActive(first.task.task_id)).toBeUndefined();
+
+    const repairArgs = [
+      "task", "recover", "--task", first.task.task_id, "--expect", first.claim.claim_id,
+      "--action", "repair-mapping", "--worktree-ref", first.worktree_ref,
+    ];
+    const stillLive = await runCli(repairArgs, dependencies);
+    expect(JSON.parse(stillLive.stderr)).toEqual({
+      error: {
+        code: "WORKTREE_MAPPING_REPAIR_UNSAFE",
+        reason: "repair_checkout_present",
+        worktree_ref: first.worktree_ref,
+      },
+    });
+
+    const orphanPath = join(fixture.worktreeRoot, first.worktree_ref);
+    await git(fixture.sourceRepo, "worktree", "remove", orphanPath);
+    const repaired = await runCli(repairArgs, dependencies);
+    expect(JSON.parse(repaired.stdout).result).toMatchObject({
+      kind: "repair-mapping",
+      task_id: first.task.task_id,
+      claim_id: first.claim.claim_id,
+      worktree_ref: first.worktree_ref,
+      lifecycle: "removed",
+      changed: true,
+    });
+    const retry = await runCli(repairArgs, dependencies);
+    expect(JSON.parse(retry.stdout).result).toMatchObject({ lifecycle: "removed", changed: false });
+
+    const successor = await runCli([
+      "task", "start", "--task", first.task.task_id, "--repo-path", fixture.sourceRepo,
+      "--session", "session-after-repair", "--origin-adapter", "codex",
+    ], dependencies);
+    expect(successor.exitCode).toBe(0);
+    expect(JSON.parse(successor.stdout).result.claim.claim_id).not.toBe(first.claim.claim_id);
+  }, 20_000);
 
   it("25. Project, Handoff, Registry restore, and snapshot injection paths reject before authoritative output", async () => {
     const fixture = await makeGateFixture();

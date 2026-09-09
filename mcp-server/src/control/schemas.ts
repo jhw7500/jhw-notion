@@ -315,6 +315,11 @@ export const ERROR_REASONS = [
   "removed_checkout_present",
   "mapping_target_invalid",
   "mapping_duplicate",
+  // WORKTREE_MAPPING_REPAIR_UNSAFE — why exact orphan proof failed.
+  "repair_checkout_present",
+  "repair_checkout_unsafe",
+  "repair_lifecycle_uncertain",
+  "repair_state_changed",
   // BOARD_BUSY — which holder class blocks, so the caller can tell "wait or
   // share" apart from "the blocker has already overstayed its lease".
   "exclusive_holder",
