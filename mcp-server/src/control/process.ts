@@ -818,8 +818,18 @@ export class MutationLock implements MutationLockPort {
       if (registryLock) await writeLockHolderRecord(lockFile, context);
       return await callback(directory);
     } finally {
-      await lockFile?.close();
-      await directory?.close();
+      let closeFailure: { cause: unknown } | undefined;
+      try {
+        await lockFile?.close();
+      } catch (cause) {
+        closeFailure = { cause };
+      }
+      try {
+        await directory?.close();
+      } catch (cause) {
+        closeFailure ??= { cause };
+      }
+      if (closeFailure) throw closeFailure.cause;
     }
   }
 }
