@@ -1029,6 +1029,7 @@ describe("GuardService", () => {
   it.each(["lock file", "state directory"] as const)(
     "preserves an exact committed permit decision when %s cleanup rejects after callback completion",
     async (cleanupTarget) => {
+    let directoryCloseAttempts = 0;
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
     fixture.currentClaim = activeClaim(fixture.currentContract);
@@ -1038,6 +1039,14 @@ describe("GuardService", () => {
       registry_mutation_barrier: trustedBarrier(join(fixture.root, "release-failure-state"), {
         secureDirectoryHooks: {
           afterDirectoryOpen: (directory) => {
+            const closeDirectory = directory.close.bind(directory);
+            directory.close = async () => {
+              directoryCloseAttempts += 1;
+              await closeDirectory();
+              if (cleanupTarget === "state directory") {
+                throw new Error("bounded post-callback directory release failure");
+              }
+            };
             if (cleanupTarget === "lock file") {
               const openFile = directory.openFile.bind(directory);
               directory.openFile = async (name, flags, mode) => {
@@ -1048,12 +1057,6 @@ describe("GuardService", () => {
                   throw new Error("bounded post-callback lock-file release failure");
                 };
                 return file;
-              };
-            } else {
-              const close = directory.close.bind(directory);
-              directory.close = async () => {
-                await close();
-                throw new Error("bounded post-callback directory release failure");
               };
             }
           },
@@ -1067,6 +1070,7 @@ describe("GuardService", () => {
       approval_command: `/jhw:unlock ${REQUEST_ID}`,
     });
     expect(fixture.permitCalls).toBe(1);
+    expect(directoryCloseAttempts).toBe(1);
     },
   );
 
