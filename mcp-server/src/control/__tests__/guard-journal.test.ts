@@ -111,6 +111,28 @@ describe("GuardJournal", () => {
     }).success).toBe(false);
   });
 
+  it("accepts bounded SessionEnd Git evidence without session or host paths", () => {
+    const ended = {
+      protocol_version: 1,
+      origin_adapter: "codex",
+      event: "session-ended",
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    };
+
+    expect(GuardJournalEventSchema.safeParse(ended).success).toBe(true);
+    expect(GuardJournalEventSchema.safeParse({ ...ended, session_id: "must-not-persist" }).success).toBe(false);
+    expect(GuardJournalEventSchema.safeParse({ ...ended, cwd: "/srv/private" }).success).toBe(false);
+    expect(GuardJournalEventSchema.safeParse({ ...ended, head_sha: "not-a-git-id" }).success).toBe(false);
+  });
+
   it("rejects noncanonical or duplicate requirement lists", () => {
     const commitRequirement = {
       capability: "git.commit" as const,

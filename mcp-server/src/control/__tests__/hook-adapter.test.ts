@@ -12,12 +12,13 @@ import type { GuardSideEventResult } from "../guard-service.js";
 import type { GuardDecision } from "../schemas.js";
 
 type HookAdapterName = "claude" | "codex";
-type HookEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse";
+type HookEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SessionEnd";
 
 interface HookGuardPort {
   submitUserPrompt(event: unknown): Promise<GuardSideEventResult>;
   evaluatePreTool(event: unknown): Promise<GuardDecision>;
   completePostTool(event: unknown): Promise<GuardSideEventResult>;
+  recordSessionEnd(event: unknown): Promise<{ status: "RECORDED" | "NO_MATCH" }>;
 }
 
 interface HookRunResult {
@@ -104,6 +105,16 @@ function postToolPayload(adapter: HookAdapterName = "claude"): string {
   });
 }
 
+function sessionEndPayload(adapter: HookAdapterName = "claude"): string {
+  return JSON.stringify({
+    session_id: "native-session-17",
+    transcript_path: adapter === "codex" ? null : "/srv/transcripts/native-17.jsonl",
+    cwd: "/srv/worktrees/native-17",
+    hook_event_name: "SessionEnd",
+    reason: "other",
+  });
+}
+
 function exactFailure(event: HookEventName, code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH"): unknown {
   if (event === "PreToolUse") {
     return {
@@ -182,6 +193,11 @@ class ObservableGuard implements HookGuardPort {
     this.calls.push({ method: "completePostTool", event });
     return this.postResult;
   }
+
+  async recordSessionEnd(event: unknown): Promise<{ status: "RECORDED" }> {
+    this.calls.push({ method: "recordSessionEnd", event });
+    return { status: "RECORDED" };
+  }
 }
 
 describe("strict hook adapter executable core", () => {
@@ -192,6 +208,8 @@ describe("strict hook adapter executable core", () => {
       .toEqual({ adapter: "claude", event: "PreToolUse" });
     expect(parseHookCliArguments(["--adapter", "codex", "--event", "PostToolUse"]))
       .toEqual({ adapter: "codex", event: "PostToolUse" });
+    expect(parseHookCliArguments(["--adapter", "codex", "--event", "SessionEnd"]))
+      .toEqual({ adapter: "codex", event: "SessionEnd" });
 
     const invalid = [
       [],
@@ -238,6 +256,8 @@ describe("strict hook adapter executable core", () => {
     ["codex", "UserPromptSubmit", promptPayload(undefined, "codex"), "submitUserPrompt", "user_prompt_submit"],
     ["codex", "PreToolUse", preToolPayload(undefined, "codex"), "evaluatePreTool", "pre_tool_use"],
     ["codex", "PostToolUse", postToolPayload("codex"), "completePostTool", "post_tool_use"],
+    ["claude", "SessionEnd", sessionEndPayload(), "recordSessionEnd", "session_end"],
+    ["codex", "SessionEnd", sessionEndPayload("codex"), "recordSessionEnd", "session_end"],
   ] as const)("routes %s %s only to the central Guard method", async (
     adapter,
     event,
@@ -256,6 +276,28 @@ describe("strict hook adapter executable core", () => {
     expect(JSON.parse(result.stdout)).toBeTypeOf("object");
     expect(guard.calls).toHaveLength(1);
     expect(guard.calls[0]).toMatchObject({ method, event: { adapter, event: guardEvent } });
+  });
+
+  it("keeps SessionEnd recorder failures advisory and never calls another lifecycle method", async () => {
+    const { runHookAdapter } = await loadAdapter();
+    const guard = new ObservableGuard();
+    guard.recordSessionEnd = async (event: unknown) => {
+      guard.calls.push({ method: "recordSessionEnd", event });
+      throw new Error("private recorder failure");
+    };
+
+    const result = await runHookAdapter(
+      ["--adapter", "codex", "--event", "SessionEnd"],
+      sessionEndPayload("codex"),
+      guard,
+    );
+
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: `${JSON.stringify({ systemMessage: "GUARD_UNAVAILABLE" })}\n`,
+      stderr: "",
+    });
+    expect(guard.calls.map((call) => call.method)).toEqual(["recordSessionEnd"]);
   });
 
   it("renders malformed payload and event disagreement as protocol failures without calling Guard", async () => {

@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   GuardAdapterSchema,
   CanonicalOperationRequirementsSchema,
+  GuardWorktreeRefSchema,
   RequestIdSchema,
 } from "./guard-protocol.js";
 import {
@@ -44,7 +45,7 @@ export const GuardJournalEventSchema = z.object({
   protocol_version: z.literal(1),
   origin_adapter: GuardAdapterSchema.optional(),
   evaluation_stage: z.enum(["hook", "execution"]).optional(),
-  event: z.enum(["decision", "requested", "approved", "consumed", "completed", "failed", "expired"]),
+  event: z.enum(["decision", "requested", "approved", "consumed", "completed", "failed", "expired", "session-ended"]),
   task_id: TaskIdSchema.optional(),
   claim_id: claimId.optional(),
   session_id: boundedCoordinate(255).optional(),
@@ -60,7 +61,35 @@ export const GuardJournalEventSchema = z.object({
   finished_at: OffsetDateTimeSchema.optional(),
   decision_code: GuardDenyCodeSchema.optional(),
   error_reason: ErrorReasonSchema.optional(),
+  worktree_ref: GuardWorktreeRefSchema.optional(),
+  branch: boundedCoordinate(255).optional(),
+  head_sha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/).optional(),
+  dirty: z.boolean().optional(),
+  ahead: z.number().int().nonnegative().optional(),
+  behind: z.number().int().nonnegative().optional(),
 }).strict().superRefine((event, context) => {
+  if (event.event === "session-ended") {
+    for (const field of [
+      "origin_adapter", "task_id", "claim_id", "worktree_ref", "branch",
+      "head_sha", "dirty", "ahead", "behind",
+    ] as const) {
+      if (event[field] === undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: `SessionEnd journal event requires ${field}`,
+        });
+      }
+    }
+    if (event.session_id !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["session_id"],
+        message: "SessionEnd journal event must not persist session identity",
+      });
+    }
+    return;
+  }
   if (event.event === "decision") return;
   for (const field of ["origin_adapter", "task_id", "claim_id", "session_id"] as const) {
     if (event[field] === undefined) {

@@ -500,12 +500,12 @@ assert_exact_owned_hook_groups() {
 const fs = require("node:fs");
 const [hooksFile] = process.argv.slice(2);
 const document = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
-for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]) {
   const expected = {
     hooks: [{
       type: "command",
       command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
-      timeout: 12,
+      timeout: event === "SessionEnd" ? 3 : 12,
     }],
   };
   const groups = document.hooks?.[event];
@@ -527,12 +527,12 @@ const hooks = {
   SessionStart: [{ hooks: [{ type: "command", command: "/foreign/session", timeout: 4 }] }],
 };
 if (includeOwned === "yes") {
-  for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+  for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]) {
     hooks[event] = [{
       hooks: [{
         type: "command",
         command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
-        timeout: 12,
+        timeout: event === "SessionEnd" ? 3 : 12,
       }],
     }];
   }
@@ -1410,9 +1410,9 @@ const fs = require("node:fs");
 const [file, home] = process.argv.slice(2);
 const text = fs.readFileSync(file, "utf8");
 const document = JSON.parse(text);
-for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]) {
   const expectedCommand = `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`;
-  const expected = { hooks: [{ type: "command", command: expectedCommand, timeout: 12 }] };
+  const expected = { hooks: [{ type: "command", command: expectedCommand, timeout: event === "SessionEnd" ? 3 : 12 }] };
   const groups = document.hooks?.[event];
   if (!Array.isArray(groups) || JSON.stringify(groups[0]) !== JSON.stringify(expected)) {
     console.error(`canonical ${event} hook is not the first executor`);
@@ -1430,7 +1430,7 @@ EOF
   node - "$hooks" <<'EOF'
 const fs = require("node:fs");
 const document = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]) {
   if (document.hooks?.[event] !== undefined) process.exit(1);
 }
 EOF
@@ -1442,14 +1442,15 @@ EOF
 const fs = require("node:fs");
 const [file, home] = process.argv.slice(2);
 const hooks = {};
-for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]) {
   const command = `${home}/.local/bin/jhw-control-hook --adapter codex --event ${event}`;
-  const group = (candidate, timeout = 12) => ({ hooks: [{ type: "command", command: candidate, timeout }] });
+  const canonicalTimeout = event === "SessionEnd" ? 3 : 12;
+  const group = (candidate, timeout = canonicalTimeout) => ({ hooks: [{ type: "command", command: candidate, timeout }] });
   hooks[event] = [
     group(command),
     group(command.replace(" --adapter", "  --adapter")),
     group(`env JHW_WRAPPER=1 ${command}`),
-    group(command, 13),
+    group(command, canonicalTimeout + 1),
     group(`/opt/foreign/jhw-control-hook --adapter codex --event ${event}`),
   ];
 }
@@ -1461,13 +1462,14 @@ const fs = require("node:fs");
 const [file, home] = process.argv.slice(2);
 const document = JSON.parse(fs.readFileSync(file, "utf8"));
 const text = fs.readFileSync(file, "utf8");
-for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]) {
   const command = `${home}/.local/bin/jhw-control-hook --adapter codex --event ${event}`;
-  const group = (candidate, timeout = 12) => ({ hooks: [{ type: "command", command: candidate, timeout }] });
+  const canonicalTimeout = event === "SessionEnd" ? 3 : 12;
+  const group = (candidate, timeout = canonicalTimeout) => ({ hooks: [{ type: "command", command: candidate, timeout }] });
   const expected = [
     group(command.replace(" --adapter", "  --adapter")),
     group(`env JHW_WRAPPER=1 ${command}`),
-    group(command, 13),
+    group(command, canonicalTimeout + 1),
     group(`/opt/foreign/jhw-control-hook --adapter codex --event ${event}`),
   ];
   const groups = document.hooks?.[event];
@@ -1522,7 +1524,7 @@ const [file, home] = process.argv.slice(2);
 const legacy = (event) => JSON.stringify({ hooks: [{
   type: "command",
   command: `${home}/.local/bin/jhw-control-hook --adapter codex --event ${event}`,
-  timeout: 12,
+  timeout: event === "SessionEnd" ? 3 : 12,
 }] });
 const text = `{
  "version" : 7.00,
@@ -1536,7 +1538,8 @@ const text = `{
    ${legacy("PreToolUse")},
    {"matcher":"Edit","hooks":[{"type":"command","command":"/foreign/pre-b","timeout":7.00}]} ],
   "PostToolUse" : [ ${legacy("PostToolUse")},
-   {"hooks":[{"type":"command","command":"/foreign/post-a","timeout":8.0e0}]} ]
+   {"hooks":[{"type":"command","command":"/foreign/post-a","timeout":8.0e0}]} ],
+  "SessionEnd" : [ ${legacy("SessionEnd")} ]
  },
  "tail" : {"escaped":"\\u0070reserve","number":1.2300e+2}
 }
@@ -1550,7 +1553,7 @@ const fs = require("node:fs");
 const [file, home] = process.argv.slice(2);
 const text = fs.readFileSync(file, "utf8");
 const document = JSON.parse(text);
-const events = ["UserPromptSubmit", "PreToolUse", "PostToolUse"];
+const events = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"];
 for (const event of events) {
   const canonical = `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`;
   const legacy = `${home}/.local/bin/jhw-control-hook --adapter codex --event ${event}`;
@@ -1620,6 +1623,7 @@ test_hook_registration_preserves_foreign_groups_and_is_idempotent() {
   "PreToolUse" : [ {"matcher":"Bash","hooks":[{"type":"command","command":"/foreign/pre-first","timeout":5}]},
    {"matcher":"Edit","hooks":[{"type":"command","command":"/foreign/pre-second","timeout":6.0e+0}]}   ],
   "PostToolUse" : [ {"hooks":[{"type":"command","command":"/foreign/post","timeout":7.000}]} ]
+  ,"SessionEnd" : [ {"hooks":[{"type":"command","command":"/foreign/session-end","timeout":3.000}]} ]
  },
  "tail" : {"escaped":"\u0070reserve","number":1.2300e+2}
 }
@@ -1639,12 +1643,13 @@ const insertions = [
   ["UserPromptSubmit", '{"matcher":"\\u0066oreign-prompt","hooks":[{"type":"command","command":"/foreign/prompt","timeout":9.00}],"foreign_order":"\\u0066irst"}'],
   ["PreToolUse", '{"matcher":"Bash","hooks":[{"type":"command","command":"/foreign/pre-first","timeout":5}]}'],
   ["PostToolUse", '{"hooks":[{"type":"command","command":"/foreign/post","timeout":7.000}]}'],
+  ["SessionEnd", '{"hooks":[{"type":"command","command":"/foreign/session-end","timeout":3.000}]}'],
 ];
 for (const [event, needle] of insertions) {
   const group = { hooks: [{
     type: "command",
     command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
-    timeout: 12,
+    timeout: event === "SessionEnd" ? 3 : 12,
   }] };
   if (text.split(needle).length !== 2) process.exit(1);
   text = text.replace(needle, `${JSON.stringify(group)},${needle}`);
@@ -1730,11 +1735,11 @@ test_uninstall_removes_only_exact_owned_hook_artifacts() {
   node - "$hooks" "$home" <<'EOF'
 const fs = require("node:fs");
 const [hooksFile, home] = process.argv.slice(2);
-const events = ["UserPromptSubmit", "PreToolUse", "PostToolUse"];
+const events = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"];
 const document = { hooks: Object.fromEntries(events.map((event) => [event, [{ hooks: [{
   type: "command",
   command: `${home}/.local/bin/jhw-control-hook --adapter codex --event ${event}`,
-  timeout: 12,
+  timeout: event === "SessionEnd" ? 3 : 12,
 }] }]])) };
 document.hooks.PreToolUse.push(
   { hooks: [{ type: "command", command: "/foreign/other-command", timeout: 12 }] },
@@ -1764,7 +1769,8 @@ EOF
 const fs = require("node:fs");
 const [hooksFile, home] = process.argv.slice(2);
 const document = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
-if (document.hooks.UserPromptSubmit !== undefined || document.hooks.PostToolUse !== undefined) process.exit(1);
+if (document.hooks.UserPromptSubmit !== undefined || document.hooks.PostToolUse !== undefined ||
+    document.hooks.SessionEnd !== undefined) process.exit(1);
 const groups = document.hooks.PreToolUse;
 if (!Array.isArray(groups) || groups.length !== 4) process.exit(1);
 const commands = groups.flatMap((group) => group.hooks.map((hook) => hook.command));

@@ -12,7 +12,7 @@ import { NativeHookOutputSchema } from "../hook-codecs.js";
 import type { GuardSideEventResult } from "../guard-service.js";
 import type { GuardDecision } from "../schemas.js";
 
-type HookEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse";
+type HookEventName = "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SessionEnd";
 type Adapter = "claude" | "codex";
 
 interface HookCodecContract {
@@ -28,6 +28,7 @@ interface AdapterContractResult {
     prompt_origin: true;
     pre_tool_block: true;
     post_tool_correlation: true;
+    session_end_evidence: true;
   };
 }
 
@@ -59,11 +60,13 @@ const CLAIM_ID = "clm-018f21e0-7b2c-7a00-8000-000000000002";
 const KEY = Buffer.alloc(32, 0x71);
 const roots: string[] = [];
 
-function fixtureBytes(adapter: Adapter, fixture: "user-prompt-submit" | "pre-tool-edit" | "post-tool-edit"): Buffer {
+type HookFixture = "user-prompt-submit" | "pre-tool-edit" | "post-tool-edit" | "session-end";
+
+function fixtureBytes(adapter: Adapter, fixture: HookFixture): Buffer {
   return readFileSync(join(fixtureRoot, adapter, `${fixture}.json`));
 }
 
-function fixtureJson(adapter: Adapter, fixture: "user-prompt-submit" | "pre-tool-edit" | "post-tool-edit"): Record<string, unknown> {
+function fixtureJson(adapter: Adapter, fixture: HookFixture): Record<string, unknown> {
   return JSON.parse(fixtureBytes(adapter, fixture).toString("utf8")) as Record<string, unknown>;
 }
 
@@ -97,6 +100,8 @@ describe("recorded native hook contracts", () => {
         .toMatchObject({ adapter, event: "pre_tool_use" });
       expect(codec(codecs, adapter).decode("PostToolUse", fixtureJson(adapter, "post-tool-edit")))
         .toMatchObject({ adapter, event: "post_tool_use" });
+      expect(codec(codecs, adapter).decode("SessionEnd", fixtureJson(adapter, "session-end")))
+        .toMatchObject({ adapter, event: "session_end" });
     }
   });
 
@@ -348,13 +353,13 @@ describe("recorded native hook contracts", () => {
         contract_version: 1,
         adapter: "claude",
         native_version: "2.1.246",
-        fixture_axes: { prompt_origin: true, pre_tool_block: true, post_tool_correlation: true },
+        fixture_axes: { prompt_origin: true, pre_tool_block: true, post_tool_correlation: true, session_end_evidence: true },
       },
       codex: {
         contract_version: 1,
         adapter: "codex",
-        native_version: "0.149.1",
-        fixture_axes: { prompt_origin: true, pre_tool_block: true, post_tool_correlation: true },
+        native_version: "0.153.4",
+        fixture_axes: { prompt_origin: true, pre_tool_block: true, post_tool_correlation: true, session_end_evidence: true },
       },
     });
   });

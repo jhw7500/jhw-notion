@@ -791,11 +791,12 @@ function validatedPortResult<T>(schema: ZodType<T>, raw: unknown, code: string):
   return parsed.data;
 }
 
-const codexHookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse"] as const;
+const codexHookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"] as const;
 const codexRuntimeEventNames = {
   UserPromptSubmit: "userPromptSubmit",
   PreToolUse: "preToolUse",
   PostToolUse: "postToolUse",
+  SessionEnd: "sessionEnd",
 } as const;
 const maximumCodexHooksBytes = 128 * 1024;
 const maximumCodexRuntimeEntries = 256;
@@ -856,11 +857,16 @@ function expectedCodexHookCommand(eventName: typeof codexHookEvents[number]): st
   return `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${eventName}`;
 }
 
+function expectedCodexHookTimeout(eventName: typeof codexHookEvents[number]): number {
+  return eventName === "SessionEnd" ? 3 : 12;
+}
+
 function isExactCodexHookGroup(value: unknown, eventName: typeof codexHookEvents[number]): boolean {
   if (!exactObjectKeys(value, ["hooks"]) || !Array.isArray(value.hooks) || value.hooks.length !== 1) return false;
   const handler = value.hooks[0];
   return exactObjectKeys(handler, ["type", "command", "timeout"]) &&
-    handler.type === "command" && handler.command === expectedCodexHookCommand(eventName) && handler.timeout === 12;
+    handler.type === "command" && handler.command === expectedCodexHookCommand(eventName) &&
+    handler.timeout === expectedCodexHookTimeout(eventName);
 }
 
 async function readBoundedNoFollowRegularFile(file: string, maximumBytes: number): Promise<Buffer | undefined> {
@@ -932,7 +938,7 @@ function isExactTrustedCodexRuntimeEntry(
     entry.async === false &&
     entry.command === expectedCodexHookCommand(eventName) &&
     entry.matcher === null &&
-    entry.timeoutSec === 12 &&
+    entry.timeoutSec === expectedCodexHookTimeout(eventName) &&
     entry.source === "user" &&
     entry.sourcePath === join(home, ".codex", "hooks.json") &&
     entry.isManaged === false &&
@@ -982,6 +988,7 @@ async function inspectAdapterCoverage(
     adapterContractResults.codex.fixture_axes.prompt_origin &&
     adapterContractResults.codex.fixture_axes.pre_tool_block &&
     adapterContractResults.codex.fixture_axes.post_tool_correlation &&
+    adapterContractResults.codex.fixture_axes.session_end_evidence &&
     await inspectExactCodexInstallation(
       dependencies.env.HOME,
       dependencies.codexRepositoryRoot ?? codexRepositoryRoot(),

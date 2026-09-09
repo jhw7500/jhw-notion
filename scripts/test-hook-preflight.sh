@@ -74,6 +74,7 @@ input.on("line", (line) => {
       ["userPromptSubmit", "UserPromptSubmit"],
       ["preToolUse", "PreToolUse"],
       ["postToolUse", "PostToolUse"],
+      ["sessionEnd", "SessionEnd"],
     ];
     const hooks = events.map(([eventName, cliEvent], index) => ({
       key: `fixture-${eventName}`,
@@ -82,7 +83,7 @@ input.on("line", (line) => {
       command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${cliEvent}`,
       async: mode === "guard-async" && eventName === "preToolUse",
       matcher: null,
-      timeoutSec: 12,
+      timeoutSec: eventName === "sessionEnd" ? 3 : 12,
       source: mode === "wrong-source" ? "project" : "user",
       sourcePath: hooksPath,
       enabled: true,
@@ -149,9 +150,10 @@ if (JSON.stringify(log.slice(1)) !== JSON.stringify(["initialize", "initialized"
 const responses = fs.readFileSync(outputPath, "utf8").trim().split("\n").map(JSON.parse);
 if (responses.length !== 2 || responses[0].id !== 1 || responses[1].id !== 2) process.exit(1);
 const hooks = responses[1].result?.data?.[0]?.hooks;
-if (!Array.isArray(hooks) || hooks.length !== 3) process.exit(1);
+if (!Array.isArray(hooks) || hooks.length !== 4) process.exit(1);
 for (const hook of hooks) {
-  if (hook.handlerType !== "command" || hook.async !== false || hook.matcher !== null || hook.timeoutSec !== 12 ||
+  const expectedTimeout = hook.eventName === "sessionEnd" ? 3 : 12;
+  if (hook.handlerType !== "command" || hook.async !== false || hook.matcher !== null || hook.timeoutSec !== expectedTimeout ||
       hook.source !== "user" || hook.sourcePath !== `${home}/.codex/hooks.json` || hook.isManaged !== false || hook.enabled !== true ||
       hook.trustStatus !== "trusted" || typeof hook.currentHash !== "string" || !hook.currentHash ||
       !Number.isInteger(hook.displayOrder) || hook.displayOrder < 0) process.exit(1);
@@ -166,7 +168,7 @@ self_test_fake_app_server
 
 owned_group_json() {
   local event="$1"
-  node -e 'process.stdout.write(JSON.stringify({hooks:[{type:"command",command:`"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${process.argv[1]}`,timeout:12}]}))' "$event"
+  node -e 'const event=process.argv[1]; process.stdout.write(JSON.stringify({hooks:[{type:"command",command:`"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,timeout:event==="SessionEnd"?3:12}]}))' "$event"
 }
 
 make_home() {
@@ -183,17 +185,19 @@ make_home() {
   esac
   case "$scenario" in
     exact-trusted|exact-invalid-shell|exact-untrusted|exact-unavailable|exact-runtime-source|exact-runtime-duplicate|exact-stubborn|exact-foreign-trusted-after|exact-mcp-untrusted|exact-guard-async|exact-missing-display-order|launcher-missing|launcher-regular|launcher-foreign)
-      printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s],"PostToolUse":[%s]}}\n' \
+      printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s],"PostToolUse":[%s],"SessionEnd":[%s]}}\n' \
         "$(owned_group_json UserPromptSubmit)" \
         "$(owned_group_json PreToolUse)" \
-        "$(owned_group_json PostToolUse)" >"$hooks"
+        "$(owned_group_json PostToolUse)" \
+        "$(owned_group_json SessionEnd)" >"$hooks"
       ;;
     duplicate-config)
-      printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s,%s],"PostToolUse":[%s]}}\n' \
+      printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s,%s],"PostToolUse":[%s],"SessionEnd":[%s]}}\n' \
         "$(owned_group_json UserPromptSubmit)" \
         "$(owned_group_json PreToolUse)" \
         "$(owned_group_json PreToolUse)" \
-        "$(owned_group_json PostToolUse)" >"$hooks"
+        "$(owned_group_json PostToolUse)" \
+        "$(owned_group_json SessionEnd)" >"$hooks"
       ;;
     missing) ;;
     malformed) printf '%s' '{"hooks":{"PreToolUse":["private-secret-marker"],' >"$hooks" ;;

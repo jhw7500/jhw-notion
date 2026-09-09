@@ -453,19 +453,24 @@ function guardRequest(state: GuardRequestLifecycle, sequence: number): GuardRequ
   return { ...consumed, finished_at: "2026-08-13T00:03:00.000Z" };
 }
 
-const task3HookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse"] as const;
+const task3HookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"] as const;
 const task3RuntimeEventNames = {
   UserPromptSubmit: "userPromptSubmit",
   PreToolUse: "preToolUse",
   PostToolUse: "postToolUse",
+  SessionEnd: "sessionEnd",
 } as const;
+
+function task3HookTimeout(event: typeof task3HookEvents[number]): number {
+  return event === "SessionEnd" ? 3 : 12;
+}
 
 function task3OwnedHookGroup(event: typeof task3HookEvents[number]) {
   return {
     hooks: [{
       type: "command",
       command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
-      timeout: 12,
+      timeout: task3HookTimeout(event),
     }],
   };
 }
@@ -545,7 +550,7 @@ async function task3CodexHome(
         hooks: [{
           type: "command",
           command: `/private/foreign-secret --event ${event}`,
-          timeout: 12,
+          timeout: task3HookTimeout(event),
         }],
       }]])),
   };
@@ -567,7 +572,7 @@ function task3RuntimeEntries(hooksPath: string): Task3CodexCommandHookMetadata[]
     async: false,
     command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
     matcher: null,
-    timeoutSec: 12,
+    timeoutSec: task3HookTimeout(event),
     source: "user",
     sourcePath: hooksPath,
     isManaged: false,

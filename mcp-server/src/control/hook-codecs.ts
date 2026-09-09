@@ -7,7 +7,7 @@ import {
 import type { GuardSideEventResult } from "./guard-service.js";
 import type { GuardDecision } from "./schemas.js";
 
-export const HookEventNameSchema = z.enum(["UserPromptSubmit", "PreToolUse", "PostToolUse"]);
+export const HookEventNameSchema = z.enum(["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]);
 export type HookEventName = z.infer<typeof HookEventNameSchema>;
 
 const coordinate = (maximumBytes: number) => z.string()
@@ -89,6 +89,15 @@ const ClaudePostToolUseSchema = z.object({
   tool_use_id: coordinate(255),
   duration_ms: z.number().finite().nonnegative().optional(),
 }).strict();
+const ClaudeSessionEndSchema = z.object({
+  session_id: coordinate(255),
+  ...documentedAgentMetadata,
+  transcript_path: transcriptPath,
+  cwd,
+  permission_mode: claudePermissionMode.optional(),
+  hook_event_name: z.literal("SessionEnd"),
+  reason: coordinate(64),
+}).strict();
 
 // Codex CLI 0.149.1 generated command-hook schemas require the metadata
 // below. The Guard keeps its narrower object-only tool input authority while
@@ -131,6 +140,14 @@ const CodexPostToolUseSchema = z.object({
   transcript_path: nullableTranscriptPath,
   turn_id: coordinate(255),
 }).strict();
+const CodexSessionEndSchema = z.object({
+  session_id: coordinate(255),
+  ...documentedAgentMetadata,
+  transcript_path: nullableTranscriptPath,
+  cwd,
+  hook_event_name: z.literal("SessionEnd"),
+  reason: z.literal("other"),
+}).strict();
 
 const preToolNeutralOutputSchema = z.object({
   hookSpecificOutput: z.object({
@@ -155,12 +172,14 @@ const promptOutputSchema = z.object({
 const postOutputSchema = z.object({
   systemMessage: z.string().min(1).max(4_096),
 }).strict();
+const sessionEndOutputSchema = z.object({}).strict();
 
 export const NativeHookOutputSchema = z.union([
   preToolNeutralOutputSchema,
   preToolDenyOutputSchema,
   promptOutputSchema,
   postOutputSchema,
+  sessionEndOutputSchema,
 ]);
 
 export interface HookCodec {
@@ -168,6 +187,7 @@ export interface HookCodec {
   renderPrompt(result: GuardSideEventResult): unknown;
   renderPreTool(result: GuardDecision): unknown;
   renderPostTool(result: GuardSideEventResult): unknown;
+  renderSessionEnd(result: unknown): unknown;
   renderFailure(
     event: HookEventName,
     code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH",
@@ -209,6 +229,16 @@ function decodeNative(
       tool_name: native.tool_name,
       tool_input: native.tool_input,
       tool_use_id: native.tool_use_id,
+    });
+  }
+  if (event === "SessionEnd") {
+    const native = schemas.SessionEnd.parse(raw) as { session_id: string; cwd: string };
+    return GuardCommonEventSchema.parse({
+      protocol_version: 1,
+      adapter,
+      event: "session_end",
+      session_id: native.session_id,
+      cwd: native.cwd,
     });
   }
   const native = schemas.PostToolUse.parse(raw) as { session_id: string; tool_use_id: string };
@@ -280,6 +310,10 @@ function renderPostTool(result: GuardSideEventResult): unknown {
   return { systemMessage: message };
 }
 
+function renderSessionEnd(_result: unknown): unknown {
+  return {};
+}
+
 export function renderStaticHookFailure(
   event: HookEventName,
   code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH",
@@ -310,11 +344,13 @@ const claudeSchemas: NativeSchemaSet = Object.freeze({
   UserPromptSubmit: ClaudeUserPromptSubmitSchema,
   PreToolUse: ClaudePreToolUseSchema,
   PostToolUse: ClaudePostToolUseSchema,
+  SessionEnd: ClaudeSessionEndSchema,
 });
 const codexSchemas: NativeSchemaSet = Object.freeze({
   UserPromptSubmit: CodexUserPromptSubmitSchema,
   PreToolUse: CodexPreToolUseSchema,
   PostToolUse: CodexPostToolUseSchema,
+  SessionEnd: CodexSessionEndSchema,
 });
 
 export interface AdapterContractResult {
@@ -325,6 +361,7 @@ export interface AdapterContractResult {
     prompt_origin: true;
     pre_tool_block: true;
     post_tool_correlation: true;
+    session_end_evidence: true;
   }>;
 }
 
@@ -333,13 +370,13 @@ export const adapterContractResults: Readonly<Record<"claude" | "codex", Adapter
     contract_version: 1,
     adapter: "claude",
     native_version: "2.1.246",
-    fixture_axes: Object.freeze({ prompt_origin: true, pre_tool_block: true, post_tool_correlation: true }),
+    fixture_axes: Object.freeze({ prompt_origin: true, pre_tool_block: true, post_tool_correlation: true, session_end_evidence: true }),
   }),
   codex: Object.freeze({
     contract_version: 1,
     adapter: "codex",
-    native_version: "0.149.1",
-    fixture_axes: Object.freeze({ prompt_origin: true, pre_tool_block: true, post_tool_correlation: true }),
+    native_version: "0.153.4",
+    fixture_axes: Object.freeze({ prompt_origin: true, pre_tool_block: true, post_tool_correlation: true, session_end_evidence: true }),
   }),
 });
 
@@ -348,6 +385,7 @@ export const claudeHookCodec: HookCodec = Object.freeze({
   renderPrompt,
   renderPreTool,
   renderPostTool,
+  renderSessionEnd,
   renderFailure: renderStaticHookFailure,
 });
 
@@ -356,5 +394,6 @@ export const codexHookCodec: HookCodec = Object.freeze({
   renderPrompt,
   renderPreTool,
   renderPostTool,
+  renderSessionEnd,
   renderFailure: renderStaticHookFailure,
 });

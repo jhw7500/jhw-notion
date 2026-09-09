@@ -70,12 +70,12 @@
 - Modify: `scripts/test-hook-preflight.sh`
 - Modify: `scripts/test-install-safety.sh`
 
-- [ ] Add native Claude/Codex SessionEnd fixtures and strict decode/contract tests.
-- [ ] Add adapter tests proving SessionEnd only invokes the evidence recorder, emits a neutral bounded response, and converts recorder/timeout failures into advisory output without lifecycle mutation.
-- [ ] Add journal schema tests for a bounded `session-ended` event with Task/Claim/worktree-ref/branch/head/dirty/ahead/behind coordinates and no path/transcript data.
-- [ ] Implement an evidence-only recorder composed from read-only Claim/worktree inspection and the derived Guard journal; do not expose Claim lifecycle methods on its port.
-- [ ] Register SessionEnd in installed hook configuration with a bounded timeout and update install/preflight assertions.
-- [ ] Re-run focused hook, journal, and installer tests and commit the slice.
+- [x] Add native Claude/Codex SessionEnd fixtures and strict decode/contract tests.
+- [x] Add adapter tests proving SessionEnd only invokes the evidence recorder, emits a neutral bounded response, and converts recorder/timeout failures into advisory output without lifecycle mutation.
+- [x] Add journal schema tests for a bounded `session-ended` event with Task/Claim/worktree-ref/branch/head/dirty/ahead/behind coordinates and no path/transcript data.
+- [x] Implement an evidence-only recorder composed from read-only Claim/worktree inspection and the derived Guard journal; do not expose Claim lifecycle methods on its port.
+- [x] Register SessionEnd in installed hook configuration with a bounded timeout and update install/preflight assertions.
+- [x] Re-run focused hook, journal, and installer tests and commit the slice.
 
 ### Task 4: Document, verify, review, and ship
 

@@ -214,10 +214,19 @@ export const UserPromptSubmitEventSchema = z.object({
 export type UserPromptSubmitEventInput = z.input<typeof UserPromptSubmitEventSchema>;
 export type UserPromptSubmitEvent = z.output<typeof UserPromptSubmitEventSchema>;
 
+export const SessionEndEventSchema = z.object({
+  ...commonEventBase,
+  event: z.literal("session_end"),
+  cwd: boundedCoordinate(4_096).refine(isAbsolute, "cwd must be absolute"),
+}).strict();
+export type SessionEndEventInput = z.input<typeof SessionEndEventSchema>;
+export type SessionEndEvent = z.output<typeof SessionEndEventSchema>;
+
 export const GuardCommonEventSchema = z.discriminatedUnion("event", [
   PreToolUseEventSchema,
   PostToolUseEventSchema,
   UserPromptSubmitEventSchema,
+  SessionEndEventSchema,
 ]);
 export type GuardCommonEventInput = z.input<typeof GuardCommonEventSchema>;
 export type GuardCommonEventOutput = z.output<typeof GuardCommonEventSchema>;
