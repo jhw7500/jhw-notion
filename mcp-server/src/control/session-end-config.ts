@@ -1,6 +1,6 @@
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { userInfo } from "node:os";
-import { isAbsolute, join, parse, resolve } from "node:path";
+import { isAbsolute, parse, resolve } from "node:path";
 
 import { loadControlConfig, type ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
@@ -19,10 +19,23 @@ function invalidConfig(): ControlError {
   return new ControlError("INVALID_CONFIG", "SessionEnd host configuration is missing or unsafe");
 }
 
-function readPrivateCoordinates(file: string): NodeJS.ProcessEnv {
+function readPrivateCoordinates(home: string): NodeJS.ProcessEnv {
+  const directories: number[] = [];
   let descriptor: number | undefined;
   try {
-    descriptor = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    // Anchor at the selected home, then walk each config component through its
+    // open parent. Leaf-only O_NOFOLLOW would still follow symlinked parents.
+    directories.push(openSync(home, constants.O_RDONLY | constants.O_DIRECTORY));
+    for (const component of [".config", "jhw-control"]) {
+      directories.push(openSync(
+        `/proc/self/fd/${directories[directories.length - 1]}/${component}`,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      ));
+    }
+    descriptor = openSync(
+      `/proc/self/fd/${directories[directories.length - 1]}/control.env`,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
     const before = fstatSync(descriptor);
     if (!before.isFile() || before.uid !== process.getuid?.() ||
         (before.mode & 0o7777) !== 0o600 || before.nlink !== 1 || before.size > maximumConfigBytes) {
@@ -62,7 +75,11 @@ function readPrivateCoordinates(file: string): NodeJS.ProcessEnv {
     // Neither file paths nor untrusted config bytes reach the hook protocol.
     throw invalidConfig();
   } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
+    try {
+      if (descriptor !== undefined) closeSync(descriptor);
+    } finally {
+      for (const directory of directories.reverse()) closeSync(directory);
+    }
   }
 }
 
@@ -72,7 +89,7 @@ export function loadSessionEndConfig(environment: NodeJS.ProcessEnv): ControlCon
   if (coordinateKeys.some((key) => environment[key] !== undefined)) return loadControlConfig(environment);
   const home = environment.HOME ?? userInfo().homedir;
   if (!isAbsolute(home) || resolve(home) === parse(resolve(home)).root) throw invalidConfig();
-  const coordinates = readPrivateCoordinates(join(home, ".config/jhw-control/control.env"));
+  const coordinates = readPrivateCoordinates(home);
   // This evidence-only composition does not consume ambient Guard policy.
   return loadControlConfig(coordinates);
 }

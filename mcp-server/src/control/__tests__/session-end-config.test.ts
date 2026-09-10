@@ -1,4 +1,4 @@
-import { chmod, link, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, readFile, readdir, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -68,6 +68,75 @@ describe("SessionEnd private host configuration", () => {
     await symlink(join(f.root, "missing"), f.file);
     await expect(createProductionSessionEndRecorder({ ...f.environment, ...f.coordinates }).record(f.event))
       .resolves.toEqual({ status: "NO_MATCH" });
+  });
+
+  it.each([".config", ".config/jhw-control"])("rejects a symlinked %s config parent", async (parent) => {
+    // Break caught: leaf-only O_NOFOLLOW permits redirected host coordinates.
+    const f = await fixture();
+    const directory = join(f.root, parent);
+    const target = join(f.root, "relocated-config-parent");
+    await rename(directory, target);
+    await symlink(target, directory);
+    expect(() => createProductionSessionEndRecorder(f.environment))
+      .toThrowError(expect.objectContaining({ code: "INVALID_CONFIG" }));
+    const result = await runProductionHookAdapter(
+      ["--adapter", "codex", "--event", "SessionEnd"],
+      JSON.stringify({ hook_event_name: "SessionEnd", session_id: "fixture-session", cwd: f.root,
+        transcript_path: null, reason: "other" }),
+      f.environment,
+    );
+    expect(result).toEqual({ exitCode: 0, stdout: '{"systemMessage":"GUARD_UNAVAILABLE"}\n', stderr: "" });
+    expect(await readFile(f.file, "utf8")).toBe(f.text);
+    expect(await readdir(f.root)).not.toContain("state");
+  });
+
+  it.each([".config", ".config/jhw-control"])("ignores a symlinked %s parent with complete ambient coordinates", async (parent) => {
+    // Break caught: hardening the fallback accidentally validates an unused source.
+    const f = await fixture();
+    const directory = join(f.root, parent);
+    const target = join(f.root, "relocated-config-parent");
+    await rename(directory, target);
+    await symlink(target, directory);
+    await expect(createProductionSessionEndRecorder({ ...f.environment, ...f.coordinates }).record(f.event))
+      .resolves.toEqual({ status: "NO_MATCH" });
+  });
+
+  it.each([".config", ".config/jhw-control"])("rejects a non-directory %s config parent", async (parent) => {
+    const f = await fixture();
+    const directory = join(f.root, parent);
+    await rename(directory, join(f.root, "relocated-config-parent"));
+    await writeFile(directory, "not a directory");
+    expect(() => createProductionSessionEndRecorder(f.environment))
+      .toThrowError(expect.objectContaining({ code: "INVALID_CONFIG" }));
+    expect(await readdir(f.root)).not.toContain("state");
+  });
+
+  it("releases config descriptors after success and parent or leaf validation failure", async () => {
+    // Break caught: an error or return from the descriptor walk leaks open handles.
+    const f = await fixture();
+    const configDescriptors = async () => {
+      const targets: string[] = [];
+      for (const name of await readdir("/proc/self/fd")) {
+        try {
+          const target = await readlink(`/proc/self/fd/${name}`);
+          if (target === f.root || target.startsWith(`${f.root}/`)) targets.push(target);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+      return targets;
+    };
+    expect(await configDescriptors()).toEqual([]);
+    createProductionSessionEndRecorder(f.environment);
+    expect(await configDescriptors()).toEqual([]);
+    await chmod(f.file, 0o644);
+    expect(() => createProductionSessionEndRecorder(f.environment))
+      .toThrowError(expect.objectContaining({ code: "INVALID_CONFIG" }));
+    expect(await configDescriptors()).toEqual([]);
+    await rename(join(f.root, ".config/jhw-control"), join(f.root, "relocated-config-parent"));
+    expect(() => createProductionSessionEndRecorder(f.environment))
+      .toThrowError(expect.objectContaining({ code: "INVALID_CONFIG" }));
+    expect(await configDescriptors()).toEqual([]);
   });
 
   it.each([

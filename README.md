@@ -226,6 +226,8 @@ Claim은 release됐지만 host mapping만 남고 checkout은 사라진 경우에
 
 종료 훅에 Control 좌표 환경변수가 하나도 전달되지 않으면 `$HOME/.config/jhw-control/control.env`의 기존 non-secret host 좌표를 읽는다(`HOME` 자체가 없으면 OS 사용자 홈 사용). 파일은 현재 사용자 소유의 단일 링크 regular file, 정확히 `0600`, 최대 16 KiB여야 하며 symlink·미등록/중복 key·credential key·셸 표현식은 거부한다. secure host의 11개 좌표가 모두 필요하고, 환경변수에 좌표가 하나라도 있으면 파일과 합치지 않고 환경변수만 검증한다. 파일 fallback은 종료 증거 기록에서 사용하지 않는 ambient `JHW_GUARD_MODE`·`JHW_GUARD_ALLOW_OBSERVE`를 전달받지 않는다. 이 fallback은 `SessionEnd` 전용으로 Guard/CLI 설정이나 credential launcher를 활성화하지 않으며, 환경변수 기반 일반 Guard 설정 검증은 그대로 유지한다. 설정이 없거나 안전하지 않으면 종료 증거를 남기지 않으며 공개 hook launcher는 중립 `{}`로 종료한다.
 
+파일 fallback은 선택한 홈 디렉터리를 기준으로 `.config`와 `jhw-control`을 열린 부모 descriptor에 상대적으로 하나씩 검사한다. 두 상위 구성요소가 symlink이거나 디렉터리가 아니면 거부하고, 마지막 `control.env`도 no-follow로 연다. 성공·실패 모두 config 파일과 디렉터리 descriptor를 닫는다.
+
 measurement journal은 authority가 아니다. 성공 output에 `journal_warning.code=JOURNAL_WRITE_FAILED`가 붙어도 command는 이미 성공했으므로 재시도하지 않는다. 실패 command도 원래 exit/error를 유지한다.
 
 `COMMAND_FAILED`는 실패한 자식 process의 redacted 진단만 `error.detail`로 제공한다. 필드는 `command`, nullable `exit_code`, optional 최대 512 UTF-8 bytes의 `stderr_head`로 닫혀 있으며 args/stdout/raw cause와 일반 `ControlError` 메시지는 내보내지 않는다. 같은 detail은 measurement journal의 `error_detail`에 기록된다.
