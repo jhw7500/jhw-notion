@@ -600,13 +600,14 @@ async function assertContainedDependencyLinks(root: string, directory = root): P
 async function installTimeout(
   fixture: LauncherFixture,
   source?: string,
-  expectedSeconds = "8",
 ): Promise<string> {
   const path = join(fixture.bin, "timeout");
   await writeExecutable(path, source ?? `#!/usr/bin/env bash
 printf '%s\\n' "$@" > "$WATCHDOG_LOG"
-if [[ "$1" != "--foreground" || "$2" != "${expectedSeconds}" ]]; then exit 93; fi
-shift 2
+case "$1:$2" in
+  --foreground:8|--kill-after=0.2:2) shift 2 ;;
+  *) exit 93 ;;
+esac
 exec "$@"
 `);
   return path;
@@ -637,6 +638,56 @@ async function runLauncher(
     child.once("close", (code, signal) => {
       if (code === 0) resolvePromise({ stdout, stderr });
       else rejectPromise(Object.assign(new Error("launcher failed"), { code, signal, stdout, stderr }));
+    });
+    child.stdin.end(stdin);
+  });
+}
+
+async function runLauncherWithHardLimit(
+  fixture: LauncherFixture,
+  args: readonly string[],
+  stdin: string,
+  hardLimitMs: number,
+): Promise<{ stdout: string; stderr: string; elapsedMs: number; timedOut: boolean }> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const startedAt = Date.now();
+    const child = spawn(fixture.launcher, [...args], {
+      cwd: fixture.root,
+      detached: true,
+      env: {
+        PATH: fixture.bin,
+        WATCHDOG_LOG: join(fixture.root, "watchdog.log"),
+        FORWARDED_STDIN: join(fixture.root, "forwarded-stdin"),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (child.pid !== undefined) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // The process group already exited between the deadline and the signal.
+        }
+      }
+    }, hardLimitMs);
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      rejectPromise(error);
+    });
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolvePromise({
+        stdout,
+        stderr,
+        elapsedMs: Date.now() - startedAt,
+        timedOut,
+      });
     });
     child.stdin.end(stdin);
   });
@@ -681,7 +732,7 @@ printf '%s\\n' "$CORE_OUTPUT"
   it("forwards SessionEnd with an exact 3-second watchdog and neutral output", async () => {
     // Break caught: the launcher rejects SessionEnd or runs it past the advisory deadline.
     const fixture = await launcherFixture();
-    await installTimeout(fixture, undefined, "3");
+    await installTimeout(fixture);
     await writeExecutable(fixture.core, `#!/usr/bin/env bash
 IFS= read -r payload || true
 printf '%s' "$payload" > "$FORWARDED_STDIN"
@@ -697,7 +748,7 @@ printf '{}\\n'
     expect(result).toEqual({ stdout: "{}\n", stderr: "" });
     expect(await readFile(join(fixture.root, "forwarded-stdin"), "utf8")).toBe(stdin);
     const watchdog = (await readFile(join(fixture.root, "watchdog.log"), "utf8")).trimEnd().split("\n");
-    expect(watchdog.slice(0, 2)).toEqual(["--foreground", "3"]);
+    expect(watchdog.slice(0, 2)).toEqual(["--kill-after=0.2", "2"]);
     expect(resolve(watchdog[2] as string)).toBe(resolve(fixture.core));
     expect(watchdog.slice(3)).toEqual(["--adapter", "codex", "--event", "SessionEnd"]);
   });
@@ -715,6 +766,28 @@ printf '{}\\n'
 
     expect(result).toEqual({ stdout: "{}\n", stderr: "" });
   });
+
+  it("hard-kills a SIGTERM-resistant SessionEnd core within three seconds", async () => {
+    // Break caught: timeout sends TERM without escalation and session shutdown hangs indefinitely.
+    const fixture = await launcherFixture();
+    await symlink("/usr/bin/timeout", join(fixture.bin, "timeout"));
+    await writeExecutable(fixture.core, `#!/usr/bin/env bash
+trap '' TERM
+while :; do /usr/bin/sleep 1; done
+`);
+
+    const result = await runLauncherWithHardLimit(
+      fixture,
+      ["--adapter", "codex", "--event", "SessionEnd"],
+      sessionEndPayload("codex"),
+      4_500,
+    );
+
+    expect(result.timedOut).toBe(false);
+    expect(result.elapsedMs).toBeLessThan(3_000);
+    expect(result.stdout).toBe("{}\n");
+    expect(result.stderr).toBe("");
+  }, 6_000);
 
   it("rejects invalid launcher flags before invoking the core", async () => {
     // Break caught: unvalidated adapter/event values reach the core or become a silent shell error.

@@ -37,9 +37,9 @@ case "${4-}" in
     exit 0
     ;;
 esac
-watchdog_seconds=8
+watchdog_args=(--foreground 8)
 if [[ "$fallback_event" == "SessionEnd" ]]; then
-  watchdog_seconds=3
+  watchdog_args=(--kill-after=0.2 2)
 fi
 
 source_path="${BASH_SOURCE[0]}"
@@ -82,7 +82,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 set +e
-"$timeout_command" --foreground "$watchdog_seconds" "$core" "$@" | "$node_command" -e '
+"$timeout_command" "${watchdog_args[@]}" "$core" "$@" | "$node_command" -e '
 const fs = require("node:fs");
 const capture = process.argv[1];
 const overflow = process.argv[2];
