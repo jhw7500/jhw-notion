@@ -70,6 +70,34 @@ describe("SessionEnd private host configuration", () => {
       .resolves.toEqual({ status: "NO_MATCH" });
   });
 
+  it.each([
+    { JHW_GUARD_MODE: "enforce" },
+    { JHW_GUARD_MODE: "invalid-mode" },
+    { JHW_GUARD_MODE: "observe" },
+    { JHW_GUARD_MODE: "observe", JHW_GUARD_ALLOW_OBSERVE: "false" },
+    { JHW_GUARD_ALLOW_OBSERVE: "invalid-value" },
+  ])("ignores unused ambient Guard policy with private file coordinates: %j", async (policy) => {
+    // Break caught: unused Guard policy suppresses file-backed termination evidence.
+    const f = await fixture();
+    await expect(createProductionSessionEndRecorder({ ...f.environment, ...policy }).record(f.event))
+      .resolves.toEqual({ status: "NO_MATCH" });
+    expect(await readFile(f.file, "utf8")).toBe(f.text);
+    expect(await readdir(f.root)).not.toContain("state");
+  });
+
+  it.each([
+    { JHW_GUARD_MODE: "invalid-mode" },
+    { JHW_GUARD_MODE: "observe" },
+    { JHW_GUARD_MODE: "observe", JHW_GUARD_ALLOW_OBSERVE: "false" },
+  ])("still rejects invalid Guard policy for complete ambient coordinates: %j", async (policy) => {
+    const f = await fixture();
+    const environment = { ...f.environment, ...f.coordinates, ...policy };
+    expect(() => loadControlConfig(environment))
+      .toThrowError(expect.objectContaining({ code: "INVALID_CONFIG" }));
+    expect(() => createProductionSessionEndRecorder(environment))
+      .toThrowError(expect.objectContaining({ code: "INVALID_CONFIG" }));
+  });
+
   it("accepts data-only export/CRLF syntax at the byte boundary", async () => {
     const f = await fixture();
     const exported = f.text.split("\n").filter(Boolean).map((line) => `export\t${line}\r\n`).join("");
@@ -78,7 +106,8 @@ describe("SessionEnd private host configuration", () => {
       .resolves.toEqual({ status: "NO_MATCH" });
   });
 
-  it("records a real native SessionEnd through file configuration without lifecycle writes", async () => {
+  it.each([{}, { JHW_GUARD_MODE: "invalid-mode" }, { JHW_GUARD_MODE: "observe" }])(
+    "records a real native SessionEnd through file configuration without lifecycle writes: %j", async (policy) => {
     // Break caught: config is loaded but the production hook never reaches the journal,
     // or the evidence composition changes Task, Claim, mapping, or Guard authority state.
     const f = await fixture();
@@ -111,7 +140,7 @@ describe("SessionEnd private host configuration", () => {
       ["--adapter", "codex", "--event", "SessionEnd"],
       JSON.stringify({ hook_event_name: "SessionEnd", session_id: "fixture-session", cwd: worktree.path,
         transcript_path: null, reason: "other" }),
-      f.environment,
+      { ...f.environment, ...policy },
     );
     expect(result).toEqual({ exitCode: 0, stdout: "{}\n", stderr: "" });
     const journalBytes = await readFile(join(config.stateDir, "guard-journal.jsonl"), "utf8");

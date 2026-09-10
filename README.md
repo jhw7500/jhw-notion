@@ -34,7 +34,7 @@ install.sh가 자동으로:
    - Gemini: `~/.gemini/settings.json`의 `mcpServers`
    - OpenCode: `~/.config/opencode/opencode.json`의 `mcp`
    - Codex: `~/.codex/config.toml`의 `mcp_servers`
-6. Codex가 설치되어 있으면 `~/.codex/hooks.json`의 `UserPromptSubmit`·`PreToolUse`·`PostToolUse` Guard command group과 evidence-only `SessionEnd` command group을 등록하고 public `jhw-control guard preflight` 실행. Control 환경변수가 미설정이면 기존 Guard 비활성화 규칙을 유지하면서 `SessionEnd`만 독립 등록한다. 이는 Guard 보호 활성화가 아니며 hook 신뢰 승인은 Codex `/hooks`에서 사용자가 확인한다.
+6. Codex가 설치되어 있으면 `~/.codex/hooks.json`의 `UserPromptSubmit`·`PreToolUse`·`PostToolUse` Guard command group과 evidence-only `SessionEnd` command group을 등록하고 public `jhw-control guard preflight` 실행. Control 좌표 환경변수가 미설정이면 `JHW_GUARD_MODE`·`JHW_GUARD_ALLOW_OBSERVE` 값과 무관하게 기존 Guard 비활성화 규칙을 유지하면서 `SessionEnd`만 독립 등록한다. 이는 Guard 보호 활성화가 아니며 hook 신뢰 승인은 Codex `/hooks`에서 사용자가 확인한다.
 
 모든 canonical/legacy skill target과 same-name MCP entry는 이 저장소 소유임이 증명될 때만 교체한다. 다른 file/symlink/registration이 있으면 그대로 보존하고 install은 fail-closed한다. JSON/TOML 설정은 기존 mode를 보존한 private same-directory temp에서 fsync 후 atomic publish한다. Codex backup도 이 설치기의 명시적 namespace만 관리한다.
 
@@ -224,7 +224,7 @@ Claim은 release됐지만 host mapping만 남고 checkout은 사라진 경우에
 
 정상 Codex 세션 종료의 `SessionEnd`는 최대 3초의 advisory evidence hook이다. exact active Claim과 cwd/worktree가 검증될 때만 bounded `session-ended` Git 좌표를 derived Guard journal에 기록한다. session ID, absolute path, transcript 내용은 저장하지 않으며 Claim release·finish·force-end·takeover·mapping repair 권한이 없다. crash/kill이나 timeout이면 evidence가 없을 수 있으므로 다음 세션은 언제나 위 recovery status와 명시적 승인 절차로 복구한다.
 
-종료 훅에 Control 좌표 환경변수가 하나도 전달되지 않으면 `$HOME/.config/jhw-control/control.env`의 기존 non-secret host 좌표를 읽는다(`HOME` 자체가 없으면 OS 사용자 홈 사용). 파일은 현재 사용자 소유의 단일 링크 regular file, 정확히 `0600`, 최대 16 KiB여야 하며 symlink·미등록/중복 key·credential key·셸 표현식은 거부한다. secure host의 11개 좌표가 모두 필요하고, 환경변수에 좌표가 하나라도 있으면 파일과 합치지 않고 환경변수만 검증한다. 이 fallback은 `SessionEnd` 전용으로 Guard/CLI 설정이나 credential launcher를 활성화하지 않는다. 설정이 없거나 안전하지 않으면 종료 증거를 남기지 않으며 공개 hook launcher는 중립 `{}`로 종료한다.
+종료 훅에 Control 좌표 환경변수가 하나도 전달되지 않으면 `$HOME/.config/jhw-control/control.env`의 기존 non-secret host 좌표를 읽는다(`HOME` 자체가 없으면 OS 사용자 홈 사용). 파일은 현재 사용자 소유의 단일 링크 regular file, 정확히 `0600`, 최대 16 KiB여야 하며 symlink·미등록/중복 key·credential key·셸 표현식은 거부한다. secure host의 11개 좌표가 모두 필요하고, 환경변수에 좌표가 하나라도 있으면 파일과 합치지 않고 환경변수만 검증한다. 파일 fallback은 종료 증거 기록에서 사용하지 않는 ambient `JHW_GUARD_MODE`·`JHW_GUARD_ALLOW_OBSERVE`를 전달받지 않는다. 이 fallback은 `SessionEnd` 전용으로 Guard/CLI 설정이나 credential launcher를 활성화하지 않으며, 환경변수 기반 일반 Guard 설정 검증은 그대로 유지한다. 설정이 없거나 안전하지 않으면 종료 증거를 남기지 않으며 공개 hook launcher는 중립 `{}`로 종료한다.
 
 measurement journal은 authority가 아니다. 성공 output에 `journal_warning.code=JOURNAL_WRITE_FAILED`가 붙어도 command는 이미 성공했으므로 재시도하지 않는다. 실패 command도 원래 exit/error를 유지한다.
 

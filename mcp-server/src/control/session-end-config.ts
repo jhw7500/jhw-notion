@@ -73,9 +73,6 @@ export function loadSessionEndConfig(environment: NodeJS.ProcessEnv): ControlCon
   const home = environment.HOME ?? userInfo().homedir;
   if (!isAbsolute(home) || resolve(home) === parse(resolve(home)).root) throw invalidConfig();
   const coordinates = readPrivateCoordinates(join(home, ".config/jhw-control/control.env"));
-  return loadControlConfig({
-    ...coordinates,
-    JHW_GUARD_MODE: environment.JHW_GUARD_MODE,
-    JHW_GUARD_ALLOW_OBSERVE: environment.JHW_GUARD_ALLOW_OBSERVE,
-  });
+  // This evidence-only composition does not consume ambient Guard policy.
+  return loadControlConfig(coordinates);
 }
