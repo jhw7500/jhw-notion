@@ -607,7 +607,7 @@ describe("secure request state", () => {
 
     await expect(store.createOrReusePending(operation())).rejects.toMatchObject({ code: "GUARD_UNAVAILABLE" });
     await expect(lstat(join(stateDir, "guard-requests.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
-    expect((await import("node:fs/promises")).readdir(stateDir).then((names) => names.filter((name) => name.endsWith(".tmp"))))
+    await expect((await import("node:fs/promises")).readdir(stateDir).then((names) => names.filter((name) => name.endsWith(".tmp"))))
       .resolves.toEqual([]);
   });
 
