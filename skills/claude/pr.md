@@ -1425,7 +1425,7 @@ jhw_pr_workflow_run_floor() {
 }
 
 jhw_pr_apply_new_pr_policy() {
-  local mode="$1" local_head actual_local_head draft expected_base workflow_trigger_event
+  local mode="$1" local_head actual_local_head draft expected_base workflow_trigger_event created_pr_url
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
   case "$mode" in
     request|auto) workflow_trigger_event=pull_request ;;
@@ -1443,8 +1443,8 @@ jhw_pr_apply_new_pr_policy() {
   git push -u origin HEAD || return 1
   actual_local_head="$(git rev-parse HEAD)" || return 1
   [[ "$actual_local_head" == "$local_head" ]] || { echo "local head changed during push" >&2; return 1; }
-  gh pr create --repo "$REPO_NWO" --base "$expected_base" --draft --fill >/dev/null || return 1
-  PR="$(gh pr view --repo "$REPO_NWO" --json number --jq .number)" || return 1
+  created_pr_url="$(gh pr create --repo "$REPO_NWO" --base "$expected_base" --draft --fill)" || return 1
+  PR="$(gh pr view "$created_pr_url" --repo "$REPO_NWO" --json number --jq .number)" || return 1
   [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid created PR" >&2; return 1; }
   jhw_pr_reconcile_review_labels "$mode" || return
   jhw_pr_verify_remote_policy "$mode" "$local_head" "$expected_base" || return
