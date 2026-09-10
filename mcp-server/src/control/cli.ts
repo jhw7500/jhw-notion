@@ -1834,7 +1834,21 @@ async function executeBoard(
   usage("Unknown command");
 }
 
-async function execute(command: CommandName, argv: readonly string[], dependencies: CliDependencies): Promise<{ result: CliResult; flags?: ParsedFlags }> {
+async function execute(
+  command: CommandName,
+  argv: readonly string[],
+  dependencies: CliDependencies,
+  retainTaskFlags: (flags: ParsedFlags) => void,
+): Promise<{ result: CliResult; flags?: ParsedFlags }> {
+  const parseTaskFlags = (allowed: ReadonlySet<string>, repeated?: Set<string>): ParsedFlags => {
+    const flags = parseFlags(argv.slice(2), allowed, repeated);
+    assertSafeFlags(flags, dependencies);
+    // Keep validated input coordinates available if a later service call throws.
+    // This runs inside the existing dispatch/lock boundary, never before it.
+    retainTaskFlags(flags);
+    return flags;
+  };
+
   if (command === "help") {
     return { result: resultJson(command, { commands: commandNames }) };
   }
@@ -1870,14 +1884,13 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task start") {
-    const flags = parseFlags(argv.slice(2), new Set([
+    const flags = parseTaskFlags(new Set([
       "--task",
       "--project", "--repo-id", "--repo-path", "--issue-node-id", "--issue-url", "--issue-revision",
       "--resolve-from-checkout",
       "--temp-alias", "--goal", "--done", "--scope", "--session", "--role", "--grant", "--depends",
       "--origin-adapter",
     ]), new Set(["--done", "--scope", "--grant", "--depends"]));
-    assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
     const session_id = requireClaimCoordinate(flags, "--session");
@@ -2032,12 +2045,11 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task child-start") {
-    const flags = parseFlags(argv.slice(2), new Set([
+    const flags = parseTaskFlags(new Set([
       "--parent", "--alias", "--repo-path", "--goal", "--done", "--required-for-parent",
       "--grant", "--depends", "--session",
       "--origin-adapter",
     ]), new Set(["--done", "--grant", "--depends"]));
-    assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
     const done_conditions = values(flags, "--done").filter((entry) => isNonEmpty(entry));
@@ -2086,10 +2098,9 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task contract") {
-    const flags = parseFlags(argv.slice(2), new Set([
+    const flags = parseTaskFlags(new Set([
       "--task", "--role", "--grant", "--depends",
     ]), new Set(["--grant", "--depends"]));
-    assertSafeFlags(flags, dependencies);
     const task_id = requireTaskId(flags);
     const configured = await dependencies.catalog.configureInactiveTask({
       task_id,
@@ -2104,10 +2115,9 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task completion-ready") {
-    const flags = parseFlags(argv.slice(2), new Set([
+    const flags = parseTaskFlags(new Set([
       "--task", "--claim", "--integration-validation", "--child-disposition",
     ]), new Set(["--integration-validation", "--child-disposition"]));
-    assertSafeFlags(flags, dependencies);
     const evidence = parseTaskCompletionEvidenceFlags(
       values(flags, "--integration-validation"),
       values(flags, "--child-disposition"),
@@ -2130,10 +2140,9 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task promote") {
-    const flags = parseFlags(argv.slice(2), new Set([
+    const flags = parseTaskFlags(new Set([
       "--task", "--repo-path", "--issue-url", "--issue-node-id", "--issue-revision",
     ]));
-    assertSafeFlags(flags, dependencies);
     const repository_path = required(flags, "--repo-path");
     if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
     const promoted = await dependencies.source.promoteTemporaryTask({
@@ -2147,10 +2156,9 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task status") {
-    const flags = parseFlags(argv.slice(2), new Set([
+    const flags = parseTaskFlags(new Set([
       "--task", "--claim", "--resolve-from-checkout", "--repo-path", "--origin-adapter", "--session",
     ]));
-    assertSafeFlags(flags, dependencies);
     const resolveFromCheckout = value(flags, "--resolve-from-checkout");
     const currentFields = ["--resolve-from-checkout", "--repo-path", "--origin-adapter", "--session"] as const;
     const currentCount = currentFields.filter((flag) => flags.has(flag)).length;
@@ -2196,8 +2204,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task handoff") {
-    const flags = parseFlags(argv.slice(2), new Set(["--task", "--claim"]));
-    assertSafeFlags(flags, dependencies);
+    const flags = parseTaskFlags(new Set(["--task", "--claim"]));
     const taskId = requireTaskId(flags);
     const claim = value(flags, "--claim");
     const handoff = await dependencies.taskService.handoff(
@@ -2208,11 +2215,10 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task finish") {
-    const flags = parseFlags(argv.slice(2), new Set([
+    const flags = parseTaskFlags(new Set([
       "--task", "--claim", "--status", "--validation", "--outcome", "--source-task-revision",
       "--progress", "--failures", "--next-step", "--related-adr-and-evidence", "--active-work-minutes",
     ]), new Set(["--validation"]));
-    assertSafeFlags(flags, dependencies);
     const task_id = requireTaskId(flags);
     const claim_id = requireClaimId(flags);
     const status = required(flags, "--status");
@@ -2258,11 +2264,10 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task recover") {
-    const flags = parseFlags(argv.slice(2), new Set([
+    const flags = parseTaskFlags(new Set([
       "--task", "--expect", "--action", "--session", "--origin-adapter",
       "--resolve-from-checkout", "--repo-path", "--issue-url", "--worktree-ref",
     ]));
-    assertSafeFlags(flags, dependencies);
     const actionName = required(flags, "--action");
     const discoveryNames = [
       "--resolve-from-checkout",
@@ -2391,8 +2396,7 @@ async function execute(command: CommandName, argv: readonly string[], dependenci
   }
 
   if (command === "task assert-owner") {
-    const flags = parseFlags(argv.slice(2), new Set(["--task", "--claim"]));
-    assertSafeFlags(flags, dependencies);
+    const flags = parseTaskFlags(new Set(["--task", "--claim"]));
     const active = await dependencies.taskService.assertOwner(requireTaskId(flags), requireClaimId(flags));
     return { flags, result: resultJson(command, { owned: true, claim: activeSummary(active) }) };
   }
@@ -2524,16 +2528,17 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
   const lockCommand = mutationLockCommand(argv);
   let flags: ParsedFlags | undefined;
   let result: CliResult;
+  const executeCommand = () => execute(command, argv, dependencies, (parsed) => { flags = parsed; });
   try {
     // Lifecycle work cannot reach a production service path without first
     // acquiring the injected host-global callback lock. Read-only commands
     // intentionally remain lock-free.
     const execution = lockCommand
       ? await dependencies.mutationLock.run(
-        () => execute(command, argv, dependencies),
+        executeCommand,
         { command: lockCommand },
       )
-      : await execute(command, argv, dependencies);
+      : await executeCommand();
     if (Buffer.byteLength(execution.result.stdout || execution.result.stderr, "utf8") > CLI_RESULT_BUDGET) {
       throw new ControlError("CLI_OUTPUT_TOO_LARGE", "A control command exceeded the bounded output envelope");
     }
