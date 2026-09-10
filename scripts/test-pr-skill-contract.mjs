@@ -1005,6 +1005,29 @@ async function main() {
   }
 
   try {
+    const issueFailureCases = [
+      ["observed Codex quota response", "chatgpt-codex-connector[bot]", "2026-08-29T00:02:00Z", "You have reached your Codex usage limits for code reviews", "FAILED,reviewer_response_failed"],
+      ["quota response plus upgrade link", "chatgpt-codex-connector[bot]", "2026-08-29T00:02:00Z", "You have reached your Codex usage limits for code reviews.\nUpgrade at https://example.invalid/usage", "FAILED,reviewer_response_failed"],
+      ["exact quota text discussed as an example", "chatgpt-codex-connector[bot]", "2026-08-29T00:02:00Z", "Add a test for the response: You have reached your Codex usage limits for code reviews.", "PENDING,"],
+      ["exact quota fixture explicitly corrected", "chatgpt-codex-connector[bot]", "2026-08-29T00:02:00Z", "You have reached your Codex usage limits for code reviews.\nThis is a regression fixture; the current review completed successfully.", "PENDING,"],
+      ["current bot failure", "chatgpt-codex-connector[bot]", "2026-08-29T00:02:00Z", "You've reached your usage limit.", "FAILED,reviewer_response_failed"],
+      ["old bot failure", "chatgpt-codex-connector[bot]", "2026-08-29T00:00:59Z", "You've reached your usage limit.", "PENDING,"],
+      ["same-second unscoped failure", "chatgpt-codex-connector[bot]", requestCreatedAt, "You've reached your usage limit.", "PENDING,"],
+      ["different actor", "some-user", "2026-08-29T00:02:00Z", "You've reached your usage limit.", "PENDING,"],
+      ["plain comment cannot approve", "chatgpt-codex-connector[bot]", "2026-08-29T00:02:00Z", "No P1 findings.", "PENDING,"],
+      ["discussion of quota is not a failure", "chatgpt-codex-connector[bot]", "2026-08-29T00:02:00Z", "Add coverage for usage limit handling.", "PENDING,"],
+    ];
+    for (const [name, actor, createdAt, body, expected] of issueFailureCases) {
+      const observed = await run(
+        baseState({ issueComments: [
+          { id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody },
+          { id: 9003, actor, createdAt, body },
+        ] }),
+        "ship_codex_trigger\nship_codex_signal_status\nprintf '%s,%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\"",
+      );
+      assert.equal(observed.stdout.trim(), expected, name);
+    }
+
     const missingBaseCoordinate = await runResult(baseState(), "ship_codex_trigger", { ROUND_BASE_OID: "" });
     assert.notEqual(missingBaseCoordinate.code, 0,
       "the round contract must fail closed without a base OID");
