@@ -2487,6 +2487,115 @@ describe("runCli", () => {
     });
   });
 
+  it.each([
+    ["resume source", "source", "prepareExistingTask", [
+      "task", "start", "--task", TASK_ID, "--repo-path", "/private/checkout",
+      "--origin-adapter", "codex", "--session", "private-resume-session",
+    ], false],
+    ["resume context", "taskService", "resumeContext", [
+      "task", "start", "--task", TASK_ID, "--repo-path", "/private/checkout",
+      "--origin-adapter", "codex", "--session", "private-resume-session",
+    ], false],
+    ["resume start", "taskService", "start", [
+      "task", "start", "--task", TASK_ID, "--repo-path", "/private/checkout",
+      "--origin-adapter", "codex", "--session", "private-resume-session",
+    ], false],
+    ["status", "taskService", "status", ["task", "status", "--task", TASK_ID, "--claim", CLAIM_ID], true],
+    ["handoff", "taskService", "handoff", ["task", "handoff", "--task", TASK_ID, "--claim", CLAIM_ID], true],
+    ["recovery status", "taskService", "recover", [
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "status",
+    ], true],
+    ["takeover", "taskService", "recover", [
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "takeover",
+      "--origin-adapter", "codex", "--session", "private-resume-session",
+    ], true],
+    ["assert-owner", "taskService", "assertOwner", ["task", "assert-owner", "--task", TASK_ID, "--claim", CLAIM_ID], true],
+    ["contract", "catalog", "configureInactiveTask", [
+      "task", "contract", "--task", TASK_ID, "--role", "standalone",
+      "--grant", "repo.modify:repository:repo-control:shared",
+    ], false],
+    ["completion-ready", "taskService", "markCompletionReady", [
+      "task", "completion-ready", "--task", TASK_ID, "--claim", CLAIM_ID,
+      "--integration-validation", "private-validation-text",
+    ], true],
+    ["promotion", "source", "promoteTemporaryTask", [
+      "task", "promote", "--task", TASK_ID, "--repo-path", "/private/checkout",
+      "--issue-url", "https://github.com/example/control/issues/1",
+    ], false],
+  ] as const)("retains parsed failure journal coordinates for %s", async (_name, port, method, args, hasClaim) => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-failure-journal-"));
+    const result = await runCli([...args], makeCliDependencies({
+      stateDir,
+      [port]: { [method]: async () => { throw new ControlError("REMOTE_DIVERGED", "private-error-text"); } },
+    }));
+
+    expect(result.exitCode).toBe(75);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "REMOTE_DIVERGED" } });
+    const text = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
+    const rows = text.trim().split("\n").map((line) => JSON.parse(line));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({
+      command: `task ${args[1]}`,
+      started_at: "2026-08-13T00:00:00.000Z",
+      finished_at: "2026-08-13T00:00:00.000Z",
+      elapsed_ms: 0,
+      ok: false,
+      error_code: "REMOTE_DIVERGED",
+      payload_bytes: Buffer.byteLength(result.stderr),
+      task_id: TASK_ID,
+      ...(hasClaim ? { claim_id: CLAIM_ID } : {}),
+    });
+    for (const privateValue of ["/private/checkout", "private-resume-session", "private-validation-text", "private-error-text"]) {
+      expect(text).not.toContain(privateValue);
+    }
+  });
+
+  it.each([
+    ["unknown flag", ["--unexpected", "value"]],
+    ["duplicate task", ["--task", TASK_ID]],
+    ["invalid claim", ["--claim", "not-a-claim"]],
+  ] as const)("does not journal rejected Task arguments: %s", async (_name, extra) => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-rejected-journal-"));
+    const result = await runCli(["task", "status", "--task", TASK_ID, ...extra], makeCliDependencies({ stateDir }));
+
+    expect(result.exitCode).toBe(2);
+    await expect(readFile(join(stateDir, "pilot-journal.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not retain journal coordinates before sensitive-data validation", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-sensitive-journal-"));
+    const result = await runCli([
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID,
+      "--action", "takeover", "--origin-adapter", "codex", "--session", "configured-private-value",
+    ], makeCliDependencies({ stateDir, env: { GH_TOKEN: "configured-private-value" } }));
+
+    expect(result.exitCode).toBe(1);
+    const text = await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8");
+    const row = JSON.parse(text);
+    expect(row.ok).toBe(false);
+    expect(row).not.toHaveProperty("task_id");
+    expect(row).not.toHaveProperty("claim_id");
+    expect(text).not.toContain("configured-private-value");
+  });
+
+  it("keeps lock failure precedence without journaling unparsed Task coordinates", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "jhw-cli-lock-journal-"));
+    const result = await runCli([
+      "task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "cleanup",
+    ], makeCliDependencies({
+      stateDir,
+      mutationLock: { run: async () => { throw new ControlError("LOCK_CONTENDED", "busy"); } },
+    }));
+
+    expect(result.exitCode).toBe(75);
+    expect(JSON.parse(result.stderr)).toEqual({ error: { code: "LOCK_CONTENDED" } });
+    const row = JSON.parse(await readFile(join(stateDir, "pilot-journal.jsonl"), "utf8"));
+    expect(row).toMatchObject({ command: "task recover", ok: false, error_code: "LOCK_CONTENDED" });
+    expect(row).not.toHaveProperty("task_id");
+    expect(row).not.toHaveProperty("claim_id");
+  });
+
   it("surfaces only retained Claim coordinates when task start reports a retained Claim", async () => {
     const dependencies = makeCliDependencies({
       taskService: {
