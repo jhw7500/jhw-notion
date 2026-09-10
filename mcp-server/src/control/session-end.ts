@@ -2,7 +2,6 @@ import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, sep } from "node:path";
 
 import { RegistryRecordStore } from "./codec.js";
-import { loadControlConfig, type ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { SessionEndEventSchema } from "./guard-protocol.js";
 import { createProductionGuardJournal, type GuardJournalPort } from "./guard-journal.js";
@@ -10,6 +9,7 @@ import { ProcessRunner } from "./process.js";
 import { RegistryGit } from "./registry-git.js";
 import { activeClaimRelativePath, taskRelativePath } from "./registry-paths.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
+import { loadSessionEndConfig } from "./session-end-config.js";
 import { ActiveClaimSchema, TaskRecordSchema, type ActiveClaim, type TaskRecord } from "./schemas.js";
 import type { GuardTaskInspection } from "./task-service.js";
 import { WorktreeManager } from "./worktree.js";
@@ -109,7 +109,7 @@ class ProductionSessionEndReader {
 export function createProductionSessionEndRecorder(
   environment: NodeJS.ProcessEnv = process.env,
 ): SessionEndRecorder {
-  const config: ControlConfig = loadControlConfig(environment);
+  const config = loadSessionEndConfig(environment);
   const runner = new ProcessRunner(environment);
   const sensitiveData = createSensitiveDataPolicy(environment, [
     config.registryDir,

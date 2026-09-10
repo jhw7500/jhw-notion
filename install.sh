@@ -666,10 +666,11 @@ unregister_opencode_mcp() {
 }
 
 register_codex_hooks() {
-  local hooks_file="$1" rc
+  local hooks_file="$1" scope="${2:-all}" label="Guard hook 그룹" rc
+  [ "$scope" != "session-end-only" ] || label="SessionEnd 증거 hook"
   mkdir -p "$(dirname "$hooks_file")"
   if node "$CONFIG_EDITOR" "register-codex-hooks-transaction" "$hooks_file" \
-      "$MCP_ENTRY" "$SCRIPT_DIR" "$HOOKS_TRANSACTION_DIR" 2>/dev/null; then
+      "$MCP_ENTRY" "$SCRIPT_DIR" "$HOOKS_TRANSACTION_DIR" "$scope" 2>/dev/null; then
     rc=0
   else
     rc=$?
@@ -686,7 +687,7 @@ register_codex_hooks() {
   fi
   if [ "$rc" -eq 0 ] && [ "$HOOKS_TRANSACTION_STAGE" = "activated" ]; then
     HOOKS_CONFIG_CHANGED=1
-    ok "Codex: Guard hook 그룹 등록"
+    ok "Codex: $label 등록"
     return
   fi
   if [ "$rc" -eq 3 ] && [ "$HOOKS_TRANSACTION_STAGE" = "unchanged-restored" ]; then
@@ -697,7 +698,7 @@ register_codex_hooks() {
       report_codex_hook_transaction
       exit 1
     fi
-    skip "Codex: Guard hook 그룹 이미 최신"
+    skip "Codex: $label 이미 최신"
     return
   fi
   if [ "$rc" -eq 4 ] && { [ "$HOOKS_TRANSACTION_STAGE" = "foreign-restored" ] ||
@@ -726,7 +727,7 @@ control_coordinates_absent() {
     JHW_REGISTRY_DIR JHW_WORKTREE_ROOT JHW_BUILD_HOST JHW_GITHUB_OWNER \
     JHW_PROJECT_NUMBER JHW_REGISTRY_REPOSITORY JHW_PREFLIGHT_PROJECT_ITEM_ID \
     JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER JHW_CONTROL_STATE_DIR JHW_REGISTRY_REMOTE \
-    JHW_REGISTRY_BRANCH JHW_GUARD_MODE JHW_GUARD_ALLOW_OBSERVE; do
+    JHW_REGISTRY_BRANCH; do
     [ -z "${!key+x}" ] || return 1
   done
   return 0
@@ -1081,8 +1082,10 @@ echo "[6/6] Codex Guard hook 등록"
 if control_coordinates_absent; then
   run_guard_preflight
   if [ -d "$CODEX_DIR" ]; then
-    unregister_codex_hooks "$CODEX_DIR/hooks.json"
+    allocate_codex_hook_transaction "$CODEX_DIR/hooks.json"
+    register_codex_hooks "$CODEX_DIR/hooks.json" "session-end-only"
     skip "Codex: Project Control 미설정 — Guard hook 그룹 비활성"
+    echo "  Codex /hooks 화면에서 SessionEnd hook을 검토하고 신뢰 상태를 확인하세요."
   else
     skip "Codex CLI 미설치 — Guard hook 배선 생략"
   fi

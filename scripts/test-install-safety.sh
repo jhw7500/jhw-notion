@@ -447,18 +447,15 @@ run_install() {
 
 run_default_install() {
   local home="$1"
-  local -a explicit_guard=()
+  shift
   provision_valid_control_host "$home"
-  if [ -n "${JHW_TEST_DEFAULT_GUARD_MODE:-}" ]; then
-    explicit_guard=("JHW_GUARD_MODE=$JHW_TEST_DEFAULT_GUARD_MODE")
-  fi
   env \
     -u JHW_REGISTRY_DIR -u JHW_REGISTRY_REMOTE -u JHW_REGISTRY_BRANCH \
     -u JHW_WORKTREE_ROOT -u JHW_CONTROL_STATE_DIR -u JHW_BUILD_HOST \
     -u JHW_GITHUB_OWNER -u JHW_PROJECT_NUMBER -u JHW_REGISTRY_REPOSITORY \
     -u JHW_PREFLIGHT_PROJECT_ITEM_ID -u JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER \
     -u JHW_GUARD_MODE -u JHW_GUARD_ALLOW_OBSERVE \
-    "${explicit_guard[@]}" \
+    "$@" \
     HOME="$home" PATH="$FAKE_BIN:$PATH" JHW_INSTALL_CODEX_LOG="$home/codex.log" \
     bash "$INSTALL" >"$home/install.log" 2>&1
 }
@@ -920,20 +917,32 @@ EOF
 }
 
 test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks() {
-  local home="$ROOT/default-unprovisioned-home" hooks expected
+  local home="$ROOT/default-unprovisioned-${1:-none}-home" hooks expected
+  if [ "$#" -gt 0 ]; then shift; fi
   make_tui_roots "$home"
   hooks="$home/.codex/hooks.json"
   expected="$home/hooks.expected.json"
   write_owned_hooks_fixture "$hooks" "$home" yes
   chmod 0640 "$hooks"
   write_owned_hooks_fixture "$expected" "$home" no
+  node - "$expected" <<'EOF'
+const fs = require("node:fs");
+const file = process.argv[2];
+const document = JSON.parse(fs.readFileSync(file, "utf8"));
+document.hooks.SessionEnd = [{ hooks: [{
+  type: "command",
+  command: '"$HOME/.local/bin/jhw-control-hook" --adapter codex --event SessionEnd',
+  timeout: 3,
+}] }];
+fs.writeFileSync(file, JSON.stringify(document));
+EOF
 
-  run_default_install "$home"
+  run_default_install "$home" "$@"
 
   [ -L "$home/.local/bin/jhw-control-hook" ] || return 1
   [ "$(readlink -f -- "$home/.local/bin/jhw-control-hook")" = "$REPO_ROOT/scripts/jhw-control-hook" ] || return 1
   if ! cmp -s -- "$expected" "$hooks"; then
-    echo "default unprovisioned install left owned Guard hooks active or changed foreign hooks" >&2
+    echo "default install must retain SessionEnd only and preserve foreign hooks" >&2
     diff -u -- "$expected" "$hooks" >&2 || true
     return 1
   fi
@@ -950,20 +959,32 @@ test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_forei
     echo "default unprovisioned install claimed protection" >&2
     return 1
   fi
+  run_default_install "$home" "$@"
+  cmp -s -- "$expected" "$hooks" || return 1
+  assert_no_hook_transaction_evidence "$home"
+  run_install "$home" --uninstall
+  write_owned_hooks_fixture "$expected" "$home" no
+  cmp -s -- "$expected" "$hooks" || return 1
+  run_default_install "$home" "$@"
+  node - "$hooks" <<'EOF'
+const fs = require("node:fs");
+const document = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (document.hooks.SessionEnd?.length !== 1 || document.hooks.PreToolUse !== undefined) process.exit(1);
+EOF
+  assert_no_hook_transaction_evidence "$home"
 }
 
-test_no_coordinates_with_explicit_invalid_guard_mode_aborts() {
-  local home="$ROOT/default-invalid-guard-home"
-  make_tui_roots "$home"
-
-  if JHW_TEST_DEFAULT_GUARD_MODE="invalid-mode" run_default_install "$home"; then
-    echo "explicit invalid Guard mode was misclassified as unprovisioned" >&2
-    return 1
-  fi
-  ! grep -qF 'UNPROTECTED' "$home/install.log" || return 1
-  ! grep -qF '설치 완료!' "$home/install.log" || return 1
-  [ ! -e "$home/.codex/hooks.json" ] || return 1
-  [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || return 1
+test_no_coordinates_installs_session_end_independently_of_guard_policy() {
+  test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks enforce \
+    JHW_GUARD_MODE=enforce
+  test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks invalid \
+    JHW_GUARD_MODE=invalid-mode
+  test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks observe \
+    JHW_GUARD_MODE=observe
+  test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks denied-observe \
+    JHW_GUARD_MODE=observe JHW_GUARD_ALLOW_OBSERVE=false
+  test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks allow-only \
+    JHW_GUARD_ALLOW_OBSERVE=invalid-value
 }
 
 test_rollback_failure_preserves_launcher_and_private_recovery_snapshot() {
@@ -3228,7 +3249,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   diagnostic-schema) test_install_requires_complete_guard_diagnostic_schema; exit ;;
   rollback-hooks) test_preflight_failure_restores_exact_prior_hook_state; exit ;;
   default-unprovisioned) test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks; exit ;;
-  invalid-default-guard) test_no_coordinates_with_explicit_invalid_guard_mode_aborts; exit ;;
+  guard-policy-independent) test_no_coordinates_installs_session_end_independently_of_guard_policy; exit ;;
   rollback-failure) test_rollback_failure_preserves_launcher_and_private_recovery_snapshot; exit ;;
   rollback-cas) test_rollback_capture_preserves_concurrent_hook_changes; exit ;;
   rollback-same-bytes-new-inode) test_rollback_same_bytes_new_inode_is_not_owned_publication; exit ;;
@@ -3310,7 +3331,7 @@ test_install_rejects_malformed_diagnostic_and_rolls_back_hooks
 test_install_requires_complete_guard_diagnostic_schema
 test_preflight_failure_restores_exact_prior_hook_state
 test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks
-test_no_coordinates_with_explicit_invalid_guard_mode_aborts
+test_no_coordinates_installs_session_end_independently_of_guard_policy
 test_rollback_failure_preserves_launcher_and_private_recovery_snapshot
 test_rollback_capture_preserves_concurrent_hook_changes
 test_rollback_same_bytes_new_inode_is_not_owned_publication
