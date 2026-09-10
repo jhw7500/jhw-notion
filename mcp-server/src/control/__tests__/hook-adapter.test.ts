@@ -597,11 +597,15 @@ async function assertContainedDependencyLinks(root: string, directory = root): P
   return links;
 }
 
-async function installTimeout(fixture: LauncherFixture, source?: string): Promise<string> {
+async function installTimeout(
+  fixture: LauncherFixture,
+  source?: string,
+  expectedSeconds = "8",
+): Promise<string> {
   const path = join(fixture.bin, "timeout");
   await writeExecutable(path, source ?? `#!/usr/bin/env bash
 printf '%s\\n' "$@" > "$WATCHDOG_LOG"
-if [[ "$1" != "--foreground" || "$2" != "8" ]]; then exit 93; fi
+if [[ "$1" != "--foreground" || "$2" != "${expectedSeconds}" ]]; then exit 93; fi
 shift 2
 exec "$@"
 `);
@@ -638,7 +642,7 @@ async function runLauncher(
   });
 }
 
-describe("8-second fail-closed launcher", () => {
+describe("event-specific fail-closed launcher", () => {
   it("ships as an executable user-facing file", async () => {
     // Break caught: installation links a launcher that the OS cannot execute.
     const stat = await lstat(sourceLauncher);
@@ -672,6 +676,44 @@ printf '%s\\n' "$CORE_OUTPUT"
     expect(watchdog.slice(0, 2)).toEqual(["--foreground", "8"]);
     expect(resolve(watchdog[2] as string)).toBe(resolve(fixture.core));
     expect(watchdog.slice(3)).toEqual(["--adapter", "claude", "--event", "PreToolUse"]);
+  });
+
+  it("forwards SessionEnd with an exact 3-second watchdog and neutral output", async () => {
+    // Break caught: the launcher rejects SessionEnd or runs it past the advisory deadline.
+    const fixture = await launcherFixture();
+    await installTimeout(fixture, undefined, "3");
+    await writeExecutable(fixture.core, `#!/usr/bin/env bash
+IFS= read -r payload || true
+printf '%s' "$payload" > "$FORWARDED_STDIN"
+printf '{}\\n'
+`);
+    const stdin = sessionEndPayload("codex");
+    const result = await runLauncher(
+      fixture,
+      ["--adapter", "codex", "--event", "SessionEnd"],
+      stdin,
+    );
+
+    expect(result).toEqual({ stdout: "{}\n", stderr: "" });
+    expect(await readFile(join(fixture.root, "forwarded-stdin"), "utf8")).toBe(stdin);
+    const watchdog = (await readFile(join(fixture.root, "watchdog.log"), "utf8")).trimEnd().split("\n");
+    expect(watchdog.slice(0, 2)).toEqual(["--foreground", "3"]);
+    expect(resolve(watchdog[2] as string)).toBe(resolve(fixture.core));
+    expect(watchdog.slice(3)).toEqual(["--adapter", "codex", "--event", "SessionEnd"]);
+  });
+
+  it("keeps SessionEnd watchdog failures advisory", async () => {
+    // Break caught: a SessionEnd timeout emits a blocking event envelope.
+    const fixture = await launcherFixture();
+    await installTimeout(fixture, "#!/usr/bin/env bash\nexit 124\n");
+    await writeExecutable(fixture.core, "#!/usr/bin/env bash\nprintf '{\"unexpected\":true}\\n'\n");
+    const result = await runLauncher(
+      fixture,
+      ["--adapter", "claude", "--event", "SessionEnd"],
+      sessionEndPayload(),
+    );
+
+    expect(result).toEqual({ stdout: "{}\n", stderr: "" });
   });
 
   it("rejects invalid launcher flags before invoking the core", async () => {
