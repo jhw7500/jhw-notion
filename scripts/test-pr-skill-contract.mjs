@@ -174,9 +174,17 @@ if (argv[0] === "pr" && argv[1] === "create") {
 }
 
 if (argv[0] === "pr" && argv[1] === "view") {
+  // Canonical calls place the selector before flags; gh cannot infer it with --repo.
+  const selector = argv[2];
+  if (argv.includes("--repo") && (!selector || selector.startsWith("-"))) {
+    process.stderr.write("argument required when using the --repo flag\n");
+    process.exit(1);
+  }
   if (!state.prExists) process.exit(1);
+  if (![String(state.prNumber), state.prUrl, state.prHeadRefName].includes(selector)) process.exit(1);
   const fields = optionValue("--json") || "";
   const query = optionValue("--jq") || optionValue("-q") || "";
+  if (query === ".number" && state.failPrNumberLookup) process.exit(1);
   if (query.includes(".state") && query.includes(".mergeCommit.oid") && query.includes("@tsv")) {
     process.stdout.write((state.prMerged && !state.hideMergeConfirmation ? "MERGED" : "OPEN") + "\t" +
       (state.prMerged && !state.hideMergeConfirmation ? state.mergeCommit : "") + "\n");
@@ -1975,9 +1983,11 @@ async function main() {
         repoLabels: [],
         prLabels: ["review:skip"],
         prExists: false,
+        prNumber: 731,
+        prUrl: "https://github.com/example/repo/pull/731",
       }),
       [
-        "jhw_pr_apply_new_pr_policy request",
+        "jhw_pr_apply_new_pr_policy request || exit $?",
         "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
         "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
         "fi",
@@ -1987,6 +1997,7 @@ async function main() {
     const requestLabelCreate = (args) => isGh(args, "label", "create") && args[2] === "review:request";
     const skipLabelCreate = (args) => isGh(args, "label", "create") && args[2] === "review:skip";
     const createDraft = (args) => isGh(args, "pr", "create") && args.includes("--draft");
+    const numberLookup = (args) => isGh(args, "pr", "view") && hasOption(args, "--jq", ".number");
     const removeSkip = (args) => isGh(args, "pr", "edit") && hasOption(args, "--remove-label", "review:skip");
     const addRequest = (args) => isGh(args, "pr", "edit") && hasOption(args, "--add-label", "review:request");
     const ready = (args) => isGh(args, "pr", "ready");
@@ -1997,6 +2008,16 @@ async function main() {
     requireBefore(newPr.log, isGitPush, createDraft, "new PR push must precede draft creation");
     assert.equal(newPr.log.some((args) => createDraft(args) && args.includes("--fill")), true,
       "new PR creation must supply noninteractive title/body metadata");
+    assert.equal(newPr.log.filter(createDraft).length, 1,
+      "resolving the new PR must not create a duplicate");
+    const createdPrLookups = newPr.log.filter(numberLookup);
+    assert.equal(createdPrLookups.length, 1);
+    assert.equal(createdPrLookups[0][2], newPr.state.prUrl,
+      "the number lookup must select the URL returned by gh pr create, not a stale PR variable");
+    requireBefore(newPr.log, createDraft, numberLookup, "draft creation must precede number lookup");
+    requireBefore(newPr.log, numberLookup, removeSkip, "number lookup must precede policy reconciliation");
+    assert.equal(newPr.log.filter(ready)[0]?.[2], "731",
+      "the ready transition must target the newly resolved PR number");
     requireBefore(newPr.log, createDraft, removeSkip, "draft creation must precede policy reconciliation");
     requireBefore(newPr.log, removeSkip, addRequest, "opposite label must be removed before request label is added");
     requireBefore(newPr.log, addRequest, ready, "verified request policy must precede ready transition");
@@ -2009,6 +2030,27 @@ async function main() {
       "a new request-mode PR must consume its ready_for_review event run");
     assert.equal(newPr.log.filter(isWorkflowDispatch).length, 0,
       "a new request-mode PR must not launch duplicate same-head dispatch runs");
+
+    for (const [name, overrides, expectedLookups] of [
+      ["creation failure", { failPrCreate: true }, 0],
+      ["number lookup failure", { failPrNumberLookup: true }, 1],
+    ]) {
+      const failedNewPr = await runResult(
+        baseState({ prExists: false, ...overrides }),
+        "jhw_pr_apply_new_pr_policy skip",
+      );
+      assert.equal(failedNewPr.code, 1, name);
+      assert.equal(failedNewPr.log.filter(createDraft).length, 1,
+        `${name} must not retry PR creation`);
+      assert.equal(failedNewPr.log.filter(numberLookup).length, expectedLookups, name);
+      assert.equal(failedNewPr.log.some((args) => isGh(args, "pr", "edit") || ready(args)), false,
+        `${name} must stop before policy reconciliation or ready`);
+      assert.equal(failedNewPr.state.prExists, expectedLookups === 1, name);
+      if (failedNewPr.state.prExists) {
+        assert.equal(failedNewPr.state.prDraft, true,
+          "a number lookup failure must leave the created PR in draft");
+      }
+    }
 
     const newPrRequestWithoutDispatchContract = await run(
       baseState({
