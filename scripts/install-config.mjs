@@ -348,15 +348,15 @@ function saveRawIfChanged(current, next) {
   process.exit(CHANGED);
 }
 
-function buildRegisteredCodexHooks(current) {
+function buildRegisteredCodexHooks(current, events = CODEX_HOOK_EVENTS) {
   if (!current.text && current.exists) throw new Error("existing empty hooks config");
   let text = current.exists ? current.text : "{}";
   let inspected = inspectCodexHooksText(text);
   if (!inspected.hooksProperty) {
-    const hooks = Object.fromEntries(CODEX_HOOK_EVENTS.map((eventName) => [eventName, [ownedCodexHookGroup(eventName)]]));
+    const hooks = Object.fromEntries(events.map((eventName) => [eventName, [ownedCodexHookGroup(eventName)]]));
     return insertObjectProperty(text, inspected.syntax, "hooks", JSON.stringify(hooks));
   }
-  for (const eventName of CODEX_HOOK_EVENTS) {
+  for (const eventName of events) {
     inspected = inspectCodexHooksText(text);
     const hooksObject = inspected.hooksProperty.value;
     const eventProperty = uniqueProperty(hooksObject, eventName);
@@ -386,14 +386,14 @@ function buildRegisteredCodexHooks(current) {
   return text;
 }
 
-function buildUnregisteredCodexHooks(current) {
+function buildUnregisteredCodexHooks(current, events = CODEX_HOOK_EVENTS) {
   if (!current.exists) return current.text;
   if (!current.text) throw new Error("existing empty hooks config");
   const initial = inspectCodexHooksText(current.text);
   if (!initial?.hooksProperty) return current.text;
   let text = current.text;
   let changed = false;
-  for (const eventName of CODEX_HOOK_EVENTS) {
+  for (const eventName of events) {
     while (true) {
       const inspected = inspectCodexHooksText(text);
       const hooksObject = inspected.hooksProperty?.value;
@@ -735,6 +735,8 @@ function recoverCaptureOrActivationError(directory) {
 }
 
 function registerCodexHooksTransaction() {
+  const scope = transactionEvidence ?? "all";
+  if (scope !== "all" && scope !== "session-end-only") return FOREIGN;
   let directory;
   let manifest;
   try {
@@ -749,7 +751,14 @@ function registerCodexHooksTransaction() {
     let next;
     try {
       if (current.exists) current.text = exactUtf8(originalBytes);
-      next = buildRegisteredCodexHooks(current);
+      if (scope === "session-end-only") {
+        // Keep the unprovisioned Guard deactivation policy, but retain the
+        // independent, advisory SessionEnd path in the same atomic transaction.
+        const text = buildUnregisteredCodexHooks(current, CODEX_HOOK_EVENTS.filter((event) => event !== "SessionEnd"));
+        next = buildRegisteredCodexHooks({ ...current, text }, ["SessionEnd"]);
+      } else {
+        next = buildRegisteredCodexHooks(current);
+      }
     } catch {
       if (current.exists) backupCapturedMalformedHooks(originalBytes);
       return restoreCapturedOriginal(directory, manifest, "foreign-restored") === CHANGED ? FOREIGN : CAS_MISMATCH;

@@ -927,13 +927,24 @@ test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_forei
   write_owned_hooks_fixture "$hooks" "$home" yes
   chmod 0640 "$hooks"
   write_owned_hooks_fixture "$expected" "$home" no
+  node - "$expected" <<'EOF'
+const fs = require("node:fs");
+const file = process.argv[2];
+const document = JSON.parse(fs.readFileSync(file, "utf8"));
+document.hooks.SessionEnd = [{ hooks: [{
+  type: "command",
+  command: '"$HOME/.local/bin/jhw-control-hook" --adapter codex --event SessionEnd',
+  timeout: 3,
+}] }];
+fs.writeFileSync(file, JSON.stringify(document));
+EOF
 
   run_default_install "$home"
 
   [ -L "$home/.local/bin/jhw-control-hook" ] || return 1
   [ "$(readlink -f -- "$home/.local/bin/jhw-control-hook")" = "$REPO_ROOT/scripts/jhw-control-hook" ] || return 1
   if ! cmp -s -- "$expected" "$hooks"; then
-    echo "default unprovisioned install left owned Guard hooks active or changed foreign hooks" >&2
+    echo "default install must retain SessionEnd only and preserve foreign hooks" >&2
     diff -u -- "$expected" "$hooks" >&2 || true
     return 1
   fi
@@ -950,6 +961,19 @@ test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_forei
     echo "default unprovisioned install claimed protection" >&2
     return 1
   fi
+  run_default_install "$home"
+  cmp -s -- "$expected" "$hooks" || return 1
+  assert_no_hook_transaction_evidence "$home"
+  run_install "$home" --uninstall
+  write_owned_hooks_fixture "$expected" "$home" no
+  cmp -s -- "$expected" "$hooks" || return 1
+  run_default_install "$home"
+  node - "$hooks" <<'EOF'
+const fs = require("node:fs");
+const document = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (document.hooks.SessionEnd?.length !== 1 || document.hooks.PreToolUse !== undefined) process.exit(1);
+EOF
+  assert_no_hook_transaction_evidence "$home"
 }
 
 test_no_coordinates_with_explicit_invalid_guard_mode_aborts() {
