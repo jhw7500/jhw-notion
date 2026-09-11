@@ -492,16 +492,16 @@ assert_file_text() {
 }
 
 assert_exact_owned_hook_groups() {
-  local hooks_file="$1" home="$2"
-  node - "$hooks_file" "$home" <<'EOF'
+  local hooks_file="$1" home="$2" adapter="${3:-codex}"
+  node - "$hooks_file" "$home" "$adapter" <<'EOF'
 const fs = require("node:fs");
-const [hooksFile] = process.argv.slice(2);
+const [hooksFile, , adapter] = process.argv.slice(2);
 const document = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
 for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]) {
   const expected = {
     hooks: [{
       type: "command",
-      command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
+      command: `"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event ${event}`,
       timeout: event === "SessionEnd" ? 3 : 12,
     }],
   };
@@ -516,10 +516,10 @@ EOF
 }
 
 write_owned_hooks_fixture() {
-  local hooks_file="$1" home="$2" include_owned="$3"
-  node - "$hooks_file" "$home" "$include_owned" <<'EOF'
+  local hooks_file="$1" home="$2" include_owned="$3" adapter="${4:-codex}"
+  node - "$hooks_file" "$home" "$include_owned" "$adapter" <<'EOF'
 const fs = require("node:fs");
-const [file, , includeOwned] = process.argv.slice(2);
+const [file, , includeOwned, adapter] = process.argv.slice(2);
 const hooks = {
   SessionStart: [{ hooks: [{ type: "command", command: "/foreign/session", timeout: 4 }] }],
 };
@@ -528,7 +528,7 @@ if (includeOwned === "yes") {
     hooks[event] = [{
       hooks: [{
         type: "command",
-        command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
+        command: `"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event ${event}`,
         timeout: event === "SessionEnd" ? 3 : 12,
       }],
     }];
@@ -765,6 +765,23 @@ test_fresh_install_creates_both_control_links_and_exact_hooks() {
   assert_no_hook_transaction_evidence "$home"
 }
 
+test_fresh_install_wires_exact_claude_hooks() {
+  local home="$ROOT/fresh-claude-hooks-home"
+  make_tui_roots "$home"
+
+  if ! run_install "$home"; then
+    cat "$home/install.log" >&2
+    return 1
+  fi
+
+  assert_exact_owned_hook_groups "$home/.claude/settings.json" "$home" claude
+  [ "$(stat -c '%a' "$home/.claude/settings.json")" = "600" ] || return 1
+  [ -z "$(find "$home/.claude" -maxdepth 1 -mindepth 1 -name '.settings.json.jhw-txn.*')" ] || {
+    echo "confirmed Claude install left private transaction evidence" >&2
+    return 1
+  }
+}
+
 test_install_orders_guard_transaction_and_runs_public_preflight() {
   local home="$ROOT/guard-order-home" control hook skills mcp registered preflight complete
   make_tui_roots "$home"
@@ -878,11 +895,15 @@ test_install_requires_complete_guard_diagnostic_schema() {
 }
 
 test_preflight_failure_restores_exact_prior_hook_state() {
-  local scenario home hooks before
+  local scenario home hooks before claude_settings claude_before
   for scenario in foreign preexisting-owned; do
     home="$ROOT/rollback-$scenario-home"
     make_tui_roots "$home"
     hooks="$home/.codex/hooks.json"
+    claude_settings="$home/.claude/settings.json"
+    printf '%s' '{ "theme" : "foreign", "hooks" : { "SessionStart" : [{"hooks":[{"type":"command","command":"/foreign/claude-keep","timeout":4.00}]}] }, "n" : 1.20e+2 }' >"$claude_settings"
+    chmod 0640 "$claude_settings"
+    claude_before="$(sha256sum "$claude_settings")"
     if [ "$scenario" = "foreign" ]; then
       printf '%s' '{ "hooks" : { "SessionStart" : [{"hooks":[{"type":"command","command":"/foreign/keep","timeout":4.00}]}] }, "n" : 1.20e+2 }' >"$hooks"
     else
@@ -906,9 +927,19 @@ EOF
       return 1
     }
     [ "$(stat -c '%a' "$hooks")" = "640" ] || return 1
+    [ "$(sha256sum "$claude_settings")" = "$claude_before" ] || {
+      echo "$scenario preflight failure did not restore exact Claude settings bytes" >&2
+      return 1
+    }
+    [ "$(stat -c '%a' "$claude_settings")" = "640" ] || return 1
+    [ -z "$(find "$home/.claude" -maxdepth 1 -mindepth 1 -name '.settings.json.jhw-txn.*')" ] || return 1
     assert_no_hook_transaction_evidence "$home"
     if [ "$scenario" = "foreign" ]; then
-      [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || return 1
+      [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || {
+        echo "$scenario preflight failure left a newly installed hook launcher" >&2
+        tail -n 80 "$home/install.log" >&2
+        return 1
+      }
     else
       [ -L "$home/.local/bin/jhw-control-hook" ] || return 1
       [ "$(readlink -f -- "$home/.local/bin/jhw-control-hook")" = "$REPO_ROOT/scripts/jhw-control-hook" ] || return 1
@@ -917,24 +948,32 @@ EOF
 }
 
 test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks() {
-  local home="$ROOT/default-unprovisioned-${1:-none}-home" hooks expected
+  local home="$ROOT/default-unprovisioned-${1:-none}-home" hooks expected claude_settings claude_expected
   if [ "$#" -gt 0 ]; then shift; fi
   make_tui_roots "$home"
   hooks="$home/.codex/hooks.json"
   expected="$home/hooks.expected.json"
+  claude_settings="$home/.claude/settings.json"
+  claude_expected="$home/claude.expected.json"
   write_owned_hooks_fixture "$hooks" "$home" yes
   chmod 0640 "$hooks"
   write_owned_hooks_fixture "$expected" "$home" no
-  node - "$expected" <<'EOF'
+  write_owned_hooks_fixture "$claude_settings" "$home" yes claude
+  chmod 0640 "$claude_settings"
+  write_owned_hooks_fixture "$claude_expected" "$home" no claude
+  node - "$expected" codex "$claude_expected" claude <<'EOF'
 const fs = require("node:fs");
-const file = process.argv[2];
-const document = JSON.parse(fs.readFileSync(file, "utf8"));
-document.hooks.SessionEnd = [{ hooks: [{
-  type: "command",
-  command: '"$HOME/.local/bin/jhw-control-hook" --adapter codex --event SessionEnd',
-  timeout: 3,
-}] }];
-fs.writeFileSync(file, JSON.stringify(document));
+for (let index = 2; index < process.argv.length; index += 2) {
+  const file = process.argv[index];
+  const adapter = process.argv[index + 1];
+  const document = JSON.parse(fs.readFileSync(file, "utf8"));
+  document.hooks.SessionEnd = [{ hooks: [{
+    type: "command",
+    command: `"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event SessionEnd`,
+    timeout: 3,
+  }] }];
+  fs.writeFileSync(file, JSON.stringify(document));
+}
 EOF
 
   run_default_install "$home" "$@"
@@ -942,11 +981,18 @@ EOF
   [ -L "$home/.local/bin/jhw-control-hook" ] || return 1
   [ "$(readlink -f -- "$home/.local/bin/jhw-control-hook")" = "$REPO_ROOT/scripts/jhw-control-hook" ] || return 1
   if ! cmp -s -- "$expected" "$hooks"; then
-    echo "default install must retain SessionEnd only and preserve foreign hooks" >&2
+    echo "default install must retain Codex SessionEnd only and preserve foreign hooks" >&2
     diff -u -- "$expected" "$hooks" >&2 || true
     return 1
   fi
+  if ! cmp -s -- "$claude_expected" "$claude_settings"; then
+    echo "default install must retain Claude SessionEnd only and preserve foreign hooks" >&2
+    diff -u -- "$claude_expected" "$claude_settings" >&2 || true
+    return 1
+  fi
   [ "$(stat -c '%a' "$hooks")" = "640" ] || return 1
+  [ "$(stat -c '%a' "$claude_settings")" = "640" ] || return 1
+  [ -z "$(find "$home/.claude" -maxdepth 1 -mindepth 1 -name '.settings.json.jhw-txn.*')" ] || return 1
   assert_no_hook_transaction_evidence "$home"
   grep -q '"code":"INVALID_CONFIG"' "$home/install.log" || {
     echo "default install did not reach the public Guard diagnostic" >&2
@@ -961,15 +1007,20 @@ EOF
   fi
   run_default_install "$home" "$@"
   cmp -s -- "$expected" "$hooks" || return 1
+  cmp -s -- "$claude_expected" "$claude_settings" || return 1
   assert_no_hook_transaction_evidence "$home"
   run_install "$home" --uninstall
   write_owned_hooks_fixture "$expected" "$home" no
+  write_owned_hooks_fixture "$claude_expected" "$home" no claude
   cmp -s -- "$expected" "$hooks" || return 1
+  cmp -s -- "$claude_expected" "$claude_settings" || return 1
   run_default_install "$home" "$@"
-  node - "$hooks" <<'EOF'
+  node - "$hooks" "$claude_settings" <<'EOF'
 const fs = require("node:fs");
-const document = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-if (document.hooks.SessionEnd?.length !== 1 || document.hooks.PreToolUse !== undefined) process.exit(1);
+for (const file of process.argv.slice(2)) {
+  const document = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (document.hooks.SessionEnd?.length !== 1 || document.hooks.PreToolUse !== undefined) process.exit(1);
+}
 EOF
   assert_no_hook_transaction_evidence "$home"
 }
@@ -2311,7 +2362,7 @@ test_empty_uninstall_creates_nothing() {
 }
 
 test_owned_round_trip() {
-  local home="$ROOT/round trip 'home" json codex first_hash
+  local home="$ROOT/round trip 'home" json codex first_hash first_claude_config
   make_tui_roots "$home"
   mkdir -p "$home/.codex/commands" "$home/.codex/prompts"
   printf 'foreign-unrelated' >"$home/.codex/prompts/unrelated.md"
@@ -2345,10 +2396,13 @@ test_owned_round_trip() {
   node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(s["$schema"]!=="https://opencode.ai/config.json" || s.mcp["jhw-notion"].command[0]!=="node") process.exit(1)' "$home/.config/opencode/opencode.json"
   grep -q '^command = "node"$' "$codex"
   first_hash="$(sha256sum "$home/.claude.json" "$json" "$home/.config/opencode/opencode.json" "$codex")"
+  first_claude_config="$home/.claude.first.json"
+  cp -- "$home/.claude.json" "$first_claude_config"
 
   run_install "$home"
   [ "$(sha256sum "$home/.claude.json" "$json" "$home/.config/opencode/opencode.json" "$codex")" = "$first_hash" ] || {
     echo "idempotent reinstall changed config bytes" >&2
+    diff -u -- "$first_claude_config" "$home/.claude.json" >&2 || true
     return 1
   }
 
@@ -3242,6 +3296,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   host-v4) test_current_v4_control_host_contract_allows_activation; exit ;;
   host-invalid) test_non_v4_control_host_contract_fails_before_activation; exit ;;
   npm-ci) test_installer_uses_lockfile_exact_npm_ci; exit ;;
+  owned-round-trip) test_owned_round_trip; exit ;;
   fresh-hooks) test_fresh_install_creates_both_control_links_and_exact_hooks; exit ;;
   install-preflight) test_install_orders_guard_transaction_and_runs_public_preflight; exit ;;
   diagnostic-failure) test_install_aborts_on_guard_diagnostic_execution_failure; exit ;;
@@ -3303,6 +3358,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   unsafe-hooks-path) test_hooks_config_symlink_and_nonregular_fail_closed; exit ;;
   private-hooks) test_new_hooks_file_is_private; exit ;;
   unsupported-tuis) test_unsupported_tuis_receive_no_guard_wiring; exit ;;
+  claude-fresh) test_fresh_install_wires_exact_claude_hooks; exit ;;
   *) echo "unknown JHW_INSTALL_TEST_ONLY selection" >&2; exit 2 ;;
 esac
 
@@ -3325,6 +3381,7 @@ test_installer_uses_lockfile_exact_npm_ci
 test_empty_uninstall_creates_nothing
 test_owned_round_trip
 test_fresh_install_creates_both_control_links_and_exact_hooks
+test_fresh_install_wires_exact_claude_hooks
 test_install_orders_guard_transaction_and_runs_public_preflight
 test_install_aborts_on_guard_diagnostic_execution_failure
 test_install_rejects_malformed_diagnostic_and_rolls_back_hooks

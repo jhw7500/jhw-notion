@@ -6,6 +6,7 @@ import { TextDecoder } from "node:util";
 
 const [operation, configFile, mcpEntry, repositoryRoot, backupStamp, transactionEvidence] = process.argv.slice(2);
 if (!operation || !configFile || !mcpEntry || !repositoryRoot) process.exit(2);
+const hookAdapter = operation.includes("-claude-hooks-transaction") ? "claude" : "codex";
 
 const CHANGED = 0;
 const UNCHANGED = 3;
@@ -118,7 +119,7 @@ function codexHookTimeout(eventName) {
 }
 
 function codexHookCommand(eventName) {
-  return `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${eventName}`;
+  return `"$HOME/.local/bin/jhw-control-hook" --adapter ${hookAdapter} --event ${eventName}`;
 }
 
 function legacyCodexHookCommand(eventName) {
@@ -139,7 +140,7 @@ function ownedCodexHookVariant(value, eventName) {
   if (!hasExactKeys(handler, ["type", "command", "timeout"]) ||
       handler.type !== "command" || handler.timeout !== codexHookTimeout(eventName)) return false;
   if (handler.command === codexHookCommand(eventName)) return "canonical";
-  if (handler.command === legacyCodexHookCommand(eventName)) return "legacy";
+  if (hookAdapter === "codex" && handler.command === legacyCodexHookCommand(eventName)) return "legacy";
   return false;
 }
 
@@ -416,7 +417,7 @@ function buildUnregisteredCodexHooks(current, events = CODEX_HOOK_EVENTS) {
   return changed ? text : current.text;
 }
 
-const HOOK_TRANSACTION_PREFIX = ".hooks.json.jhw-txn.";
+const HOOK_TRANSACTION_PREFIX = `.${path.basename(configFile)}.jhw-txn.`;
 const HOOK_TRANSACTION_KNOWN = new Set([
   "manifest.json", "original", "original-absent", "captured-live",
   "published", "published-ready", "candidate", "candidate-absent", "candidate-live",
@@ -1649,6 +1650,11 @@ try {
   if (operation === "rollback-codex-hooks-transaction") process.exit(rollbackCodexHooksTransaction());
   if (operation === "inspect-codex-hooks-transaction") process.exit(inspectCodexHooksTransaction());
   if (operation === "finalize-codex-hooks-transaction") process.exit(finalizeCodexHooksTransaction());
+  if (operation === "unregister-claude-hooks-transaction") process.exit(unregisterCodexHooksTransaction());
+  if (operation === "register-claude-hooks-transaction") process.exit(registerCodexHooksTransaction());
+  if (operation === "rollback-claude-hooks-transaction") process.exit(rollbackCodexHooksTransaction());
+  if (operation === "inspect-claude-hooks-transaction") process.exit(inspectCodexHooksTransaction());
+  if (operation === "finalize-claude-hooks-transaction") process.exit(finalizeCodexHooksTransaction());
   if (operation === "remove-control-hook-link-transaction") process.exit(removeControlHookLinkTransaction());
   if (operation === "inspect-control-hook-link-transaction") process.exit(inspectControlHookLinkTransaction());
   if (operation === "finalize-control-hook-link-transaction") process.exit(finalizeControlHookLinkTransaction());

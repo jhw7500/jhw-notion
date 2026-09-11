@@ -131,6 +131,70 @@ input.on("close", () => {
 });
 EOF
 chmod +x "$FAKE_BIN/codex"
+cat >"$FAKE_BIN/claude" <<'EOF'
+#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+for (const key of [
+  "JHW_REGISTRY_DIR", "JHW_REGISTRY_REMOTE", "JHW_REGISTRY_BRANCH", "JHW_WORKTREE_ROOT",
+  "JHW_CONTROL_STATE_DIR", "JHW_BUILD_HOST", "JHW_GITHUB_OWNER", "JHW_PROJECT_NUMBER",
+  "JHW_REGISTRY_REPOSITORY", "JHW_PREFLIGHT_PROJECT_ITEM_ID", "JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER",
+  "JHW_GUARD_MODE", "JHW_GUARD_ALLOW_OBSERVE",
+]) {
+  if (process.env[key] !== undefined) process.exit(65);
+}
+const configDir = process.env.CLAUDE_CONFIG_DIR;
+if (!configDir || !path.isAbsolute(configDir) || configDir === path.join(process.env.HOME, ".claude")) process.exit(66);
+const configInfo = fs.statSync(configDir);
+const settingsPath = path.join(configDir, "settings.json");
+const settingsInfo = fs.statSync(settingsPath);
+if (!configInfo.isDirectory() || (configInfo.mode & 0o777) !== 0o700 ||
+    !settingsInfo.isFile() || (settingsInfo.mode & 0o777) !== 0o600) process.exit(66);
+let userSettings;
+try { userSettings = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch { process.exit(66); }
+const owned = userSettings?.hooks?.UserPromptSubmit?.[0]?.hooks?.[0];
+if (owned?.type !== "command" || owned?.timeout !== 12 ||
+    owned?.command !== '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event UserPromptSubmit') process.exit(66);
+if (process.env.ANTHROPIC_API_KEY !== "jhw-preflight-no-network" ||
+    process.env.ANTHROPIC_BASE_URL !== "http://127.0.0.1:1" ||
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== "1" ||
+    process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY !== "1") process.exit(66);
+fs.writeFileSync(path.join(configDir, "probe-state"), "must-be-cleaned", { mode: 0o600 });
+fs.appendFileSync(process.env.JHW_FAKE_CLAUDE_LOG, `${JSON.stringify({ args, configDir, home: process.env.HOME })}\n`, "utf8");
+const settingSources = args.indexOf("--setting-sources");
+const settingsIndex = args.indexOf("--settings");
+if (!args.includes("-p") || !args.includes("--verbose") || !args.includes("--no-session-persistence") ||
+    !args.includes("--include-hook-events") || !args.includes("stream-json") ||
+    settingSources < 0 || args[settingSources + 1] !== "user,project,local" || settingsIndex < 0) process.exit(64);
+let settings;
+try { settings = JSON.parse(args[settingsIndex + 1]); } catch { process.exit(64); }
+const blocker = settings?.hooks?.UserPromptSubmit?.[0]?.hooks?.[0];
+if (blocker?.type !== "command" || blocker?.timeout !== 3 ||
+    blocker?.command !== "printf 'jhw-claude-preflight-stop\\n' >&2; exit 2") process.exit(64);
+const native = JSON.stringify({
+  hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "GUARD_UNAVAILABLE" },
+  systemMessage: "GUARD_UNAVAILABLE",
+});
+for (const value of [
+  {
+    type: "system", subtype: "hook_response", hook_id: "owned-hook-response",
+    hook_name: "UserPromptSubmit", hook_event: "UserPromptSubmit",
+    output: native, stdout: native, stderr: "", exit_code: 0, outcome: "success",
+  },
+  {
+    type: "system", subtype: "hook_response", hook_id: "blocking-probe-response",
+    hook_name: "UserPromptSubmit", hook_event: "UserPromptSubmit",
+    output: "jhw-claude-preflight-stop", stdout: "jhw-claude-preflight-stop",
+    stderr: "", exit_code: 2, outcome: "error",
+  },
+  {
+    type: "result", subtype: "success", is_error: false, duration_api_ms: 0,
+    num_turns: 0, total_cost_usd: 0, modelUsage: {},
+  },
+]) process.stdout.write(`${JSON.stringify(value)}\n`);
+EOF
+chmod +x "$FAKE_BIN/claude"
 trap 'rm -rf -- "$ROOT"' EXIT
 
 self_test_fake_app_server() {
@@ -167,13 +231,13 @@ self_test_fake_app_server
 [ -x "$CLI" ] || { echo "built jhw-control entry is not executable" >&2; exit 1; }
 
 owned_group_json() {
-  local event="$1"
-  node -e 'const event=process.argv[1]; process.stdout.write(JSON.stringify({hooks:[{type:"command",command:`"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,timeout:event==="SessionEnd"?3:12}]}))' "$event"
+  local event="$1" adapter="${2:-codex}"
+  node -e 'const [event, adapter]=process.argv.slice(1); process.stdout.write(JSON.stringify({hooks:[{type:"command",command:`"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event ${event}`,timeout:event==="SessionEnd"?3:12}]}))' "$event" "$adapter"
 }
 
 make_home() {
   local scenario="$1" home="$ROOT/$scenario-home" hooks="$ROOT/$scenario-home/.codex/hooks.json"
-  mkdir -p "$home/.codex" "$home/.local/bin" "$home/registry" "$home/worktrees" "$home/state"
+  mkdir -p "$home/.claude" "$home/.codex" "$home/.local/bin" "$home/registry" "$home/worktrees" "$home/state"
   case "$scenario" in
     launcher-missing) ;;
     launcher-regular) printf 'private-regular-launcher-marker' >"$home/.local/bin/jhw-control-hook" ;;
@@ -183,6 +247,14 @@ make_home() {
       ;;
     *) ln -s "$REPO_ROOT/scripts/jhw-control-hook" "$home/.local/bin/jhw-control-hook" ;;
   esac
+  if [ "$scenario" = "claude-exact-trusted" ]; then
+    printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s],"PostToolUse":[%s],"SessionEnd":[%s]}}\n' \
+      "$(owned_group_json UserPromptSubmit claude)" \
+      "$(owned_group_json PreToolUse claude)" \
+      "$(owned_group_json PostToolUse claude)" \
+      "$(owned_group_json SessionEnd claude)" >"$home/.claude/settings.json"
+    chmod 0600 "$home/.claude/settings.json"
+  fi
   case "$scenario" in
     exact-trusted|exact-invalid-shell|exact-untrusted|exact-unavailable|exact-runtime-source|exact-runtime-duplicate|exact-stubborn|exact-foreign-trusted-after|exact-mcp-untrusted|exact-guard-async|exact-missing-display-order|launcher-missing|launcher-regular|launcher-foreign)
       printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s],"PostToolUse":[%s],"SessionEnd":[%s]}}\n' \
@@ -210,7 +282,7 @@ make_home() {
 }
 
 run_preflight() {
-  local scenario="$1" home="$2" output="$home/preflight.out" error="$home/preflight.err" rc mode log probe_log probe_cwd_log runtime_shell
+  local scenario="$1" home="$2" output="$home/preflight.out" error="$home/preflight.err" rc mode log claude_log probe_log probe_cwd_log runtime_shell
   case "$scenario" in
     exact-trusted) mode="trusted" ;;
     exact-invalid-shell) mode="trusted" ;;
@@ -226,6 +298,7 @@ run_preflight() {
     *) mode="trusted" ;;
   esac
   log="$ROOT/$scenario-app-server.log"
+  claude_log="$ROOT/$scenario-claude.log"
   probe_log="$ROOT/$scenario-shell-probe.log"
   probe_cwd_log="$ROOT/$scenario-shell-probe-cwd.log"
   runtime_shell="${SHELL:-/bin/sh}"
@@ -235,6 +308,7 @@ run_preflight() {
   if HOME="$home" PATH="$FAKE_BIN:$PATH" SHELL="$runtime_shell" \
       JHW_FAKE_CODEX_MODE="$mode" \
       JHW_FAKE_CODEX_LOG="$log" \
+      JHW_FAKE_CLAUDE_LOG="$claude_log" \
       JHW_FAKE_CODEX_PID="$ROOT/$scenario-app-server.pid" \
       JHW_FAKE_PROBE_LOG="$probe_log" \
       JHW_FAKE_PROBE_CWD_LOG="$probe_cwd_log" \
@@ -270,10 +344,10 @@ run_preflight() {
       return 1
     fi
   fi
-  node - "$scenario" "$output" "$error" "$log" "$probe_log" "$probe_cwd_log" "$REPO_ROOT" <<'EOF'
+  node - "$scenario" "$output" "$error" "$log" "$claude_log" "$probe_log" "$probe_cwd_log" "$REPO_ROOT" "$home" <<'EOF'
 const fs = require("node:fs");
 const path = require("node:path");
-const [scenario, stdoutPath, stderrPath, logPath, probeLogPath, probeCwdLogPath, expectedProbeCwd] = process.argv.slice(2);
+const [scenario, stdoutPath, stderrPath, logPath, claudeLogPath, probeLogPath, probeCwdLogPath, expectedProbeCwd, expectedHome] = process.argv.slice(2);
 const stdout = fs.readFileSync(stdoutPath, "utf8");
 const stderr = fs.readFileSync(stderrPath, "utf8");
 const raw = stdout || stderr;
@@ -294,13 +368,21 @@ for (const [adapter, value] of Object.entries(coverage)) {
   }
 }
 const staticExpected = {
-  claude: { prompt_origin: "missing", pre_tool_block: "missing", post_tool_correlation: "missing", execution_recheck: "pending", enforced: false },
   gemini: { prompt_origin: "unsupported", pre_tool_block: "unsupported", post_tool_correlation: "unsupported", execution_recheck: "pending", enforced: false },
   opencode: { prompt_origin: "unsupported", pre_tool_block: "unsupported", post_tool_correlation: "unsupported", execution_recheck: "pending", enforced: false },
 };
 for (const [adapter, expected] of Object.entries(staticExpected)) {
   if (JSON.stringify(coverage[adapter]) !== JSON.stringify(expected)) fail(`${adapter} coverage is not truthful`);
 }
+const claudeAxes = scenario === "claude-exact-trusted" ? "ok" : "missing";
+const expectedClaude = {
+  prompt_origin: claudeAxes,
+  pre_tool_block: claudeAxes,
+  post_tool_correlation: claudeAxes,
+  execution_recheck: "pending",
+  enforced: scenario === "claude-exact-trusted",
+};
+if (JSON.stringify(coverage.claude) !== JSON.stringify(expectedClaude)) fail("Claude installed/runtime coverage is not truthful");
 const installedAxes = scenario.startsWith("exact-") ? "ok" : "missing";
 const expectedCodex = {
   prompt_origin: installedAxes,
@@ -329,6 +411,18 @@ if (scenario.startsWith("exact-")) {
     fail("Codex inspector did not complete initialize/initialized/hooks/list");
   }
 }
+if (scenario === "claude-exact-trusted") {
+  if (!fs.existsSync(claudeLogPath)) fail("production preflight did not invoke Claude runtime");
+  const calls = fs.readFileSync(claudeLogPath, "utf8").trim().split("\n").map(JSON.parse);
+  if (calls.length !== 1) fail("Claude runtime probe did not run exactly once");
+  const call = calls[0];
+  if (!Array.isArray(call.args) || call.home !== expectedHome) {
+    fail("Claude runtime probe did not retain the exact launcher HOME");
+  }
+  if (typeof call.configDir !== "string" || fs.existsSync(call.configDir)) {
+    fail("Claude runtime probe did not clean its isolated config directory");
+  }
+}
 if (scenario === "exact-trusted" || scenario === "exact-mcp-untrusted") {
   if (!fs.existsSync(probeLogPath)) fail("production preflight did not execute the stored canonical command");
   const probe = fs.readFileSync(probeLogPath, "utf8").trim().split("\n");
@@ -343,6 +437,7 @@ EOF
 }
 
 all_scenarios=(
+  claude-exact-trusted
   exact-trusted exact-invalid-shell exact-untrusted exact-unavailable exact-runtime-source exact-runtime-duplicate exact-stubborn
   exact-foreign-trusted-after exact-mcp-untrusted exact-guard-async exact-missing-display-order
   launcher-missing launcher-regular launcher-foreign duplicate-config missing malformed foreign

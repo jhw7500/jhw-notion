@@ -8,6 +8,7 @@ import { assertValidHandoff, buildHandoff, parseHandoffMetadata, parseHandoffSec
 import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
 import { ControlError } from "../errors.js";
+import { GuardJournal } from "../guard-journal.js";
 import { ProcessRunner } from "../process.js";
 import { RegistryGit } from "../registry-git.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
@@ -866,7 +867,24 @@ describe("TaskService", () => {
 
   it.each(["status", "force-end"] as const)("preserves direct %s recovery without takeover worktree mutation", async (kind) => {
     const { tasks, claims, worktrees } = await taskFixture();
-    claims.recoverClaim.mockResolvedValue({ kind });
+    claims.recoverClaim.mockResolvedValue(kind === "status" ? {
+      kind,
+      active: activeClaim,
+      recorded: { host: activeClaim.host, session_id: activeClaim.session_id },
+      process_exists: false,
+      worktree_mapped: true,
+      dirty: false,
+      ahead: 0,
+    } : {
+      kind,
+      history: {
+        ...activeClaim,
+        released_at: "2026-08-13T12:35:56.789Z",
+        status: "force-ended",
+        head_sha: "a".repeat(40),
+        validation_summary: "force-end approved",
+      },
+    });
 
     await tasks.recover({
       task_id: activeClaim.task_id,
@@ -1235,7 +1253,7 @@ describe("TaskService", () => {
   });
 
   it("strips session identity and internal Task coordinates from active recovery discovery", async () => {
-    const { tasks, claims } = await taskFixture();
+    const { tasks, claims, worktrees } = await taskFixture();
     claims.getActive.mockResolvedValue(activeClaim);
     claims.recoverClaim.mockResolvedValue({
       kind: "status",
@@ -1245,6 +1263,17 @@ describe("TaskService", () => {
       worktree_mapped: true,
       dirty: false,
       ahead: 0,
+    });
+    worktrees.inspect.mockResolvedValue({
+      path: "not-exported",
+      repository_path: "not-exported",
+      worktree_ref: activeClaim.worktree_ref,
+      branch: activeClaim.branch,
+      head_sha: "c".repeat(40),
+      dirty: false,
+      dirty_files: [],
+      ahead: 0,
+      behind: 0,
     });
 
     const discovered = await tasks.recoveryDiscovery(TASK_ID);
@@ -1264,11 +1293,140 @@ describe("TaskService", () => {
         worktree_mapped: true,
         dirty: false,
         ahead: 0,
+        session_end: { status: "absent" },
       },
     });
     expect(JSON.stringify(discovered)).not.toContain(activeClaim.session_id);
     expect(JSON.stringify(discovered)).not.toContain(activeClaim.project_id);
     expect(JSON.stringify(discovered)).not.toContain(activeClaim.repo_id);
+  });
+
+  it("projects one exact local SessionEnd row into active recovery discovery", async () => {
+    const { tasks, claims, worktrees, fixture } = await taskFixture();
+    const headSha = "a".repeat(40);
+    claims.getActive.mockResolvedValue(activeClaim);
+    claims.recoverClaim.mockResolvedValue({
+      kind: "status",
+      active: activeClaim,
+      recorded: { host: activeClaim.host, session_id: activeClaim.session_id },
+      process_exists: false,
+      worktree_mapped: true,
+      dirty: false,
+      ahead: 0,
+    });
+    worktrees.inspect.mockResolvedValue({
+      path: "not-exported",
+      repository_path: "not-exported",
+      worktree_ref: activeClaim.worktree_ref,
+      branch: activeClaim.branch,
+      head_sha: headSha,
+      dirty: false,
+      dirty_files: [],
+      ahead: 0,
+      behind: 0,
+    });
+    await new GuardJournal(configFor(fixture.registryDir).stateDir).append({
+      protocol_version: 1,
+      origin_adapter: activeClaim.origin_adapter,
+      event: "session-ended",
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      worktree_ref: activeClaim.worktree_ref,
+      branch: activeClaim.branch,
+      head_sha: headSha,
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    });
+
+    await expect(tasks.recoveryDiscovery(TASK_ID)).resolves.toMatchObject({
+      state: "active",
+      recovery: {
+        session_end: {
+          status: "recorded",
+          origin_adapter: "codex",
+          occurred_at: "2026-08-25T01:00:00.000Z",
+        },
+      },
+    });
+  });
+
+  it("adds the same bounded SessionEnd evidence to direct read-only recovery status", async () => {
+    const { tasks, claims, worktrees, fixture } = await taskFixture();
+    const headSha = "b".repeat(40);
+    claims.recoverClaim.mockResolvedValue({
+      kind: "status",
+      active: activeClaim,
+      recorded: { host: activeClaim.host, session_id: activeClaim.session_id },
+      process_exists: false,
+      worktree_mapped: true,
+      dirty: false,
+      ahead: 0,
+    });
+    worktrees.inspect.mockResolvedValue({
+      path: "not-exported",
+      repository_path: "not-exported",
+      worktree_ref: activeClaim.worktree_ref,
+      branch: activeClaim.branch,
+      head_sha: headSha,
+      dirty: false,
+      dirty_files: [],
+      ahead: 0,
+      behind: 0,
+    });
+    await new GuardJournal(configFor(fixture.registryDir).stateDir).append({
+      protocol_version: 1,
+      origin_adapter: activeClaim.origin_adapter,
+      event: "session-ended",
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      worktree_ref: activeClaim.worktree_ref,
+      branch: activeClaim.branch,
+      head_sha: headSha,
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:02:00.000Z",
+    });
+
+    await expect(tasks.recover({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      action: { kind: "status" },
+    })).resolves.toMatchObject({
+      kind: "status",
+      session_end: {
+        status: "recorded",
+        origin_adapter: "codex",
+        occurred_at: "2026-08-25T01:02:00.000Z",
+      },
+    });
+  });
+
+  it("degrades a raced advisory Git reinspection to unverified without hiding recovery status", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.recoverClaim.mockResolvedValue({
+      kind: "status",
+      active: activeClaim,
+      recorded: { host: activeClaim.host, session_id: activeClaim.session_id },
+      process_exists: false,
+      worktree_mapped: true,
+      dirty: false,
+      ahead: 0,
+    });
+    worktrees.inspect.mockRejectedValue(new ControlError("WORKTREE_NOT_MAPPED", "raced mapping change"));
+
+    await expect(tasks.recover({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      action: { kind: "status" },
+    })).resolves.toMatchObject({
+      kind: "status",
+      process_exists: false,
+      worktree_mapped: true,
+      session_end: { status: "unverified" },
+    });
   });
 
   it("rejects an absolute host path restored from a committed Handoff", async () => {

@@ -104,10 +104,18 @@ HOOK_LINK_CREATED=0
 INSTALL_TRANSACTION_ACTIVE=0
 HOOKS_CONFIG_CHANGED=0
 HOOKS_CONFIG_FILE=""
+HOOKS_ADAPTER="codex"
+HOOKS_DISPLAY_NAME="Codex"
 HOOKS_TRANSACTION_DIR=""
 HOOKS_TRANSACTION_STAGE=""
 HOOKS_TRANSACTION_METADATA=""
 HOOKS_TRANSACTION_PRESERVE=0
+CLAUDE_HOOKS_CONFIG_CHANGED=0
+CLAUDE_HOOKS_CONFIG_FILE=""
+CLAUDE_HOOKS_TRANSACTION_DIR=""
+CLAUDE_HOOKS_TRANSACTION_STAGE=""
+CLAUDE_HOOKS_TRANSACTION_METADATA=""
+CLAUDE_HOOKS_TRANSACTION_PRESERVE=0
 CONTROL_HOOK_LINK_TRANSACTION_DIR=""
 CONTROL_HOOK_LINK_TRANSACTION_STAGE=""
 CONTROL_HOOK_LINK_TRANSACTION_METADATA=""
@@ -298,28 +306,80 @@ remove_control_hook_link_transaction() {
   fi
 }
 
-allocate_codex_hook_transaction() {
-  local hooks_file="$1" directory
+allocate_hook_transaction() {
+  local adapter="$1" display_name="$2" hooks_file="$3" directory prefix
+  HOOKS_ADAPTER="$adapter"
+  HOOKS_DISPLAY_NAME="$display_name"
   HOOKS_CONFIG_FILE="$hooks_file"
   HOOKS_CONFIG_CHANGED=0
   HOOKS_TRANSACTION_STAGE=""
   HOOKS_TRANSACTION_METADATA=""
   HOOKS_TRANSACTION_PRESERVE=0
   directory="$(dirname "$hooks_file")"
+  prefix=".$(basename "$hooks_file").jhw-txn.XXXXXX"
   mkdir -p "$directory"
-  HOOKS_TRANSACTION_DIR="$(mktemp -d "$directory/.hooks.json.jhw-txn.XXXXXX")"
+  HOOKS_TRANSACTION_DIR="$(mktemp -d "$directory/$prefix")"
   chmod 0700 "$HOOKS_TRANSACTION_DIR"
 }
 
-reject_stale_codex_hook_transactions() {
-  local candidate found=0
-  [ -d "$HOME/.codex" ] || return 0
-  for candidate in "$HOME/.codex"/.hooks.json.jhw-txn.*; do
+allocate_codex_hook_transaction() {
+  allocate_hook_transaction codex Codex "$1"
+}
+
+allocate_claude_hook_transaction() {
+  allocate_hook_transaction claude Claude "$1"
+}
+
+clear_current_hook_transaction() {
+  HOOKS_CONFIG_CHANGED=0
+  HOOKS_CONFIG_FILE=""
+  HOOKS_TRANSACTION_DIR=""
+  HOOKS_TRANSACTION_STAGE=""
+  HOOKS_TRANSACTION_METADATA=""
+  HOOKS_TRANSACTION_PRESERVE=0
+}
+
+save_claude_hook_transaction() {
+  [ "$HOOKS_ADAPTER" = "claude" ] || return 1
+  CLAUDE_HOOKS_CONFIG_CHANGED="$HOOKS_CONFIG_CHANGED"
+  CLAUDE_HOOKS_CONFIG_FILE="$HOOKS_CONFIG_FILE"
+  CLAUDE_HOOKS_TRANSACTION_DIR="$HOOKS_TRANSACTION_DIR"
+  CLAUDE_HOOKS_TRANSACTION_STAGE="$HOOKS_TRANSACTION_STAGE"
+  CLAUDE_HOOKS_TRANSACTION_METADATA="$HOOKS_TRANSACTION_METADATA"
+  CLAUDE_HOOKS_TRANSACTION_PRESERVE="$HOOKS_TRANSACTION_PRESERVE"
+  clear_current_hook_transaction
+}
+
+load_claude_hook_transaction() {
+  [ -n "$CLAUDE_HOOKS_TRANSACTION_DIR" ] || return 1
+  HOOKS_ADAPTER="claude"
+  HOOKS_DISPLAY_NAME="Claude"
+  HOOKS_CONFIG_CHANGED="$CLAUDE_HOOKS_CONFIG_CHANGED"
+  HOOKS_CONFIG_FILE="$CLAUDE_HOOKS_CONFIG_FILE"
+  HOOKS_TRANSACTION_DIR="$CLAUDE_HOOKS_TRANSACTION_DIR"
+  HOOKS_TRANSACTION_STAGE="$CLAUDE_HOOKS_TRANSACTION_STAGE"
+  HOOKS_TRANSACTION_METADATA="$CLAUDE_HOOKS_TRANSACTION_METADATA"
+  HOOKS_TRANSACTION_PRESERVE="$CLAUDE_HOOKS_TRANSACTION_PRESERVE"
+}
+
+clear_saved_claude_hook_transaction() {
+  CLAUDE_HOOKS_CONFIG_CHANGED=0
+  CLAUDE_HOOKS_CONFIG_FILE=""
+  CLAUDE_HOOKS_TRANSACTION_DIR=""
+  CLAUDE_HOOKS_TRANSACTION_STAGE=""
+  CLAUDE_HOOKS_TRANSACTION_METADATA=""
+  CLAUDE_HOOKS_TRANSACTION_PRESERVE=0
+}
+
+reject_stale_hook_transactions() {
+  local directory="$1" pattern="$2" display_name="$3" candidate found=0
+  [ -d "$directory" ] || return 0
+  for candidate in "$directory"/$pattern; do
     [ -e "$candidate" ] || [ -L "$candidate" ] || continue
     if [ "$found" -eq 0 ]; then
-      fail "abandoned Codex hook transaction evidence blocks this operation: $candidate"
+      fail "abandoned $display_name hook transaction evidence blocks this operation: $candidate"
     else
-      fail "additional abandoned Codex hook transaction evidence: $candidate"
+      fail "additional abandoned $display_name hook transaction evidence: $candidate"
     fi
     found=1
   done
@@ -327,6 +387,14 @@ reject_stale_codex_hook_transactions() {
     fail "Review and recover/remove the private transaction path before retrying; its contents were not printed."
     return 1
   fi
+}
+
+reject_stale_codex_hook_transactions() {
+  reject_stale_hook_transactions "$HOME/.codex" '.hooks.json.jhw-txn.*' Codex
+}
+
+reject_stale_claude_hook_transactions() {
+  reject_stale_hook_transactions "$HOME/.claude" '.settings.json.jhw-txn.*' Claude
 }
 
 reject_stale_control_hook_link_transactions() {
@@ -350,7 +418,7 @@ reject_stale_control_hook_link_transactions() {
 
 inspect_codex_hook_transaction() {
   [ -n "$HOOKS_TRANSACTION_DIR" ] || return 1
-  if ! HOOKS_TRANSACTION_METADATA="$(node "$CONFIG_EDITOR" "inspect-codex-hooks-transaction" \
+  if ! HOOKS_TRANSACTION_METADATA="$(node "$CONFIG_EDITOR" "inspect-${HOOKS_ADAPTER}-hooks-transaction" \
       "$HOOKS_CONFIG_FILE" "$MCP_ENTRY" "$SCRIPT_DIR" "$HOOKS_TRANSACTION_DIR" 2>/dev/null)"; then
     return 1
   fi
@@ -405,7 +473,7 @@ report_durable_manual_hook_recovery() {
 finalize_codex_hook_transaction() {
   local expected_stage="$1" rc
   [ -n "$HOOKS_TRANSACTION_DIR" ] || return 0
-  if node "$CONFIG_EDITOR" "finalize-codex-hooks-transaction" "$HOOKS_CONFIG_FILE" \
+  if node "$CONFIG_EDITOR" "finalize-${HOOKS_ADAPTER}-hooks-transaction" "$HOOKS_CONFIG_FILE" \
       "$MCP_ENTRY" "$SCRIPT_DIR" "$HOOKS_TRANSACTION_DIR" "$expected_stage" 2>/dev/null; then
     rc=0
   else
@@ -424,14 +492,14 @@ finalize_codex_hook_transaction() {
 rollback_codex_hooks() {
   local rc
   [ "$HOOKS_CONFIG_CHANGED" -eq 1 ] && [ "$HOOKS_TRANSACTION_PRESERVE" -eq 0 ] || return 1
-  if node "$CONFIG_EDITOR" "rollback-codex-hooks-transaction" "$HOOKS_CONFIG_FILE" \
+  if node "$CONFIG_EDITOR" "rollback-${HOOKS_ADAPTER}-hooks-transaction" "$HOOKS_CONFIG_FILE" \
       "$MCP_ENTRY" "$SCRIPT_DIR" "$HOOKS_TRANSACTION_DIR" 2>/dev/null; then
     rc=0
   else
     rc=$?
   fi
   if ! inspect_codex_hook_transaction; then
-    fail "Codex hooks.json rollback 결과를 확인할 수 없습니다. current path를 단정하지 않습니다."
+    fail "$HOOKS_DISPLAY_NAME $(basename "$HOOKS_CONFIG_FILE") rollback 결과를 확인할 수 없습니다. current path를 단정하지 않습니다."
     report_codex_hook_transaction
     return 1
   fi
@@ -469,20 +537,37 @@ rollback_codex_hooks() {
     fail "repository hook launcher는 수동 검토가 끝날 때까지 보존합니다."
     return 1
   fi
-  fail "Codex hooks.json rollback이 concurrent/ambiguous 상태로 끝났습니다 (rc=$rc). current path를 단정하지 않습니다."
+  fail "$HOOKS_DISPLAY_NAME $(basename "$HOOKS_CONFIG_FILE") rollback이 concurrent/ambiguous 상태로 끝났습니다 (rc=$rc). current path를 단정하지 않습니다."
   report_codex_hook_transaction
   fail "repository hook launcher는 수동 검토가 끝날 때까지 보존합니다."
   return 1
 }
 
+rollback_current_guard_hook_transaction() {
+  local rc
+  if [ "$HOOKS_CONFIG_CHANGED" -eq 1 ] && [ "$HOOKS_TRANSACTION_PRESERVE" -eq 0 ]; then
+    rollback_codex_hooks
+    rc=$?
+    return "$rc"
+  fi
+  if [ -n "$HOOKS_TRANSACTION_DIR" ]; then
+    report_codex_hook_transaction
+    return 1
+  fi
+  return 0
+}
+
 rollback_install_transaction_on_exit() {
   local rc=$? hooks_rollback_ok=1
   if [ "$rc" -ne 0 ] && [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
-    if [ "$HOOKS_CONFIG_CHANGED" -eq 1 ] && [ "$HOOKS_TRANSACTION_PRESERVE" -eq 0 ]; then
-      if ! rollback_codex_hooks; then hooks_rollback_ok=0; fi
-    elif [ -n "$HOOKS_TRANSACTION_DIR" ]; then
-      hooks_rollback_ok=0
-      report_codex_hook_transaction
+    if ! rollback_current_guard_hook_transaction; then hooks_rollback_ok=0; fi
+    if [ -n "$CLAUDE_HOOKS_TRANSACTION_DIR" ]; then
+      if load_claude_hook_transaction && rollback_current_guard_hook_transaction; then
+        clear_saved_claude_hook_transaction
+        clear_current_hook_transaction
+      else
+        hooks_rollback_ok=0
+      fi
     fi
     if [ "$hooks_rollback_ok" -eq 1 ]; then
       if ! rollback_new_control_hook; then :; fi
@@ -516,7 +601,8 @@ reject_all_private_hook_transactions() {
   if ! reject_stale_control_hook_link_transactions; then
     return 1
   fi
-  reject_stale_codex_hook_transactions
+  reject_stale_codex_hook_transactions || return 1
+  reject_stale_claude_hook_transactions
 }
 
 install_owned_symlink() {
@@ -665,11 +751,11 @@ unregister_opencode_mcp() {
     "OpenCode: 소유한 jhw-notion 등록 없음"
 }
 
-register_codex_hooks() {
+register_guard_hooks() {
   local hooks_file="$1" scope="${2:-all}" label="Guard hook 그룹" rc
   [ "$scope" != "session-end-only" ] || label="SessionEnd 증거 hook"
   mkdir -p "$(dirname "$hooks_file")"
-  if node "$CONFIG_EDITOR" "register-codex-hooks-transaction" "$hooks_file" \
+  if node "$CONFIG_EDITOR" "register-${HOOKS_ADAPTER}-hooks-transaction" "$hooks_file" \
       "$MCP_ENTRY" "$SCRIPT_DIR" "$HOOKS_TRANSACTION_DIR" "$scope" 2>/dev/null; then
     rc=0
   else
@@ -677,7 +763,7 @@ register_codex_hooks() {
   fi
   if ! inspect_codex_hook_transaction; then
     HOOKS_TRANSACTION_PRESERVE=1
-    fail "Codex hook transaction manifest를 안전하게 확인하지 못했습니다."
+    fail "$HOOKS_DISPLAY_NAME hook transaction manifest를 안전하게 확인하지 못했습니다."
     fail "live hooks path 상태는 확인되지 않았습니다."
     report_codex_hook_transaction
     exit 1
@@ -687,7 +773,7 @@ register_codex_hooks() {
   fi
   if [ "$rc" -eq 0 ] && [ "$HOOKS_TRANSACTION_STAGE" = "activated" ]; then
     HOOKS_CONFIG_CHANGED=1
-    ok "Codex: $label 등록"
+    ok "$HOOKS_DISPLAY_NAME: $label 등록"
     return
   fi
   if [ "$rc" -eq 3 ] && [ "$HOOKS_TRANSACTION_STAGE" = "unchanged-restored" ]; then
@@ -698,7 +784,7 @@ register_codex_hooks() {
       report_codex_hook_transaction
       exit 1
     fi
-    skip "Codex: $label 이미 최신"
+    skip "$HOOKS_DISPLAY_NAME: $label 이미 최신"
     return
   fi
   if [ "$rc" -eq 4 ] && { [ "$HOOKS_TRANSACTION_STAGE" = "foreign-restored" ] ||
@@ -711,14 +797,44 @@ register_codex_hooks() {
       exit 1
     fi
     rollback_new_control_hook
-    fail "Codex hooks.json이 안전한 객체 파일이 아니거나 소유 그룹이 중복되어 설치를 중단합니다."
+    fail "$HOOKS_DISPLAY_NAME $(basename "$hooks_file")이 안전한 객체 파일이 아니거나 소유 그룹이 중복되어 설치를 중단합니다."
     exit 1
   fi
   HOOKS_TRANSACTION_PRESERVE=1
-  fail "Codex hooks.json capture/publish가 concurrent 또는 ambiguous 상태입니다 (rc=$rc, stage=$HOOKS_TRANSACTION_STAGE)."
+  fail "$HOOKS_DISPLAY_NAME $(basename "$hooks_file") capture/publish가 concurrent 또는 ambiguous 상태입니다 (rc=$rc, stage=$HOOKS_TRANSACTION_STAGE)."
   report_codex_hook_transaction
   fail "live hooks path 상태는 확인되지 않았으며 repository hook launcher는 transaction 검토가 끝날 때까지 보존합니다."
   exit 1
+}
+
+register_codex_hooks() {
+  register_guard_hooks "$@"
+}
+
+register_claude_hooks() {
+  register_guard_hooks "$@"
+}
+
+finalize_registered_guard_hooks() {
+  [ -n "$HOOKS_TRANSACTION_DIR" ] || return 0
+  if ! inspect_codex_hook_transaction || [ "$HOOKS_TRANSACTION_STAGE" != "activated" ] ||
+      ! finalize_codex_hook_transaction "activated"; then
+    HOOKS_TRANSACTION_PRESERVE=1
+    fail "$HOOKS_DISPLAY_NAME hook 설정은 publish됐지만 private transaction finalize를 확인하지 못했습니다."
+    report_codex_hook_transaction
+    return 1
+  fi
+  HOOKS_CONFIG_CHANGED=0
+}
+
+finalize_saved_claude_guard_hooks() {
+  [ -n "$CLAUDE_HOOKS_TRANSACTION_DIR" ] || return 0
+  load_claude_hook_transaction || return 1
+  if ! finalize_registered_guard_hooks; then
+    return 1
+  fi
+  clear_saved_claude_hook_transaction
+  clear_current_hook_transaction
 }
 
 control_coordinates_absent() {
@@ -800,7 +916,10 @@ validate_guard_preflight_diagnostic() {
         !oneOf(diagnostics.registry_claims.availability, ["available", "unavailable"])) process.exit(1);
     const coverage = diagnostics.adapter_coverage;
     if (!exact(coverage, ["claude", "codex", "gemini", "opencode"]) ||
-        !exactStaticCoverage(coverage.claude, "missing") ||
+        !validCoverageEntry(coverage.claude) ||
+        coverage.claude.prompt_origin !== "ok" || coverage.claude.pre_tool_block !== "ok" ||
+        coverage.claude.post_tool_correlation !== "ok" ||
+        (diagnostics.runtime_mode !== "enforce" && coverage.claude.enforced) ||
         !validCoverageEntry(coverage.codex) ||
         coverage.codex.prompt_origin !== "ok" || coverage.codex.pre_tool_block !== "ok" ||
         coverage.codex.post_tool_correlation !== "ok" ||
@@ -811,18 +930,17 @@ validate_guard_preflight_diagnostic() {
   ' <<<"$output"
 }
 
-unregister_codex_hooks() {
+unregister_guard_hooks() {
   local hooks_file="$1" rc
   if [ ! -e "$hooks_file" ] && [ ! -L "$hooks_file" ]; then
-    skip "Codex: 소유한 Guard hook 그룹 없음"
+    skip "$HOOKS_DISPLAY_NAME: 소유한 Guard hook 그룹 없음"
     return
   fi
-  allocate_codex_hook_transaction "$hooks_file"
-  if node "$CONFIG_EDITOR" "unregister-codex-hooks-transaction" "$hooks_file" \
+  if node "$CONFIG_EDITOR" "unregister-${HOOKS_ADAPTER}-hooks-transaction" "$hooks_file" \
       "$MCP_ENTRY" "$SCRIPT_DIR" "$HOOKS_TRANSACTION_DIR" 2>/dev/null; then rc=0; else rc=$?; fi
   if ! inspect_codex_hook_transaction; then
     HOOKS_TRANSACTION_PRESERVE=1
-    fail "Codex hook uninstall transaction manifest를 안전하게 확인하지 못했습니다."
+    fail "$HOOKS_DISPLAY_NAME hook uninstall transaction manifest를 안전하게 확인하지 못했습니다."
     fail "live hooks path 상태는 확인되지 않았습니다."
     report_codex_hook_transaction
     exit 1
@@ -833,11 +951,11 @@ unregister_codex_hooks() {
   if [ "$rc" -eq 0 ] && [ "$HOOKS_TRANSACTION_STAGE" = "activated" ]; then
     if ! finalize_codex_hook_transaction "activated"; then
       HOOKS_TRANSACTION_PRESERVE=1
-      fail "Codex hook uninstall finalize를 확인하지 못했습니다."
+      fail "$HOOKS_DISPLAY_NAME hook uninstall finalize를 확인하지 못했습니다."
       report_codex_hook_transaction
       exit 1
     fi
-    ok "Codex: 소유한 Guard hook 그룹 제거"
+    ok "$HOOKS_DISPLAY_NAME: 소유한 Guard hook 그룹 제거"
     return
   fi
   if [ "$rc" -eq 3 ] && [ "$HOOKS_TRANSACTION_STAGE" = "unchanged-restored" ]; then
@@ -846,7 +964,7 @@ unregister_codex_hooks() {
       report_codex_hook_transaction
       exit 1
     fi
-    skip "Codex: 소유한 Guard hook 그룹 없음"
+    skip "$HOOKS_DISPLAY_NAME: 소유한 Guard hook 그룹 없음"
     return
   fi
   if [ "$rc" -eq 4 ] && { [ "$HOOKS_TRANSACTION_STAGE" = "foreign-restored" ] ||
@@ -856,15 +974,37 @@ unregister_codex_hooks() {
       report_codex_hook_transaction
       exit 1
     fi
-    fail "Codex hooks.json을 안전하게 읽지 못해 hook 그룹을 보존합니다."
+    fail "$HOOKS_DISPLAY_NAME $(basename "$hooks_file")을 안전하게 읽지 못해 hook 그룹을 보존합니다."
     exit 1
   fi
   HOOKS_TRANSACTION_PRESERVE=1
-  fail "Codex hook uninstall은 concurrent/ambiguous 상태입니다 (rc=$rc, stage=$HOOKS_TRANSACTION_STAGE)."
+  fail "$HOOKS_DISPLAY_NAME hook uninstall은 concurrent/ambiguous 상태입니다 (rc=$rc, stage=$HOOKS_TRANSACTION_STAGE)."
   report_codex_hook_transaction
   fail "live hooks path 상태를 확인하지 못했습니다."
   fail "repository hook launcher는 transaction 검토가 끝날 때까지 보존합니다."
   exit 1
+}
+
+unregister_codex_hooks() {
+  HOOKS_ADAPTER="codex"
+  HOOKS_DISPLAY_NAME="Codex"
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+    skip "Codex: 소유한 Guard hook 그룹 없음"
+    return
+  fi
+  allocate_codex_hook_transaction "$1"
+  unregister_guard_hooks "$1"
+}
+
+unregister_claude_hooks() {
+  HOOKS_ADAPTER="claude"
+  HOOKS_DISPLAY_NAME="Claude"
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+    skip "Claude: 소유한 Guard hook 그룹 없음"
+    return
+  fi
+  allocate_claude_hook_transaction "$1"
+  unregister_guard_hooks "$1"
 }
 
 run_guard_preflight() {
@@ -895,7 +1035,8 @@ if [ "${1:-}" = "--uninstall" ]; then
   echo "jhw-notion 제거를 시작합니다..."
   echo ""
 
-  echo "[1/4] Codex Guard hook 등록 해제"
+  echo "[1/4] Guard hook 등록 해제"
+  unregister_claude_hooks "$HOME/.claude/settings.json"
   unregister_codex_hooks "$HOME/.codex/hooks.json"
   uninstall_control_hook
 
@@ -1076,11 +1217,19 @@ if [ -d "$CODEX_DIR" ]; then
   register_codex_mcp "$CODEX_DIR/config.toml"
 fi
 
-# [6/6] Codex Guard hook 등록. 신뢰 여부는 Codex가 관리하므로 설치기는 절대 승인하지 않는다.
+# [6/6] Guard hook 등록. 런타임 신뢰 여부는 preflight가 별도로 검증한다.
 echo ""
-echo "[6/6] Codex Guard hook 등록"
+echo "[6/6] Guard hook 등록"
 if control_coordinates_absent; then
   run_guard_preflight
+  if [ -d "$CLAUDE_DIR" ]; then
+    allocate_claude_hook_transaction "$CLAUDE_DIR/settings.json"
+    register_claude_hooks "$CLAUDE_DIR/settings.json" "session-end-only"
+    save_claude_hook_transaction || exit 1
+    skip "Claude: Project Control 미설정 — Guard hook 그룹 비활성"
+  else
+    skip "Claude Code 미설치 — Guard hook 배선 생략"
+  fi
   if [ -d "$CODEX_DIR" ]; then
     allocate_codex_hook_transaction "$CODEX_DIR/hooks.json"
     register_codex_hooks "$CODEX_DIR/hooks.json" "session-end-only"
@@ -1090,25 +1239,25 @@ if control_coordinates_absent; then
     skip "Codex CLI 미설치 — Guard hook 배선 생략"
   fi
 else
+  if [ -d "$CLAUDE_DIR" ]; then
+    allocate_claude_hook_transaction "$CLAUDE_DIR/settings.json"
+    register_claude_hooks "$CLAUDE_DIR/settings.json"
+    save_claude_hook_transaction || exit 1
+  else
+    skip "Claude Code 미설치 — Guard hook 배선 생략"
+  fi
   if [ -d "$CODEX_DIR" ]; then
     allocate_codex_hook_transaction "$CODEX_DIR/hooks.json"
     register_codex_hooks "$CODEX_DIR/hooks.json"
-    echo "  Codex /hooks 화면에서 세 hook을 검토하고 신뢰 상태를 확인하세요."
+    echo "  Codex /hooks 화면에서 네 hook을 검토하고 신뢰 상태를 확인하세요."
   else
     skip "Codex CLI 미설치 — Guard hook 배선 생략"
   fi
   run_guard_preflight
 fi
 
-if [ -n "$HOOKS_TRANSACTION_DIR" ]; then
-  if ! inspect_codex_hook_transaction || [ "$HOOKS_TRANSACTION_STAGE" != "activated" ] ||
-      ! finalize_codex_hook_transaction "activated"; then
-    HOOKS_TRANSACTION_PRESERVE=1
-    fail "설치는 publish됐지만 private hook transaction finalize를 확인하지 못했습니다."
-    report_codex_hook_transaction
-    exit 1
-  fi
-fi
+finalize_registered_guard_hooks || exit 1
+finalize_saved_claude_guard_hooks || exit 1
 INSTALL_TRANSACTION_ACTIVE=0
 trap - EXIT
 

@@ -9,6 +9,10 @@ import type {
 import type { ControlConfig } from "./config.js";
 import { RegistryRecordStore, type RegistryDirectoryEntry } from "./codec.js";
 import { ControlError } from "./errors.js";
+import {
+  GuardJournal,
+  type GuardSessionEndEvidence,
+} from "./guard-journal.js";
 import type { GuardAdapter } from "./guard-protocol.js";
 import {
   buildHandoff,
@@ -210,6 +214,7 @@ export type TaskRecoveryDiscovery =
         worktree_mapped: boolean;
         dirty: boolean;
         ahead: number;
+        session_end: GuardSessionEndEvidence;
       };
     };
 
@@ -225,7 +230,11 @@ export interface TaskCleanupRecoveryResult {
   worktree: WorktreeRemovalResult;
 }
 
-export type TaskRecoveryResult = RecoveryResult | TaskCleanupRecoveryResult | WorktreeMappingRepairResult;
+export type TaskRecoveryResult =
+  | Exclude<RecoveryResult, { kind: "status" }>
+  | (Extract<RecoveryResult, { kind: "status" }> & { session_end: GuardSessionEndEvidence })
+  | TaskCleanupRecoveryResult
+  | WorktreeMappingRepairResult;
 
 export interface TaskServiceHooks {
   afterClaim?: (claim: ActiveClaim) => void | Promise<void>;
@@ -431,6 +440,7 @@ function parseHandoffGitState(value: string, handoffPath: string): HandoffGitSta
 export class TaskService {
   private readonly records: RegistryRecordStore;
   private readonly sensitiveData: SensitiveDataPolicy;
+  private readonly guardJournal: GuardJournal;
 
   constructor(
     private readonly config: ControlConfig,
@@ -447,6 +457,7 @@ export class TaskService {
       config.worktreeRoot,
     ]);
     this.records = new RegistryRecordStore(config.registryDir, registry, this.sensitiveData);
+    this.guardJournal = new GuardJournal(config.stateDir, {}, this.sensitiveData);
   }
 
   async start(input: TaskStartInput): Promise<TaskStartResult> {
@@ -731,6 +742,7 @@ export class TaskService {
         worktree_mapped: status.worktree_mapped,
         dirty: status.dirty,
         ahead: status.ahead,
+        session_end: await this.sessionEndEvidence(status.active),
       },
     };
   }
@@ -955,13 +967,27 @@ export class TaskService {
       }
       return { kind: "cleanup", history, worktree: await this.worktrees.cleanupReleased(history) };
     }
+    if (input.action.kind === "status") {
+      const recovered = await this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
+      if (recovered.kind !== "status") {
+        throw new ControlError("INVALID_RECOVERY_RESULT", "Recovery status did not return status");
+      }
+      return {
+        ...recovered,
+        session_end: await this.sessionEndEvidence(recovered.active),
+      };
+    }
     if (input.action.kind === "force-end") {
       const previous = await this.claims.assertOwner(input.task_id, input.claim_id);
       await this.worktrees.assertForceEndEligible(previous);
-      return this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
+      const recovered = await this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
+      if (recovered.kind !== "force-end") {
+        throw new ControlError("INVALID_RECOVERY_RESULT", "Force-end recovery did not return force-end");
+      }
+      return recovered;
     }
     if (input.action.kind !== "takeover") {
-      return this.claims.recoverClaim(input.task_id, input.claim_id, input.action);
+      throw new ControlError("INVALID_RECOVERY_ACTION", "Recovery action was not recognized");
     }
 
     let previous: ActiveClaim | undefined;
@@ -980,6 +1006,34 @@ export class TaskService {
     }
     await this.worktrees.rebindTakeover(recovered.history, recovered.active);
     return recovered;
+  }
+
+  private async sessionEndEvidence(active: ActiveClaim): Promise<GuardSessionEndEvidence> {
+    if (!("origin_adapter" in active) || active.host !== this.config.buildHost) {
+      return { status: "unverified" };
+    }
+    try {
+      const inspection = await this.worktrees.inspect(active);
+      if (
+        inspection.worktree_ref !== active.worktree_ref
+        || inspection.branch !== active.branch
+      ) {
+        return { status: "unverified" };
+      }
+      return this.guardJournal.inspectSessionEndEvidence({
+        origin_adapter: active.origin_adapter,
+        task_id: active.task_id,
+        claim_id: active.claim_id,
+        worktree_ref: active.worktree_ref,
+        branch: active.branch,
+        head_sha: inspection.head_sha,
+        dirty: inspection.dirty,
+        ahead: inspection.ahead,
+        behind: inspection.behind,
+      });
+    } catch {
+      return { status: "unverified" };
+    }
   }
 
   private timestamp(): string {

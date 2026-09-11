@@ -1848,6 +1848,7 @@ describe("Phase 1A deterministic adversarial gate", () => {
         worktree_mapped: true,
         dirty: true,
         ahead: 0,
+        session_end: { status: "absent" },
       },
     });
     expect((await graph.claims.getActive(formal.id))?.claim_id).toBe(resumedClaimId);
