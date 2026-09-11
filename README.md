@@ -174,6 +174,7 @@ Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Regi
 - `JHW_REGISTRY_DIR`, Registry SSH remote/repository slug, `JHW_CONTROL_STATE_DIR`를 한 host identity로 고정한다. alternate checkout/symlink/state directory를 섞으면 전역 lock과 Registry identity가 깨지므로 허용하지 않는다.
 - Project Record는 개인 비공개 GitHub Project의 canonical DraftIssue다. 제목과 `{id, objective, repositories}` 본문은 DraftIssue가, 다섯 운영 필드는 같은 Project item이 소유한다. Registry Issue와 node ID를 결합하지 않는다.
 - `jhw-control preflight`는 committed authority/tool version, read-only Notion ancestry guard, exact credential scope, private Project/Registry repository, 고정 Project DraftIssue와 독립 Registry Issue fixture restore, unique matching SSH remote와 Git dry-run을 확인하는 운영 go/no-go다.
+- Control의 Notion 검사는 host가 전달한 `NOTION_API_KEY`만 사용한다. 누락 시 `MISSING_CREDENTIAL`로 중단하며 MCP 싱글턴이나 `.env`로 폴백하지 않는다. 전용 클라이언트의 SDK 원문 로그는 출력하지 않고, 검사 실패는 `NOTION_GUARD_INDETERMINATE` 오류 JSON과 종료 코드 78로 전달한다. 전역 MCP 로깅과 host 런처의 엄격한 JSON 검증은 유지한다.
 - build server에서 manual/on-demand로 실행한다. Phase 1A에는 GitHub Actions workflow/minutes 의존과 schedule이 없다.
 
 구현된 public control command는 다음 13개뿐이다.
