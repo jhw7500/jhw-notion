@@ -189,6 +189,8 @@ child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또�
 - `active`: `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 Claim 좌표와 recovery observations만 보여주고, 별도 승인 전에는 멈춘다.
 - `handoff.available: false`: exact latest generation에는 Handoff가 없다는 뜻이다.
 - `process_exists: false`: recovery observation일 뿐 stale 판정이 아니다.
+- `session_end.status: recorded`: exact Task/Claim 후보가 하나이고 현재 adapter/worktree/branch/HEAD/dirty/ahead/behind와 모두 일치한 정상 종료 증거다. 출력된 `origin_adapter`와 `occurred_at`만 함께 보여주되 lifecycle 변경 근거로 자동 사용하지 않는다.
+- `session_end.status: absent | ambiguous | unverified`: 종료 증거가 없거나 하나로 확정할 수 없거나 안전성/현재 좌표 일치를 검증하지 못했다는 뜻이다. crash·kill·timeout과 구분하지 못하므로 stale로 판정하지 않는다.
 - takeover 성공 후에는 반환된 새 `claim_id`만 사용해 `task status`를 확인한다.
 - `TASK_CONTRACT_MISMATCH`: checkout recovery discovery로 canonical Task를 찾고 formal registration을 반복하지 않는다.
 - `TASK_ALREADY_CLAIMED`: 반환된 exact Claim 좌표를 recovery status로 확인하고 자동 takeover하지 않는다.
@@ -432,6 +434,8 @@ completed 전환이어도 이전 worktree는 병합 여부 판정에 따라 남�
 ```
 
 stale을 추정하지 않는다. `force-end`/`takeover`는 결과를 보여준 뒤 **실행 직전에 별도 사용자 승인**을 받는다.
+
+status의 `session_end`는 `recorded | absent | ambiguous | unverified`만 해석한다. `recorded`는 이전 native Claude/Codex 세션이 현재 live Git 좌표에서 정상 종료됐다는 bounded advisory evidence이므로 사용자에게 그 사실과 기존 `takeover`/`force-end` 선택지가 있음을 설명할 수 있다. 그러나 이 값이나 `process_exists: false`만으로 action을 고르거나 실행하지 않는다. `absent`, `ambiguous`, `unverified`이면 정상 종료를 주장하지 않는다. 어떤 경우든 아래 mutation command는 대상 좌표를 보여준 뒤 **각 실행 직전에 받은 별도 승인**이 있어야 한다.
 
 ```bash
 "$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <active-claim-id> --action force-end

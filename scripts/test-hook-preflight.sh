@@ -6,6 +6,7 @@ CLI="$REPO_ROOT/mcp-server/dist/control/cli.js"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/jhw hook preflight 'runtime.XXXXXX")"
 FAKE_BIN="$ROOT/fake-bin"
 mkdir -p "$FAKE_BIN"
+chmod 0755 "$FAKE_BIN"
 REAL_TIMEOUT="$(command -v timeout)"
 cat >"$FAKE_BIN/timeout" <<EOF
 #!/bin/sh
@@ -13,7 +14,7 @@ printf '%s\n' "\$*" >>"\${JHW_FAKE_PROBE_LOG:?}"
 printf '%s\n' "\$PWD" >"\${JHW_FAKE_PROBE_CWD_LOG:?}"
 exec "$REAL_TIMEOUT" "\$@"
 EOF
-chmod +x "$FAKE_BIN/timeout"
+chmod 0755 "$FAKE_BIN/timeout"
 cat >"$FAKE_BIN/codex" <<'EOF'
 #!/usr/bin/env node
 const fs = require("node:fs");
@@ -130,7 +131,80 @@ input.on("close", () => {
   if (stage !== 3) fail("client-closed-early");
 });
 EOF
-chmod +x "$FAKE_BIN/codex"
+chmod 0755 "$FAKE_BIN/codex"
+cat >"$FAKE_BIN/claude" <<'EOF'
+#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+for (const key of [
+  "JHW_REGISTRY_DIR", "JHW_REGISTRY_REMOTE", "JHW_REGISTRY_BRANCH", "JHW_WORKTREE_ROOT",
+  "JHW_CONTROL_STATE_DIR", "JHW_BUILD_HOST", "JHW_GITHUB_OWNER", "JHW_PROJECT_NUMBER",
+  "JHW_REGISTRY_REPOSITORY", "JHW_PREFLIGHT_PROJECT_ITEM_ID", "JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER",
+  "JHW_GUARD_MODE", "JHW_GUARD_ALLOW_OBSERVE",
+]) {
+  if (process.env[key] !== undefined) process.exit(65);
+}
+const configDir = process.env.CLAUDE_CONFIG_DIR;
+if (!configDir || !path.isAbsolute(configDir) || configDir === path.join(process.env.HOME, ".claude")) process.exit(66);
+const configInfo = fs.statSync(configDir);
+const settingsPath = path.join(configDir, "settings.json");
+if (!configInfo.isDirectory() || (configInfo.mode & 0o777) !== 0o700 || fs.existsSync(settingsPath)) process.exit(66);
+const signalPath = process.env.JHW_CLAUDE_PROBE_SIGNAL;
+if (!signalPath || !path.isAbsolute(signalPath) || path.dirname(signalPath) !== configDir || fs.existsSync(signalPath)) process.exit(66);
+if (process.env.ANTHROPIC_API_KEY !== "jhw-preflight-no-network" ||
+    process.env.ANTHROPIC_BASE_URL !== "http://127.0.0.1:1" ||
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== "1" ||
+    process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY !== "1") process.exit(66);
+fs.writeFileSync(path.join(configDir, "probe-state"), "must-be-cleaned", { mode: 0o600 });
+if (process.env.AWS_SECRET_ACCESS_KEY !== undefined || process.env.JHW_FAKE_CLAUDE_LOG !== undefined ||
+    process.env.NODE_OPTIONS !== undefined) process.exit(66);
+const logPath = path.join(process.env.HOME, "claude-runtime-probe.log");
+fs.appendFileSync(logPath, `${JSON.stringify({
+  args,
+  configDir,
+  home: process.env.HOME,
+  cwd: process.cwd(),
+  entrypoint: process.argv[1],
+})}\n`, "utf8");
+const settingSources = args.indexOf("--setting-sources");
+const settingsIndex = args.indexOf("--settings");
+if (!args.includes("-p") || !args.includes("--verbose") || !args.includes("--no-session-persistence") ||
+    !args.includes("--restricted") || !args.includes("--include-hook-events") || !args.includes("stream-json") ||
+    settingSources !== -1 || settingsIndex < 0 || process.cwd() !== configDir) process.exit(64);
+let settings;
+try { settings = JSON.parse(args[settingsIndex + 1]); } catch { process.exit(64); }
+const inlineGroups = settings?.hooks?.UserPromptSubmit;
+const inlineOwned = inlineGroups?.[0]?.hooks?.[0];
+const blocker = inlineGroups?.[1]?.hooks?.[0];
+const expectedOwned = '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event UserPromptSubmit; status=$?; /usr/bin/touch -- "$JHW_CLAUDE_PROBE_SIGNAL"; exit "$status"';
+const expectedBlocker = 'i=0; while [ ! -f "$JHW_CLAUDE_PROBE_SIGNAL" ] && [ "$i" -lt 200 ]; do /usr/bin/sleep 0.05; i=$((i+1)); done; [ -f "$JHW_CLAUDE_PROBE_SIGNAL" ] || exit 3; /usr/bin/sleep 1; printf \'jhw-claude-preflight-stop\\n\' >&2; exit 2';
+if (inlineGroups?.length !== 2 || inlineOwned?.type !== "command" || inlineOwned?.timeout !== 12 ||
+    inlineOwned?.command !== expectedOwned) process.exit(64);
+if (blocker?.type !== "command" || blocker?.timeout !== 12 || blocker?.command !== expectedBlocker) process.exit(64);
+const native = JSON.stringify({
+  hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "GUARD_UNAVAILABLE" },
+  systemMessage: "GUARD_UNAVAILABLE",
+});
+for (const value of [
+  {
+    type: "system", subtype: "hook_response", hook_id: "owned-hook-response",
+    hook_name: "UserPromptSubmit", hook_event: "UserPromptSubmit",
+    output: `${native}\n`, stdout: `${native}\n`, stderr: "", exit_code: 0, outcome: "success",
+  },
+  {
+    type: "system", subtype: "hook_response", hook_id: "blocking-probe-response",
+    hook_name: "UserPromptSubmit", hook_event: "UserPromptSubmit",
+    output: "jhw-claude-preflight-stop\n", stdout: "",
+    stderr: "jhw-claude-preflight-stop\n", exit_code: 2, outcome: "error",
+  },
+  {
+    type: "result", subtype: "success", is_error: false, duration_api_ms: 0,
+    num_turns: 0, total_cost_usd: 0, modelUsage: {},
+  },
+]) process.stdout.write(`${JSON.stringify(value)}\n`);
+EOF
+chmod 0755 "$FAKE_BIN/claude"
 trap 'rm -rf -- "$ROOT"' EXIT
 
 self_test_fake_app_server() {
@@ -167,13 +241,14 @@ self_test_fake_app_server
 [ -x "$CLI" ] || { echo "built jhw-control entry is not executable" >&2; exit 1; }
 
 owned_group_json() {
-  local event="$1"
-  node -e 'const event=process.argv[1]; process.stdout.write(JSON.stringify({hooks:[{type:"command",command:`"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,timeout:event==="SessionEnd"?3:12}]}))' "$event"
+  local event="$1" adapter="${2:-codex}"
+  node -e 'const [event, adapter]=process.argv.slice(1); process.stdout.write(JSON.stringify({hooks:[{type:"command",command:`"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event ${event}`,timeout:event==="SessionEnd"?3:12}]}))' "$event" "$adapter"
 }
 
 make_home() {
   local scenario="$1" home="$ROOT/$scenario-home" hooks="$ROOT/$scenario-home/.codex/hooks.json"
-  mkdir -p "$home/.codex" "$home/.local/bin" "$home/registry" "$home/worktrees" "$home/state"
+  mkdir -p "$home/.claude" "$home/.codex" "$home/.local/bin" "$home/registry" "$home/worktrees" "$home/state"
+  chmod 0700 "$home" "$home/.claude" "$home/.local" "$home/.local/bin"
   case "$scenario" in
     launcher-missing) ;;
     launcher-regular) printf 'private-regular-launcher-marker' >"$home/.local/bin/jhw-control-hook" ;;
@@ -183,6 +258,41 @@ make_home() {
       ;;
     *) ln -s "$REPO_ROOT/scripts/jhw-control-hook" "$home/.local/bin/jhw-control-hook" ;;
   esac
+  if [[ "$scenario" == claude-* ]]; then
+    printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s],"PostToolUse":[%s],"SessionEnd":[%s]}}\n' \
+      "$(owned_group_json UserPromptSubmit claude)" \
+      "$(owned_group_json PreToolUse claude)" \
+      "$(owned_group_json PostToolUse claude)" \
+      "$(owned_group_json SessionEnd claude)" >"$home/.claude/settings.json"
+    chmod 0600 "$home/.claude/settings.json"
+    mkdir -p "$home/project/nested"
+    chmod 0700 "$home/project" "$home/project/nested"
+    case "$scenario" in
+      claude-global-file-writable)
+        chmod 0622 "$home/.claude/settings.json"
+        ;;
+      claude-global-dir-writable)
+        chmod 0777 "$home/.claude"
+        ;;
+      claude-project-parent-writable)
+        chmod 0777 "$home/project"
+        ;;
+      claude-project-disabled)
+        mkdir -p "$home/project/.claude"
+        printf '%s\n' '{"disableAllHooks":true}' >"$home/project/.claude/settings.json"
+        chmod 0600 "$home/project/.claude/settings.json"
+        ;;
+      claude-local-disabled)
+        mkdir -p "$home/project/.claude"
+        printf '%s\n' '{"disableAllHooks":true}' >"$home/project/.claude/settings.local.json"
+        chmod 0600 "$home/project/.claude/settings.local.json"
+        ;;
+      claude-ancestor-symlink)
+        mkdir -p "$home/project-settings-target"
+        ln -s "$home/project-settings-target" "$home/project/.claude"
+        ;;
+    esac
+  fi
   case "$scenario" in
     exact-trusted|exact-invalid-shell|exact-untrusted|exact-unavailable|exact-runtime-source|exact-runtime-duplicate|exact-stubborn|exact-foreign-trusted-after|exact-mcp-untrusted|exact-guard-async|exact-missing-display-order|launcher-missing|launcher-regular|launcher-foreign)
       printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s],"PostToolUse":[%s],"SessionEnd":[%s]}}\n' \
@@ -210,7 +320,7 @@ make_home() {
 }
 
 run_preflight() {
-  local scenario="$1" home="$2" output="$home/preflight.out" error="$home/preflight.err" rc mode log probe_log probe_cwd_log runtime_shell
+  local scenario="$1" home="$2" output="$home/preflight.out" error="$home/preflight.err" rc mode log claude_log probe_log probe_cwd_log runtime_shell run_cwd
   case "$scenario" in
     exact-trusted) mode="trusted" ;;
     exact-invalid-shell) mode="trusted" ;;
@@ -226,15 +336,24 @@ run_preflight() {
     *) mode="trusted" ;;
   esac
   log="$ROOT/$scenario-app-server.log"
+  claude_log="$home/claude-runtime-probe.log"
   probe_log="$ROOT/$scenario-shell-probe.log"
   probe_cwd_log="$ROOT/$scenario-shell-probe-cwd.log"
   runtime_shell="${SHELL:-/bin/sh}"
-  [ "$scenario" != "exact-invalid-shell" ] || runtime_shell="$home/private-missing-shell"
+  run_cwd="$REPO_ROOT"
+  case "$scenario" in
+    exact-invalid-shell|claude-exact-trusted) runtime_shell="$home/private-missing-shell" ;;
+    claude-project-parent-writable|claude-project-disabled|claude-local-disabled|claude-ancestor-symlink)
+      run_cwd="$home/project/nested"
+      ;;
+  esac
   local started_ms finished_ms elapsed_ms stubborn_pid
   started_ms="$(date +%s%3N)"
-  if HOME="$home" PATH="$FAKE_BIN:$PATH" SHELL="$runtime_shell" \
+  if (cd "$run_cwd" && HOME="$home" PATH="$FAKE_BIN:$PATH" SHELL="$runtime_shell" NODE_OPTIONS="--no-warnings" \
       JHW_FAKE_CODEX_MODE="$mode" \
       JHW_FAKE_CODEX_LOG="$log" \
+      JHW_FAKE_CLAUDE_LOG="private-claude-log-path" \
+      AWS_SECRET_ACCESS_KEY="private-cloud-secret" \
       JHW_FAKE_CODEX_PID="$ROOT/$scenario-app-server.pid" \
       JHW_FAKE_PROBE_LOG="$probe_log" \
       JHW_FAKE_PROBE_CWD_LOG="$probe_cwd_log" \
@@ -248,7 +367,7 @@ run_preflight() {
       JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER="1" \
       JHW_CONTROL_STATE_DIR="$home/state" \
       JHW_GUARD_MODE="enforce" \
-      "$CLI" guard preflight >"$output" 2>"$error"; then
+      "$CLI" guard preflight) >"$output" 2>"$error"; then
     rc=0
   else
     rc=$?
@@ -270,10 +389,10 @@ run_preflight() {
       return 1
     fi
   fi
-  node - "$scenario" "$output" "$error" "$log" "$probe_log" "$probe_cwd_log" "$REPO_ROOT" <<'EOF'
+  node - "$scenario" "$output" "$error" "$log" "$claude_log" "$probe_log" "$probe_cwd_log" "$REPO_ROOT" "$home" <<'EOF'
 const fs = require("node:fs");
 const path = require("node:path");
-const [scenario, stdoutPath, stderrPath, logPath, probeLogPath, probeCwdLogPath, expectedProbeCwd] = process.argv.slice(2);
+const [scenario, stdoutPath, stderrPath, logPath, claudeLogPath, probeLogPath, probeCwdLogPath, expectedProbeCwd, expectedHome] = process.argv.slice(2);
 const stdout = fs.readFileSync(stdoutPath, "utf8");
 const stderr = fs.readFileSync(stderrPath, "utf8");
 const raw = stdout || stderr;
@@ -294,12 +413,25 @@ for (const [adapter, value] of Object.entries(coverage)) {
   }
 }
 const staticExpected = {
-  claude: { prompt_origin: "missing", pre_tool_block: "missing", post_tool_correlation: "missing", execution_recheck: "pending", enforced: false },
   gemini: { prompt_origin: "unsupported", pre_tool_block: "unsupported", post_tool_correlation: "unsupported", execution_recheck: "pending", enforced: false },
   opencode: { prompt_origin: "unsupported", pre_tool_block: "unsupported", post_tool_correlation: "unsupported", execution_recheck: "pending", enforced: false },
 };
 for (const [adapter, expected] of Object.entries(staticExpected)) {
   if (JSON.stringify(coverage[adapter]) !== JSON.stringify(expected)) fail(`${adapter} coverage is not truthful`);
+}
+const claudeGlobalUnsafe = [
+  "claude-global-file-writable", "claude-global-dir-writable", "claude-global-home-writable",
+].includes(scenario);
+const claudeAxes = scenario.startsWith("claude-") && !claudeGlobalUnsafe ? "ok" : "missing";
+const expectedClaude = {
+  prompt_origin: claudeAxes,
+  pre_tool_block: claudeAxes,
+  post_tool_correlation: claudeAxes,
+  execution_recheck: "pending",
+  enforced: scenario === "claude-exact-trusted",
+};
+if (JSON.stringify(coverage.claude) !== JSON.stringify(expectedClaude)) {
+  fail(`Claude installed/runtime coverage is not truthful: ${JSON.stringify(coverage.claude)}`);
 }
 const installedAxes = scenario.startsWith("exact-") ? "ok" : "missing";
 const expectedCodex = {
@@ -329,6 +461,33 @@ if (scenario.startsWith("exact-")) {
     fail("Codex inspector did not complete initialize/initialized/hooks/list");
   }
 }
+if (scenario === "claude-exact-trusted") {
+  if (!fs.existsSync(claudeLogPath)) fail("production preflight did not invoke Claude runtime");
+  const calls = fs.readFileSync(claudeLogPath, "utf8").trim().split("\n").map(JSON.parse);
+  if (calls.length !== 1) fail("Claude runtime probe did not run exactly once");
+  const call = calls[0];
+  if (!Array.isArray(call.args) || call.home !== expectedHome) {
+    fail("Claude runtime probe did not retain the exact launcher HOME");
+  }
+  if (!/^\/(?:proc\/self|dev)\/fd\/3$/.test(call.entrypoint)) {
+    fail("Claude runtime probe was not bound to the inspected executable descriptor");
+  }
+  if (typeof call.configDir !== "string" || fs.existsSync(call.configDir)) {
+    fail("Claude runtime probe did not clean its isolated config directory");
+  }
+  if (call.cwd !== call.configDir) fail("Claude runtime probe did not isolate its working directory");
+  if (fs.existsSync(probeLogPath) || fs.existsSync(probeCwdLogPath)) {
+    fail("Claude direct probe inherited the caller PATH instrumentation");
+  }
+}
+if ([
+  "claude-global-file-writable", "claude-global-dir-writable", "claude-global-home-writable",
+  "claude-runtime-file-writable", "claude-runtime-parent-writable", "claude-runtime-link-parent-writable",
+  "claude-project-parent-writable", "claude-project-disabled", "claude-local-disabled", "claude-ancestor-symlink",
+].includes(scenario) &&
+    fs.existsSync(claudeLogPath)) {
+  fail("Claude runtime probe ran despite an unsafe trust boundary");
+}
 if (scenario === "exact-trusted" || scenario === "exact-mcp-untrusted") {
   if (!fs.existsSync(probeLogPath)) fail("production preflight did not execute the stored canonical command");
   const probe = fs.readFileSync(probeLogPath, "utf8").trim().split("\n");
@@ -343,6 +502,9 @@ EOF
 }
 
 all_scenarios=(
+  claude-exact-trusted claude-global-file-writable claude-global-dir-writable claude-global-home-writable
+  claude-runtime-file-writable claude-runtime-parent-writable claude-runtime-link-parent-writable
+  claude-project-parent-writable claude-project-disabled claude-local-disabled claude-ancestor-symlink
   exact-trusted exact-invalid-shell exact-untrusted exact-unavailable exact-runtime-source exact-runtime-duplicate exact-stubborn
   exact-foreign-trusted-after exact-mcp-untrusted exact-guard-async exact-missing-display-order
   launcher-missing launcher-regular launcher-foreign duplicate-config missing malformed foreign
@@ -377,7 +539,27 @@ for scenario in "${scenarios[@]}"; do
   else
     launcher_kind="missing"
   fi
+  case "$scenario" in
+    claude-global-home-writable) chmod 0777 "$home" ;;
+    claude-runtime-file-writable) chmod 0777 "$FAKE_BIN/claude" ;;
+    claude-runtime-parent-writable) chmod 0777 "$FAKE_BIN" ;;
+    claude-runtime-link-parent-writable)
+      mv "$FAKE_BIN/claude" "$ROOT/trusted-claude"
+      ln -s "$ROOT/trusted-claude" "$FAKE_BIN/claude"
+      chmod 0777 "$FAKE_BIN"
+      ;;
+  esac
   run_preflight "$scenario" "$home"
+  case "$scenario" in
+    claude-runtime-file-writable) chmod 0755 "$FAKE_BIN/claude" ;;
+    claude-runtime-parent-writable) chmod 0755 "$FAKE_BIN" ;;
+    claude-runtime-link-parent-writable)
+      chmod 0755 "$FAKE_BIN"
+      rm -- "$FAKE_BIN/claude"
+      mv "$ROOT/trusted-claude" "$FAKE_BIN/claude"
+      chmod 0755 "$FAKE_BIN/claude"
+      ;;
+  esac
   if [ -e "$hooks" ]; then
     [ "$(sha256sum "$hooks")" = "$before" ] || { echo "preflight modified $scenario hooks" >&2; exit 1; }
     [ "$(stat -c '%a' "$hooks")" = "$before_mode" ] || { echo "preflight changed $scenario hook mode" >&2; exit 1; }

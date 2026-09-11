@@ -1,4 +1,4 @@
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -131,6 +131,326 @@ describe("GuardJournal", () => {
     expect(GuardJournalEventSchema.safeParse({ ...ended, session_id: "must-not-persist" }).success).toBe(false);
     expect(GuardJournalEventSchema.safeParse({ ...ended, cwd: "/srv/private" }).success).toBe(false);
     expect(GuardJournalEventSchema.safeParse({ ...ended, head_sha: "not-a-git-id" }).success).toBe(false);
+  });
+
+  it("reports one exact SessionEnd row as recorded without exposing Claim or Git coordinates", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const journal = new GuardJournal(stateDir);
+    const ended = {
+      protocol_version: 1 as const,
+      origin_adapter: "codex" as const,
+      event: "session-ended" as const,
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    };
+    await journal.append(ended);
+
+    const result = await journal.inspectSessionEndEvidence({
+      origin_adapter: ended.origin_adapter,
+      task_id: ended.task_id,
+      claim_id: ended.claim_id,
+      worktree_ref: ended.worktree_ref,
+      branch: ended.branch,
+      head_sha: ended.head_sha,
+      dirty: ended.dirty,
+      ahead: ended.ahead,
+      behind: ended.behind,
+    });
+
+    expect(result).toEqual({
+      status: "recorded",
+      origin_adapter: "codex",
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    });
+    expect(JSON.stringify(result)).not.toContain(ended.task_id);
+    expect(JSON.stringify(result)).not.toContain(ended.claim_id);
+    expect(JSON.stringify(result)).not.toContain(ended.head_sha);
+  });
+
+  it("reports absent without creating an uninitialized state directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "missing-state");
+
+    await expect(new GuardJournal(stateDir).inspectSessionEndEvidence({
+      origin_adapter: "codex",
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+    })).resolves.toEqual({ status: "absent" });
+    await expect(lstat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reports duplicate exact SessionEnd rows as ambiguous", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const journal = new GuardJournal(join(root, "state"));
+    const ended = {
+      protocol_version: 1 as const,
+      origin_adapter: "codex" as const,
+      event: "session-ended" as const,
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    };
+    await journal.append(ended);
+    await journal.append({ ...ended, occurred_at: "2026-08-25T01:01:00.000Z" });
+
+    await expect(journal.inspectSessionEndEvidence({
+      origin_adapter: ended.origin_adapter,
+      task_id: ended.task_id,
+      claim_id: ended.claim_id,
+      worktree_ref: ended.worktree_ref,
+      branch: ended.branch,
+      head_sha: ended.head_sha,
+      dirty: ended.dirty,
+      ahead: ended.ahead,
+      behind: ended.behind,
+    })).resolves.toEqual({ status: "ambiguous" });
+  });
+
+  it("reports a coordinate-drifted SessionEnd row as unverified", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const journal = new GuardJournal(join(root, "state"));
+    const ended = {
+      protocol_version: 1 as const,
+      origin_adapter: "codex" as const,
+      event: "session-ended" as const,
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    };
+    await journal.append(ended);
+
+    await expect(journal.inspectSessionEndEvidence({
+      origin_adapter: ended.origin_adapter,
+      task_id: ended.task_id,
+      claim_id: ended.claim_id,
+      worktree_ref: ended.worktree_ref,
+      branch: ended.branch,
+      head_sha: "b".repeat(40),
+      dirty: ended.dirty,
+      ahead: ended.ahead,
+      behind: ended.behind,
+    })).resolves.toEqual({ status: "unverified" });
+  });
+
+  it("reports an unsafe journal file as unverified without repairing or reading through it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const journalPath = join(stateDir, "guard-journal.jsonl");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(journalPath, `${JSON.stringify({ event: "attacker-controlled" })}\n`, { mode: 0o600 });
+    await chmod(journalPath, 0o644);
+    const before = await lstat(journalPath);
+
+    await expect(new GuardJournal(stateDir).inspectSessionEndEvidence({
+      origin_adapter: "codex",
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+    })).resolves.toEqual({ status: "unverified" });
+
+    const after = await lstat(journalPath);
+    expect(after.mode & 0o777).toBe(0o644);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(await readFile(journalPath, "utf8")).toBe(`${JSON.stringify({ event: "attacker-controlled" })}\n`);
+  });
+
+  it.each([
+    ["truncated JSON", '{"event":"session-ended"'],
+    ["an oversized journal", "x".repeat((8 * 1024 * 1024) + 1)],
+  ])("reports %s as unverified", async (_label, bytes) => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(join(stateDir, "guard-journal.jsonl"), bytes, { mode: 0o600 });
+
+    await expect(new GuardJournal(stateDir).inspectSessionEndEvidence({
+      origin_adapter: "codex",
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+    })).resolves.toEqual({ status: "unverified" });
+  });
+
+  it.each(["symlink", "hardlink"])("does not trust a %s journal leaf", async (kind) => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const journalPath = join(stateDir, "guard-journal.jsonl");
+    const external = join(root, "external-journal.jsonl");
+    const original = `${JSON.stringify({ event: "attacker-controlled" })}\n`;
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(external, original, { mode: 0o600 });
+    if (kind === "symlink") await symlink(external, journalPath);
+    else await link(external, journalPath);
+
+    await expect(new GuardJournal(stateDir).inspectSessionEndEvidence({
+      origin_adapter: "claude",
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+    })).resolves.toEqual({ status: "unverified" });
+    expect(await readFile(external, "utf8")).toBe(original);
+  });
+
+  it("reports a journal changed during its descriptor-bound read as unverified", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const journalPath = join(stateDir, "guard-journal.jsonl");
+    const ended = {
+      protocol_version: 1 as const,
+      origin_adapter: "claude" as const,
+      event: "session-ended" as const,
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    };
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(journalPath, `${JSON.stringify(ended)}\n`, { mode: 0o600 });
+    const journal = new GuardJournal(stateDir, {
+      afterDirectoryOpen(directory) {
+        const openFile = directory.openFile.bind(directory);
+        Object.defineProperty(directory, "openFile", {
+          configurable: true,
+          value: async (name: string, flags: number, mode?: number) => {
+            const file = await openFile(name, flags, mode);
+            const originalStat = file.stat.bind(file) as unknown as (options: unknown) => Promise<unknown>;
+            let statCount = 0;
+            Object.defineProperty(file, "stat", {
+              configurable: true,
+              value: async (options: unknown) => {
+                statCount += 1;
+                if (statCount === 2) {
+                  await appendFile(journalPath, `${JSON.stringify({ ...ended, occurred_at: "2026-08-25T01:01:00.000Z" })}\n`);
+                }
+                return originalStat(options);
+              },
+            });
+            return file;
+          },
+        });
+      },
+    });
+
+    await expect(journal.inspectSessionEndEvidence({
+      origin_adapter: ended.origin_adapter,
+      task_id: ended.task_id,
+      claim_id: ended.claim_id,
+      worktree_ref: ended.worktree_ref,
+      branch: ended.branch,
+      head_sha: ended.head_sha,
+      dirty: ended.dirty,
+      ahead: ended.ahead,
+      behind: ended.behind,
+    })).resolves.toEqual({ status: "unverified" });
+  });
+
+  it("does not trust a journal leaf owned by another user", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const journalPath = join(stateDir, "guard-journal.jsonl");
+    const ended = {
+      protocol_version: 1 as const,
+      origin_adapter: "claude" as const,
+      event: "session-ended" as const,
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    };
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(journalPath, `${JSON.stringify(ended)}\n`, { mode: 0o600 });
+    const journal = new GuardJournal(stateDir, {
+      afterDirectoryOpen(directory) {
+        const openFile = directory.openFile.bind(directory);
+        Object.defineProperty(directory, "openFile", {
+          configurable: true,
+          value: async (name: string, flags: number, mode?: number) => {
+            const file = await openFile(name, flags, mode);
+            const originalStat = file.stat.bind(file) as unknown as (options: unknown) => Promise<Record<string, unknown>>;
+            Object.defineProperty(file, "stat", {
+              configurable: true,
+              value: async (options: unknown) => {
+                const info = await originalStat(options);
+                return { ...info, isFile: () => true, uid: (info.uid as bigint) + 1n };
+              },
+            });
+            return file;
+          },
+        });
+      },
+    });
+
+    await expect(journal.inspectSessionEndEvidence({
+      origin_adapter: ended.origin_adapter,
+      task_id: ended.task_id,
+      claim_id: ended.claim_id,
+      worktree_ref: ended.worktree_ref,
+      branch: ended.branch,
+      head_sha: ended.head_sha,
+      dirty: ended.dirty,
+      ahead: ended.ahead,
+      behind: ended.behind,
+    })).resolves.toEqual({ status: "unverified" });
   });
 
   it("rejects noncanonical or duplicate requirement lists", () => {

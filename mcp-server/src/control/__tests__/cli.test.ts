@@ -218,6 +218,10 @@ type Overrides = {
     list(): Promise<Task3CodexHookRuntimeInventory>;
     probe(home: string, command: string, cwd: string): Promise<Task3CodexHookProbeResult>;
   };
+  claudeHookRuntime?: {
+    probePrompt(home: string): Promise<Task3CodexHookProbeResult>;
+    probeCommand(home: string, command: string): Promise<Task3CodexHookProbeResult>;
+  };
   registrationRecordWarning?: CliDependencies["registrationRecordWarning"];
 };
 
@@ -263,7 +267,15 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
       state: "inactive",
       handoff: { available: false },
     }),
-    recover: vi.fn().mockResolvedValue({ kind: "status", active: activeClaim, process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 }),
+    recover: vi.fn().mockResolvedValue({
+      kind: "status",
+      active: activeClaim,
+      process_exists: false,
+      worktree_mapped: true,
+      dirty: false,
+      ahead: 0,
+      session_end: { status: "absent" },
+    }),
     assertOwner: vi.fn().mockResolvedValue(activeClaim),
     markCompletionReady: vi.fn().mockResolvedValue({
       version: 1,
@@ -364,6 +376,7 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     guardClaims,
     ...(overrides.codexRepositoryRoot ? { codexRepositoryRoot: overrides.codexRepositoryRoot } : {}),
     ...(overrides.codexHookRuntime ? { codexHookRuntime: overrides.codexHookRuntime } : {}),
+    ...(overrides.claudeHookRuntime ? { claudeHookRuntime: overrides.claudeHookRuntime } : {}),
     ...(overrides.journal ? { journal: overrides.journal } : {}),
     boardJournal: overrides.boardJournal ?? { append: vi.fn().mockResolvedValue(undefined) },
     ...(overrides.registrationRecordWarning ? { registrationRecordWarning: overrides.registrationRecordWarning } : {}),
@@ -499,6 +512,17 @@ async function task3CodexHome(
   await mkdir(join(home, ".codex"), { recursive: true });
   await mkdir(dirname(expectedLauncherPath), { recursive: true });
   await mkdir(dirname(corePath), { recursive: true });
+  for (const directory of [
+    home,
+    join(home, ".local"),
+    join(home, ".local", "bin"),
+    join(home, ".codex"),
+    repositoryRoot,
+    dirname(expectedLauncherPath),
+    join(repositoryRoot, "mcp-server"),
+    join(repositoryRoot, "mcp-server", "dist"),
+    dirname(corePath),
+  ]) await chmod(directory, 0o700);
 
   if (artifact === "resolved-nonregular") {
     await mkdir(expectedLauncherPath);
@@ -624,6 +648,92 @@ function task3Runtime(
   return {
     list: vi.fn().mockResolvedValue({ cwd, hooks: metadata }),
     probe: vi.fn().mockResolvedValue(probeResult),
+  };
+}
+
+async function task3ClaudeHome(): Promise<Awaited<ReturnType<typeof task3CodexHome>> & { settingsPath: string }> {
+  const fixture = await task3CodexHome("missing");
+  const settingsPath = join(fixture.home, ".claude", "settings.json");
+  await mkdir(dirname(settingsPath), { recursive: true });
+  await chmod(dirname(settingsPath), 0o700);
+  const hooks = Object.fromEntries(task3HookEvents.map((event) => [event, [{
+    hooks: [{
+      type: "command",
+      command: `"$HOME/.local/bin/jhw-control-hook" --adapter claude --event ${event}`,
+      timeout: task3HookTimeout(event),
+    }],
+  }]]));
+  await writeFile(settingsPath, `${JSON.stringify({ hooks }, null, 2)}\n`, { mode: 0o600 });
+  return { ...fixture, settingsPath };
+}
+
+function task3SuccessfulClaudePromptProbe(): Task3CodexHookProbeResult {
+  const native = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "UserPromptSubmit",
+      additionalContext: "GUARD_UNAVAILABLE",
+    },
+    systemMessage: "GUARD_UNAVAILABLE",
+  });
+  const lines = [
+    {
+      type: "system",
+      subtype: "hook_response",
+      hook_id: "owned-hook-response",
+      hook_name: "UserPromptSubmit",
+      hook_event: "UserPromptSubmit",
+      output: `${native}\n`,
+      stdout: `${native}\n`,
+      stderr: "",
+      exit_code: 0,
+      outcome: "success",
+    },
+    {
+      type: "system",
+      subtype: "hook_response",
+      hook_id: "blocking-probe-response",
+      hook_name: "UserPromptSubmit",
+      hook_event: "UserPromptSubmit",
+      output: "jhw-claude-preflight-stop\n",
+      stdout: "",
+      stderr: "jhw-claude-preflight-stop\n",
+      exit_code: 2,
+      outcome: "error",
+    },
+    {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      duration_api_ms: 0,
+      num_turns: 0,
+      total_cost_usd: 0,
+      modelUsage: {},
+    },
+  ];
+  return {
+    exitCode: 0,
+    signal: null,
+    stdout: Buffer.from(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`),
+    stderr: Buffer.alloc(0),
+  };
+}
+
+function mutateClaudePromptProbe(
+  mutate: (lines: Array<Record<string, unknown>>) => Array<Record<string, unknown>>,
+): Task3CodexHookProbeResult {
+  const original = task3SuccessfulClaudePromptProbe();
+  const lines = Buffer.from(original.stdout).toString("utf8").trim().split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  return {
+    ...original,
+    stdout: Buffer.from(`${mutate(lines).map((line) => JSON.stringify(line)).join("\n")}\n`),
+  };
+}
+
+function task3ClaudeRuntime() {
+  return {
+    probePrompt: vi.fn().mockResolvedValue(task3SuccessfulClaudePromptProbe()),
+    probeCommand: vi.fn().mockResolvedValue(task3SuccessfulProbe()),
   };
 }
 
@@ -2772,7 +2882,19 @@ describe("runCli", () => {
     const dependencies = makeCliDependencies({
       taskService: {
         recover: vi.fn()
-          .mockResolvedValueOnce({ kind: "status", active: activeClaim, process_exists: false, worktree_mapped: true, dirty: false, ahead: 0 })
+          .mockResolvedValueOnce({
+            kind: "status",
+            active: activeClaim,
+            process_exists: false,
+            worktree_mapped: true,
+            dirty: false,
+            ahead: 0,
+            session_end: {
+              status: "recorded",
+              origin_adapter: "codex",
+              occurred_at: "2026-08-25T01:02:00.000Z",
+            },
+          })
           .mockResolvedValueOnce({ kind: "force-end", history: { ...activeClaim, status: "force-ended", released_at: "2026-08-13T00:01:00.000Z" } })
           .mockResolvedValueOnce({ kind: "takeover", active: replacement, history: { ...replacement, status: "taken-over", released_at: "2026-08-13T00:01:00.000Z" } }),
       },
@@ -2788,6 +2910,11 @@ describe("runCli", () => {
     const owner = await runCli(["task", "assert-owner", "--task", TASK_ID, "--claim", newClaim], dependencies);
 
     expect(status.exitCode).toBe(0);
+    expect(JSON.parse(status.stdout).result.session_end).toEqual({
+      status: "recorded",
+      origin_adapter: "codex",
+      occurred_at: "2026-08-25T01:02:00.000Z",
+    });
     expect(forceEnd.exitCode).toBe(0);
     expect(takeover.exitCode).toBe(0);
     expect(dependencies.taskService.recover).toHaveBeenNthCalledWith(1, { task_id: TASK_ID, claim_id: CLAIM_ID, action: { kind: "status" } });
@@ -3110,6 +3237,317 @@ describe("runCli", () => {
       fixture.home,
     );
     expect(Buffer.byteLength(result.stdout || result.stderr, "utf8")).toBeLessThanOrEqual(12 * 1024);
+  });
+
+  it("reports exact Claude hooks enforced only after zero-token runtime and direct PreTool probes", async () => {
+    const fixture = await task3ClaudeHome();
+    const document = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
+    document.hooks.UserPromptSubmit.push({
+      hooks: [{ type: "command", command: "/foreign/must-not-run", timeout: 9 }],
+    });
+    document.hooks.PreToolUse.push({
+      hooks: [{ type: "command", command: "/foreign/must-not-copy", timeout: 9 }],
+    });
+    await writeFile(fixture.settingsPath, `${JSON.stringify(document)}\n`, { mode: 0o600 });
+    const runtime = task3ClaudeRuntime();
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      claudeHookRuntime: runtime,
+    }));
+
+    expect(runtime.probePrompt).toHaveBeenCalledWith(fixture.home);
+    expect(runtime.probeCommand).toHaveBeenCalledWith(
+      fixture.home,
+      '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event PreToolUse',
+    );
+    expect(task3AdapterCoverage(result).claude).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: true,
+    });
+  });
+
+  it("does not claim the standard Claude settings path when CLAUDE_CONFIG_DIR selects another root", async () => {
+    const fixture = await task3ClaudeHome();
+    const runtime = task3ClaudeRuntime();
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home, CLAUDE_CONFIG_DIR: join(fixture.home, "other-claude-root") },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      claudeHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).claude).toEqual({
+      prompt_origin: "missing",
+      pre_tool_block: "missing",
+      post_tool_correlation: "missing",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.probePrompt).not.toHaveBeenCalled();
+    expect(runtime.probeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["nonzero model cost", () => mutateClaudePromptProbe((lines) => lines.map((line) =>
+      line.type === "result" ? { ...line, total_cost_usd: 0.01 } : line))],
+    ["one model turn", () => mutateClaudePromptProbe((lines) => lines.map((line) =>
+      line.type === "result" ? { ...line, num_turns: 1 } : line))],
+    ["API duration", () => mutateClaudePromptProbe((lines) => lines.map((line) =>
+      line.type === "result" ? { ...line, duration_api_ms: 1 } : line))],
+    ["missing blocker", () => mutateClaudePromptProbe((lines) => lines.filter((line) =>
+      line.hook_id !== "blocking-probe-response"))],
+    ["extra prompt handler", () => mutateClaudePromptProbe((lines) => [
+      ...lines,
+      { ...lines[0], hook_id: "foreign-extra-response" },
+    ])],
+    ["stderr output", () => ({
+      ...task3SuccessfulClaudePromptProbe(),
+      stderr: Buffer.from("private-claude-probe-error"),
+    })],
+  ] as const)("keeps exact Claude hooks unenforced when the runtime probe has %s", async (_name, probe) => {
+    const fixture = await task3ClaudeHome();
+    const runtime = {
+      probePrompt: vi.fn().mockResolvedValue(probe()),
+      probeCommand: vi.fn().mockResolvedValue(task3SuccessfulProbe()),
+    };
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      claudeHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).claude).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.probeCommand).not.toHaveBeenCalled();
+    expect(`${result.stdout}${result.stderr}`).not.toContain("private-claude-probe-error");
+  });
+
+  it("keeps exact Claude hooks unenforced when the direct PreTool probe fails", async () => {
+    const fixture = await task3ClaudeHome();
+    const runtime = task3ClaudeRuntime();
+    runtime.probeCommand.mockResolvedValue({ ...task3SuccessfulProbe(), exitCode: 17 });
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      claudeHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).claude.enforced).toBe(false);
+    expect(runtime.probeCommand).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["project settings", "settings.json", '{"disableAllHooks":true}\n'],
+    ["local settings", "settings.local.json", '{"disableAllHooks":true}\n'],
+    ["duplicate disable setting", "settings.local.json", '{"disableAllHooks":false,"disableAllHooks":false}\n'],
+  ] as const)("keeps exact Claude hooks unenforced when ancestor %s disables trustworthy discovery", async (
+    _name,
+    fileName,
+    content,
+  ) => {
+    const fixture = await task3ClaudeHome();
+    const projectRoot = join(fixture.home, "project");
+    const projectCwd = join(projectRoot, "nested");
+    await mkdir(join(projectRoot, ".claude"), { recursive: true });
+    await mkdir(projectCwd, { recursive: true });
+    await writeFile(join(projectRoot, ".claude", fileName), content, { mode: 0o600 });
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(projectCwd);
+    const runtime = task3ClaudeRuntime();
+    try {
+      const result = await runCli(["guard", "preflight"], makeCliDependencies({
+        env: { HOME: fixture.home },
+        codexRepositoryRoot: fixture.repositoryRoot,
+        claudeHookRuntime: runtime,
+      }));
+
+      expect(task3AdapterCoverage(result).claude).toEqual({
+        prompt_origin: "ok",
+        pre_tool_block: "ok",
+        post_tool_correlation: "ok",
+        execution_recheck: "pending",
+        enforced: false,
+      });
+      expect(runtime.probePrompt).not.toHaveBeenCalled();
+      expect(runtime.probeCommand).not.toHaveBeenCalled();
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
+  it("keeps exact Claude hooks unenforced when an ancestor .claude directory is a symlink", async () => {
+    const fixture = await task3ClaudeHome();
+    const projectRoot = join(fixture.home, "project");
+    const projectCwd = join(projectRoot, "nested");
+    const settingsTarget = join(fixture.home, "project-settings-target");
+    await mkdir(projectRoot, { recursive: true });
+    await mkdir(projectCwd, { recursive: true });
+    await mkdir(settingsTarget);
+    await symlink(settingsTarget, join(projectRoot, ".claude"));
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(projectCwd);
+    const runtime = task3ClaudeRuntime();
+    try {
+      const result = await runCli(["guard", "preflight"], makeCliDependencies({
+        env: { HOME: fixture.home },
+        codexRepositoryRoot: fixture.repositoryRoot,
+        claudeHookRuntime: runtime,
+      }));
+
+      expect(task3AdapterCoverage(result).claude.enforced).toBe(false);
+      expect(runtime.probePrompt).not.toHaveBeenCalled();
+      expect(runtime.probeCommand).not.toHaveBeenCalled();
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
+  it.each([
+    ["settings file", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(fixture.settingsPath, 0o622);
+    }],
+    ["settings directory", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(dirname(fixture.settingsPath), 0o777);
+    }],
+  ] as const)("fails closed when the global Claude %s is writable outside the probe cwd", async (
+    _name,
+    makeWritable,
+  ) => {
+    const fixture = await task3ClaudeHome();
+    const outsideCwd = await mkdtemp(join(tmpdir(), "jhw-claude-probe-cwd-"));
+    await makeWritable(fixture);
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(outsideCwd);
+    const runtime = task3ClaudeRuntime();
+    try {
+      const result = await runCli(["guard", "preflight"], makeCliDependencies({
+        env: { HOME: fixture.home },
+        codexRepositoryRoot: fixture.repositoryRoot,
+        claudeHookRuntime: runtime,
+      }));
+
+      expect(task3AdapterCoverage(result).claude).toEqual({
+        prompt_origin: "missing",
+        pre_tool_block: "missing",
+        post_tool_correlation: "missing",
+        execution_recheck: "pending",
+        enforced: false,
+      });
+      expect(runtime.probePrompt).not.toHaveBeenCalled();
+      expect(runtime.probeCommand).not.toHaveBeenCalled();
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
+  it.each([
+    ["launcher target file is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(fixture.expectedLauncherPath, 0o722);
+    }],
+    ["core file is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(fixture.corePath, 0o722);
+    }],
+    ["launcher parent is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(dirname(fixture.launcherPath), 0o777);
+    }],
+    ["launcher ancestor is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(join(fixture.home, ".local"), 0o777);
+    }],
+    ["launcher target parent is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(dirname(fixture.expectedLauncherPath), 0o777);
+    }],
+    ["repository root is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(fixture.repositoryRoot, 0o777);
+    }],
+    ["core parent is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(dirname(fixture.corePath), 0o777);
+    }],
+    ["launcher target is a symlink", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      const target = join(fixture.home, "foreign-launcher-target");
+      await writeFile(target, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      await unlink(fixture.expectedLauncherPath);
+      await symlink(target, fixture.expectedLauncherPath);
+    }],
+  ] as const)("fails closed when Claude executable artifact %s", async (_name, makeUnsafe) => {
+    const fixture = await task3ClaudeHome();
+    await makeUnsafe(fixture);
+    const runtime = task3ClaudeRuntime();
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      claudeHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).claude).toEqual({
+      prompt_origin: "missing",
+      pre_tool_block: "missing",
+      post_tool_correlation: "missing",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.probePrompt).not.toHaveBeenCalled();
+    expect(runtime.probeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["disabled hooks setting", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      const document = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
+      document.disableAllHooks = true;
+      await writeFile(fixture.settingsPath, `${JSON.stringify(document)}\n`, { mode: 0o600 });
+    }],
+    ["duplicate owned group", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      const document = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
+      document.hooks.PreToolUse.push(document.hooks.PreToolUse[0]);
+      await writeFile(fixture.settingsPath, `${JSON.stringify(document)}\n`, { mode: 0o600 });
+    }],
+    ["malformed JSON", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await writeFile(fixture.settingsPath, '{"hooks":{"PreToolUse":["private-claude-marker"],', { mode: 0o600 });
+    }],
+    ["settings symlink", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      const target = join(fixture.home, "private-claude-settings-target.json");
+      await writeFile(target, await readFile(fixture.settingsPath), { mode: 0o600 });
+      await unlink(fixture.settingsPath);
+      await symlink(target, fixture.settingsPath);
+    }],
+    ["duplicate disable setting", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      const document = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
+      await writeFile(
+        fixture.settingsPath,
+        `{"disableAllHooks":false,"disableAllHooks":false,"hooks":${JSON.stringify(document.hooks)}}\n`,
+        { mode: 0o600 },
+      );
+    }],
+  ] as const)("fails closed on Claude %s without probing or mutating settings", async (_name, mutate) => {
+    const fixture = await task3ClaudeHome();
+    await mutate(fixture);
+    const before = await readFile(fixture.settingsPath);
+    const beforeInfo = await lstat(fixture.settingsPath);
+    const runtime = task3ClaudeRuntime();
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      claudeHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).claude).toEqual({
+      prompt_origin: "missing",
+      pre_tool_block: "missing",
+      post_tool_correlation: "missing",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.probePrompt).not.toHaveBeenCalled();
+    expect(runtime.probeCommand).not.toHaveBeenCalled();
+    expect(await readFile(fixture.settingsPath)).toEqual(before);
+    const afterInfo = await lstat(fixture.settingsPath);
+    expect(afterInfo.isSymbolicLink()).toBe(beforeInfo.isSymbolicLink());
+    expect(afterInfo.mtimeMs).toBe(beforeInfo.mtimeMs);
+    expect(`${result.stdout}${result.stderr}`).not.toContain("private-claude-marker");
   });
 
   it.each(["relative", "missing"] as const)(

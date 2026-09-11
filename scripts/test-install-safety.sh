@@ -52,6 +52,17 @@ function marker(name, value) {
   fs.writeFileSync(path.join(process.env.HOME, name), value, { mode: 0o600 });
 }
 
+function sameDirectoryEntry(candidate, logical) {
+  if (path.basename(candidate) !== path.basename(logical)) return false;
+  try {
+    const candidateParent = fs.statSync(path.dirname(candidate));
+    const logicalParent = fs.statSync(path.dirname(logical));
+    return candidateParent.dev === logicalParent.dev && candidateParent.ino === logicalParent.ino;
+  } catch {
+    return path.resolve(candidate) === path.resolve(logical);
+  }
+}
+
 function launcherKind(info) {
   if (info.isSymbolicLink()) return "symlink";
   if (info.isFile()) return "file";
@@ -101,11 +112,11 @@ const realRenameSync = fs.renameSync.bind(fs);
 fs.renameSync = (source, destination) => {
   const capturesHooks =
     ["register-codex-hooks-transaction", "unregister-codex-hooks-transaction"].includes(operation) &&
-    path.resolve(source) === path.resolve(hooksFile) && path.basename(destination) === "captured-live";
+    sameDirectoryEntry(source, hooksFile) && path.basename(destination) === "captured-live";
   const capturesRollbackCandidate = operation === "rollback-codex-hooks-transaction" &&
-    path.resolve(source) === path.resolve(hooksFile) && path.basename(destination) === "candidate-live";
+    sameDirectoryEntry(source, hooksFile) && path.basename(destination) === "candidate-live";
   const capturesLauncher = operation === "remove-control-hook-link-transaction" &&
-    path.resolve(source) === path.resolve(launcherFile) && path.basename(destination) === "captured-link";
+    sameDirectoryEntry(source, launcherFile) && path.basename(destination) === "captured-link";
   if (capturesLauncher && ["uninstall-regular", "uninstall-symlink", "uninstall-same-target",
       "rollback-regular", "rollback-winner"].includes(launcherRaceMode)) {
     injectLauncherReplacement();
@@ -158,7 +169,7 @@ fs.renameSync = (source, destination) => {
     (round5Mode === "capture-manual-hard-exit" && operation === "register-codex-hooks-transaction") ||
     (round5Mode === "unregister-manual-hard-exit" && operation === "unregister-codex-hooks-transaction");
   if ((rollbackCandidateRenamed && operation === "rollback-codex-hooks-transaction" || captureManualHardExit) &&
-      path.resolve(destination) === path.join(path.resolve(transactionDirectory), "manifest.json")) {
+      sameDirectoryEntry(destination, path.join(transactionDirectory, "manifest.json"))) {
     try {
       const nextManifest = JSON.parse(fs.readFileSync(source, "utf8"));
       if (nextManifest.stage === "manual-recovery-required") recoveryManifestKind = "manual";
@@ -166,7 +177,7 @@ fs.renameSync = (source, destination) => {
     } catch {}
   }
   if (operation === "remove-control-hook-link-transaction" &&
-      path.resolve(destination) === path.join(path.resolve(transactionDirectory), "manifest.json")) {
+      sameDirectoryEntry(destination, path.join(transactionDirectory, "manifest.json"))) {
     try {
       launcherManifestStage = JSON.parse(fs.readFileSync(source, "utf8")).stage;
     } catch {}
@@ -198,19 +209,19 @@ fs.renameSync = (source, destination) => {
 const realLinkSync = fs.linkSync.bind(fs);
 fs.linkSync = (source, destination) => {
   if (operation === "remove-control-hook-link-transaction" && launcherRaceMode === "rollback-winner" &&
-      path.basename(source) === "captured-link" && path.resolve(destination) === path.resolve(launcherFile)) {
+      path.basename(source) === "captured-link" && sameDirectoryEntry(destination, launcherFile)) {
     fs.writeFileSync(launcherFile, "foreign-launcher-winner", { flag: "wx", mode: 0o622 });
     fs.chmodSync(launcherFile, 0o622);
     recordLauncherIdentity("launcher-winner.identity", launcherFile);
   }
   if (operation === "rollback-codex-hooks-transaction" &&
       round5Mode === "rollback-wave2-substitute-link" &&
-      path.basename(source) === "candidate-live" && path.resolve(destination) === path.resolve(hooksFile)) {
+      path.basename(source) === "candidate-live" && sameDirectoryEntry(destination, hooksFile)) {
     realRenameSync(source, path.join(process.env.HOME, "rollback-candidate-original-held"));
     fs.writeFileSync(source, "substituted-candidate-must-not-publish", { mode: 0o622 });
     marker("rollback-candidate-link-substitution-hit", source);
   }
-  if (!injected && matchingOperation && path.resolve(destination) === path.resolve(hooksFile)) {
+  if (!injected && matchingOperation && sameDirectoryEntry(destination, hooksFile)) {
     injected = true;
     const mode = Number.parseInt(process.env.JHW_TEST_LINK_RACE_MODE ?? "622", 8);
     const fd = fs.openSync(hooksFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, mode);
@@ -231,8 +242,8 @@ fs.linkSync = (source, destination) => {
 const realUnlinkSync = fs.unlinkSync.bind(fs);
 fs.unlinkSync = (target) => {
   if (operation === "remove-control-hook-link-transaction" &&
-      launcherRaceMode === "delete-hard-exit" && path.dirname(target) === path.resolve(transactionDirectory) &&
-      path.basename(target) === "captured-link") {
+      launcherRaceMode === "delete-hard-exit" &&
+      sameDirectoryEntry(target, path.join(transactionDirectory, "captured-link"))) {
     const manifest = JSON.parse(fs.readFileSync(path.join(transactionDirectory, "manifest.json"), "utf8"));
     marker("launcher-delete-stage-observed", String(manifest.stage));
     const result = realUnlinkSync(target);
@@ -241,7 +252,7 @@ fs.unlinkSync = (target) => {
   }
   if (operation === "register-codex-hooks-transaction" &&
       round5Mode === "activation-detach-intent" &&
-      path.dirname(target) === path.resolve(transactionDirectory) && path.basename(target) === "published-ready") {
+      sameDirectoryEntry(target, path.join(transactionDirectory, "published-ready"))) {
     const manifest = JSON.parse(fs.readFileSync(path.join(transactionDirectory, "manifest.json"), "utf8"));
     marker("activation-detach-stage-observed", String(manifest.stage));
     realUnlinkSync(target);
@@ -249,7 +260,8 @@ fs.unlinkSync = (target) => {
     process.exit(93);
   }
   if (!injected && operation === "finalize-codex-hooks-transaction" &&
-      round5Mode === "finalize-partial" && path.dirname(target) === path.resolve(transactionDirectory) &&
+      round5Mode === "finalize-partial" &&
+      sameDirectoryEntry(target, path.join(transactionDirectory, path.basename(target))) &&
       path.basename(target) !== "manifest.json") {
     injected = true;
     realUnlinkSync(target);
@@ -264,7 +276,7 @@ const realRmdirSync = fs.rmdirSync.bind(fs);
 fs.rmdirSync = (target, ...args) => {
   const result = realRmdirSync(target, ...args);
   if (operation === "finalize-codex-hooks-transaction" &&
-      round5Mode === "finalize-post-rmdir-fsync" && path.resolve(target) === path.resolve(transactionDirectory)) {
+      round5Mode === "finalize-post-rmdir-fsync" && sameDirectoryEntry(target, transactionDirectory)) {
     removedTransactionDirectory = true;
     marker("finalize-rmdir-hit", target);
   }
@@ -353,6 +365,11 @@ if [ "\${JHW_TEST_ROLLBACK_FAIL:-0}" = "1" ] &&
    [ "\${2:-}" = "rollback-codex-hooks-transaction" ]; then
   exit 19
 fi
+if [ "\${JHW_TEST_CLAUDE_ROLLBACK_FAIL:-0}" = "1" ] &&
+   [ "\${1:-}" = "$REPO_ROOT/scripts/install-config.mjs" ] &&
+   [ "\${2:-}" = "rollback-claude-hooks-transaction" ]; then
+  exit 19
+fi
 if [ "\${JHW_TEST_ROLLBACK_AFTER_MUTATION_FAIL:-0}" = "1" ] &&
    [ "\${1:-}" = "$REPO_ROOT/scripts/install-config.mjs" ] &&
    [ "\${2:-}" = "rollback-codex-hooks-transaction" ]; then
@@ -432,6 +449,7 @@ run_install() {
     JHW_TEST_DIAGNOSTIC_OUTPUT="${JHW_TEST_DIAGNOSTIC_OUTPUT:-}" \
     JHW_TEST_DIAGNOSTIC_EXIT="${JHW_TEST_DIAGNOSTIC_EXIT:-78}" \
     JHW_TEST_ROLLBACK_FAIL="${JHW_TEST_ROLLBACK_FAIL:-0}" \
+    JHW_TEST_CLAUDE_ROLLBACK_FAIL="${JHW_TEST_CLAUDE_ROLLBACK_FAIL:-0}" \
     JHW_TEST_ROLLBACK_AFTER_MUTATION_FAIL="${JHW_TEST_ROLLBACK_AFTER_MUTATION_FAIL:-0}" \
     JHW_TEST_CONCURRENT_HOOKS="${JHW_TEST_CONCURRENT_HOOKS:-}" \
     JHW_TEST_CONCURRENT_MODE="${JHW_TEST_CONCURRENT_MODE:-0644}" \
@@ -480,7 +498,8 @@ EOF
 
 make_tui_roots() {
   local home="$1"
-  mkdir -p "$home/.claude" "$home/.gemini" "$home/.config/opencode" "$home/.codex"
+  mkdir -p "$home/.claude" "$home/.gemini" "$home/.config/opencode" "$home/.codex" "$home/.local/bin"
+  chmod 0700 "$home" "$home/.claude" "$home/.codex" "$home/.local" "$home/.local/bin"
 }
 
 assert_file_text() {
@@ -492,16 +511,16 @@ assert_file_text() {
 }
 
 assert_exact_owned_hook_groups() {
-  local hooks_file="$1" home="$2"
-  node - "$hooks_file" "$home" <<'EOF'
+  local hooks_file="$1" home="$2" adapter="${3:-codex}"
+  node - "$hooks_file" "$home" "$adapter" <<'EOF'
 const fs = require("node:fs");
-const [hooksFile] = process.argv.slice(2);
+const [hooksFile, , adapter] = process.argv.slice(2);
 const document = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
 for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"]) {
   const expected = {
     hooks: [{
       type: "command",
-      command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
+      command: `"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event ${event}`,
       timeout: event === "SessionEnd" ? 3 : 12,
     }],
   };
@@ -516,10 +535,10 @@ EOF
 }
 
 write_owned_hooks_fixture() {
-  local hooks_file="$1" home="$2" include_owned="$3"
-  node - "$hooks_file" "$home" "$include_owned" <<'EOF'
+  local hooks_file="$1" home="$2" include_owned="$3" adapter="${4:-codex}"
+  node - "$hooks_file" "$home" "$include_owned" "$adapter" <<'EOF'
 const fs = require("node:fs");
-const [file, , includeOwned] = process.argv.slice(2);
+const [file, , includeOwned, adapter] = process.argv.slice(2);
 const hooks = {
   SessionStart: [{ hooks: [{ type: "command", command: "/foreign/session", timeout: 4 }] }],
 };
@@ -528,7 +547,7 @@ if (includeOwned === "yes") {
     hooks[event] = [{
       hooks: [{
         type: "command",
-        command: `"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,
+        command: `"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event ${event}`,
         timeout: event === "SessionEnd" ? 3 : 12,
       }],
     }];
@@ -765,6 +784,23 @@ test_fresh_install_creates_both_control_links_and_exact_hooks() {
   assert_no_hook_transaction_evidence "$home"
 }
 
+test_fresh_install_wires_exact_claude_hooks() {
+  local home="$ROOT/fresh-claude-hooks-home"
+  make_tui_roots "$home"
+
+  if ! run_install "$home"; then
+    cat "$home/install.log" >&2
+    return 1
+  fi
+
+  assert_exact_owned_hook_groups "$home/.claude/settings.json" "$home" claude
+  [ "$(stat -c '%a' "$home/.claude/settings.json")" = "600" ] || return 1
+  [ -z "$(find "$home/.claude" -maxdepth 1 -mindepth 1 -name '.settings.json.jhw-txn.*')" ] || {
+    echo "confirmed Claude install left private transaction evidence" >&2
+    return 1
+  }
+}
+
 test_install_orders_guard_transaction_and_runs_public_preflight() {
   local home="$ROOT/guard-order-home" control hook skills mcp registered preflight complete
   make_tui_roots "$home"
@@ -877,12 +913,140 @@ test_install_requires_complete_guard_diagnostic_schema() {
   done
 }
 
+test_install_accepts_guard_diagnostic_for_detected_adapters() {
+  local scenario home claude_state codex_state output
+  for scenario in codex-only claude-only neither; do
+    home="$ROOT/guard-diagnostic-adapters-$scenario-home"
+    mkdir -p "$home"
+    claude_state=missing
+    codex_state=missing
+    case "$scenario" in
+      codex-only)
+        mkdir -p "$home/.codex"
+        codex_state=ok
+        ;;
+      claude-only)
+        mkdir -p "$home/.claude"
+        claude_state=ok
+        ;;
+    esac
+    output="$(node - "$claude_state" "$codex_state" <<'EOF'
+const [claudeState, codexState] = process.argv.slice(2);
+const coverage = (state) => ({
+  prompt_origin: state,
+  pre_tool_block: state,
+  post_tool_correlation: state,
+  execution_recheck: "pending",
+  enforced: false,
+});
+process.stdout.write(JSON.stringify({
+  command: "guard preflight",
+  result: {
+    status: "NO-GO",
+    code: "GUARD_UNAVAILABLE",
+    diagnostics: {
+      protocol_version: 1,
+      runtime_mode: "enforce",
+      request_state: {
+        safety: "not_initialized",
+        counts: { PENDING: 0, APPROVED: 0, CONSUMED: 0, COMPLETED: 0, FAILED: 0, EXPIRED: 0, total: 0 },
+      },
+      digest_key: { safety: "not_initialized" },
+      registry_claims: { availability: "available" },
+      adapter_coverage: {
+        claude: coverage(claudeState),
+        codex: coverage(codexState),
+        gemini: coverage("unsupported"),
+        opencode: coverage("unsupported"),
+      },
+    },
+  },
+}));
+EOF
+)"
+
+    JHW_TEST_DIAGNOSTIC_OUTPUT="$output" JHW_TEST_DIAGNOSTIC_EXIT=78 run_install "$home"
+    grep -qF '설치 완료!' "$home/install.log" || return 1
+    if [ "$claude_state" = "ok" ]; then
+      assert_exact_owned_hook_groups "$home/.claude/settings.json" "$home" claude
+    else
+      [ ! -e "$home/.claude/settings.json" ] || return 1
+    fi
+    if [ "$codex_state" = "ok" ]; then
+      assert_exact_owned_hook_groups "$home/.codex/hooks.json" "$home" codex
+    else
+      [ ! -e "$home/.codex/hooks.json" ] || return 1
+    fi
+  done
+}
+
+test_symlinked_supported_tui_roots_fail_before_adapter_writes() {
+  local adapter home target marker
+  for adapter in claude codex; do
+    home="$ROOT/symlinked-$adapter-root-home"
+    target="$ROOT/symlinked-$adapter-root-target"
+    mkdir -p "$home" "$target"
+    marker="$target/preserve"
+    printf '%s' 'foreign-root-marker' >"$marker"
+    ln -s "$target" "$home/.$adapter"
+
+    if run_install "$home"; then
+      echo "symlinked $adapter root was accepted" >&2
+      return 1
+    fi
+    assert_file_text "$marker" "foreign-root-marker"
+    [ "$(find "$target" -maxdepth 1 -mindepth 1 | wc -l)" -eq 1 ] || {
+      echo "symlinked $adapter root received installer writes" >&2
+      return 1
+    }
+    [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || return 1
+    [ ! -e "$home/.local/bin/jhw-control" ] && [ ! -L "$home/.local/bin/jhw-control" ] || {
+      echo "failed root validation left a partial jhw-control install" >&2
+      return 1
+    }
+    [ ! -e "$home/npm.log" ] || {
+      echo "failed root validation ran the build pipeline" >&2
+      return 1
+    }
+    ! grep -qF '설치 완료!' "$home/install.log" || return 1
+  done
+}
+
+test_uninstall_rejects_symlinked_supported_tui_roots_before_transactions() {
+  local adapter home target marker
+  for adapter in claude codex; do
+    home="$ROOT/uninstall-symlinked-$adapter-root-home"
+    target="$ROOT/uninstall-symlinked-$adapter-root-target"
+    mkdir -p "$home/.claude" "$home/.codex" "$target"
+    rmdir "$home/.$adapter"
+    marker="$target/preserve"
+    printf '%s' 'foreign-root-marker' >"$marker"
+    ln -s "$target" "$home/.$adapter"
+
+    if run_install "$home" --uninstall; then
+      echo "uninstall accepted symlinked $adapter root" >&2
+      return 1
+    fi
+    assert_file_text "$marker" "foreign-root-marker"
+    [ -L "$home/.$adapter" ] || return 1
+    [ "$(find "$target" -maxdepth 1 -mindepth 1 | wc -l)" -eq 1 ] || {
+      echo "symlinked $adapter root received uninstall transaction writes" >&2
+      return 1
+    }
+    ! grep -qF '제거 완료!' "$home/install.log" || return 1
+  done
+}
+
 test_preflight_failure_restores_exact_prior_hook_state() {
-  local scenario home hooks before
+  local scenario home hooks before claude_settings claude_before
   for scenario in foreign preexisting-owned; do
     home="$ROOT/rollback-$scenario-home"
     make_tui_roots "$home"
     hooks="$home/.codex/hooks.json"
+    claude_settings="$home/.claude/settings.json"
+    printf '%s' '{ "theme" : "foreign", "hooks" : { "SessionStart" : [{"hooks":[{"type":"command","command":"/foreign/claude-keep","timeout":4.00}]}] }, "n" : 1.20e+2 }' >"$claude_settings"
+    chmod 0640 "$claude_settings"
+    claude_before="$(sha256sum "$claude_settings")"
     if [ "$scenario" = "foreign" ]; then
       printf '%s' '{ "hooks" : { "SessionStart" : [{"hooks":[{"type":"command","command":"/foreign/keep","timeout":4.00}]}] }, "n" : 1.20e+2 }' >"$hooks"
     else
@@ -906,9 +1070,19 @@ EOF
       return 1
     }
     [ "$(stat -c '%a' "$hooks")" = "640" ] || return 1
+    [ "$(sha256sum "$claude_settings")" = "$claude_before" ] || {
+      echo "$scenario preflight failure did not restore exact Claude settings bytes" >&2
+      return 1
+    }
+    [ "$(stat -c '%a' "$claude_settings")" = "640" ] || return 1
+    [ -z "$(find "$home/.claude" -maxdepth 1 -mindepth 1 -name '.settings.json.jhw-txn.*')" ] || return 1
     assert_no_hook_transaction_evidence "$home"
     if [ "$scenario" = "foreign" ]; then
-      [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || return 1
+      [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || {
+        echo "$scenario preflight failure left a newly installed hook launcher" >&2
+        tail -n 80 "$home/install.log" >&2
+        return 1
+      }
     else
       [ -L "$home/.local/bin/jhw-control-hook" ] || return 1
       [ "$(readlink -f -- "$home/.local/bin/jhw-control-hook")" = "$REPO_ROOT/scripts/jhw-control-hook" ] || return 1
@@ -917,24 +1091,32 @@ EOF
 }
 
 test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks() {
-  local home="$ROOT/default-unprovisioned-${1:-none}-home" hooks expected
+  local home="$ROOT/default-unprovisioned-${1:-none}-home" hooks expected claude_settings claude_expected
   if [ "$#" -gt 0 ]; then shift; fi
   make_tui_roots "$home"
   hooks="$home/.codex/hooks.json"
   expected="$home/hooks.expected.json"
+  claude_settings="$home/.claude/settings.json"
+  claude_expected="$home/claude.expected.json"
   write_owned_hooks_fixture "$hooks" "$home" yes
   chmod 0640 "$hooks"
   write_owned_hooks_fixture "$expected" "$home" no
-  node - "$expected" <<'EOF'
+  write_owned_hooks_fixture "$claude_settings" "$home" yes claude
+  chmod 0640 "$claude_settings"
+  write_owned_hooks_fixture "$claude_expected" "$home" no claude
+  node - "$expected" codex "$claude_expected" claude <<'EOF'
 const fs = require("node:fs");
-const file = process.argv[2];
-const document = JSON.parse(fs.readFileSync(file, "utf8"));
-document.hooks.SessionEnd = [{ hooks: [{
-  type: "command",
-  command: '"$HOME/.local/bin/jhw-control-hook" --adapter codex --event SessionEnd',
-  timeout: 3,
-}] }];
-fs.writeFileSync(file, JSON.stringify(document));
+for (let index = 2; index < process.argv.length; index += 2) {
+  const file = process.argv[index];
+  const adapter = process.argv[index + 1];
+  const document = JSON.parse(fs.readFileSync(file, "utf8"));
+  document.hooks.SessionEnd = [{ hooks: [{
+    type: "command",
+    command: `"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event SessionEnd`,
+    timeout: 3,
+  }] }];
+  fs.writeFileSync(file, JSON.stringify(document));
+}
 EOF
 
   run_default_install "$home" "$@"
@@ -942,11 +1124,18 @@ EOF
   [ -L "$home/.local/bin/jhw-control-hook" ] || return 1
   [ "$(readlink -f -- "$home/.local/bin/jhw-control-hook")" = "$REPO_ROOT/scripts/jhw-control-hook" ] || return 1
   if ! cmp -s -- "$expected" "$hooks"; then
-    echo "default install must retain SessionEnd only and preserve foreign hooks" >&2
+    echo "default install must retain Codex SessionEnd only and preserve foreign hooks" >&2
     diff -u -- "$expected" "$hooks" >&2 || true
     return 1
   fi
+  if ! cmp -s -- "$claude_expected" "$claude_settings"; then
+    echo "default install must retain Claude SessionEnd only and preserve foreign hooks" >&2
+    diff -u -- "$claude_expected" "$claude_settings" >&2 || true
+    return 1
+  fi
   [ "$(stat -c '%a' "$hooks")" = "640" ] || return 1
+  [ "$(stat -c '%a' "$claude_settings")" = "640" ] || return 1
+  [ -z "$(find "$home/.claude" -maxdepth 1 -mindepth 1 -name '.settings.json.jhw-txn.*')" ] || return 1
   assert_no_hook_transaction_evidence "$home"
   grep -q '"code":"INVALID_CONFIG"' "$home/install.log" || {
     echo "default install did not reach the public Guard diagnostic" >&2
@@ -961,15 +1150,20 @@ EOF
   fi
   run_default_install "$home" "$@"
   cmp -s -- "$expected" "$hooks" || return 1
+  cmp -s -- "$claude_expected" "$claude_settings" || return 1
   assert_no_hook_transaction_evidence "$home"
   run_install "$home" --uninstall
   write_owned_hooks_fixture "$expected" "$home" no
+  write_owned_hooks_fixture "$claude_expected" "$home" no claude
   cmp -s -- "$expected" "$hooks" || return 1
+  cmp -s -- "$claude_expected" "$claude_settings" || return 1
   run_default_install "$home" "$@"
-  node - "$hooks" <<'EOF'
+  node - "$hooks" "$claude_settings" <<'EOF'
 const fs = require("node:fs");
-const document = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-if (document.hooks.SessionEnd?.length !== 1 || document.hooks.PreToolUse !== undefined) process.exit(1);
+for (const file of process.argv.slice(2)) {
+  const document = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (document.hooks.SessionEnd?.length !== 1 || document.hooks.PreToolUse !== undefined) process.exit(1);
+}
 EOF
   assert_no_hook_transaction_evidence "$home"
 }
@@ -1020,6 +1214,31 @@ test_rollback_failure_preserves_launcher_and_private_recovery_snapshot() {
     ! grep -qF '새 hooks.json과 launcher를 함께 보존' "$home/install.log" || return 1
     ! grep -qF '설치 완료!' "$home/install.log" || return 1
   done
+}
+
+test_cross_adapter_rollback_failure_preserves_launcher() {
+  local home target transaction
+  home="$ROOT/cross-adapter-rollback-failure-home"
+  make_tui_roots "$home"
+  target="$home/foreign-codex-hooks.json"
+  printf '%s' '{"foreign":"preserve"}' >"$target"
+  ln -s "$target" "$home/.codex/hooks.json"
+
+  if JHW_TEST_CLAUDE_ROLLBACK_FAIL=1 run_install "$home"; then
+    echo "foreign Codex hooks unexpectedly completed after Claude activation" >&2
+    return 1
+  fi
+  [ -L "$home/.local/bin/jhw-control-hook" ] || {
+    echo "Claude rollback failure removed the launcher while published hooks remained" >&2
+    return 1
+  }
+  assert_exact_owned_hook_groups "$home/.claude/settings.json" "$home" claude
+  transaction="$(find "$home/.claude" -maxdepth 1 -mindepth 1 -type d -name '.settings.json.jhw-txn.*')"
+  [ -n "$transaction" ] || return 1
+  grep -qF "$transaction" "$home/install.log" || return 1
+  [ -L "$home/.codex/hooks.json" ] || return 1
+  [ "$(readlink -- "$home/.codex/hooks.json")" = "$target" ] || return 1
+  ! grep -qF '설치 완료!' "$home/install.log" || return 1
 }
 
 test_rollback_capture_preserves_concurrent_hook_changes() {
@@ -2311,7 +2530,7 @@ test_empty_uninstall_creates_nothing() {
 }
 
 test_owned_round_trip() {
-  local home="$ROOT/round trip 'home" json codex first_hash
+  local home="$ROOT/round trip 'home" json codex first_hash first_claude_config
   make_tui_roots "$home"
   mkdir -p "$home/.codex/commands" "$home/.codex/prompts"
   printf 'foreign-unrelated' >"$home/.codex/prompts/unrelated.md"
@@ -2345,10 +2564,13 @@ test_owned_round_trip() {
   node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(s["$schema"]!=="https://opencode.ai/config.json" || s.mcp["jhw-notion"].command[0]!=="node") process.exit(1)' "$home/.config/opencode/opencode.json"
   grep -q '^command = "node"$' "$codex"
   first_hash="$(sha256sum "$home/.claude.json" "$json" "$home/.config/opencode/opencode.json" "$codex")"
+  first_claude_config="$home/.claude.first.json"
+  cp -- "$home/.claude.json" "$first_claude_config"
 
   run_install "$home"
   [ "$(sha256sum "$home/.claude.json" "$json" "$home/.config/opencode/opencode.json" "$codex")" = "$first_hash" ] || {
     echo "idempotent reinstall changed config bytes" >&2
+    diff -u -- "$first_claude_config" "$home/.claude.json" >&2 || true
     return 1
   }
 
@@ -3242,15 +3464,20 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   host-v4) test_current_v4_control_host_contract_allows_activation; exit ;;
   host-invalid) test_non_v4_control_host_contract_fails_before_activation; exit ;;
   npm-ci) test_installer_uses_lockfile_exact_npm_ci; exit ;;
+  owned-round-trip) test_owned_round_trip; exit ;;
   fresh-hooks) test_fresh_install_creates_both_control_links_and_exact_hooks; exit ;;
   install-preflight) test_install_orders_guard_transaction_and_runs_public_preflight; exit ;;
   diagnostic-failure) test_install_aborts_on_guard_diagnostic_execution_failure; exit ;;
   malformed-diagnostic) test_install_rejects_malformed_diagnostic_and_rolls_back_hooks; exit ;;
   diagnostic-schema) test_install_requires_complete_guard_diagnostic_schema; exit ;;
+  adapter-subsets) test_install_accepts_guard_diagnostic_for_detected_adapters; exit ;;
+  symlinked-tui-root) test_symlinked_supported_tui_roots_fail_before_adapter_writes; exit ;;
+  uninstall-symlinked-tui-root) test_uninstall_rejects_symlinked_supported_tui_roots_before_transactions; exit ;;
   rollback-hooks) test_preflight_failure_restores_exact_prior_hook_state; exit ;;
   default-unprovisioned) test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks; exit ;;
   guard-policy-independent) test_no_coordinates_installs_session_end_independently_of_guard_policy; exit ;;
   rollback-failure) test_rollback_failure_preserves_launcher_and_private_recovery_snapshot; exit ;;
+  cross-adapter-rollback-failure) test_cross_adapter_rollback_failure_preserves_launcher; exit ;;
   rollback-cas) test_rollback_capture_preserves_concurrent_hook_changes; exit ;;
   rollback-same-bytes-new-inode) test_rollback_same_bytes_new_inode_is_not_owned_publication; exit ;;
   launcher-remove-race) test_launcher_uninstall_races_preserve_replacements; exit ;;
@@ -3303,6 +3530,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   unsafe-hooks-path) test_hooks_config_symlink_and_nonregular_fail_closed; exit ;;
   private-hooks) test_new_hooks_file_is_private; exit ;;
   unsupported-tuis) test_unsupported_tuis_receive_no_guard_wiring; exit ;;
+  claude-fresh) test_fresh_install_wires_exact_claude_hooks; exit ;;
   *) echo "unknown JHW_INSTALL_TEST_ONLY selection" >&2; exit 2 ;;
 esac
 
@@ -3325,14 +3553,19 @@ test_installer_uses_lockfile_exact_npm_ci
 test_empty_uninstall_creates_nothing
 test_owned_round_trip
 test_fresh_install_creates_both_control_links_and_exact_hooks
+test_fresh_install_wires_exact_claude_hooks
 test_install_orders_guard_transaction_and_runs_public_preflight
 test_install_aborts_on_guard_diagnostic_execution_failure
 test_install_rejects_malformed_diagnostic_and_rolls_back_hooks
 test_install_requires_complete_guard_diagnostic_schema
+test_install_accepts_guard_diagnostic_for_detected_adapters
+test_symlinked_supported_tui_roots_fail_before_adapter_writes
+test_uninstall_rejects_symlinked_supported_tui_roots_before_transactions
 test_preflight_failure_restores_exact_prior_hook_state
 test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks
 test_no_coordinates_installs_session_end_independently_of_guard_policy
 test_rollback_failure_preserves_launcher_and_private_recovery_snapshot
+test_cross_adapter_rollback_failure_preserves_launcher
 test_rollback_capture_preserves_concurrent_hook_changes
 test_rollback_same_bytes_new_inode_is_not_owned_publication
 test_launcher_uninstall_races_preserve_replacements

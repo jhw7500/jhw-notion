@@ -101,6 +101,18 @@ Authority/Notion/repository prerequisite가 먼저 통과한 뒤에만 두 prefl
 
 실패 command에서 journal append도 실패하면 원래 nonzero exit와 원래 `error.code`가 유지되고 `journal_warning`만 추가된다. raw stderr, token, private path를 복사하지 않는다.
 
+### Claude/Codex Guard hook 점검
+
+`./install.sh`는 설치된 Claude Code와 Codex에 동일한 repository launcher를 adapter별로 배선한다. Claude는 `~/.claude/settings.json`, Codex는 `~/.codex/hooks.json`의 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SessionEnd` exact group만 소유한다. foreign group과 기존 상대 순서·file mode를 보존하며 malformed, duplicate, symlink/nonregular, stale transaction, publish/rollback race는 덮어쓰지 않고 중단한다. 뒤 단계가 실패하면 아직 열린 Claude/Codex private transaction을 모두 검증해 원상복구한 뒤 이번 실행이 만든 launcher만 제거한다.
+
+설치 후 대상 worktree에서 다음을 실행한다.
+
+```bash
+jhw-control guard preflight
+```
+
+Claude `enforced: true`는 standard `HOME/.claude` source, 네 exact on-disk group, owned executable launcher/core, 실제 `claude -p`에서 repository `UserPromptSubmit`과 inline blocker가 각각 한 번 실행된 0-token/0-API-time/0-cost 결과, direct `PreToolUse` deny probe가 모두 확인된 경우에만 나온다. runtime은 user hook object만 private temporary `CLAUDE_CONFIG_DIR/settings.json`으로 복제하고 원래 `HOME`은 launcher 확장에만 유지한다. 실제 credential/provider와 Project Control 좌표는 제거하며 dummy key를 사용하므로 blocker가 열리면 모델을 호출하지 못하고 실패한다. Claude가 만든 임시 app/session state는 probe 종료 후 함께 제거한다. Codex는 기존 read-only runtime inventory와 direct deny probe를 사용한다. 추가 handler, config override, malformed/timeout/output overflow, model 사용, command probe 실패는 `NO-GO`다. `execution_recheck`가 `pending`이면 다른 축이 `ok`여도 그 사실을 숨기지 않는다. Control 좌표가 전혀 없는 설치는 Guard group 없이 두 adapter의 `SessionEnd`만 유지하는 `UNPROTECTED` 상태이며 보호 완료로 기록하지 않는다.
+
 ### 기존 Issue-backed Project fixture 전환
 
 구 구현으로 만든 Issue-backed Project item이 있으면 새 reader는 이를 Project Record로 무시하지 않고 fail-closed한다. 전환은 자동 migration이나 authority cutover가 아니라 승인된 trial fixture 정리이며 다음 순서를 지킨다.
@@ -337,7 +349,7 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
   --issue-url https://github.com/<owner>/<repo>/issues/<number>
 ```
 
-`state: inactive`이면 반환된 canonical `task_id`를 registration field 없이 기존 `task start --task`에 사용한다. `handoff.available: false`는 exact latest Claim generation에 Handoff가 없다는 뜻이다. `state: active`이면 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 Claim 좌표와 recovery observations만 표시하고 멈춘다. `process_exists: false`는 관찰일 뿐 stale 판정이나 takeover 권한이 아니다. takeover·force-end는 아래 exact 좌표 명령을 실행하기 직전에 계속 별도 승인을 받는다.
+`state: inactive`이면 반환된 canonical `task_id`를 registration field 없이 기존 `task start --task`에 사용한다. `handoff.available: false`는 exact latest Claim generation에 Handoff가 없다는 뜻이다. `state: active`이면 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 Claim 좌표와 recovery observations만 표시하고 멈춘다. `session_end.status`는 `recorded | absent | ambiguous | unverified` 중 하나다. `recorded`만 exact Task/Claim 후보가 하나이고 현재 adapter/worktree/branch/HEAD/dirty/ahead/behind와 모두 일치한 정상 Claude/Codex 종료 증거이며 adapter와 시각만 노출한다. `absent`는 증거 없음, `ambiguous`는 exact 후보 중복, `unverified`는 안전한 journal read 또는 현재 좌표 일치 실패다. `process_exists: false`와 네 SessionEnd 상태는 모두 관찰일 뿐 stale 판정이나 takeover 권한이 아니다. takeover·force-end는 아래 exact 좌표 명령을 실행하기 직전에 계속 별도 승인을 받는다.
 
 활성 Claim 상태를 먼저 읽는다.
 
@@ -345,7 +357,7 @@ jhw-control task assert-owner --task <tsk-id> --claim <current-claim-id>
 jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action status
 ```
 
-stale을 자동 추정하지 않는다. `force-end` 또는 `takeover`는 결과와 대상 Claim을 보여준 뒤 실행 직전에 별도 승인을 받는다.
+stale을 자동 추정하지 않는다. `recorded`이면 이전 세션이 현재 좌표에서 정상 종료됐다는 사실과 기존 `force-end`/`takeover` 선택지를 설명할 수 있지만 action을 자동 선택하지 않는다. `absent | ambiguous | unverified`이면 정상 종료를 주장하지 않는다. `force-end` 또는 `takeover`는 결과와 대상 Claim을 보여준 뒤 실행 직전에 별도 승인을 받는다.
 
 ```bash
 jhw-control task recover --task <tsk-id> --expect <active-claim-id> --action force-end
