@@ -1000,6 +1000,14 @@ test_symlinked_supported_tui_roots_fail_before_adapter_writes() {
       return 1
     }
     [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || return 1
+    [ ! -e "$home/.local/bin/jhw-control" ] && [ ! -L "$home/.local/bin/jhw-control" ] || {
+      echo "failed root validation left a partial jhw-control install" >&2
+      return 1
+    }
+    [ ! -e "$home/npm.log" ] || {
+      echo "failed root validation ran the build pipeline" >&2
+      return 1
+    }
     ! grep -qF '설치 완료!' "$home/install.log" || return 1
   done
 }

@@ -1110,6 +1110,14 @@ fi
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then usage; fi
 
 require_control_host
+
+CLAUDE_DIR="$HOME/.claude"
+GEMINI_DIR="$HOME/.gemini"
+OPENCODE_DIR="$HOME/.config/opencode"
+CODEX_DIR="$HOME/.codex"
+
+validate_supported_tui_root "$CLAUDE_DIR" "Claude Code"
+validate_supported_tui_root "$CODEX_DIR" "Codex CLI"
 reject_all_private_hook_transactions || exit 1
 
 echo "jhw-notion 설치를 시작합니다..."
@@ -1135,14 +1143,6 @@ trap rollback_install_transaction_on_exit EXIT
 # [3/6] TUI 감지
 echo ""
 echo "[3/6] TUI 감지"
-CLAUDE_DIR="$HOME/.claude"
-GEMINI_DIR="$HOME/.gemini"
-OPENCODE_DIR="$HOME/.config/opencode"
-CODEX_DIR="$HOME/.codex"
-
-validate_supported_tui_root "$CLAUDE_DIR" "Claude Code"
-validate_supported_tui_root "$CODEX_DIR" "Codex CLI"
-
 [ -d "$CLAUDE_DIR" ] && ok "Claude Code ($CLAUDE_DIR)" || skip "Claude Code (미설치)"
 [ -d "$GEMINI_DIR" ] && ok "Gemini CLI ($GEMINI_DIR)" || skip "Gemini CLI (미설치)"
 [ -d "$OPENCODE_DIR" ] && ok "OpenCode ($OPENCODE_DIR)" || skip "OpenCode (미설치)"
