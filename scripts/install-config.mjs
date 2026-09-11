@@ -4,8 +4,11 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
 
-const [operation, configFile, mcpEntry, repositoryRoot, backupStamp, transactionEvidence] = process.argv.slice(2);
+const [operation, configFileArgument, mcpEntry, repositoryRoot, backupStampArgument, transactionEvidence] = process.argv.slice(2);
+let configFile = configFileArgument;
+let backupStamp = backupStampArgument;
 if (!operation || !configFile || !mcpEntry || !repositoryRoot) process.exit(2);
+const logicalConfigFile = configFile;
 const hookAdapter = operation.includes("-claude-hooks-transaction") ? "claude" : "codex";
 
 const CHANGED = 0;
@@ -123,7 +126,7 @@ function codexHookCommand(eventName) {
 }
 
 function legacyCodexHookCommand(eventName) {
-  const homeDirectory = path.dirname(path.dirname(configFile));
+  const homeDirectory = path.dirname(path.dirname(logicalConfigFile));
   return `${path.join(homeDirectory, ".local", "bin", "jhw-control-hook")} --adapter codex --event ${eventName}`;
 }
 
@@ -435,6 +438,48 @@ const CONTROL_HOOK_LINK_STAGES = new Set([
 const CONTROL_HOOK_LINK_FINALIZABLE_STAGES = new Set([
   "unchanged-absent", "foreign-untouched", "removed-owned", "foreign-republished",
 ]);
+
+function anchorHookTransactionPaths() {
+  const logicalParent = path.dirname(path.resolve(logicalConfigFile));
+  const parentInfo = fs.lstatSync(logicalParent);
+  if (parentInfo.isSymbolicLink() || !parentInfo.isDirectory() ||
+      (typeof process.getuid === "function" && parentInfo.uid !== process.getuid()) ||
+      fs.realpathSync(logicalParent) !== logicalParent) {
+    throw new Error("unsafe hook config parent");
+  }
+  const descriptor = fs.openSync(
+    logicalParent,
+    fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+  );
+  const openedInfo = fs.fstatSync(descriptor);
+  if (openedInfo.dev !== parentInfo.dev || openedInfo.ino !== parentInfo.ino) {
+    fs.closeSync(descriptor);
+    throw new Error("hook config parent changed");
+  }
+  const anchoredParent = ["/proc/self/fd", "/dev/fd"]
+    .map((root) => path.join(root, String(descriptor)))
+    .find((candidate) => {
+      try {
+        const candidateInfo = fs.statSync(candidate);
+        return candidateInfo.dev === openedInfo.dev && candidateInfo.ino === openedInfo.ino;
+      } catch {
+        return false;
+      }
+    });
+  if (anchoredParent === undefined) {
+    fs.closeSync(descriptor);
+    throw new Error("hook config parent cannot be descriptor-anchored");
+  }
+  configFile = path.join(anchoredParent, path.basename(logicalConfigFile));
+  if (backupStamp !== undefined) {
+    const logicalTransaction = path.resolve(backupStamp);
+    if (path.dirname(logicalTransaction) !== logicalParent) {
+      fs.closeSync(descriptor);
+      throw new Error("hook transaction escaped config parent");
+    }
+    backupStamp = path.join(anchoredParent, path.basename(logicalTransaction));
+  }
+}
 
 function hookMode(info) {
   return (info.mode & 0o777).toString(8);
@@ -1639,6 +1684,9 @@ function unregisterCodex() {
 }
 
 try {
+  if (operation.endsWith("-codex-hooks-transaction") || operation.endsWith("-claude-hooks-transaction")) {
+    anchorHookTransactionPaths();
+  }
   if (operation === "register-stdio") registerStdio();
   if (operation === "unregister-stdio") unregisterStdio();
   if (operation === "register-opencode") registerOpenCode();

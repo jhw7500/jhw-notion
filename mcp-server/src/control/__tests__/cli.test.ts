@@ -3229,6 +3229,14 @@ describe("runCli", () => {
 
   it("reports exact Claude hooks enforced only after zero-token runtime and direct PreTool probes", async () => {
     const fixture = await task3ClaudeHome();
+    const document = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
+    document.hooks.UserPromptSubmit.push({
+      hooks: [{ type: "command", command: "/foreign/must-not-run", timeout: 9 }],
+    });
+    document.hooks.PreToolUse.push({
+      hooks: [{ type: "command", command: "/foreign/must-not-copy", timeout: 9 }],
+    });
+    await writeFile(fixture.settingsPath, `${JSON.stringify(document)}\n`, { mode: 0o600 });
     const runtime = task3ClaudeRuntime();
     const result = await runCli(["guard", "preflight"], makeCliDependencies({
       env: { HOME: fixture.home },
@@ -3249,6 +3257,9 @@ describe("runCli", () => {
         timeout: 12,
       }],
     });
+    expect(Object.keys(promptSettings.hooks)).toEqual(["UserPromptSubmit"]);
+    expect(promptSettings.hooks.UserPromptSubmit).toHaveLength(1);
+    expect(JSON.stringify(promptSettings)).not.toContain("/foreign/");
     expect(runtime.probeCommand).toHaveBeenCalledWith(
       fixture.home,
       '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event PreToolUse',
@@ -3338,6 +3349,11 @@ describe("runCli", () => {
   });
 
   it.each([
+    ["disabled hooks setting", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      const document = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
+      document.disableAllHooks = true;
+      await writeFile(fixture.settingsPath, `${JSON.stringify(document)}\n`, { mode: 0o600 });
+    }],
     ["duplicate owned group", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
       const document = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
       document.hooks.PreToolUse.push(document.hooks.PreToolUse[0]);

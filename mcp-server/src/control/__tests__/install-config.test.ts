@@ -16,10 +16,10 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-function runEditor(args: string[]) {
+function runEditor(args: string[], env: NodeJS.ProcessEnv = {}) {
   return spawnSync(process.execPath, [editor, ...args], {
     encoding: "utf8",
-    env: { ...process.env },
+    env: { ...process.env, ...env },
   });
 }
 
@@ -211,5 +211,80 @@ describe("install-config Claude hook transactions", () => {
       transaction,
       "foreign-untouched",
     ]).status).toBe(0);
+  });
+
+  it("does not traverse a symlinked Claude config parent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-claude-hook-config-"));
+    roots.push(root);
+    const external = join(root, "external-claude");
+    const claudeDir = join(root, ".claude");
+    const settings = join(claudeDir, "settings.json");
+    const transaction = join(claudeDir, ".settings.json.jhw-txn.parent-symlink");
+    await mkdir(external, { mode: 0o700 });
+    await symlink(external, claudeDir);
+    await mkdir(transaction, { mode: 0o700 });
+
+    const result = runEditor([
+      "register-claude-hooks-transaction",
+      settings,
+      mcpEntry,
+      repositoryRoot,
+      transaction,
+      "all",
+    ]);
+
+    expect(result.status).toBe(1);
+    await expect(lstat(join(external, "settings.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(join(external, ".settings.json.jhw-txn.parent-symlink"))).toEqual([]);
+  });
+
+  it("keeps a Claude transaction on its opened parent when the path is swapped", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-claude-hook-config-"));
+    roots.push(root);
+    const claudeDir = join(root, ".claude");
+    const movedClaudeDir = join(root, ".claude-moved");
+    const external = join(root, "external-claude");
+    const settings = join(claudeDir, "settings.json");
+    const transaction = join(claudeDir, ".settings.json.jhw-txn.parent-race");
+    const preload = join(root, "swap-parent.cjs");
+    await mkdir(transaction, { recursive: true, mode: 0o700 });
+    await mkdir(external, { mode: 0o700 });
+    await writeFile(settings, '{"foreign":"original"}\n', { mode: 0o600 });
+    await writeFile(join(external, "preserve"), "external-marker", { mode: 0o600 });
+    await writeFile(preload, `
+const fs = require("node:fs");
+const path = require("node:path");
+const rename = fs.renameSync.bind(fs);
+let injected = false;
+fs.renameSync = (source, destination) => {
+  if (!injected && path.basename(source) === "settings.json" && path.basename(destination) === "captured-live") {
+    injected = true;
+    rename(process.env.JHW_TEST_LOGICAL_PARENT, process.env.JHW_TEST_MOVED_PARENT);
+    fs.symlinkSync(process.env.JHW_TEST_EXTERNAL_PARENT, process.env.JHW_TEST_LOGICAL_PARENT);
+  }
+  return rename(source, destination);
+};
+`, { mode: 0o600 });
+
+    const result = runEditor([
+      "register-claude-hooks-transaction",
+      settings,
+      mcpEntry,
+      repositoryRoot,
+      transaction,
+      "all",
+    ], {
+      NODE_OPTIONS: `--require=${preload}`,
+      JHW_TEST_LOGICAL_PARENT: claudeDir,
+      JHW_TEST_MOVED_PARENT: movedClaudeDir,
+      JHW_TEST_EXTERNAL_PARENT: external,
+    });
+
+    expect(result.status).toBe(0);
+    expect((await lstat(claudeDir)).isSymbolicLink()).toBe(true);
+    expect(await readdir(external)).toEqual(["preserve"]);
+    expect(await readFile(join(external, "preserve"), "utf8")).toBe("external-marker");
+    const installed = JSON.parse(await readFile(join(movedClaudeDir, "settings.json"), "utf8"));
+    expect(installed.hooks.UserPromptSubmit[0].hooks[0].command).toContain("--adapter claude");
   });
 });

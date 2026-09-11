@@ -810,12 +810,6 @@ const maximumCodexRuntimeEntries = 256;
 const maximumCodexProbeBytes = 12 * 1024;
 const maximumClaudeProbeLines = 64;
 const claudeProbeStopMarker = "jhw-claude-preflight-stop";
-const claudeProbeControlEnvironmentKeys = [
-  "JHW_REGISTRY_DIR", "JHW_REGISTRY_REMOTE", "JHW_REGISTRY_BRANCH", "JHW_WORKTREE_ROOT",
-  "JHW_CONTROL_STATE_DIR", "JHW_BUILD_HOST", "JHW_GITHUB_OWNER", "JHW_PROJECT_NUMBER",
-  "JHW_REGISTRY_REPOSITORY", "JHW_PREFLIGHT_PROJECT_ITEM_ID", "JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER",
-  "JHW_GUARD_MODE", "JHW_GUARD_ALLOW_OBSERVE",
-] as const;
 
 const CodexHookMetadataCommonSchema = z.object({
   eventName: z.string().min(1).max(255),
@@ -943,7 +937,11 @@ async function inspectExactHookInstallation(
     const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
     const document: unknown = JSON.parse(text);
     if (!document || typeof document !== "object" || Array.isArray(document)) return undefined;
-    const hooks = (document as Record<string, unknown>).hooks;
+    const settings = document as Record<string, unknown>;
+    if (adapter === "claude" && Object.hasOwn(settings, "disableAllHooks") && settings.disableAllHooks !== false) {
+      return undefined;
+    }
+    const hooks = settings.hooks;
     if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return undefined;
     const exact = codexHookEvents.every((eventName) => {
       const groups = (hooks as Record<string, unknown>)[eventName];
@@ -952,10 +950,15 @@ async function inspectExactHookInstallation(
     });
     if (!exact) return undefined;
     const preToolGroups = (hooks as Record<string, unknown>).PreToolUse as Array<{ hooks: Array<{ command: string }> }>;
+    const promptGroups = (hooks as Record<string, unknown>).UserPromptSubmit as unknown[];
     return {
       probeCommand: preToolGroups[0]?.hooks[0]?.command as string,
       ...(adapter === "claude"
-        ? { claudePromptSettings: Buffer.from(`${JSON.stringify({ hooks })}\n`, "utf8") }
+        ? {
+          claudePromptSettings: Buffer.from(`${JSON.stringify({
+            hooks: { UserPromptSubmit: [promptGroups[0]] },
+          })}\n`, "utf8"),
+        }
         : {}),
     };
   } catch {
@@ -1394,25 +1397,31 @@ async function probeCodexHookCommand(
 async function probeClaudePromptHooks(
   env: NodeJS.ProcessEnv,
   home: string,
-  cwd: string,
+  _cwd: string,
   userHookSettings: Buffer,
 ): Promise<CodexHookProbeResult> {
+  const ownedSettings = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(userHookSettings)) as {
+    hooks: { UserPromptSubmit: unknown[] };
+  };
   const inlineSettings = JSON.stringify({
     hooks: {
-      UserPromptSubmit: [{
-        hooks: [{
-          type: "command",
-          command: `printf '${claudeProbeStopMarker}\\n' >&2; exit 2`,
-          timeout: 3,
-        }],
-      }],
+      UserPromptSubmit: [
+        ownedSettings.hooks.UserPromptSubmit[0],
+        {
+          hooks: [{
+            type: "command",
+            command: `printf '${claudeProbeStopMarker}\\n' >&2; exit 2`,
+            timeout: 3,
+          }],
+        },
+      ],
     },
   });
   const args = [
     "-p",
     "--verbose",
     "--no-session-persistence",
-    "--setting-sources", "user,project,local",
+    "--restricted",
     "--settings", inlineSettings,
     "--strict-mcp-config",
     "--mcp-config", JSON.stringify({ mcpServers: {} }),
@@ -1429,10 +1438,15 @@ async function probeClaudePromptHooks(
       mode: 0o600,
     });
     return await new Promise((resolve, reject) => {
-      const childEnvironment: NodeJS.ProcessEnv = { ...env, HOME: home };
-      delete childEnvironment.CLAUDECODE;
-      delete childEnvironment.CLAUDE_CODE_ENTRYPOINT;
-      for (const key of claudeProbeControlEnvironmentKeys) delete childEnvironment[key];
+      const childEnvironment: NodeJS.ProcessEnv = {
+        HOME: home,
+        PATH: env.PATH,
+        LANG: env.LANG,
+        LC_ALL: env.LC_ALL,
+        LC_CTYPE: env.LC_CTYPE,
+        SHELL: "/bin/sh",
+        TMPDIR: probeConfigDir,
+      };
       childEnvironment.CLAUDE_CONFIG_DIR = probeConfigDir;
       childEnvironment.ANTHROPIC_API_KEY = "jhw-preflight-no-network";
       childEnvironment.ANTHROPIC_BASE_URL = "http://127.0.0.1:1";
@@ -1447,7 +1461,7 @@ async function probeClaudePromptHooks(
       childEnvironment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
       childEnvironment.DISABLE_TELEMETRY = "1";
       const child = spawn("claude", args, {
-        cwd,
+        cwd: probeConfigDir,
         detached: true,
         env: childEnvironment,
         stdio: ["ignore", "pipe", "pipe"],

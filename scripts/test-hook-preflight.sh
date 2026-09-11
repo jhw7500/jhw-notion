@@ -156,20 +156,28 @@ try { userSettings = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch 
 const owned = userSettings?.hooks?.UserPromptSubmit?.[0]?.hooks?.[0];
 if (owned?.type !== "command" || owned?.timeout !== 12 ||
     owned?.command !== '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event UserPromptSubmit') process.exit(66);
+if (JSON.stringify(Object.keys(userSettings.hooks ?? {})) !== JSON.stringify(["UserPromptSubmit"]) ||
+    userSettings.hooks.UserPromptSubmit.length !== 1) process.exit(66);
 if (process.env.ANTHROPIC_API_KEY !== "jhw-preflight-no-network" ||
     process.env.ANTHROPIC_BASE_URL !== "http://127.0.0.1:1" ||
     process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== "1" ||
     process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY !== "1") process.exit(66);
 fs.writeFileSync(path.join(configDir, "probe-state"), "must-be-cleaned", { mode: 0o600 });
-fs.appendFileSync(process.env.JHW_FAKE_CLAUDE_LOG, `${JSON.stringify({ args, configDir, home: process.env.HOME })}\n`, "utf8");
+if (process.env.AWS_SECRET_ACCESS_KEY !== undefined || process.env.JHW_FAKE_CLAUDE_LOG !== undefined) process.exit(66);
+const logPath = path.join(process.env.HOME, "claude-runtime-probe.log");
+fs.appendFileSync(logPath, `${JSON.stringify({ args, configDir, home: process.env.HOME, cwd: process.cwd() })}\n`, "utf8");
 const settingSources = args.indexOf("--setting-sources");
 const settingsIndex = args.indexOf("--settings");
 if (!args.includes("-p") || !args.includes("--verbose") || !args.includes("--no-session-persistence") ||
-    !args.includes("--include-hook-events") || !args.includes("stream-json") ||
-    settingSources < 0 || args[settingSources + 1] !== "user,project,local" || settingsIndex < 0) process.exit(64);
+    !args.includes("--restricted") || !args.includes("--include-hook-events") || !args.includes("stream-json") ||
+    settingSources !== -1 || settingsIndex < 0 || process.cwd() !== configDir) process.exit(64);
 let settings;
 try { settings = JSON.parse(args[settingsIndex + 1]); } catch { process.exit(64); }
-const blocker = settings?.hooks?.UserPromptSubmit?.[0]?.hooks?.[0];
+const inlineGroups = settings?.hooks?.UserPromptSubmit;
+const inlineOwned = inlineGroups?.[0]?.hooks?.[0];
+const blocker = inlineGroups?.[1]?.hooks?.[0];
+if (inlineGroups?.length !== 2 || inlineOwned?.type !== "command" || inlineOwned?.timeout !== 12 ||
+    inlineOwned?.command !== '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event UserPromptSubmit') process.exit(64);
 if (blocker?.type !== "command" || blocker?.timeout !== 3 ||
     blocker?.command !== "printf 'jhw-claude-preflight-stop\\n' >&2; exit 2") process.exit(64);
 const native = JSON.stringify({
@@ -298,7 +306,7 @@ run_preflight() {
     *) mode="trusted" ;;
   esac
   log="$ROOT/$scenario-app-server.log"
-  claude_log="$ROOT/$scenario-claude.log"
+  claude_log="$home/claude-runtime-probe.log"
   probe_log="$ROOT/$scenario-shell-probe.log"
   probe_cwd_log="$ROOT/$scenario-shell-probe-cwd.log"
   runtime_shell="${SHELL:-/bin/sh}"
@@ -308,7 +316,8 @@ run_preflight() {
   if HOME="$home" PATH="$FAKE_BIN:$PATH" SHELL="$runtime_shell" \
       JHW_FAKE_CODEX_MODE="$mode" \
       JHW_FAKE_CODEX_LOG="$log" \
-      JHW_FAKE_CLAUDE_LOG="$claude_log" \
+      JHW_FAKE_CLAUDE_LOG="private-claude-log-path" \
+      AWS_SECRET_ACCESS_KEY="private-cloud-secret" \
       JHW_FAKE_CODEX_PID="$ROOT/$scenario-app-server.pid" \
       JHW_FAKE_PROBE_LOG="$probe_log" \
       JHW_FAKE_PROBE_CWD_LOG="$probe_cwd_log" \
@@ -422,6 +431,7 @@ if (scenario === "claude-exact-trusted") {
   if (typeof call.configDir !== "string" || fs.existsSync(call.configDir)) {
     fail("Claude runtime probe did not clean its isolated config directory");
   }
+  if (call.cwd !== call.configDir) fail("Claude runtime probe did not isolate its working directory");
 }
 if (scenario === "exact-trusted" || scenario === "exact-mcp-untrusted") {
   if (!fs.existsSync(probeLogPath)) fail("production preflight did not execute the stored canonical command");

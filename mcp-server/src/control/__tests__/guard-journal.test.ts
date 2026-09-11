@@ -398,6 +398,61 @@ describe("GuardJournal", () => {
     })).resolves.toEqual({ status: "unverified" });
   });
 
+  it("does not trust a journal leaf owned by another user", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const journalPath = join(stateDir, "guard-journal.jsonl");
+    const ended = {
+      protocol_version: 1 as const,
+      origin_adapter: "claude" as const,
+      event: "session-ended" as const,
+      task_id: "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      claim_id: "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      worktree_ref: "wt-000000000001-session-end",
+      branch: "task/000000000001-session-end",
+      head_sha: "a".repeat(40),
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      occurred_at: "2026-08-25T01:00:00.000Z",
+    };
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(journalPath, `${JSON.stringify(ended)}\n`, { mode: 0o600 });
+    const journal = new GuardJournal(stateDir, {
+      afterDirectoryOpen(directory) {
+        const openFile = directory.openFile.bind(directory);
+        Object.defineProperty(directory, "openFile", {
+          configurable: true,
+          value: async (name: string, flags: number, mode?: number) => {
+            const file = await openFile(name, flags, mode);
+            const originalStat = file.stat.bind(file) as unknown as (options: unknown) => Promise<Record<string, unknown>>;
+            Object.defineProperty(file, "stat", {
+              configurable: true,
+              value: async (options: unknown) => {
+                const info = await originalStat(options);
+                return { ...info, isFile: () => true, uid: (info.uid as bigint) + 1n };
+              },
+            });
+            return file;
+          },
+        });
+      },
+    });
+
+    await expect(journal.inspectSessionEndEvidence({
+      origin_adapter: ended.origin_adapter,
+      task_id: ended.task_id,
+      claim_id: ended.claim_id,
+      worktree_ref: ended.worktree_ref,
+      branch: ended.branch,
+      head_sha: ended.head_sha,
+      dirty: ended.dirty,
+      ahead: ended.ahead,
+      behind: ended.behind,
+    })).resolves.toEqual({ status: "unverified" });
+  });
+
   it("rejects noncanonical or duplicate requirement lists", () => {
     const commitRequirement = {
       capability: "git.commit" as const,

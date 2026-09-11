@@ -212,10 +212,12 @@ export class GuardJournal implements GuardJournalPort {
         }
         try {
           const before = await file.stat({ bigint: true });
+          const currentUid = typeof process.getuid === "function" ? BigInt(process.getuid()) : undefined;
           if (
             !before.isFile()
             || before.nlink !== 1n
             || (before.mode & 0o777n) !== 0o600n
+            || (currentUid !== undefined && before.uid !== currentUid)
             || before.size > BigInt(MAX_GUARD_JOURNAL_READ_BYTES)
           ) {
             return { status: "unverified" };

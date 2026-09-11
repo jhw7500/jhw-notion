@@ -20,6 +20,22 @@ ok() { echo -e "  ${GREEN}✅ $1${NC}"; }
 skip() { echo -e "  ${YELLOW}⏭️  $1${NC}"; }
 fail() { echo -e "  ${RED}❌ $1${NC}"; }
 
+validate_supported_tui_root() {
+  local directory="$1" label="$2"
+  [ -e "$directory" ] || [ -L "$directory" ] || return 0
+  if ! node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const directory = path.resolve(process.argv[1]);
+    const info = fs.lstatSync(directory);
+    if (info.isSymbolicLink() || !info.isDirectory() || fs.realpathSync(directory) !== directory ||
+        (typeof process.getuid === "function" && info.uid !== process.getuid())) process.exit(1);
+  ' "$directory" 2>/dev/null; then
+    fail "$label 설정 root가 current-user-owned real directory가 아니므로 설치를 중단합니다."
+    exit 1
+  fi
+}
+
 require_control_host() {
   local contract
   if [ ! -x "$HOST_LAUNCHER" ]; then
@@ -796,7 +812,6 @@ register_guard_hooks() {
       report_codex_hook_transaction
       exit 1
     fi
-    rollback_new_control_hook
     fail "$HOOKS_DISPLAY_NAME $(basename "$hooks_file")이 안전한 객체 파일이 아니거나 소유 그룹이 중복되어 설치를 중단합니다."
     exit 1
   fi
@@ -865,8 +880,8 @@ is_unprovisioned_control_diagnostic() {
 }
 
 validate_guard_preflight_diagnostic() {
-  local output="$1" rc="$2"
-  GUARD_PREFLIGHT_RC="$rc" node -e '
+  local output="$1" rc="$2" expect_claude="$3" expect_codex="$4"
+  GUARD_PREFLIGHT_RC="$rc" GUARD_EXPECT_CLAUDE="$expect_claude" GUARD_EXPECT_CODEX="$expect_codex" node -e '
     const fs = require("node:fs");
     const raw = fs.readFileSync(0, "utf8");
     if (Buffer.byteLength(raw, "utf8") > 12 * 1024) process.exit(1);
@@ -899,7 +914,15 @@ validate_guard_preflight_diagnostic() {
     const exactStaticCoverage = (value, state) => validCoverageEntry(value) &&
       value.prompt_origin === state && value.pre_tool_block === state &&
       value.post_tool_correlation === state && value.enforced === false;
+    const exactExpectedCoverage = (value, expected) => expected
+      ? validCoverageEntry(value) && value.prompt_origin === "ok" &&
+        value.pre_tool_block === "ok" && value.post_tool_correlation === "ok" &&
+        (diagnostics.runtime_mode === "enforce" || value.enforced === false)
+      : exactStaticCoverage(value, "missing");
     const rc = Number(process.env.GUARD_PREFLIGHT_RC);
+    const expectClaude = process.env.GUARD_EXPECT_CLAUDE;
+    const expectCodex = process.env.GUARD_EXPECT_CODEX;
+    if (!oneOf(expectClaude, ["true", "false"]) || !oneOf(expectCodex, ["true", "false"])) process.exit(1);
     if (rc !== 78 || !exact(payload, ["command", "result"]) || payload.command !== "guard preflight") process.exit(1);
     const result = payload.result;
     if (!exact(result, ["status", "code", "diagnostics"]) ||
@@ -916,14 +939,8 @@ validate_guard_preflight_diagnostic() {
         !oneOf(diagnostics.registry_claims.availability, ["available", "unavailable"])) process.exit(1);
     const coverage = diagnostics.adapter_coverage;
     if (!exact(coverage, ["claude", "codex", "gemini", "opencode"]) ||
-        !validCoverageEntry(coverage.claude) ||
-        coverage.claude.prompt_origin !== "ok" || coverage.claude.pre_tool_block !== "ok" ||
-        coverage.claude.post_tool_correlation !== "ok" ||
-        (diagnostics.runtime_mode !== "enforce" && coverage.claude.enforced) ||
-        !validCoverageEntry(coverage.codex) ||
-        coverage.codex.prompt_origin !== "ok" || coverage.codex.pre_tool_block !== "ok" ||
-        coverage.codex.post_tool_correlation !== "ok" ||
-        (diagnostics.runtime_mode !== "enforce" && coverage.codex.enforced) ||
+        !exactExpectedCoverage(coverage.claude, expectClaude === "true") ||
+        !exactExpectedCoverage(coverage.codex, expectCodex === "true") ||
         !exactStaticCoverage(coverage.gemini, "unsupported") ||
         !exactStaticCoverage(coverage.opencode, "unsupported")) process.exit(1);
     process.stdout.write(JSON.stringify(payload));
@@ -1008,7 +1025,7 @@ unregister_claude_hooks() {
 }
 
 run_guard_preflight() {
-  local output rc validated_output
+  local output rc validated_output expect_claude=false expect_codex=false
   if output="$("$CONTROL_LINK" guard preflight 2>&1)"; then
     rc=0
   else
@@ -1021,7 +1038,10 @@ run_guard_preflight() {
     echo "  Configure JHW_REGISTRY_DIR, JHW_WORKTREE_ROOT, GitHub Project/Registry coordinates, then rerun jhw-control guard preflight."
     return
   fi
-  if ! validated_output="$(validate_guard_preflight_diagnostic "$output" "$rc")"; then
+  if [ -d "$CLAUDE_DIR" ]; then expect_claude=true; fi
+  if [ -d "$CODEX_DIR" ]; then expect_codex=true; fi
+  if ! validated_output="$(validate_guard_preflight_diagnostic \
+      "$output" "$rc" "$expect_claude" "$expect_codex")"; then
     fail "Guard preflight가 진단 결과가 아닌 오류를 반환했습니다. 설치를 중단합니다."
     exit 1
   fi
@@ -1117,6 +1137,9 @@ CLAUDE_DIR="$HOME/.claude"
 GEMINI_DIR="$HOME/.gemini"
 OPENCODE_DIR="$HOME/.config/opencode"
 CODEX_DIR="$HOME/.codex"
+
+validate_supported_tui_root "$CLAUDE_DIR" "Claude Code"
+validate_supported_tui_root "$CODEX_DIR" "Codex CLI"
 
 [ -d "$CLAUDE_DIR" ] && ok "Claude Code ($CLAUDE_DIR)" || skip "Claude Code (미설치)"
 [ -d "$GEMINI_DIR" ] && ok "Gemini CLI ($GEMINI_DIR)" || skip "Gemini CLI (미설치)"
