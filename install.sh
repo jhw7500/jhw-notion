@@ -1051,6 +1051,8 @@ run_guard_preflight() {
 
 # --- Uninstall ---
 if [ "${1:-}" = "--uninstall" ]; then
+  validate_supported_tui_root "$HOME/.claude" "Claude Code"
+  validate_supported_tui_root "$HOME/.codex" "Codex CLI"
   reject_all_private_hook_transactions || exit 1
   echo "jhw-notion 제거를 시작합니다..."
   echo ""

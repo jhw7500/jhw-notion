@@ -644,6 +644,7 @@ async function task3ClaudeHome(): Promise<Awaited<ReturnType<typeof task3CodexHo
   const fixture = await task3CodexHome("missing");
   const settingsPath = join(fixture.home, ".claude", "settings.json");
   await mkdir(dirname(settingsPath), { recursive: true });
+  await chmod(dirname(settingsPath), 0o700);
   const hooks = Object.fromEntries(task3HookEvents.map((event) => [event, [{
     hooks: [{
       type: "command",
@@ -3389,6 +3390,43 @@ describe("runCli", () => {
       }));
 
       expect(task3AdapterCoverage(result).claude.enforced).toBe(false);
+      expect(runtime.probePrompt).not.toHaveBeenCalled();
+      expect(runtime.probeCommand).not.toHaveBeenCalled();
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
+  it.each([
+    ["settings file", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(fixture.settingsPath, 0o622);
+    }],
+    ["settings directory", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(dirname(fixture.settingsPath), 0o777);
+    }],
+  ] as const)("fails closed when the global Claude %s is writable outside the probe cwd", async (
+    _name,
+    makeWritable,
+  ) => {
+    const fixture = await task3ClaudeHome();
+    const outsideCwd = await mkdtemp(join(tmpdir(), "jhw-claude-probe-cwd-"));
+    await makeWritable(fixture);
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(outsideCwd);
+    const runtime = task3ClaudeRuntime();
+    try {
+      const result = await runCli(["guard", "preflight"], makeCliDependencies({
+        env: { HOME: fixture.home },
+        codexRepositoryRoot: fixture.repositoryRoot,
+        claudeHookRuntime: runtime,
+      }));
+
+      expect(task3AdapterCoverage(result).claude).toEqual({
+        prompt_origin: "missing",
+        pre_tool_block: "missing",
+        post_tool_correlation: "missing",
+        execution_recheck: "pending",
+        enforced: false,
+      });
       expect(runtime.probePrompt).not.toHaveBeenCalled();
       expect(runtime.probeCommand).not.toHaveBeenCalled();
     } finally {

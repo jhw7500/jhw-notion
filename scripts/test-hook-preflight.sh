@@ -241,6 +241,7 @@ owned_group_json() {
 make_home() {
   local scenario="$1" home="$ROOT/$scenario-home" hooks="$ROOT/$scenario-home/.codex/hooks.json"
   mkdir -p "$home/.claude" "$home/.codex" "$home/.local/bin" "$home/registry" "$home/worktrees" "$home/state"
+  chmod 0700 "$home/.claude"
   case "$scenario" in
     launcher-missing) ;;
     launcher-regular) printf 'private-regular-launcher-marker' >"$home/.local/bin/jhw-control-hook" ;;
@@ -259,6 +260,12 @@ make_home() {
     chmod 0600 "$home/.claude/settings.json"
     mkdir -p "$home/project/nested"
     case "$scenario" in
+      claude-global-file-writable)
+        chmod 0622 "$home/.claude/settings.json"
+        ;;
+      claude-global-dir-writable)
+        chmod 0777 "$home/.claude"
+        ;;
       claude-project-disabled)
         mkdir -p "$home/project/.claude"
         printf '%s\n' '{"disableAllHooks":true}' >"$home/project/.claude/settings.json"
@@ -399,7 +406,8 @@ const staticExpected = {
 for (const [adapter, expected] of Object.entries(staticExpected)) {
   if (JSON.stringify(coverage[adapter]) !== JSON.stringify(expected)) fail(`${adapter} coverage is not truthful`);
 }
-const claudeAxes = scenario.startsWith("claude-") ? "ok" : "missing";
+const claudeGlobalUnsafe = ["claude-global-file-writable", "claude-global-dir-writable"].includes(scenario);
+const claudeAxes = scenario.startsWith("claude-") && !claudeGlobalUnsafe ? "ok" : "missing";
 const expectedClaude = {
   prompt_origin: claudeAxes,
   pre_tool_block: claudeAxes,
@@ -452,7 +460,10 @@ if (scenario === "claude-exact-trusted") {
     fail("Claude direct probe inherited the caller PATH instrumentation");
   }
 }
-if (["claude-project-disabled", "claude-local-disabled", "claude-ancestor-symlink"].includes(scenario) &&
+if ([
+  "claude-global-file-writable", "claude-global-dir-writable",
+  "claude-project-disabled", "claude-local-disabled", "claude-ancestor-symlink",
+].includes(scenario) &&
     fs.existsSync(claudeLogPath)) {
   fail("Claude runtime probe ran despite unsafe effective settings discovery");
 }
@@ -470,7 +481,8 @@ EOF
 }
 
 all_scenarios=(
-  claude-exact-trusted claude-project-disabled claude-local-disabled claude-ancestor-symlink
+  claude-exact-trusted claude-global-file-writable claude-global-dir-writable
+  claude-project-disabled claude-local-disabled claude-ancestor-symlink
   exact-trusted exact-invalid-shell exact-untrusted exact-unavailable exact-runtime-source exact-runtime-duplicate exact-stubborn
   exact-foreign-trusted-after exact-mcp-untrusted exact-guard-async exact-missing-display-order
   launcher-missing launcher-regular launcher-foreign duplicate-config missing malformed foreign

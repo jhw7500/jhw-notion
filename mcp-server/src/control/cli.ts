@@ -1011,7 +1011,7 @@ async function openAbsoluteDirectoryChain(directoryPath: string): Promise<FileHa
 type ClaudeSettingsObservation =
   | { state: "absent" }
   | { state: "unsafe" }
-  | { state: "present"; disablesHooks: boolean };
+  | { state: "present"; disablesHooks: boolean; text: string };
 
 async function inspectClaudeSettingsFile(
   directory: FileHandle,
@@ -1067,11 +1067,50 @@ async function inspectClaudeSettingsFile(
     return {
       state: "present",
       disablesHooks: disableKeyCount === 1 && settings.disableAllHooks !== false,
+      text,
     };
   } catch {
     return { state: "unsafe" };
   } finally {
     await handle.close().catch(() => undefined);
+  }
+}
+
+async function readTrustedClaudeGlobalSettings(home: string): Promise<string | undefined> {
+  const uid = process.getuid?.();
+  if (uid === undefined) return undefined;
+  let ancestors: FileHandle[] = [];
+  let claudeDirectory: FileHandle | undefined;
+  try {
+    ancestors = await openAbsoluteDirectoryChain(home);
+    claudeDirectory = await openDescriptorChild(
+      ancestors[ancestors.length - 1] as FileHandle,
+      ".claude",
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    const before = await claudeDirectory.stat({ bigint: true });
+    if (
+      !before.isDirectory()
+      || before.uid !== BigInt(uid)
+      || (before.mode & 0o022n) !== 0n
+    ) return undefined;
+    const observation = await inspectClaudeSettingsFile(claudeDirectory, "settings.json", BigInt(uid));
+    const after = await claudeDirectory.stat({ bigint: true });
+    if (
+      after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.uid !== before.uid
+      || after.mode !== before.mode
+      || after.nlink !== before.nlink
+      || after.mtimeNs !== before.mtimeNs
+      || after.ctimeNs !== before.ctimeNs
+    ) return undefined;
+    return observation.state === "present" ? observation.text : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await claudeDirectory?.close().catch(() => undefined);
+    for (const ancestor of ancestors.reverse()) await ancestor.close().catch(() => undefined);
   }
 }
 
@@ -1137,14 +1176,19 @@ async function inspectExactHookInstallation(
     if (!resolvedLauncherInfo.isFile() || (resolvedLauncherInfo.mode & 0o111) === 0) return undefined;
     const coreInfo = await lstat(corePath);
     if (!coreInfo.isFile() || coreInfo.isSymbolicLink() || (coreInfo.mode & 0o111) === 0) return undefined;
-    const bytes = await readBoundedNoFollowRegularFile(hooksPath, maximumCodexHooksBytes);
-    if (!bytes) return undefined;
-    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-    const document: unknown = JSON.parse(text);
+    let settingsText: string | undefined;
+    if (adapter === "claude") {
+      settingsText = await readTrustedClaudeGlobalSettings(home);
+    } else {
+      const bytes = await readBoundedNoFollowRegularFile(hooksPath, maximumCodexHooksBytes);
+      if (bytes) settingsText = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    }
+    if (settingsText === undefined) return undefined;
+    const document: unknown = JSON.parse(settingsText);
     if (!document || typeof document !== "object" || Array.isArray(document)) return undefined;
     const settings = document as Record<string, unknown>;
     if (adapter === "claude") {
-      const disableKeyCount = topLevelJsonKeyCount(text, "disableAllHooks");
+      const disableKeyCount = topLevelJsonKeyCount(settingsText, "disableAllHooks");
       if (disableKeyCount > 1 || disableKeyCount === 1 && settings.disableAllHooks !== false) return undefined;
     }
     const hooks = settings.hooks;

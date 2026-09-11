@@ -1003,6 +1003,31 @@ test_symlinked_supported_tui_roots_fail_before_adapter_writes() {
   done
 }
 
+test_uninstall_rejects_symlinked_supported_tui_roots_before_transactions() {
+  local adapter home target marker
+  for adapter in claude codex; do
+    home="$ROOT/uninstall-symlinked-$adapter-root-home"
+    target="$ROOT/uninstall-symlinked-$adapter-root-target"
+    mkdir -p "$home/.claude" "$home/.codex" "$target"
+    rmdir "$home/.$adapter"
+    marker="$target/preserve"
+    printf '%s' 'foreign-root-marker' >"$marker"
+    ln -s "$target" "$home/.$adapter"
+
+    if run_install "$home" --uninstall; then
+      echo "uninstall accepted symlinked $adapter root" >&2
+      return 1
+    fi
+    assert_file_text "$marker" "foreign-root-marker"
+    [ -L "$home/.$adapter" ] || return 1
+    [ "$(find "$target" -maxdepth 1 -mindepth 1 | wc -l)" -eq 1 ] || {
+      echo "symlinked $adapter root received uninstall transaction writes" >&2
+      return 1
+    }
+    ! grep -qF '제거 완료!' "$home/install.log" || return 1
+  done
+}
+
 test_preflight_failure_restores_exact_prior_hook_state() {
   local scenario home hooks before claude_settings claude_before
   for scenario in foreign preexisting-owned; do
@@ -3438,6 +3463,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   diagnostic-schema) test_install_requires_complete_guard_diagnostic_schema; exit ;;
   adapter-subsets) test_install_accepts_guard_diagnostic_for_detected_adapters; exit ;;
   symlinked-tui-root) test_symlinked_supported_tui_roots_fail_before_adapter_writes; exit ;;
+  uninstall-symlinked-tui-root) test_uninstall_rejects_symlinked_supported_tui_roots_before_transactions; exit ;;
   rollback-hooks) test_preflight_failure_restores_exact_prior_hook_state; exit ;;
   default-unprovisioned) test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks; exit ;;
   guard-policy-independent) test_no_coordinates_installs_session_end_independently_of_guard_policy; exit ;;
@@ -3525,6 +3551,7 @@ test_install_rejects_malformed_diagnostic_and_rolls_back_hooks
 test_install_requires_complete_guard_diagnostic_schema
 test_install_accepts_guard_diagnostic_for_detected_adapters
 test_symlinked_supported_tui_roots_fail_before_adapter_writes
+test_uninstall_rejects_symlinked_supported_tui_roots_before_transactions
 test_preflight_failure_restores_exact_prior_hook_state
 test_default_unprovisioned_install_removes_owned_guard_hooks_and_preserves_foreign_hooks
 test_no_coordinates_installs_session_end_independently_of_guard_policy
