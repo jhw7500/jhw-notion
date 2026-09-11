@@ -15,6 +15,7 @@ import { basename, delimiter, dirname, isAbsolute, join, parse, resolve as resol
 import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
 import { TextDecoder } from "node:util";
+import { Client } from "@notionhq/client";
 import { z, type ZodType } from "zod";
 
 import { spawn, type StdioOptions } from "node:child_process";
@@ -70,7 +71,6 @@ import {
   parseWorkContractFlags,
 } from "./work-contract-cli.js";
 import { assertPhase1ACommittedLegacy, createAuthorityService } from "./authority.js";
-import { getNotionClient } from "../notion-client.js";
 import { verifyConfiguredNotionAuthorityRoutes } from "../notion/authority-guard.js";
 import {
   AuthorityRecordSchema,
@@ -440,7 +440,13 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
   };
   const notionProbe = {
     async verifyReadOnlyRoutes() {
-      await verifyConfiguredNotionAuthorityRoutes(getNotionClient());
+      if (!env.NOTION_API_KEY) {
+        throw new ControlError("MISSING_CREDENTIAL", "Missing host credential", { key: "NOTION_API_KEY" });
+      }
+      // The host consumes JSON-only streams. SDK logs can echo server content;
+      // failures must reach it only through the bounded ControlError envelope.
+      const notion = new Client({ auth: env.NOTION_API_KEY, logger: () => undefined });
+      await verifyConfiguredNotionAuthorityRoutes(notion);
     },
   };
   const worktrees = new WorktreeManager(config, runner);
