@@ -1,7 +1,17 @@
 #!/usr/bin/env node
 import { constants as fsConstants, realpathSync, writeSync } from "node:fs";
-import { chmod, lstat, mkdtemp, open, readlink, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import {
+  chmod,
+  lstat,
+  mkdtemp,
+  open,
+  readlink,
+  realpath,
+  rm,
+  stat,
+  type FileHandle,
+} from "node:fs/promises";
+import { delimiter, dirname, isAbsolute, join, parse, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
 import { TextDecoder } from "node:util";
@@ -299,8 +309,8 @@ export interface CodexHookRuntimePort {
 }
 
 export interface ClaudeHookRuntimePort {
-  probePrompt(home: string, cwd: string, userHookSettings: Buffer): Promise<CodexHookProbeResult>;
-  probeCommand(home: string, command: string, cwd: string): Promise<CodexHookProbeResult>;
+  probePrompt(home: string): Promise<CodexHookProbeResult>;
+  probeCommand(home: string, command: string): Promise<CodexHookProbeResult>;
 }
 
 export interface CliDependencies {
@@ -908,9 +918,204 @@ async function readBoundedNoFollowRegularFile(file: string, maximumBytes: number
   }
 }
 
+function topLevelJsonKeyCount(text: string, expectedKey: string): number {
+  let depth = 0;
+  let stringStart = -1;
+  let escaped = false;
+  let count = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (stringStart >= 0) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        if (depth === 1) {
+          let next = index + 1;
+          while (next < text.length && /\s/u.test(text[next] as string)) next += 1;
+          if (text[next] === ":") {
+            const key = JSON.parse(text.slice(stringStart, index + 1)) as unknown;
+            if (key === expectedKey) count += 1;
+          }
+        }
+        stringStart = -1;
+      }
+      continue;
+    }
+    if (character === '"') {
+      stringStart = index;
+    } else if (character === "{" || character === "[") {
+      depth += 1;
+    } else if (character === "}" || character === "]") {
+      depth -= 1;
+    }
+  }
+  return count;
+}
+
+function nodeErrorCode(cause: unknown): string | undefined {
+  return typeof cause === "object" && cause !== null && "code" in cause &&
+    typeof (cause as { code?: unknown }).code === "string"
+    ? (cause as { code: string }).code
+    : undefined;
+}
+
+async function openDescriptorChild(directory: FileHandle, name: string, flags: number): Promise<FileHandle> {
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\")) {
+    throw new Error("Invalid descriptor-relative path component");
+  }
+  let lastCause: unknown;
+  for (const root of ["/proc/self/fd", "/dev/fd"]) {
+    try {
+      return await open(`${root}/${directory.fd}/${name}`, flags);
+    } catch (cause) {
+      lastCause = cause;
+    }
+  }
+  throw lastCause;
+}
+
+async function openAbsoluteDirectoryChain(directoryPath: string): Promise<FileHandle[]> {
+  if (!isAbsolute(directoryPath) || resolvePath(directoryPath) !== directoryPath) {
+    throw new Error("Claude discovery cwd is not an absolute normalized path");
+  }
+  const root = parse(directoryPath).root;
+  const handles: FileHandle[] = [];
+  try {
+    const rootHandle = await open(
+      root,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    handles.push(rootHandle);
+    for (const component of directoryPath.slice(root.length).split(sep).filter(Boolean)) {
+      const next = await openDescriptorChild(
+        handles[handles.length - 1] as FileHandle,
+        component,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+      );
+      const info = await next.stat({ bigint: true });
+      if (!info.isDirectory()) {
+        await next.close();
+        throw new Error("Claude discovery ancestor is not a directory");
+      }
+      handles.push(next);
+    }
+    return handles;
+  } catch (cause) {
+    for (const handle of handles.reverse()) await handle.close().catch(() => undefined);
+    throw cause;
+  }
+}
+
+type ClaudeSettingsObservation =
+  | { state: "absent" }
+  | { state: "unsafe" }
+  | { state: "present"; disablesHooks: boolean };
+
+async function inspectClaudeSettingsFile(
+  directory: FileHandle,
+  name: "settings.json" | "settings.local.json",
+  currentUid: bigint,
+): Promise<ClaudeSettingsObservation> {
+  let handle: FileHandle;
+  try {
+    handle = await openDescriptorChild(
+      directory,
+      name,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
+  } catch (cause) {
+    return nodeErrorCode(cause) === "ENOENT" ? { state: "absent" } : { state: "unsafe" };
+  }
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (
+      !before.isFile()
+      || before.uid !== currentUid
+      || before.nlink !== 1n
+      || (before.mode & 0o022n) !== 0n
+      || before.size > BigInt(maximumCodexHooksBytes)
+    ) return { state: "unsafe" };
+    const buffer = Buffer.alloc(maximumCodexHooksBytes + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, null);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (
+      offset > maximumCodexHooksBytes
+      || BigInt(offset) !== before.size
+      || after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.uid !== before.uid
+      || after.mode !== before.mode
+      || after.nlink !== before.nlink
+      || after.size !== before.size
+      || after.mtimeNs !== before.mtimeNs
+      || after.ctimeNs !== before.ctimeNs
+    ) return { state: "unsafe" };
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+      .decode(buffer.subarray(0, offset));
+    const document: unknown = JSON.parse(text);
+    if (!document || typeof document !== "object" || Array.isArray(document)) return { state: "unsafe" };
+    const disableKeyCount = topLevelJsonKeyCount(text, "disableAllHooks");
+    if (disableKeyCount > 1) return { state: "unsafe" };
+    const settings = document as Record<string, unknown>;
+    return {
+      state: "present",
+      disablesHooks: disableKeyCount === 1 && settings.disableAllHooks !== false,
+    };
+  } catch {
+    return { state: "unsafe" };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function claudeSettingsHierarchyAllowsHooks(cwd: string): Promise<boolean> {
+  const uid = process.getuid?.();
+  if (uid === undefined) return false;
+  let ancestors: FileHandle[] = [];
+  try {
+    ancestors = await openAbsoluteDirectoryChain(cwd);
+    for (const ancestor of [...ancestors].reverse()) {
+      let claudeDirectory: FileHandle;
+      try {
+        claudeDirectory = await openDescriptorChild(
+          ancestor,
+          ".claude",
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+        );
+      } catch (cause) {
+        if (nodeErrorCode(cause) === "ENOENT") continue;
+        return false;
+      }
+      try {
+        const info = await claudeDirectory.stat({ bigint: true });
+        if (!info.isDirectory() || info.uid !== BigInt(uid) || (info.mode & 0o022n) !== 0n) return false;
+        for (const name of ["settings.json", "settings.local.json"] as const) {
+          const observation = await inspectClaudeSettingsFile(claudeDirectory, name, BigInt(uid));
+          if (observation.state === "unsafe" || observation.state === "present" && observation.disablesHooks) {
+            return false;
+          }
+        }
+      } finally {
+        await claudeDirectory.close().catch(() => undefined);
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    for (const ancestor of ancestors.reverse()) await ancestor.close().catch(() => undefined);
+  }
+}
+
 type ExactHookInstallationEvidence = {
   probeCommand: string;
-  claudePromptSettings?: Buffer;
 };
 
 async function inspectExactHookInstallation(
@@ -938,8 +1143,9 @@ async function inspectExactHookInstallation(
     const document: unknown = JSON.parse(text);
     if (!document || typeof document !== "object" || Array.isArray(document)) return undefined;
     const settings = document as Record<string, unknown>;
-    if (adapter === "claude" && Object.hasOwn(settings, "disableAllHooks") && settings.disableAllHooks !== false) {
-      return undefined;
+    if (adapter === "claude") {
+      const disableKeyCount = topLevelJsonKeyCount(text, "disableAllHooks");
+      if (disableKeyCount > 1 || disableKeyCount === 1 && settings.disableAllHooks !== false) return undefined;
     }
     const hooks = settings.hooks;
     if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return undefined;
@@ -950,17 +1156,7 @@ async function inspectExactHookInstallation(
     });
     if (!exact) return undefined;
     const preToolGroups = (hooks as Record<string, unknown>).PreToolUse as Array<{ hooks: Array<{ command: string }> }>;
-    const promptGroups = (hooks as Record<string, unknown>).UserPromptSubmit as unknown[];
-    return {
-      probeCommand: preToolGroups[0]?.hooks[0]?.command as string,
-      ...(adapter === "claude"
-        ? {
-          claudePromptSettings: Buffer.from(`${JSON.stringify({
-            hooks: { UserPromptSubmit: [promptGroups[0]] },
-          })}\n`, "utf8"),
-        }
-        : {}),
-    };
+    return { probeCommand: preToolGroups[0]?.hooks[0]?.command as string };
   } catch {
     return undefined;
   }
@@ -1058,16 +1254,20 @@ function hasExactClaudePromptProbe(raw: unknown): boolean {
     line.type === "system" && line.subtype === "hook_response" &&
     line.hook_name === "UserPromptSubmit" && line.hook_event === "UserPromptSubmit");
   if (responses.length !== 2) return false;
+  const stopLine = `${claudeProbeStopMarker}\n`;
   const blocking = responses.filter((line) =>
-    line.output === claudeProbeStopMarker && line.stdout === claudeProbeStopMarker &&
-    line.stderr === "" && line.exit_code === 2 && line.outcome === "error");
+    line.output === stopLine && line.stdout === "" &&
+    line.stderr === stopLine && line.exit_code === 2 && line.outcome === "error");
   const owned = responses.filter((line) => {
     if (
       typeof line.stdout !== "string" || line.output !== line.stdout || line.stderr !== "" ||
       line.exit_code !== 0 || line.outcome !== "success"
     ) return false;
+    if (!line.stdout.endsWith("\n")) return false;
+    const nativeLine = line.stdout.slice(0, -1);
+    if (!nativeLine || nativeLine.includes("\n") || nativeLine.includes("\r")) return false;
     try {
-      const native = NativeHookOutputSchema.safeParse(JSON.parse(line.stdout));
+      const native = NativeHookOutputSchema.safeParse(JSON.parse(nativeLine));
       return native.success && "hookSpecificOutput" in native.data &&
         native.data.hookSpecificOutput.hookEventName === "UserPromptSubmit";
     } catch {
@@ -1122,22 +1322,15 @@ async function inspectAdapterCoverage(
   if (claudeInstalled && dependencies.claudeHookRuntime) {
     try {
       const cwd = process.cwd();
-      const cwdInfo = isAbsolute(cwd) ? await stat(cwd) : undefined;
-      if (cwdInfo?.isDirectory()) {
-        const promptSettings = (claudeInstallation as ExactHookInstallationEvidence).claudePromptSettings;
-        claudePromptTrusted = promptSettings !== undefined && hasExactClaudePromptProbe(
-          await dependencies.claudeHookRuntime.probePrompt(
-            dependencies.env.HOME as string,
-            cwd,
-            promptSettings,
-          ),
+      if (await claudeSettingsHierarchyAllowsHooks(cwd)) {
+        claudePromptTrusted = hasExactClaudePromptProbe(
+          await dependencies.claudeHookRuntime.probePrompt(dependencies.env.HOME as string),
         );
         if (claudePromptTrusted) {
           claudeCommandTrusted = hasExactCodexHookProbe(
             await dependencies.claudeHookRuntime.probeCommand(
               dependencies.env.HOME as string,
               (claudeInstallation as ExactHookInstallationEvidence).probeCommand,
-              cwd,
             ),
           );
         }
@@ -1394,24 +1587,159 @@ async function probeCodexHookCommand(
   });
 }
 
+function sanitizedProbePath(): string {
+  return [...new Set([dirname(process.execPath), "/usr/local/bin", "/usr/bin", "/bin"])]
+    .filter(isAbsolute)
+    .join(delimiter);
+}
+
+function minimalProbeEnvironment(
+  env: NodeJS.ProcessEnv,
+  home: string,
+  temporaryDirectory: string,
+): NodeJS.ProcessEnv {
+  const childEnvironment: NodeJS.ProcessEnv = {
+    HOME: home,
+    PATH: sanitizedProbePath(),
+    SHELL: "/bin/sh",
+    TMPDIR: temporaryDirectory,
+  };
+  for (const name of ["LANG", "LC_ALL", "LC_CTYPE"] as const) {
+    if (typeof env[name] === "string") childEnvironment[name] = env[name];
+  }
+  return childEnvironment;
+}
+
+async function resolveExecutableOnPath(name: string, pathValue: string | undefined): Promise<string> {
+  if (!name || name.includes("/") || name.includes("\\")) throw new Error("Invalid executable name");
+  const currentUid = process.getuid?.();
+  for (const directory of (pathValue ?? sanitizedProbePath()).split(delimiter)) {
+    if (!isAbsolute(directory)) continue;
+    try {
+      const resolved = await realpath(join(directory, name));
+      const info = await stat(resolved);
+      if (
+        info.isFile()
+        && (info.mode & 0o111) !== 0
+        && (info.uid === 0 || currentUid !== undefined && info.uid === currentUid)
+      ) return resolved;
+    } catch {
+      // Continue through the bounded caller PATH without exposing candidates.
+    }
+  }
+  throw new Error("Claude executable is unavailable");
+}
+
+async function runBoundedClaudeProbe(
+  executable: string,
+  args: readonly string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    stdin?: string;
+    timeoutMs: number;
+    timeoutMessage: string;
+  },
+): Promise<CodexHookProbeResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, {
+      cwd: options.cwd,
+      detached: true,
+      env: options.env,
+      stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let shutdownRequested = false;
+    let terminalError: unknown;
+    let forceTimer: NodeJS.Timeout | undefined;
+    const signalGroup = (signal: NodeJS.Signals) => {
+      if (child.pid === undefined) return;
+      try {
+        process.kill(-child.pid, signal);
+      } catch {
+        try { child.kill(signal); } catch {}
+      }
+    };
+    const requestShutdown = (cause: unknown) => {
+      if (settled || shutdownRequested) return;
+      shutdownRequested = true;
+      terminalError = cause;
+      child.stdin?.end();
+      signalGroup("SIGTERM");
+      forceTimer = setTimeout(() => signalGroup("SIGKILL"), 250);
+    };
+    const timer = setTimeout(() => requestShutdown(new Error(options.timeoutMessage)), options.timeoutMs);
+    const capture = (target: Buffer[], stream: "stdout" | "stderr", chunk: Buffer) => {
+      if (stream === "stdout") stdoutBytes += chunk.length;
+      else stderrBytes += chunk.length;
+      if (stdoutBytes > maximumCodexProbeBytes || stderrBytes > maximumCodexProbeBytes) {
+        requestShutdown(new Error("Claude hook runtime probe output exceeded its bound"));
+        return;
+      }
+      target.push(Buffer.from(chunk));
+    };
+    child.on("error", (cause) => {
+      if (settled) return;
+      if (child.pid === undefined) {
+        settled = true;
+        clearTimeout(timer);
+        if (forceTimer) clearTimeout(forceTimer);
+        reject(cause);
+        return;
+      }
+      requestShutdown(cause);
+    });
+    child.stdin?.on("error", (cause) => requestShutdown(cause));
+    child.stdout?.on("data", (chunk: Buffer) => capture(stdout, "stdout", chunk));
+    child.stderr?.on("data", (chunk: Buffer) => capture(stderr, "stderr", chunk));
+    child.on("close", (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (terminalError !== undefined) {
+        reject(terminalError);
+        return;
+      }
+      resolve({
+        exitCode,
+        signal,
+        stdout: Buffer.concat(stdout, stdoutBytes),
+        stderr: Buffer.concat(stderr, stderrBytes),
+      });
+    });
+    if (options.stdin !== undefined) child.stdin?.end(options.stdin);
+  });
+}
+
 async function probeClaudePromptHooks(
   env: NodeJS.ProcessEnv,
   home: string,
-  _cwd: string,
-  userHookSettings: Buffer,
 ): Promise<CodexHookProbeResult> {
-  const ownedSettings = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(userHookSettings)) as {
-    hooks: { UserPromptSubmit: unknown[] };
-  };
+  const claudeExecutable = await resolveExecutableOnPath("claude", env.PATH);
+  const probeConfigDir = await mkdtemp(join(tmpdir(), "jhw-claude-hook-preflight-"));
+  await chmod(probeConfigDir, 0o700);
+  const signalPath = join(probeConfigDir, "owned-hook-complete");
+  const ownedCommand = `${expectedHookCommand("claude", "UserPromptSubmit")}; status=$?; ` +
+    `/usr/bin/touch -- "$JHW_CLAUDE_PROBE_SIGNAL"; exit "$status"`;
+  const blockingCommand = `i=0; while [ ! -f "$JHW_CLAUDE_PROBE_SIGNAL" ] && [ "$i" -lt 200 ]; do ` +
+    `/usr/bin/sleep 0.05; i=$((i+1)); done; [ -f "$JHW_CLAUDE_PROBE_SIGNAL" ] || exit 3; ` +
+    `/usr/bin/sleep 1; printf '${claudeProbeStopMarker}\\n' >&2; exit 2`;
   const inlineSettings = JSON.stringify({
     hooks: {
       UserPromptSubmit: [
-        ownedSettings.hooks.UserPromptSubmit[0],
+        {
+          hooks: [{ type: "command", command: ownedCommand, timeout: 12 }],
+        },
         {
           hooks: [{
             type: "command",
-            command: `printf '${claudeProbeStopMarker}\\n' >&2; exit 2`,
-            timeout: 3,
+            command: blockingCommand,
+            timeout: 12,
           }],
         },
       ],
@@ -1430,110 +1758,51 @@ async function probeClaudePromptHooks(
     "--max-budget-usd", "0.000001",
     "jhw-claude-preflight-probe",
   ];
-  const probeConfigDir = await mkdtemp(join(tmpdir(), "jhw-claude-hook-preflight-"));
-  await chmod(probeConfigDir, 0o700);
   try {
-    await writeFile(join(probeConfigDir, "settings.json"), userHookSettings, {
-      flag: "wx",
-      mode: 0o600,
-    });
-    return await new Promise((resolve, reject) => {
-      const childEnvironment: NodeJS.ProcessEnv = {
-        HOME: home,
-        PATH: env.PATH,
-        LANG: env.LANG,
-        LC_ALL: env.LC_ALL,
-        LC_CTYPE: env.LC_CTYPE,
-        SHELL: "/bin/sh",
-        TMPDIR: probeConfigDir,
-      };
-      childEnvironment.CLAUDE_CONFIG_DIR = probeConfigDir;
-      childEnvironment.ANTHROPIC_API_KEY = "jhw-preflight-no-network";
-      childEnvironment.ANTHROPIC_BASE_URL = "http://127.0.0.1:1";
-      delete childEnvironment.ANTHROPIC_AUTH_TOKEN;
-      delete childEnvironment.CLAUDE_CODE_OAUTH_TOKEN;
-      delete childEnvironment.CLAUDE_CODE_USE_BEDROCK;
-      delete childEnvironment.CLAUDE_CODE_USE_FOUNDRY;
-      delete childEnvironment.CLAUDE_CODE_USE_MANTLE;
-      delete childEnvironment.CLAUDE_CODE_USE_VERTEX;
-      childEnvironment.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
-      childEnvironment.CLAUDE_CODE_SKIP_PROMPT_HISTORY = "1";
-      childEnvironment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-      childEnvironment.DISABLE_TELEMETRY = "1";
-      const child = spawn("claude", args, {
-        cwd: probeConfigDir,
-        detached: true,
-        env: childEnvironment,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
-      let stdoutBytes = 0;
-      let stderrBytes = 0;
-      let settled = false;
-      let shutdownRequested = false;
-      let terminalError: unknown;
-      let forceTimer: NodeJS.Timeout | undefined;
-      const signalGroup = (signal: NodeJS.Signals) => {
-        if (child.pid === undefined) return;
-        try {
-          process.kill(-child.pid, signal);
-        } catch {
-          try { child.kill(signal); } catch {}
-        }
-      };
-      const requestShutdown = (cause: unknown) => {
-        if (settled || shutdownRequested) return;
-        shutdownRequested = true;
-        terminalError = cause;
-        signalGroup("SIGTERM");
-        forceTimer = setTimeout(() => signalGroup("SIGKILL"), 250);
-      };
-      const timer = setTimeout(
-        () => requestShutdown(new Error("Claude hook runtime probe timed out")),
-        15_000,
-      );
-      const capture = (target: Buffer[], stream: "stdout" | "stderr", chunk: Buffer) => {
-        if (stream === "stdout") stdoutBytes += chunk.length;
-        else stderrBytes += chunk.length;
-        if (stdoutBytes > maximumCodexProbeBytes || stderrBytes > maximumCodexProbeBytes) {
-          requestShutdown(new Error("Claude hook runtime probe output exceeded its bound"));
-          return;
-        }
-        target.push(Buffer.from(chunk));
-      };
-      child.on("error", (cause) => {
-        if (settled) return;
-        if (child.pid === undefined) {
-          settled = true;
-          clearTimeout(timer);
-          if (forceTimer) clearTimeout(forceTimer);
-          reject(cause);
-          return;
-        }
-        requestShutdown(cause);
-      });
-      child.stdout.on("data", (chunk: Buffer) => capture(stdout, "stdout", chunk));
-      child.stderr.on("data", (chunk: Buffer) => capture(stderr, "stderr", chunk));
-      child.on("close", (exitCode, signal) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (forceTimer) clearTimeout(forceTimer);
-        if (terminalError !== undefined) {
-          reject(terminalError);
-          return;
-        }
-        resolve({
-          exitCode,
-          signal,
-          stdout: Buffer.concat(stdout, stdoutBytes),
-          stderr: Buffer.concat(stderr, stderrBytes),
-        });
-      });
+    const childEnvironment = minimalProbeEnvironment(env, home, probeConfigDir);
+    childEnvironment.CLAUDE_CONFIG_DIR = probeConfigDir;
+    childEnvironment.JHW_CLAUDE_PROBE_SIGNAL = signalPath;
+    childEnvironment.ANTHROPIC_API_KEY = "jhw-preflight-no-network";
+    childEnvironment.ANTHROPIC_BASE_URL = "http://127.0.0.1:1";
+    childEnvironment.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+    childEnvironment.CLAUDE_CODE_SKIP_PROMPT_HISTORY = "1";
+    childEnvironment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+    childEnvironment.DISABLE_TELEMETRY = "1";
+    return await runBoundedClaudeProbe(claudeExecutable, args, {
+      cwd: probeConfigDir,
+      env: childEnvironment,
+      timeoutMs: 15_000,
+      timeoutMessage: "Claude hook runtime probe timed out",
     });
   } finally {
     await rm(probeConfigDir, { recursive: true, force: true });
+  }
+}
+
+async function probeClaudeHookCommand(
+  env: NodeJS.ProcessEnv,
+  home: string,
+  command: string,
+): Promise<CodexHookProbeResult> {
+  if (command !== expectedHookCommand("claude", "PreToolUse")) {
+    throw new Error("Claude hook command is not canonical");
+  }
+  const probeDirectory = await mkdtemp(join(tmpdir(), "jhw-claude-command-preflight-"));
+  await chmod(probeDirectory, 0o700);
+  try {
+    return await runBoundedClaudeProbe(
+      "/usr/bin/bash",
+      [join(home, ".local", "bin", "jhw-control-hook"), "--adapter", "claude", "--event", "PreToolUse"],
+      {
+        cwd: probeDirectory,
+        env: minimalProbeEnvironment(env, home, probeDirectory),
+        stdin: '{"hook_event_name":"PreToolUse"}\n',
+        timeoutMs: 9_000,
+        timeoutMessage: "Claude hook command probe timed out",
+      },
+    );
+  } finally {
+    await rm(probeDirectory, { recursive: true, force: true });
   }
 }
 
@@ -1546,8 +1815,8 @@ function createCodexHookRuntime(env: NodeJS.ProcessEnv): CodexHookRuntimePort {
 
 function createClaudeHookRuntime(env: NodeJS.ProcessEnv): ClaudeHookRuntimePort {
   return {
-    probePrompt: (home, cwd, userHookSettings) => probeClaudePromptHooks(env, home, cwd, userHookSettings),
-    probeCommand: (home, command, cwd) => probeCodexHookCommand(env, home, command, cwd),
+    probePrompt: (home) => probeClaudePromptHooks(env, home),
+    probeCommand: (home, command) => probeClaudeHookCommand(env, home, command),
   };
 }
 

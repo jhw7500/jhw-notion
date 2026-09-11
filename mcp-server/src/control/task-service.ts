@@ -742,7 +742,7 @@ export class TaskService {
         worktree_mapped: status.worktree_mapped,
         dirty: status.dirty,
         ahead: status.ahead,
-        session_end: await this.sessionEndEvidence(status.active),
+        session_end: await this.sessionEndEvidence(status.active, status),
       },
     };
   }
@@ -974,7 +974,7 @@ export class TaskService {
       }
       return {
         ...recovered,
-        session_end: await this.sessionEndEvidence(recovered.active),
+        session_end: await this.sessionEndEvidence(recovered.active, recovered),
       };
     }
     if (input.action.kind === "force-end") {
@@ -1008,8 +1008,15 @@ export class TaskService {
     return recovered;
   }
 
-  private async sessionEndEvidence(active: ActiveClaim): Promise<GuardSessionEndEvidence> {
-    if (!("origin_adapter" in active) || active.host !== this.config.buildHost) {
+  private async sessionEndEvidence(
+    active: ActiveClaim,
+    observed: { worktree_mapped: boolean; dirty: boolean; ahead: number },
+  ): Promise<GuardSessionEndEvidence> {
+    if (
+      !("origin_adapter" in active)
+      || active.host !== this.config.buildHost
+      || !observed.worktree_mapped
+    ) {
       return { status: "unverified" };
     }
     try {
@@ -1017,6 +1024,8 @@ export class TaskService {
       if (
         inspection.worktree_ref !== active.worktree_ref
         || inspection.branch !== active.branch
+        || inspection.dirty !== observed.dirty
+        || inspection.ahead !== observed.ahead
       ) {
         return { status: "unverified" };
       }

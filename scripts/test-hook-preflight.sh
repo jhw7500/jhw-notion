@@ -148,22 +148,16 @@ const configDir = process.env.CLAUDE_CONFIG_DIR;
 if (!configDir || !path.isAbsolute(configDir) || configDir === path.join(process.env.HOME, ".claude")) process.exit(66);
 const configInfo = fs.statSync(configDir);
 const settingsPath = path.join(configDir, "settings.json");
-const settingsInfo = fs.statSync(settingsPath);
-if (!configInfo.isDirectory() || (configInfo.mode & 0o777) !== 0o700 ||
-    !settingsInfo.isFile() || (settingsInfo.mode & 0o777) !== 0o600) process.exit(66);
-let userSettings;
-try { userSettings = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch { process.exit(66); }
-const owned = userSettings?.hooks?.UserPromptSubmit?.[0]?.hooks?.[0];
-if (owned?.type !== "command" || owned?.timeout !== 12 ||
-    owned?.command !== '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event UserPromptSubmit') process.exit(66);
-if (JSON.stringify(Object.keys(userSettings.hooks ?? {})) !== JSON.stringify(["UserPromptSubmit"]) ||
-    userSettings.hooks.UserPromptSubmit.length !== 1) process.exit(66);
+if (!configInfo.isDirectory() || (configInfo.mode & 0o777) !== 0o700 || fs.existsSync(settingsPath)) process.exit(66);
+const signalPath = process.env.JHW_CLAUDE_PROBE_SIGNAL;
+if (!signalPath || !path.isAbsolute(signalPath) || path.dirname(signalPath) !== configDir || fs.existsSync(signalPath)) process.exit(66);
 if (process.env.ANTHROPIC_API_KEY !== "jhw-preflight-no-network" ||
     process.env.ANTHROPIC_BASE_URL !== "http://127.0.0.1:1" ||
     process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== "1" ||
     process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY !== "1") process.exit(66);
 fs.writeFileSync(path.join(configDir, "probe-state"), "must-be-cleaned", { mode: 0o600 });
-if (process.env.AWS_SECRET_ACCESS_KEY !== undefined || process.env.JHW_FAKE_CLAUDE_LOG !== undefined) process.exit(66);
+if (process.env.AWS_SECRET_ACCESS_KEY !== undefined || process.env.JHW_FAKE_CLAUDE_LOG !== undefined ||
+    process.env.NODE_OPTIONS !== undefined) process.exit(66);
 const logPath = path.join(process.env.HOME, "claude-runtime-probe.log");
 fs.appendFileSync(logPath, `${JSON.stringify({ args, configDir, home: process.env.HOME, cwd: process.cwd() })}\n`, "utf8");
 const settingSources = args.indexOf("--setting-sources");
@@ -176,10 +170,11 @@ try { settings = JSON.parse(args[settingsIndex + 1]); } catch { process.exit(64)
 const inlineGroups = settings?.hooks?.UserPromptSubmit;
 const inlineOwned = inlineGroups?.[0]?.hooks?.[0];
 const blocker = inlineGroups?.[1]?.hooks?.[0];
+const expectedOwned = '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event UserPromptSubmit; status=$?; /usr/bin/touch -- "$JHW_CLAUDE_PROBE_SIGNAL"; exit "$status"';
+const expectedBlocker = 'i=0; while [ ! -f "$JHW_CLAUDE_PROBE_SIGNAL" ] && [ "$i" -lt 200 ]; do /usr/bin/sleep 0.05; i=$((i+1)); done; [ -f "$JHW_CLAUDE_PROBE_SIGNAL" ] || exit 3; /usr/bin/sleep 1; printf \'jhw-claude-preflight-stop\\n\' >&2; exit 2';
 if (inlineGroups?.length !== 2 || inlineOwned?.type !== "command" || inlineOwned?.timeout !== 12 ||
-    inlineOwned?.command !== '"$HOME/.local/bin/jhw-control-hook" --adapter claude --event UserPromptSubmit') process.exit(64);
-if (blocker?.type !== "command" || blocker?.timeout !== 3 ||
-    blocker?.command !== "printf 'jhw-claude-preflight-stop\\n' >&2; exit 2") process.exit(64);
+    inlineOwned?.command !== expectedOwned) process.exit(64);
+if (blocker?.type !== "command" || blocker?.timeout !== 12 || blocker?.command !== expectedBlocker) process.exit(64);
 const native = JSON.stringify({
   hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "GUARD_UNAVAILABLE" },
   systemMessage: "GUARD_UNAVAILABLE",
@@ -188,13 +183,13 @@ for (const value of [
   {
     type: "system", subtype: "hook_response", hook_id: "owned-hook-response",
     hook_name: "UserPromptSubmit", hook_event: "UserPromptSubmit",
-    output: native, stdout: native, stderr: "", exit_code: 0, outcome: "success",
+    output: `${native}\n`, stdout: `${native}\n`, stderr: "", exit_code: 0, outcome: "success",
   },
   {
     type: "system", subtype: "hook_response", hook_id: "blocking-probe-response",
     hook_name: "UserPromptSubmit", hook_event: "UserPromptSubmit",
-    output: "jhw-claude-preflight-stop", stdout: "jhw-claude-preflight-stop",
-    stderr: "", exit_code: 2, outcome: "error",
+    output: "jhw-claude-preflight-stop\n", stdout: "",
+    stderr: "jhw-claude-preflight-stop\n", exit_code: 2, outcome: "error",
   },
   {
     type: "result", subtype: "success", is_error: false, duration_api_ms: 0,
@@ -255,13 +250,30 @@ make_home() {
       ;;
     *) ln -s "$REPO_ROOT/scripts/jhw-control-hook" "$home/.local/bin/jhw-control-hook" ;;
   esac
-  if [ "$scenario" = "claude-exact-trusted" ]; then
+  if [[ "$scenario" == claude-* ]]; then
     printf '{"hooks":{"UserPromptSubmit":[%s],"PreToolUse":[%s],"PostToolUse":[%s],"SessionEnd":[%s]}}\n' \
       "$(owned_group_json UserPromptSubmit claude)" \
       "$(owned_group_json PreToolUse claude)" \
       "$(owned_group_json PostToolUse claude)" \
       "$(owned_group_json SessionEnd claude)" >"$home/.claude/settings.json"
     chmod 0600 "$home/.claude/settings.json"
+    mkdir -p "$home/project/nested"
+    case "$scenario" in
+      claude-project-disabled)
+        mkdir -p "$home/project/.claude"
+        printf '%s\n' '{"disableAllHooks":true}' >"$home/project/.claude/settings.json"
+        chmod 0600 "$home/project/.claude/settings.json"
+        ;;
+      claude-local-disabled)
+        mkdir -p "$home/project/.claude"
+        printf '%s\n' '{"disableAllHooks":true}' >"$home/project/.claude/settings.local.json"
+        chmod 0600 "$home/project/.claude/settings.local.json"
+        ;;
+      claude-ancestor-symlink)
+        mkdir -p "$home/project-settings-target"
+        ln -s "$home/project-settings-target" "$home/project/.claude"
+        ;;
+    esac
   fi
   case "$scenario" in
     exact-trusted|exact-invalid-shell|exact-untrusted|exact-unavailable|exact-runtime-source|exact-runtime-duplicate|exact-stubborn|exact-foreign-trusted-after|exact-mcp-untrusted|exact-guard-async|exact-missing-display-order|launcher-missing|launcher-regular|launcher-foreign)
@@ -290,7 +302,7 @@ make_home() {
 }
 
 run_preflight() {
-  local scenario="$1" home="$2" output="$home/preflight.out" error="$home/preflight.err" rc mode log claude_log probe_log probe_cwd_log runtime_shell
+  local scenario="$1" home="$2" output="$home/preflight.out" error="$home/preflight.err" rc mode log claude_log probe_log probe_cwd_log runtime_shell run_cwd
   case "$scenario" in
     exact-trusted) mode="trusted" ;;
     exact-invalid-shell) mode="trusted" ;;
@@ -310,10 +322,14 @@ run_preflight() {
   probe_log="$ROOT/$scenario-shell-probe.log"
   probe_cwd_log="$ROOT/$scenario-shell-probe-cwd.log"
   runtime_shell="${SHELL:-/bin/sh}"
-  [ "$scenario" != "exact-invalid-shell" ] || runtime_shell="$home/private-missing-shell"
+  run_cwd="$REPO_ROOT"
+  case "$scenario" in
+    exact-invalid-shell|claude-exact-trusted) runtime_shell="$home/private-missing-shell" ;;
+    claude-project-disabled|claude-local-disabled|claude-ancestor-symlink) run_cwd="$home/project/nested" ;;
+  esac
   local started_ms finished_ms elapsed_ms stubborn_pid
   started_ms="$(date +%s%3N)"
-  if HOME="$home" PATH="$FAKE_BIN:$PATH" SHELL="$runtime_shell" \
+  if (cd "$run_cwd" && HOME="$home" PATH="$FAKE_BIN:$PATH" SHELL="$runtime_shell" NODE_OPTIONS="--no-warnings" \
       JHW_FAKE_CODEX_MODE="$mode" \
       JHW_FAKE_CODEX_LOG="$log" \
       JHW_FAKE_CLAUDE_LOG="private-claude-log-path" \
@@ -331,7 +347,7 @@ run_preflight() {
       JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER="1" \
       JHW_CONTROL_STATE_DIR="$home/state" \
       JHW_GUARD_MODE="enforce" \
-      "$CLI" guard preflight >"$output" 2>"$error"; then
+      "$CLI" guard preflight) >"$output" 2>"$error"; then
     rc=0
   else
     rc=$?
@@ -383,7 +399,7 @@ const staticExpected = {
 for (const [adapter, expected] of Object.entries(staticExpected)) {
   if (JSON.stringify(coverage[adapter]) !== JSON.stringify(expected)) fail(`${adapter} coverage is not truthful`);
 }
-const claudeAxes = scenario === "claude-exact-trusted" ? "ok" : "missing";
+const claudeAxes = scenario.startsWith("claude-") ? "ok" : "missing";
 const expectedClaude = {
   prompt_origin: claudeAxes,
   pre_tool_block: claudeAxes,
@@ -432,6 +448,13 @@ if (scenario === "claude-exact-trusted") {
     fail("Claude runtime probe did not clean its isolated config directory");
   }
   if (call.cwd !== call.configDir) fail("Claude runtime probe did not isolate its working directory");
+  if (fs.existsSync(probeLogPath) || fs.existsSync(probeCwdLogPath)) {
+    fail("Claude direct probe inherited the caller PATH instrumentation");
+  }
+}
+if (["claude-project-disabled", "claude-local-disabled", "claude-ancestor-symlink"].includes(scenario) &&
+    fs.existsSync(claudeLogPath)) {
+  fail("Claude runtime probe ran despite unsafe effective settings discovery");
 }
 if (scenario === "exact-trusted" || scenario === "exact-mcp-untrusted") {
   if (!fs.existsSync(probeLogPath)) fail("production preflight did not execute the stored canonical command");
@@ -447,7 +470,7 @@ EOF
 }
 
 all_scenarios=(
-  claude-exact-trusted
+  claude-exact-trusted claude-project-disabled claude-local-disabled claude-ancestor-symlink
   exact-trusted exact-invalid-shell exact-untrusted exact-unavailable exact-runtime-source exact-runtime-duplicate exact-stubborn
   exact-foreign-trusted-after exact-mcp-untrusted exact-guard-async exact-missing-display-order
   launcher-missing launcher-regular launcher-foreign duplicate-config missing malformed foreign

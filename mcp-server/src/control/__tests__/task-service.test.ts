@@ -1429,6 +1429,86 @@ describe("TaskService", () => {
     });
   });
 
+  it.each(["discovery", "direct"] as const)(
+    "degrades %s SessionEnd evidence when the second worktree snapshot drifts",
+    async (surface) => {
+      const { tasks, claims, worktrees } = await taskFixture();
+      claims.getActive.mockResolvedValue(activeClaim);
+      claims.recoverClaim.mockResolvedValue({
+        kind: "status",
+        active: activeClaim,
+        recorded: { host: activeClaim.host, session_id: activeClaim.session_id },
+        process_exists: false,
+        worktree_mapped: true,
+        dirty: false,
+        ahead: 0,
+      });
+      worktrees.inspect.mockResolvedValue({
+        path: "not-exported",
+        repository_path: "not-exported",
+        worktree_ref: activeClaim.worktree_ref,
+        branch: activeClaim.branch,
+        head_sha: "d".repeat(40),
+        dirty: true,
+        dirty_files: ["private-raced-file"],
+        ahead: 1,
+        behind: 0,
+      });
+
+      if (surface === "discovery") {
+        const result = await tasks.recoveryDiscovery(TASK_ID);
+        expect(result).toMatchObject({
+          state: "active",
+          recovery: { session_end: { status: "unverified" } },
+        });
+      } else {
+        const result = await tasks.recover({
+          task_id: TASK_ID,
+          claim_id: CLAIM_ID,
+          action: { kind: "status" },
+        });
+        expect(result).toMatchObject({
+          kind: "status",
+          session_end: { status: "unverified" },
+        });
+      }
+    },
+  );
+
+  it("does not trust a second worktree inspection after the recovery snapshot reported no mapping", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.recoverClaim.mockResolvedValue({
+      kind: "status",
+      active: activeClaim,
+      recorded: { host: activeClaim.host, session_id: activeClaim.session_id },
+      process_exists: false,
+      worktree_mapped: false,
+      dirty: false,
+      ahead: 0,
+    });
+    worktrees.inspect.mockResolvedValue({
+      path: "not-exported",
+      repository_path: "not-exported",
+      worktree_ref: activeClaim.worktree_ref,
+      branch: activeClaim.branch,
+      head_sha: "e".repeat(40),
+      dirty: false,
+      dirty_files: [],
+      ahead: 0,
+      behind: 0,
+    });
+
+    await expect(tasks.recover({
+      task_id: TASK_ID,
+      claim_id: CLAIM_ID,
+      action: { kind: "status" },
+    })).resolves.toMatchObject({
+      kind: "status",
+      worktree_mapped: false,
+      session_end: { status: "unverified" },
+    });
+  });
+
   it("rejects an absolute host path restored from a committed Handoff", async () => {
     const { tasks, claims, fixture } = await taskFixture();
     const relativePath = `handoffs/${TASK_ID}/${CLAIM_ID}.md`;
