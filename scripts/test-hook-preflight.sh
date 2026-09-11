@@ -241,7 +241,7 @@ owned_group_json() {
 make_home() {
   local scenario="$1" home="$ROOT/$scenario-home" hooks="$ROOT/$scenario-home/.codex/hooks.json"
   mkdir -p "$home/.claude" "$home/.codex" "$home/.local/bin" "$home/registry" "$home/worktrees" "$home/state"
-  chmod 0700 "$home/.claude"
+  chmod 0700 "$home" "$home/.claude" "$home/.local" "$home/.local/bin"
   case "$scenario" in
     launcher-missing) ;;
     launcher-regular) printf 'private-regular-launcher-marker' >"$home/.local/bin/jhw-control-hook" ;;

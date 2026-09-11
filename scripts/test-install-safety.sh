@@ -498,7 +498,8 @@ EOF
 
 make_tui_roots() {
   local home="$1"
-  mkdir -p "$home/.claude" "$home/.gemini" "$home/.config/opencode" "$home/.codex"
+  mkdir -p "$home/.claude" "$home/.gemini" "$home/.config/opencode" "$home/.codex" "$home/.local/bin"
+  chmod 0700 "$home" "$home/.claude" "$home/.codex" "$home/.local" "$home/.local/bin"
 }
 
 assert_file_text() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { constants as fsConstants, realpathSync, writeSync } from "node:fs";
+import { constants as fsConstants, realpathSync, writeSync, type BigIntStats } from "node:fs";
 import {
   chmod,
   lstat,
@@ -11,7 +11,7 @@ import {
   stat,
   type FileHandle,
 } from "node:fs/promises";
-import { delimiter, dirname, isAbsolute, join, parse, resolve as resolvePath, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, parse, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Writable } from "node:stream";
 import { TextDecoder } from "node:util";
@@ -1008,6 +1008,204 @@ async function openAbsoluteDirectoryChain(directoryPath: string): Promise<FileHa
   }
 }
 
+type TrustedDirectoryChain = {
+  handles: FileHandle[];
+  observations: BigIntStats[];
+};
+
+const maximumTrustedHookArtifactBytes = 8 * 1024 * 1024;
+
+function sameStableFsObject(before: BigIntStats, after: BigIntStats): boolean {
+  return after.dev === before.dev
+    && after.ino === before.ino
+    && after.uid === before.uid
+    && after.gid === before.gid
+    && after.mode === before.mode
+    && after.nlink === before.nlink
+    && after.size === before.size
+    && after.mtimeNs === before.mtimeNs
+    && after.ctimeNs === before.ctimeNs;
+}
+
+function sameStableDirectory(before: BigIntStats, after: BigIntStats): boolean {
+  return after.dev === before.dev
+    && after.ino === before.ino
+    && after.uid === before.uid
+    && after.gid === before.gid
+    && after.mode === before.mode;
+}
+
+function isTrustedArtifactDirectory(info: BigIntStats, currentUid: bigint): boolean {
+  const stickyRootDirectory = info.uid === 0n && (info.mode & 0o1000n) !== 0n;
+  return info.isDirectory()
+    && (info.uid === currentUid || info.uid === 0n)
+    && ((info.mode & 0o022n) === 0n || stickyRootDirectory);
+}
+
+async function closeDirectoryChain(chain: TrustedDirectoryChain | undefined): Promise<void> {
+  if (!chain) return;
+  for (const handle of chain.handles.reverse()) await handle.close().catch(() => undefined);
+}
+
+async function openTrustedArtifactDirectoryChain(
+  directoryPath: string,
+  currentUid: bigint,
+): Promise<TrustedDirectoryChain> {
+  const handles = await openAbsoluteDirectoryChain(directoryPath);
+  try {
+    const observations: BigIntStats[] = [];
+    for (const handle of handles) {
+      const info = await handle.stat({ bigint: true });
+      if (!isTrustedArtifactDirectory(info, currentUid)) {
+        throw new Error("Unsafe executable artifact directory");
+      }
+      observations.push(info);
+    }
+    return { handles, observations };
+  } catch (cause) {
+    for (const handle of handles.reverse()) await handle.close().catch(() => undefined);
+    throw cause;
+  }
+}
+
+async function trustedArtifactDirectoryChainRemainsStable(
+  directoryPath: string,
+  chain: TrustedDirectoryChain,
+  currentUid: bigint,
+): Promise<boolean> {
+  for (let index = 0; index < chain.handles.length; index += 1) {
+    const current = await (chain.handles[index] as FileHandle).stat({ bigint: true });
+    if (!sameStableDirectory(chain.observations[index] as BigIntStats, current)) return false;
+  }
+  let reopened: TrustedDirectoryChain | undefined;
+  try {
+    reopened = await openTrustedArtifactDirectoryChain(directoryPath, currentUid);
+    return reopened.observations.length === chain.observations.length
+      && reopened.observations.every((current, index) =>
+        sameStableDirectory(chain.observations[index] as BigIntStats, current));
+  } catch {
+    return false;
+  } finally {
+    await closeDirectoryChain(reopened);
+  }
+}
+
+async function descriptorChildOperation<T>(
+  directory: FileHandle,
+  name: string,
+  operation: (path: string) => Promise<T>,
+): Promise<T> {
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\")) {
+    throw new Error("Invalid descriptor-relative path component");
+  }
+  let lastCause: unknown;
+  for (const root of ["/proc/self/fd", "/dev/fd"]) {
+    try {
+      return await operation(`${root}/${directory.fd}/${name}`);
+    } catch (cause) {
+      lastCause = cause;
+    }
+  }
+  throw lastCause;
+}
+
+async function lstatDescriptorChild(directory: FileHandle, name: string): Promise<BigIntStats> {
+  return descriptorChildOperation(directory, name, (path) => lstat(path, { bigint: true }));
+}
+
+async function readlinkDescriptorChild(directory: FileHandle, name: string): Promise<string> {
+  return descriptorChildOperation(directory, name, (path) => readlink(path));
+}
+
+async function inspectTrustedExecutableArtifact(file: string, currentUid: bigint): Promise<boolean> {
+  const parentPath = dirname(file);
+  const name = basename(file);
+  let chain: TrustedDirectoryChain | undefined;
+  let handle: FileHandle | undefined;
+  let currentHandle: FileHandle | undefined;
+  try {
+    chain = await openTrustedArtifactDirectoryChain(parentPath, currentUid);
+    const parent = chain.handles[chain.handles.length - 1] as FileHandle;
+    handle = await openDescriptorChild(
+      parent,
+      name,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
+    const before = await handle.stat({ bigint: true });
+    if (
+      !before.isFile()
+      || before.uid !== currentUid
+      || before.nlink !== 1n
+      || (before.mode & 0o022n) !== 0n
+      || (before.mode & 0o111n) === 0n
+      || before.size > BigInt(maximumTrustedHookArtifactBytes)
+    ) return false;
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let total = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > maximumTrustedHookArtifactBytes) return false;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (BigInt(total) !== before.size || !sameStableFsObject(before, after)) return false;
+    currentHandle = await openDescriptorChild(
+      parent,
+      name,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
+    const current = await currentHandle.stat({ bigint: true });
+    if (!current.isFile() || !sameStableFsObject(after, current)) return false;
+    return await trustedArtifactDirectoryChainRemainsStable(parentPath, chain, currentUid);
+  } catch {
+    return false;
+  } finally {
+    await currentHandle?.close().catch(() => undefined);
+    await handle?.close().catch(() => undefined);
+    await closeDirectoryChain(chain);
+  }
+}
+
+async function inspectTrustedLauncherSymlink(
+  launcherPath: string,
+  expectedTarget: string,
+  currentUid: bigint,
+): Promise<boolean> {
+  const parentPath = dirname(launcherPath);
+  const name = basename(launcherPath);
+  let chain: TrustedDirectoryChain | undefined;
+  try {
+    chain = await openTrustedArtifactDirectoryChain(parentPath, currentUid);
+    const parent = chain.handles[chain.handles.length - 1] as FileHandle;
+    const before = await lstatDescriptorChild(parent, name);
+    if (!before.isSymbolicLink() || before.uid !== currentUid || before.nlink !== 1n) return false;
+    const target = await readlinkDescriptorChild(parent, name);
+    const after = await lstatDescriptorChild(parent, name);
+    if (target !== expectedTarget || !sameStableFsObject(before, after)) return false;
+    return await trustedArtifactDirectoryChainRemainsStable(parentPath, chain, currentUid);
+  } catch {
+    return false;
+  } finally {
+    await closeDirectoryChain(chain);
+  }
+}
+
+async function inspectTrustedClaudeExecutableArtifacts(
+  home: string,
+  repositoryRoot: string,
+): Promise<boolean> {
+  const uid = process.getuid?.();
+  if (uid === undefined) return false;
+  const currentUid = BigInt(uid);
+  const launcherPath = join(home, ".local", "bin", "jhw-control-hook");
+  const expectedLauncher = join(repositoryRoot, "scripts", "jhw-control-hook");
+  const corePath = join(repositoryRoot, "mcp-server", "dist", "control", "hook-adapter.js");
+  return await inspectTrustedLauncherSymlink(launcherPath, expectedLauncher, currentUid)
+    && await inspectTrustedExecutableArtifact(expectedLauncher, currentUid)
+    && await inspectTrustedExecutableArtifact(corePath, currentUid);
+}
+
 type ClaudeSettingsObservation =
   | { state: "absent" }
   | { state: "unsafe" }
@@ -1170,12 +1368,16 @@ async function inspectExactHookInstallation(
     ? join(home, ".claude", "settings.json")
     : join(home, ".codex", "hooks.json");
   try {
-    const launcherInfo = await lstat(launcherPath);
-    if (!launcherInfo.isSymbolicLink() || await readlink(launcherPath) !== expectedLauncher) return undefined;
-    const resolvedLauncherInfo = await stat(launcherPath);
-    if (!resolvedLauncherInfo.isFile() || (resolvedLauncherInfo.mode & 0o111) === 0) return undefined;
-    const coreInfo = await lstat(corePath);
-    if (!coreInfo.isFile() || coreInfo.isSymbolicLink() || (coreInfo.mode & 0o111) === 0) return undefined;
+    if (adapter === "claude") {
+      if (!await inspectTrustedClaudeExecutableArtifacts(home, repositoryRoot)) return undefined;
+    } else {
+      const launcherInfo = await lstat(launcherPath);
+      if (!launcherInfo.isSymbolicLink() || await readlink(launcherPath) !== expectedLauncher) return undefined;
+      const resolvedLauncherInfo = await stat(launcherPath);
+      if (!resolvedLauncherInfo.isFile() || (resolvedLauncherInfo.mode & 0o111) === 0) return undefined;
+      const coreInfo = await lstat(corePath);
+      if (!coreInfo.isFile() || coreInfo.isSymbolicLink() || (coreInfo.mode & 0o111) === 0) return undefined;
+    }
     let settingsText: string | undefined;
     if (adapter === "claude") {
       settingsText = await readTrustedClaudeGlobalSettings(home);

@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc && chmod +x dist/control/cli.js dist/control/hook-adapter.js",
+    "build": "umask 022 && node scripts/clean-dist.mjs && tsc && chmod 0755 dist/control/cli.js dist/control/hook-adapter.js",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",

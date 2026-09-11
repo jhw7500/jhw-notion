@@ -512,6 +512,17 @@ async function task3CodexHome(
   await mkdir(join(home, ".codex"), { recursive: true });
   await mkdir(dirname(expectedLauncherPath), { recursive: true });
   await mkdir(dirname(corePath), { recursive: true });
+  for (const directory of [
+    home,
+    join(home, ".local"),
+    join(home, ".local", "bin"),
+    join(home, ".codex"),
+    repositoryRoot,
+    dirname(expectedLauncherPath),
+    join(repositoryRoot, "mcp-server"),
+    join(repositoryRoot, "mcp-server", "dist"),
+    dirname(corePath),
+  ]) await chmod(directory, 0o700);
 
   if (artifact === "resolved-nonregular") {
     await mkdir(expectedLauncherPath);
@@ -3432,6 +3443,55 @@ describe("runCli", () => {
     } finally {
       cwd.mockRestore();
     }
+  });
+
+  it.each([
+    ["launcher target file is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(fixture.expectedLauncherPath, 0o722);
+    }],
+    ["core file is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(fixture.corePath, 0o722);
+    }],
+    ["launcher parent is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(dirname(fixture.launcherPath), 0o777);
+    }],
+    ["launcher ancestor is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(join(fixture.home, ".local"), 0o777);
+    }],
+    ["launcher target parent is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(dirname(fixture.expectedLauncherPath), 0o777);
+    }],
+    ["repository root is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(fixture.repositoryRoot, 0o777);
+    }],
+    ["core parent is writable", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      await chmod(dirname(fixture.corePath), 0o777);
+    }],
+    ["launcher target is a symlink", async (fixture: Awaited<ReturnType<typeof task3ClaudeHome>>) => {
+      const target = join(fixture.home, "foreign-launcher-target");
+      await writeFile(target, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      await unlink(fixture.expectedLauncherPath);
+      await symlink(target, fixture.expectedLauncherPath);
+    }],
+  ] as const)("fails closed when Claude executable artifact %s", async (_name, makeUnsafe) => {
+    const fixture = await task3ClaudeHome();
+    await makeUnsafe(fixture);
+    const runtime = task3ClaudeRuntime();
+    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      claudeHookRuntime: runtime,
+    }));
+
+    expect(task3AdapterCoverage(result).claude).toEqual({
+      prompt_origin: "missing",
+      pre_tool_block: "missing",
+      post_tool_correlation: "missing",
+      execution_recheck: "pending",
+      enforced: false,
+    });
+    expect(runtime.probePrompt).not.toHaveBeenCalled();
+    expect(runtime.probeCommand).not.toHaveBeenCalled();
   });
 
   it.each([
