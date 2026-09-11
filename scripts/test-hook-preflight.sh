@@ -6,6 +6,7 @@ CLI="$REPO_ROOT/mcp-server/dist/control/cli.js"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/jhw hook preflight 'runtime.XXXXXX")"
 FAKE_BIN="$ROOT/fake-bin"
 mkdir -p "$FAKE_BIN"
+chmod 0755 "$FAKE_BIN"
 REAL_TIMEOUT="$(command -v timeout)"
 cat >"$FAKE_BIN/timeout" <<EOF
 #!/bin/sh
@@ -13,7 +14,7 @@ printf '%s\n' "\$*" >>"\${JHW_FAKE_PROBE_LOG:?}"
 printf '%s\n' "\$PWD" >"\${JHW_FAKE_PROBE_CWD_LOG:?}"
 exec "$REAL_TIMEOUT" "\$@"
 EOF
-chmod +x "$FAKE_BIN/timeout"
+chmod 0755 "$FAKE_BIN/timeout"
 cat >"$FAKE_BIN/codex" <<'EOF'
 #!/usr/bin/env node
 const fs = require("node:fs");
@@ -130,7 +131,7 @@ input.on("close", () => {
   if (stage !== 3) fail("client-closed-early");
 });
 EOF
-chmod +x "$FAKE_BIN/codex"
+chmod 0755 "$FAKE_BIN/codex"
 cat >"$FAKE_BIN/claude" <<'EOF'
 #!/usr/bin/env node
 const fs = require("node:fs");
@@ -159,7 +160,13 @@ fs.writeFileSync(path.join(configDir, "probe-state"), "must-be-cleaned", { mode:
 if (process.env.AWS_SECRET_ACCESS_KEY !== undefined || process.env.JHW_FAKE_CLAUDE_LOG !== undefined ||
     process.env.NODE_OPTIONS !== undefined) process.exit(66);
 const logPath = path.join(process.env.HOME, "claude-runtime-probe.log");
-fs.appendFileSync(logPath, `${JSON.stringify({ args, configDir, home: process.env.HOME, cwd: process.cwd() })}\n`, "utf8");
+fs.appendFileSync(logPath, `${JSON.stringify({
+  args,
+  configDir,
+  home: process.env.HOME,
+  cwd: process.cwd(),
+  entrypoint: process.argv[1],
+})}\n`, "utf8");
 const settingSources = args.indexOf("--setting-sources");
 const settingsIndex = args.indexOf("--settings");
 if (!args.includes("-p") || !args.includes("--verbose") || !args.includes("--no-session-persistence") ||
@@ -197,7 +204,7 @@ for (const value of [
   },
 ]) process.stdout.write(`${JSON.stringify(value)}\n`);
 EOF
-chmod +x "$FAKE_BIN/claude"
+chmod 0755 "$FAKE_BIN/claude"
 trap 'rm -rf -- "$ROOT"' EXIT
 
 self_test_fake_app_server() {
@@ -259,12 +266,16 @@ make_home() {
       "$(owned_group_json SessionEnd claude)" >"$home/.claude/settings.json"
     chmod 0600 "$home/.claude/settings.json"
     mkdir -p "$home/project/nested"
+    chmod 0700 "$home/project" "$home/project/nested"
     case "$scenario" in
       claude-global-file-writable)
         chmod 0622 "$home/.claude/settings.json"
         ;;
       claude-global-dir-writable)
         chmod 0777 "$home/.claude"
+        ;;
+      claude-project-parent-writable)
+        chmod 0777 "$home/project"
         ;;
       claude-project-disabled)
         mkdir -p "$home/project/.claude"
@@ -332,7 +343,9 @@ run_preflight() {
   run_cwd="$REPO_ROOT"
   case "$scenario" in
     exact-invalid-shell|claude-exact-trusted) runtime_shell="$home/private-missing-shell" ;;
-    claude-project-disabled|claude-local-disabled|claude-ancestor-symlink) run_cwd="$home/project/nested" ;;
+    claude-project-parent-writable|claude-project-disabled|claude-local-disabled|claude-ancestor-symlink)
+      run_cwd="$home/project/nested"
+      ;;
   esac
   local started_ms finished_ms elapsed_ms stubborn_pid
   started_ms="$(date +%s%3N)"
@@ -406,7 +419,9 @@ const staticExpected = {
 for (const [adapter, expected] of Object.entries(staticExpected)) {
   if (JSON.stringify(coverage[adapter]) !== JSON.stringify(expected)) fail(`${adapter} coverage is not truthful`);
 }
-const claudeGlobalUnsafe = ["claude-global-file-writable", "claude-global-dir-writable"].includes(scenario);
+const claudeGlobalUnsafe = [
+  "claude-global-file-writable", "claude-global-dir-writable", "claude-global-home-writable",
+].includes(scenario);
 const claudeAxes = scenario.startsWith("claude-") && !claudeGlobalUnsafe ? "ok" : "missing";
 const expectedClaude = {
   prompt_origin: claudeAxes,
@@ -415,7 +430,9 @@ const expectedClaude = {
   execution_recheck: "pending",
   enforced: scenario === "claude-exact-trusted",
 };
-if (JSON.stringify(coverage.claude) !== JSON.stringify(expectedClaude)) fail("Claude installed/runtime coverage is not truthful");
+if (JSON.stringify(coverage.claude) !== JSON.stringify(expectedClaude)) {
+  fail(`Claude installed/runtime coverage is not truthful: ${JSON.stringify(coverage.claude)}`);
+}
 const installedAxes = scenario.startsWith("exact-") ? "ok" : "missing";
 const expectedCodex = {
   prompt_origin: installedAxes,
@@ -452,6 +469,9 @@ if (scenario === "claude-exact-trusted") {
   if (!Array.isArray(call.args) || call.home !== expectedHome) {
     fail("Claude runtime probe did not retain the exact launcher HOME");
   }
+  if (!/^\/(?:proc\/self|dev)\/fd\/3$/.test(call.entrypoint)) {
+    fail("Claude runtime probe was not bound to the inspected executable descriptor");
+  }
   if (typeof call.configDir !== "string" || fs.existsSync(call.configDir)) {
     fail("Claude runtime probe did not clean its isolated config directory");
   }
@@ -461,11 +481,12 @@ if (scenario === "claude-exact-trusted") {
   }
 }
 if ([
-  "claude-global-file-writable", "claude-global-dir-writable",
-  "claude-project-disabled", "claude-local-disabled", "claude-ancestor-symlink",
+  "claude-global-file-writable", "claude-global-dir-writable", "claude-global-home-writable",
+  "claude-runtime-file-writable", "claude-runtime-parent-writable", "claude-runtime-link-parent-writable",
+  "claude-project-parent-writable", "claude-project-disabled", "claude-local-disabled", "claude-ancestor-symlink",
 ].includes(scenario) &&
     fs.existsSync(claudeLogPath)) {
-  fail("Claude runtime probe ran despite unsafe effective settings discovery");
+  fail("Claude runtime probe ran despite an unsafe trust boundary");
 }
 if (scenario === "exact-trusted" || scenario === "exact-mcp-untrusted") {
   if (!fs.existsSync(probeLogPath)) fail("production preflight did not execute the stored canonical command");
@@ -481,8 +502,9 @@ EOF
 }
 
 all_scenarios=(
-  claude-exact-trusted claude-global-file-writable claude-global-dir-writable
-  claude-project-disabled claude-local-disabled claude-ancestor-symlink
+  claude-exact-trusted claude-global-file-writable claude-global-dir-writable claude-global-home-writable
+  claude-runtime-file-writable claude-runtime-parent-writable claude-runtime-link-parent-writable
+  claude-project-parent-writable claude-project-disabled claude-local-disabled claude-ancestor-symlink
   exact-trusted exact-invalid-shell exact-untrusted exact-unavailable exact-runtime-source exact-runtime-duplicate exact-stubborn
   exact-foreign-trusted-after exact-mcp-untrusted exact-guard-async exact-missing-display-order
   launcher-missing launcher-regular launcher-foreign duplicate-config missing malformed foreign
@@ -517,7 +539,27 @@ for scenario in "${scenarios[@]}"; do
   else
     launcher_kind="missing"
   fi
+  case "$scenario" in
+    claude-global-home-writable) chmod 0777 "$home" ;;
+    claude-runtime-file-writable) chmod 0777 "$FAKE_BIN/claude" ;;
+    claude-runtime-parent-writable) chmod 0777 "$FAKE_BIN" ;;
+    claude-runtime-link-parent-writable)
+      mv "$FAKE_BIN/claude" "$ROOT/trusted-claude"
+      ln -s "$ROOT/trusted-claude" "$FAKE_BIN/claude"
+      chmod 0777 "$FAKE_BIN"
+      ;;
+  esac
   run_preflight "$scenario" "$home"
+  case "$scenario" in
+    claude-runtime-file-writable) chmod 0755 "$FAKE_BIN/claude" ;;
+    claude-runtime-parent-writable) chmod 0755 "$FAKE_BIN" ;;
+    claude-runtime-link-parent-writable)
+      chmod 0755 "$FAKE_BIN"
+      rm -- "$FAKE_BIN/claude"
+      mv "$ROOT/trusted-claude" "$FAKE_BIN/claude"
+      chmod 0755 "$FAKE_BIN/claude"
+      ;;
+  esac
   if [ -e "$hooks" ]; then
     [ "$(sha256sum "$hooks")" = "$before" ] || { echo "preflight modified $scenario hooks" >&2; exit 1; }
     [ "$(stat -c '%a' "$hooks")" = "$before_mode" ] || { echo "preflight changed $scenario hook mode" >&2; exit 1; }

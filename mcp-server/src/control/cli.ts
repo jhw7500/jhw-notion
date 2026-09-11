@@ -17,7 +17,7 @@ import type { Writable } from "node:stream";
 import { TextDecoder } from "node:util";
 import { z, type ZodType } from "zod";
 
-import { spawn } from "node:child_process";
+import { spawn, type StdioOptions } from "node:child_process";
 import { constants as osConstants, tmpdir } from "node:os";
 
 import { BoardJournal, type BoardJournalPort } from "./board-journal.js";
@@ -1014,6 +1014,14 @@ type TrustedDirectoryChain = {
 };
 
 const maximumTrustedHookArtifactBytes = 8 * 1024 * 1024;
+const maximumTrustedClaudeExecutableBytes = 512 * 1024 * 1024;
+const childExecutableDescriptor = 3;
+
+type TrustedExecutableLease = {
+  handle: FileHandle;
+  childPath: string;
+  observation: BigIntStats;
+};
 
 function sameStableFsObject(before: BigIntStats, after: BigIntStats): boolean {
   return after.dev === before.dev
@@ -1117,12 +1125,30 @@ async function readlinkDescriptorChild(directory: FileHandle, name: string): Pro
   return descriptorChildOperation(directory, name, (path) => readlink(path));
 }
 
-async function inspectTrustedExecutableArtifact(file: string, currentUid: bigint): Promise<boolean> {
+async function executableDescriptorRoot(handle: FileHandle, observation: BigIntStats): Promise<string> {
+  let lastCause: unknown;
+  for (const root of ["/proc/self/fd", "/dev/fd"]) {
+    try {
+      const current = await stat(`${root}/${handle.fd}`, { bigint: true });
+      if (current.dev === observation.dev && current.ino === observation.ino) return root;
+    } catch (cause) {
+      lastCause = cause;
+    }
+  }
+  throw lastCause ?? new Error("Executable descriptor filesystem is unavailable");
+}
+
+async function openTrustedExecutableArtifact(
+  file: string,
+  currentUid: bigint,
+  options: { allowRootOwner: boolean; maximumBytes: number },
+): Promise<TrustedExecutableLease> {
   const parentPath = dirname(file);
   const name = basename(file);
   let chain: TrustedDirectoryChain | undefined;
   let handle: FileHandle | undefined;
   let currentHandle: FileHandle | undefined;
+  let leased = false;
   try {
     chain = await openTrustedArtifactDirectoryChain(parentPath, currentUid);
     const parent = chain.handles[chain.handles.length - 1] as FileHandle;
@@ -1134,36 +1160,62 @@ async function inspectTrustedExecutableArtifact(file: string, currentUid: bigint
     const before = await handle.stat({ bigint: true });
     if (
       !before.isFile()
-      || before.uid !== currentUid
+      || !(before.uid === currentUid || options.allowRootOwner && before.uid === 0n)
       || before.nlink !== 1n
       || (before.mode & 0o022n) !== 0n
       || (before.mode & 0o111n) === 0n
-      || before.size > BigInt(maximumTrustedHookArtifactBytes)
-    ) return false;
+      || before.size > BigInt(options.maximumBytes)
+    ) throw new Error("Unsafe executable artifact");
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let total = 0;
     while (true) {
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
       if (bytesRead === 0) break;
       total += bytesRead;
-      if (total > maximumTrustedHookArtifactBytes) return false;
+      if (total > options.maximumBytes) throw new Error("Executable artifact exceeded its bound");
     }
     const after = await handle.stat({ bigint: true });
-    if (BigInt(total) !== before.size || !sameStableFsObject(before, after)) return false;
+    if (BigInt(total) !== before.size || !sameStableFsObject(before, after)) {
+      throw new Error("Executable artifact changed during inspection");
+    }
     currentHandle = await openDescriptorChild(
       parent,
       name,
       fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
     );
     const current = await currentHandle.stat({ bigint: true });
-    if (!current.isFile() || !sameStableFsObject(after, current)) return false;
-    return await trustedArtifactDirectoryChainRemainsStable(parentPath, chain, currentUid);
+    if (!current.isFile() || !sameStableFsObject(after, current)) {
+      throw new Error("Executable artifact pathname changed during inspection");
+    }
+    if (!await trustedArtifactDirectoryChainRemainsStable(parentPath, chain, currentUid)) {
+      throw new Error("Executable artifact directory changed during inspection");
+    }
+    const descriptorRoot = await executableDescriptorRoot(handle, after);
+    leased = true;
+    return {
+      handle,
+      childPath: `${descriptorRoot}/${childExecutableDescriptor}`,
+      observation: after,
+    };
+  } finally {
+    await currentHandle?.close().catch(() => undefined);
+    if (!leased) await handle?.close().catch(() => undefined);
+    await closeDirectoryChain(chain);
+  }
+}
+
+async function inspectTrustedExecutableArtifact(file: string, currentUid: bigint): Promise<boolean> {
+  let lease: TrustedExecutableLease | undefined;
+  try {
+    lease = await openTrustedExecutableArtifact(file, currentUid, {
+      allowRootOwner: false,
+      maximumBytes: maximumTrustedHookArtifactBytes,
+    });
+    return true;
   } catch {
     return false;
   } finally {
-    await currentHandle?.close().catch(() => undefined);
-    await handle?.close().catch(() => undefined);
-    await closeDirectoryChain(chain);
+    await lease?.handle.close().catch(() => undefined);
   }
 }
 
@@ -1277,48 +1329,32 @@ async function inspectClaudeSettingsFile(
 async function readTrustedClaudeGlobalSettings(home: string): Promise<string | undefined> {
   const uid = process.getuid?.();
   if (uid === undefined) return undefined;
-  let ancestors: FileHandle[] = [];
-  let claudeDirectory: FileHandle | undefined;
+  const currentUid = BigInt(uid);
+  const directoryPath = join(home, ".claude");
+  let chain: TrustedDirectoryChain | undefined;
   try {
-    ancestors = await openAbsoluteDirectoryChain(home);
-    claudeDirectory = await openDescriptorChild(
-      ancestors[ancestors.length - 1] as FileHandle,
-      ".claude",
-      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-    );
-    const before = await claudeDirectory.stat({ bigint: true });
-    if (
-      !before.isDirectory()
-      || before.uid !== BigInt(uid)
-      || (before.mode & 0o022n) !== 0n
-    ) return undefined;
-    const observation = await inspectClaudeSettingsFile(claudeDirectory, "settings.json", BigInt(uid));
-    const after = await claudeDirectory.stat({ bigint: true });
-    if (
-      after.dev !== before.dev
-      || after.ino !== before.ino
-      || after.uid !== before.uid
-      || after.mode !== before.mode
-      || after.nlink !== before.nlink
-      || after.mtimeNs !== before.mtimeNs
-      || after.ctimeNs !== before.ctimeNs
-    ) return undefined;
+    chain = await openTrustedArtifactDirectoryChain(directoryPath, currentUid);
+    const directoryObservation = chain.observations[chain.observations.length - 1] as BigIntStats;
+    if (directoryObservation.uid !== currentUid) return undefined;
+    const claudeDirectory = chain.handles[chain.handles.length - 1] as FileHandle;
+    const observation = await inspectClaudeSettingsFile(claudeDirectory, "settings.json", currentUid);
+    if (!await trustedArtifactDirectoryChainRemainsStable(directoryPath, chain, currentUid)) return undefined;
     return observation.state === "present" ? observation.text : undefined;
   } catch {
     return undefined;
   } finally {
-    await claudeDirectory?.close().catch(() => undefined);
-    for (const ancestor of ancestors.reverse()) await ancestor.close().catch(() => undefined);
+    await closeDirectoryChain(chain);
   }
 }
 
 async function claudeSettingsHierarchyAllowsHooks(cwd: string): Promise<boolean> {
   const uid = process.getuid?.();
   if (uid === undefined) return false;
-  let ancestors: FileHandle[] = [];
+  const currentUid = BigInt(uid);
+  let chain: TrustedDirectoryChain | undefined;
   try {
-    ancestors = await openAbsoluteDirectoryChain(cwd);
-    for (const ancestor of [...ancestors].reverse()) {
+    chain = await openTrustedArtifactDirectoryChain(cwd, currentUid);
+    for (const ancestor of [...chain.handles].reverse()) {
       let claudeDirectory: FileHandle;
       try {
         claudeDirectory = await openDescriptorChild(
@@ -1332,9 +1368,9 @@ async function claudeSettingsHierarchyAllowsHooks(cwd: string): Promise<boolean>
       }
       try {
         const info = await claudeDirectory.stat({ bigint: true });
-        if (!info.isDirectory() || info.uid !== BigInt(uid) || (info.mode & 0o022n) !== 0n) return false;
+        if (!info.isDirectory() || info.uid !== currentUid || (info.mode & 0o022n) !== 0n) return false;
         for (const name of ["settings.json", "settings.local.json"] as const) {
-          const observation = await inspectClaudeSettingsFile(claudeDirectory, name, BigInt(uid));
+          const observation = await inspectClaudeSettingsFile(claudeDirectory, name, currentUid);
           if (observation.state === "unsafe" || observation.state === "present" && observation.disablesHooks) {
             return false;
           }
@@ -1343,11 +1379,11 @@ async function claudeSettingsHierarchyAllowsHooks(cwd: string): Promise<boolean>
         await claudeDirectory.close().catch(() => undefined);
       }
     }
-    return true;
+    return await trustedArtifactDirectoryChainRemainsStable(cwd, chain, currentUid);
   } catch {
     return false;
   } finally {
-    for (const ancestor of ancestors.reverse()) await ancestor.close().catch(() => undefined);
+    await closeDirectoryChain(chain);
   }
 }
 
@@ -1858,19 +1894,53 @@ function minimalProbeEnvironment(
 
 async function resolveExecutableOnPath(name: string, pathValue: string | undefined): Promise<string> {
   if (!name || name.includes("/") || name.includes("\\")) throw new Error("Invalid executable name");
-  const currentUid = process.getuid?.();
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error("Executable ownership is unavailable");
+  const currentUid = BigInt(uid);
   for (const directory of (pathValue ?? sanitizedProbePath()).split(delimiter)) {
     if (!isAbsolute(directory)) continue;
+    let chain: TrustedDirectoryChain | undefined;
     try {
-      const resolved = await realpath(join(directory, name));
+      try {
+        chain = await openTrustedArtifactDirectoryChain(directory, currentUid);
+      } catch {
+        try {
+          await lstat(join(directory, name));
+        } catch (cause) {
+          if (nodeErrorCode(cause) === "ENOENT" || nodeErrorCode(cause) === "ENOTDIR") continue;
+        }
+        throw new Error("Executable search path is unsafe");
+      }
+      const parent = chain.handles[chain.handles.length - 1] as FileHandle;
+      let entryBefore: BigIntStats;
+      try {
+        entryBefore = await lstatDescriptorChild(parent, name);
+      } catch (cause) {
+        if (nodeErrorCode(cause) === "ENOENT") continue;
+        throw cause;
+      }
+      if (
+        !(entryBefore.isFile() || entryBefore.isSymbolicLink())
+        || !(entryBefore.uid === 0n || entryBefore.uid === currentUid)
+        || entryBefore.nlink !== 1n
+      ) throw new Error("Executable search entry is unsafe");
+      const resolved = await descriptorChildOperation(parent, name, (candidate) => realpath(candidate));
+      const entryAfter = await lstatDescriptorChild(parent, name);
+      if (!sameStableFsObject(entryBefore, entryAfter)) {
+        throw new Error("Executable search entry changed during resolution");
+      }
+      if (!await trustedArtifactDirectoryChainRemainsStable(directory, chain, currentUid)) {
+        throw new Error("Executable search path changed during resolution");
+      }
       const info = await stat(resolved);
       if (
         info.isFile()
         && (info.mode & 0o111) !== 0
-        && (info.uid === 0 || currentUid !== undefined && info.uid === currentUid)
+        && (info.uid === 0 || info.uid === uid)
       ) return resolved;
-    } catch {
-      // Continue through the bounded caller PATH without exposing candidates.
+      throw new Error("Executable search entry is unavailable");
+    } finally {
+      await closeDirectoryChain(chain);
     }
   }
   throw new Error("Claude executable is unavailable");
@@ -1882,17 +1952,21 @@ async function runBoundedClaudeProbe(
   options: {
     cwd: string;
     env: NodeJS.ProcessEnv;
+    executableFd?: number;
     stdin?: string;
     timeoutMs: number;
     timeoutMessage: string;
   },
 ): Promise<CodexHookProbeResult> {
   return new Promise((resolve, reject) => {
+    const stdio: StdioOptions = options.executableFd === undefined
+      ? [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"]
+      : [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe", options.executableFd];
     const child = spawn(executable, args, {
       cwd: options.cwd,
       detached: true,
       env: options.env,
-      stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      stdio,
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -1966,45 +2040,52 @@ async function probeClaudePromptHooks(
   env: NodeJS.ProcessEnv,
   home: string,
 ): Promise<CodexHookProbeResult> {
-  const claudeExecutable = await resolveExecutableOnPath("claude", env.PATH);
-  const probeConfigDir = await mkdtemp(join(tmpdir(), "jhw-claude-hook-preflight-"));
-  await chmod(probeConfigDir, 0o700);
-  const signalPath = join(probeConfigDir, "owned-hook-complete");
-  const ownedCommand = `${expectedHookCommand("claude", "UserPromptSubmit")}; status=$?; ` +
-    `/usr/bin/touch -- "$JHW_CLAUDE_PROBE_SIGNAL"; exit "$status"`;
-  const blockingCommand = `i=0; while [ ! -f "$JHW_CLAUDE_PROBE_SIGNAL" ] && [ "$i" -lt 200 ]; do ` +
-    `/usr/bin/sleep 0.05; i=$((i+1)); done; [ -f "$JHW_CLAUDE_PROBE_SIGNAL" ] || exit 3; ` +
-    `/usr/bin/sleep 1; printf '${claudeProbeStopMarker}\\n' >&2; exit 2`;
-  const inlineSettings = JSON.stringify({
-    hooks: {
-      UserPromptSubmit: [
-        {
-          hooks: [{ type: "command", command: ownedCommand, timeout: 12 }],
-        },
-        {
-          hooks: [{
-            type: "command",
-            command: blockingCommand,
-            timeout: 12,
-          }],
-        },
-      ],
-    },
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error("Claude executable ownership is unavailable");
+  const resolvedClaudeExecutable = await resolveExecutableOnPath("claude", env.PATH);
+  const executable = await openTrustedExecutableArtifact(resolvedClaudeExecutable, BigInt(uid), {
+    allowRootOwner: true,
+    maximumBytes: maximumTrustedClaudeExecutableBytes,
   });
-  const args = [
-    "-p",
-    "--verbose",
-    "--no-session-persistence",
-    "--restricted",
-    "--settings", inlineSettings,
-    "--strict-mcp-config",
-    "--mcp-config", JSON.stringify({ mcpServers: {} }),
-    "--include-hook-events",
-    "--output-format", "stream-json",
-    "--max-budget-usd", "0.000001",
-    "jhw-claude-preflight-probe",
-  ];
+  let probeConfigDir: string | undefined;
   try {
+    probeConfigDir = await mkdtemp(join(tmpdir(), "jhw-claude-hook-preflight-"));
+    await chmod(probeConfigDir, 0o700);
+    const signalPath = join(probeConfigDir, "owned-hook-complete");
+    const ownedCommand = `${expectedHookCommand("claude", "UserPromptSubmit")}; status=$?; ` +
+      `/usr/bin/touch -- "$JHW_CLAUDE_PROBE_SIGNAL"; exit "$status"`;
+    const blockingCommand = `i=0; while [ ! -f "$JHW_CLAUDE_PROBE_SIGNAL" ] && [ "$i" -lt 200 ]; do ` +
+      `/usr/bin/sleep 0.05; i=$((i+1)); done; [ -f "$JHW_CLAUDE_PROBE_SIGNAL" ] || exit 3; ` +
+      `/usr/bin/sleep 1; printf '${claudeProbeStopMarker}\\n' >&2; exit 2`;
+    const inlineSettings = JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [
+          {
+            hooks: [{ type: "command", command: ownedCommand, timeout: 12 }],
+          },
+          {
+            hooks: [{
+              type: "command",
+              command: blockingCommand,
+              timeout: 12,
+            }],
+          },
+        ],
+      },
+    });
+    const args = [
+      "-p",
+      "--verbose",
+      "--no-session-persistence",
+      "--restricted",
+      "--settings", inlineSettings,
+      "--strict-mcp-config",
+      "--mcp-config", JSON.stringify({ mcpServers: {} }),
+      "--include-hook-events",
+      "--output-format", "stream-json",
+      "--max-budget-usd", "0.000001",
+      "jhw-claude-preflight-probe",
+    ];
     const childEnvironment = minimalProbeEnvironment(env, home, probeConfigDir);
     childEnvironment.CLAUDE_CONFIG_DIR = probeConfigDir;
     childEnvironment.JHW_CLAUDE_PROBE_SIGNAL = signalPath;
@@ -2014,14 +2095,20 @@ async function probeClaudePromptHooks(
     childEnvironment.CLAUDE_CODE_SKIP_PROMPT_HISTORY = "1";
     childEnvironment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
     childEnvironment.DISABLE_TELEMETRY = "1";
-    return await runBoundedClaudeProbe(claudeExecutable, args, {
+    const beforeSpawn = await executable.handle.stat({ bigint: true });
+    if (!sameStableFsObject(executable.observation, beforeSpawn)) {
+      throw new Error("Claude executable changed before runtime probe");
+    }
+    return await runBoundedClaudeProbe(executable.childPath, args, {
       cwd: probeConfigDir,
       env: childEnvironment,
+      executableFd: executable.handle.fd,
       timeoutMs: 15_000,
       timeoutMessage: "Claude hook runtime probe timed out",
     });
   } finally {
-    await rm(probeConfigDir, { recursive: true, force: true });
+    if (probeConfigDir !== undefined) await rm(probeConfigDir, { recursive: true, force: true });
+    await executable.handle.close().catch(() => undefined);
   }
 }
 
