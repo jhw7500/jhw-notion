@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -u
+# Closed selector only. The canonical entry validates the entire helper set
+# before loading any runtime module; no caller-selected executable is accepted.
+physical=$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || physical=''
+entry="${physical%/*}/jhw-runtime-entry"
+if [[ -n "$physical" && -f "$entry" && -x "$entry" && ! -L "$entry" ]]; then
+  exec "$entry" control "$@"
+fi
+printf 'DEPLOY_BOOTSTRAP_INVALID\n' >&2
+exit 75

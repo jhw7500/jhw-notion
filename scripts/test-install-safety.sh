@@ -2,8 +2,44 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-INSTALL="$REPO_ROOT/install.sh"
+PUBLIC_INSTALL="$REPO_ROOT/install.sh"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/jhw install 'safety.XXXXXX")"
+# Snapshot only the legacy wiring test inputs into a trusted private source.
+# Sync and ownership checks must not depend on the worktree's writable ancestors.
+SOURCE_REPO_ROOT="$REPO_ROOT"
+REPO_ROOT="$ROOT/source"
+mkdir -p "$REPO_ROOT/mcp-server"
+cp -a "$SOURCE_REPO_ROOT/scripts" "$SOURCE_REPO_ROOT/skills" "$REPO_ROOT/"
+cp -a "$SOURCE_REPO_ROOT/mcp-server/dist" "$REPO_ROOT/mcp-server/"
+cp "$SOURCE_REPO_ROOT/mcp-server/package.json" "$REPO_ROOT/mcp-server/package.json"
+chmod -R go-w "$REPO_ROOT"
+ln -s "$SOURCE_REPO_ROOT/mcp-server/node_modules" "$REPO_ROOT/mcp-server/node_modules"
+# Exercise the legitimate source-only wiring boundary. Public deployment always
+# inventories real sessions; it must never be used as a fixture gate bypass.
+INSTALL="$ROOT/legacy-wiring-fixture.sh"
+cat >"$INSTALL" <<EOF
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR=$(printf '%q' "$REPO_ROOT")
+source "\$SCRIPT_DIR/scripts/install-wiring.sh"
+initialize_wiring_directories
+if [[ "\${1:-}" = --uninstall ]]; then uninstall_wiring; exit; fi
+require_control_host
+validate_supported_tui_root "\$HOME/.claude" "Claude Code"
+validate_supported_tui_root "\$HOME/.codex" "Codex CLI"
+reject_all_private_hook_transactions || exit 1
+cd "\$SCRIPT_DIR/mcp-server"
+npm ci --silent 2>&1 | tail -1
+npm run build 2>&1
+cd "\$SCRIPT_DIR"
+node "\$SCRIPT_DIR/scripts/sync-codex-skills.mjs"
+trap rollback_install_transaction_on_exit EXIT
+install_wiring
+run_guard_preflight
+finalize_wiring
+trap - EXIT
+if [[ "\$INSTALL_UNPROTECTED" = 1 ]]; then echo '설치 완료! (UNPROTECTED)'; else echo '설치 완료!'; fi
+EOF
 FAKE_BIN="$ROOT/fake-bin"
 mkdir -p "$FAKE_BIN"
 cat >"$FAKE_BIN/npm" <<'EOF'
@@ -3607,6 +3643,7 @@ test_failed_hook_registration_preserves_preexisting_owned_hook_link
 test_hooks_config_symlink_and_nonregular_fail_closed
 test_new_hooks_file_is_private
 test_unsupported_tuis_receive_no_guard_wiring
+REPO_ROOT="$SOURCE_REPO_ROOT"
 node "$REPO_ROOT/scripts/test-pr-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-issue-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-review-skill-contract.mjs"

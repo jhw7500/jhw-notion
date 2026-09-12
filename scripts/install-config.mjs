@@ -3,13 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
+import { validateBootstrap } from "./runtime-entry.mjs";
 
 const [operation, configFileArgument, mcpEntry, repositoryRoot, backupStampArgument, transactionEvidence] = process.argv.slice(2);
 let configFile = configFileArgument;
 let backupStamp = backupStampArgument;
 if (!operation || !configFile || !mcpEntry || !repositoryRoot) process.exit(2);
 const logicalConfigFile = configFile;
-const hookAdapter = operation.includes("-claude-hooks-transaction") ? "claude" : "codex";
+const hookAdapter = operation.includes("-claude-hooks") ? "claude" : "codex";
 
 const CHANGED = 0;
 const UNCHANGED = 3;
@@ -82,14 +83,24 @@ function isOwnedEntryPath(candidate) {
   }
 }
 
-function isOwnedStdio(entry) {
-  return entry && entry.command === "node" && Array.isArray(entry.args) && entry.args.length === 1 && isOwnedEntryPath(entry.args[0]);
+function managedEntry(candidate) {
+  if (candidate !== path.join(path.resolve(repositoryRoot), ".jhw-runtime/bootstrap/jhw-runtime-entry")) return false;
+  try { validateBootstrap({ repositoryRoot: path.resolve(repositoryRoot) }); return true; } catch { return false; }
 }
-
-function isOwnedOpenCode(entry) {
-  return entry && Array.isArray(entry.command) && entry.command.length === 2 &&
-    entry.command[0] === "node" && isOwnedEntryPath(entry.command[1]);
+function stdioArgs() {
+  if (mcpEntry === path.join(path.resolve(repositoryRoot), ".jhw-runtime/bootstrap/jhw-runtime-entry")) {
+    if (!managedEntry(mcpEntry)) failForeign();
+    return [mcpEntry,"mcp"];
+  }
+  return [mcpEntry];
 }
+function ownedVector(command, args) {
+  if (command !== "node" || !Array.isArray(args)) return false;
+  return args.length === 1 && isOwnedEntryPath(args[0]) && !args[0].includes("/.jhw-runtime/") ||
+    args.length === 2 && args[1] === "mcp" && managedEntry(args[0]);
+}
+function isOwnedStdio(entry) { return entry && ownedVector(entry.command, entry.args); }
+function isOwnedOpenCode(entry) { return entry && Array.isArray(entry.command) && ownedVector(entry.command[0], entry.command.slice(1)); }
 
 function objectMap(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
@@ -115,7 +126,7 @@ function saveIfChanged(file, before, value, mode) {
   process.exit(CHANGED);
 }
 
-const CODEX_HOOK_EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"];
+const codexHookEvents = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd"];
 
 function codexHookTimeout(eventName) {
   return eventName === "SessionEnd" ? 3 : 12;
@@ -286,7 +297,7 @@ function inspectCodexHooksText(text) {
     throw new Error("hooks property is not an object");
   }
   if (settings.hooks !== undefined && !hooksProperty) throw new Error("hooks syntax mismatch");
-  for (const eventName of CODEX_HOOK_EVENTS) {
+  for (const eventName of codexHookEvents) {
     const eventProperty = hooksProperty ? uniqueProperty(hooksProperty.value, eventName) : undefined;
     if (settings.hooks?.[eventName] !== undefined &&
         (!Array.isArray(settings.hooks[eventName]) || eventProperty?.value.kind !== "array")) {
@@ -352,7 +363,7 @@ function saveRawIfChanged(current, next) {
   process.exit(CHANGED);
 }
 
-function buildRegisteredCodexHooks(current, events = CODEX_HOOK_EVENTS) {
+function buildRegisteredCodexHooks(current, events = codexHookEvents) {
   if (!current.text && current.exists) throw new Error("existing empty hooks config");
   let text = current.exists ? current.text : "{}";
   let inspected = inspectCodexHooksText(text);
@@ -390,7 +401,7 @@ function buildRegisteredCodexHooks(current, events = CODEX_HOOK_EVENTS) {
   return text;
 }
 
-function buildUnregisteredCodexHooks(current, events = CODEX_HOOK_EVENTS) {
+function buildUnregisteredCodexHooks(current, events = codexHookEvents) {
   if (!current.exists) return current.text;
   if (!current.text) throw new Error("existing empty hooks config");
   const initial = inspectCodexHooksText(current.text);
@@ -800,7 +811,7 @@ function registerCodexHooksTransaction() {
       if (scope === "session-end-only") {
         // Keep the unprovisioned Guard deactivation policy, but retain the
         // independent, advisory SessionEnd path in the same atomic transaction.
-        const text = buildUnregisteredCodexHooks(current, CODEX_HOOK_EVENTS.filter((event) => event !== "SessionEnd"));
+        const text = buildUnregisteredCodexHooks(current, codexHookEvents.filter((event) => event !== "SessionEnd"));
         next = buildRegisteredCodexHooks({ ...current, text }, ["SessionEnd"]);
       } else {
         next = buildRegisteredCodexHooks(current);
@@ -1028,7 +1039,10 @@ function finalizeCodexHooksTransaction() {
 }
 
 function expectedControlHookTarget() {
-  const expected = path.join(path.resolve(repositoryRoot), "scripts", "jhw-control-hook");
+  const legacy = path.join(path.resolve(repositoryRoot), "scripts", "jhw-control-hook");
+  const managed = path.join(path.resolve(repositoryRoot), ".jhw-runtime/bootstrap/jhw-runtime-hook");
+  const expected = mcpEntry === managed ? managed : legacy;
+  if (mcpEntry === managed) validateBootstrap({ repositoryRoot: path.resolve(repositoryRoot) });
   if (path.basename(configFile) !== "jhw-control-hook" || mcpEntry !== expected) {
     throw new Error("control hook link transaction is restricted to the exact repository launcher");
   }
@@ -1377,6 +1391,31 @@ function finalizeControlHookLinkTransaction() {
   return CHANGED;
 }
 
+function verifyManagedConfiguration() {
+  const current = safeExistingFile(configFile);
+  if (!current.exists) failForeign();
+  if (operation === "verify-codex") {
+    const inspected = ownedToml(current.text);
+    if (!inspected.owned) failForeign();
+    const parent = inspected.range.lines.slice(inspected.range.start + 1, inspected.range.parentEnd);
+    const args = parent.map(line => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(line)).find(Boolean);
+    if (!args || JSON.stringify(JSON.parse(args[1])) !== JSON.stringify(stdioArgs())) failForeign();
+  } else if (operation === "verify-stdio" || operation === "verify-opencode") {
+    const settings = parsedJson(current.text);
+    const vector = operation === "verify-stdio" ? settings.mcpServers?.["jhw-notion"] : settings.mcp?.["jhw-notion"];
+    if (operation === "verify-stdio" ? !isOwnedStdio(vector) || JSON.stringify(vector.args) !== JSON.stringify(stdioArgs()) : !isOwnedOpenCode(vector) || JSON.stringify(vector.command) !== JSON.stringify(["node",...stdioArgs()])) failForeign();
+  } else {
+    const document = parseCodexHooks(current, false);
+    if (!document) failForeign();
+    const events = backupStamp === "session-end-only" ? ["SessionEnd"] : codexHookEvents;
+    for (const event of events) {
+      const groups = document.settings.hooks?.[event];
+      if (!Array.isArray(groups) || ownedCodexHookVariant(groups[0],event) !== "canonical" || groups.filter(group => isOwnedCodexHookGroup(group,event)).length !== 1) failForeign();
+    }
+  }
+  process.exit(CHANGED);
+}
+
 function registerStdio() {
   const current = safeExistingFile(configFile);
   const settings = parsedJson(current.text);
@@ -1387,7 +1426,7 @@ function registerStdio() {
   settings.mcpServers["jhw-notion"] = {
     type: "stdio",
     command: "node",
-    args: [mcpEntry],
+    args: stdioArgs(),
     env: { NOTION_API_KEY: "${NOTION_API_KEY}" },
   };
   saveIfChanged(configFile, current.text, settings, current.mode);
@@ -1416,7 +1455,7 @@ function registerOpenCode() {
   if (legacy !== undefined && !isOwnedStdio(legacy)) failForeign();
   settings["$schema"] ??= "https://opencode.ai/config.json";
   settings.mcp ??= {};
-  settings.mcp["jhw-notion"] = { type: "local", command: ["node", mcpEntry], enabled: true };
+  settings.mcp["jhw-notion"] = { type: "local", command: ["node", ...stdioArgs()], enabled: true };
   if (legacy !== undefined) {
     delete settings.mcpServers["jhw-notion"];
     if (Object.keys(settings.mcpServers).length === 0) delete settings.mcpServers;
@@ -1628,14 +1667,14 @@ function ownedToml(source) {
   if (commands.length !== 1 || argsLines.length !== 1 || commands[0][1] !== "node") return { owned: false, range };
   let args;
   try { args = JSON.parse(argsLines[0][1]); } catch { return { owned: false, range }; }
-  return { owned: Array.isArray(args) && args.length === 1 && isOwnedEntryPath(args[0]), range };
+  return { owned: ownedVector(commands[0][1], args), range };
 }
 
 function codexEntry() {
   return [
     parentHeader,
     'command = "node"',
-    `args = [${JSON.stringify(mcpEntry)}]`,
+    `args = ${JSON.stringify(stdioArgs())}`,
     "startup_timeout_sec = 60.0",
   ];
 }
@@ -1687,6 +1726,7 @@ try {
   if (operation.endsWith("-codex-hooks-transaction") || operation.endsWith("-claude-hooks-transaction")) {
     anchorHookTransactionPaths();
   }
+  if (["verify-stdio","verify-opencode","verify-codex","verify-claude-hooks","verify-codex-hooks"].includes(operation)) verifyManagedConfiguration();
   if (operation === "register-stdio") registerStdio();
   if (operation === "unregister-stdio") unregisterStdio();
   if (operation === "register-opencode") registerOpenCode();

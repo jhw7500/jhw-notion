@@ -4,7 +4,7 @@ Phase 1A는 별도 private Registry와 개인 private GitHub Project를 이용�
 
 ## 1. 경계와 사전조건
 
-- 한 대의 Linux build server, Node.js 20, `git`, `gh`, 실행 가능한 `/usr/bin/flock`, 설치된 `jhw-control`
+- 한 대의 Linux build server, Node.js 22 이상, Bash, `/proc`, `git`, `gh`, 실행 가능한 `/usr/bin/flock`, 설치된 `jhw-control`
 - 이 저장소와 분리된 private Registry 저장소/checkout
 - 등록할 private source repository의 정확한 checkout
 - 개인 계정 소유 private GitHub Project와 정확히 다섯 필드: `Status`, `Priority`, `Health`, `Next Action`, `Last Reviewed`
@@ -19,7 +19,7 @@ node --version
 jhw-control --help
 ```
 
-build server에서 manual/on-demand로만 실행한다. Actions workflow, schedule, heartbeat, cross-host retry를 만들지 않는다. 설치기의 host contract v4 remains unchanged because the existing `task status` allowlist already includes this command; current-context flags를 전달하며 새 launcher command나 버전을 추가하지 않는다.
+build server에서 manual/on-demand로만 실행한다. Actions workflow, schedule, heartbeat, cross-host retry를 만들지 않는다. 설치기는 `secure-store-only` host contract exact v5와 `unlock`, `preflight`, `portfolio status`, 10개 `task` command, `board status`·`board acquire`·`board with`의 closed command 집합을 요구한다. 구 v4나 command가 하나라도 빠지거나 추가된 계약은 거부한다.
 
 ## 2. 하나의 host identity와 credential 계약
 
@@ -283,7 +283,7 @@ jhw-control task handoff --task <tsk-id> [--claim <released-handoff-claim-id>]
 
 #### 현재 checkout의 current-context status
 
-현재 checkout에서 Task를 조회할 때는 다음 exact read-only command를 실행한다. `task status`는 host contract v4의 기존 allowlist 항목이므로 이 mode를 위해 launcher command/version을 바꾸지 않는다.
+현재 checkout에서 Task를 조회할 때는 다음 exact read-only command를 실행한다. `task status`는 host contract v5의 기존 allowlist 항목이므로 이 mode를 위해 launcher command/version을 바꾸지 않는다.
 
 ```bash
 REPOSITORY_PATH="$(git rev-parse --show-toplevel)" || exit $?
@@ -387,7 +387,132 @@ worktree 제거는 commit 개수가 아니라 **통합 여부**로 판정한다.
 
 다음이면 즉시 NO-GO다: 중복 active Claim/Project item, wrong owner release/share, Notion guard 우회, secret/private path 노출, authority rollback/flip, Registry remote mismatch/divergence, fixture restore 실패, 반복되는 manual bypass. 해결 전 추가 cycle/export/registration을 하지 않는다.
 
-## 10. evidence와 Phase 1B 경계
+## 10. Issue #153 첫 live deployment
+
+Issue #153 implementation readiness와 첫 live deployment 완료는 별도 checkpoint다. 코드와
+fixture 검증이 끝났어도 live release가 준비·활성화됐다는 뜻이 아니다. Issue reminder는
+재부팅이나 deployment를 자동 실행하지 않는다. Issue #153은 재부팅 뒤 exact release의 첫
+활성화와 검증이 끝날 때까지 열어 둔다.
+
+### 재부팅 전: 준비와 기록
+
+전용 canonical trusted runtime checkout에 승인된 revision이 통합된 뒤 ordinary host shell에서
+다음을 실행한다. 현재 implementation worktree나 임의로 mode를 완화한 checkout을 runtime
+checkout으로 쓰지 않는다. 이 단계는 HOME wiring과 live `current`를 바꾸지 않는다.
+
+```bash
+cd <canonical-trusted-runtime-checkout>
+command -v node bash
+node --version                 # v22 이상
+test -r /proc/self/status
+test -x /usr/bin/flock
+./install.sh --prepare
+./install.sh --status
+```
+
+`DEPLOY_PREPARED`의 exact `releaseId`를 승인 기록에 보관한다. 허용 형식은
+`r-<40 또는 64자리 lowercase hex source revision>-<64자리 lowercase hex content digest>`다.
+`--status`의 `advisory: true`, selected release, predecessor 유무, pending recovery 수,
+`tui`·`app_server`·`legacy`·`managed` 집계를 기록한다. 준비 중 만든 private test fixture의
+release ID를 사용하지 않는다. release, activation, bootstrap, journal은 자동 정리하지 않는다.
+
+현재 업무를 완료하거나 durable handoff하고 active Claim을 정상 정리한다. Claim release와
+SessionEnd는 coordination evidence일 뿐 deployment authority나 TUI 종료 증명이 아니다.
+재부팅이 필요하면 재부팅 자체의 승인을 별도로 받고, deployment 승인으로 간주하지 않는다.
+
+### 재부팅 후: ordinary SSH shell에서만 활성화
+
+1. 일반 SSH shell로 접속한다. Claude Code, Codex CLI, Gemini CLI, OpenCode를 열어 activation을
+   지시하지 않는다. 기존 host 운영 방식으로 이 TUI들과 Codex app server가 maintenance가
+   끝날 때까지 새로 시작되지 않게 유지하고 auto-started consumer도 확인한다.
+2. canonical runtime checkout에서 `./install.sh --status`를 실행한다. 이 결과는 advisory다.
+   실제 안전 gate는 activation의 pre-lock/post-lock inventory와 exclusive admission이다.
+3. 보관한 release ID가 승인 revision의 준비 결과와 정확히 같은지 확인한 뒤 아래 exact
+   activation 한 건에 대한 별도 승인을 받는다.
+4. 같은 SSH shell에서 실행한다.
+
+```bash
+cd <canonical-trusted-runtime-checkout>
+./install.sh --activate '<exact prepared RELEASE_ID>'
+```
+
+`DEPLOY_CONSUMERS_ACTIVE`, `DEPLOY_INVENTORY_UNCERTAIN`, `DEPLOY_LOCK_CONTENDED`이면 shared
+mutation 전 거부된 것이다. 새 session을 열지 말고 consumer/관측/정상 lease holder를
+해소한 뒤 exact activation을 다시 승인받는다. force, process signal, lock 삭제로 우회하지
+않는다. `DEPLOY_WIRING_TOPOLOGY_CHANGED` / `guarded_uninstall_reinstall_required`이면 pointer는
+그대로다. helper 또는 Codex 개별 skill/prompt 이름 변경을 채택하기로 승인한 경우에만 같은
+maintenance window에서 각각 gate를 통과하는 다음 절차를 쓴다.
+
+```bash
+./install.sh --uninstall
+./install.sh --activate '<exact desired retained RELEASE_ID>'
+```
+
+### 성공 검증과 maintenance 종료
+
+`DEPLOY_ACTIVATED`는 requested/current release read-back, host contract exact v5, Guard
+preflight 실행, managed MCP `initialize`·`notifications/initialized`·`tools/list`, 마지막
+exclusive admission 재획득과 consumer inventory가 모두 끝난 뒤에만 반환된다. 성공 뒤에도
+TUI/app server 시작 금지를 유지하고 ordinary SSH shell에서 다음을 확인한다.
+
+```bash
+./install.sh --status
+"$HOME/.local/bin/jhw-control-host" --contract
+"$HOME/.local/bin/jhw-control" guard preflight
+```
+
+- status의 `releaseId`가 승인한 exact ID이고 `recoveryPending`이 0인지 확인한다.
+- host contract가 `version: 5`, `credential_policy: secure-store-only`, documented closed command
+  집합과 exact 일치하는지 확인한다.
+- `unprotected: true`는 Project Control 좌표가 전혀 없어 Guard group을 활성화하지 않은
+  상태다. `guard preflight`의 `NO-GO`(exit 78)는 검증되지 않은 protection 축이 남았다는
+  뜻이다. 둘 다 Guard 보호 완료가 아니며, 보호가 필요한 운영에서는 해결 전 TUI session을
+  재개하지 않는다. wiring 존재나 `DEPLOY_ACTIVATED`만으로 protection을 주장하지 않는다.
+
+세 결과가 승인 조건을 만족할 때만 maintenance를 닫고 fresh TUI/app-server session을
+시작한다. 실제 첫 activation과 검증 결과를 Issue #153에 기록한 뒤에만 Issue를 닫는다.
+
+### 실패와 recovery
+
+activation 이후 검증이 실패하면 maintenance를 계속 유지한다. 새 working session을 열지
+않는다. 기존 설치 완료 wiring을 유지한 managed pointer update에서
+`DEPLOY_VALIDATION_FAILED` / `validated_rollback_required`이고 managed predecessor가
+있을 때만 다음 command가 durable pending observation과 committed predecessor를 다시 검증해
+rollback할 수 있다.
+
+```bash
+./install.sh --rollback
+```
+
+rollback 성공 뒤 `--status`, host contract, Guard preflight와 내부 MCP 검증 결과를 다시
+확인한 다음 maintenance를 닫는다. 이미 TUI/app server를 다시 연 뒤에는 rollback하지 않는다.
+
+첫 migration에는 managed predecessor가 없다. `first_migration_recovery_required`에서는
+`--rollback`이 legacy checkout/wiring을 복원하지 않고 `DEPLOY_PREDECESSOR_INVALID`로 끝난다.
+guarded uninstall 뒤 helper/topology 재설치 검증 실패는 `DEPLOY_VALIDATION_FAILED` /
+`wiring_refresh_recovery_required`다. `predecessorAvailable: true`는 retained history만 뜻하며
+rollback 가능성을 보장하지 않는다. unfinished wiring 때문에 `--rollback`은
+`DEPLOY_RECOVERY_REQUIRED`로 거부되고 selected pointer와 pending evidence가 그대로 남는다.
+operator가 wiring·helper·hook transaction 상태를 수동 검토해야 하며 `installed:true`를
+강제 기록하거나 journal을 삭제해서는 안 된다.
+rollback 자체의 검증 실패는 `DEPLOY_VALIDATION_FAILED` / `rollback_recovery_required`다.
+추가 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. maintenance를 유지하고
+selected pointer·pending evidence를 보존한 채 operator 수동 검토로 넘긴다.
+`DEPLOY_RECOVERY_REQUIRED`, 특히 `maintenance_reacquisition_failed`도 자동 restore하지 않는다.
+다음 read-only 확인만 하고 maintenance를 유지한 채 operator review로 넘긴다.
+
+```bash
+./install.sh --status
+```
+
+actual runtime checkout의 retained `.jhw-runtime/.deploy.<32 lowercase hex>/state.json`,
+`before.json`, bounded phase log와 state가 지목한 hook transaction evidence를 private하게
+검토한다. `before.json`은 복구 command가 아니라 mutation 전 known wiring preimage다. 해당
+파일을 외부 메시지에 붙이거나 fixture artifact를 live deployable release로 부르지 않는다.
+증거가 ambiguous한 상태에서 journal, release, old bootstrap, legacy artifact를 삭제하거나
+임의 wiring을 덮어쓰지 않는다.
+
+## 11. evidence와 Phase 1B 경계
 
 로컬 test/build/e2e/preflight fixture 구현 완료는 pilot evidence가 아니다. 실제 업무에서 정확히 세 자연 cycle이 아직 발생하지 않았으면 상태는 `insufficient evidence`다. 이 문서나 테스트를 근거로 synthetic cycle/Handoff를 만들거나 live preflight 결과를 꾸미지 않는다.
 

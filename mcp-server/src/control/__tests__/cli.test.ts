@@ -1,6 +1,8 @@
 import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
@@ -3250,11 +3252,13 @@ describe("runCli", () => {
     });
     await writeFile(fixture.settingsPath, `${JSON.stringify(document)}\n`, { mode: 0o600 });
     const runtime = task3ClaudeRuntime();
-    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(fixture.home);
+    let result;
+    try { result = await runCli(["guard", "preflight"], makeCliDependencies({
       env: { HOME: fixture.home },
       codexRepositoryRoot: fixture.repositoryRoot,
       claudeHookRuntime: runtime,
-    }));
+    })); } finally { cwd.mockRestore(); }
 
     expect(runtime.probePrompt).toHaveBeenCalledWith(fixture.home);
     expect(runtime.probeCommand).toHaveBeenCalledWith(
@@ -3273,11 +3277,13 @@ describe("runCli", () => {
   it("does not claim the standard Claude settings path when CLAUDE_CONFIG_DIR selects another root", async () => {
     const fixture = await task3ClaudeHome();
     const runtime = task3ClaudeRuntime();
-    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(fixture.home);
+    let result;
+    try { result = await runCli(["guard", "preflight"], makeCliDependencies({
       env: { HOME: fixture.home, CLAUDE_CONFIG_DIR: join(fixture.home, "other-claude-root") },
       codexRepositoryRoot: fixture.repositoryRoot,
       claudeHookRuntime: runtime,
-    }));
+    })); } finally { cwd.mockRestore(); }
 
     expect(task3AdapterCoverage(result).claude).toEqual({
       prompt_origin: "missing",
@@ -3313,11 +3319,13 @@ describe("runCli", () => {
       probePrompt: vi.fn().mockResolvedValue(probe()),
       probeCommand: vi.fn().mockResolvedValue(task3SuccessfulProbe()),
     };
-    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(fixture.home);
+    let result;
+    try { result = await runCli(["guard", "preflight"], makeCliDependencies({
       env: { HOME: fixture.home },
       codexRepositoryRoot: fixture.repositoryRoot,
       claudeHookRuntime: runtime,
-    }));
+    })); } finally { cwd.mockRestore(); }
 
     expect(task3AdapterCoverage(result).claude).toEqual({
       prompt_origin: "ok",
@@ -3326,6 +3334,7 @@ describe("runCli", () => {
       execution_recheck: "pending",
       enforced: false,
     });
+    expect(runtime.probePrompt).toHaveBeenCalledOnce();
     expect(runtime.probeCommand).not.toHaveBeenCalled();
     expect(`${result.stdout}${result.stderr}`).not.toContain("private-claude-probe-error");
   });
@@ -3334,11 +3343,13 @@ describe("runCli", () => {
     const fixture = await task3ClaudeHome();
     const runtime = task3ClaudeRuntime();
     runtime.probeCommand.mockResolvedValue({ ...task3SuccessfulProbe(), exitCode: 17 });
-    const result = await runCli(["guard", "preflight"], makeCliDependencies({
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(fixture.home);
+    let result;
+    try { result = await runCli(["guard", "preflight"], makeCliDependencies({
       env: { HOME: fixture.home },
       codexRepositoryRoot: fixture.repositoryRoot,
       claudeHookRuntime: runtime,
-    }));
+    })); } finally { cwd.mockRestore(); }
 
     expect(task3AdapterCoverage(result).claude.enforced).toBe(false);
     expect(runtime.probeCommand).toHaveBeenCalledOnce();
@@ -4434,5 +4445,47 @@ describe("runCli", () => {
 
     expect(result.exitCode).toBe(1);
     expect(JSON.parse(result.stderr)).toEqual({ error: { code: "INVALID_SNAPSHOT_RESULT" } });
+  });
+});
+
+
+describe("managed deployment hook trust", () => {
+  it("accepts the exact manifested bootstrap and refuses tampered helper, manifest, and core bytes", async () => {
+    const fixture = await task3ClaudeHome();
+    const root = fixture.repositoryRoot;
+    const source = resolve(import.meta.dirname, "../../../..");
+    const store = await import(pathToFileURL(join(source, "scripts/runtime-store.mjs")).href);
+    const entry = await import(pathToFileURL(join(source, "scripts/runtime-entry.mjs")).href);
+    for (const name of ["runtime-entry.mjs", "runtime-safety.mjs", "runtime-store.mjs", "jhw-runtime-entry", "jhw-runtime-control", "jhw-runtime-hook"]) {
+      await writeFile(join(root, "scripts", name), await readFile(join(source, "scripts", name)), {mode: name.startsWith("jhw-") ? 0o755 : 0o644});
+      await chmod(join(root, "scripts", name), name.startsWith("jhw-") ? 0o755 : 0o644);
+    }
+    await mkdir(join(root, "mcp-server/src"), {recursive:true,mode:0o755});
+    await mkdir(join(root, "skills/claude"), {recursive:true,mode:0o755});
+    for (const [name, text] of [["mcp-server/package.json", '{"type":"module"}'], ["mcp-server/package-lock.json", '{"lockfileVersion":3}'], ["mcp-server/tsconfig.json", '{}'], ["mcp-server/src/index.ts", 'export {};'], ["skills/claude/task.md", 'fixture'], [".gitignore", '.jhw-runtime/\n']]) {
+      await writeFile(join(root, name as string), text as string, {mode:0o644});
+    }
+    for (const args of [["init","-q"],["add","."],["-c","user.name=Fixture","-c","user.email=f@example.invalid","commit","-qm","fixture"]]) {
+      expect(spawnSync("git", args, {cwd:root}).status).toBe(0);
+    }
+    const release = await store.prepareRelease({repositoryRoot:root, build:async ({stagingRoot}:{stagingRoot:string}) => {
+      await mkdir(join(stagingRoot,"mcp-server/dist/control"),{recursive:true,mode:0o755});
+      await mkdir(join(stagingRoot,"mcp-server/node_modules"),{mode:0o755});
+      for (const file of ["index.js","control/cli.js","control/hook-adapter.js"]) await writeFile(join(stagingRoot,"mcp-server/dist",file),'#!/usr/bin/env node\n',{mode:0o755});
+    }});
+    await entry.installBootstrap({repositoryRoot:root,releaseId:release.releaseId});
+    const selected = join(root,".jhw-runtime/releases",release.releaseId);
+    await unlink(fixture.launcherPath);
+    await symlink(join(root,".jhw-runtime/bootstrap/jhw-runtime-hook"),fixture.launcherPath);
+    const cwd=vi.spyOn(process,"cwd").mockReturnValue(fixture.home);
+    try {
+      const inspect = async () => task3AdapterCoverage(await runCli(["guard","preflight"],makeCliDependencies({env:{HOME:fixture.home},codexRepositoryRoot:selected,claudeHookRuntime:task3ClaudeRuntime()}))).claude;
+      expect((await inspect()).enforced).toBe(true);
+      for(const target of [join(root,".jhw-runtime/bootstrap/jhw-runtime-hook"),join(root,".jhw-runtime/bootstrap/manifest.json"),join(selected,"mcp-server/dist/control/hook-adapter.js"),join(selected,"scripts/runtime-entry.mjs")]) {
+        const bytes=await readFile(target);await writeFile(target,Buffer.concat([bytes,Buffer.from("tampered")]));
+        expect((await inspect()).enforced).toBe(false);await writeFile(target,bytes);
+      }
+      expect((await inspect()).enforced).toBe(true);
+    } finally {cwd.mockRestore();}
   });
 });

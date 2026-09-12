@@ -15,3 +15,6 @@ docs/notion-architecture-review.md
 
 # pre-pr-tribunal 상태 (로컬 전용)
 .review/
+
+# Immutable runtime releases and private deployment evidence
+.jhw-runtime/

@@ -25,7 +25,7 @@
 사용자 → TUI 스킬(얇은 가이드) → LLM → jhw-notion MCP 서버 → Notion REST API
 ```
 
-- **MCP 서버**: Notion API 직접 호출. 14개 고수준 도구 제공
+- **MCP 서버**: Notion API 직접 호출. 15개 고수준 도구 제공
 - **TUI 스킬**: LLM에게 "어떤 MCP 도구를 호출하라"만 안내 (얇은 레이어)
 - **review만 예외**: 세션 대화 분석은 LLM 역할이므로 각 TUI 스킬에 로직 유지
 
@@ -35,13 +35,13 @@ Phase 1A는 위 Notion workspace를 대체하지 않는 trial control plane이�
 
 ```text
 명시적 /jhw:task, /jhw:portfolio, /jhw:project --trial
-        ↓
+        |
 build server의 jhw-control CLI
-        ├─ 별도 private Registry checkout (identity, Task, Claim, governance)
-        ├─ personal private GitHub Project (DraftIssue Project Records + 5 operational fields)
-        └─ private local state/snapshot (measurement, export)
+        +-- 별도 private Registry checkout (identity, Task, Claim, governance)
+        +-- personal private GitHub Project (DraftIssue Project Records + 5 operational fields)
+        `-- private local state/snapshot (measurement, export)
 
-일반 /jhw:project, /jhw:status → 기존 Notion live authority
+일반 /jhw:project, /jhw:status --> 기존 Notion live authority
 ```
 
 - Registry는 `jhw-notion` 워킹 트리 안의 디렉터리가 아니라 독립된 GitHub 저장소/checkout이다.
@@ -77,40 +77,40 @@ measurement journal은 derived observation이다. journal append가 실패해도
 
 ```
 jhw-notion/
-├── mcp-server/                  # TypeScript MCP 서버
-│   ├── src/
-│   │   ├── index.ts             # 엔트리포인트
-│   │   ├── server.ts            # MCP 서버 설정
-│   │   ├── notion-client.ts     # Notion REST API 클라이언트
-│   │   ├── config.ts            # DB ID, 페이지 ID 설정
-│   │   ├── control/             # Project Control CLI/domain/ports
-│   │   └── tools/               # Notion 도구별 핸들러
-│   │       ├── record.ts
-│   │       ├── note.ts
-│   │       ├── delete.ts
-│   │       ├── search.ts
-│   │       ├── context.ts
-│   │       ├── history.ts
-│   │       ├── status.ts
-│   │       ├── start.ts
-│   │       └── close.ts
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── .env.example
-├── skills/
-│   ├── claude/                  # 모든 TUI가 공유하는 Markdown 정본
-│   │   ├── task.md
-│   │   ├── project.md
-│   │   ├── portfolio.md
-│   │   └── (Notion command Markdown)
-│   └── codex/jhw-*/             # 정본에서 생성한 SKILL.md + reference link
-├── scripts/
-│   ├── sync-codex-skills.mjs    # Codex generated skill 동기화
-│   ├── install-config.mjs       # ownership-aware atomic config editor
-│   └── test-install-safety.sh   # isolated-HOME installer gate
-├── install.sh                   # 원클릭 설치
-├── .env.example
-└── README.md
+|-- mcp-server/                  # TypeScript MCP 서버
+|   |-- src/
+|   |   |-- index.ts             # 엔트리포인트
+|   |   |-- server.ts            # MCP 서버 설정
+|   |   |-- notion-client.ts     # Notion REST API 클라이언트
+|   |   |-- config.ts            # DB ID, 페이지 ID 설정
+|   |   |-- control/             # Project Control CLI/domain/ports
+|   |   `-- tools/               # Notion 도구별 핸들러
+|   |       |-- record.ts
+|   |       |-- note.ts
+|   |       |-- delete.ts
+|   |       |-- search.ts
+|   |       |-- context.ts
+|   |       |-- history.ts
+|   |       |-- status.ts
+|   |       |-- start.ts
+|   |       `-- close.ts
+|   |-- package.json
+|   |-- tsconfig.json
+|   `-- .env.example
+|-- skills/
+|   |-- claude/                  # 모든 TUI가 공유하는 Markdown 정본
+|   |   |-- task.md
+|   |   |-- project.md
+|   |   |-- portfolio.md
+|   |   `-- (Notion command Markdown)
+|   `-- codex/jhw-*/             # 정본에서 생성한 SKILL.md + reference link
+|-- scripts/
+|   |-- sync-codex-skills.mjs    # Codex generated skill 동기화
+|   |-- install-config.mjs       # ownership-aware atomic config editor
+|   `-- test-install-safety.sh   # isolated-HOME installer gate
+|-- install.sh                   # 원클릭 설치
+|-- .env.example
+`-- README.md
 ```
 
 위 트리는 초기 구조를 설명한다. 현재 live 파일과 Phase 1A 경계는 실제 코드, `README.md`, 본 문서, runbook을 우선한다. `PLAN.md`는 초기 계획의 원본 snapshot으로 유지하며 live architecture로 다시 쓰지 않는다.
@@ -371,26 +371,91 @@ description: 세션 마무리 시 Notion 저장 후보 정리 및 승인 저장
 
 ### 6.1 install.sh 동작과 ownership
 
-`install.sh`는 `set -euo pipefail`로 build 실패를 보존하고 다음 순서로 동작한다.
+`install.sh`는 Linux `/proc`, Bash, `/usr/bin/flock`, Node.js 22 이상을 요구하는 작은 공개
+dispatcher다. 인자를 그대로 `scripts/runtime-deploy.mjs`에 넘기며 production CLI에는 fixture
+root, lock fd, inventory 우회, force flag가 없다. 공개 command는 `--prepare`, `--status`,
+`--activate RELEASE_ID`, `--rollback`, `--uninstall`뿐이다. release ID는
+`r-<40 또는 64자리 source revision>-<64자리 content digest>`의 lowercase hex exact 값이다.
 
-1. MCP server와 `jhw-control`을 build한다.
-2. Claude/Gemini/OpenCode/Codex 설치 root를 감지한다.
-3. canonical skill link와 Codex legacy/prompt link를 검사한다. target이 없거나 이 repository를 가리키는 symlink일 때만 설치/갱신한다. foreign file/symlink이면 보존하고 install을 실패시킨다.
-4. `skills/claude/*.md` 정본에서 Codex skill을 생성한 뒤 link한다. generated Codex file을 손편집하지 않는다.
-5. Claude/Gemini/OpenCode JSON과 Codex TOML의 `jhw-notion` entry가 정확히 `node <this-repository>/mcp-server/dist/index.js`를 가리킬 때만 갱신한다. semantic TOML alternate/duplicate와 foreign same-name entry는 보존하고 실패한다.
-6. configuration은 shell string interpolation 없이 argv로 전달하고, 기존 mode를 적용한 private same-directory temp를 fsync한 뒤 atomic publish하고 directory를 fsync한다. Codex backup은 unique project-marked namespace만 exclusive publish/prune한다.
+runtime artifact는 canonical trusted checkout의 `.jhw-runtime/`에 있다.
 
-Uninstall도 같은 ownership proof를 사용한다. Claude/Codex 설정 root는 private transaction을 탐색하거나 만들기 전에 검증하므로 symlink/non-directory/외부 소유 root를 따라 쓰지 않는다. 이 repository가 소유한 link/entry만 제거하고 foreign target/config/backup은 건드리지 않는다. 설치 안전성은 `scripts/test-install-safety.sh`의 isolated HOME에서 네 TUI install → reinstall → uninstall → reinstall과 canonical/legacy/foreign case를 검증한다.
+```text
+.jhw-runtime/
+|-- deploy.lock
+|-- admission.lock
+|-- bootstrap/                 # independently validated stable entry helpers
+|-- current -> activations/<activation-id>
+|-- activations/<activation-id>/
+|-- releases/<release-id>/    # immutable built generation
+|-- .bootstrap.previous.<id>/ # retained helper evidence, 있을 때
+`-- .deploy.<id>/             # private 0600 state/preimage/phase evidence
+```
+
+`--prepare`는 private `0700` same-store stage에 allowlisted source만 복사하고 그 안에서
+`npm ci`와 build를 실행한다. manifest와 content digest를 검증한 complete release만 atomic
+rename으로 보존하며 live checkout의 `dist`·`node_modules`, `current`, HOME wiring을 바꾸지
+않는다. staging fixture에서 생긴 ID는 live deployable artifact가 아니다.
+
+`--activate`·`--rollback`·`--uninstall`은 mutation 전 inventory, exclusive deploy/admission
+lease, lease 뒤 두 번째 inventory를 요구한다. TUI, Codex app server, legacy runtime,
+managed MCP/control/hook 중 하나가 살아 있거나 `/proc` 관측이 불확실하면 shared mutation
+전에 fail-closed한다. force·process signal·lock 삭제는 없다. mutation worker는 실제 두 lease
+fd를 상속한다. runtime validation 동안 exclusive admission은 닫아 managed MCP/control/hook이
+shared admission으로 진입할 수 있게 하고, finalize 전 새 exclusive admission과 inventory를
+다시 얻는다. worker timeout이나 parent EOF는 child를 종료하거나 자동 restore하지 않으며,
+child가 끝날 때까지 상속 lease와 pending evidence가 남는다.
+
+첫 activation은 stable bootstrap을 설치하고 기존 ownership-aware no-clobber transaction으로
+네 TUI의 MCP/skill, control/hook, Claude/Codex hook wiring을 옮긴다. managed MCP vector는
+bootstrap `jhw-runtime-entry mcp`, control/hook link는 bootstrap의 closed selector, skill은
+`current/skills`를 사용한다. configuration은 기존 mode를 적용한 private same-directory temp를
+fsync한 뒤 atomic publish하고 directory를 fsync한다. foreign target/config/group과 모호한
+ownership은 그대로 보존하고 실패한다.
+
+activation validation은 fresh worker의 exact host contract v5와 Guard preflight, managed MCP
+`initialize`·`notifications/initialized`·`tools/list`를 bounded output/timeout으로 검사한다.
+그 뒤 admission을 다시 독점하고 consumer inventory와 pointer read-back을 반복해야
+finalize한다. `NO-GO` 또는 결과의 `unprotected: true`는 Guard protection 완료가 아니다.
+
+첫 migration에는 managed predecessor가 없다. 실패 시 `.deploy.<id>/state.json`, mutation 전
+`before.json`, bounded phase log와 기존 hook transaction evidence를 보존하지만 자동 복원
+CLI나 legacy rollback은 제공하지 않는다. 초기 검증 실패는 `DEPLOY_VALIDATION_FAILED` /
+`first_migration_recovery_required`로 operator의 수동 wiring 검토를 요구한다. 기존 설치 완료
+wiring을 유지한 managed pointer update 실패에만 `validated_rollback_required`를 안내하고,
+durable observation이 정확히 일치할 때 `--rollback`이 committed predecessor를 검증한다.
+guarded uninstall 뒤 재설치 검증 실패는 `DEPLOY_VALIDATION_FAILED` /
+`wiring_refresh_recovery_required`다. retained predecessor가 있어도 wiring은 아직 설치 완료가
+아니므로 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부되고 pointer와 evidence는 유지된다.
+operator는 maintenance를 유지한 채 wiring·helper·hook transaction evidence를 수동 검토한다.
+rollback 자체의 검증 실패는 `DEPLOY_VALIDATION_FAILED` / `rollback_recovery_required`로
+수동 operator 검토를 요구한다. 추가 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부되며
+maintenance와 selected pointer·pending evidence를 유지한다.
+`installed:true` 조기 기록이나 journal 삭제로 recovery gate를 우회하지 않는다.
 
 ### 6.2 업데이트
 
 ```bash
-cd /path/to/jhw-notion
-git pull
-npm run build --prefix mcp-server
-# 스킬은 심링크라 자동 반영
-# MCP 서버는 TUI 재시작 시 반영
+cd <canonical-trusted-runtime-checkout>
+./install.sh --prepare
+./install.sh --status
+# 별도 승인된 all-consumers-stopped maintenance window
+./install.sh --activate '<exact retained RELEASE_ID>'
 ```
+
+normal managed update는 validated activation과 `current` pointer만 바꾸며 HOME wiring과 stable
+bootstrap source release를 유지한다. source checkout build나 skill 변경은 즉시 live 반영되지
+않는다. Claude/Gemini/OpenCode의 whole-directory skill link는 새 `current` content를 보지만,
+Codex의 개별 skill/prompt 이름 집합이 달라지는 release는 pointer publication 전에
+`DEPLOY_WIRING_TOPOLOGY_CHANGED` / `guarded_uninstall_reinstall_required`로 거부된다. helper
+교체 또는 이 Codex topology 변경을 채택할 때만 같은 maintenance gate 아래 다음을 실행한다.
+
+```bash
+./install.sh --uninstall
+./install.sh --activate '<exact retained RELEASE_ID>'
+```
+
+두 command 모두 독립적으로 quiescence와 exclusive admission을 통과해야 한다. 이전 helper
+directory, release, activation, `current`, journal은 자동 삭제하지 않는다.
 
 ### 6.3 제거
 
@@ -398,6 +463,12 @@ npm run build --prefix mcp-server
 ./install.sh --uninstall
 # 이 repository 소유가 증명된 link와 MCP entry만 제거
 ```
+
+Uninstall도 같은 ownership proof를 사용한다. Claude/Codex 설정 root는 private transaction을
+탐색하거나 만들기 전에 검증하므로 symlink/non-directory/외부 소유 root를 따라 쓰지 않는다.
+installer-owned HOME wiring만 제거하고 foreign target/config/backup과 retained runtime
+artifact/evidence는 건드리지 않는다. 설치 안전성은 isolated HOME에서 네 TUI, canonical,
+legacy, foreign, transaction/race/recovery 경계를 검증한다.
 
 ## 7. 설치 호환성과 migration 경계
 

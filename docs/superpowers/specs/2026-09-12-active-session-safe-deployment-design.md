@@ -2,8 +2,8 @@
 
 Date: 2026-09-12
 Issue: https://github.com/jhw7500/jhw-notion/issues/153
-Status: Design direction approved; written revision pending review;
-implementation and live rollout deferred
+Status: Implementation and isolated readiness verification complete; final
+whole-branch review and post-reboot first live rollout pending
 
 ## 1. Decision summary
 
@@ -22,16 +22,18 @@ never finishes, releases, or takes over a Task or Claim.
 This design deliberately does not support old and new sessions concurrently.
 The current work is completed or handed off first, its Claims are normally
 released, all consumers are stopped, and only then may an exact prepared release
-be activated. The first implementation and the first live activation are both
-deferred. Live activation requires a separate deployment approval even after
-implementation is reviewed and merged. A server reboot is optional after all
-work has stopped; it is neither inferred nor performed by the deployment tool.
+be activated. The implementation and private-fixture verification are complete;
+they did not prepare or activate a live artifact. The first live activation is
+part of Issue #153 and remains pending until the planned reboot. It requires a
+separate approval for the exact retained release. A server reboot has its own
+approval and is neither inferred nor performed by the deployment tool.
 
 ## 2. Current problem
 
-The current installer runs `npm ci` and `npm run build` directly in the checkout's
-`mcp-server` directory. Global control links, TUI skill links, MCP registrations,
-and Guard hook wiring also resolve directly into that checkout.
+Before this implementation, the installer ran `npm ci` and `npm run build`
+directly in the checkout's `mcp-server` directory. Global control links, TUI
+skill links, MCP registrations, and Guard hook wiring also resolved directly
+into that checkout.
 
 This creates three unsafe deployment windows:
 
@@ -82,7 +84,7 @@ gate.
 - Automatically deleting retained generations.
 - Changing Notion credentials or copying `.env` secret bytes into a release.
 - Changing the Project Control authority epoch or performing Phase 1B cutover.
-- Deploying the implementation produced by Issue #153.
+- Performing the live deployment during the implementation/readiness checkpoint.
 
 ## 5. Runtime layout
 
@@ -96,7 +98,10 @@ its current location.
 |-- admission.lock
 |-- bootstrap/
 |   |-- manifest.json
-|   `-- jhw-runtime-entry
+|   |-- jhw-runtime-entry
+|   |-- jhw-runtime-control
+|   |-- jhw-runtime-hook
+|   `-- runtime-*.mjs
 |-- current -> activations/<activation-id>
 |-- activations/
 |   |-- <activation-id>/
@@ -117,15 +122,23 @@ its current location.
 |   |   |-- scripts/jhw-control-hook
 |   |   `-- skills/
 |   `-- <older-release-id>/...
+|-- .bootstrap.previous.<32hex>/...
+|-- .deploy.<32hex>/
+|   |-- state.json
+|   |-- before.json
+|   `-- <phase>.<16hex>.log
 `-- .stage.<random>/
 ```
 
 `.jhw-runtime/` is ignored by Git. Its directory, locks, bootstrap, manifests,
 releases, and symlinks must be owned by the current user and must not traverse an
-unverified symlink. Staging directories use mode `0700` and are never valid
-execution targets. The bootstrap manifest pins the entry digest and closed set
-of supported selectors; bootstrap replacement is allowed only under the same
-quiescent maintenance gate as first migration.
+unverified symlink. Staging and deployment directories use mode `0700`; private
+state, preimage, manifest, and phase-log files use mode `0600`. Stages and private
+fixture releases are never valid live execution targets. The bootstrap manifest
+pins the entry digest and closed set of supported selectors. Ordinary activation
+retains its independently validated `sourceReleaseId`; adopting changed helper
+bytes requires the separately gated uninstall then exact retained-release
+activation path, and preserves the previous helper directory.
 
 Release IDs use a strict closed format derived from the source revision and a
 content digest. A release `manifest.json` records the exact release ID, source
@@ -155,7 +168,8 @@ provides closed subcommands to:
 - validate a staged or retained release and its manifest;
 - create an immutable activation for a validated release and publish it through
   an atomic `current` symlink rename;
-- report current, predecessor, legacy, and active-process counts;
+- report current release, predecessor availability, pending recovery count, and
+  aggregate supported-consumer counts;
 - atomically roll `current` back to its validated predecessor.
 
 It returns bounded JSON. It rejects unknown keys, malformed release IDs,
@@ -197,7 +211,9 @@ or a zero MCP-child count as proof that the corresponding TUI has stopped.
 ### 6.3 Installer orchestration
 
 `install.sh` keeps its existing ownership and TUI wiring responsibilities but
-delegates runtime generation work to the helper.
+delegates runtime generation work to the helper. Its public dispatcher requires
+Linux `/proc`, Bash, executable `/usr/bin/flock`, and Node.js 22 or newer before
+loading the deployment ESM.
 
 The supported paths are:
 
@@ -234,11 +250,21 @@ does not claim that an open TUI session is pinned to a generation. The separate
 TUI/app-server quiescence check is therefore mandatory.
 
 The first migration may update consumer records one at a time only after the
-quiescence gate passes. Every record points to a complete validated generation;
-it never exposes a staging directory or a partially built tree. Existing
-configuration/hook transaction evidence restores prior wiring if migration
-fails. Subsequent deployments require only the single atomic `current`
-transition and do not rewrite TUI configuration.
+quiescence gate passes. Every record points through the validated bootstrap or
+`current/skills`; it never exposes a staging directory or partially built tree.
+A durable deployment marker and bounded exact known-wiring preimages exist
+before the first mutation worker. EOF, timeout, or failed validation never
+claims automatic restoration. Configuration/hook transaction evidence and all
+legacy artifacts are retained for inspection.
+
+Subsequent compatible deployments require only the single atomic `current`
+transition and do not rewrite TUI configuration. A candidate whose individually
+installed Codex skill/prompt name set differs is refused before publication with
+`DEPLOY_WIRING_TOPOLOGY_CHANGED` / `guarded_uninstall_reinstall_required`.
+Whole-directory adapters continue to follow `current/skills`. Bootstrap helper
+or Codex topology changes require guarded uninstall followed by activation of
+the exact desired retained release; both commands independently pass the same
+maintenance gate.
 
 ## 7. Data flow
 
@@ -257,38 +283,54 @@ transition and do not rewrite TUI configuration.
    releases parent.
 9. Return the bounded release ID and validation state. Do not change `current`.
 
-A failure removes only the invocation's private staging directory. It does not
-modify the current release, legacy `dist`, legacy `node_modules`, global links,
-or TUI configuration.
+A failure removes only an unchanged, still-trusted invocation stage. A stage
+whose identity or trust became uncertain is retained for explicit inspection.
+Neither path modifies the current release, legacy `dist`, legacy `node_modules`,
+global links, or TUI configuration.
 
 ### 7.2 Activate
 
 1. Require the separately approved maintenance-window invocation and run an
-   initial bounded supported-consumer inventory.
-2. Refuse immediately if any supported consumer exists or any required
-   observation is uncertain. Do not create a maintenance marker or change shared
-   state.
-3. Acquire `deploy.lock`, then acquire `admission.lock` exclusively without
-   forcing or terminating a shared holder.
-4. Repeat the complete supported-consumer inventory while holding both locks.
-   Refuse and release both locks on any match or uncertainty.
-5. Re-read the exact `current` activation and validate the requested retained
-   release and all manifest digests.
-6. Create and fsync a private activation directory containing the selected
-   release links and a manifest that names the observed activation as its
-   predecessor.
-7. Rename the complete activation into `activations/<activation-id>` and fsync
-   the activations parent.
-8. Revalidate that `current` still has the exact observation captured in step 5.
-9. Build a same-parent temporary symlink to the new activation.
-10. Atomically rename that symlink over `current` and fsync the store parent.
-11. Re-read and validate the live activation and selected release.
-12. Report the previous/new release IDs and the all-zero gated inventory, then
-    release both locks.
+   initial bounded supported-consumer inventory before shared mutation.
+2. Create or validate the private runtime store, acquire `deploy.lock` and
+   exclusive `admission.lock`, then repeat the complete inventory. Refuse on any
+   consumer, uncertainty, or contention without forcing or signaling a holder.
+3. Validate current/pending state and the exact requested retained release.
+   Create and fsync `.deploy.<32hex>/state.json` before any mutation worker.
+4. Snapshot whether wiring was successfully installed before this operation,
+   independently of the mutable worker-mode flag and retained activation history.
+   For managed wiring, verify existing wiring and candidate Codex topology
+   before pointer publication. For initial/refresh wiring, record bounded exact
+   known-path preimages in private `before.json` before the first mutation.
+5. Publish the immutable activation and `current` pointer. First migration also
+   installs the stable bootstrap and invokes a fresh wiring worker that inherits
+   the actual deploy and exclusive-admission file descriptions.
+6. Close exclusive admission while retaining deployment serialization. Invoke a
+   fresh validation worker with only the deploy descriptor: exact host contract
+   v5, Guard preflight, then a managed MCP initialize/initialized/tools-list
+   exchange through normal shared admission.
+7. Reacquire exclusive admission and repeat the supported-consumer inventory.
+   Failure records `recovery_blocked` and returns `DEPLOY_RECOVERY_REQUIRED` /
+   `maintenance_reacquisition_failed`; it never restores automatically.
+8. If validation failed, retain the selected pointer and all private evidence.
+   With `DEPLOY_VALIDATION_FAILED`, return `validated_rollback_required` only
+   for a managed pointer update that began with successfully installed wiring
+   and a predecessor, with pending operation `activate`. Initial wiring without
+   a predecessor returns `first_migration_recovery_required`; failed reinstallation
+   after guarded uninstall returns `wiring_refresh_recovery_required` even with a retained
+   predecessor. Both wiring failures require manual operator review of wiring,
+   helpers and hook transactions while maintaining the maintenance window.
+9. Re-read the exact pointer. A fresh finalization worker inherits the deploy and
+   newly acquired exclusive-admission descriptors. Only successful finalization
+   records `installed:true`, marks the journal complete and reports the
+   previous/new release IDs. Never mark unfinished wiring installed to admit
+   recovery.
 
 No process signal or Task lifecycle command is issued. Managed entry points fail
 immediately with a stable bounded maintenance diagnostic while the exclusive
-admission lease is held; they never race the pointer transition.
+admission lease is held; they never race the pointer transition. A mutation
+worker retains inherited leases after driver EOF or timeout until that worker
+exits; the driver does not signal it or claim restoration.
 
 ### 7.3 Rollback
 
@@ -297,24 +339,40 @@ admission lease is held; they never race the pointer transition.
    current state.
 3. Read the predecessor activation from the current activation's committed
    manifest.
-4. Validate that activation and its selected release exactly.
+4. Validate that activation and its selected release exactly, including Codex
+   individual-link topology compatibility.
 5. Atomically replace `current` with a symlink to the predecessor activation.
-6. Re-read the pointer, report bounded release IDs and the all-zero gated
-   inventory, and release both locks.
+6. Run the same validation, exclusive-admission reacquisition, final inventory,
+   pointer read-back, and fresh finalization phases as activation.
 
-Rollback is not attempted after sessions have reopened. If verification of the
-new release fails, consumers remain stopped and the operator separately approves
-or invokes the validated rollback while the maintenance boundary is still held.
-The tool never kills or restarts them automatically.
+Rollback is not attempted after sessions have reopened. If verification of a
+managed pointer update that retained successfully installed wiring fails,
+consumers remain stopped and the operator invokes the validated rollback while
+the maintenance boundary is still held. The first migration has no managed
+predecessor: `--rollback` returns
+`DEPLOY_PREDECESSOR_INVALID` and never restores a legacy checkout or wiring.
+After guarded uninstall, a failed reinstall can retain a predecessor while
+`installed:false` still prevents rollback: `--rollback` returns
+`DEPLOY_RECOVERY_REQUIRED` without changing the pointer or retained evidence.
+`predecessorAvailable` reports history, not recovery eligibility. Keep maintenance
+and all private evidence for manual operator review; do not delete journals or
+force `installed:true`. If validation of rollback itself fails, return
+`DEPLOY_VALIDATION_FAILED` / `rollback_recovery_required` and retain the selected
+pointer and pending evidence for manual operator review with consumers stopped.
+A further `--rollback` returns `DEPLOY_RECOVERY_REQUIRED`; pending rollback
+operations are not admitted as failed-activation recovery.
+Incompatible rollback topology is refused before publication and uses the
+separately gated uninstall/activate route only after operator approval. The tool
+never kills or restarts consumers automatically.
 
 ## 8. Active-process diagnostics
 
 Linux `/proc` inspection matches only current-user processes using an allowlist
-of supported TUI, app-server, legacy runtime, bootstrap, and retained runtime
-identities. Runtime output is grouped by `legacy`, `current`, or a bounded
-release ID; TUI and app-server output is grouped by bounded consumer class. It
-never emits a PID, full argv, absolute path, environment, Task, Claim, or session
-identifier.
+of supported TUI, Codex app-server, legacy runtime, bootstrap, and retained
+runtime identities. Inventory output has only the aggregate `tui`, `app_server`,
+`legacy`, and `managed` counts plus `clear` and `uncertain`; status reports the
+selected bounded release ID separately. It never emits a PID, full argv,
+absolute path, environment, Task, Claim, or session identifier.
 
 Inspection has strict entry and byte limits. Missing, changing, or unreadable
 required process records, skipped observations, or limit exhaustion make the
@@ -328,8 +386,9 @@ described as proof.
 
 - Build failure: current and all global wiring remain unchanged.
 - Invalid staged release: refuse publication and retain the current release.
-- Active or uncertain consumer inventory: refuse before shared mutation and
-  return a stable bounded diagnostic naming only consumer classes and counts.
+- Active or uncertain consumer inventory: refuse before shared mutation with a
+  stable bounded code. Advisory `--status` separately exposes only aggregate
+  consumer classes and counts.
 - Admission contention: refuse without waiting indefinitely, deleting the lock,
   or signaling its holder.
 - Pointer changed during validation: fail closed; do not retry automatically.
@@ -338,12 +397,32 @@ described as proof.
 - Publication read-back mismatch: stop and report current state without guessing
   which release is active.
 - Missing or invalid predecessor: refuse rollback.
-- First-migration wiring failure: preserve complete release artifacts and use the
-  existing configuration/hook transaction evidence; never fall back to an
-  in-place build.
-- Crash while holding a file lease: the operating system releases the lease;
-  the next status validates pointer, activation, and transaction evidence before
-  any recovery action.
+- Codex individual skill/prompt topology mismatch: refuse before pointer
+  publication with `guarded_uninstall_reinstall_required`; keep current and HOME
+  unchanged and leave no pending recovery journal.
+- Managed activation validation failure with previously installed wiring: retain
+  the selected pointer and evidence; return `validated_rollback_required`.
+  Explicit `--rollback` is available only when the pending operation is
+  `activate`, wiring remains installed, and the durable current observation and
+  committed predecessor match exactly.
+- Reinstallation validation failure after guarded uninstall: return
+  `DEPLOY_VALIDATION_FAILED` / `wiring_refresh_recovery_required`; a retained
+  predecessor does not make unfinished wiring eligible for rollback. Keep
+  maintenance and evidence for manual review.
+- Rollback validation failure: return `DEPLOY_VALIDATION_FAILED` /
+  `rollback_recovery_required`; keep maintenance and evidence for manual review.
+  Another `--rollback` refuses with `DEPLOY_RECOVERY_REQUIRED`.
+- First-migration wiring failure: return `DEPLOY_WIRING_FAILED` and preserve
+  complete releases, exact known-wiring preimages, and configuration/hook
+  transaction evidence. First-migration validation failure returns
+  `DEPLOY_VALIDATION_FAILED` / `first_migration_recovery_required`. Neither has
+  a managed predecessor, legacy rollback, or automatic restore command.
+- Exclusive-admission reacquisition or final inventory failure: record
+  `recovery_blocked` and `maintenance_reacquisition_failed`; keep maintenance
+  open for private evidence review.
+- Worker EOF, timeout, or driver exit: never signal the worker. A surviving
+  mutation descendant retains inherited deploy/admission file descriptions until
+  it exits. Pending state and phase logs remain; no automatic restore occurs.
 
 ## 10. Testing strategy
 
@@ -381,44 +460,57 @@ Required regression coverage:
 Repository gates remain:
 
 ```text
-cd mcp-server && npm run build
-cd mcp-server && npm run typecheck
-cd mcp-server && npm test
+node --test scripts/test-runtime-safety.mjs scripts/test-runtime-store.mjs scripts/test-runtime-entry.mjs scripts/test-runtime-deploy.mjs
+npm run build --prefix mcp-server
+npm run typecheck --prefix mcp-server
+npm test --prefix mcp-server
 bash scripts/test-install-safety.sh
 ```
 
-No live `install.sh`, activate, rollback, cleanup, process termination, server
-reboot, or real TUI configuration mutation is part of Issue #153 verification.
+The implementation checkpoint completed these gates and a normal staged npm
+build, managed hooks, and SDK MCP startup in private source/HOME fixtures. Those
+fixture artifacts are not live prepared releases. The final whole-branch review
+remains a separate readiness gate. No live `install.sh`, activation, rollback,
+cleanup, process termination, reboot, or real HOME mutation occurred during the
+implementation checkpoint; the later first live deployment remains part of
+Issue #153.
 
 ## 11. Rollout boundary
 
-The implementation branch may be reviewed and merged independently of live
-activation. The first live rollout is deliberately postponed until all current
-project work can stop. It follows this separate sequence:
+The implementation branch may be reviewed and integrated independently of live
+activation. The first live rollout is postponed until the planned reboot and
+follows this separate sequence:
 
-1. Complete or durably hand off current work and normally release its active
-   Claims. Claim release is coordination evidence, not deployment authority.
-2. Stop every supported TUI and app server that consumes jhw-notion. Do not have
-   the deployment tool terminate them.
-3. Optionally reboot the server if the operator wants the strongest practical
-   cleanup of leftover processes. A reboot requires its own explicit approval
-   and is not required by the tool.
-4. Obtain a new, explicit approval for the exact deployment run.
-5. Prepare and validate the exact release in the private store; inspect bounded
-   status without changing live wiring.
-6. Reconfirm that no unrelated maintenance, automation #175 work, or Phase 1B
-   cutover is in progress, and prevent new TUI/app-server starts for the window.
-7. Activate the exact prepared release. The command must acquire the exclusive
-   admission lease and pass both all-clear consumer inventories or refuse without
-   shared mutation.
-8. Before reopening normal work, verify the host launcher contract, control
-   preflight, MCP startup, release pointer read-back, and rollback coordinate
-   from one fresh validation session.
-9. If verification fails, close that validation session and perform only the
-   validated predecessor rollback under the same maintenance gate.
-10. Start fresh working sessions only after activation or rollback verification
-    succeeds and the maintenance window is closed.
+1. Finish the whole-branch review and place the approved revision in the
+   dedicated canonical trusted runtime checkout. Do not normalize an arbitrary
+   live tree merely to pass ownership or mode checks.
+2. Before reboot, use an ordinary host shell to run `./install.sh --prepare` and
+   `./install.sh --status`. Record the exact returned release ID; preparation
+   changes neither HOME wiring nor the live pointer.
+3. Complete or durably hand off current work and normally release active Claims.
+   Claim release and SessionEnd are coordination evidence, not deployment
+   authority or proof that a TUI stopped.
+4. Obtain separate reboot approval and perform the planned reboot. An Issue
+   reminder does not reboot or deploy automatically.
+5. After reboot, use an ordinary SSH shell. Do not start Claude, Codex, Gemini,
+   OpenCode, or a Codex app server to drive activation. Prevent new starts,
+   inspect auto-started consumers with bounded status, and keep the maintenance
+   window closed.
+6. Obtain explicit approval for `./install.sh --activate <exact-release-id>` and
+   run that exact command in the canonical runtime checkout. Both inventories
+   and exclusive admission must pass or the command refuses.
+7. Before opening a TUI, verify status pointer read-back, exact host contract v5,
+   and `jhw-control guard preflight` from the SSH shell. `DEPLOY_ACTIVATED` already
+   requires the normal managed MCP initialize/initialized/tools-list exchange.
+   `unprotected: true` and Guard `NO-GO` are not protection success.
+8. If a later managed activation fails validation, retain the maintenance window
+   and invoke only its validated predecessor rollback. First migration has no
+   managed predecessor; retain private evidence and escalate for operator review
+   instead of claiming legacy restoration.
+9. Start fresh working sessions only after activation or validated rollback and
+   all required verification succeed. Keep Issue #153 open until this first live
+   deployment evidence is recorded.
 
-Until step 4 is satisfied, agents must not perform live activation. Approval to
-implement, test, commit, review, merge, prepare, reboot, or stop a process is not
-deployment approval, and none of those approvals implies another.
+Until step 6 is separately approved, agents must not perform live activation.
+Approval to implement, test, commit, review, integrate, prepare, reboot, stop a
+process, uninstall, or roll back does not imply approval for another action.
