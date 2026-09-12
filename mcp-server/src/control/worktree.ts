@@ -581,8 +581,9 @@ export class WorktreeManager {
     if (mapping.lifecycle === "removed") {
       throw new ControlError("WORKTREE_REMOVED", "Worktree has a durable removal tombstone", { worktree_ref: claim.worktree_ref });
     }
-    this.assertExactGeneration(mapping, claim, mapping.repository_identity, root, "active");
-    return this.inspectMappedFull(mapping, claim, root);
+    const repository = await this.repositoryForMappedWorktree(mapping);
+    this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
+    return this.inspectMappedFull(mapping, claim, root, repository.root);
   }
 
   async assertTakeoverEligible(previous: ActiveClaim): Promise<void> {
@@ -770,8 +771,9 @@ export class WorktreeManager {
     const state = await this.loadState();
     const mapping = state.worktrees[claim.worktree_ref];
     if (!mapping) throw new ControlError("WORKTREE_NOT_MAPPED", "Claim has no host-local worktree mapping", { worktree_ref: claim.worktree_ref });
-    const repository = await this.repositoryInfo(mapping.repository_path);
+    const repository = await this.repositoryForMappedWorktree(mapping);
     this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
+    mapping.repository_path = repository.root;
     mapping.lifecycle = "pending-remove";
     // Persist the destructive intent before invoking Git.
     await this.saveState(state);
@@ -883,12 +885,13 @@ export class WorktreeManager {
       return { removed: true, recovered, lifecycle: "removed" };
     }
 
-    const repository = await this.repositoryInfo(mapping.repository_path);
+    const repository = await this.repositoryForMappedWorktree(mapping);
     this.assertExactGeneration(mapping, claim, repository.identity, root, "pending-remove");
+    mapping.repository_path = repository.root;
 
     // This is deliberately after the durable intent write and immediately
     // before `git worktree remove`: dirty/ahead state can change meanwhile.
-    const { inspection: current, status_entries } = await this.inspectMappedFull(mapping, claim, root);
+    const { inspection: current, status_entries } = await this.inspectMappedFull(mapping, claim, root, repository.root);
     if (removalBlockingEntries(status_entries).length > 0) {
       throw new ControlError("WORKTREE_DIRTY", "Refusing to remove a newly dirty worktree", {
         worktree_ref: current.worktree_ref,
@@ -999,7 +1002,12 @@ export class WorktreeManager {
     return output === `refs/heads/${branch}`;
   }
 
-  private async inspectMappedFull(mapping: WorktreeMapping, claim: WorktreeClaim, root: string): Promise<FullWorktreeInspection> {
+  private async inspectMappedFull(
+    mapping: WorktreeMapping,
+    claim: WorktreeClaim,
+    root: string,
+    repositoryPath: string,
+  ): Promise<FullWorktreeInspection> {
     await this.verifyWorktree(mapping.path, claim.branch, mapping.repository_identity, root);
     // Enumerate untracked files rather than collapsing a new `.ai/` directory;
     // retry evidence permits exactly `.ai/handoff.md`, never an opaque folder.
@@ -1029,7 +1037,7 @@ export class WorktreeManager {
     return {
       inspection: {
         path: mapping.path,
-        repository_path: mapping.repository_path,
+        repository_path: repositoryPath,
         branch: claim.branch,
         worktree_ref: claim.worktree_ref,
         head_sha: head,
@@ -1040,6 +1048,42 @@ export class WorktreeManager {
       },
       status_entries: statusEntries,
     };
+  }
+
+  /**
+   * A Task may have been created from a linked checkout that is later removed.
+   * In that case Git's surviving main worktree is the only safe integration
+   * point: the managed Task worktree itself would make every Task tip appear
+   * integrated. Recovery is attempted only when the recorded path is absent,
+   * and the physical common-directory identity must still match exactly.
+   */
+  private async repositoryForMappedWorktree(mapping: WorktreeMapping): Promise<RepositoryInfo> {
+    try {
+      await lstat(mapping.repository_path);
+      return this.repositoryInfo(mapping.repository_path);
+    } catch (cause) {
+      if (!isNotFound(cause)) throw cause;
+    }
+
+    const listed = await this.git(["-C", mapping.path, "worktree", "list", "--porcelain", "-z"]);
+    const primaryEntry = listed.stdout
+      .split("\0")
+      .find((entry) => entry.startsWith("worktree "));
+    const primaryPath = primaryEntry?.slice("worktree ".length);
+    if (!primaryPath || !isAbsolute(primaryPath)) {
+      throw new ControlError(
+        "WORKTREE_REPOSITORY_MISMATCH",
+        "Stored source checkout is absent and Git did not report a primary worktree",
+      );
+    }
+    const repository = await this.repositoryInfo(primaryPath);
+    if (repository.identity !== mapping.repository_identity || repository.root === mapping.path) {
+      throw new ControlError(
+        "WORKTREE_REPOSITORY_MISMATCH",
+        "Recovered primary worktree does not match the stored repository identity",
+      );
+    }
+    return repository;
   }
 
   private async verifyWorktree(path: string, branch: string, repositoryIdentity: string, root: string): Promise<void> {
