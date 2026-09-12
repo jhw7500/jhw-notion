@@ -2,24 +2,30 @@
 
 Date: 2026-09-12
 Issue: https://github.com/jhw7500/jhw-notion/issues/153
-Status: Approved for implementation; live rollout deferred
+Status: Design direction approved; written revision pending review;
+implementation and live rollout deferred
 
 ## 1. Decision summary
 
 jhw-notion runtime artifacts will be built as immutable generations and exposed
-through one stable `current` symlink. A deployment builds and validates a new
-generation without modifying the live `dist` or `node_modules`, then atomically
-switches `current` to the complete generation.
+through one stable `current` symlink. Preparation builds and validates a new
+generation without modifying live `dist`, `node_modules`, links, hooks, or TUI
+configuration. Activation atomically switches `current` only inside a deliberate
+quiescent maintenance window.
 
-Processes that started before the switch continue using their old generation.
-Processes started after the switch use the new generation. No deployment action
-kills, restarts, finishes, releases, or takes over a Task or Claim.
+Activation and rollback are refused before any shared mutation when a supported
+TUI, app server, MCP, control, or hook consumer is active. Managed runtime entry
+points share an admission gate with deployment so a new managed consumer cannot
+race the final quiescence check. Deployment never kills or restarts a process and
+never finishes, releases, or takes over a Task or Claim.
 
-The implementation, tests, documentation, commits, and review may proceed under
-Issue #153. The first live activation is explicitly outside this implementation
-run and requires a separate deployment approval. A server reboot is not an
-activation prerequisite: existing sessions remain on their physical old release,
-and only sessions started after activation resolve the new release.
+This design deliberately does not support old and new sessions concurrently.
+The current work is completed or handed off first, its Claims are normally
+released, all consumers are stopped, and only then may an exact prepared release
+be activated. The first implementation and the first live activation are both
+deferred. Live activation requires a separate deployment approval even after
+implementation is reviewed and merged. A server reboot is optional after all
+work has stopped; it is neither inferred nor performed by the deployment tool.
 
 ## 2. Current problem
 
@@ -36,19 +42,27 @@ This creates three unsafe deployment windows:
 3. Updating several global links and configuration records can temporarily mix
    old and new entry points.
 
-Stopping every session first would avoid some races, but it is not practical on
-the shared build server. Read-only inspection recently found many MCP processes
-using the same runtime checkout. Process discovery is also inherently racy, so a
-zero-process observation cannot be the primary safety boundary.
+Read-only inspection recently found many MCP processes using the same runtime
+checkout. More importantly, MCP processes are not the only consumers: an already
+open TUI session can invoke a new hook or control subprocess after an activation.
+A shared `current` pointer therefore cannot guarantee session-level pinning.
+
+The selected policy prioritizes zero impact to existing sessions over continuous
+deployment. It waits until current work is finished, establishes a closed
+maintenance boundary, verifies quiescence, performs one atomic activation, and
+then starts fresh sessions. A momentary zero-process observation alone is racy,
+so managed entry points and activation must also coordinate through one admission
+gate.
 
 ## 3. Goals
 
 - Never run dependency installation or compilation inside the live generation.
 - Ensure a new invocation observes either one complete old generation or one
   complete new generation.
-- Allow already-running MCP sessions to finish on the old generation without a
-  forced restart.
-- Report bounded active-process counts for the legacy path and each retained
+- Refuse activation and rollback while any supported existing session or runtime
+  consumer is active.
+- Prevent new managed runtime consumers from racing the final quiescence check.
+- Report bounded active-consumer counts by supported consumer class and retained
   generation.
 - Support a validated, atomic rollback to the predecessor generation.
 - Keep Task/Claim lifecycle, automation #175, and Phase 1B authority cutover out
@@ -59,7 +73,10 @@ zero-process observation cannot be the primary safety boundary.
 ## 4. Non-goals
 
 - Hot-reloading an already-running MCP process.
-- Making all sessions change version at the same instant.
+- Per-session release profiles or routing old and new live sessions to different
+  generations.
+- Activating while an existing supported session remains open, even when its MCP
+  child is momentarily idle.
 - Automatically terminating processes or restarting TUI sessions.
 - Requiring or attempting to prove a host reboot before activation.
 - Automatically deleting retained generations.
@@ -76,6 +93,10 @@ its current location.
 ```text
 <runtime-checkout>/.jhw-runtime/
 |-- deploy.lock
+|-- admission.lock
+|-- bootstrap/
+|   |-- manifest.json
+|   `-- jhw-runtime-entry
 |-- current -> activations/<activation-id>
 |-- activations/
 |   |-- <activation-id>/
@@ -99,10 +120,12 @@ its current location.
 `-- .stage.<random>/
 ```
 
-`.jhw-runtime/` is ignored by Git. Its directory, lock, manifests, releases, and
-symlinks must be owned by the current user and must not traverse an unverified
-symlink. Staging directories use mode `0700` and are never valid execution
-targets.
+`.jhw-runtime/` is ignored by Git. Its directory, locks, bootstrap, manifests,
+releases, and symlinks must be owned by the current user and must not traverse an
+unverified symlink. Staging directories use mode `0700` and are never valid
+execution targets. The bootstrap manifest pins the entry digest and closed set
+of supported selectors; bootstrap replacement is allowed only under the same
+quiescent maintenance gate as first migration.
 
 Release IDs use a strict closed format derived from the source revision and a
 content digest. A release `manifest.json` records the exact release ID, source
@@ -140,47 +163,82 @@ non-regular runtime files, unsafe symlinks, ownership mismatches, unexpected
 directory modes, manifest/digest mismatches, and concurrent state changes.
 
 The helper serializes stage/publish/rollback operations with `deploy.lock`.
-Lock contention fails with a stable diagnostic; it never removes a lock file or
-terminates a holder.
+Activation and rollback additionally require an exclusive lease on
+`admission.lock`. Lock contention fails with a stable diagnostic; the helper
+never removes a lock file or terminates a holder.
 
-### 6.2 Installer orchestration
+### 6.2 Runtime admission and quiescence gate
+
+A stable bootstrap outside the versioned release resolves managed MCP, control,
+and hook entry points. Before resolving `current`, it acquires a shared lease on
+`admission.lock` and retains the lease until the child exits. Activation and
+rollback acquire the same lock exclusively. Consequently, a running managed
+runtime prevents publication, and a managed runtime cannot begin between the
+final check and the pointer transition.
+
+The exclusive lease is necessary but not sufficient because a TUI or app server
+can be alive while no child runtime is executing. Before taking the lease and
+again after taking it, activation inventories an allowlisted set of supported
+TUI, app-server, legacy MCP, control, and hook consumers. Any match, skipped
+observation, unreadable required process record, or inventory-limit exhaustion
+refuses the operation before shared state changes.
+
+The safety claim is limited to supported, installer-managed host entry points.
+An arbitrary direct execution of a release file is outside that claim. During a
+maintenance window the operator must also prevent anyone from starting a new TUI
+or app server. The one-time migration from legacy entry points is a bootstrap
+case: because legacy consumers do not yet honor `admission.lock`, it requires the
+same all-consumers-stopped maintenance boundary and refuses on any uncertain
+inventory result.
+
+The gate has no force mode. It never treats a released Claim, a SessionEnd event,
+or a zero MCP-child count as proof that the corresponding TUI has stopped.
+
+### 6.3 Installer orchestration
 
 `install.sh` keeps its existing ownership and TUI wiring responsibilities but
 delegates runtime generation work to the helper.
 
 The supported paths are:
 
-- default install: stage, validate, wire stable consumer paths, and activate;
 - prepare-only: stage and validate without changing `current` or global wiring;
-- activate: validate a named prepared release, then switch it live;
-- status: read-only bounded release/process diagnostics;
-- rollback: validate the predecessor and switch `current` back;
+- activate: under the quiescence gate, validate an exact prepared release and
+  switch it live;
+- status: read-only bounded release and consumer diagnostics;
+- rollback: under the same quiescence gate, validate the predecessor and switch
+  `current` back;
+- fresh install: only when no prior installation or consumer exists, run the
+  same staged build and quiescence-gated activation path;
 - uninstall: remove only verified installer-owned wiring, preserving releases
-  and any process still using them.
+  and refusing while a supported consumer is active.
 
 The formal rollout runbook uses prepare-only and activate as separate commands.
-The default path remains available for a fresh installation, but it uses the same
-staging and atomic publication machinery and never rebuilds the live generation.
+An existing installation never turns a default install invocation into an
+implicit activation. It returns a bounded instruction to prepare and activate in
+separate, explicitly approved steps.
 
-### 6.3 Stable consumer paths
+### 6.4 Stable consumer paths
 
-After the one-time migration, consumers point only through `.jhw-runtime/current`:
+After the one-time migration, executable consumers enter through the stable
+bootstrap, which selects an entry below `.jhw-runtime/current` only after taking
+its admission lease:
 
-- MCP registrations use `current/mcp-server/dist/index.js`;
-- `jhw-control` uses `current/mcp-server/dist/control/cli.js`;
-- `jhw-control-hook` uses `current/scripts/jhw-control-hook`;
+- MCP registrations execute `bootstrap/jhw-runtime-entry mcp`;
+- `jhw-control` executes the bootstrap's closed `control` selector;
+- `jhw-control-hook` executes the bootstrap's closed `hook` selector;
 - TUI skills and prompts use `current/skills/...`.
 
-Node resolves the launched entry through the activation links to its physical
-generation. The hook launcher already resolves its own symlink before locating
-the compiled core. Therefore a process that starts before publication remains
-bound to the old physical release, while a later invocation resolves through the
-new `current` target.
+The stable bootstrap acquires its shared admission lease before resolving these
+paths. This prevents a running managed child from crossing an activation, but it
+does not claim that an open TUI session is pinned to a generation. The separate
+TUI/app-server quiescence check is therefore mandatory.
 
-The first migration may update consumer records one at a time, but every record
-always points to a complete validated generation. It never exposes a staging
-directory or a partially built tree. Subsequent deployments require only the
-single atomic `current` transition.
+The first migration may update consumer records one at a time only after the
+quiescence gate passes. Every record points to a complete validated generation;
+it never exposes a staging directory or a partially built tree. Existing
+configuration/hook transaction evidence restores prior wiring if migration
+fails. Subsequent deployments require only the single atomic `current`
+transition and do not rewrite TUI configuration.
 
 ## 7. Data flow
 
@@ -205,61 +263,87 @@ or TUI configuration.
 
 ### 7.2 Activate
 
-1. Acquire the deployment lock and re-read the exact `current` activation.
-2. Validate the requested retained release and all manifest digests.
-3. Create and fsync a private activation directory containing the selected
+1. Require the separately approved maintenance-window invocation and run an
+   initial bounded supported-consumer inventory.
+2. Refuse immediately if any supported consumer exists or any required
+   observation is uncertain. Do not create a maintenance marker or change shared
+   state.
+3. Acquire `deploy.lock`, then acquire `admission.lock` exclusively without
+   forcing or terminating a shared holder.
+4. Repeat the complete supported-consumer inventory while holding both locks.
+   Refuse and release both locks on any match or uncertainty.
+5. Re-read the exact `current` activation and validate the requested retained
+   release and all manifest digests.
+6. Create and fsync a private activation directory containing the selected
    release links and a manifest that names the observed activation as its
    predecessor.
-4. Rename the complete activation into `activations/<activation-id>` and fsync
+7. Rename the complete activation into `activations/<activation-id>` and fsync
    the activations parent.
-5. Revalidate that `current` still has the exact observation captured in step 1.
-6. Build a same-parent temporary symlink to the new activation.
-7. Atomically rename that symlink over `current` and fsync the store parent.
-8. Re-read and validate the live activation and selected release.
-9. Report the previous/new release IDs and bounded active-process counts.
+8. Revalidate that `current` still has the exact observation captured in step 5.
+9. Build a same-parent temporary symlink to the new activation.
+10. Atomically rename that symlink over `current` and fsync the store parent.
+11. Re-read and validate the live activation and selected release.
+12. Report the previous/new release IDs and the all-zero gated inventory, then
+    release both locks.
 
-No process signal or Task lifecycle command is issued. An invocation racing the
-rename resolves either the old or new complete target.
+No process signal or Task lifecycle command is issued. Managed entry points fail
+immediately with a stable bounded maintenance diagnostic while the exclusive
+admission lease is held; they never race the pointer transition.
 
 ### 7.3 Rollback
 
-1. Acquire the deployment lock and validate current state.
-2. Read the predecessor activation from the current activation's committed
+1. Pass the same pre-lock and post-lock quiescence checks used by activation.
+2. Acquire the same deployment and exclusive admission leases and validate
+   current state.
+3. Read the predecessor activation from the current activation's committed
    manifest.
-3. Validate that activation and its selected release exactly.
-4. Atomically replace `current` with a symlink to the predecessor activation.
-5. Re-read the pointer and report bounded release IDs and process counts.
+4. Validate that activation and its selected release exactly.
+5. Atomically replace `current` with a symlink to the predecessor activation.
+6. Re-read the pointer, report bounded release IDs and the all-zero gated
+   inventory, and release both locks.
 
-Rollback affects only new invocations. Processes already bound to the failed
-generation are reported and require an operator-directed restart if necessary;
-the tool never kills them automatically.
+Rollback is not attempted after sessions have reopened. If verification of the
+new release fails, consumers remain stopped and the operator separately approves
+or invokes the validated rollback while the maintenance boundary is still held.
+The tool never kills or restarts them automatically.
 
 ## 8. Active-process diagnostics
 
-Linux `/proc` inspection matches only current-user processes whose NUL-delimited
-argv identifies the exact legacy or retained MCP/control entry. Output contains
-counts grouped by `legacy`, `current`, or a bounded release ID; it never emits a
-PID, full argv, absolute path, environment, Task, Claim, or session identifier.
+Linux `/proc` inspection matches only current-user processes using an allowlist
+of supported TUI, app-server, legacy runtime, bootstrap, and retained runtime
+identities. Runtime output is grouped by `legacy`, `current`, or a bounded
+release ID; TUI and app-server output is grouped by bounded consumer class. It
+never emits a PID, full argv, absolute path, environment, Task, Claim, or session
+identifier.
 
 Inspection has strict entry and byte limits. Missing, changing, or unreadable
-process records are counted as skipped observations. The result is advisory and
-cannot authorize deletion or prove quiescence. Safety comes from immutable
-generations and retaining old releases, not from a momentary process count.
+required process records, skipped observations, or limit exhaustion make the
+activation gate fail closed. Read-only `status` remains advisory. The activation
+safety boundary is the combination of the exclusive admission lease, two
+all-clear inventories, a no-new-TUI operational maintenance window, immutable
+generations, and atomic publication; a momentary process count alone is never
+described as proof.
 
 ## 9. Failure and recovery rules
 
 - Build failure: current and all global wiring remain unchanged.
 - Invalid staged release: refuse publication and retain the current release.
+- Active or uncertain consumer inventory: refuse before shared mutation and
+  return a stable bounded diagnostic naming only consumer classes and counts.
+- Admission contention: refuse without waiting indefinitely, deleting the lock,
+  or signaling its holder.
 - Pointer changed during validation: fail closed; do not retry automatically.
 - Lock contention: report one bounded error; do not delete the lock or kill the
   holder.
 - Publication read-back mismatch: stop and report current state without guessing
   which release is active.
 - Missing or invalid predecessor: refuse rollback.
-- Active old processes: retain their releases and report counts.
 - First-migration wiring failure: preserve complete release artifacts and use the
   existing configuration/hook transaction evidence; never fall back to an
   in-place build.
+- Crash while holding a file lease: the operating system releases the lease;
+  the next status validates pointer, activation, and transaction evidence before
+  any recovery action.
 
 ## 10. Testing strategy
 
@@ -273,10 +357,20 @@ Required regression coverage:
 - build failure leaves live `dist`, `node_modules`, `current`, and wiring intact;
 - staged content is unreachable through `current` before activation;
 - publication exposes only a complete old or new release;
-- a process started through old `current` remains bound to the old physical tree;
-- new processes resolve the new tree after activation;
-- status output is bounded and does not expose PIDs, argv, or absolute paths;
+- every managed runtime bootstrap holds a shared admission lease for its child's
+  lifetime;
+- a shared admission holder prevents activation and leaves `current` and wiring
+  unchanged;
+- active TUI, app-server, legacy runtime, MCP, control, and hook fixtures each
+  refuse activation before shared mutation;
+- skipped, unreadable, changing, or over-limit process observations refuse
+  activation;
+- a managed consumer racing an exclusive activation lease cannot resolve or
+  execute across the pointer transition;
+- status and refusal output is bounded and does not expose PIDs, argv, absolute
+  paths, Task coordinates, or Claim coordinates;
 - rollback selects only the activation-manifest-recorded validated predecessor;
+- rollback enforces the same quiescence and admission gate as activation;
 - active releases and legacy artifacts are never automatically deleted;
 - concurrent activation and changed-pointer races fail closed;
 - foreign links, unsafe filesystem objects, and malformed manifests are preserved
@@ -293,24 +387,38 @@ cd mcp-server && npm test
 bash scripts/test-install-safety.sh
 ```
 
-No live `install.sh`, activate, rollback, cleanup, process termination, or real
-TUI configuration mutation is part of Issue #153 verification.
+No live `install.sh`, activate, rollback, cleanup, process termination, server
+reboot, or real TUI configuration mutation is part of Issue #153 verification.
 
 ## 11. Rollout boundary
 
 The implementation branch may be reviewed and merged independently of live
-activation. The first live rollout follows this separate sequence:
+activation. The first live rollout is deliberately postponed until all current
+project work can stop. It follows this separate sequence:
 
-1. Obtain a new, explicit deployment approval.
-2. Run prepare-only and inspect the bounded status output.
-3. Reconfirm there is no unrelated maintenance or Phase 1B cutover in progress.
-4. Activate the exact prepared release.
-5. Verify the host launcher contract, control preflight, MCP startup, release
-   pointer read-back, and rollback coordinate from a new session.
-6. Leave sessions that started before activation on their old physical release.
-7. Restart an old session only when the user separately chooses version
-   convergence for that session.
+1. Complete or durably hand off current work and normally release its active
+   Claims. Claim release is coordination evidence, not deployment authority.
+2. Stop every supported TUI and app server that consumes jhw-notion. Do not have
+   the deployment tool terminate them.
+3. Optionally reboot the server if the operator wants the strongest practical
+   cleanup of leftover processes. A reboot requires its own explicit approval
+   and is not required by the tool.
+4. Obtain a new, explicit approval for the exact deployment run.
+5. Prepare and validate the exact release in the private store; inspect bounded
+   status without changing live wiring.
+6. Reconfirm that no unrelated maintenance, automation #175 work, or Phase 1B
+   cutover is in progress, and prevent new TUI/app-server starts for the window.
+7. Activate the exact prepared release. The command must acquire the exclusive
+   admission lease and pass both all-clear consumer inventories or refuse without
+   shared mutation.
+8. Before reopening normal work, verify the host launcher contract, control
+   preflight, MCP startup, release pointer read-back, and rollback coordinate
+   from one fresh validation session.
+9. If verification fails, close that validation session and perform only the
+   validated predecessor rollback under the same maintenance gate.
+10. Start fresh working sessions only after activation or rollback verification
+    succeeds and the maintenance window is closed.
 
-Until step 1 is satisfied, agents must not recommend or perform the live
-activation. Approval to implement, test, commit, review, or merge is not
-deployment approval.
+Until step 4 is satisfied, agents must not perform live activation. Approval to
+implement, test, commit, review, merge, prepare, reboot, or stop a process is not
+deployment approval, and none of those approvals implies another.
