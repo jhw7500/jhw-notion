@@ -581,8 +581,7 @@ export class WorktreeManager {
     if (mapping.lifecycle === "removed") {
       throw new ControlError("WORKTREE_REMOVED", "Worktree has a durable removal tombstone", { worktree_ref: claim.worktree_ref });
     }
-    const repository = await this.repositoryInfo(mapping.repository_path);
-    this.assertExactGeneration(mapping, claim, repository.identity, root, "active");
+    this.assertExactGeneration(mapping, claim, mapping.repository_identity, root, "active");
     return this.inspectMappedFull(mapping, claim, root);
   }
 

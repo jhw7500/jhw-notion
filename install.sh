@@ -39,7 +39,7 @@ validate_supported_tui_root() {
 require_control_host() {
   local contract
   if [ ! -x "$HOST_LAUNCHER" ]; then
-    fail "jhw-control-host v4가 필요합니다. claude-config/install.sh를 먼저 실행하세요."
+    fail "jhw-control-host v5가 필요합니다. claude-config/install.sh를 먼저 실행하세요."
     exit 1
   fi
   if ! contract="$("$HOST_LAUNCHER" --contract 2>/dev/null)"; then
@@ -49,10 +49,10 @@ require_control_host() {
   if ! JHW_CONTROL_HOST_CONTRACT="$contract" node -e '
     const { isDeepStrictEqual } = require("node:util");
     const expected = {
-      commands: ["unlock", "preflight", "portfolio status", "task start", "task child-start", "task contract", "task completion-ready", "task promote", "task status", "task handoff", "task finish", "task recover", "task assert-owner"],
+      commands: ["unlock", "preflight", "portfolio status", "task start", "task child-start", "task contract", "task completion-ready", "task promote", "task status", "task handoff", "task finish", "task recover", "task assert-owner", "board status", "board acquire", "board with"],
       credential_policy: "secure-store-only",
       name: "jhw-control-host",
-      version: 4,
+      version: 5,
     };
     let actual;
     try {
@@ -62,7 +62,7 @@ require_control_host() {
     }
     process.exit(isDeepStrictEqual(actual, expected) ? 0 : 1);
   '; then
-    fail "jhw-control-host v4 secure-store-only 계약이 필요합니다. claude-config/install.sh를 다시 실행하세요."
+    fail "jhw-control-host v5 secure-store-only 계약이 필요합니다. claude-config/install.sh를 다시 실행하세요."
     exit 1
   fi
 }

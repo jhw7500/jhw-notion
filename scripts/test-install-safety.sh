@@ -481,7 +481,7 @@ run_default_install() {
 provision_valid_control_host() {
   local home="$1"
   provision_control_host_contract "$home" \
-    '{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":4}'
+    '{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner","board status","board acquire","board with"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":5}'
 }
 
 provision_control_host_contract() {
@@ -2462,12 +2462,12 @@ test_installer_uses_lockfile_exact_npm_ci() {
   grep -qF 'run build' "$npm_log" || return 1
 }
 
-test_current_v4_control_host_contract_allows_activation() {
-  local home="$ROOT/current-v4-control-host-home"
+test_current_v5_control_host_contract_allows_activation() {
+  local home="$ROOT/current-v5-control-host-home"
   make_tui_roots "$home"
 
-  if ! run_install "$home"; then
-    echo "current jhw-control-host v4 contract was rejected" >&2
+  if ! run_default_install "$home"; then
+    echo "current jhw-control-host v5 contract was rejected" >&2
     cat "$home/install.log" >&2
     return 1
   fi
@@ -2493,7 +2493,7 @@ test_missing_control_host_fails_before_activation() {
   [ ! -e "$home/.codex/config.toml" ] || return 1
 }
 
-test_non_v4_control_host_contract_fails_before_activation() {
+test_non_v5_control_host_contract_fails_before_activation() {
   local label home contract
   while IFS='|' read -r label contract; do
     home="$ROOT/invalid-control-host-$label-home"
@@ -2501,7 +2501,7 @@ test_non_v4_control_host_contract_fails_before_activation() {
     provision_control_host_contract "$home" "$contract"
 
     if HOME="$home" PATH="$FAKE_BIN:$PATH" bash "$INSTALL" >"$home/install.log" 2>&1; then
-      echo "non-v4 jhw-control-host contract was accepted: $label" >&2
+      echo "non-v5 jhw-control-host contract was accepted: $label" >&2
       return 1
     fi
 
@@ -2511,10 +2511,10 @@ test_non_v4_control_host_contract_fails_before_activation() {
     [ ! -e "$home/.claude.json" ] || return 1
     [ ! -e "$home/.codex/config.toml" ] || return 1
   done <<'EOF'
-v3|{"commands":["unlock","preflight","portfolio status","task start","task finish"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":3}
-unsafe-policy|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner"],"credential_policy":"environment-fallback","name":"jhw-control-host","version":4}
-missing-command|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":4}
-extra-command|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner","task unexpected"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":4}
+v4|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":4}
+unsafe-policy|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner","board status","board acquire","board with"],"credential_policy":"environment-fallback","name":"jhw-control-host","version":5}
+missing-command|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner","board status","board acquire"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":5}
+extra-command|{"commands":["unlock","preflight","portfolio status","task start","task child-start","task contract","task completion-ready","task promote","task status","task handoff","task finish","task recover","task assert-owner","board status","board acquire","board with","task unexpected"],"credential_policy":"secure-store-only","name":"jhw-control-host","version":5}
 malformed|not-json
 EOF
 }
@@ -3461,8 +3461,8 @@ test_stale_hook_transactions_block_install_and_uninstall() {
 
 case "${JHW_INSTALL_TEST_ONLY:-all}" in
   all) ;;
-  host-v4) test_current_v4_control_host_contract_allows_activation; exit ;;
-  host-invalid) test_non_v4_control_host_contract_fails_before_activation; exit ;;
+  host-v5) test_current_v5_control_host_contract_allows_activation; exit ;;
+  host-invalid) test_non_v5_control_host_contract_fails_before_activation; exit ;;
   npm-ci) test_installer_uses_lockfile_exact_npm_ci; exit ;;
   owned-round-trip) test_owned_round_trip; exit ;;
   fresh-hooks) test_fresh_install_creates_both_control_links_and_exact_hooks; exit ;;
@@ -3546,9 +3546,9 @@ test_uninstall_preserves_foreign_mcp_configs
 test_uninstall_preserves_foreign_config_symlink
 test_atomic_config_syncs_mode_before_content
 test_npm_pipeline_failure_stops_install
-test_current_v4_control_host_contract_allows_activation
+test_current_v5_control_host_contract_allows_activation
 test_missing_control_host_fails_before_activation
-test_non_v4_control_host_contract_fails_before_activation
+test_non_v5_control_host_contract_fails_before_activation
 test_installer_uses_lockfile_exact_npm_ci
 test_empty_uninstall_creates_nothing
 test_owned_round_trip

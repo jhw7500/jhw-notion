@@ -21,6 +21,11 @@ boolean 옵션은 전부 **exact literal `true`**를 값으로 받는다
 (`--claim-expired true`, `--accept-shortened true`, `--long-lease true`,
 `--exclusive true`, `--cross-session true`).
 
+secure host contract v5가 공개한 `board status`, `board acquire`, `board with`는 반드시
+`"$HOME/.local/bin/jhw-control-host"`로 실행한다. 이 경로는 control.env의 non-secret
+좌표만 읽고 credential provider를 호출하지 않는다. launcher 오류 시 raw CLI로
+fallback하지 않는다. 나머지 관리 command는 아직 secure host 공개 범위가 아니다.
+
 ## 등록·조회
 
 ```bash
@@ -29,8 +34,8 @@ jhw-control board register <board-id> [--description <text>] \
 jhw-control board update <board-id> [--description <text>] [--interface <type>=<address>] --session <session-id>
 jhw-control board unregister <board-id> --session <session-id>
 jhw-control board list [--after <board-id>]
-jhw-control board status [--after <board-id>]
-jhw-control board status <board-id>
+"$HOME/.local/bin/jhw-control-host" board status [--after <board-id>]
+"$HOME/.local/bin/jhw-control-host" board status <board-id>
 ```
 
 interface type은 `ethernet|wireless|serial`. address는 표시용이며 자격증명을 넣지
@@ -50,7 +55,7 @@ snapshot과 일치하지 않을 수 있다.
 ## 점유·해제
 
 ```bash
-jhw-control board acquire <board-id> --mode exclusive|shared \
+"$HOME/.local/bin/jhw-control-host" board acquire <board-id> --mode exclusive|shared \
   (--for <90m|2h> | --until <offset-datetime>) --session <session-id> --purpose <text> \
   [--pid <n>] [--consume <rsv-id>] [--claim-expired true] [--accept-shortened true] [--long-lease true]
 jhw-control board release <board-id> [--holder <hld-id>] --session <session-id>
@@ -111,9 +116,9 @@ overstay로 표시만 하며, 제거는 후속 acquire의 `--claim-expired true`
 jhw-control board wait <board-id> --mode exclusive|shared (--for <d> | --until <t>) \
   --session <session-id> --purpose <text> [--consume <rsv-id>] [--timeout <duration>]
 
-jhw-control board with <board-id> --mode exclusive|shared (--for <d> | --until <t>) \
+"$HOME/.local/bin/jhw-control-host" board with <board-id> --mode exclusive|shared (--for <d> | --until <t>) \
   --session <session-id> --purpose <text> [--consume <rsv-id>] [--long-lease true] -- <command...>
-jhw-control board with <board-id> --use-holder <hld-id> --session <session-id> -- <command...>
+"$HOME/.local/bin/jhw-control-host" board with <board-id> --use-holder <hld-id> --session <session-id> -- <command...>
 ```
 
 - `wait`는 10초 간격 폴링으로 전 구간을 확보할 수 있을 때만 성공한다(단축 승인
