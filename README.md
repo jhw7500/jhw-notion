@@ -271,6 +271,7 @@ Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Regi
 `task start --task`는 같은 persistent Task를 명시적으로 재개하고 bounded latest Handoff만 반환한다. Handoff source revision은 Claim 시점에 고정된다. release 뒤 local cleanup은 `task recover --action cleanup`으로 exact Claim generation만 복구한다. `task assert-owner`는 raw Git을 통합 enforce하지 않는 advisory check라서 승인된 takeover와 race할 수 있다.
 
 현재 checkout의 Task를 확인할 때는 exact v5 allowlist의 `task status`에 current-context flags를 그대로 전달한다. 이 mode는 기존 v5 command 집합 안에서 동작하므로 새 launcher command/version을 추가하지 않는다.
+이 mode가 처음 추가된 v4 시점의 계약도 같다: host contract v4 remains unchanged because the existing `task status` allowlist already includes this command. 이후 launcher의 별도 기능 추가로 현재 contract만 v5가 되었다.
 
 ```bash
 REPOSITORY_PATH="$(git rev-parse --show-toplevel)" || exit $?

@@ -40,9 +40,10 @@ async function fixture(t, body = "process.stdin.pipe(process.stdout); process.st
   git(root, ['init', '-q']); git(root, ['add', '.']);
   git(root, ['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
   const prepare = () => prepareRelease({ repositoryRoot: root, build: async ({stagingRoot}) => {
-    write(stagingRoot, 'mcp-server/dist/index.js', body);
-    write(stagingRoot, 'mcp-server/dist/control/cli.js', '#!/usr/bin/env node\n'+body, 0o755);
-    write(stagingRoot, 'mcp-server/dist/control/hook-adapter.js', '#!/usr/bin/env node\n'+hookBody, 0o755);
+    const targetBody=typeof body==='function' ? body(root) : body;
+    write(stagingRoot, 'mcp-server/dist/index.js', targetBody);
+    write(stagingRoot, 'mcp-server/dist/control/cli.js', '#!/usr/bin/env node\n'+targetBody, 0o755);
+    write(stagingRoot, 'mcp-server/dist/control/hook-adapter.js', '#!/usr/bin/env node\n'+(typeof hookBody==='function' ? hookBody(root) : hookBody), 0o755);
     fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { mode: 0o755 });
   }});
   const release = await prepare();
@@ -128,10 +129,10 @@ test('real running child excludes writers for its entire lifetime', async t => {
 
 // Break caught: explicit LOCK_UN, or omission of the inherited child descriptor.
 test('child retains admission after its fixture supervisor is killed', async t => {
-  const f = await fixture(t,"import fs from 'node:fs'; process.stdout.write('READY\\n'); const timer=setInterval(()=>{if(fs.existsSync(process.argv[1]+'.go')) {clearInterval(timer); process.exit(0);}},10);");
+  const f = await fixture(t,root=>`import fs from 'node:fs'; process.stdout.write('READY\\n'); const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(path.join(root,'child-go'))})) {clearInterval(timer); process.exit(0);}},10);`);
   const p = start(f); await until(()=>p.output().includes('READY'));
   const exited = once(p.child,'exit'); p.child.kill('SIGKILL'); await exited;
-  contended(f.lock); fs.writeFileSync(path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/dist/index.js.go'),'go'); await p.done;
+  contended(f.lock); fs.writeFileSync(path.join(f.root,'child-go'),'go'); await p.done;
   const lock = acquireLease(f.lock); lock.close();
 });
 
@@ -148,7 +149,7 @@ for (const event of ['PreToolUse','UserPromptSubmit','PostToolUse','SessionEnd']
 }
 
 // Break caught: bypassing the release's bounded hook protocol wrapper.
-test('hook admission executes the existing release wrapper and rejects malformed core output', async t => {
+test('hook admission executes the pinned validation runner and rejects malformed core output', async t => {
   const f = await fixture(t,undefined,"process.stdout.write('not-json');");
   const result = run(f,'jhw-runtime-hook',['--adapter','claude','--event','PreToolUse'],'{}');
   assert.equal(result.status,0,result.stderr); assert.deepEqual(JSON.parse(result.stdout),hookFailure('PreToolUse','GUARD_UNAVAILABLE'));
@@ -200,12 +201,12 @@ test('managed hook trust relation binds physical wrapper and core to the retaine
 });
 
 // Break caught: a shell pipeline/timeout closing inherited fd 3 after supervisor death.
-test('hook wrapper and core retain admission after the fixture supervisor exits', async t => {
-  const f=await fixture(t,undefined,"import fs from 'node:fs'; fs.writeFileSync(process.argv[1]+'.ready','ready'); const timer=setInterval(()=>{ if(fs.existsSync(process.argv[1]+'.go')) { clearInterval(timer); process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse'}})+'\\n'); } },10);");
+test('hook runner and core retain admission after the fixture supervisor exits', async t => {
+  const f=await fixture(t,undefined,root=>`import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(root,'hook-core-ready'))},'ready'); const timer=setInterval(()=>{ if(fs.existsSync(${JSON.stringify(path.join(root,'hook-core-go'))})) { clearInterval(timer); process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse'}})+'\\n'); } },10);`);
   const core=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/dist/control/hook-adapter.js');
   const p=start(f,'jhw-runtime-hook',['--adapter','claude','--event','PreToolUse']); p.child.stdin.end('{}');
-  await until(()=>fs.existsSync(core+'.ready')); const exited=once(p.child,'exit'); p.child.kill('SIGKILL'); await exited;
-  contended(f.lock); fs.writeFileSync(core+'.go','go'); await p.done;
+  await until(()=>fs.existsSync(path.join(f.root,'hook-core-ready'))); const exited=once(p.child,'exit'); p.child.kill('SIGKILL'); await exited;
+  contended(f.lock); fs.writeFileSync(path.join(f.root,'hook-core-go'),'go'); await p.done;
   const lease=acquireLease(f.lock); lease.close(); assert.equal(JSON.parse(p.output()).hookSpecificOutput.hookEventName,'PreToolUse');
 });
 
@@ -269,7 +270,7 @@ for (const invalid of ['missing', 'changed']) {
 // not mix its cached A entry/safety with B store code or execute any selected child.
 test('bootstrap replacement during a paused safety import refuses generation mixing', async t => {
   const f=await fixture(t,"process.stdout.write('CHILD STARTED');",undefined,{
-    'runtime-safety.mjs':(bytes,root)=>bytes+`\nif(import.meta.url.includes('/.jhw-runtime/')) { fs.writeFileSync(${JSON.stringify(path.join(root,'safety-ready'))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,'resume-safety'))})) await new Promise(resolve=>setTimeout(resolve,10)); }\n`,
+    'runtime-safety.mjs':(bytes,root)=>bytes+`\nif(import.meta.url.startsWith('data:')) { fs.writeFileSync(${JSON.stringify(path.join(root,'safety-ready'))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,'resume-safety'))})) await new Promise(resolve=>setTimeout(resolve,10)); }\n`,
   });
   const p=start(f);
   await until(()=>fs.existsSync(path.join(f.root,'safety-ready')));
@@ -282,6 +283,48 @@ test('bootstrap replacement during a paused safety import refuses generation mix
   assert.equal(status,75,p.error()); assert.equal(p.output(),''); assert.equal(p.error(),'DEPLOY_BOOTSTRAP_CHANGED\n');
   assert.equal(fs.existsSync(path.join(f.root,'store-b-evaluated')),false,'replacement store must not be imported by the earlier generation');
   const lease=acquireLease(f.lock); lease.close();
+});
+
+// Break caught: validating runtime-entry bytes, then importing a replacement
+// through the same mutable release pathname.
+test('verified runtime entry never executes replacement bytes from its pathname', async t => {
+  const readyName='entry-import-ready'; const resumeName='entry-import-resume';
+  const f=await fixture(t,undefined,undefined,{
+    'jhw-runtime-entry':(bytes,root)=>bytes.replace(
+      '    const entry=await import(',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    const entry=await import(`,
+    ),
+  });
+  const p=start(f);
+  await until(()=>fs.existsSync(path.join(f.root,readyName)),'runtime entry import pause');
+  const target=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'scripts/runtime-entry.mjs');
+  const replacement=`import fs from 'node:fs'; export async function runManaged(){ fs.writeFileSync(${JSON.stringify(path.join(f.root,'replacement-entry-executed'))},'bad'); return 0; }\n`;
+  const temporary=`${target}.replacement`; fs.writeFileSync(temporary,replacement,{mode:0o644}); fs.renameSync(temporary,target);
+  fs.writeFileSync(path.join(f.root,resumeName),'go'); p.child.stdin.end('kept\n');
+  const [status]=await p.done;
+  assert.equal(status,75,p.error()); assert.equal(p.output(),''); assert.equal(p.error(),'DEPLOY_BOOTSTRAP_INVALID\n');
+  assert.equal(fs.existsSync(path.join(f.root,'replacement-entry-executed')),false);
+});
+
+// Break caught: validating a release target, then spawning a replacement by
+// its mutable pathname after admission has already been granted.
+test('managed child refuses before replacement target bytes can execute', async t => {
+  const readyName='child-spawn-ready'; const resumeName='child-spawn-resume';
+  const f=await fixture(t,"process.stdout.write('ORIGINAL');",undefined,{
+    'runtime-entry.mjs':(bytes,root)=>bytes.replace(
+      '    return await new Promise((resolve,reject)=>{',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    return await new Promise((resolve,reject)=>{`,
+    ),
+  });
+  const p=start(f);
+  await until(()=>fs.existsSync(path.join(f.root,readyName)),'managed child spawn pause');
+  const target=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/dist/index.js');
+  const replacement=`import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(f.root,'replacement-child-executed'))},'bad'); process.stdout.write('REPLACEMENT');\n`;
+  const temporary=`${target}.replacement`; fs.writeFileSync(temporary,replacement,{mode:0o644}); fs.renameSync(temporary,target);
+  fs.writeFileSync(path.join(f.root,resumeName),'go'); p.child.stdin.end();
+  const [status]=await p.done;
+  assert.equal(status,75,p.error()); assert.equal(p.output(),''); assert.equal(p.error(),'DEPLOY_RELEASE_CHANGED\n');
+  assert.equal(fs.existsSync(path.join(f.root,'replacement-child-executed')),false);
 });
 
 // I3: unavailable/incompatible interpreters must not escape through a shebang

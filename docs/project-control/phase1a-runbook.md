@@ -284,6 +284,7 @@ jhw-control task handoff --task <tsk-id> [--claim <released-handoff-claim-id>]
 #### 현재 checkout의 current-context status
 
 현재 checkout에서 Task를 조회할 때는 다음 exact read-only command를 실행한다. `task status`는 host contract v5의 기존 allowlist 항목이므로 이 mode를 위해 launcher command/version을 바꾸지 않는다.
+이 mode가 처음 추가된 v4 시점에도 host contract v4 remains unchanged because the existing `task status` allowlist already includes this command. 현재 contract v5 전환은 별도 launcher 기능 추가에 따른 것이다.
 
 ```bash
 REPOSITORY_PATH="$(git rev-parse --show-toplevel)" || exit $?

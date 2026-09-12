@@ -4,7 +4,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { pathToFileURL } = require('node:url');
 const physical = __filename;
 const name = path.basename(physical);
 const selector = process.argv[2];
@@ -47,9 +46,11 @@ function refuse() {
     if(!manifest || Object.keys(manifest).sort().join(',')!=='files,sourceReleaseId,version' || manifest.version!==1 || typeof manifest.sourceReleaseId!=='string' || !/^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/.test(manifest.sourceReleaseId) || !Array.isArray(manifest.files) || manifest.files.length!==6) throw Error();
     const files=['jhw-runtime-control','jhw-runtime-entry','jhw-runtime-hook','runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs'];
     if(fs.readdirSync(`/proc/self/fd/${held.at(-1).fd}`).sort().join(',')!==[...files,'manifest.json'].sort().join(',')) throw Error();
+    const contents={};
     for(let index=0;index<files.length;index++) {
       const record=manifest.files[index]; const expected=files[index]; const mode=expected.startsWith('jhw-') ? 0o755 : 0o644;
-      if(!record || Object.keys(record).sort().join(',')!=='mode,name,sha256' || record.name!==expected || record.mode!==mode || typeof record.sha256!=='string' || !/^[a-f0-9]{64}$/.test(record.sha256) || crypto.createHash('sha256').update(read(expected,mode,1024*1024)).digest('hex')!==record.sha256) throw Error();
+      const bytes=read(expected,mode,1024*1024); contents[expected]=bytes;
+      if(!record || Object.keys(record).sort().join(',')!=='mode,name,sha256' || record.name!==expected || record.mode!==mode || typeof record.sha256!=='string' || !/^[a-f0-9]{64}$/.test(record.sha256) || crypto.createHash('sha256').update(bytes).digest('hex')!==record.sha256) throw Error();
     }
 
     const canonical=value=>Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value!==null && typeof value==='object' ? `{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
@@ -76,9 +77,10 @@ function refuse() {
       const stat=fs.lstatSync(record.name,{bigint:true});
       if(['dev','ino','uid','gid','mode'].some(key=>record.stat[key]!==stat[key])) throw Error();
     }
-    // Immutable generation URLs prevent Node's module cache and a replaced
-    // bootstrap directory from changing any imported helper generation.
-    const entry=await import(pathToFileURL(path.join(repositoryRoot,'.jhw-runtime/releases',manifest.sourceReleaseId,'scripts/runtime-entry.mjs')));
-    process.exitCode=await entry.runManaged({repositoryRoot,selector,args});
+    // Import the descriptor-read bytes themselves. A release pathname replaced
+    // after validation can no longer select different helper code.
+    const moduleUrl=bytes=>`data:text/javascript;base64,${bytes.toString('base64')}`;
+    const entry=await import(moduleUrl(contents['runtime-entry.mjs']));
+    process.exitCode=await entry.runManaged({repositoryRoot,selector,args,sourceReleaseId:manifest.sourceReleaseId,safetySource:contents['runtime-safety.mjs'],storeSource:contents['runtime-store.mjs']});
   } finally { for(const record of held.reverse()) fs.closeSync(record.fd); }
 })().catch(refuse);

@@ -410,7 +410,11 @@ child가 끝날 때까지 상속 lease와 pending evidence가 남는다.
 bootstrap `jhw-runtime-entry mcp`, control/hook link는 bootstrap의 closed selector, skill은
 `current/skills`를 사용한다. configuration은 기존 mode를 적용한 private same-directory temp를
 fsync한 뒤 atomic publish하고 directory를 fsync한다. foreign target/config/group과 모호한
-ownership은 그대로 보존하고 실패한다.
+ownership은 그대로 보존하고 실패한다. bootstrap verifier는 no-follow descriptor로 읽어
+검증한 helper bytes 자체를 import하며, selected MCP/control/hook artifact는 열린 descriptor와
+현재 이름의 identity를 spawn 직전에 다시 대조한다. 모든 owned launcher/skill/prompt 제거는
+같은 parent의 private capture transaction으로 수행해 검사 뒤 바뀐 foreign replacement를
+삭제하지 않는다.
 
 activation validation은 fresh worker의 exact host contract v5와 Guard preflight, managed MCP
 `initialize`·`notifications/initialized`·`tools/list`를 bounded output/timeout으로 검사한다.
@@ -423,6 +427,9 @@ CLI나 legacy rollback은 제공하지 않는다. 초기 검증 실패는 `DEPLO
 `first_migration_recovery_required`로 operator의 수동 wiring 검토를 요구한다. 기존 설치 완료
 wiring을 유지한 managed pointer update 실패에만 `validated_rollback_required`를 안내하고,
 durable observation이 정확히 일치할 때 `--rollback`이 committed predecessor를 검증한다.
+pointer 목적 activation은 `current` rename 전에 journal에 fsync하므로 rename 뒤 directory
+fsync나 read-back이 실패해도 관측된 destination과 predecessor가 일치하면 같은 recovery gate로
+rollback할 수 있다.
 guarded uninstall 뒤 재설치 검증 실패는 `DEPLOY_VALIDATION_FAILED` /
 `wiring_refresh_recovery_required`다. retained predecessor가 있어도 wiring은 아직 설치 완료가
 아니므로 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부되고 pointer와 evidence는 유지된다.

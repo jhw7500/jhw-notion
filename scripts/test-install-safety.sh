@@ -65,7 +65,7 @@ const path = require("node:path");
 
 const operation = process.argv[2] ?? "";
 const hooksFile = path.join(process.env.HOME, ".codex", "hooks.json");
-const launcherFile = path.join(process.env.HOME, ".local", "bin", "jhw-control-hook");
+const launcherFile = process.env.JHW_TEST_LAUNCHER_PATH || path.join(process.env.HOME, ".local", "bin", "jhw-control-hook");
 const expectedLauncherTarget = process.argv[4] ?? "";
 const transactionDirectory = process.argv[6] ?? "";
 const wanted = process.env.JHW_TEST_LINK_RACE_OPERATION ?? "";
@@ -424,7 +424,7 @@ EOF
 chmod +x "$FAKE_BIN/node"
 cat >"$FAKE_BIN/rm" <<EOF
 #!/bin/sh
-launcher="\${HOME}/.local/bin/jhw-control-hook"
+launcher="\${JHW_TEST_LAUNCHER_PATH:-\${HOME}/.local/bin/jhw-control-hook}"
 case "\${JHW_TEST_LAUNCHER_RACE_MODE:-}" in
   uninstall-regular|uninstall-symlink|uninstall-same-target|rollback-regular|rollback-winner)
     for argument in "\$@"; do
@@ -495,6 +495,7 @@ run_install() {
     JHW_TEST_CAPTURE_MODE="${JHW_TEST_CAPTURE_MODE:-}" \
     JHW_TEST_ROUND5_MODE="${JHW_TEST_ROUND5_MODE:-}" \
     JHW_TEST_LAUNCHER_RACE_MODE="${JHW_TEST_LAUNCHER_RACE_MODE:-}" \
+    JHW_TEST_LAUNCHER_PATH="${JHW_TEST_LAUNCHER_PATH:-}" \
     JHW_TEST_SUBSTITUTE_TARGET="${JHW_TEST_SUBSTITUTE_TARGET:-}" \
     bash "$INSTALL" "$@" >"$home/install.log" 2>&1
 }
@@ -1447,6 +1448,19 @@ test_launcher_uninstall_races_preserve_replacements() {
       return 1
     }
   done
+}
+
+test_owned_control_cli_uninstall_race_preserves_replacement() {
+  local home launcher
+  home="$ROOT/control-cli-remove-race-home"
+  make_tui_roots "$home"
+  run_install "$home"
+  launcher="$home/.local/bin/jhw-control"
+  [ -L "$launcher" ] || return 1
+  JHW_TEST_LAUNCHER_PATH="$launcher" JHW_TEST_LAUNCHER_RACE_MODE="uninstall-regular" \
+    run_install "$home" --uninstall
+  assert_launcher_matches_recorded_identity "$launcher" "$home/launcher-replacement.identity"
+  assert_file_text "$launcher" "foreign-launcher-regular-uninstall-regular"
 }
 
 test_launcher_failed_install_rollback_races_are_no_clobber() {
@@ -3517,6 +3531,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   rollback-cas) test_rollback_capture_preserves_concurrent_hook_changes; exit ;;
   rollback-same-bytes-new-inode) test_rollback_same_bytes_new_inode_is_not_owned_publication; exit ;;
   launcher-remove-race) test_launcher_uninstall_races_preserve_replacements; exit ;;
+  owned-link-remove-race) test_owned_control_cli_uninstall_race_preserves_replacement; exit ;;
   launcher-rollback-race) test_launcher_failed_install_rollback_races_are_no_clobber; exit ;;
   launcher-capture-hard-exit) test_launcher_transaction_hard_exits_leave_inspectable_evidence; exit ;;
   stale-hook-link-transaction) test_stale_hook_link_transactions_block_install_and_uninstall; exit ;;

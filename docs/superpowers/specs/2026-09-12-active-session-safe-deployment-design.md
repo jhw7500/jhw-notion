@@ -302,9 +302,16 @@ global links, or TUI configuration.
    For managed wiring, verify existing wiring and candidate Codex topology
    before pointer publication. For initial/refresh wiring, record bounded exact
    known-path preimages in private `before.json` before the first mutation.
-5. Publish the immutable activation and `current` pointer. First migration also
-   installs the stable bootstrap and invokes a fresh wiring worker that inherits
-   the actual deploy and exclusive-admission file descriptions.
+5. Fsync a bounded destination activation record into the deployment journal,
+   then publish the immutable activation and `current` pointer. A failure after
+   pointer rename is recoverable only when the observed destination and recorded
+   predecessor match that durable intent. First migration also installs the stable
+   bootstrap and invokes a fresh wiring worker that inherits the actual deploy and
+   exclusive-admission file descriptions. The bootstrap imports descriptor-read,
+   manifest-bound helper bytes; each selected MCP/control/hook artifact remains
+   open and is identity-checked immediately before spawn. Owned HOME symlinks are
+   removed only through the same-parent capture transaction so a raced foreign
+   replacement is preserved.
 6. Close exclusive admission while retaining deployment serialization. Invoke a
    fresh validation worker with only the deploy descriptor: exact host contract
    v5, Guard preflight, then a managed MCP initialize/initialized/tools-list

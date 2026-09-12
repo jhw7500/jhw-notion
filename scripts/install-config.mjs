@@ -1039,12 +1039,20 @@ function finalizeCodexHooksTransaction() {
 }
 
 function expectedControlHookTarget() {
-  const legacy = path.join(path.resolve(repositoryRoot), "scripts", "jhw-control-hook");
-  const managed = path.join(path.resolve(repositoryRoot), ".jhw-runtime/bootstrap/jhw-runtime-hook");
-  const expected = mcpEntry === managed ? managed : legacy;
-  if (mcpEntry === managed) validateBootstrap({ repositoryRoot: path.resolve(repositoryRoot) });
-  if (path.basename(configFile) !== "jhw-control-hook" || mcpEntry !== expected) {
-    throw new Error("control hook link transaction is restricted to the exact repository launcher");
+  const root = path.resolve(repositoryRoot);
+  const expected = path.resolve(mcpEntry);
+  const live = path.resolve(configFile);
+  const home = path.resolve(process.env.HOME ?? "");
+  const relative = path.relative(home, live);
+  const allowed = relative === ".local/bin/jhw-control" || relative === ".local/bin/jhw-control-hook" ||
+    relative === ".claude/commands/jhw" || relative === ".gemini/commands/jhw" ||
+    relative === ".config/opencode/skills/jhw" || relative === ".codex/commands/jhw" ||
+    /^\.codex\/skills\/jhw-[^/]+$/.test(relative) || /^\.codex\/prompts\/[^/]+\.md$/.test(relative);
+  if (!allowed || expected !== mcpEntry || !isOwnedEntryPath(expected)) {
+    throw new Error("owned link transaction is restricted to an exact repository source and supported HOME target");
+  }
+  if (expected.startsWith(path.join(root, ".jhw-runtime/bootstrap") + path.sep)) {
+    validateBootstrap({ repositoryRoot: root });
   }
   return expected;
 }

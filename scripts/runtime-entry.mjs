@@ -4,7 +4,7 @@ import path from 'node:path';
 import { constants as osConstants } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 
 const C = fs.constants;
 const FILES = ['jhw-runtime-control', 'jhw-runtime-entry', 'jhw-runtime-hook', 'runtime-entry.mjs', 'runtime-safety.mjs', 'runtime-store.mjs'];
@@ -59,6 +59,29 @@ function read(directory,name,requiredMode,maximum=1024*1024) {
     if(fs.readSync(fd,Buffer.alloc(1),0,1,null)!==0 || !same(before,fs.fstatSync(fd,{bigint:true})) || !same(before,fs.lstatSync(location,{bigint:true}))) fail();
     directory.verify(); return bytes;
   } finally { fs.closeSync(fd); }
+}
+
+function openArtifact(repositoryRoot, releaseId, relativeName) {
+  const manifest=releaseManifest(repositoryRoot,releaseId);
+  const record=manifest.entries.find(entry=>entry.path===relativeName);
+  if(!record || record.type!=='file') fail('DEPLOY_RELEASE_INVALID');
+  const directory=new Directory(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,path.dirname(relativeName)));
+  let fd;
+  try {
+    const location=directory.at(path.basename(relativeName));
+    fd=fs.openSync(location,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);
+    const before=fs.fstatSync(fd,{bigint:true});
+    if(!before.isFile() || before.uid!==BigInt(process.getuid()) || before.nlink!==1n || (Number(before.mode)&0o7777)!==record.mode || before.size>128n*1024n*1024n) fail('DEPLOY_RELEASE_INVALID');
+    const digest=createHash('sha256'); const buffer=Buffer.alloc(64*1024); let total=0;
+    for(;;) { const count=fs.readSync(fd,buffer,0,buffer.length,null); if(!count) break; total+=count; if(total>128*1024*1024) fail('DEPLOY_RELEASE_INVALID'); digest.update(buffer.subarray(0,count)); }
+    if(digest.digest('hex')!==record.sha256 || !same(before,fs.fstatSync(fd,{bigint:true})) || !same(before,fs.lstatSync(location,{bigint:true}))) fail('DEPLOY_RELEASE_INVALID');
+    directory.verify();
+    const named=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,relativeName);
+    return {fd,verify:()=>{
+      if(!same(before,fs.fstatSync(fd,{bigint:true})) || !same(before,fs.lstatSync(named,{bigint:true}))) fail('DEPLOY_RELEASE_CHANGED');
+    }};
+  } catch(error) { if(fd!==undefined) fs.closeSync(fd); throw error; }
+  finally { directory.close(); }
 }
 
 function canonical(value) {
@@ -219,38 +242,97 @@ function failure(selector,args,code) {
   else result={hookSpecificOutput:{hookEventName:event,permissionDecision:'deny',permissionDecisionReason:code},systemMessage:code};
   process.stdout.write(JSON.stringify(result)+'\n'); return 0;
 }
-export async function runManaged({repositoryRoot,selector,args=[]}) {
-  let lease;
+
+const HOOK_RUNNER_SOURCE=String.raw`
+const {spawn}=require('node:child_process');
+const args=process.argv.slice(1); const event=args[3];
+const exact=(value,keys)=>value!==null && typeof value==='object' && !Array.isArray(value) && Object.keys(value).sort().join(',')===[...keys].sort().join(',');
+const fallback=()=>{
+  const code='GUARD_UNAVAILABLE'; let value;
+  if(event==='SessionEnd') value={};
+  else if(event==='PostToolUse') value={systemMessage:code};
+  else if(event==='UserPromptSubmit') value={hookSpecificOutput:{hookEventName:event,additionalContext:code},systemMessage:code};
+  else value={hookSpecificOutput:{hookEventName:'PreToolUse',permissionDecision:'deny',permissionDecisionReason:code},systemMessage:code};
+  process.stdout.write(JSON.stringify(value)+'\n');
+};
+const validate=bytes=>{
+  if(bytes.length===0 || bytes.length>12*1024) return;
+  let value; try { value=JSON.parse(bytes.toString('utf8')); } catch { return; }
+  const hook=value?.hookSpecificOutput; let valid=false;
+  if(event==='PreToolUse' && hook?.hookEventName==='PreToolUse') {
+    valid=exact(value,['hookSpecificOutput']) && exact(hook,['hookEventName']);
+    if(hook.permissionDecision==='deny') valid=exact(value,['hookSpecificOutput','systemMessage']) && exact(hook,['hookEventName','permissionDecision','permissionDecisionReason']) && typeof hook.permissionDecisionReason==='string' && hook.permissionDecisionReason.length>0 && typeof value.systemMessage==='string' && value.systemMessage.length>0;
+  } else if(event==='UserPromptSubmit') valid=exact(value,['hookSpecificOutput','systemMessage']) && exact(hook,['hookEventName','additionalContext']) && hook.hookEventName===event && typeof hook.additionalContext==='string' && hook.additionalContext.length>0 && typeof value.systemMessage==='string' && value.systemMessage.length>0;
+  else if(event==='PostToolUse') valid=exact(value,['systemMessage']) && typeof value.systemMessage==='string' && value.systemMessage.length>0;
+  else if(event==='SessionEnd') valid=exact(value,[]);
+  if(!valid) return;
+  const output=Buffer.from(JSON.stringify(value)+'\n'); return output.length<=12*1024 ? output : undefined;
+};
+let child; let timer; let killTimer; let settled=false; let overflow=false; let length=0; const chunks=[];
+const finish=(code,signal)=>{
+  if(settled) return; settled=true; clearTimeout(timer); clearTimeout(killTimer);
+  const output=!overflow && code===0 && signal===null ? validate(Buffer.concat(chunks,length)) : undefined;
+  if(output) process.stdout.write(output); else fallback();
+};
+try { child=spawn(process.execPath,['/proc/self/fd/4',...args],{stdio:['inherit','pipe','inherit',3,4]}); }
+catch { fallback(); process.exit(0); }
+child.stdout.on('data',chunk=>{ if(overflow) return; length+=chunk.length; if(length>12*1024) { overflow=true; chunks.length=0; child.kill('SIGTERM'); } else chunks.push(chunk); });
+child.stdout.on('error',()=>{ overflow=true; child.kill('SIGTERM'); });
+child.once('error',()=>finish(null,null)); child.once('close',finish);
+timer=setTimeout(()=>{ child.kill('SIGTERM'); if(event==='SessionEnd') killTimer=setTimeout(()=>child.kill('SIGKILL'),200); },event==='SessionEnd' ? 2000 : 8000);
+`;
+
+function runPinnedHook({args,artifact,lease}) {
+  return new Promise(resolve=>{
+    let child;
+    try {
+      artifact.verify();
+      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd]});
+      fs.closeSync(artifact.fd); artifact.fd=undefined;
+    } catch { if(artifact.fd!==undefined) { fs.closeSync(artifact.fd); artifact.fd=undefined; } resolve(failure('hook',args,'GUARD_UNAVAILABLE')); return; }
+    child.once('error',()=>resolve(failure('hook',args,'GUARD_UNAVAILABLE')));
+    child.once('exit',(code,signal)=>resolve(code===0 && signal===null ? 0 : failure('hook',args,'GUARD_UNAVAILABLE')));
+  });
+}
+
+export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseId,safetySource,storeSource}) {
+  let lease; const artifacts=[];
   try {
     if(!['mcp','control','hook'].includes(selector)) fail('DEPLOY_SELECTOR_INVALID');
     if(!Array.isArray(args) || args.some(value=>typeof value!=='string' || value.includes('\0'))) fail('DEPLOY_SELECTOR_INVALID');
     if(selector==='hook' && (args.length!==4 || args[0]!=='--adapter' || !['claude','codex'].includes(args[1]) || args[2]!=='--event' || !['PreToolUse','PostToolUse','UserPromptSubmit','SessionEnd'].includes(args[3]))) return failure(selector,args,'GUARD_PROTOCOL_MISMATCH');
     const validated=validateBootstrap({repositoryRoot});
-    const helpers=path.join(repositoryRoot,'.jhw-runtime/releases',validated.sourceReleaseId,'scripts');
-    // This entry module must belong to the exact generation chosen by the root
-    // verifier. A replacement while importing it is a refusal, never a restart
-    // through a mutable path or a mixture of cached helper generations.
-    if(fileURLToPath(import.meta.url)!==path.join(helpers,'runtime-entry.mjs')) fail('DEPLOY_BOOTSTRAP_CHANGED');
-    const safety=await import(pathToFileURL(path.join(helpers,'runtime-safety.mjs')));
+    if(sourceReleaseId!==validated.sourceReleaseId || !Buffer.isBuffer(safetySource) || !Buffer.isBuffer(storeSource)) fail('DEPLOY_BOOTSTRAP_CHANGED');
+    const byName=new Map(validated.files.map(record=>[record.name,record]));
+    if(hash(safetySource)!==byName.get('runtime-safety.mjs')?.sha256 || hash(storeSource)!==byName.get('runtime-store.mjs')?.sha256) fail('DEPLOY_BOOTSTRAP_CHANGED');
+    const moduleUrl=bytes=>`data:text/javascript;base64,${Buffer.from(bytes).toString('base64')}`;
+    const safetyUrl=moduleUrl(safetySource);
+    const safety=await import(safetyUrl);
     try { lease=safety.acquireLease(path.join(repositoryRoot,'.jhw-runtime/admission.lock'),{shared:true}); }
     catch(error) { if(error.code==='DEPLOY_LOCK_CONTENDED') fail('DEPLOY_MAINTENANCE'); throw error; }
     // Admission now prevents a cooperating maintenance writer from replacing
     // bootstrap. Revalidate before importing store or resolving current.
     if(canonical(validateBootstrap({repositoryRoot}))!==canonical(validated)) fail('DEPLOY_BOOTSTRAP_CHANGED');
-    const store=await import(pathToFileURL(path.join(helpers,'runtime-store.mjs')));
+    const storeText=new TextDecoder('utf-8',{fatal:true}).decode(storeSource);
+    const safetySpecifier="'./runtime-safety.mjs'";
+    if(storeText.split(safetySpecifier).length!==2) fail('DEPLOY_BOOTSTRAP_CHANGED');
+    const store=await import(moduleUrl(Buffer.from(storeText.replace(safetySpecifier,JSON.stringify(safetyUrl)))));
     const activation=store.readActivation({repositoryRoot});
     if(!activation) fail('DEPLOY_NO_CURRENT');
     const release=path.join(repositoryRoot,'.jhw-runtime/releases',activation.releaseId);
-    const target=path.join(release, selector==='mcp' ? 'mcp-server/dist/index.js' : selector==='control' ? 'mcp-server/dist/control/cli.js' : 'scripts/jhw-control-hook');
-    const command=selector==='hook' ? target : process.execPath;
-    const childArgs=selector==='hook' ? args : [target,...args];
+    const target=path.join(release, selector==='mcp' ? 'mcp-server/dist/index.js' : selector==='control' ? 'mcp-server/dist/control/cli.js' : 'mcp-server/dist/control/hook-adapter.js');
+    const relative=path.relative(release,target); artifacts.push(openArtifact(repositoryRoot,activation.releaseId,relative));
+    if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease});
+    const command=process.execPath; const childArgs=[`/proc/self/fd/4`,...args];
     return await new Promise((resolve,reject)=>{
       // fd 3 is inherited through Node, Bash, timeout, and core. Closing the
       // supervisor's fd never unlocks the child's open-file description.
-      const child=spawn(command,childArgs,{stdio:['inherit','inherit','inherit',lease.fd]});
+      for(const artifact of artifacts) artifact.verify();
+      const child=spawn(command,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd)]});
+      for(const artifact of artifacts.splice(0)) fs.closeSync(artifact.fd);
       child.once('error',()=>reject(Object.assign(new Error('DEPLOY_START_FAILED'),{code:'DEPLOY_START_FAILED'})));
       child.once('exit',(code,signal)=>resolve(code ?? (128+(osConstants.signals[signal] ?? 1))));
     });
   } catch(error) { return failure(selector,args,typeof error.code==='string' && /^DEPLOY_[A-Z_]{1,56}$/.test(error.code) ? error.code : 'DEPLOY_START_FAILED'); }
-  finally { lease?.close(); }
+  finally { for(const artifact of artifacts) if(artifact.fd!==undefined) fs.closeSync(artifact.fd); lease?.close(); }
 }

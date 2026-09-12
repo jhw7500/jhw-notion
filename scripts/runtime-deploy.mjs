@@ -281,8 +281,21 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    if(command.operation!=='rollback'||abandoned.length!==1)fail('DEPLOY_RECOVERY_REQUIRED');
    const recoveryDirectory=path.join(runtime,abandoned[0]);const prior=privateRead(path.join(recoveryDirectory,'state.json'));
    if(!prior.previous)fail('DEPLOY_PREDECESSOR_INVALID');
-   if(prior.operation!=='activate'||!['validation_failed','recovery_blocked','validate','finalize'].includes(prior.phase)||JSON.stringify(prior.current)!==JSON.stringify(previous)||previous?.predecessorActivationId!==prior.previous.activationId)fail('DEPLOY_RECOVERY_REQUIRED');
-   recovery={directory:recoveryDirectory,state:prior};
+   const destination=prior.destination;
+   const validDestination=destination && Object.keys(destination).sort().join(',')==='activationId,predecessorActivationId,releaseId' &&
+     /^a-[a-f0-9]{32}$/.test(destination.activationId) && RELEASE.test(destination.releaseId) &&
+     (destination.predecessorActivationId===null || /^a-[a-f0-9]{32}$/.test(destination.predecessorActivationId));
+   const atOrigin=JSON.stringify(previous)===JSON.stringify(prior.previous);
+   const atDestination=validDestination && previous?.activationId===destination.activationId && previous.releaseId===destination.releaseId && previous.predecessorActivationId===destination.predecessorActivationId;
+   if(prior.phase==='pointer_intent' && validDestination && (atOrigin || atDestination)) {
+    if(atOrigin || prior.operation==='rollback') {
+     prior.status='complete';prior.phase='complete';prior.recovery=atOrigin?'pointer_not_published':'pointer_published';checkpoint(recoveryDirectory,prior);
+     if(prior.operation==='activate' || atDestination) return {code:'DEPLOY_ROLLED_BACK',previousReleaseId:previous?.releaseId??null,releaseId:previous?.releaseId??null,predecessorAvailable:previous?.predecessorActivationId!==null&&previous!==null,inventory:{before,after},unprotected:false};
+    } else recovery={directory:recoveryDirectory,state:prior};
+   } else {
+    if(prior.operation!=='activate'||!['validation_failed','recovery_blocked','validate','finalize'].includes(prior.phase)||JSON.stringify(prior.current)!==JSON.stringify(previous)||previous?.predecessorActivationId!==prior.previous.activationId)fail('DEPLOY_RECOVERY_REQUIRED');
+    recovery={directory:recoveryDirectory,state:prior};
+   }
   }
   const wiringFile=path.join(runtime,'wiring.json');
   const wiringPreviouslyInstalled = exists(wiringFile) && privateRead(wiringFile).installed === true;
@@ -293,6 +306,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   directory=createPrivateDirectory(runtime,`.deploy.${randomBytes(16).toString('hex')}`);
   state={version:1,status:'pending',operation:command.operation,phase:'before_mutation',previous,variables:{}};checkpoint(directory,state);
   const run=async phase=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs});};
+  const pointerIntent=destination=>{state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);};
   let current=previous;
   if(managed&&command.operation!=='uninstall') {
    await run('verify');
@@ -307,8 +321,8 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    state.mutationStarted=true;checkpoint(directory,state);
    if(command.operation==='activate') {
     if(!managed)await installBootstrap({repositoryRoot,releaseId:command.releaseId});else validateBootstrap({repositoryRoot});
-    current=publishActivation({repositoryRoot,releaseId:command.releaseId,expectedCurrent:previous});
-   } else {validateBootstrap({repositoryRoot});current=rollbackActivation({repositoryRoot,expectedCurrent:previous});}
+    current=publishActivation({repositoryRoot,releaseId:command.releaseId,expectedCurrent:previous,onPointerIntent:pointerIntent});
+   } else {validateBootstrap({repositoryRoot});current=rollbackActivation({repositoryRoot,expectedCurrent:previous,onPointerIntent:pointerIntent});}
    state.current=current;checkpoint(directory,state);
    if (!managed) {
     managed = true;

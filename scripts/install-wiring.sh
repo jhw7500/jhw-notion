@@ -98,24 +98,19 @@ install_control_cli() {
 
   mkdir -p "$(dirname "$CONTROL_LINK")"
   if [ -e "$CONTROL_LINK" ] || [ -L "$CONTROL_LINK" ]; then
-    if is_repo_owned_symlink "$CONTROL_LINK"; then
-      rm -- "$CONTROL_LINK"
-    else
-      fail "$CONTROL_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
-      exit 1
+    if [ -L "$CONTROL_LINK" ] && [ "$(readlink -- "$CONTROL_LINK" 2>/dev/null)" = "$CONTROL_ENTRY" ]; then
+      skip "$CONTROL_LINK 이미 최신"
+      return
     fi
+    fail "$CONTROL_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
+    exit 1
   fi
   ln -s "$CONTROL_ENTRY" "$CONTROL_LINK"
   ok "$CONTROL_LINK → $CONTROL_ENTRY"
 }
 
 uninstall_control_cli() {
-  if is_repo_owned_symlink "$CONTROL_LINK"; then
-    rm -- "$CONTROL_LINK"
-    ok "$CONTROL_LINK 심링크 제거"
-  elif [ -e "$CONTROL_LINK" ] || [ -L "$CONTROL_LINK" ]; then
-    skip "$CONTROL_LINK 는 이 저장소 소유가 아니므로 보존"
-  fi
+  remove_owned_link_transaction "$CONTROL_LINK" "$CONTROL_ENTRY" "$CONTROL_LINK"
 }
 
 HOOK_LINK_CREATED=0
@@ -324,6 +319,27 @@ remove_control_hook_link_transaction() {
     report_control_hook_link_transaction
     return 1
   fi
+}
+
+remove_owned_link_transaction() {
+  local target="$1" source="$2" label="$3" previous_link previous_entry outcome
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then return 0; fi
+  previous_link="$CONTROL_HOOK_LINK"
+  previous_entry="$CONTROL_HOOK_ENTRY"
+  CONTROL_HOOK_LINK="$target"
+  CONTROL_HOOK_ENTRY="$source"
+  if ! reject_stale_control_hook_link_transactions || ! remove_control_hook_link_transaction; then
+    CONTROL_HOOK_LINK="$previous_link"
+    CONTROL_HOOK_ENTRY="$previous_entry"
+    return 1
+  fi
+  outcome="$CONTROL_HOOK_LINK_REMOVE_OUTCOME"
+  CONTROL_HOOK_LINK="$previous_link"
+  CONTROL_HOOK_ENTRY="$previous_entry"
+  case "$outcome" in
+    removed) ok "$label 심링크 제거" ;;
+    foreign) skip "$label 는 이 저장소 소유가 아니므로 보존" ;;
+  esac
 }
 
 allocate_hook_transaction() {
@@ -631,12 +647,12 @@ install_owned_symlink() {
   local label="$3"
   mkdir -p "$(dirname "$target")"
   if [ -e "$target" ] || [ -L "$target" ]; then
-    if is_repo_owned_symlink "$target"; then
-      rm -- "$target"
-    else
-      fail "$label 대상이 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
-      exit 1
+    if [ -L "$target" ] && [ "$(readlink -- "$target" 2>/dev/null)" = "$source" ]; then
+      skip "$label 이미 최신"
+      return
     fi
+    fail "$label 대상이 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
+    exit 1
   fi
   ln -s -- "$source" "$target"
   ok "$label 심링크 설치"
@@ -644,13 +660,9 @@ install_owned_symlink() {
 
 uninstall_owned_symlink() {
   local target="$1"
-  local label="$2"
-  if is_repo_owned_symlink "$target"; then
-    rm -- "$target"
-    ok "$label 심링크 제거"
-  elif [ -e "$target" ] || [ -L "$target" ]; then
-    skip "$label 는 이 저장소 소유가 아니므로 보존"
-  fi
+  local source="$2"
+  local label="$3"
+  remove_owned_link_transaction "$target" "$source" "$label"
 }
 
 run_config_editor() {
@@ -1132,10 +1144,8 @@ if [ -d "$CODEX_DIR" ]; then
   # (~/.codex/commands/*.toml은 스캔하지 않으므로 예전 TOML 배선은 제거한다.)
   LEGACY="$CODEX_DIR/commands/jhw"
   if [ -e "$LEGACY" ] || [ -L "$LEGACY" ]; then
-    if is_repo_owned_symlink "$LEGACY"; then
-      rm -- "$LEGACY"
-      ok "Codex: 소유한 legacy commands/jhw 배선 제거"
-    else
+    remove_owned_link_transaction "$LEGACY" "$SKILL_ROOT/claude" "Codex: legacy commands/jhw 배선" || exit 1
+    if [ -e "$LEGACY" ] || [ -L "$LEGACY" ]; then
       fail "Codex legacy commands/jhw가 외부 파일/링크이므로 보존하고 설치를 중단합니다."
       exit 1
     fi
@@ -1148,12 +1158,12 @@ if [ -d "$CODEX_DIR" ]; then
     NAME="$(basename "$SRC")"
     TARGET="$CODEX_DIR/skills/$NAME"
     if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
-      if is_repo_owned_symlink "$TARGET"; then
-        rm -- "$TARGET"
-      else
-        fail "Codex 스킬 이름 충돌을 보존하기 위해 설치를 중단합니다."
-        exit 1
+      if [ -L "$TARGET" ] && [ "$(readlink -- "$TARGET" 2>/dev/null)" = "$SRC" ]; then
+        LINKED=$((LINKED + 1))
+        continue
       fi
+      fail "Codex 스킬 이름 충돌을 보존하기 위해 설치를 중단합니다."
+      exit 1
     fi
     ln -s -- "$SRC" "$TARGET"
     LINKED=$((LINKED + 1))
@@ -1169,12 +1179,12 @@ if [ -d "$CODEX_DIR" ]; then
     [ "$NAME" = "AGENTS.md" ] && continue
     TARGET="$CODEX_DIR/prompts/$NAME"
     if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
-      if is_repo_owned_symlink "$TARGET"; then
-        rm -- "$TARGET"
-      else
-        fail "Codex 프롬프트 이름 충돌을 보존하기 위해 설치를 중단합니다."
-        exit 1
+      if [ -L "$TARGET" ] && [ "$(readlink -- "$TARGET" 2>/dev/null)" = "$SRC" ]; then
+        PLINKED=$((PLINKED + 1))
+        continue
       fi
+      fail "Codex 프롬프트 이름 충돌을 보존하기 위해 설치를 중단합니다."
+      exit 1
     fi
     ln -s -- "$SRC" "$TARGET"
     PLINKED=$((PLINKED + 1))
@@ -1264,32 +1274,33 @@ uninstall_wiring() {
   uninstall_control_cli
 
   echo "[3/4] 스킬 심링크 제거"
-  uninstall_owned_symlink "$HOME/.claude/commands/jhw" "Claude jhw"
-  uninstall_owned_symlink "$HOME/.gemini/commands/jhw" "Gemini jhw"
-  uninstall_owned_symlink "$HOME/.config/opencode/skills/jhw" "OpenCode jhw"
-  uninstall_owned_symlink "$HOME/.codex/commands/jhw" "Codex legacy jhw"
+  uninstall_owned_symlink "$HOME/.claude/commands/jhw" "$SKILL_ROOT/claude" "Claude jhw"
+  uninstall_owned_symlink "$HOME/.gemini/commands/jhw" "$SKILL_ROOT/claude" "Gemini jhw"
+  uninstall_owned_symlink "$HOME/.config/opencode/skills/jhw" "$SKILL_ROOT/claude" "OpenCode jhw"
+  uninstall_owned_symlink "$HOME/.codex/commands/jhw" "$SKILL_ROOT/claude" "Codex legacy jhw"
 
   # Codex prompts는 평평한 디렉토리라 파일별 심링크로 깔려 있다.
   # 이 저장소를 가리키는 것만 제거하고 남의 프롬프트는 건드리지 않는다.
   # readlink -f는 BSD(macOS)에 없다. 우리가 만든 링크는 항상 절대 경로라 -f가 필요 없다.
   # 이 저장소를 가리키는 링크만 제거하고 남의 프롬프트/스킬은 건드리지 않는다.
   removed=0
-  for link in "$HOME/.codex/prompts"/*.md; do
+  for source in "$SKILL_ROOT"/claude/*.md; do
+    [ -f "$source" ] || continue
+    [ "$(basename "$source")" = "AGENTS.md" ] && continue
+    link="$HOME/.codex/prompts/$(basename "$source")"
     [ -L "$link" ] || continue
-    if is_repo_owned_symlink "$link"; then
-      rm -- "$link"
-      removed=$((removed + 1))
-    fi
+    remove_owned_link_transaction "$link" "$source" "Codex prompt $(basename "$source")" || exit 1
+    [ "$CONTROL_HOOK_LINK_REMOVE_OUTCOME" = "removed" ] && removed=$((removed + 1))
   done
   [ "$removed" -gt 0 ] && ok "$HOME/.codex/prompts 심링크 ${removed}개 제거"
 
   removed=0
-  for link in "$HOME/.codex/skills"/jhw-*; do
+  for source in "$SKILL_ROOT"/codex/jhw-*; do
+    [ -d "$source" ] || continue
+    link="$HOME/.codex/skills/$(basename "$source")"
     [ -L "$link" ] || continue
-    if is_repo_owned_symlink "$link"; then
-      rm -- "$link"
-      removed=$((removed + 1))
-    fi
+    remove_owned_link_transaction "$link" "$source" "Codex skill $(basename "$source")" || exit 1
+    [ "$CONTROL_HOOK_LINK_REMOVE_OUTCOME" = "removed" ] && removed=$((removed + 1))
   done
   [ "$removed" -gt 0 ] && ok "$HOME/.codex/skills 심링크 ${removed}개 제거"
 

@@ -81,6 +81,32 @@ test('later validation failure retains evidence and explicit gated rollback rest
   assert.equal((await f.run(['--status'])).recoveryPending, 0);
   assert.deepEqual(fs.readFileSync(path.join(f.root, '.jhw-runtime/bootstrap/manifest.json')), bootstrapBefore);
 });
+
+test('pointer replacement failure before readback retains a rollback destination', async t => {
+  const f=fixture(t); host(f);
+  const first=await f.run(['--prepare']); await f.run(['--activate',first.releaseId]);
+  write(f.root,'mcp-server/src/index.ts','export const pointerFailure=1;');
+  const second=await f.run(['--prepare']);
+  const realRename=fs.renameSync; const realFsync=fs.fsyncSync; let replaced=false; let injected=false;
+  fs.renameSync=function(source,destination,...rest) {
+    const result=realRename.call(this,source,destination,...rest);
+    if(path.basename(String(destination))==='current') replaced=true;
+    return result;
+  };
+  fs.fsyncSync=function(fd,...rest) {
+    let descriptor=''; try { descriptor=fs.readlinkSync(`/proc/self/fd/${fd}`); } catch {}
+    if(replaced&&!injected&&descriptor===path.join(f.root,'.jhw-runtime')) { injected=true; throw new Error('injected pointer directory fsync failure'); }
+    return realFsync.call(this,fd,...rest);
+  };
+  try { await assert.rejects(f.run(['--activate',second.releaseId])); }
+  finally { fs.renameSync=realRename; fs.fsyncSync=realFsync; }
+  assert.equal(injected,true);
+  assert.equal(readActivation({repositoryRoot:f.root}).releaseId,second.releaseId);
+  assert.equal((await f.run(['--status'])).recoveryPending,1);
+  await f.run(['--rollback']);
+  assert.equal(readActivation({repositoryRoot:f.root}).releaseId,first.releaseId);
+  assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
 test('failed rollback validation requires manual recovery instead of another rollback', async t => {
   const f = fixture(t);
   host(f);

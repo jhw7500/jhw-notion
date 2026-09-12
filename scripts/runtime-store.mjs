@@ -461,7 +461,7 @@ function checkCurrent(runtime, repositoryRoot, expectedCurrent) {
   if (canonical(actual) !== canonical(expectedCurrent)) fail('DEPLOY_CURRENT_CHANGED');
   return actual;
 }
-function switchPointer(runtime, repositoryRoot, activationId, expectedCurrent) {
+function switchPointer(runtime, repositoryRoot, activationId, expectedCurrent, onPointerIntent) {
   const temporary = `.current.${randomBytes(16).toString('hex')}`;
   let created = false;
   try {
@@ -469,6 +469,8 @@ function switchPointer(runtime, repositoryRoot, activationId, expectedCurrent) {
     fs.symlinkSync(`activations/${activationId}`, runtime.at(temporary)); created = true;
     runtime.verify();
     if (canonical(observation(runtime)) !== canonical(expectedCurrent?.observation ?? null)) fail('DEPLOY_CURRENT_CHANGED');
+    const destination=activationIn(runtime,repositoryRoot,activationId);
+    onPointerIntent?.({activationId:destination.activationId,releaseId:destination.releaseId,predecessorActivationId:destination.predecessorActivationId});
     fs.renameSync(runtime.at(temporary), runtime.at('current')); created = false;
     fs.fsyncSync(runtime.fd);
     const result = currentIn(runtime, repositoryRoot);
@@ -478,7 +480,7 @@ function switchPointer(runtime, repositoryRoot, activationId, expectedCurrent) {
     if (created) { runtime.verify(); fs.unlinkSync(runtime.at(temporary)); }
   }
 }
-export function publishActivation({ repositoryRoot, releaseId, expectedCurrent }) {
+export function publishActivation({ repositoryRoot, releaseId, expectedCurrent, onPointerIntent }) {
   return withStore(repositoryRoot, false, runtime => {
     if (!runtime) fail('DEPLOY_RELEASE_INVALID');
     checkCurrent(runtime, repositoryRoot, expectedCurrent);
@@ -498,7 +500,7 @@ export function publishActivation({ repositoryRoot, releaseId, expectedCurrent }
       stage.close(); stage = null;
       fs.fsyncSync(activations.fd);
       activationIn(runtime, repositoryRoot, activationId);
-      return switchPointer(runtime, repositoryRoot, activationId, expectedCurrent);
+      return switchPointer(runtime, repositoryRoot, activationId, expectedCurrent, onPointerIntent);
     } finally {
       if (stage) {
         try { stage.verify(); fs.rmSync(runtime.at(stageName), { recursive: true }); } catch { /* Preserve untrusted evidence. */ }
@@ -508,7 +510,7 @@ export function publishActivation({ repositoryRoot, releaseId, expectedCurrent }
     }
   });
 }
-export function rollbackActivation({ repositoryRoot, expectedCurrent }) {
+export function rollbackActivation({ repositoryRoot, expectedCurrent, onPointerIntent }) {
   return withStore(repositoryRoot, false, runtime => {
     const current = checkCurrent(runtime, repositoryRoot, expectedCurrent);
     if (!current?.predecessorActivationId) fail('DEPLOY_PREDECESSOR_INVALID');
@@ -516,6 +518,6 @@ export function rollbackActivation({ repositoryRoot, expectedCurrent }) {
     const predecessor = activationIn(runtime, repositoryRoot, current.predecessorActivationId);
     if (predecessor.releaseId !== manifest.priorCurrent.releaseId ||
         predecessor.predecessorActivationId !== manifest.priorCurrent.predecessorActivationId) fail('DEPLOY_PREDECESSOR_INVALID');
-    return switchPointer(runtime, repositoryRoot, current.predecessorActivationId, expectedCurrent);
+    return switchPointer(runtime, repositoryRoot, current.predecessorActivationId, expectedCurrent, onPointerIntent);
   });
 }
