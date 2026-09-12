@@ -318,6 +318,42 @@ describe("WorktreeManager", () => {
     );
   });
 
+  it("inspects an active mapped worktree after its original source checkout is removed", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const transientSource = join(fixture.root, "transient-source");
+    await git(repoDir, "worktree", "add", "--detach", transientSource, "HEAD");
+    const active = claim();
+    const created = await manager.createOrReuse(active, transientSource);
+
+    await git(repoDir, "worktree", "remove", transientSource);
+
+    await expect(manager.inspect(active)).resolves.toMatchObject({
+      path: created.path,
+      repository_path: repoDir,
+      worktree_ref: active.worktree_ref,
+      branch: active.branch,
+      dirty: false,
+    });
+  });
+
+  it("removes an active worktree after its original source checkout is removed", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const transientSource = join(fixture.root, "transient-source");
+    await git(repoDir, "worktree", "add", "--detach", transientSource, "HEAD");
+    const active = claim();
+    const created = await manager.createOrReuse(active, transientSource);
+
+    await git(repoDir, "worktree", "remove", transientSource);
+
+    await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true });
+    await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
+    const state = JSON.parse(await readFile(join(fixture.root, "state", "worktrees.json"), "utf8"));
+    expect(state.worktrees[active.worktree_ref]).toMatchObject({
+      repository_path: repoDir,
+      lifecycle: "removed",
+    });
+  });
+
   it("matches only the active Claim mapped to the exact current checkout", async () => {
     const { repoDir, manager } = await worktreeFixture();
     const active = claim();
