@@ -59,7 +59,9 @@ control/hook link 또는 지원 TUI 설정 파일이 하나라도 있으면 buil
 `.jhw-runtime/current/skills`를 가리킨다. 준비 단계는 세 selector마다 npm 실행 코드를
 단일 CJS bundle로 만들며, bootstrap은 manifest로 검증한 bundle inode를 descriptor로 고정해
 실행하고 그 뒤 built-in이 아닌 module load를 거부한다. 따라서 검사 뒤 release의 다른 JS나
-`node_modules`가 교체되어도 새 바이트를 불러오지 않는다. hook runner는 모든 이벤트에서
+`node_modules`가 교체되어도 새 바이트를 불러오지 않는다. control authorization에 쓰는 tool
+version도 build 시 package metadata에서 읽어 bundle bytes에 삽입하므로 실행 중 mutable
+`package.json`을 다시 읽지 않는다. hook runner는 모든 이벤트에서
 timeout 뒤 `SIGTERM`, 200 ms 뒤 `SIGKILL` 순으로 종료를 보장한다. 설치기는 다음 wiring을
 ownership proof와 기존 no-clobber transaction으로 생성한다.
 

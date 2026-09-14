@@ -335,7 +335,7 @@ test('default npm build and skill generation stay private with safe modes under 
     fs.mkdirSync('node_modules/.bin', { recursive: true });
     fs.writeFileSync('dist/index.js', 'export {};');
     for (const name of ['cli', 'hook-adapter']) fs.writeFileSync('dist/control/' + name + '.js', '#!/usr/bin/env node\\n', { mode: 0o755 });
-    fs.writeFileSync('node_modules/.bin/rolldown', '#!/bin/sh\\ninput="$1"\\nshift\\nwhile [ "$#" -gt 0 ]; do if [ "$1" = "--file" ]; then output="$2"; shift 2; else shift; fi; done\\ncp -- "$input" "$output"\\n', { mode: 0o755 });
+    fs.writeFileSync('node_modules/.bin/rolldown', '#!/bin/sh\\ninput="$1"\\nshift\\nargs="$*"\\nwhile [ "$#" -gt 0 ]; do if [ "$1" = "--file" ]; then output="$2"; shift 2; else shift; fi; done\\ncp -- "$input" "$output"\\nprintf "\\n// %s\\n" "$args" >> "$output"\\n', { mode: 0o755 });
     fs.chmodSync('node_modules/.bin/rolldown', 0o755);
   `);
   write(root, 'scripts/sync-codex-skills.mjs', "import fs from 'node:fs'; fs.mkdirSync(new URL('../skills/generated', import.meta.url)); fs.writeFileSync(new URL('../skills/generated/done', import.meta.url), 'generated');\n");
@@ -345,6 +345,10 @@ test('default npm build and skill generation stay private with safe modes under 
   finally { process.umask(old); }
   assert.equal(fs.readFileSync(path.join(releasePath(root, release), 'skills/generated/done'), 'utf8'), 'generated');
   assert.equal(fs.existsSync(path.join(releasePath(root, release), '.build-home')), false);
+  for (const name of ['mcp.cjs', 'control.cjs', 'hook.cjs']) {
+    const bundle=fs.readFileSync(path.join(releasePath(root, release), 'mcp-server/dist/runtime', name), 'utf8');
+    assert.match(bundle,/--transform\.define __JHW_BUNDLED_CONTROL_TOOL_VERSION__:"1\.0\.0"/);
+  }
   unchanged(root);
 });
 

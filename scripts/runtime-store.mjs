@@ -352,6 +352,11 @@ async function defaultBuild({ stagingRoot }) {
   const mcpRoot = path.join(stagingRoot, 'mcp-server');
   await run('npm', ['ci', '--no-audit', '--no-fund'], mcpRoot, env);
   await run('npm', ['run', 'build'], mcpRoot, env);
+  const packageMetadata = JSON.parse(fs.readFileSync(path.join(mcpRoot, 'package.json'), 'utf8'));
+  if (typeof packageMetadata.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(packageMetadata.version)) {
+    throw new DeploymentError('DEPLOY_BUILD_FAILED');
+  }
+  const controlVersionDefine = `__JHW_BUNDLED_CONTROL_TOOL_VERSION__:${JSON.stringify(packageMetadata.version)}`;
   const runtime = path.join(mcpRoot, 'dist/runtime');
   fs.mkdirSync(runtime, { recursive: true, mode: 0o755 });
   fs.chmodSync(runtime, 0o755);
@@ -362,7 +367,8 @@ async function defaultBuild({ stagingRoot }) {
     ['dist/control/hook-adapter.js', 'dist/runtime/hook.cjs', true],
   ]) {
     await run(bundler, [input, '--file', output, '--format', 'cjs', '--platform', 'node',
-      '--no-codeSplitting', '--minify', '--legalComments', 'none', '--logLevel', 'silent'], mcpRoot, env);
+      '--no-codeSplitting', '--minify', '--legalComments', 'none', '--logLevel', 'silent',
+      '--transform.define', controlVersionDefine], mcpRoot, env);
     fs.chmodSync(path.join(mcpRoot, output), executable ? 0o755 : 0o644);
   }
   await run(process.execPath, ['scripts/sync-codex-skills.mjs'], stagingRoot, env);

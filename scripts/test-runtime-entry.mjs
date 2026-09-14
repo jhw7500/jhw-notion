@@ -5,7 +5,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { acquireLease } from './runtime-safety.mjs';
 import { prepareRelease, publishActivation } from './runtime-store.mjs';
@@ -85,6 +85,22 @@ function hookFailure(event, code) {
   if (event === 'PostToolUse') return {systemMessage:code};
   if (event === 'UserPromptSubmit') return {hookSpecificOutput:{hookEventName:event,additionalContext:code},systemMessage:code};
   return {hookSpecificOutput:{hookEventName:'PreToolUse',permissionDecision:'deny',permissionDecisionReason:code},systemMessage:code};
+}
+
+function bundledControlVersion(t, version) {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'jhw-version-bundle-'));
+  fs.chmodSync(root,0o700); t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const input=path.join(root,'entry.mjs'); const output=path.join(root,'control.cjs');
+  const versionModule=pathToFileURL(path.join(source,'../mcp-server/src/control/version.ts')).href;
+  fs.writeFileSync(input,`import { CONTROL_TOOL_VERSION } from ${JSON.stringify(versionModule)}; process.stdout.write(CONTROL_TOOL_VERSION);\n`,{mode:0o600});
+  const bundler=path.join(source,'../mcp-server/node_modules/.bin/rolldown');
+  const result=spawnSync(bundler,[input,'--file',output,'--format','cjs','--platform','node','--no-codeSplitting',
+    '--minify','--logLevel','silent','--transform.define',`__JHW_BUNDLED_CONTROL_TOOL_VERSION__:${JSON.stringify(version)}`],
+    {encoding:'utf8',timeout:12000});
+  assert.equal(result.status,0,result.stderr);
+  const bytes=fs.readFileSync(output,'utf8');
+  assert.equal(bytes.includes('package.json'),false,'managed version bundle must not retain the metadata pathname');
+  return bytes;
 }
 
 // Break caught: bootstrap publication with missing/unverified helpers, or prepare replacing live bootstrap.
@@ -382,6 +398,28 @@ test('managed selector executes one pinned bundle after a non-entry dependency r
   const [status]=await p.done;
   assert.equal(status,0,p.error()); assert.equal(p.output(),'ORIGINAL');
   assert.equal(fs.existsSync(path.join(f.root,'replacement-dependency-executed')),false);
+});
+
+// Break caught: the admitted control bundle resolving its authorization version
+// from a mutable package.json pathname after the bundle descriptor was pinned.
+test('control authorization version stays pinned after package metadata replacement', async t => {
+  const readyName='control-version-ready'; const resumeName='control-version-resume';
+  const bundle=bundledControlVersion(t,'1.0.0');
+  const f=await fixture(t,undefined,undefined,{
+    'runtime-entry.mjs':(bytes,root)=>bytes.replace(
+      '    return await new Promise((resolve,reject)=>{',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    return await new Promise((resolve,reject)=>{`,
+    ),
+  },{bundleBody:bundle});
+  const ready=path.join(f.root,readyName); const resume=path.join(f.root,resumeName);
+  const p=start(f,'jhw-runtime-control',[]);
+  await until(()=>fs.existsSync(ready),'control version spawn pause');
+  const metadata=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/package.json');
+  fs.writeFileSync(`${metadata}.replacement`,JSON.stringify({version:'9.9.9',type:'module'}),{mode:0o644});
+  fs.renameSync(`${metadata}.replacement`,metadata);
+  fs.writeFileSync(resume,'go');
+  const [status]=await p.done;
+  assert.equal(status,0,p.error()); assert.equal(p.output(),'1.0.0');
 });
 
 // Break caught: a bundled dependency loader reaching back into mutable release

@@ -414,7 +414,9 @@ fsync한 뒤 atomic publish하고 directory를 fsync한다. foreign target/confi
 ownership은 그대로 보존하고 실패한다. bootstrap verifier는 no-follow descriptor로 읽어
 검증한 helper bytes 자체를 import하며, selected MCP/control/hook artifact는 열린 descriptor와
 현재 이름의 identity를 spawn 직전에 다시 대조한다. selector는 그 pinned bundle 하나만
-entry로 실행하고 이후 built-in 외 module load를 거부한다. hook timeout은 이벤트 종류와
+entry로 실행하고 이후 built-in 외 module load를 거부한다. control authorization tool version은
+private build stage의 package metadata에서 검증해 bundle bytes에 상수로 삽입하며 managed
+runtime은 release pathname의 `package.json`을 읽지 않는다. hook timeout은 이벤트 종류와
 무관하게 `SIGTERM` 뒤 200 ms grace가 지나면 `SIGKILL`로 승격한다. 모든 owned
 launcher/skill/prompt 제거는 같은 parent의 private capture transaction으로 수행해 검사 뒤
 바뀐 foreign replacement를 삭제하지 않는다. control/hook launcher transaction도 parent를
