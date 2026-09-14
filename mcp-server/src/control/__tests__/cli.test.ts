@@ -4470,8 +4470,10 @@ describe("managed deployment hook trust", () => {
     }
     const release = await store.prepareRelease({repositoryRoot:root, build:async ({stagingRoot}:{stagingRoot:string}) => {
       await mkdir(join(stagingRoot,"mcp-server/dist/control"),{recursive:true,mode:0o755});
+      await mkdir(join(stagingRoot,"mcp-server/dist/runtime"),{recursive:true,mode:0o755});
       await mkdir(join(stagingRoot,"mcp-server/node_modules"),{mode:0o755});
       for (const file of ["index.js","control/cli.js","control/hook-adapter.js"]) await writeFile(join(stagingRoot,"mcp-server/dist",file),'#!/usr/bin/env node\n',{mode:0o755});
+      for (const file of ["mcp.cjs","control.cjs","hook.cjs"]) await writeFile(join(stagingRoot,"mcp-server/dist/runtime",file),'#!/usr/bin/env node\n',{mode:file === "mcp.cjs" ? 0o644 : 0o755});
     }});
     await entry.installBootstrap({repositoryRoot:root,releaseId:release.releaseId});
     const selected = join(root,".jhw-runtime/releases",release.releaseId);
@@ -4481,7 +4483,7 @@ describe("managed deployment hook trust", () => {
     try {
       const inspect = async () => task3AdapterCoverage(await runCli(["guard","preflight"],makeCliDependencies({env:{HOME:fixture.home},codexRepositoryRoot:selected,claudeHookRuntime:task3ClaudeRuntime()}))).claude;
       expect((await inspect()).enforced).toBe(true);
-      for(const target of [join(root,".jhw-runtime/bootstrap/jhw-runtime-hook"),join(root,".jhw-runtime/bootstrap/manifest.json"),join(selected,"mcp-server/dist/control/hook-adapter.js"),join(selected,"scripts/runtime-entry.mjs")]) {
+      for(const target of [join(root,".jhw-runtime/bootstrap/jhw-runtime-hook"),join(root,".jhw-runtime/bootstrap/manifest.json"),join(selected,"mcp-server/dist/runtime/hook.cjs"),join(selected,"scripts/runtime-entry.mjs")]) {
         const bytes=await readFile(target);await writeFile(target,Buffer.concat([bytes,Buffer.from("tampered")]));
         expect((await inspect()).enforced).toBe(false);await writeFile(target,bytes);
       }

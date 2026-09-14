@@ -221,16 +221,16 @@ export function managedHookRelationship({repositoryRoot,releaseRoot}) {
   if(typeof releaseRoot!=='string') fail();
   const releaseId=path.basename(releaseRoot);
   if(!RELEASE.test(releaseId) || releaseRoot!==path.join(repositoryRoot,'.jhw-runtime/releases',releaseId)) fail();
-  let scripts; let control;
+  let scripts; let runtime;
   try {
-    scripts=new Directory(path.join(releaseRoot,'scripts')); control=new Directory(path.join(releaseRoot,'mcp-server/dist/control'));
+    scripts=new Directory(path.join(releaseRoot,'scripts')); runtime=new Directory(path.join(releaseRoot,'mcp-server/dist/runtime'));
     const selected=releaseManifest(repositoryRoot,releaseId);
-    for(const [directory,name,relative] of [[scripts,'jhw-control-hook','scripts/jhw-control-hook'],[control,'hook-adapter.js','mcp-server/dist/control/hook-adapter.js']]) {
+    for(const [directory,name,relative] of [[scripts,'jhw-control-hook','scripts/jhw-control-hook'],[runtime,'hook.cjs','mcp-server/dist/runtime/hook.cjs']]) {
       const record=selected.entries.find(entry=>entry.path===relative);
       if(!record || record.type!=='file' || !(record.mode&0o100) || hash(read(directory,name,record.mode,128*1024*1024))!==record.sha256) fail();
     }
-    return {sourceReleaseId:manifest.sourceReleaseId,releaseId,launcherPath:path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-hook'),wrapperPath:path.join(releaseRoot,'scripts/jhw-control-hook'),corePath:path.join(releaseRoot,'mcp-server/dist/control/hook-adapter.js')};
-  } finally { scripts?.close(); control?.close(); }
+    return {sourceReleaseId:manifest.sourceReleaseId,releaseId,launcherPath:path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-hook'),wrapperPath:path.join(releaseRoot,'scripts/jhw-control-hook'),corePath:path.join(releaseRoot,'mcp-server/dist/runtime/hook.cjs')};
+  } finally { scripts?.close(); runtime?.close(); }
 }
 function failure(selector,args,code) {
   if(selector!=='hook') { process.stderr.write(code+'\n'); return 75; }
@@ -243,9 +243,24 @@ function failure(selector,args,code) {
   process.stdout.write(JSON.stringify(result)+'\n'); return 0;
 }
 
+const MODULE_RUNNER_SOURCE=String.raw`
+const Module=require('node:module');
+const entry=process.argv[1]; const args=process.argv.slice(2);
+const builtins=new Set(Module.builtinModules.flatMap(name=>[name,'node:'+name]));
+const load=Module._load; let loadingEntry=true;
+Module._load=function(request,parent,isMain){
+  if(loadingEntry && request===entry) { loadingEntry=false; return load.apply(this,arguments); }
+  if(!builtins.has(request)) throw Object.assign(new Error('DEPLOY_EXTERNAL_MODULE_FORBIDDEN'),{code:'DEPLOY_EXTERNAL_MODULE_FORBIDDEN'});
+  return load.apply(this,arguments);
+};
+process.argv=[process.execPath,entry,...args];
+require(entry);
+`;
+
 const HOOK_RUNNER_SOURCE=String.raw`
 const {spawn}=require('node:child_process');
 const args=process.argv.slice(1); const event=args[3];
+const coreRunner=${JSON.stringify(MODULE_RUNNER_SOURCE)};
 const exact=(value,keys)=>value!==null && typeof value==='object' && !Array.isArray(value) && Object.keys(value).sort().join(',')===[...keys].sort().join(',');
 const fallback=()=>{
   const code='GUARD_UNAVAILABLE'; let value;
@@ -274,12 +289,12 @@ const finish=(code,signal)=>{
   const output=!overflow && code===0 && signal===null ? validate(Buffer.concat(chunks,length)) : undefined;
   if(output) process.stdout.write(output); else fallback();
 };
-try { child=spawn(process.execPath,['/proc/self/fd/4',...args],{stdio:['inherit','pipe','inherit',3,4]}); }
+try { child=spawn(process.execPath,['-e',coreRunner,'--','/proc/self/fd/4',...args],{stdio:['inherit','pipe','inherit',3,4]}); }
 catch { fallback(); process.exit(0); }
 child.stdout.on('data',chunk=>{ if(overflow) return; length+=chunk.length; if(length>12*1024) { overflow=true; chunks.length=0; child.kill('SIGTERM'); } else chunks.push(chunk); });
 child.stdout.on('error',()=>{ overflow=true; child.kill('SIGTERM'); });
 child.once('error',()=>finish(null,null)); child.once('close',finish);
-timer=setTimeout(()=>{ child.kill('SIGTERM'); if(event==='SessionEnd') killTimer=setTimeout(()=>child.kill('SIGKILL'),200); },event==='SessionEnd' ? 2000 : 8000);
+timer=setTimeout(()=>{ child.kill('SIGTERM'); killTimer=setTimeout(()=>child.kill('SIGKILL'),200); },event==='SessionEnd' ? 2000 : 8000);
 `;
 
 function runPinnedHook({args,artifact,lease}) {
@@ -320,10 +335,10 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
     const activation=store.readActivation({repositoryRoot});
     if(!activation) fail('DEPLOY_NO_CURRENT');
     const release=path.join(repositoryRoot,'.jhw-runtime/releases',activation.releaseId);
-    const target=path.join(release, selector==='mcp' ? 'mcp-server/dist/index.js' : selector==='control' ? 'mcp-server/dist/control/cli.js' : 'mcp-server/dist/control/hook-adapter.js');
+    const target=path.join(release, selector==='mcp' ? 'mcp-server/dist/runtime/mcp.cjs' : selector==='control' ? 'mcp-server/dist/runtime/control.cjs' : 'mcp-server/dist/runtime/hook.cjs');
     const relative=path.relative(release,target); artifacts.push(openArtifact(repositoryRoot,activation.releaseId,relative));
     if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease});
-    const command=process.execPath; const childArgs=[`/proc/self/fd/4`,...args];
+    const command=process.execPath; const childArgs=['-e',MODULE_RUNNER_SOURCE,'--',`/proc/self/fd/4`,...args];
     return await new Promise((resolve,reject)=>{
       // fd 3 is inherited through Node, Bash, timeout, and core. Closing the
       // supervisor's fd never unlocks the child's open-file description.

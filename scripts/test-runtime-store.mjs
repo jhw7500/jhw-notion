@@ -58,6 +58,9 @@ async function build({ stagingRoot }) {
   write(stagingRoot, 'mcp-server/dist/index.js', 'export const version = 1;\n');
   write(stagingRoot, 'mcp-server/dist/control/cli.js', '#!/usr/bin/env node\n', 0o755);
   write(stagingRoot, 'mcp-server/dist/control/hook-adapter.js', '#!/usr/bin/env node\n', 0o755);
+  write(stagingRoot, 'mcp-server/dist/runtime/mcp.cjs', 'exports.version = 1;\n');
+  write(stagingRoot, 'mcp-server/dist/runtime/control.cjs', '#!/usr/bin/env node\n', 0o755);
+  write(stagingRoot, 'mcp-server/dist/runtime/hook.cjs', '#!/usr/bin/env node\n', 0o755);
   write(stagingRoot, 'mcp-server/node_modules/example/bin.js', '#!/usr/bin/env node\n', 0o755);
   fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules/.bin'), { mode: 0o755 });
   fs.symlinkSync('../example/bin.js', path.join(stagingRoot, 'mcp-server/node_modules/.bin/example'));
@@ -137,6 +140,7 @@ test('missing credentials are allowed without dereferencing the credential sourc
 
 for (const [name, change] of [
   ['missing executable core', dir => fs.unlinkSync(path.join(dir, 'mcp-server/dist/control/cli.js'))],
+  ['missing pinned runtime bundle', dir => fs.unlinkSync(path.join(dir, 'mcp-server/dist/runtime/mcp.cjs'))],
   ['tampered dependency bytes', dir => write(dir, 'mcp-server/node_modules/example/bin.js', 'tampered')],
   ['changed runtime mode', dir => fs.chmodSync(path.join(dir, 'mcp-server/dist/control/cli.js'), 0o644)],
   ['unmanifested artifact', dir => write(dir, 'mcp-server/dist/extra.js')],
@@ -328,8 +332,11 @@ test('default npm build and skill generation stay private with safe modes under 
     import fs from 'node:fs';
     fs.mkdirSync('dist/control', { recursive: true });
     fs.mkdirSync('node_modules', { recursive: true });
+    fs.mkdirSync('node_modules/.bin', { recursive: true });
     fs.writeFileSync('dist/index.js', 'export {};');
     for (const name of ['cli', 'hook-adapter']) fs.writeFileSync('dist/control/' + name + '.js', '#!/usr/bin/env node\\n', { mode: 0o755 });
+    fs.writeFileSync('node_modules/.bin/rolldown', '#!/bin/sh\\ninput="$1"\\nshift\\nwhile [ "$#" -gt 0 ]; do if [ "$1" = "--file" ]; then output="$2"; shift 2; else shift; fi; done\\ncp -- "$input" "$output"\\n', { mode: 0o755 });
+    fs.chmodSync('node_modules/.bin/rolldown', 0o755);
   `);
   write(root, 'scripts/sync-codex-skills.mjs', "import fs from 'node:fs'; fs.mkdirSync(new URL('../skills/generated', import.meta.url)); fs.writeFileSync(new URL('../skills/generated/done', import.meta.url), 'generated');\n");
   const old = process.umask(0);

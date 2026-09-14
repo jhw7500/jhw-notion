@@ -36,6 +36,8 @@ const REQUIRED = new Map([
   ['mcp-server/package.json', false], ['mcp-server/package-lock.json', false],
   ['mcp-server/dist/index.js', false], ['mcp-server/dist/control/cli.js', true],
   ['mcp-server/dist/control/hook-adapter.js', true], ['scripts/jhw-control-hook', true],
+  ['mcp-server/dist/runtime/mcp.cjs', false], ['mcp-server/dist/runtime/control.cjs', true],
+  ['mcp-server/dist/runtime/hook.cjs', true],
 ]);
 const fail = (code = 'DEPLOY_UNTRUSTED_PATH') => { throw new DeploymentError(code); };
 function boundary(error, code) { throw error instanceof DeploymentError ? error : new DeploymentError(code); }
@@ -347,8 +349,22 @@ async function defaultBuild({ stagingRoot }) {
   const home = path.join(stagingRoot, '.build-home');
   fs.mkdirSync(home, { mode: 0o700 });
   const env = { ...process.env, HOME: home, npm_config_cache: path.join(home, 'npm-cache'), npm_config_userconfig: path.join(home, '.npmrc') };
-  await run('npm', ['ci', '--no-audit', '--no-fund'], path.join(stagingRoot, 'mcp-server'), env);
-  await run('npm', ['run', 'build'], path.join(stagingRoot, 'mcp-server'), env);
+  const mcpRoot = path.join(stagingRoot, 'mcp-server');
+  await run('npm', ['ci', '--no-audit', '--no-fund'], mcpRoot, env);
+  await run('npm', ['run', 'build'], mcpRoot, env);
+  const runtime = path.join(mcpRoot, 'dist/runtime');
+  fs.mkdirSync(runtime, { recursive: true, mode: 0o755 });
+  fs.chmodSync(runtime, 0o755);
+  const bundler = path.join(mcpRoot, 'node_modules/.bin/rolldown');
+  for (const [input, output, executable] of [
+    ['dist/index.js', 'dist/runtime/mcp.cjs', false],
+    ['dist/control/cli.js', 'dist/runtime/control.cjs', true],
+    ['dist/control/hook-adapter.js', 'dist/runtime/hook.cjs', true],
+  ]) {
+    await run(bundler, [input, '--file', output, '--format', 'cjs', '--platform', 'node',
+      '--no-codeSplitting', '--minify', '--legalComments', 'none', '--logLevel', 'silent'], mcpRoot, env);
+    fs.chmodSync(path.join(mcpRoot, output), executable ? 0o755 : 0o644);
+  }
   await run(process.execPath, ['scripts/sync-codex-skills.mjs'], stagingRoot, env);
   fs.rmSync(home, { recursive: true });
 }

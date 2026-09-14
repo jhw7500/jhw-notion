@@ -27,7 +27,7 @@ function git(root, args) {
   const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
 }
-async function fixture(t, body = "process.stdin.pipe(process.stdout); process.stderr.write('fixture-stderr\\n'); process.stdin.on('end', () => { process.exitCode = 23; });", hookBody = "process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse'}})+'\\n');", helperEdits = {}) {
+async function fixture(t, body = "process.stdin.pipe(process.stdout); process.stderr.write('fixture-stderr\\n'); process.stdin.on('end', () => { process.exitCode = 23; });", hookBody = "process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse'}})+'\\n');", helperEdits = {}, runtimeOptions = {}) {
   assert.equal(typeof entry.installBootstrap, 'function', 'complete validated bootstrap installation must exist');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jhw-entry-test-'));
   fs.chmodSync(root, 0o700);
@@ -41,9 +41,16 @@ async function fixture(t, body = "process.stdin.pipe(process.stdout); process.st
   git(root, ['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
   const prepare = () => prepareRelease({ repositoryRoot: root, build: async ({stagingRoot}) => {
     const targetBody=typeof body==='function' ? body(root) : body;
+    const resolvedHookBody=typeof hookBody==='function' ? hookBody(root) : hookBody;
+    const bundleBody=typeof runtimeOptions.bundleBody==='function' ? runtimeOptions.bundleBody(root) : runtimeOptions.bundleBody ?? targetBody;
+    const hookBundleBody=typeof runtimeOptions.hookBundleBody==='function' ? runtimeOptions.hookBundleBody(root) : runtimeOptions.hookBundleBody ?? resolvedHookBody;
     write(stagingRoot, 'mcp-server/dist/index.js', targetBody);
     write(stagingRoot, 'mcp-server/dist/control/cli.js', '#!/usr/bin/env node\n'+targetBody, 0o755);
-    write(stagingRoot, 'mcp-server/dist/control/hook-adapter.js', '#!/usr/bin/env node\n'+(typeof hookBody==='function' ? hookBody(root) : hookBody), 0o755);
+    write(stagingRoot, 'mcp-server/dist/control/hook-adapter.js', '#!/usr/bin/env node\n'+resolvedHookBody, 0o755);
+    write(stagingRoot, 'mcp-server/dist/runtime/mcp.cjs', bundleBody);
+    write(stagingRoot, 'mcp-server/dist/runtime/control.cjs', '#!/usr/bin/env node\n'+bundleBody, 0o755);
+    write(stagingRoot, 'mcp-server/dist/runtime/hook.cjs', '#!/usr/bin/env node\n'+hookBundleBody, 0o755);
+    runtimeOptions.extraBuild?.(stagingRoot,root);
     fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { mode: 0o755 });
   }});
   const release = await prepare();
@@ -129,7 +136,9 @@ test('real running child excludes writers for its entire lifetime', async t => {
 
 // Break caught: explicit LOCK_UN, or omission of the inherited child descriptor.
 test('child retains admission after its fixture supervisor is killed', async t => {
-  const f = await fixture(t,root=>`import fs from 'node:fs'; process.stdout.write('READY\\n'); const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(path.join(root,'child-go'))})) {clearInterval(timer); process.exit(0);}},10);`);
+  const f = await fixture(t,root=>`import fs from 'node:fs'; process.stdout.write('READY\\n'); const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(path.join(root,'child-go'))})) {clearInterval(timer); process.exit(0);}},10);`,undefined,{}, {
+    bundleBody:root=>`const fs=require('node:fs'); process.stdout.write('READY\\n'); const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(path.join(root,'child-go'))})) {clearInterval(timer); process.exit(0);}},10);`,
+  });
   const p = start(f); await until(()=>p.output().includes('READY'));
   const exited = once(p.child,'exit'); p.child.kill('SIGKILL'); await exited;
   contended(f.lock); fs.writeFileSync(path.join(f.root,'child-go'),'go'); await p.done;
@@ -194,7 +203,7 @@ test('bootstrap checksums remain bound to the source release manifest', async t 
 test('managed hook trust relation binds physical wrapper and core to the retained release', async t => {
   const f=await fixture(t); const releaseRoot=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId);
   const relation=entry.managedHookRelationship({repositoryRoot:f.root,releaseRoot});
-  assert.deepEqual(relation,{sourceReleaseId:f.release.releaseId,releaseId:f.release.releaseId,launcherPath:path.join(f.bootstrap,'jhw-runtime-hook'),wrapperPath:path.join(releaseRoot,'scripts/jhw-control-hook'),corePath:path.join(releaseRoot,'mcp-server/dist/control/hook-adapter.js')});
+  assert.deepEqual(relation,{sourceReleaseId:f.release.releaseId,releaseId:f.release.releaseId,launcherPath:path.join(f.bootstrap,'jhw-runtime-hook'),wrapperPath:path.join(releaseRoot,'scripts/jhw-control-hook'),corePath:path.join(releaseRoot,'mcp-server/dist/runtime/hook.cjs')});
   assert.throws(()=>entry.managedHookRelationship({repositoryRoot:f.root,releaseRoot:path.join(f.root,'.jhw-runtime/current')}));
   fs.appendFileSync(relation.corePath,'\n// corrupted');
   assert.throws(()=>entry.managedHookRelationship({repositoryRoot:f.root,releaseRoot}));
@@ -202,12 +211,32 @@ test('managed hook trust relation binds physical wrapper and core to the retaine
 
 // Break caught: a shell pipeline/timeout closing inherited fd 3 after supervisor death.
 test('hook runner and core retain admission after the fixture supervisor exits', async t => {
-  const f=await fixture(t,undefined,root=>`import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(root,'hook-core-ready'))},'ready'); const timer=setInterval(()=>{ if(fs.existsSync(${JSON.stringify(path.join(root,'hook-core-go'))})) { clearInterval(timer); process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse'}})+'\\n'); } },10);`);
-  const core=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/dist/control/hook-adapter.js');
+  const f=await fixture(t,undefined,root=>`import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(root,'hook-core-ready'))},'ready'); const timer=setInterval(()=>{ if(fs.existsSync(${JSON.stringify(path.join(root,'hook-core-go'))})) { clearInterval(timer); process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse'}})+'\\n'); } },10);`,{}, {
+    hookBundleBody:root=>`const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(path.join(root,'hook-core-ready'))},'ready'); const timer=setInterval(()=>{ if(fs.existsSync(${JSON.stringify(path.join(root,'hook-core-go'))})) { clearInterval(timer); process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse'}})+'\\n'); } },10);`,
+  });
+  const core=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/dist/runtime/hook.cjs');
   const p=start(f,'jhw-runtime-hook',['--adapter','claude','--event','PreToolUse']); p.child.stdin.end('{}');
   await until(()=>fs.existsSync(path.join(f.root,'hook-core-ready'))); const exited=once(p.child,'exit'); p.child.kill('SIGKILL'); await exited;
   contended(f.lock); fs.writeFileSync(path.join(f.root,'hook-core-go'),'go'); await p.done;
   const lease=acquireLease(f.lock); lease.close(); assert.equal(JSON.parse(p.output()).hookSpecificOutput.hookEventName,'PreToolUse');
+});
+
+// Break caught: non-SessionEnd hook cores that consume SIGTERM forever must
+// still release their inherited admission lease within a fixed grace period.
+test('every hook event escalates an ignored SIGTERM to SIGKILL', async t => {
+  const hookBody="process.on('SIGTERM',()=>{}); setTimeout(()=>process.exit(0),1200); setInterval(()=>{},1000);";
+  const f=await fixture(t,undefined,hookBody,{
+    'runtime-entry.mjs':bytes=>bytes.replace("event==='SessionEnd' ? 2000 : 8000","event==='SessionEnd' ? 100 : 100"),
+  });
+  for (const event of ['PreToolUse','UserPromptSubmit','PostToolUse']) {
+    const result=spawnSync(path.join(f.bootstrap,'jhw-runtime-hook'),['--adapter','claude','--event',event],{
+      input:'{}',encoding:'utf8',timeout:900,
+    });
+    assert.equal(result.error,undefined,String(result.error));
+    assert.equal(result.status,0,result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout),hookFailure(event,'GUARD_UNAVAILABLE'));
+    const lease=acquireLease(f.lock); lease.close();
+  }
 });
 
 // Break caught: caching current at bootstrap installation instead of reading after admission.
@@ -219,6 +248,9 @@ test('paused fresh invocation selects the activation committed before admission'
     write(stagingRoot,'mcp-server/dist/index.js',"process.stdout.write('new');");
     write(stagingRoot,'mcp-server/dist/control/cli.js','#!/usr/bin/env node\n',0o755);
     write(stagingRoot,'mcp-server/dist/control/hook-adapter.js','#!/usr/bin/env node\n',0o755);
+    write(stagingRoot,'mcp-server/dist/runtime/mcp.cjs',"process.stdout.write('new');");
+    write(stagingRoot,'mcp-server/dist/runtime/control.cjs','#!/usr/bin/env node\n',0o755);
+    write(stagingRoot,'mcp-server/dist/runtime/hook.cjs','#!/usr/bin/env node\n',0o755);
     fs.mkdirSync(path.join(stagingRoot,'mcp-server/node_modules'),{mode:0o755});
   }});
   const lease=acquireLease(f.lock);
@@ -318,13 +350,64 @@ test('managed child refuses before replacement target bytes can execute', async 
   });
   const p=start(f);
   await until(()=>fs.existsSync(path.join(f.root,readyName)),'managed child spawn pause');
-  const target=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/dist/index.js');
+  const target=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/dist/runtime/mcp.cjs');
   const replacement=`import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(f.root,'replacement-child-executed'))},'bad'); process.stdout.write('REPLACEMENT');\n`;
   const temporary=`${target}.replacement`; fs.writeFileSync(temporary,replacement,{mode:0o644}); fs.renameSync(temporary,target);
   fs.writeFileSync(path.join(f.root,resumeName),'go'); p.child.stdin.end();
   const [status]=await p.done;
   assert.equal(status,75,p.error()); assert.equal(p.output(),''); assert.equal(p.error(),'DEPLOY_RELEASE_CHANGED\n');
   assert.equal(fs.existsSync(path.join(f.root,'replacement-child-executed')),false);
+});
+
+// Break caught: pinning only an entry file while a relative import remains
+// reachable through the mutable release pathname.
+test('managed selector executes one pinned bundle after a non-entry dependency replacement', async t => {
+  const readyName='bundle-spawn-ready'; const resumeName='bundle-spawn-resume';
+  const f=await fixture(t,"import './dependency.js';",undefined,{
+    'runtime-entry.mjs':(bytes,root)=>bytes.replace(
+      '    return await new Promise((resolve,reject)=>{',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    return await new Promise((resolve,reject)=>{`,
+    ),
+  },{
+    bundleBody:"process.stdout.write('ORIGINAL');",
+    extraBuild:(stagingRoot)=>write(stagingRoot,'mcp-server/dist/dependency.js',"process.stdout.write('ORIGINAL');"),
+  });
+  const p=start(f);
+  await until(()=>fs.existsSync(path.join(f.root,readyName)),'bundle spawn pause');
+  const dependency=path.join(f.root,'.jhw-runtime/releases',f.release.releaseId,'mcp-server/dist/dependency.js');
+  const replacement=`import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(path.join(f.root,'replacement-dependency-executed'))},'bad'); process.stdout.write('REPLACEMENT');\n`;
+  fs.writeFileSync(`${dependency}.replacement`,replacement,{mode:0o644});
+  fs.renameSync(`${dependency}.replacement`,dependency);
+  fs.writeFileSync(path.join(f.root,resumeName),'go'); p.child.stdin.end();
+  const [status]=await p.done;
+  assert.equal(status,0,p.error()); assert.equal(p.output(),'ORIGINAL');
+  assert.equal(fs.existsSync(path.join(f.root,'replacement-dependency-executed')),false);
+});
+
+// Break caught: a bundled dependency loader reaching back into mutable release
+// files after the selector artifact has been admitted.
+test('managed selector permits only built-in module loads after its pinned bundle starts', async t => {
+  const f=await fixture(t,undefined,undefined,{}, {
+    bundleBody:"require('../external.cjs');",
+    extraBuild:(stagingRoot,root)=>write(stagingRoot,'mcp-server/dist/external.cjs',
+      `require('node:fs').writeFileSync(${JSON.stringify(path.join(root,'external-module-executed'))},'bad');`),
+  });
+  const result=run(f);
+  assert.notEqual(result.status,0);
+  assert.match(result.stderr,/DEPLOY_EXTERNAL_MODULE_FORBIDDEN/);
+  assert.equal(fs.existsSync(path.join(f.root,'external-module-executed')),false);
+});
+
+test('managed hook permits only built-in module loads after its pinned bundle starts', async t => {
+  const f=await fixture(t,undefined,undefined,{}, {
+    hookBundleBody:"require('../external.cjs');",
+    extraBuild:(stagingRoot,root)=>write(stagingRoot,'mcp-server/dist/external.cjs',
+      `require('node:fs').writeFileSync(${JSON.stringify(path.join(root,'external-hook-module-executed'))},'bad');`),
+  });
+  const result=run(f,'jhw-runtime-hook',['--adapter','claude','--event','PreToolUse'],'{}');
+  assert.equal(result.status,0,result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout),hookFailure('PreToolUse','GUARD_UNAVAILABLE'));
+  assert.equal(fs.existsSync(path.join(f.root,'external-hook-module-executed')),false);
 });
 
 // I3: unavailable/incompatible interpreters must not escape through a shebang

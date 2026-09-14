@@ -129,6 +129,18 @@ function injectLauncherReplacement() {
   recordLauncherIdentity("launcher-replacement.identity", launcherFile);
 }
 
+function substituteLauncherParent() {
+  const logicalParent = path.dirname(launcherFile);
+  const retainedParent = path.join(process.env.HOME, "launcher-parent-original");
+  const attackerParent = path.join(process.env.HOME, "launcher-parent-attacker");
+  realRenameSync(logicalParent, retainedParent);
+  fs.mkdirSync(attackerParent, { mode: 0o700 });
+  fs.writeFileSync(path.join(attackerParent, path.basename(launcherFile)),
+    "foreign-parent-substitution", { mode: 0o640 });
+  fs.symlinkSync(attackerParent, logicalParent);
+  marker("launcher-parent-substitution-hit", "yes");
+}
+
 function appendRecoverySequence(value) {
   fs.appendFileSync(path.join(process.env.HOME, "rollback-recovery-sequence"), `${value}\n`, { mode: 0o600 });
 }
@@ -153,7 +165,9 @@ fs.renameSync = (source, destination) => {
     sameDirectoryEntry(source, hooksFile) && path.basename(destination) === "candidate-live";
   const capturesLauncher = operation === "remove-control-hook-link-transaction" &&
     sameDirectoryEntry(source, launcherFile) && path.basename(destination) === "captured-link";
-  if (capturesLauncher && ["uninstall-regular", "uninstall-symlink", "uninstall-same-target",
+  if (capturesLauncher && launcherRaceMode === "parent-substitution") {
+    substituteLauncherParent();
+  } else if (capturesLauncher && ["uninstall-regular", "uninstall-symlink", "uninstall-same-target",
       "rollback-regular", "rollback-winner"].includes(launcherRaceMode)) {
     injectLauncherReplacement();
   }
@@ -1461,6 +1475,42 @@ test_owned_control_cli_uninstall_race_preserves_replacement() {
     run_install "$home" --uninstall
   assert_launcher_matches_recorded_identity "$launcher" "$home/launcher-replacement.identity"
   assert_file_text "$launcher" "foreign-launcher-regular-uninstall-regular"
+}
+
+test_control_link_parent_substitution_is_descriptor_anchored() {
+  local home parent launcher transaction retained attacker manifest
+  home="$ROOT/control-link-parent-substitution-home"
+  parent="$home/.local/bin"
+  launcher="$parent/jhw-control-hook"
+  transaction="$parent/.jhw-control-hook-link-txn.parent-substitution"
+  retained="$home/launcher-parent-original"
+  attacker="$home/launcher-parent-attacker"
+  mkdir -p "$parent"
+  chmod 0700 "$home" "$home/.local" "$parent"
+  ln -s "$REPO_ROOT/scripts/jhw-control-hook" "$launcher"
+  mkdir "$transaction"
+  chmod 0700 "$transaction"
+
+  if HOME="$home" PATH="$FAKE_BIN:$PATH" \
+      JHW_TEST_LAUNCHER_PATH="$launcher" JHW_TEST_LAUNCHER_RACE_MODE="parent-substitution" \
+      node "$REPO_ROOT/scripts/install-config.mjs" \
+      remove-control-hook-link-transaction "$launcher" "$REPO_ROOT/scripts/jhw-control-hook" \
+      "$REPO_ROOT" "$transaction"; then
+    echo "control link parent substitution was not detected" >&2
+    return 1
+  fi
+
+  [ -f "$home/launcher-parent-substitution-hit" ] || return 1
+  [ -L "$parent" ] && [ "$(readlink -- "$parent")" = "$attacker" ] || return 1
+  assert_file_text "$attacker/jhw-control-hook" "foreign-parent-substitution"
+  [ ! -e "$retained/jhw-control-hook" ] && [ ! -L "$retained/jhw-control-hook" ] || return 1
+  manifest="$retained/$(basename "$transaction")/manifest.json"
+  [ -f "$manifest" ] && [ "$(stat -c '%a' "$manifest")" = "600" ] || return 1
+  node - "$manifest" <<'EOF'
+const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (manifest.stage !== "removed-owned" || manifest.artifacts.length !== 0) process.exit(1);
+EOF
 }
 
 test_launcher_failed_install_rollback_races_are_no_clobber() {
@@ -3532,6 +3582,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   rollback-same-bytes-new-inode) test_rollback_same_bytes_new_inode_is_not_owned_publication; exit ;;
   launcher-remove-race) test_launcher_uninstall_races_preserve_replacements; exit ;;
   owned-link-remove-race) test_owned_control_cli_uninstall_race_preserves_replacement; exit ;;
+  control-link-parent-substitution) test_control_link_parent_substitution_is_descriptor_anchored; exit ;;
   launcher-rollback-race) test_launcher_failed_install_rollback_races_are_no_clobber; exit ;;
   launcher-capture-hard-exit) test_launcher_transaction_hard_exits_leave_inspectable_evidence; exit ;;
   stale-hook-link-transaction) test_stale_hook_link_transactions_block_install_and_uninstall; exit ;;
@@ -3620,6 +3671,7 @@ test_cross_adapter_rollback_failure_preserves_launcher
 test_rollback_capture_preserves_concurrent_hook_changes
 test_rollback_same_bytes_new_inode_is_not_owned_publication
 test_launcher_uninstall_races_preserve_replacements
+test_control_link_parent_substitution_is_descriptor_anchored
 test_launcher_failed_install_rollback_races_are_no_clobber
 test_launcher_transaction_hard_exits_leave_inspectable_evidence
 test_stale_hook_link_transactions_block_install_and_uninstall

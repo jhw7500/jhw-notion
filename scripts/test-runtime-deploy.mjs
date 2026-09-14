@@ -18,7 +18,7 @@ function fixture(t) {
  for(const name of ['runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);
  for(const args of [['init','-q'],['add','.'],['-c','user.name=Fixture','-c','user.email=f@example.invalid','commit','-qm','fixture']])assert.equal(spawnSync('git',args,{cwd:root}).status,0);
  let builds=0;
- const build=async ({stagingRoot})=>{builds++;write(stagingRoot,'mcp-server/dist/index.js',"process.stdin.setEncoding('utf8');let b='';process.stdin.on('data',c=>{b+=c;let n;while((n=b.indexOf('\\n'))>=0){const q=JSON.parse(b.slice(0,n));b=b.slice(n+1);if(q.id)process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result:q.method==='tools/list'?{tools:[]}:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n');}});");write(stagingRoot,'mcp-server/dist/control/cli.js',"#!/usr/bin/env node\nconsole.log(JSON.stringify({error:{code:'INVALID_CONFIG'}}));process.exitCode=78;",0o755);write(stagingRoot,'mcp-server/dist/control/hook-adapter.js','#!/usr/bin/env node\nconsole.log("{}");',0o755);fs.mkdirSync(path.join(stagingRoot,'mcp-server/node_modules'),{mode:0o755});};
+ const build=async ({stagingRoot})=>{builds++;const mcp="process.stdin.setEncoding('utf8');let b='';process.stdin.on('data',c=>{b+=c;let n;while((n=b.indexOf('\\n'))>=0){const q=JSON.parse(b.slice(0,n));b=b.slice(n+1);if(q.id)process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result:q.method==='tools/list'?{tools:[]}:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n');}});";const control="#!/usr/bin/env node\nconsole.log(JSON.stringify({error:{code:'INVALID_CONFIG'}}));process.exitCode=78;";const hook='#!/usr/bin/env node\nconsole.log("{}");';write(stagingRoot,'mcp-server/dist/index.js',mcp);write(stagingRoot,'mcp-server/dist/control/cli.js',control,0o755);write(stagingRoot,'mcp-server/dist/control/hook-adapter.js',hook,0o755);write(stagingRoot,'mcp-server/dist/runtime/mcp.cjs',mcp);write(stagingRoot,'mcp-server/dist/runtime/control.cjs',control,0o755);write(stagingRoot,'mcp-server/dist/runtime/hook.cjs',hook,0o755);fs.mkdirSync(path.join(stagingRoot,'mcp-server/node_modules'),{mode:0o755});};
  const options={repositoryRoot:root,home,procRoot,build};
  return {root,home,procRoot,options,build,builds:()=>builds,run:argv=>{assert.equal(typeof deploy.runDeployment,'function','deployment orchestrator must exist');return deploy.runDeployment({...options,argv});}};
 }
@@ -166,7 +166,7 @@ test('failed real MCP startup refuses success with retained recovery evidence', 
     argv:['--prepare'],
     build:async args => {
       await f.build(args);
-      write(args.stagingRoot, 'mcp-server/dist/index.js', 'process.exit(23);');
+      write(args.stagingRoot, 'mcp-server/dist/runtime/mcp.cjs', 'process.exit(23);');
     },
   });
   await assert.rejects(f.run(['--activate', release.releaseId]), {
@@ -209,7 +209,7 @@ for (const refresh of ['helper', 'topology']) {
       argv:['--prepare'],
       build:async args => {
         await f.build(args);
-        write(args.stagingRoot, 'mcp-server/dist/index.js', 'process.exit(23);');
+        write(args.stagingRoot, 'mcp-server/dist/runtime/mcp.cjs', 'process.exit(23);');
       },
     });
     await f.run(['--uninstall']);
@@ -282,7 +282,7 @@ test('journal directory replacement cannot chmod a foreign symlink target',async
 
 test('first migration failure retains exact bounded configuration and launcher preimages',async t=>{
  const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.claude'),{mode:0o700});write(f.root,'mcp-server/dist/index.js','legacy');const original=JSON.stringify({mcpServers:{'jhw-notion':{command:'node',args:[path.join(f.root,'mcp-server/dist/index.js')]}},foreign:'private-preimage-marker'})+'\n';write(f.home,'.claude.json',original,0o640);const link=path.join(f.root,'scripts/jhw-control-hook');fs.symlinkSync(link,path.join(f.home,'.local/bin/jhw-control-hook'));
- const release=await deploy.runDeployment({...f.options,argv:['--prepare'],build:async args=>{await f.build(args);write(args.stagingRoot,'mcp-server/dist/index.js','process.exit(23);');}});await assert.rejects(f.run(['--activate',release.releaseId]),{code:'DEPLOY_VALIDATION_FAILED'});
+ const release=await deploy.runDeployment({...f.options,argv:['--prepare'],build:async args=>{await f.build(args);write(args.stagingRoot,'mcp-server/dist/runtime/mcp.cjs','process.exit(23);');}});await assert.rejects(f.run(['--activate',release.releaseId]),{code:'DEPLOY_VALIDATION_FAILED'});
  const runtime=path.join(f.root,'.jhw-runtime');const journal=fs.readdirSync(runtime).find(n=>/^\.deploy\./.test(n));const evidencePath=path.join(runtime,journal,'before.json');const evidence=JSON.parse(fs.readFileSync(evidencePath));const config=evidence.entries.find(e=>e.path==='.claude.json');assert.equal(Buffer.from(config.bytes,'base64').toString('utf8'),original);assert.equal(config.mode,0o640);assert.deepEqual(evidence.entries.find(e=>e.path==='.local/bin/jhw-control-hook').target,link);assert.equal(evidence.entries.find(e=>e.path==='.claude/settings.json').type,'absent');assert.equal(fs.statSync(evidencePath).mode&0o777,0o600);
 });
 

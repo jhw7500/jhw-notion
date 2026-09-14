@@ -449,6 +449,7 @@ const CONTROL_HOOK_LINK_STAGES = new Set([
 const CONTROL_HOOK_LINK_FINALIZABLE_STAGES = new Set([
   "unchanged-absent", "foreign-untouched", "removed-owned", "foreign-republished",
 ]);
+let transactionParentAnchor;
 
 function anchorHookTransactionPaths() {
   const logicalParent = path.dirname(path.resolve(logicalConfigFile));
@@ -481,6 +482,7 @@ function anchorHookTransactionPaths() {
     fs.closeSync(descriptor);
     throw new Error("hook config parent cannot be descriptor-anchored");
   }
+  transactionParentAnchor = { descriptor, logicalParent, parentInfo };
   configFile = path.join(anchoredParent, path.basename(logicalConfigFile));
   if (backupStamp !== undefined) {
     const logicalTransaction = path.resolve(backupStamp);
@@ -489,6 +491,19 @@ function anchorHookTransactionPaths() {
       throw new Error("hook transaction escaped config parent");
     }
     backupStamp = path.join(anchoredParent, path.basename(logicalTransaction));
+  }
+}
+
+function verifyTransactionParent() {
+  if (!transactionParentAnchor) return;
+  const { descriptor, logicalParent, parentInfo } = transactionParentAnchor;
+  const openedInfo = fs.fstatSync(descriptor);
+  const currentInfo = fs.lstatSync(logicalParent);
+  if (currentInfo.isSymbolicLink() || !currentInfo.isDirectory() ||
+      fs.realpathSync(logicalParent) !== logicalParent ||
+      ["dev", "ino", "uid", "mode"].some((key) =>
+        openedInfo[key] !== parentInfo[key] || currentInfo[key] !== parentInfo[key])) {
+    throw new Error("hook config parent changed");
   }
 }
 
@@ -1041,7 +1056,7 @@ function finalizeCodexHooksTransaction() {
 function expectedControlHookTarget() {
   const root = path.resolve(repositoryRoot);
   const expected = path.resolve(mcpEntry);
-  const live = path.resolve(configFile);
+  const live = path.resolve(logicalConfigFile);
   const home = path.resolve(process.env.HOME ?? "");
   const relative = path.relative(home, live);
   const allowed = relative === ".local/bin/jhw-control" || relative === ".local/bin/jhw-control-hook" ||
@@ -1731,7 +1746,13 @@ function unregisterCodex() {
 }
 
 try {
-  if (operation.endsWith("-codex-hooks-transaction") || operation.endsWith("-claude-hooks-transaction")) {
+  const controlHookLinkOperations = new Set([
+    "remove-control-hook-link-transaction",
+    "inspect-control-hook-link-transaction",
+    "finalize-control-hook-link-transaction",
+  ]);
+  if (operation.endsWith("-codex-hooks-transaction") || operation.endsWith("-claude-hooks-transaction") ||
+      controlHookLinkOperations.has(operation)) {
     anchorHookTransactionPaths();
   }
   if (["verify-stdio","verify-opencode","verify-codex","verify-claude-hooks","verify-codex-hooks"].includes(operation)) verifyManagedConfiguration();
@@ -1751,9 +1772,13 @@ try {
   if (operation === "rollback-claude-hooks-transaction") process.exit(rollbackCodexHooksTransaction());
   if (operation === "inspect-claude-hooks-transaction") process.exit(inspectCodexHooksTransaction());
   if (operation === "finalize-claude-hooks-transaction") process.exit(finalizeCodexHooksTransaction());
-  if (operation === "remove-control-hook-link-transaction") process.exit(removeControlHookLinkTransaction());
-  if (operation === "inspect-control-hook-link-transaction") process.exit(inspectControlHookLinkTransaction());
-  if (operation === "finalize-control-hook-link-transaction") process.exit(finalizeControlHookLinkTransaction());
+  if (controlHookLinkOperations.has(operation)) {
+    const status = operation === "remove-control-hook-link-transaction" ? removeControlHookLinkTransaction() :
+      operation === "inspect-control-hook-link-transaction" ? inspectControlHookLinkTransaction() :
+      finalizeControlHookLinkTransaction();
+    verifyTransactionParent();
+    process.exit(status);
+  }
   process.exit(2);
 } catch {
   process.exit(1);

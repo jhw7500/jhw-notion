@@ -392,9 +392,10 @@ runtime artifact는 canonical trusted checkout의 `.jhw-runtime/`에 있다.
 ```
 
 `--prepare`는 private `0700` same-store stage에 allowlisted source만 복사하고 그 안에서
-`npm ci`와 build를 실행한다. manifest와 content digest를 검증한 complete release만 atomic
-rename으로 보존하며 live checkout의 `dist`·`node_modules`, `current`, HOME wiring을 바꾸지
-않는다. staging fixture에서 생긴 ID는 live deployable artifact가 아니다.
+`npm ci`와 build를 실행한다. MCP/control/hook selector는 각각 code splitting 없는 단일 CJS
+bundle로 생성한다. manifest와 content digest를 검증한 complete release만 atomic rename으로
+보존하며 live checkout의 `dist`·`node_modules`, `current`, HOME wiring을 바꾸지 않는다.
+staging fixture에서 생긴 ID는 live deployable artifact가 아니다.
 
 `--activate`·`--rollback`·`--uninstall`은 mutation 전 inventory, exclusive deploy/admission
 lease, lease 뒤 두 번째 inventory를 요구한다. TUI, Codex app server, legacy runtime,
@@ -412,9 +413,12 @@ bootstrap `jhw-runtime-entry mcp`, control/hook link는 bootstrap의 closed sele
 fsync한 뒤 atomic publish하고 directory를 fsync한다. foreign target/config/group과 모호한
 ownership은 그대로 보존하고 실패한다. bootstrap verifier는 no-follow descriptor로 읽어
 검증한 helper bytes 자체를 import하며, selected MCP/control/hook artifact는 열린 descriptor와
-현재 이름의 identity를 spawn 직전에 다시 대조한다. 모든 owned launcher/skill/prompt 제거는
-같은 parent의 private capture transaction으로 수행해 검사 뒤 바뀐 foreign replacement를
-삭제하지 않는다.
+현재 이름의 identity를 spawn 직전에 다시 대조한다. selector는 그 pinned bundle 하나만
+entry로 실행하고 이후 built-in 외 module load를 거부한다. hook timeout은 이벤트 종류와
+무관하게 `SIGTERM` 뒤 200 ms grace가 지나면 `SIGKILL`로 승격한다. 모든 owned
+launcher/skill/prompt 제거는 같은 parent의 private capture transaction으로 수행해 검사 뒤
+바뀐 foreign replacement를 삭제하지 않는다. control/hook launcher transaction도 parent를
+retained no-follow descriptor로 고정하며 반환 직전 논리 parent identity를 다시 검증한다.
 
 activation validation은 fresh worker의 exact host contract v5와 Guard preflight, managed MCP
 `initialize`·`notifications/initialized`·`tools/list`를 bounded output/timeout으로 검사한다.
