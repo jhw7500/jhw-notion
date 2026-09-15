@@ -84,6 +84,28 @@ function openArtifact(repositoryRoot, releaseId, relativeName) {
   finally { directory.close(); }
 }
 
+function openCredential(repositoryRoot, releaseId) {
+  const manifest=releaseManifest(repositoryRoot,releaseId);
+  const record=manifest.entries.find(entry=>entry.path==='mcp-server/.env');
+  if(!record || record.type!=='credential' || record.target!=='canonical-mcp-env') fail('DEPLOY_RELEASE_INVALID');
+  const directory=new Directory(path.join(repositoryRoot,'mcp-server'));
+  let fd;
+  try {
+    const location=directory.at('.env');
+    try { fd=fs.openSync(location,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK); }
+    catch(error) { if(error.code==='ENOENT') return null; throw error; }
+    const before=fs.fstatSync(fd,{bigint:true}); const mode=Number(before.mode);
+    if(!before.isFile() || before.uid!==BigInt(process.getuid()) || before.nlink!==1n || mode&0o7022 || !(mode&0o400) || before.size>1024n*1024n) fail('DEPLOY_RELEASE_INVALID');
+    if(!same(before,fs.fstatSync(fd,{bigint:true})) || !same(before,fs.lstatSync(location,{bigint:true}))) fail('DEPLOY_RELEASE_CHANGED');
+    directory.verify();
+    const named=path.join(repositoryRoot,'mcp-server/.env');
+    return {fd,verify:()=>{
+      if(!same(before,fs.fstatSync(fd,{bigint:true})) || !same(before,fs.lstatSync(named,{bigint:true}))) fail('DEPLOY_RELEASE_CHANGED');
+    }};
+  } catch(error) { if(fd!==undefined) fs.closeSync(fd); throw error; }
+  finally { directory.close(); }
+}
+
 function canonical(value) {
   if(Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
   if(value!==null && typeof value==='object') return `{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
@@ -245,7 +267,11 @@ function failure(selector,args,code) {
 
 const MODULE_RUNNER_SOURCE=String.raw`
 const Module=require('node:module');
-const entry=process.argv[1]; const args=process.argv.slice(2);
+const fs=require('node:fs'); const path=require('node:path');
+const entry=process.argv[1]; const releaseRoot=process.argv[2]; const selector=process.argv[3]; const credential=process.argv[4]; const args=process.argv.slice(5);
+if(typeof releaseRoot!=='string' || !path.isAbsolute(releaseRoot) || path.resolve(releaseRoot)!==releaseRoot || releaseRoot.includes('\0') || !['mcp','control','hook'].includes(selector) || !['none','loaded'].includes(credential)) throw Object.assign(new Error('DEPLOY_RUNTIME_BINDING_INVALID'),{code:'DEPLOY_RUNTIME_BINDING_INVALID'});
+Object.defineProperty(globalThis,'__JHW_MANAGED_RELEASE_ROOT__',{value:releaseRoot,writable:false,configurable:false,enumerable:false});
+if(credential==='loaded') { try { fs.closeSync(5); } catch {} }
 const builtins=new Set(Module.builtinModules.flatMap(name=>[name,'node:'+name]));
 const load=Module._load; let loadingEntry=true;
 Module._load=function(request,parent,isMain){
@@ -259,7 +285,7 @@ require(entry);
 
 const HOOK_RUNNER_SOURCE=String.raw`
 const {spawn}=require('node:child_process');
-const args=process.argv.slice(1); const event=args[3];
+const releaseRoot=process.argv[1]; const args=process.argv.slice(2); const event=args[3];
 const coreRunner=${JSON.stringify(MODULE_RUNNER_SOURCE)};
 const exact=(value,keys)=>value!==null && typeof value==='object' && !Array.isArray(value) && Object.keys(value).sort().join(',')===[...keys].sort().join(',');
 const fallback=()=>{
@@ -289,7 +315,7 @@ const finish=(code,signal)=>{
   const output=!overflow && code===0 && signal===null ? validate(Buffer.concat(chunks,length)) : undefined;
   if(output) process.stdout.write(output); else fallback();
 };
-try { child=spawn(process.execPath,['-e',coreRunner,'--','/proc/self/fd/4',...args],{stdio:['inherit','pipe','inherit',3,4]}); }
+try { child=spawn(process.execPath,['-e',coreRunner,'--','/proc/self/fd/4',releaseRoot,'hook','none',...args],{stdio:['inherit','pipe','inherit',3,4]}); }
 catch { fallback(); process.exit(0); }
 child.stdout.on('data',chunk=>{ if(overflow) return; length+=chunk.length; if(length>12*1024) { overflow=true; chunks.length=0; child.kill('SIGTERM'); } else chunks.push(chunk); });
 child.stdout.on('error',()=>{ overflow=true; child.kill('SIGTERM'); });
@@ -297,12 +323,12 @@ child.once('error',()=>finish(null,null)); child.once('close',finish);
 timer=setTimeout(()=>{ child.kill('SIGTERM'); killTimer=setTimeout(()=>child.kill('SIGKILL'),200); },event==='SessionEnd' ? 2000 : 8000);
 `;
 
-function runPinnedHook({args,artifact,lease}) {
+function runPinnedHook({args,artifact,lease,releaseRoot}) {
   return new Promise(resolve=>{
     let child;
     try {
       artifact.verify();
-      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd]});
+      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',releaseRoot,...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd]});
       fs.closeSync(artifact.fd); artifact.fd=undefined;
     } catch { if(artifact.fd!==undefined) { fs.closeSync(artifact.fd); artifact.fd=undefined; } resolve(failure('hook',args,'GUARD_UNAVAILABLE')); return; }
     child.once('error',()=>resolve(failure('hook',args,'GUARD_UNAVAILABLE')));
@@ -311,7 +337,7 @@ function runPinnedHook({args,artifact,lease}) {
 }
 
 export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseId,safetySource,storeSource}) {
-  let lease; const artifacts=[];
+  let lease; let credential; const artifacts=[];
   try {
     if(!['mcp','control','hook'].includes(selector)) fail('DEPLOY_SELECTOR_INVALID');
     if(!Array.isArray(args) || args.some(value=>typeof value!=='string' || value.includes('\0'))) fail('DEPLOY_SELECTOR_INVALID');
@@ -337,17 +363,20 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
     const release=path.join(repositoryRoot,'.jhw-runtime/releases',activation.releaseId);
     const target=path.join(release, selector==='mcp' ? 'mcp-server/dist/runtime/mcp.cjs' : selector==='control' ? 'mcp-server/dist/runtime/control.cjs' : 'mcp-server/dist/runtime/hook.cjs');
     const relative=path.relative(release,target); artifacts.push(openArtifact(repositoryRoot,activation.releaseId,relative));
-    if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease});
-    const command=process.execPath; const childArgs=['-e',MODULE_RUNNER_SOURCE,'--',`/proc/self/fd/4`,...args];
+    if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease,releaseRoot:release});
+    if(selector==='mcp') credential=openCredential(repositoryRoot,activation.releaseId);
+    const command=process.execPath; const childArgs=[...(credential ? ['--env-file=/proc/self/fd/5'] : []),'-e',MODULE_RUNNER_SOURCE,'--',`/proc/self/fd/4`,release,selector,credential?'loaded':'none',...args];
     return await new Promise((resolve,reject)=>{
       // fd 3 is inherited through Node, Bash, timeout, and core. Closing the
       // supervisor's fd never unlocks the child's open-file description.
       for(const artifact of artifacts) artifact.verify();
-      const child=spawn(command,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd)]});
+      credential?.verify();
+      const child=spawn(command,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd),credential?.fd??'ignore']});
       for(const artifact of artifacts.splice(0)) fs.closeSync(artifact.fd);
+      if(credential){fs.closeSync(credential.fd);credential.fd=undefined;}
       child.once('error',()=>reject(Object.assign(new Error('DEPLOY_START_FAILED'),{code:'DEPLOY_START_FAILED'})));
       child.once('exit',(code,signal)=>resolve(code ?? (128+(osConstants.signals[signal] ?? 1))));
     });
   } catch(error) { return failure(selector,args,typeof error.code==='string' && /^DEPLOY_[A-Z_]{1,56}$/.test(error.code) ? error.code : 'DEPLOY_START_FAILED'); }
-  finally { for(const artifact of artifacts) if(artifact.fd!==undefined) fs.closeSync(artifact.fd); lease?.close(); }
+  finally { for(const artifact of artifacts) if(artifact.fd!==undefined) fs.closeSync(artifact.fd); if(credential?.fd!==undefined) fs.closeSync(credential.fd); lease?.close(); }
 }

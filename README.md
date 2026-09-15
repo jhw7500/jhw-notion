@@ -61,7 +61,11 @@ control/hook link 또는 지원 TUI 설정 파일이 하나라도 있으면 buil
 실행하고 그 뒤 built-in이 아닌 module load를 거부한다. 따라서 검사 뒤 release의 다른 JS나
 `node_modules`가 교체되어도 새 바이트를 불러오지 않는다. control authorization에 쓰는 tool
 version도 build 시 package metadata에서 읽어 bundle bytes에 삽입하므로 실행 중 mutable
-`package.json`을 다시 읽지 않는다. hook runner는 모든 이벤트에서
+`package.json`을 다시 읽지 않는다. descriptor 실행 전에 bootstrap은 검증한 selected release
+root를 변경 불가능한 process-local binding으로 전달하므로 control이 `/proc/self/fd` 위치를
+저장소 root로 오인하지 않는다. managed MCP는 canonical `mcp-server/.env`를 owner·mode·type·
+single-link·identity 검사 뒤 열린 descriptor로 상속하고 Node가 bundle 평가 전에 그 fd에서
+환경을 읽게 하므로 release의 mutable pathname을 다시 열지 않는다. hook runner는 모든 이벤트에서
 timeout 뒤 `SIGTERM`, 200 ms 뒤 `SIGKILL` 순으로 종료를 보장한다. 설치기는 다음 wiring을
 ownership proof와 기존 no-clobber transaction으로 생성한다.
 

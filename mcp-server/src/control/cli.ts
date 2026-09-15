@@ -869,6 +869,23 @@ const CodexHookProbeResultSchema = z.object({
 }).strict();
 
 function codexRepositoryRoot(): string {
+  const managedReleaseRoot = (globalThis as Record<string, unknown>).__JHW_MANAGED_RELEASE_ROOT__;
+  if (managedReleaseRoot !== undefined) {
+    if (
+      typeof managedReleaseRoot !== "string" ||
+      !isAbsolute(managedReleaseRoot) ||
+      managedReleaseRoot !== resolvePath(managedReleaseRoot) ||
+      managedReleaseRoot.includes("\0") ||
+      basename(dirname(managedReleaseRoot)) !== "releases" ||
+      basename(dirname(dirname(managedReleaseRoot))) !== ".jhw-runtime" ||
+      !/^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/.test(basename(managedReleaseRoot))
+    ) {
+      throw new ControlError("INVALID_CONFIG", "Managed release root is invalid", {
+        key: "managed_release_root",
+      });
+    }
+    return managedReleaseRoot;
+  }
   return resolvePath(dirname(fileURLToPath(import.meta.url)), "../../..");
 }
 

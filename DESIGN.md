@@ -417,7 +417,11 @@ ownership은 그대로 보존하고 실패한다. bootstrap verifier는 no-follo
 entry로 실행하고 이후 built-in 외 module load를 거부한다. control authorization tool version은
 private build stage의 package metadata에서 검증해 bundle bytes에 상수로 삽입하며 managed
 runtime은 release pathname의 `package.json`을 읽지 않는다. hook timeout은 이벤트 종류와
-무관하게 `SIGTERM` 뒤 200 ms grace가 지나면 `SIGKILL`로 승격한다. 모든 owned
+무관하게 `SIGTERM` 뒤 200 ms grace가 지나면 `SIGKILL`로 승격한다. bootstrap runner는
+selected release root를 bundle 평가 전에 변경 불가능한 process-local binding으로 설정해
+descriptor filename과 control trust root를 분리한다. managed MCP credential은 canonical
+`.env`의 owner·mode·type·single-link·identity를 검사한 열린 fd를 상속하고 Node의 pre-evaluation
+env-file loader로 읽어 bundle이 `/proc/self/fd` 기준의 잘못된 pathname을 다시 열지 않게 한다. 모든 owned
 launcher/skill/prompt 제거는 같은 parent의 private capture transaction으로 수행해 검사 뒤
 바뀐 foreign replacement를 삭제하지 않는다. control/hook launcher transaction도 parent를
 retained no-follow descriptor로 고정하며 반환 직전 논리 parent identity를 다시 검증한다.

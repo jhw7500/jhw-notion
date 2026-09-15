@@ -63,11 +63,19 @@ async function fixture(t, body = "process.stdin.pipe(process.stdout); process.st
   } finally { lease.close(); deploy.close(); }
   return { root, release, activation, prepare, bootstrap:path.join(root,'.jhw-runtime/bootstrap'), lock:path.join(root,'.jhw-runtime/admission.lock') };
 }
-function run(f, name = 'jhw-runtime-entry', args = ['mcp'], input = '') {
-  return spawnSync(path.join(f.bootstrap,name), args, { input, encoding:'utf8', timeout:12000 });
+function run(f, name = 'jhw-runtime-entry', args = ['mcp'], input = '', options = {}) {
+  return spawnSync(path.join(f.bootstrap,name), args, {
+    input, encoding:'utf8', timeout:12000,
+    ...(options.cwd ? { cwd:options.cwd } : {}),
+    ...(options.env ? { env:options.env } : {}),
+  });
 }
-function start(f, name = 'jhw-runtime-entry', args = ['mcp']) {
-  const child = spawn(path.join(f.bootstrap,name), args, { stdio:['pipe','pipe','pipe'] });
+function start(f, name = 'jhw-runtime-entry', args = ['mcp'], options = {}) {
+  const child = spawn(path.join(f.bootstrap,name), args, {
+    stdio:['pipe','pipe','pipe'],
+    ...(options.cwd ? { cwd:options.cwd } : {}),
+    ...(options.env ? { env:options.env } : {}),
+  });
   let out = ''; let err = '';
   child.stdout.on('data', chunk => { out += chunk; }); child.stderr.on('data', chunk => { err += chunk; });
   return { child, output:() => out, error:() => err, done:once(child,'close') };
@@ -101,6 +109,28 @@ function bundledControlVersion(t, version) {
   const bytes=fs.readFileSync(output,'utf8');
   assert.equal(bytes.includes('package.json'),false,'managed version bundle must not retain the metadata pathname');
   return bytes;
+}
+
+function bundledEntry(t, name, input) {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),`jhw-${name}-bundle-`));
+  fs.chmodSync(root,0o700); t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const output=path.join(root,`${name}.cjs`);
+  const bundler=path.join(source,'../mcp-server/node_modules/.bin/rolldown');
+  const result=spawnSync(bundler,[input,'--file',output,'--format','cjs','--platform','node','--no-codeSplitting',
+    '--minify','--logLevel','silent','--transform.define','__JHW_BUNDLED_CONTROL_TOOL_VERSION__:"1.0.0"'],
+    {encoding:'utf8',timeout:12000});
+  assert.equal(result.status,0,result.stderr);
+  return fs.readFileSync(output,'utf8').replace(/^#![^\n]*\n/,'');
+}
+
+function bundledCredentialProbe(t) {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'jhw-credential-probe-source-'));
+  fs.chmodSync(root,0o700); t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const input=path.join(root,'credential-probe.mjs');
+  const envModule=pathToFileURL(path.join(source,'../mcp-server/src/env.ts')).href;
+  const clientModule=pathToFileURL(path.join(source,'../mcp-server/src/notion-client.ts')).href;
+  fs.writeFileSync(input,`import {loadNotionEnv} from ${JSON.stringify(envModule)}; import {getNotionClient} from ${JSON.stringify(clientModule)}; loadNotionEnv(); getNotionClient(); process.stdout.write(process.env.NOTION_API_KEY ?? 'credential-missing');\n`,{mode:0o600});
+  return bundledEntry(t,'credential-probe',input);
 }
 
 // Break caught: bootstrap publication with missing/unverified helpers, or prepare replacing live bootstrap.
@@ -420,6 +450,71 @@ test('control authorization version stays pinned after package metadata replacem
   fs.writeFileSync(resume,'go');
   const [status]=await p.done;
   assert.equal(status,0,p.error()); assert.equal(p.output(),'1.0.0');
+});
+
+// Break caught: Rolldown lowers import.meta.url to the descriptor filename, so
+// managed Control must consume the admitted release binding instead of `/`.
+test('actual control bundle keeps managed Codex hook coverage through descriptor execution', async t => {
+  const control=bundledEntry(t,'control',path.join(source,'../mcp-server/src/control/cli.ts'));
+  const hookFailureBody=`process.stdout.write(${JSON.stringify(JSON.stringify(hookFailure('PreToolUse','GUARD_PROTOCOL_MISMATCH'))+'\n')});`;
+  const f=await fixture(t,undefined,undefined,{}, {bundleBody:control,hookBundleBody:hookFailureBody});
+  const home=path.join(f.root,'home'); const bin=path.join(f.root,'bin');
+  for(const directory of [home,path.join(home,'.local'),path.join(home,'.local','bin'),path.join(home,'.codex'),bin,
+    path.join(f.root,'registry'),path.join(f.root,'worktrees'),path.join(f.root,'state')]) fs.mkdirSync(directory,{recursive:true,mode:0o700});
+  fs.symlinkSync(path.join(f.bootstrap,'jhw-runtime-hook'),path.join(home,'.local','bin','jhw-control-hook'));
+  const hooks={hooks:Object.fromEntries(['PreToolUse','UserPromptSubmit','PostToolUse','SessionEnd'].map(event=>[event,[{hooks:[{
+    type:'command',command:`"$HOME/.local/bin/jhw-control-hook" --adapter codex --event ${event}`,timeout:event==='SessionEnd'?3:12,
+  }]}]]))};
+  write(home,'.codex/hooks.json',JSON.stringify(hooks),0o600);
+  const fakeCodex=`#!${process.execPath}\nconst readline=require('node:readline'); const home=process.env.HOME;\nconst events={PreToolUse:'preToolUse',UserPromptSubmit:'userPromptSubmit',PostToolUse:'postToolUse',SessionEnd:'sessionEnd'};\nconst rl=readline.createInterface({input:process.stdin}); rl.on('line',line=>{const message=JSON.parse(line); if(message.id===1) process.stdout.write(JSON.stringify({id:1,result:{}})+'\\n'); if(message.id===2){const cwd=message.params.cwds[0]; const hooks=Object.entries(events).map(([event,eventName],displayOrder)=>({eventName,matcher:null,timeoutSec:event==='SessionEnd'?3:12,source:'user',sourcePath:home+'/.codex/hooks.json',isManaged:false,enabled:true,trustStatus:'trusted',currentHash:'fixture-'+event,displayOrder,handlerType:'command',async:false,command:'"$HOME/.local/bin/jhw-control-hook" --adapter codex --event '+event})); process.stdout.write(JSON.stringify({id:2,result:{data:[{cwd,hooks,errors:[],warnings:[]}]}})+'\\n');}});\n`;
+  write(bin,'codex',fakeCodex,0o755);
+  const env={...process.env,
+    HOME:home,SHELL:'/bin/bash',PATH:[bin,path.dirname(process.execPath),'/usr/bin','/bin'].join(':'),
+    JHW_REGISTRY_DIR:path.join(f.root,'registry'),JHW_WORKTREE_ROOT:path.join(f.root,'worktrees'),
+    JHW_CONTROL_STATE_DIR:path.join(f.root,'state'),JHW_BUILD_HOST:'fixture-host',JHW_GITHUB_OWNER:'fixture',
+    JHW_PROJECT_NUMBER:'1',JHW_REGISTRY_REPOSITORY:'fixture/registry',JHW_PREFLIGHT_PROJECT_ITEM_ID:'PVTI_fixture',
+    JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER:'1',
+  };
+  for(const name of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV']) delete env[name];
+  const result=run(f,'jhw-runtime-control',['guard','preflight'],'',{cwd:f.root,env});
+  assert.equal(result.status,78,result.stderr);
+  const payload=JSON.parse(result.stderr);
+  assert.equal(payload.command,'guard preflight');
+  assert.equal(payload.result.diagnostics.adapter_coverage.codex.enforced,true);
+});
+
+// Break caught: the managed MCP bundle's import.meta.url points at its fd, so
+// load the release credential through the already authenticated descriptor.
+test('managed credential reaches a bundled Notion client through descriptor execution', async t => {
+  const bundle=bundledCredentialProbe(t);
+  const f=await fixture(t,undefined,undefined,{}, {bundleBody:bundle});
+  write(f.root,'mcp-server/.env','NOTION_API_KEY=descriptor-only-test-key\n',0o600);
+  const env={...process.env}; delete env.NOTION_API_KEY; delete env.NODE_OPTIONS; delete env.NODE_PATH;
+  const result=run(f,'jhw-runtime-entry',['mcp'],'',{env});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(result.stdout,'descriptor-only-test-key');
+});
+
+test('managed credential replacement fails before descriptor execution', async t => {
+  const readyName='credential-ready'; const resumeName='credential-resume';
+  const bundle=bundledCredentialProbe(t);
+  const f=await fixture(t,undefined,undefined,{
+    'runtime-entry.mjs':(bytes,root)=>bytes.replace(
+      '    return await new Promise((resolve,reject)=>{',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    return await new Promise((resolve,reject)=>{`,
+    ),
+  },{bundleBody:bundle});
+  const credential=write(f.root,'mcp-server/.env','NOTION_API_KEY=original-descriptor-key\n',0o600);
+  const env={...process.env}; delete env.NOTION_API_KEY; delete env.NODE_OPTIONS; delete env.NODE_PATH;
+  const p=start(f,'jhw-runtime-entry',['mcp'],{env});
+  await until(()=>fs.existsSync(path.join(f.root,readyName)),'credential spawn pause');
+  fs.writeFileSync(`${credential}.replacement`,'NOTION_API_KEY=replacement-key\n',{mode:0o600});
+  fs.renameSync(`${credential}.replacement`,credential);
+  fs.writeFileSync(path.join(f.root,resumeName),'go'); p.child.stdin.end();
+  const [status]=await p.done;
+  assert.equal(status,75,p.error());
+  assert.equal(p.output(),'');
+  assert.equal(p.error(),'DEPLOY_RELEASE_CHANGED\n');
 });
 
 // Break caught: a bundled dependency loader reaching back into mutable release
