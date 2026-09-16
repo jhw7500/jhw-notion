@@ -13,28 +13,124 @@ Notion AI Workspace를 여러 AI TUI에서 사용할 수 있는 MCP 서버.
 
 `/jhw:task`가 사용하는 secure launcher는 `claude-config`가 소유한다. 먼저 해당 저장소의
 `install.sh`를 실행해 `$HOME/.local/bin/jhw-control-host`를 설치해야 한다. 이 저장소의
-설치기는 launcher의 공개 host contract v4가 exact v4·`secure-store-only`이고 `task start`,
-`task child-start`, `task contract`, `task completion-ready`, `task promote`, `task status`,
-`task handoff`, `task finish`, `task recover`, `task assert-owner`를 모두 포함하는지 확인한다.
-계약이 누락되었거나 구버전이면 스킬·심링크·MCP 설정을 활성화하기 전에 중단한다.
+설치기는 launcher의 공개 host contract v5가 exact v5·`secure-store-only`이고 `unlock`,
+`preflight`, `portfolio status`, `task start`, `task child-start`, `task contract`,
+`task completion-ready`, `task promote`, `task status`, `task handoff`, `task finish`,
+`task recover`, `task assert-owner`, `board status`, `board acquire`, `board with`를 정확히
+포함하는지 확인한다. 계약이 누락되었거나 구버전이면 global wiring을 활성화하기 전에
+중단한다. 공개 deployment CLI는 Linux `/proc`, Bash, 실행 가능한 `/usr/bin/flock`,
+Node.js 22 이상이 필요하다. Node가 없거나 22보다 오래되면 다른 module을 읽기 전에
+`DEPLOY_NODE_UNSUPPORTED`로 끝난다.
 
 ```bash
 git clone https://github.com/jhw7500/jhw-notion.git
 cd jhw-notion
-./install.sh
+./install.sh --help
 ```
 
-install.sh가 자동으로:
-1. MCP 서버 빌드 (`npm ci` + build; manifest/lockfile 불일치 시 수정 없이 실패)
-2. `~/.local/bin/jhw-control`과 `~/.local/bin/jhw-control-hook`을 검증한 뒤 두 심링크 생성
-3. 설치된 TUI 감지
-4. 스킬 심링크 생성
-5. 각 TUI 설정 파일에 MCP 서버 등록
+운영 설치와 업데이트는 준비와 활성화를 분리한다. `--prepare`는 active consumer가 있어도
+실행할 수 있으며 checkout의 live `dist`나 `node_modules`, `current`, HOME 설정을 바꾸지
+않는다. 출력 JSON의 `releaseId` 전체를 그대로 보관하고 별도 maintenance window에서만
+그 정확한 ID를 활성화한다.
+
+```bash
+./install.sh --prepare
+./install.sh --status
+./install.sh --activate 'r-<40-or-64 lowercase hex source revision>-<64 lowercase hex content digest>'
+```
+
+release ID는 `--prepare`가 반환한 `r-` 접두사의 lowercase hex 문자열만 허용한다. 생략,
+축약, path, 임의 별칭은 허용하지 않는다. 아무 인자 없는 `./install.sh`는 설치 흔적이 전혀
+없는 fresh host에서만 같은 staged build와 gated activation을 연속 수행한다. runtime store,
+control/hook link 또는 지원 TUI 설정 파일이 하나라도 있으면 build·배선 없이
+`DEPLOY_EXPLICIT_ACTIVATION_REQUIRED`와 `--prepare`, `--activate RELEASE_ID`를 반환한다.
+
+| 명령 | 공개 동작 |
+|---|---|
+| `./install.sh --prepare` | private stage에서 `npm ci`와 build를 수행하고 immutable release를 검증·보존한다. live pointer와 HOME은 그대로다. |
+| `./install.sh --status` | 선택된 release, predecessor 유무, pending recovery 수와 `tui`·`app_server`·`legacy`·`managed` 집계만 반환하는 advisory 조회다. |
+| `./install.sh --activate RELEASE_ID` | 두 번의 consumer inventory와 exclusive admission을 통과한 정확한 retained release만 활성화한다. |
+| `./install.sh --rollback` | 현재 activation manifest에 기록된 validated predecessor 하나만 같은 gate 아래 활성화한다. |
+| `./install.sh --uninstall` | 확인된 installer-owned HOME wiring만 제거한다. release, activation, `current`, bootstrap, recovery evidence는 보존한다. |
+
+첫 활성화는 legacy entry를 stable bootstrap으로 옮긴다. 성공 뒤 MCP/control/hook은
+`.jhw-runtime/bootstrap/jhw-runtime-{entry,control,hook}`를 거쳐 admission lease를 잡고,
+실행할 release는 `.jhw-runtime/current` 아래에서 선택한다. 스킬은
+`.jhw-runtime/current/skills`를 가리킨다. 준비 단계는 세 selector마다 npm 실행 코드를
+단일 CJS bundle로 만들며, bootstrap은 manifest로 검증한 bundle inode를 descriptor로 고정해
+실행하고 그 뒤 built-in이 아닌 module load를 거부한다. 따라서 검사 뒤 release의 다른 JS나
+`node_modules`가 교체되어도 새 바이트를 불러오지 않는다. control authorization에 쓰는 tool
+version도 build 시 package metadata에서 읽어 bundle bytes에 삽입하므로 실행 중 mutable
+`package.json`을 다시 읽지 않는다. descriptor 실행 전에 bootstrap은 검증한 selected release
+root를 변경 불가능한 process-local binding으로 전달하므로 control이 `/proc/self/fd` 위치를
+저장소 root로 오인하지 않는다. managed MCP는 canonical `mcp-server/.env`를 owner·mode·type·
+single-link·identity 검사 뒤 열린 descriptor로 상속한다. 인증된 runner가 bounded fatal-UTF-8
+parser로 descriptor를 읽고 전후 identity를 대조한 뒤 `NOTION_API_KEY`만 process environment에
+반영하고 fd를 닫는다. 다른 well-formed key는 실행하거나 전달하지 않으며 Node startup injection
+변수도 selector child environment에서 제거하므로 credential data가 bundle보다 먼저 코드로
+평가되지 않는다. hook runner는 모든 이벤트에서
+timeout 뒤 `SIGTERM`, 200 ms 뒤 `SIGKILL` 순으로 종료를 보장한다. 설치기는 다음 wiring을
+ownership proof와 기존 no-clobber transaction으로 생성한다.
+
+1. `~/.local/bin/jhw-control`과 `~/.local/bin/jhw-control-hook`
+2. 설치된 TUI의 skill/command link
+3. 각 TUI 설정 파일의 managed bootstrap MCP entry
    - Claude: `~/.claude.json`의 `mcpServers`
    - Gemini: `~/.gemini/settings.json`의 `mcpServers`
    - OpenCode: `~/.config/opencode/opencode.json`의 `mcp`
    - Codex: `~/.codex/config.toml`의 `mcp_servers`
-6. Claude Code와 Codex가 설치되어 있으면 각각 `~/.claude/settings.json`, `~/.codex/hooks.json`에 repository-owned `UserPromptSubmit`·`PreToolUse`·`PostToolUse` Guard command group과 evidence-only `SessionEnd` command group을 등록하고 public `jhw-control guard preflight`를 실행한다. Control 좌표 환경변수가 미설정이면 `JHW_GUARD_MODE`·`JHW_GUARD_ALLOW_OBSERVE` 값과 무관하게 기존 Guard 비활성화 규칙을 유지하면서 두 adapter 모두 `SessionEnd`만 독립 등록한다. 이는 Guard 보호 활성화가 아니다. Codex hook 신뢰는 `/hooks`에서 사용자가 확인하고, Claude coverage는 아래 0-token runtime probe로 검증한다.
+4. Claude Code와 Codex의 repository-owned `UserPromptSubmit`·`PreToolUse`·`PostToolUse`
+   Guard command group과 evidence-only `SessionEnd` command group
+
+첫 migration에는 managed predecessor가 없다. mutation을 시작한 activation이 실패하면 release와 private
+`.jhw-runtime/.deploy.<32 lowercase hex>/`의 `state.json`, `before.json`, bounded phase log,
+기존 hook transaction evidence를 보존하고 maintenance를 계속 유지한 채 operator가
+검토한다. `--rollback`은 legacy checkout이나 과거 wiring을 복원하지 않으며 이 경우
+`DEPLOY_PREDECESSOR_INVALID`로 거부된다. 자동 복원 command는 없다.
+
+이후 compatible release 활성화는 `current` pointer만 바꾸고 TUI 설정을 다시 쓰지 않는다.
+stable bootstrap helper가 바뀌었거나 Codex에 개별 설치되는 skill/prompt 이름 집합이
+달라지면 일반 activation/rollback으로 배선을 갱신하지 않는다. Codex topology 차이는
+`DEPLOY_WIRING_TOPOLOGY_CHANGED` / `guarded_uninstall_reinstall_required`로 pointer 변경 전에
+거부된다. 이 변경을 채택하려면 consumer가 없는 같은 maintenance window에서 다음 두
+명령을 각각 gate에 통과시킨다.
+
+```bash
+./install.sh --uninstall
+./install.sh --activate '<exact retained RELEASE_ID>'
+```
+
+재설치 검증 실패는 `DEPLOY_VALIDATION_FAILED` / `wiring_refresh_recovery_required`다.
+retained predecessor가 있어도 unfinished wiring을 pointer rollback으로 복구할 수 없으며
+`--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. maintenance와 private evidence를
+유지하고 operator가 wiring·helper·hook transaction 상태를 검토해야 한다.
+
+`.jhw-runtime/releases/`, `activations/`, `bootstrap/`, 이전 helper directory와 완료·미완료
+deployment journal은 자동 삭제하지 않는다. stage와 private evidence를 임의 cleanup하거나
+임의 checkout의 mode를 완화해 trust 검사를 우회하지 않는다.
+
+공개 성공 결과는 `DEPLOY_PREPARED`, `DEPLOY_STATUS`, `DEPLOY_ACTIVATED`,
+`DEPLOY_ROLLED_BACK`, `DEPLOY_UNINSTALLED` 중 하나와 bounded release/consumer 정보만
+포함한다. 오류도 PID, argv, 환경변수, 절대 경로, Task/session 좌표를 내보내지 않는다.
+
+| 진단 | operator 조치 |
+|---|---|
+| `DEPLOY_CONSUMERS_ACTIVE`, `DEPLOY_INVENTORY_UNCERTAIN` | TUI와 app server를 시작하지 못하게 유지하고 supported consumer 또는 `/proc` 관측 불확실성을 해소한다. `--status`는 참고용이며 activation gate를 대체하지 않는다. |
+| `DEPLOY_LOCK_CONTENDED`, managed entry의 `DEPLOY_MAINTENANCE` | 진행 중인 정상 작업이 끝나기를 기다린다. lock file을 지우거나 holder를 종료하지 않는다. |
+| `DEPLOY_SOURCE_INVALID`, `DEPLOY_SOURCE_CHANGED`, `DEPLOY_UNTRUSTED_PATH`, `DEPLOY_RELEASE_INVALID`, `DEPLOY_CURRENT_CHANGED` | 승인 revision의 전용 canonical trusted runtime checkout과 retained manifest/pointer를 검사한다. 임의 tree를 `chmod`하거나 trust 검사를 완화하지 않는다. |
+| `DEPLOY_WIRING_TOPOLOGY_CHANGED` / `guarded_uninstall_reinstall_required` | maintenance gate 아래 `--uninstall`, 이어서 원하는 exact retained release의 `--activate`를 실행한다. |
+| `DEPLOY_VALIDATION_FAILED` / `validated_rollback_required` | 기존 설치 완료 wiring을 유지한 managed pointer update 실패다. 새 session을 열지 말고 같은 maintenance window에서 `--rollback`으로 기록된 predecessor를 검증·활성화한다. |
+| `DEPLOY_VALIDATION_FAILED` / `first_migration_recovery_required` | 첫 migration에는 predecessor가 없다. maintenance와 retained private evidence를 유지하고 operator가 초기 wiring을 검토한다. 자동 restore나 legacy rollback은 없다. |
+| `DEPLOY_VALIDATION_FAILED` / `wiring_refresh_recovery_required` | guarded uninstall 뒤 재설치 검증 실패다. predecessor가 남아도 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. maintenance와 evidence를 유지하고 operator가 wiring·helper·hook transaction을 검토한다. |
+| `DEPLOY_VALIDATION_FAILED` / `rollback_recovery_required` | rollback 자체의 검증 실패다. 추가 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. maintenance와 pointer·pending evidence를 유지하고 operator 수동 검토로 넘긴다. |
+| `DEPLOY_RECOVERY_REQUIRED` | `--status`와 retained private evidence를 읽고 maintenance를 유지한 채 operator review로 넘긴다. 자동 restore, journal 삭제, `installed:true` 강제 설정은 하지 않는다. |
+| `DEPLOY_PREDECESSOR_INVALID` | rollback 대상이 없거나 유효하지 않다. 임의 release를 predecessor로 대체하지 않는다. |
+
+Guard 결과는 deployment 성공과 별도다. activation 결과의 `unprotected: true`는 Project
+Control 좌표가 전혀 없어 exact `INVALID_CONFIG` 경로로 Guard group을 활성화하지 않았다는
+뜻이다. `jhw-control guard preflight`의 `NO-GO`는 검증되지 않은 protection 축이 남았다는
+뜻이다. 둘 다 보호 완료로 기록하지 않는다. hook wiring이 존재하거나 activation이
+`DEPLOY_ACTIVATED`를 반환했다는 사실만으로 Guard protection을 주장할 수 없다.
 
 모든 canonical/legacy skill target과 same-name MCP entry는 이 저장소 소유임이 증명될 때만 교체한다. 다른 file/symlink/registration이 있으면 그대로 보존하고 install은 fail-closed한다. JSON/TOML 설정은 기존 mode를 보존한 private same-directory temp에서 fsync 후 atomic publish한다. Codex backup도 이 설치기의 명시적 namespace만 관리한다.
 
@@ -46,7 +142,7 @@ Claude/Codex hook의 canonical command는 다음 문자열이다. `$HOME` 값을
 
 installer는 adapter별 canonical command만 자기 소유로 보며, Codex에 한해 이전 installer가 만든 exact legacy absolute launcher command도 소유로 인정한다. install은 소유가 증명된 Codex legacy만 canonical로 migration하고 uninstall은 exact owned variant만 제거한다. 유사 command, wrapper, matcher가 추가된 group, 다중 handler, 외부 group은 수정하지 않는다. 각 이벤트에서 Guard group은 맨 앞에 추가되며 기존 외부 group은 lexical byte content와 기존 상대 순서를 유지한다.
 
-`jhw-control guard status`는 기존 Plan 2의 고정 `pending` coverage를 유지하며 설치 상태를 추론하지 않는다. 설치된 Codex 0.153.4는 같은 이벤트의 matching synchronous local handler를 함께 실행하므로 local config에 Guard가 존재하거나 첫 위치라는 사실만으로 보호를 주장하지 않는다. `jhw-control guard preflight`의 Codex `enforced: true`는 `enforce` mode에서 네 이벤트마다 exact trusted synchronous Guard가 하나이고, Guard 외에 활성·실행 가능한 synchronous `command`/`mcpTool` handler가 없음을 read-only runtime inventory로 확인하며, owned launcher symlink가 이 저장소의 executable `scripts/jhw-control-hook`를 가리키고 executable regular `mcp-server/dist/control/hook-adapter.js` core가 존재하며, 저장된 PreToolUse command의 bounded shell probe가 stderr 없이 exact `GUARD_PROTOCOL_MISMATCH` deny를 반환할 때만 가능하다. `command` variant의 `async: false`만 synchronous이고 `mcpTool` variant는 항상 synchronous다. 실행 가능한 foreign handler는 trusted 또는 managed 항목이며 untrusted·modified·disabled handler와 asynchronous command는 충돌로 보지 않는다. variant별 `command`/`async` 또는 `server`/`tool`, trust metadata, probe를 검증할 수 없으면 `enforced: false`/`NO-GO`다. project-source inventory는 이 명령을 실행한 current working directory 범위이므로 진단은 대상 worktree에서 실행한다. 미신뢰 훅 실행을 강제로 우회 허용한 별도 Codex 런타임은 이 판정의 전제 밖이므로 사용하지 않는다.
+`jhw-control guard status`는 기존 Plan 2의 고정 `pending` coverage를 유지하며 설치 상태를 추론하지 않는다. 설치된 Codex 0.153.4는 같은 이벤트의 matching synchronous local handler를 함께 실행하므로 local config에 Guard가 존재하거나 첫 위치라는 사실만으로 보호를 주장하지 않는다. `jhw-control guard preflight`의 Codex `enforced: true`는 `enforce` mode에서 네 이벤트마다 exact trusted synchronous Guard가 하나이고, Guard 외에 활성·실행 가능한 synchronous `command`/`mcpTool` handler가 없음을 read-only runtime inventory로 확인할 때만 가능하다. legacy wiring은 owned launcher가 이 저장소의 exact executable `scripts/jhw-control-hook`와 `mcp-server/dist/control/hook-adapter.js`를 가리켜야 한다. managed wiring은 canonical store ancestry의 bounded no-follow bootstrap manifest·helper bytes와 selected release의 wrapper/core digest를 함께 검증한 exact `bootstrap/jhw-runtime-hook` 관계여야 한다. 두 경우 모두 저장된 PreToolUse command의 bounded shell probe가 stderr 없이 exact `GUARD_PROTOCOL_MISMATCH` deny를 반환해야 한다. `command` variant의 `async: false`만 synchronous이고 `mcpTool` variant는 항상 synchronous다. 실행 가능한 foreign handler는 trusted 또는 managed 항목이며 untrusted·modified·disabled handler와 asynchronous command는 충돌로 보지 않는다. variant별 `command`/`async` 또는 `server`/`tool`, trust metadata, probe를 검증할 수 없으면 `enforced: false`/`NO-GO`다. project-source inventory는 이 명령을 실행한 current working directory 범위이므로 진단은 대상 worktree에서 실행한다. 미신뢰 훅 실행을 강제로 우회 허용한 별도 Codex 런타임은 이 판정의 전제 밖이므로 사용하지 않는다.
 
 Claude `enforced: true`도 `enforce` mode에서만 가능하다. preflight는 standard `HOME/.claude` 설정 source(`CLAUDE_CONFIG_DIR`가 없거나 같은 절대 경로), 네 exact first-position group, 단일 owned launcher symlink와 executable core를 먼저 확인한다. global source는 filesystem root부터 `HOME/.claude`까지 전체 absolute directory chain을 descriptor-relative no-follow로 열어 root/current-user ownership과 group/world non-writable mode(root-owned sticky directory 제외)를 검증하되 마지막 `.claude`는 current-user-owned여야 하며, 읽은 뒤 같은 live pathname chain인지 다시 확인한다. `settings.json`도 current-user-owned regular 단일 link·group/world non-writable인지와 읽기 전후 identity/mode/size/time 안정성을 검증한다. launcher symlink, 그 exact target, core도 각 absolute parent chain을 같은 방식으로 열어 단일 link, executable regular type, bounded full-read 전후 안정성, current-path identity를 검증한다. 빌드는 새 `dist`를 `umask 022`로 생성하고 executable core를 정확히 `0755`로 고정한다. 또한 진단 cwd의 전체 parent chain도 같은 directory trust와 live-path 재검증을 통과해야 하며, filesystem root까지 Claude가 발견할 수 있는 `.claude/settings.json`과 `.claude/settings.local.json`을 열린 ancestor descriptor에 상대적으로 no-follow 조회한다. 현재 사용자 소유의 안정된 regular file이 아니거나 JSON·UTF-8·top-level `disableAllHooks` key가 모호하면 fail-closed하며, 어느 source든 명시 값이 정확히 `false`가 아니면 runtime probe를 시작하지 않는다. 다른 hook 내용은 실행하거나 probe 설정에 복제하지 않는다.
 
@@ -54,7 +150,7 @@ runtime probe는 PATH의 선택된 search entry chain과 해석된 Claude binary
 
 Claude/Codex hook 등록은 설치기가 hook을 임의 신뢰하지 않는다. 설치된 adapter의 설정 root는 current-user-owned real directory여야 하며 symlink·non-directory·소유자 불일치는 install과 uninstall 모두 transaction 탐색·할당 전에 거부한다. 중첩된 ownership key까지 중복 없는 exact group만 소유하며 모호한 JSON과 fatal UTF-8 검증을 통과하지 못한 raw bytes는 fail-closed하고 malformed backup도 byte-exact하게 남긴다. 설치 마지막 preflight의 정형 `NO-GO`(exit 78)는 검증되지 않은 축이 남았다는 fail-closed 진단이므로 그대로 표시하고 설치는 완료하지만 보호 완료를 뜻하지 않는다. Project Control/Guard 환경 설정이 하나도 없는 기본 설치는 public diagnostic의 exact `INVALID_CONFIG`만 `UNPROTECTED`로 분류하고 필수 좌표 설정 안내와 함께 완료한다. 이때 launcher·스킬·MCP는 설치하지만 Guard hook group은 활성화하지 않으며, 두 adapter의 이전 exact owned group만 제거하고 외부 hook은 보존한다. 좌표를 설정한 뒤 installer를 다시 실행해야 Guard group이 등록된다. required/optional을 불문한 일부 명시 설정, invalid Guard mode, malformed/non-Guard output, 또는 다른 실행 실패는 설치를 중단하고 이번 실행이 추가한 두 hook config와 launcher를 함께 원상 복구한다. PostToolUse adapter의 `ok: true`는 승인된 invocation이 transport event까지 도달해 exact Guard correlation을 닫았다는 뜻일 뿐, tool의 업무 성공을 뜻하지 않는다.
 
-hook config 등록·rollback·uninstall은 current-user-owned real parent를 no-follow로 열고 그 descriptor에 고정한 same-parent private `0700` namespace(`.settings.json.jhw-txn.*`, `.hooks.json.jhw-txn.*`)를 사용하며, launcher symlink 제거는 별도의 same-parent private `0700` `.jhw-control-hook-link-txn.*` no-clobber namespace를 사용한다. 논리 parent path가 열린 뒤 다른 directory나 symlink로 교체되어도 해당 helper의 설정 작업은 처음 연 directory 밖으로 이동하지 않는다. Claude transaction은 Codex 등록과 최종 preflight가 끝날 때까지 finalize하지 않으므로 뒤 단계 실패 시 두 설정을 함께 되돌린다. Node는 live path를 capture하기 전에 intent를 fsync하고, capture 후 실제 type·mode·identity와 exact bytes를 `0600` manifest/evidence에 기록한다. symlink/FIFO는 follow하지 않고 exclusive hard-link로 원 객체를 복구한다. launcher 제거도 owned symlink를 private `captured-link`로 atomic rename한 뒤 identity/target을 재검증하며, 경합 교체된 외부 object는 absent live path에만 no-clobber republish한다. winner가 있으면 덮어쓰거나 지우지 않고 evidence를 보존한다. 경합 중 capture된 directory는 Node 표준 API로 안전한 no-clobber rename을 할 수 없으므로 private `captured-live` subtree와 launcher를 보존하고 `manual recovery required`로 중단하며, live path를 복구했다고 주장하지 않는다. rollback의 live candidate도 이동 전에 별도 intent를 fsync한다. 이동 직후 기록이 끊기면 recovery는 live parent와 transaction directory를 먼저 fsync하고 surviving `candidate-live` identity를 manifest에 인수한 뒤, 종류와 무관하게 exact candidate 경로와 launcher를 보존한 `manual-recovery-required` 상태에서 중단한다. Node의 pathname-only hard-link API로는 기록한 inode와 이후 publication source를 원자적으로 결속할 수 없으므로 이 interrupted-intent 경로는 live config를 자동 재게시하지 않는다. 정상적으로 중단 없이 진행되는 등록·복구·rollback만 준비된 inode를 absent live path에 exclusive link하는 방식으로 publish한다. 그 사이 다른 path가 생기면 해당 winner를 덮어쓰거나 지우지 않고 launcher와 original/published/candidate evidence를 보존한다. 어느 namespace든 기존 transaction directory가 남아 있으면 다음 install/uninstall은 새 transaction을 만들기 전에 그 exact path를 안내하고 fail-closed한다.
+hook config 등록·rollback·uninstall과 launcher symlink 제거는 current-user-owned real parent를 no-follow로 열고 retained descriptor에 고정한 same-parent private `0700` namespace(`.settings.json.jhw-txn.*`, `.hooks.json.jhw-txn.*`, `.jhw-control-hook-link-txn.*`)를 사용한다. 논리 parent path가 열린 뒤 다른 directory나 symlink로 교체되어도 작업은 처음 연 directory 밖으로 이동하지 않으며, launcher transaction은 반환 직전 논리 parent가 같은 inode·owner·mode인지 다시 확인해 교체를 실패로 남긴다. Claude transaction은 Codex 등록과 최종 preflight가 끝날 때까지 finalize하지 않으므로 뒤 단계 실패 시 두 설정을 함께 되돌린다. Node는 live path를 capture하기 전에 intent를 fsync하고, capture 후 실제 type·mode·identity와 exact bytes를 `0600` manifest/evidence에 기록한다. symlink/FIFO는 follow하지 않고 exclusive hard-link로 원 객체를 복구한다. launcher 제거도 owned symlink를 private `captured-link`로 atomic rename한 뒤 identity/target을 재검증하며, 경합 교체된 외부 object는 absent live path에만 no-clobber republish한다. winner가 있으면 덮어쓰거나 지우지 않고 evidence를 보존한다. 경합 중 capture된 directory는 Node 표준 API로 안전한 no-clobber rename을 할 수 없으므로 private `captured-live` subtree와 launcher를 보존하고 `manual recovery required`로 중단하며, live path를 복구했다고 주장하지 않는다. rollback의 live candidate도 이동 전에 별도 intent를 fsync한다. 이동 직후 기록이 끊기면 recovery는 live parent와 transaction directory를 먼저 fsync하고 surviving `candidate-live` identity를 manifest에 인수한 뒤, 종류와 무관하게 exact candidate 경로와 launcher를 보존한 `manual-recovery-required` 상태에서 중단한다. Node의 pathname-only hard-link API로는 기록한 inode와 이후 publication source를 원자적으로 결속할 수 없으므로 이 interrupted-intent 경로는 live config를 자동 재게시하지 않는다. 정상적으로 중단 없이 진행되는 등록·복구·rollback만 준비된 inode를 absent live path에 exclusive link하는 방식으로 publish한다. 그 사이 다른 path가 생기면 해당 winner를 덮어쓰거나 지우지 않고 launcher와 original/published/candidate evidence를 보존한다. 어느 namespace든 기존 transaction directory가 남아 있으면 다음 install/uninstall은 새 transaction을 만들기 전에 그 exact path를 안내하고 fail-closed한다.
 
 helper 결과나 fsync가 불명확한 경우 installer는 현재 path 상태를 단정하지 않으며, 검증된 manifest의 존재하는 evidence 경로와 실제 mode만 안내한다. register와 unregister 모두 inspector가 durable `manual-recovery-required`와 실제 `captured-live`를 확인하면 helper 종료 코드와 무관하게 그 exact evidence를 선택한다. rollback은 재검증된 durable stage와 실제 `candidate-live`, launcher 제거는 전용 manifest stage와 실제 `captured-link`를 기준으로 안내한다. 따라서 stage commit 직후 helper가 비정상 종료해도 해당 exact 경로를 표시한다. parent fsync 전에 실패한 `rollback-capture-intent`도 검증 가능한 candidate가 남아 있으면 내구성 완료를 주장하지 않은 채 그 경로와 live unknown/absent 상태만 안내한다. live config를 exclusive link하고 parent를 sync한 뒤 private `published-ready`를 떼기 전에는 `activation-detach-intent`와 exact delete target을 먼저 기록한다. 중단 시 이 stage만 `published-ready` 하나의 누락을 허용하므로 surviving live config와 transaction evidence를 검사할 수 있지만, installer는 완료를 주장하지 않고 launcher와 private transaction을 보존한다. finalize는 각 artifact의 recorded identity와 durable delete-intent를 확인해 재시도하고 unexpected loss/substitution을 삭제하지 않는다. transaction directory 제거 뒤 parent fsync가 실패하면 evidence가 제거됐다는 사실과 durability 미확인 상태를 그대로 알리고 launcher를 유지하며, evidence가 보존됐다고 말하거나 완료를 주장하지 않는다. Gemini/OpenCode Guard는 현재 지원하지 않는다.
 
@@ -187,7 +283,8 @@ Phase 1A control plane은 이 저장소와 **별도 checkout**인 비공개 Regi
 
 `task start --task`는 같은 persistent Task를 명시적으로 재개하고 bounded latest Handoff만 반환한다. Handoff source revision은 Claim 시점에 고정된다. release 뒤 local cleanup은 `task recover --action cleanup`으로 exact Claim generation만 복구한다. `task assert-owner`는 raw Git을 통합 enforce하지 않는 advisory check라서 승인된 takeover와 race할 수 있다.
 
-현재 checkout의 Task를 확인할 때는 이미 v4 allowlist에 있는 `task status`에 current-context flags를 그대로 전달한다. host contract v4 remains unchanged because the existing `task status` allowlist already includes this command; 새 launcher command/version은 추가하지 않는다.
+현재 checkout의 Task를 확인할 때는 exact v5 allowlist의 `task status`에 current-context flags를 그대로 전달한다. 이 mode는 기존 v5 command 집합 안에서 동작하므로 새 launcher command/version을 추가하지 않는다.
+이 mode가 처음 추가된 v4 시점의 계약도 같다: host contract v4 remains unchanged because the existing `task status` allowlist already includes this command. 이후 launcher의 별도 기능 추가로 현재 contract만 v5가 되었다.
 
 ```bash
 REPOSITORY_PATH="$(git rev-parse --show-toplevel)" || exit $?
@@ -242,12 +339,17 @@ measurement journal은 authority가 아니다. 성공 output에 `journal_warning
 ## 업데이트
 
 ```bash
-cd jhw-notion
-git pull
-npm run build --prefix mcp-server
+cd <canonical-trusted-runtime-checkout>
+./install.sh --prepare
+./install.sh --status
+# maintenance 승인 뒤, 출력에서 보관한 exact release ID 사용
+./install.sh --activate '<exact retained RELEASE_ID>'
 ```
 
-스킬은 심링크이므로 자동 반영. MCP 서버는 TUI 재시작 시 반영.
+source checkout의 `npm run build`나 skill file 변경은 live runtime에 즉시 반영되지 않는다.
+MCP와 skill은 activation이 선택한 immutable generation에서 함께 제공된다. 첫 live rollout의
+재부팅 전 준비, 재부팅 후 ordinary SSH shell 활성화, 검증·복구 절차는
+[Phase 1A runbook](docs/project-control/phase1a-runbook.md)의 Issue #153 절을 따른다.
 
 ## 현재 Notion DB 스키마
 
@@ -261,12 +363,12 @@ npm run build --prefix mcp-server
 
 ```
 jhw-notion/
-├── mcp-server/          # TypeScript MCP 서버 (Notion API 직접 호출)
-│   ├── src/tools/       # 15개 도구 핸들러
-│   └── dist/            # 빌드 결과
-├── skills/claude/       # 공유 TUI 스킬 정본 (Project Control 명시적 진입점 포함)
-├── install.sh           # 원클릭 설치/제거
-└── DESIGN.md            # 설계 문서
+|-- mcp-server/          # TypeScript MCP 서버 (Notion API 직접 호출)
+|   |-- src/tools/       # 15개 도구 핸들러
+|   `-- dist/            # 빌드 결과
+|-- skills/claude/       # 공유 TUI 스킬 정본 (Project Control 명시적 진입점 포함)
+|-- install.sh           # staged 설치/활성화/제거 dispatcher
+`-- DESIGN.md            # 설계 문서
 ```
 
 `PLAN.md`는 초기 구현 계획의 **원본 snapshot**이다. live 기준은 `README.md`, `DESIGN.md`, runbook, 그리고 실제 코드다.

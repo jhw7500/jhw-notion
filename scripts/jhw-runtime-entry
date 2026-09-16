@@ -1,0 +1,86 @@
+#!/usr/bin/env node
+// Deliberately self-contained root of trust. Only built-ins run before checking
+// the complete helper set. Small selector wrappers exec this canonical verifier.
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const physical = __filename;
+const name = path.basename(physical);
+const selector = process.argv[2];
+const args = process.argv.slice(3);
+function refuse() {
+  const code='DEPLOY_BOOTSTRAP_INVALID';
+  if(selector!=='hook') { process.stderr.write(code+'\n'); process.exitCode=75; return; }
+  const event=args[2]==='--event' && ['UserPromptSubmit','PostToolUse','SessionEnd'].includes(args[3]) ? args[3] : 'PreToolUse';
+  const value=event==='SessionEnd' ? {} : event==='PostToolUse' ? {systemMessage:code} : event==='UserPromptSubmit' ? {hookSpecificOutput:{hookEventName:event,additionalContext:code},systemMessage:code} : {hookSpecificOutput:{hookEventName:event,permissionDecision:'deny',permissionDecisionReason:code},systemMessage:code};
+  process.stdout.write(JSON.stringify(value)+'\n'); process.exitCode=0;
+}
+(async()=>{
+  const directory=path.dirname(physical);
+  const repositoryRoot=path.dirname(path.dirname(directory));
+  if(directory!==path.join(repositoryRoot,'.jhw-runtime/bootstrap') || name!=='jhw-runtime-entry') throw Error();
+  // Refuse symlink/group-writable ancestry before opening any helper.
+  let current='/'; const parts=directory.split('/').filter(Boolean); const held=[];
+  try {
+    for(let i=-1;i<parts.length;i++) {
+      if(i>=0) current=path.join(current,parts[i]);
+      const fd=fs.openSync(i<0 ? '/' : `/proc/self/fd/${held.at(-1).fd}/${parts[i]}`,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
+      const stat=fs.fstatSync(fd,{bigint:true}); held.push({fd,stat,name:current});
+      const mode=Number(stat.mode); const leaf=i===parts.length-1;
+      if(!stat.isDirectory() || (stat.uid!==BigInt(process.getuid()) && (leaf || stat.uid!==0n)) || (mode&0o022 && (leaf || !(mode&0o1000))) || mode&0o6000 || (leaf && (mode&0o7777)!==0o700)) throw Error();
+    }
+    const read=(name,mode,limit,parent=held.at(-1).fd)=>{
+      const file=`/proc/self/fd/${parent}/${name}`;
+      const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NONBLOCK|fs.constants.O_NOFOLLOW);
+      try {
+        const before=fs.fstatSync(fd,{bigint:true});
+        if(!before.isFile() || before.uid!==BigInt(process.getuid()) || before.nlink!==1n || (Number(before.mode)&0o7777)!==mode || before.size>BigInt(limit)) throw Error();
+        const bytes=Buffer.alloc(Number(before.size)); let offset=0;
+        while(offset<bytes.length) { const n=fs.readSync(fd,bytes,offset,bytes.length-offset,null); if(!n) throw Error(); offset+=n; }
+        const after=fs.fstatSync(fd,{bigint:true}); const named=fs.lstatSync(file,{bigint:true});
+        if(fs.readSync(fd,Buffer.alloc(1),0,1,null)!==0 || ['dev','ino','mode','uid','gid','nlink','size','mtimeNs','ctimeNs'].some(key=>before[key]!==after[key] || before[key]!==named[key])) throw Error();
+        return bytes;
+      } finally { fs.closeSync(fd); }
+    };
+    const manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read('manifest.json',0o600,16384)));
+    if(!manifest || Object.keys(manifest).sort().join(',')!=='files,sourceReleaseId,version' || manifest.version!==1 || typeof manifest.sourceReleaseId!=='string' || !/^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/.test(manifest.sourceReleaseId) || !Array.isArray(manifest.files) || manifest.files.length!==6) throw Error();
+    const files=['jhw-runtime-control','jhw-runtime-entry','jhw-runtime-hook','runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs'];
+    if(fs.readdirSync(`/proc/self/fd/${held.at(-1).fd}`).sort().join(',')!==[...files,'manifest.json'].sort().join(',')) throw Error();
+    const contents={};
+    for(let index=0;index<files.length;index++) {
+      const record=manifest.files[index]; const expected=files[index]; const mode=expected.startsWith('jhw-') ? 0o755 : 0o644;
+      const bytes=read(expected,mode,1024*1024); contents[expected]=bytes;
+      if(!record || Object.keys(record).sort().join(',')!=='mode,name,sha256' || record.name!==expected || record.mode!==mode || typeof record.sha256!=='string' || !/^[a-f0-9]{64}$/.test(record.sha256) || crypto.createHash('sha256').update(bytes).digest('hex')!==record.sha256) throw Error();
+    }
+
+    const canonical=value=>Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value!==null && typeof value==='object' ? `{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
+    // The bootstrap checksum alone cannot authorize changed helper bytes. Bind
+    // every helper to its source generation's content-derived ID and bytes.
+    let releasesFd; let sourceFd; let scriptsFd;
+    try {
+      releasesFd=fs.openSync(`/proc/self/fd/${held.at(-2).fd}/releases`,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
+      sourceFd=fs.openSync(`/proc/self/fd/${releasesFd}/${manifest.sourceReleaseId}`,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
+      for(const fd of [releasesFd,sourceFd]) { const stat=fs.fstatSync(fd); if(stat.uid!==process.getuid() || (stat.mode&0o7777)!==0o700) throw Error(); }
+      const source=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read('manifest.json',0o600,32*1024*1024,sourceFd)));
+      if(!source || Object.keys(source).sort().join(',')!=='contentDigest,createdAt,dirty,entries,releaseId,sourceDigest,sourceRevision,version' || source.version!==1 || source.releaseId!==manifest.sourceReleaseId || !Array.isArray(source.entries) || source.entries.length>100000) throw Error();
+      const digest=crypto.createHash('sha256').update(canonical({sourceRevision:source.sourceRevision,sourceDigest:source.sourceDigest,dirty:source.dirty,entries:source.entries})).digest('hex');
+      if(source.contentDigest!==digest || source.releaseId!==`r-${source.sourceRevision}-${digest}`) throw Error();
+      scriptsFd=fs.openSync(`/proc/self/fd/${sourceFd}/scripts`,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
+      const scriptsStat=fs.fstatSync(scriptsFd);
+      if(scriptsStat.uid!==process.getuid() || (scriptsStat.mode&0o7022)) throw Error();
+      for(const record of manifest.files) {
+        const entries=source.entries.filter(entry=>entry?.path===`scripts/${record.name}`);
+        if(entries.length!==1 || Object.keys(entries[0]).sort().join(',')!=='mode,path,sha256,type' || entries[0].type!=='file' || entries[0].mode!==record.mode || entries[0].sha256!==record.sha256 || crypto.createHash('sha256').update(read(record.name,record.mode,1024*1024,scriptsFd)).digest('hex')!==record.sha256) throw Error();
+      }
+    } finally { if(scriptsFd!==undefined) fs.closeSync(scriptsFd); if(sourceFd!==undefined) fs.closeSync(sourceFd); if(releasesFd!==undefined) fs.closeSync(releasesFd); }
+    for(const record of held) {
+      const stat=fs.lstatSync(record.name,{bigint:true});
+      if(['dev','ino','uid','gid','mode'].some(key=>record.stat[key]!==stat[key])) throw Error();
+    }
+    // Import the descriptor-read bytes themselves. A release pathname replaced
+    // after validation can no longer select different helper code.
+    const moduleUrl=bytes=>`data:text/javascript;base64,${bytes.toString('base64')}`;
+    const entry=await import(moduleUrl(contents['runtime-entry.mjs']));
+    process.exitCode=await entry.runManaged({repositoryRoot,selector,args,sourceReleaseId:manifest.sourceReleaseId,safetySource:contents['runtime-safety.mjs'],storeSource:contents['runtime-store.mjs']});
+  } finally { for(const record of held.reverse()) fs.closeSync(record.fd); }
+})().catch(refuse);

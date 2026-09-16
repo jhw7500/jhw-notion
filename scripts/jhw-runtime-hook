@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -u
+# Closed selector only. The canonical entry validates the entire helper set
+# before loading any runtime module; no caller-selected executable is accepted.
+physical=$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || physical=''
+entry="${physical%/*}/jhw-runtime-entry"
+code='DEPLOY_BOOTSTRAP_INVALID'
+if [[ -n "$physical" && -f "$entry" && -x "$entry" && ! -L "$entry" ]]; then
+  node_command=$(command -v node 2>/dev/null || true)
+  # Keep this probe valid on old interpreters: they must reach the event-shaped
+  # shell fallback instead of failing while parsing the modern bootstrap.
+  if [[ -n "$node_command" ]] && "$node_command" -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 18 ? 0 : 1)' >/dev/null 2>&1; then
+    exec "$node_command" "$entry" hook "$@"
+  fi
+  code='GUARD_UNAVAILABLE'
+fi
+event='PreToolUse'
+if [[ "${3-}" == '--event' ]]; then
+  case "${4-}" in UserPromptSubmit|PostToolUse|SessionEnd) event="${4}" ;; esac
+fi
+case "$event" in
+  SessionEnd) printf '{}\n' ;;
+  PostToolUse) printf '{"systemMessage":"%s"}\n' "$code" ;;
+  UserPromptSubmit) printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"},"systemMessage":"%s"}\n' "$code" "$code" ;;
+  *) printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"},"systemMessage":"%s"}\n' "$code" "$code" ;;
+esac
+exit 0

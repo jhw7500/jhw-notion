@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, parse, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import type { Writable } from "node:stream";
 import { TextDecoder } from "node:util";
 import { Client } from "@notionhq/client";
@@ -868,6 +869,23 @@ const CodexHookProbeResultSchema = z.object({
 }).strict();
 
 function codexRepositoryRoot(): string {
+  const managedReleaseRoot = (globalThis as Record<string, unknown>).__JHW_MANAGED_RELEASE_ROOT__;
+  if (managedReleaseRoot !== undefined) {
+    if (
+      typeof managedReleaseRoot !== "string" ||
+      !isAbsolute(managedReleaseRoot) ||
+      managedReleaseRoot !== resolvePath(managedReleaseRoot) ||
+      managedReleaseRoot.includes("\0") ||
+      basename(dirname(managedReleaseRoot)) !== "releases" ||
+      basename(dirname(dirname(managedReleaseRoot))) !== ".jhw-runtime" ||
+      !/^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/.test(basename(managedReleaseRoot))
+    ) {
+      throw new ControlError("INVALID_CONFIG", "Managed release root is invalid", {
+        key: "managed_release_root",
+      });
+    }
+    return managedReleaseRoot;
+  }
   return resolvePath(dirname(fileURLToPath(import.meta.url)), "../../..");
 }
 
@@ -1249,6 +1267,57 @@ async function inspectTrustedLauncherSymlink(
   }
 }
 
+type HookArtifacts = { launcherPath: string; wrapperPath: string; corePath: string };
+
+async function readTrustedManagedArtifact(file: string, maximum: number): Promise<Buffer> {
+  const uid = BigInt(process.getuid?.() ?? -1);
+  const chain = await openTrustedArtifactDirectoryChain(dirname(file), uid);
+  let handle: FileHandle | undefined;
+  try {
+    const parent = chain.handles.at(-1) as FileHandle;
+    handle = await openDescriptorChild(parent, basename(file), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    const before = await handle.stat({bigint:true});
+    if (!before.isFile() || before.uid !== uid || before.nlink !== 1n || (before.mode & 0o7022n) !== 0n || before.size > BigInt(maximum)) throw new Error("Unsafe managed artifact");
+    const buffer = Buffer.alloc(Number(before.size) + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const {bytesRead} = await handle.read(buffer, length, buffer.length - length, null);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    const bytes = buffer.subarray(0,length);
+    if (BigInt(length) !== before.size || bytes.length > maximum || !sameStableFsObject(before, await handle.stat({bigint:true})) ||
+        !sameStableFsObject(before, await lstatDescriptorChild(parent, basename(file))) ||
+        !await trustedArtifactDirectoryChainRemainsStable(dirname(file), chain, uid)) throw new Error("Changed managed artifact");
+    return bytes;
+  } finally { await handle?.close(); await closeDirectoryChain(chain); }
+}
+
+async function hookArtifacts(repositoryRoot: string): Promise<HookArtifacts> {
+  const releaseId = basename(repositoryRoot);
+  if (!/^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/.test(releaseId) || basename(dirname(repositoryRoot)) !== "releases" || basename(dirname(dirname(repositoryRoot))) !== ".jhw-runtime") {
+    return {launcherPath:join(repositoryRoot,"scripts/jhw-control-hook"),wrapperPath:join(repositoryRoot,"scripts/jhw-control-hook"),corePath:join(repositoryRoot,"mcp-server/dist/control/hook-adapter.js")};
+  }
+  const root = dirname(dirname(dirname(repositoryRoot)));
+  const manifest = JSON.parse((await readTrustedManagedArtifact(join(repositoryRoot,"manifest.json"),32*1024*1024)).toString("utf8"));
+  const canonical = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value !== null && typeof value === "object") return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical((value as Record<string,unknown>)[key])}`).join(",")}}`;
+    return JSON.stringify(value);
+  };
+  const hash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
+  const digest = hash(canonical({sourceRevision:manifest.sourceRevision,sourceDigest:manifest.sourceDigest,dirty:manifest.dirty,entries:manifest.entries}));
+  if (manifest.version !== 1 || manifest.releaseId !== releaseId || releaseId !== `r-${manifest.sourceRevision}-${digest}` || manifest.contentDigest !== digest || !Array.isArray(manifest.entries)) throw new Error("Invalid managed manifest");
+  const helpers = manifest.entries.filter((entry: {path?:unknown}) => entry.path === "scripts/runtime-entry.mjs");
+  const bytes = await readTrustedManagedArtifact(join(repositoryRoot,"scripts/runtime-entry.mjs"),1024*1024);
+  if (helpers.length !== 1 || helpers[0].type !== "file" || helpers[0].mode !== 0o644 || hash(bytes) !== helpers[0].sha256) throw new Error("Invalid managed verifier");
+  // Evaluate the exact verified bytes, never reopen a mutable module pathname.
+  // managedHookRelationship uses only built-ins and validates bootstrap provenance
+  // and the physical selected release's wrapper/core subset before trusting links.
+  const verifier = await import(`data:text/javascript;base64,${bytes.toString("base64")}`);
+  return verifier.managedHookRelationship({repositoryRoot:root,releaseRoot:repositoryRoot}) as HookArtifacts;
+}
+
 async function inspectTrustedClaudeExecutableArtifacts(
   home: string,
   repositoryRoot: string,
@@ -1257,10 +1326,12 @@ async function inspectTrustedClaudeExecutableArtifacts(
   if (uid === undefined) return false;
   const currentUid = BigInt(uid);
   const launcherPath = join(home, ".local", "bin", "jhw-control-hook");
-  const expectedLauncher = join(repositoryRoot, "scripts", "jhw-control-hook");
-  const corePath = join(repositoryRoot, "mcp-server", "dist", "control", "hook-adapter.js");
+  const artifacts = await hookArtifacts(repositoryRoot);
+  const expectedLauncher = artifacts.launcherPath;
+  const corePath = artifacts.corePath;
   return await inspectTrustedLauncherSymlink(launcherPath, expectedLauncher, currentUid)
     && await inspectTrustedExecutableArtifact(expectedLauncher, currentUid)
+    && await inspectTrustedExecutableArtifact(artifacts.wrapperPath, currentUid)
     && await inspectTrustedExecutableArtifact(corePath, currentUid);
 }
 
@@ -1404,12 +1475,13 @@ async function inspectExactHookInstallation(
 ): Promise<ExactHookInstallationEvidence | undefined> {
   if (!isAbsolute(home) || !isAbsolute(repositoryRoot)) return undefined;
   const launcherPath = join(home, ".local", "bin", "jhw-control-hook");
-  const expectedLauncher = join(repositoryRoot, "scripts", "jhw-control-hook");
-  const corePath = join(repositoryRoot, "mcp-server", "dist", "control", "hook-adapter.js");
   const hooksPath = adapter === "claude"
     ? join(home, ".claude", "settings.json")
     : join(home, ".codex", "hooks.json");
   try {
+    const artifacts = await hookArtifacts(repositoryRoot);
+    const expectedLauncher = artifacts.launcherPath;
+    const corePath = artifacts.corePath;
     if (adapter === "claude") {
       if (!await inspectTrustedClaudeExecutableArtifacts(home, repositoryRoot)) return undefined;
     } else {
