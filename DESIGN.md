@@ -420,8 +420,11 @@ runtime은 release pathname의 `package.json`을 읽지 않는다. hook timeout�
 무관하게 `SIGTERM` 뒤 200 ms grace가 지나면 `SIGKILL`로 승격한다. bootstrap runner는
 selected release root를 bundle 평가 전에 변경 불가능한 process-local binding으로 설정해
 descriptor filename과 control trust root를 분리한다. managed MCP credential은 canonical
-`.env`의 owner·mode·type·single-link·identity를 검사한 열린 fd를 상속하고 Node의 pre-evaluation
-env-file loader로 읽어 bundle이 `/proc/self/fd` 기준의 잘못된 pathname을 다시 열지 않게 한다. 모든 owned
+`.env`의 owner·mode·type·single-link·identity를 검사한 열린 fd를 상속한다. 인증된 runner는
+1 MiB 한도와 fatal UTF-8을 적용해 descriptor를 끝까지 읽고 read 전후 identity를 비교하며,
+well-formed assignment 중 `NOTION_API_KEY` 하나만 반영한 뒤 bundle load 전에 fd를 닫는다. 다른 key는
+실행·전달하지 않고 selector child의 `NODE_OPTIONS`·`NODE_PATH`·`NODE_REPL_EXTERNAL_MODULE`·
+`BASH_ENV`·`ENV`를 제거하므로 credential data가 Node pre-evaluation 단계에 도달하지 않는다. 모든 owned
 launcher/skill/prompt 제거는 같은 parent의 private capture transaction으로 수행해 검사 뒤
 바뀐 foreign replacement를 삭제하지 않는다. control/hook launcher transaction도 parent를
 retained no-follow descriptor로 고정하며 반환 직전 논리 parent identity를 다시 검증한다.

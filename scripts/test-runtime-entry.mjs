@@ -495,6 +495,23 @@ test('managed credential reaches a bundled Notion client through descriptor exec
   assert.equal(result.stdout,'descriptor-only-test-key');
 });
 
+// Break caught: Node processes --env-file NODE_OPTIONS before evaluating the
+// trusted runner, which allowed credential data to execute with inherited fds.
+test('managed credential cannot inject Node startup options', async t => {
+  const marker=path.join(os.tmpdir(),`jhw-credential-preload-${process.pid}-${Date.now()}`);
+  const preload=path.join(os.tmpdir(),`jhw-credential-preload-${process.pid}-${Date.now()}.cjs`);
+  t.after(()=>{ fs.rmSync(marker,{force:true}); fs.rmSync(preload,{force:true}); });
+  fs.writeFileSync(preload,`require('node:fs').writeFileSync(${JSON.stringify(marker)},'executed');\n`,{mode:0o600});
+  const bundle=bundledCredentialProbe(t);
+  const f=await fixture(t,undefined,undefined,{}, {bundleBody:bundle});
+  write(f.root,'mcp-server/.env',`NOTION_API_KEY=descriptor-safe-key\nNODE_OPTIONS=--require=${preload}\n`,0o600);
+  const env={...process.env}; delete env.NOTION_API_KEY; delete env.NODE_OPTIONS; delete env.NODE_PATH;
+  const result=run(f,'jhw-runtime-entry',['mcp'],'',{env});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(result.stdout,'descriptor-safe-key');
+  assert.equal(fs.existsSync(marker),false);
+});
+
 test('managed credential replacement fails before descriptor execution', async t => {
   const readyName='credential-ready'; const resumeName='credential-resume';
   const bundle=bundledCredentialProbe(t);

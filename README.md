@@ -64,8 +64,11 @@ version도 build 시 package metadata에서 읽어 bundle bytes에 삽입하므�
 `package.json`을 다시 읽지 않는다. descriptor 실행 전에 bootstrap은 검증한 selected release
 root를 변경 불가능한 process-local binding으로 전달하므로 control이 `/proc/self/fd` 위치를
 저장소 root로 오인하지 않는다. managed MCP는 canonical `mcp-server/.env`를 owner·mode·type·
-single-link·identity 검사 뒤 열린 descriptor로 상속하고 Node가 bundle 평가 전에 그 fd에서
-환경을 읽게 하므로 release의 mutable pathname을 다시 열지 않는다. hook runner는 모든 이벤트에서
+single-link·identity 검사 뒤 열린 descriptor로 상속한다. 인증된 runner가 bounded fatal-UTF-8
+parser로 descriptor를 읽고 전후 identity를 대조한 뒤 `NOTION_API_KEY`만 process environment에
+반영하고 fd를 닫는다. 다른 well-formed key는 실행하거나 전달하지 않으며 Node startup injection
+변수도 selector child environment에서 제거하므로 credential data가 bundle보다 먼저 코드로
+평가되지 않는다. hook runner는 모든 이벤트에서
 timeout 뒤 `SIGTERM`, 200 ms 뒤 `SIGKILL` 순으로 종료를 보장한다. 설치기는 다음 wiring을
 ownership proof와 기존 no-clobber transaction으로 생성한다.
 

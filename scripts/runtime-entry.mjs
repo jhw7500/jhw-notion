@@ -9,8 +9,14 @@ import { pathToFileURL } from 'node:url';
 const C = fs.constants;
 const FILES = ['jhw-runtime-control', 'jhw-runtime-entry', 'jhw-runtime-hook', 'runtime-entry.mjs', 'runtime-safety.mjs', 'runtime-store.mjs'];
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
+const STARTUP_ENVIRONMENT = ['NODE_OPTIONS','NODE_PATH','NODE_REPL_EXTERNAL_MODULE','BASH_ENV','ENV'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const modeFor = name => name.startsWith('jhw-') ? 0o755 : 0o644;
+function runtimeEnvironment() {
+  const environment={...process.env};
+  for(const name of STARTUP_ENVIRONMENT) delete environment[name];
+  return environment;
+}
 function fail(code = 'DEPLOY_BOOTSTRAP_INVALID') { const error = new Error(code); error.code = code; throw error; }
 function exact(value, keys) { return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join(',') === [...keys].sort().join(','); }
 function same(a, b) { return ['dev','ino','uid','gid','mode','nlink','size','ctimeNs','mtimeNs'].every(key => a[key] === b[key]); }
@@ -269,9 +275,53 @@ const MODULE_RUNNER_SOURCE=String.raw`
 const Module=require('node:module');
 const fs=require('node:fs'); const path=require('node:path');
 const entry=process.argv[1]; const releaseRoot=process.argv[2]; const selector=process.argv[3]; const credential=process.argv[4]; const args=process.argv.slice(5);
-if(typeof releaseRoot!=='string' || !path.isAbsolute(releaseRoot) || path.resolve(releaseRoot)!==releaseRoot || releaseRoot.includes('\0') || !['mcp','control','hook'].includes(selector) || !['none','loaded'].includes(credential)) throw Object.assign(new Error('DEPLOY_RUNTIME_BINDING_INVALID'),{code:'DEPLOY_RUNTIME_BINDING_INVALID'});
+const invalid=()=>{ throw Object.assign(new Error('DEPLOY_RUNTIME_BINDING_INVALID'),{code:'DEPLOY_RUNTIME_BINDING_INVALID'}); };
+const same=(a,b)=>['dev','ino','uid','gid','mode','nlink','size','ctimeNs','mtimeNs'].every(key=>a[key]===b[key]);
+const parseCredential=bytes=>{
+  let text; try { text=new TextDecoder('utf-8',{fatal:true}).decode(bytes); } catch { invalid(); }
+  if(text.includes('\0')) invalid();
+  let credentialValue;
+  for(let line of text.split('\n')) {
+    if(line.endsWith('\r')) line=line.slice(0,-1);
+    if(/^[ \t]*(?:#.*)?$/.test(line)) continue;
+    const match=/^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*)$/.exec(line);
+    if(!match) invalid();
+    if(match[1]!=='NOTION_API_KEY') continue;
+    if(credentialValue!==undefined) invalid();
+    let value=match[2].trim();
+    if(value.startsWith("'")) {
+      if(value.length<2 || !value.endsWith("'") || value.slice(1,-1).includes("'")) invalid();
+      value=value.slice(1,-1);
+    } else if(value.startsWith('"')) {
+      if(value.length<2 || !value.endsWith('"')) invalid();
+      const body=value.slice(1,-1); let decoded='';
+      for(let index=0;index<body.length;index++) {
+        if(body[index]!=='\\') { decoded+=body[index]; continue; }
+        const next=body[++index];
+        if(next==='n') decoded+='\n'; else if(next==='r') decoded+='\r'; else if(next==='t') decoded+='\t';
+        else if(next==='"' || next==='\\') decoded+=next; else invalid();
+      }
+      value=decoded;
+    }
+    if(!value || value.length>16*1024 || /[\0\r\n]/.test(value)) invalid();
+    credentialValue=value;
+  }
+  return credentialValue;
+};
+const loadCredential=()=>{
+  let before;
+  try {
+    before=fs.fstatSync(5,{bigint:true}); const mode=Number(before.mode);
+    if(!before.isFile() || before.uid!==BigInt(process.getuid()) || before.nlink!==1n || mode&0o7022 || !(mode&0o400) || before.size>1024n*1024n) invalid();
+    const bytes=Buffer.alloc(Number(before.size)); let offset=0;
+    while(offset<bytes.length) { const count=fs.readSync(5,bytes,offset,bytes.length-offset,null); if(!count) invalid(); offset+=count; }
+    if(fs.readSync(5,Buffer.alloc(1),0,1,null)!==0 || !same(before,fs.fstatSync(5,{bigint:true}))) invalid();
+    return parseCredential(bytes);
+  } finally { try { fs.closeSync(5); } catch {} }
+};
+if(typeof releaseRoot!=='string' || !path.isAbsolute(releaseRoot) || path.resolve(releaseRoot)!==releaseRoot || releaseRoot.includes('\0') || !['mcp','control','hook'].includes(selector) || !['none','fd'].includes(credential)) invalid();
+if(credential==='fd') { const value=loadCredential(); if(value!==undefined) process.env.NOTION_API_KEY=value; }
 Object.defineProperty(globalThis,'__JHW_MANAGED_RELEASE_ROOT__',{value:releaseRoot,writable:false,configurable:false,enumerable:false});
-if(credential==='loaded') { try { fs.closeSync(5); } catch {} }
 const builtins=new Set(Module.builtinModules.flatMap(name=>[name,'node:'+name]));
 const load=Module._load; let loadingEntry=true;
 Module._load=function(request,parent,isMain){
@@ -328,7 +378,7 @@ function runPinnedHook({args,artifact,lease,releaseRoot}) {
     let child;
     try {
       artifact.verify();
-      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',releaseRoot,...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd]});
+      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',releaseRoot,...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd],env:runtimeEnvironment()});
       fs.closeSync(artifact.fd); artifact.fd=undefined;
     } catch { if(artifact.fd!==undefined) { fs.closeSync(artifact.fd); artifact.fd=undefined; } resolve(failure('hook',args,'GUARD_UNAVAILABLE')); return; }
     child.once('error',()=>resolve(failure('hook',args,'GUARD_UNAVAILABLE')));
@@ -365,13 +415,13 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
     const relative=path.relative(release,target); artifacts.push(openArtifact(repositoryRoot,activation.releaseId,relative));
     if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease,releaseRoot:release});
     if(selector==='mcp') credential=openCredential(repositoryRoot,activation.releaseId);
-    const command=process.execPath; const childArgs=[...(credential ? ['--env-file=/proc/self/fd/5'] : []),'-e',MODULE_RUNNER_SOURCE,'--',`/proc/self/fd/4`,release,selector,credential?'loaded':'none',...args];
+    const command=process.execPath; const childArgs=['-e',MODULE_RUNNER_SOURCE,'--',`/proc/self/fd/4`,release,selector,credential?'fd':'none',...args];
     return await new Promise((resolve,reject)=>{
       // fd 3 is inherited through Node, Bash, timeout, and core. Closing the
       // supervisor's fd never unlocks the child's open-file description.
       for(const artifact of artifacts) artifact.verify();
       credential?.verify();
-      const child=spawn(command,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd),credential?.fd??'ignore']});
+      const child=spawn(command,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd),credential?.fd??'ignore'],env:runtimeEnvironment()});
       for(const artifact of artifacts.splice(0)) fs.closeSync(artifact.fd);
       if(credential){fs.closeSync(credential.fd);credential.fd=undefined;}
       child.once('error',()=>reject(Object.assign(new Error('DEPLOY_START_FAILED'),{code:'DEPLOY_START_FAILED'})));
