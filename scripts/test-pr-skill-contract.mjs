@@ -70,7 +70,7 @@ const fullReviewWorkflowContract = [
   "",
   "on:",
   "  pull_request:",
-  "    types: [opened, synchronize, ready_for_review]",
+  "    types: [opened, synchronize, ready_for_review, labeled]",
   "  workflow_dispatch:",
   "    inputs:",
   "      pr_number:",
@@ -243,6 +243,17 @@ if (argv[0] === "pr" && argv[1] === "edit") {
       }
       if (argv[index] === "--add-label" && !state.prLabels.includes(argv[index + 1])) {
         state.prLabels.push(argv[index + 1]);
+        if (argv[index + 1] === "review:request" && !state.prDraft && state.runOnRequestLabel) {
+          const nextRun = Array.isArray(state.runOnRequestLabel) ? state.runOnRequestLabel.shift() : state.runOnRequestLabel;
+          if (nextRun && nextRun.createdAt === "fake-clock") {
+            // Stamp the run with the fake clock, then let time pass so a boundary taken after the label is later.
+            const epoch = Number(fs.readFileSync(process.env.FAKE_DATE_EPOCH_FILE, "utf8").trim());
+            nextRun.createdAt = new Date(epoch * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+            fs.writeFileSync(process.env.FAKE_DATE_EPOCH_FILE, String(epoch + 2));
+          }
+          if (nextRun) state.runs.push(nextRun);
+          if (!Array.isArray(state.runOnRequestLabel)) delete state.runOnRequestLabel;
+        }
       }
     }
   }
@@ -709,6 +720,20 @@ const argv = process.argv.slice(2);
 if (argv.length === 1 && argv[0] === "+%s") {
   process.stdout.write(fs.readFileSync(process.env.FAKE_DATE_EPOCH_FILE, "utf8").trim() + "\n");
   process.exit(0);
+}
+
+const utcFormat = "+%Y-%m-%dT%H:%M:%SZ";
+function printUtc(epochText) {
+  if (!/^[0-9]+$/.test(epochText)) process.exit(1);
+  process.stdout.write(new Date(Number(epochText) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z") + "\n");
+  process.exit(0);
+}
+if (process.env.FAKE_DATE_BSD_ONLY !== "1" && argv.length === 4 && argv[0] === "-u" && argv[1] === "-d" &&
+  argv[2].startsWith("@") && argv[3] === utcFormat) {
+  printUtc(argv[2].slice(1));
+}
+if (argv.length === 4 && argv[0] === "-u" && argv[1] === "-r" && argv[3] === utcFormat) {
+  printUtc(argv[2]);
 }
 
 if (process.env.FAKE_DATE_BSD_ONLY !== "1" && argv.length === 4 && argv[0] === "-u" && argv[1] === "-d" && argv[3] === "+%s") {
@@ -1818,18 +1843,22 @@ async function main() {
       join(fixtureWorkflowDir, "claude-code-review.yml"),
       "on:\n  workflow_dispatch:\n    inputs:\n      pr_number:\n",
     );
-    const staleWorkflowContract = await runResult(
+    const dispatchlessSameHead = await runResult(
       baseState({
-        repoLabels: [],
+        prLabels: ["review:request"],
         prHead: currentHead,
         remoteBranchHead: currentHead,
       }),
-      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+      [
+        `jhw_pr_apply_existing_pr_policy request ${currentHead} || exit $?`,
+        "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
+      ].join("\n"),
     );
     await writeFile(join(fixtureWorkflowDir, "claude-code-review.yml"), dispatchContract);
-    assert.notEqual(staleWorkflowContract.code, 0);
-    assert.deepEqual(mutationCalls(staleWorkflowContract.log), [],
-      "an unchanged request round with an unsupported force_review contract must stop before mutation");
+    assert.equal(dispatchlessSameHead.code, 0,
+      "an unchanged request round must not depend on the force_review dispatch contract");
+    assert.match(dispatchlessSameHead.stdout, /^event=pull_request$/m);
+    assert.equal(dispatchlessSameHead.log.filter(isWorkflowDispatch).length, 0);
 
     await writeFile(fixtureConfigPath, enabledReviewConfig.replace(
       "  claude-code-review:\n    enabled: true",
@@ -1876,7 +1905,7 @@ async function main() {
       baseState({
         remoteWorkflowContents: {
           "claude-code-review.yml": fullReviewWorkflowContract.replace(
-            "types: [opened, synchronize, ready_for_review]",
+            "types: [opened, synchronize, ready_for_review, labeled]",
             "types: [opened]",
           ),
           "gemini-auto-review.yml": fullReviewWorkflowContract,
@@ -2000,6 +2029,7 @@ async function main() {
     const numberLookup = (args) => isGh(args, "pr", "view") && hasOption(args, "--jq", ".number");
     const removeSkip = (args) => isGh(args, "pr", "edit") && hasOption(args, "--remove-label", "review:skip");
     const addRequest = (args) => isGh(args, "pr", "edit") && hasOption(args, "--add-label", "review:request");
+    const removeRequestLabel = (args) => isGh(args, "pr", "edit") && hasOption(args, "--remove-label", "review:request");
     const ready = (args) => isGh(args, "pr", "ready");
     requireBefore(newPr.log, requestLabelCreate, isGitPush, "request label definition must precede push");
     requireBefore(newPr.log, skipLabelCreate, isGitPush, "skip label definition must precede push");
@@ -2213,19 +2243,35 @@ async function main() {
     assert.equal(frozenBase.log.some(isGitPush), false,
       "failed base read-back must stop before synchronize");
 
+    const labeledRun = {
+      id: 9401,
+      attempt: 1,
+      runNumber: 140,
+      name: "Claude Code Review",
+      head: currentHead,
+      createdAt: requestCreatedAt,
+      status: "completed",
+      conclusion: "success",
+      event: "pull_request",
+    };
     const sameHeadExistingPr = await run(
       baseState({
         prLabels: ["review:skip"],
         prHead: currentHead,
         remoteBranchHead: currentHead,
+        runOnRequestLabel: { ...labeledRun, createdAt: "fake-clock" },
       }),
       [
+        "unset ROUND_STARTED_AT ROUND_PUSHED_AT",
         `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
         "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
         "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
         "fi",
-        "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
+        "printf 'event=%s\\nstarted=%s\\npushed=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" \"$ROUND_STARTED_AT\" \"$ROUND_PUSHED_AT\"",
+        "ship_workflow_trigger 'Claude Code Review'",
+        "printf 'trigger=%s,%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_RUN_ID\" \"$SHIP_WORKFLOW_TRIGGER_REASON\"",
       ].join("\n"),
+      { SHIP_NOW_EPOCH: "" },
     );
     assert.deepEqual(sameHeadExistingPr.state.prLabels, ["review:request"]);
     assert.equal(sameHeadExistingPr.log.filter(isGitPush).length, 0,
@@ -2233,10 +2279,80 @@ async function main() {
     assert.equal(sameHeadExistingPr.log.some((args) =>
       isGh(args, "pr", "edit") && args.includes("--base")), false,
     "an already-correct base must not receive a redundant edit");
-    assert.match(sameHeadExistingPr.stdout, /^event=workflow_dispatch$/m,
-      "an unchanged request-mode PR must retain an explicit dispatch round");
-    assert.equal(sameHeadExistingPr.log.filter(isWorkflowDispatch).length, 2,
-      "an unchanged request round must dispatch each available managed reviewer");
+    assert.match(sameHeadExistingPr.stdout, /^event=pull_request$/m,
+      "an unchanged ready request round must wait for the labeled pull_request run");
+    assert.equal(sameHeadExistingPr.log.filter(isWorkflowDispatch).length, 0,
+      "the labeled run already reviews the head, so a force dispatch would only be refused");
+    assert.match(sameHeadExistingPr.stdout, new RegExp(`^started=${requestCreatedAt}$`, "m"),
+      "the policy helper must export the round boundary captured before its label mutation");
+    assert.match(sameHeadExistingPr.stdout, /^trigger=STARTED,9401,$/m,
+      "a labeled run created by the helper's own label mutation must belong to the round");
+    assert.match(sameHeadExistingPr.stdout, /^pushed=2026-08-29T00:01:02Z$/m,
+      "the trigger grace boundary must be taken after the helper's last label mutation");
+
+    const sameHeadWithoutLabeledCaller = await run(
+      baseState({
+        prLabels: ["review:request"],
+        prHead: currentHead,
+        remoteBranchHead: currentHead,
+        remoteWorkflowContents: {
+          "claude-code-review.yml": pullRequestOnlyWorkflowContract,
+          "gemini-auto-review.yml": pullRequestOnlyWorkflowContract,
+        },
+      }),
+      [
+        `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+        "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+      ].join("\n"),
+    );
+    assert.match(sameHeadWithoutLabeledCaller.stdout, /^available=$/m,
+      "a caller that does not subscribe to labeled cannot review an unchanged ready head");
+    assert.match(sameHeadWithoutLabeledCaller.stdout,
+      /claude-code-review\.yml\tworkflow_event_contract_unsupported/);
+    assert.match(sameHeadWithoutLabeledCaller.stdout,
+      /gemini-auto-review\.yml\tworkflow_event_contract_unsupported/);
+
+    const newPrBoundary = await run(
+      baseState({ prExists: false }),
+      [
+        "unset ROUND_STARTED_AT ROUND_PUSHED_AT",
+        "jhw_pr_apply_new_pr_policy request",
+        "printf 'started=%s\\npushed=%s\\n' \"$ROUND_STARTED_AT\" \"$ROUND_PUSHED_AT\"",
+      ].join("\n"),
+    );
+    assert.match(newPrBoundary.stdout, new RegExp(`^started=${requestCreatedAt}$`, "m"),
+      "the new-PR helper must export the round boundary it captured before push and ready");
+    assert.match(newPrBoundary.stdout, new RegExp(`^pushed=${requestCreatedAt}$`, "m"));
+
+    const sameHeadLabelPresent = await run(
+      baseState({
+        prLabels: ["review:request"],
+        prHead: currentHead,
+        remoteBranchHead: currentHead,
+        runOnRequestLabel: labeledRun,
+      }),
+      [
+        `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+        "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
+        "ship_workflow_trigger 'Claude Code Review'",
+        "printf 'trigger=%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_RUN_ID\"",
+      ].join("\n"),
+    );
+    const refreshRemove = callIndex(sameHeadLabelPresent.log, removeRequestLabel);
+    const refreshAdd = callIndex(sameHeadLabelPresent.log, addRequest, refreshRemove + 1);
+    assert.ok(refreshRemove >= 0 && refreshAdd > refreshRemove,
+      "an already-present request label must be re-applied to emit a fresh labeled event");
+    assert.deepEqual(sameHeadLabelPresent.state.prLabels, ["review:request"]);
+    assert.match(sameHeadLabelPresent.stdout, /^event=pull_request$/m);
+    assert.equal(sameHeadLabelPresent.log.filter(isWorkflowDispatch).length, 0);
+    assert.match(sameHeadLabelPresent.stdout, /^trigger=STARTED,9401$/m);
+
+    const changedHeadLabelPresent = await run(
+      baseState({ prLabels: ["review:request"] }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+    );
+    assert.equal(changedHeadLabelPresent.log.some(removeRequestLabel), false,
+      "a new head already emits synchronize, so the request label must not be churned");
 
     const changedDraftRequest = await run(
       baseState({
@@ -2266,6 +2382,7 @@ async function main() {
         },
       }),
       [
+        "unset ROUND_STARTED_AT ROUND_PUSHED_AT",
         `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
         "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
         "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
@@ -2310,47 +2427,40 @@ async function main() {
     requireBefore(sameHeadDraftRequest.log, addRequest, ready,
       "request policy must be reconciled before readying an unchanged draft");
 
-    const unchangedAuto = await run(
-      baseState({
-        prHead: currentHead,
-        remoteBranchHead: currentHead,
-      }),
-      [
+    for (const prLabels of [[], ["review:request"]]) {
+      const unchangedAuto = await runResult(
+        baseState({
+          prLabels,
+          prHead: currentHead,
+          remoteBranchHead: currentHead,
+        }),
         `jhw_pr_apply_existing_pr_policy auto ${currentHead}`,
-        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
-        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
-        "fi",
-        "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
-      ].join("\n"),
-    );
-    assert.match(unchangedAuto.stdout, /^event=workflow_dispatch$/m,
-      "an unchanged ready PR in auto mode must select an explicit dispatch round");
-    assert.equal(unchangedAuto.log.filter(isWorkflowDispatch).length, 2,
-      "each available managed reviewer must be dispatched when no PR event was emitted");
-    assert.ok(unchangedAuto.log.filter(isWorkflowDispatch).every((args) =>
-      hasOption(args, "--ref", "task/f28bfecee9de-jhw7500-jhw-notion-99")),
-    "head-scoped dispatches must run from the verified PR branch ref");
+      );
+      assert.notEqual(unchangedAuto.code, 0,
+        "an unchanged ready PR in auto mode emits no review event and must not report a round");
+      assert.match(unchangedAuto.stderr, /rerun with --review/);
+      assert.deepEqual(mutationCalls(unchangedAuto.log), [],
+        "the auto no-event stop must precede every label, base, push, and dispatch mutation");
+      assert.equal(unchangedAuto.log.filter(isWorkflowDispatch).length, 0,
+        "a force dispatch without an override label is always refused by the budget");
+    }
 
-    const unchangedAutoWithoutDispatchContract = await run(
+    await writeFile(fixtureConfigPath, "review:\n  auto: false\n");
+    const unchangedAutoDisabled = await runResult(
       baseState({
         prHead: currentHead,
         remoteBranchHead: currentHead,
-        remoteWorkflowContents: {
-          "claude-code-review.yml": pullRequestOnlyWorkflowContract,
-          "gemini-auto-review.yml": pullRequestOnlyWorkflowContract,
-        },
       }),
       [
-        `jhw_pr_apply_existing_pr_policy auto ${currentHead}`,
-        "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
+        `jhw_pr_apply_existing_pr_policy auto ${currentHead} || exit $?`,
+        "printf 'available=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\"",
       ].join("\n"),
     );
-    assert.match(unchangedAutoWithoutDispatchContract.stdout, /^available=$/m,
-      "an unchanged auto round must not plan workflows that cannot be dispatched");
-    assert.match(unchangedAutoWithoutDispatchContract.stdout,
-      /claude-code-review\.yml\tworkflow_event_contract_unsupported/);
-    assert.match(unchangedAutoWithoutDispatchContract.stdout,
-      /gemini-auto-review\.yml\tworkflow_event_contract_unsupported/);
+    await writeFile(fixtureConfigPath, enabledReviewConfig);
+    assert.equal(unchangedAutoDisabled.code, 0,
+      "auto=false needs no review event, so an unchanged ready head must continue to the CI gate");
+    assert.match(unchangedAutoDisabled.stdout, /^available=$/m);
+    assert.equal(unchangedAutoDisabled.log.filter(isWorkflowDispatch).length, 0);
 
     const autoExisting = await run(
       baseState({ prLabels: ["review:request", "review:skip"] }),
