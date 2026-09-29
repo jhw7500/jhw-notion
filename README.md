@@ -231,7 +231,7 @@ PR 리뷰 정책 예시:
 
 `--review`/`--no-review`를 생략하면 저장소 설정을 따르며, 현재 설정처럼 `review.auto`와
 `workflows.<name>.auto`가 모두 없으면 호환 기본값은 review-off다.
-review-on은 GitHub mutation 전에 관리 workflow의 active 상태·고정 파일 경로·Actions 표시 이름과 기본 브랜치 event/dispatch 계약, 동일 저장소 App canary를 확인하고,
+review-on은 GitHub mutation 전에 관리 workflow의 active 상태·고정 파일 경로·Actions 표시 이름과 기본 브랜치 event 계약, 동일 저장소 App canary를 확인하고,
 증명되지 않은 workflow/App은 `UNAVAILABLE`로 남겨 mention하지 않는다. Codex App canary가 bracketed/unbracketed
 actor 중 정확히 하나를 증명하면 그 identity만 현재 리뷰 라운드에 고정한다. App canary의 quota·connector·review 불가
 응답은 capability 증거로 인정하지 않으며, 정상 PR 댓글·inline·review·head-scoped clean reaction은 증거 표면에 포함한다.
