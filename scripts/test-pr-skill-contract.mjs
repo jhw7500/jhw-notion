@@ -303,13 +303,6 @@ if (argv[0] === "workflow" && argv[1] === "run") {
   const workflow = argv[2];
   if (state.failWorkflowDispatch || state.workflowStates?.[workflow] !== "active") process.exit(1);
   state.dispatchedWorkflows.push({ workflow, args: argv.slice(3) });
-  if (state.runOnDispatch) {
-    const nextRun = Array.isArray(state.runOnDispatch)
-      ? state.runOnDispatch.shift()
-      : state.runOnDispatch;
-    if (nextRun) state.runs.push(nextRun);
-    if (!Array.isArray(state.runOnDispatch)) delete state.runOnDispatch;
-  }
   save();
   process.exit(0);
 }
@@ -854,9 +847,6 @@ async function main() {
   assert.doesNotMatch(prText, /기본 (?:\*\*)?3(?:라운드|\b)/);
   assert.doesNotMatch(prText, /최초 PR 라운드는 기존 자동 트리거/);
   assert.match(prText, /jhw_pr_request_app_review codex "\$head"/);
-  assert.match(prText, /jhw_pr_dispatch_same_head claude-code-review\.yml 'Claude Code Review' "\$head"/);
-  assert.match(prText, /jhw_pr_dispatch_same_head gemini-auto-review\.yml 'Gemini Auto PR Review' "\$head"/);
-  assert.match(prText, /jhw_pr_dispatch_same_head opencode-auto-review\.yml 'OpenCode Auto PR Review' "\$head"/);
   assert.match(
     prText,
     /jhw_pr_capture_workflow_run_floors "\$ROUND_HEAD" "\$\{JHW_PR_AVAILABLE_WORKFLOWS:-\}"/,
@@ -881,8 +871,8 @@ async function main() {
     "the executable review flow must request only its preflighted App plan");
   assert.match(
     prText,
-    /case "\$EFFECTIVE_REVIEW_POLICY" in\n  request\|auto=true\)[\s\S]*?    case "\$JHW_PR_WORKFLOW_TRIGGER_EVENT" in[\s\S]*?      pull_request\) ;;/,
-    "request rounds must dispatch only when no pull_request mutation event was emitted",
+    /case "\$EFFECTIVE_REVIEW_POLICY" in\n  request\|auto=true\)[\s\S]*?    case "\$JHW_PR_WORKFLOW_TRIGGER_EVENT" in\n      pull_request\) ;;\n      \*\) return 2 ;;/,
+    "request rounds must accept only the pull_request mutation event",
   );
   assert.doesNotMatch(prText, /gh workflow view .*--json state/,
     "workflow state detection must not depend on unsupported gh workflow --json flags");
@@ -1989,24 +1979,6 @@ async function main() {
       );
     }
 
-    const missingRemoteDispatchInput = await run(
-      baseState({
-        remoteWorkflowContents: {
-          "claude-code-review.yml": fullReviewWorkflowContract.replace("      force_review:\n", ""),
-          "gemini-auto-review.yml": fullReviewWorkflowContract,
-        },
-      }),
-      [
-        "jhw_pr_prepare_review_plan request",
-        "printf 'available=%s\\nunavailable=%s\\n' \"$JHW_PR_AVAILABLE_WORKFLOWS\" \"$JHW_PR_UNAVAILABLE_WORKFLOWS\"",
-      ].join("\n"),
-    );
-    assert.match(
-      missingRemoteDispatchInput.stdout,
-      /claude-code-review\.yml\tworkflow_event_contract_unsupported/,
-      "manual workflow dispatch must be supported by the default-branch contract",
-    );
-
     const newPr = await run(
       baseState({
         repoLabels: [],
@@ -2017,9 +1989,6 @@ async function main() {
       }),
       [
         "jhw_pr_apply_new_pr_policy request || exit $?",
-        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
-        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
-        "fi",
         "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
       ].join("\n"),
     );
@@ -2167,9 +2136,6 @@ async function main() {
       baseState({ prLabels: ["review:skip"] }),
       [
         `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
-        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
-        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
-        "fi",
         "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
       ].join("\n"),
     );
@@ -2204,7 +2170,7 @@ async function main() {
       [
         "unset JHW_PR_REPO_ROOT JHW_PR_CONFIG_PATH",
         "printf 'auto=%s\\n' \"$(jhw_pr_global_auto_enabled)\"",
-        "jhw_pr_preflight_workflow claude-code-review.yml request",
+        "jhw_pr_preflight_workflow claude-code-review.yml auto",
         "jhw_pr_gemini_code_assist_enabled",
         "printf 'gemini-root-ok\\n'",
       ].join("\n"),
@@ -2264,9 +2230,6 @@ async function main() {
       [
         "unset ROUND_STARTED_AT ROUND_PUSHED_AT",
         `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
-        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
-        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
-        "fi",
         "printf 'event=%s\\nstarted=%s\\npushed=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" \"$ROUND_STARTED_AT\" \"$ROUND_PUSHED_AT\"",
         "ship_workflow_trigger 'Claude Code Review'",
         "printf 'trigger=%s,%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_RUN_ID\" \"$SHIP_WORKFLOW_TRIGGER_REASON\"",
@@ -2384,9 +2347,6 @@ async function main() {
       [
         "unset ROUND_STARTED_AT ROUND_PUSHED_AT",
         `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
-        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
-        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
-        "fi",
         "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
         "ship_workflow_trigger 'Claude Code Review'",
         "printf 'trigger=%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_RUN_ID\"",
@@ -2412,9 +2372,6 @@ async function main() {
       }),
       [
         `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
-        "if [[ \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\" == workflow_dispatch ]]; then",
-        "  jhw_pr_dispatch_preflighted_workflows \"$ROUND_HEAD\" \"${JHW_PR_AVAILABLE_WORKFLOWS:-}\"",
-        "fi",
         "printf 'event=%s\\n' \"$JHW_PR_WORKFLOW_TRIGGER_EVENT\"",
       ].join("\n"),
     );
@@ -2625,232 +2582,6 @@ async function main() {
     assert.notEqual(codexMixedCompatibilityDuplicate.code, 0);
     assert.match(codexMixedCompatibilityDuplicate.stderr, /TRIGGER_FAILED/);
     assert.equal(countPosts(codexMixedCompatibilityDuplicate), 0);
-
-    const sameHeadWorkflow = await run(
-      baseState({
-        prHead: currentHead,
-        runs: [
-          {
-            id: 9301,
-            attempt: 1,
-            name: "Claude Code Review",
-            head: currentHead,
-            createdAt: requestCreatedAt,
-            status: "queued",
-            conclusion: "null",
-            event: "workflow_dispatch",
-          },
-        ],
-      }),
-      [
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_RUN_ID\"",
-      ].join("\n"),
-    );
-    assert.equal(sameHeadWorkflow.stdout.trim(), "REUSED,9301");
-    assert.equal(sameHeadWorkflow.log.filter(isWorkflowDispatch).length, 0);
-
-    const priorRoundSameHeadWorkflow = await run(
-      baseState({
-        prHead: currentHead,
-        runs: [
-          {
-            id: 9306,
-            attempt: 1,
-            name: "Claude Code Review",
-            head: currentHead,
-            createdAt: "2026-08-28T23:59:59Z",
-            status: "completed",
-            conclusion: "success",
-            event: "workflow_dispatch",
-          },
-        ],
-      }),
-      [
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_RUN_ID\"",
-      ].join("\n"),
-    );
-    assert.equal(priorRoundSameHeadWorkflow.stdout.trim(), "DISPATCHED,");
-    assert.equal(priorRoundSameHeadWorkflow.log.filter(isWorkflowDispatch).length, 1,
-      "a same-head workflow run from an earlier round must not suppress the current dispatch");
-
-    const sameSecondPriorRoundWorkflow = await run(
-      baseState({
-        prHead: currentHead,
-        runs: [{
-          id: 9307,
-          attempt: 1,
-          name: "Claude Code Review",
-          head: currentHead,
-          createdAt: roundStartedAt,
-          status: "completed",
-          conclusion: "success",
-          event: "workflow_dispatch",
-        }],
-      }),
-      [
-        `jhw_pr_capture_workflow_run_floors ${currentHead} claude-code-review.yml`,
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_RUN_ID\"",
-      ].join("\n"),
-    );
-    assert.equal(sameSecondPriorRoundWorkflow.stdout.trim(), "DISPATCHED,",
-      "a prior-round same-head run in the round-start timestamp second must be below the captured ID floor");
-    assert.equal(sameSecondPriorRoundWorkflow.log.filter(isWorkflowDispatch).length, 1);
-
-    const sameSecondDispatchRetry = await run(
-      baseState({
-        prHead: currentHead,
-        runs: [{
-          id: 9307,
-          attempt: 1,
-          name: "Claude Code Review",
-          head: currentHead,
-          createdAt: roundStartedAt,
-          status: "completed",
-          conclusion: "success",
-          event: "workflow_dispatch",
-        }],
-        runOnDispatch: {
-          id: 9308,
-          attempt: 1,
-          name: "Claude Code Review",
-          head: currentHead,
-          createdAt: roundStartedAt,
-          status: "queued",
-          conclusion: "null",
-          event: "workflow_dispatch",
-        },
-      }),
-      [
-        `jhw_pr_capture_workflow_run_floors ${currentHead} claude-code-review.yml`,
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_RUN_ID\"",
-      ].join("\n"),
-    );
-    assert.equal(sameSecondDispatchRetry.stdout.trim(), "REUSED,9308",
-      "a retry must reuse the post-floor dispatch even when GitHub timestamps share one second");
-    assert.equal(sameSecondDispatchRetry.log.filter(isWorkflowDispatch).length, 1);
-
-    const missingDispatchFloor = await run(
-      baseState(),
-      [
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_REQUEST_REASON\"",
-      ].join("\n"),
-      { JHW_PR_WORKFLOW_RUN_FLOORS: "" },
-    );
-    assert.equal(missingDispatchFloor.stdout.trim(), "TRIGGER_FAILED,workflow_floor_missing",
-      "same-head dispatch must fail closed when the pre-mutation run floor was not captured");
-    assert.equal(missingDispatchFloor.log.filter(isWorkflowDispatch).length, 0);
-
-    const exactDispatch = await run(
-      baseState({
-        prHead: currentHead,
-        runs: [
-          {
-            id: 9302,
-            attempt: 1,
-            name: "Gemini Auto PR Review",
-            head: currentHead,
-            createdAt: requestCreatedAt,
-            status: "completed",
-            conclusion: "success",
-            event: "push",
-          },
-          {
-            id: 9303,
-            attempt: 1,
-            name: "Gemini Auto PR Review",
-            head: oldHead,
-            createdAt: requestCreatedAt,
-            status: "in_progress",
-            conclusion: "null",
-            event: "workflow_dispatch",
-          },
-        ],
-      }),
-      [
-        `jhw_pr_dispatch_same_head gemini-auto-review.yml 'Gemini Auto PR Review' ${currentHead}`,
-        "printf '%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\"",
-      ].join("\n"),
-    );
-    assert.equal(exactDispatch.stdout.trim(), "DISPATCHED");
-    assert.deepEqual(
-      exactDispatch.log.filter(isWorkflowDispatch),
-      [[
-        "workflow", "run", "gemini-auto-review.yml", "--repo", "example/repo",
-        "--ref", "task/f28bfecee9de-jhw7500-jhw-notion-99",
-        "-f", "pr_number=42", "-f", "force_review=true",
-      ]],
-    );
-
-    const openCodeDispatch = await run(
-      baseState({ prHead: currentHead }),
-      `jhw_pr_dispatch_same_head opencode-auto-review.yml 'OpenCode Auto PR Review' ${currentHead}`,
-    );
-    assert.deepEqual(
-      openCodeDispatch.log.filter(isWorkflowDispatch),
-      [[
-        "workflow", "run", "opencode-auto-review.yml", "--repo", "example/repo",
-        "--ref", "task/f28bfecee9de-jhw7500-jhw-notion-99",
-        "-f", "pr_number=42", "-f", "force_review=true",
-      ]],
-    );
-
-    const ambiguousWorkflow = await runResult(
-      baseState({
-        runs: [9304, 9305].map((id) => ({
-          id,
-          attempt: 1,
-          name: "Claude Code Review",
-          head: currentHead,
-          createdAt: requestCreatedAt,
-          status: "in_progress",
-          conclusion: "null",
-          event: "workflow_dispatch",
-        })),
-      }),
-      `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-    );
-    assert.notEqual(ambiguousWorkflow.code, 0);
-    assert.match(ambiguousWorkflow.stderr, /TRIGGER_FAILED/);
-    assert.equal(ambiguousWorkflow.log.filter(isWorkflowDispatch).length, 0);
-
-    const unavailableWorkflow = await run(
-      baseState({ workflowStates: {} }),
-      [
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_REQUEST_REASON\"",
-      ].join("\n"),
-    );
-    assert.equal(unavailableWorkflow.stdout.trim(), "UNAVAILABLE,workflow_unavailable");
-    assert.equal(unavailableWorkflow.log.filter(isWorkflowDispatch).length, 0);
-
-    const disabledWorkflow = await run(
-      baseState({ workflowStates: { "claude-code-review.yml": "disabled_manually" } }),
-      [
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_REQUEST_REASON\"",
-      ].join("\n"),
-    );
-    assert.equal(disabledWorkflow.stdout.trim(), "UNAVAILABLE,workflow_disabled");
-    assert.equal(disabledWorkflow.log.filter(isWorkflowDispatch).length, 0);
-
-    const renamedWorkflow = await run(
-      baseState({
-        workflowMetadata: { "claude-code-review.yml": { name: "Renamed Review" } },
-      }),
-      [
-        `jhw_pr_dispatch_same_head claude-code-review.yml 'Claude Code Review' ${currentHead}`,
-        "printf '%s,%s\n' \"$JHW_PR_WORKFLOW_REQUEST_STATUS\" \"$JHW_PR_WORKFLOW_REQUEST_REASON\"",
-      ].join("\n"),
-    );
-    assert.equal(renamedWorkflow.stdout.trim(), "UNAVAILABLE,workflow_identity_mismatch");
-    assert.equal(renamedWorkflow.log.filter(isWorkflowDispatch).length, 0,
-      "a renamed workflow must not be dispatched under a stale run name");
 
     const requiredChecks = await run(
       baseState({ prHead: currentHead }),
@@ -3554,36 +3285,45 @@ async function main() {
     assert.equal(bsdTimestamp.stdout.trim(), "STARTED,9002",
       "GitHub timestamps must parse with the BSD date available on macOS");
 
-    const explicitDispatchCollision = await run(
-      baseState({
-        runs: [
-          {
-            id: 9309,
-            attempt: 1,
-            name: "Claude Code Review",
-            head: currentHead,
-            createdAt: requestCreatedAt,
-            status: "in_progress",
-            conclusion: "null",
-            event: "pull_request",
-          },
-          {
-            id: 9310,
-            attempt: 1,
-            name: "Claude Code Review",
-            head: currentHead,
-            createdAt: requestCreatedAt,
-            status: "in_progress",
-            conclusion: "null",
-            event: "workflow_dispatch",
-          },
-        ],
-      }),
+    const dispatchCollisionRuns = [
+      {
+        id: 9309,
+        attempt: 1,
+        name: "Claude Code Review",
+        head: currentHead,
+        createdAt: requestCreatedAt,
+        status: "in_progress",
+        conclusion: "null",
+        event: "pull_request",
+      },
+      {
+        id: 9310,
+        attempt: 1,
+        name: "Claude Code Review",
+        head: currentHead,
+        createdAt: requestCreatedAt,
+        status: "in_progress",
+        conclusion: "null",
+        event: "workflow_dispatch",
+      },
+    ];
+    const manualDispatchCollision = await run(
+      baseState({ runs: dispatchCollisionRuns }),
       "ship_workflow_trigger 'Claude Code Review'\nprintf '%s,%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_RUN_ID\" \"$SHIP_WORKFLOW_RUN_EVENT\"",
+    );
+    assert.equal(manualDispatchCollision.stdout.trim(), "STARTED,9309,pull_request",
+      "a pull_request round must ignore a manual dispatch run that shares the timestamp");
+    const rejectedDispatchEvent = await run(
+      baseState({ runs: dispatchCollisionRuns }),
+      "ship_workflow_trigger 'Claude Code Review'\nprintf '%s,%s\\n' \"$SHIP_WORKFLOW_TRIGGER_STATUS\" \"$SHIP_WORKFLOW_TRIGGER_REASON\"",
       { JHW_PR_WORKFLOW_TRIGGER_EVENT: "workflow_dispatch" },
     );
-    assert.equal(explicitDispatchCollision.stdout.trim(), "STARTED,9310,workflow_dispatch",
-      "an explicit round must select its dispatch run when a PR-event run shares the timestamp");
+    assert.equal(rejectedDispatchEvent.stdout.trim(), "TRIGGER_FAILED,workflow_trigger_event_missing",
+      "workflow_dispatch is no longer a round trigger event");
+    const rejectedDispatchPlan = await runResult(baseState(), "jhw_pr_prepare_review_plan request workflow_dispatch");
+    assert.equal(rejectedDispatchPlan.code, 2,
+      "review planning must reject the removed workflow_dispatch transport");
+    assert.equal(rejectedDispatchPlan.log.filter(isWorkflowDispatch).length, 0);
 
     for (const runs of [
       [
