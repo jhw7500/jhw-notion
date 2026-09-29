@@ -88,6 +88,22 @@ describe("multi_select 옵션 자동 등록 (옵션 B)", () => {
       expect(notion.dataSources.retrieve).not.toHaveBeenCalled();
     });
 
+    it("allowNew=false 경고는 Notion 부재가 아니라 허용목록 밖임을 말하고 --force-tag를 안내한다", async () => {
+      const warnings: string[] = [];
+      await applyMultiSelectGuard(
+        notion as any,
+        "knowledgeBase",
+        "tags",
+        ["코드리뷰", "프로세스"],
+        { warnings }
+      );
+      expect(warnings).toEqual([
+        "[knowledgeBase.tags] 허용목록에 없어 2개 제외: 코드리뷰, 프로세스 " +
+          "(Notion에 이미 있는 옵션이면 --force-tag(allowNewTags: true)로 통과)",
+      ]);
+      expect(warnings.join(" ")).not.toContain("미등록");
+    });
+
     it("allowNew=true: 미등록을 자동 등록 후 포함 + 경고", async () => {
       notion.dataSources.retrieve.mockResolvedValue({
         properties: {

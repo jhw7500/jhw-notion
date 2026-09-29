@@ -54,7 +54,8 @@ export async function applyMultiSelectGuard(
   }
 
   opts.warnings?.push(
-    `[${db}.${field}] 미등록 값 ${dropped.length}개 제외: ${dropped.join(", ")}`
+    `[${db}.${field}] 허용목록에 없어 ${dropped.length}개 제외: ${dropped.join(", ")} ` +
+      "(Notion에 이미 있는 옵션이면 --force-tag(allowNewTags: true)로 통과)"
   );
   return kept;
 }
