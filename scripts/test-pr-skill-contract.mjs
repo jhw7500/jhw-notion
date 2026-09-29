@@ -463,6 +463,13 @@ if (/\/issues\/\d+\/comments\?per_page=100$/.test(endpoint)) {
     })));
     process.exit(0);
   }
+  if (query === '.[] | [(.user.type // ""), ((.body // "") | @base64)] | @tsv') {
+    rows(state.issueComments.map((item) => [
+      item.actor.endsWith("[bot]") ? "Bot" : "User",
+      Buffer.from(item.body || "").toString("base64"),
+    ].join("\t")));
+    process.exit(0);
+  }
   if (query.includes("@base64")) {
     rows(visibleGenericSignals(state.issueComments, query).map((item) => [
       item.id,
@@ -4718,6 +4725,62 @@ async function main() {
       "the repository must explicitly disable Gemini Code Assist without deleting its config");
     assert.match(repositoryGeminiConfig, /^    code_review: false$/m,
       "future Gemini Code Assist reactivation must remain manual-only");
+
+    const budgetLedger = (reviewer, lastDecision, actor = "github-actions[bot]", id = 9801) => ({
+      id,
+      actor,
+      createdAt: requestCreatedAt,
+      body: [
+        `<!-- automation:review-invocation-budget:${reviewer}:v1 -->`,
+        `<!-- automation-budget-state:${JSON.stringify({ schema: 1, reviewer, pr: 42, last_decision: lastDecision })} -->`,
+        "",
+        "## Review invocation budget",
+      ].join("\n"),
+    });
+    const budgetProbe = (reviewer, runId, attempt) => [
+      `ship_workflow_budget_decision ${reviewer} ${runId} ${attempt}`,
+      "printf 'rc=%s decision=%s action=%s\\n' \"$?\" \"$SHIP_WORKFLOW_BUDGET_DECISION\" \"$SHIP_WORKFLOW_BUDGET_ACTION\"",
+    ].join("\n");
+    const duplicateHead = await run(
+      baseState({ issueComments: [budgetLedger("gemini", { decision: "duplicate_head", run_id: 9701, run_attempt: 1 })] }),
+      budgetProbe("gemini", 9701, 1),
+    );
+    assert.match(duplicateHead.stdout, /^rc=0 decision=duplicate_head action=override_required$/m,
+      "a refused same-head run must report that a same-head re-review needs an override");
+    const exhausted = await run(
+      baseState({ issueComments: [budgetLedger("claude", { decision: "round_budget_exhausted", run_id: 9702, run_attempt: 2 })] }),
+      budgetProbe("claude", 9702, 2),
+    );
+    assert.match(exhausted.stdout, /^rc=0 decision=round_budget_exhausted action=budget_exhausted$/m);
+    const otherRun = await run(
+      baseState({ issueComments: [budgetLedger("gemini", { decision: "duplicate_head", run_id: 9700, run_attempt: 1 })] }),
+      budgetProbe("gemini", 9701, 1),
+    );
+    assert.match(otherRun.stdout, /^rc=3 decision= action=$/m,
+      "a ledger decision for another run must not explain the current run");
+    const finalized = await run(
+      baseState({ issueComments: [budgetLedger("gemini", { decision: "finalized", run_id: 9701, run_attempt: 1, stop_reason: "provider_failed" })] }),
+      budgetProbe("gemini", 9701, 1),
+    );
+    assert.match(finalized.stdout, /^rc=3 decision= action=$/m,
+      "a finalized run is not a budget refusal");
+    const duplicateLedger = await run(
+      baseState({ issueComments: [
+        budgetLedger("gemini", { decision: "duplicate_head", run_id: 9701, run_attempt: 1 }),
+        budgetLedger("gemini", { decision: "duplicate_head", run_id: 9701, run_attempt: 1 }, "github-actions[bot]", 9802),
+      ] }),
+      budgetProbe("gemini", 9701, 1),
+    );
+    assert.match(duplicateLedger.stdout, /^rc=3 decision= action=$/m,
+      "an ambiguous ledger must not be trusted");
+    const spoofedLedger = await run(
+      baseState({ issueComments: [budgetLedger("gemini", { decision: "duplicate_head", run_id: 9701, run_attempt: 1 }, "jhw7500")] }),
+      budgetProbe("gemini", 9701, 1),
+    );
+    assert.match(spoofedLedger.stdout, /^rc=3 decision= action=$/m,
+      "a ledger comment written by a user must be ignored");
+    const invalidReviewer = await run(baseState(), budgetProbe("codex", 9701, 1));
+    assert.match(invalidReviewer.stdout, /^rc=2 decision= action=$/m);
 
     console.log("pr skill contract: ok");
   } finally {
