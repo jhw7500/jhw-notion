@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync, lstatSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -290,6 +290,19 @@ if (argv[0] === "pr" && argv[1] === "checks") {
   }
   if (state.requiredChecksMessage) process.stderr.write(state.requiredChecksMessage);
   process.exit(state.requiredChecksExit || 0);
+}
+
+if (argv[0] === "run" && argv[1] === "download") {
+  const name = argv[argv.indexOf("-n") + 1];
+  const dir = argv[argv.indexOf("-D") + 1];
+  const artifact = (state.providerErrorArtifacts || {})[name];
+  if (artifact === undefined) process.exit(1);
+  if (artifact.symlink) {
+    fs.symlinkSync(statePath, dir + "/gemini_provider_error.txt");
+  } else {
+    fs.writeFileSync(dir + "/gemini_provider_error.txt", artifact.text);
+  }
+  process.exit(0);
 }
 
 if (argv[0] === "workflow" && argv[1] === "view") {
@@ -4781,6 +4794,41 @@ async function main() {
       "a ledger comment written by a user must be ignored");
     const invalidReviewer = await run(baseState(), budgetProbe("codex", 9701, 1));
     assert.match(invalidReviewer.stdout, /^rc=2 decision= action=$/m);
+
+    const providerTmp = await mkdtemp(join(tmpdir(), "jhw-pr-provider-test-"));
+    const providerProbe = (runId, attempt) => [
+      `ship_gemini_provider_failure ${runId} ${attempt}`,
+      "printf 'rc=%s reason=%s\\n' \"$?\" \"$SHIP_WORKFLOW_PROVIDER_REASON\"",
+    ].join("\n");
+    const providerCase = async (text, expected, message) => {
+      const result = await run(
+        baseState({ providerErrorArtifacts: text === undefined ? {} : {
+          "gemini-provider-error-9901-1": typeof text === "string" ? { text } : text,
+        } }),
+        providerProbe(9901, 1),
+        { TMPDIR: providerTmp },
+      );
+      assert.match(result.stdout, expected, message);
+    };
+    await providerCase(
+      "Failed to generate Gemini review: 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand.'}}\n",
+      /^rc=0 reason=provider_overloaded$/m, "a 503 provider error must be reported as an overloaded model");
+    await providerCase(
+      "Failed to generate Gemini review: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429}}\n",
+      /^rc=0 reason=provider_quota_exhausted$/m, "a 429 provider error must be reported as an exhausted quota");
+    await providerCase(
+      "Failed to generate Gemini review: provider request exceeded the process deadline\n",
+      /^rc=0 reason=provider_timeout$/m, "a deadline provider error must be reported as a timeout");
+    await providerCase(
+      "Failed to generate Gemini review: 500 INTERNAL.\n",
+      /^rc=0 reason=provider_failed$/m, "an unrecognized provider error must stay provider_failed");
+    await providerCase(undefined, /^rc=3 reason=provider_failed$/m,
+      "a missing or expired provider-error artifact must keep provider_failed");
+    await providerCase({ symlink: true }, /^rc=3 reason=provider_failed$/m,
+      "a symlinked provider-error file must not be read");
+    const invalidProviderRun = await run(baseState(), providerProbe("abc", 1), { TMPDIR: providerTmp });
+    assert.match(invalidProviderRun.stdout, /^rc=2 reason=provider_failed$/m);
+    assert.deepEqual(await readdir(providerTmp), [], "provider-error downloads must not leave temporary directories");
 
     console.log("pr skill contract: ok");
   } finally {

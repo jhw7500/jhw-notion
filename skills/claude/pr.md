@@ -2025,6 +2025,28 @@ process.stdout.write(last.decision);
   esac
 }
 
+ship_gemini_provider_failure() {
+  local run_id="$1" run_attempt="$2" dir file line='' status=3
+  SHIP_WORKFLOW_PROVIDER_REASON=provider_failed
+  [[ "$run_id" =~ ^[1-9][0-9]*$ && "$run_attempt" =~ ^[1-9][0-9]*$ ]] || return 2
+  dir="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/jhw-pr-provider.XXXXXXXX")" || return 1
+  if gh run download "$run_id" --repo "$REPO_NWO" -n "gemini-provider-error-$run_id-$run_attempt" \
+    -D "$dir" >/dev/null 2>&1; then
+    file="$dir/gemini_provider_error.txt"
+    if [[ -f "$file" && ! -L "$file" ]] && (( $(wc -c < "$file") <= 8192 )); then
+      IFS= read -r line < "$file" || true
+      status=0
+    fi
+  fi
+  rm -rf -- "$dir"
+  (( status == 0 )) || return 3
+  case "$line" in
+    'Failed to generate Gemini review: 503 UNAVAILABLE'*) SHIP_WORKFLOW_PROVIDER_REASON=provider_overloaded ;;
+    'Failed to generate Gemini review: 429 RESOURCE_EXHAUSTED'*) SHIP_WORKFLOW_PROVIDER_REASON=provider_quota_exhausted ;;
+    'Failed to generate Gemini review: provider request exceeded the process deadline') SHIP_WORKFLOW_PROVIDER_REASON=provider_timeout ;;
+  esac
+}
+
 ship_codex_author_matches() {
   [[ "$1" == "$SHIP_CODEX_LOGIN" ]]
 }
@@ -2829,6 +2851,7 @@ ship_signal_cleanup_finish || return
 - **Gemini 리뷰(워크플로우)**: 유효한 현재-head v3 성공은 Claude와 같은 canonical 활성 heading 규칙으로 판정한다. provider/quota·지역·출력 계약 실패를 포함한 현재-head 실패 state는 FAILED이며 해당 managed `gemini` run을 재실행해야 한다. Gemini Code Assist App 결과로 대체하지 않는다.
 - **Claude/Gemini legacy v2 호환**: v3 마커가 전혀 없을 때만 완료 run + legacy marker + `- Reviewed: 현재 SHA`를 terminal로 인정하고, 기존 bracket 심각도 규칙을 적용한다. 현재-head v2 `Status: failure`/`Last attempt: failure`는 FAILED다.
 - **OpenCode 리뷰(활성화된 리포)**: `OpenCode Auto PR Review` run `completed` + **이번 라운드에 새로 달린** 마커 코멘트(스티키가 아니라 누적형 — 최신 것만 이번 라운드)로 판정. run은 완료됐는데 새 코멘트가 없거나 "Failed to get summary from agent"로 실패하면 **FAILED** — CLI 플레이크로 재실행이 1차 복구.
+- **Gemini 공급자 실패 분류**: 현재-head Gemini v3 state가 `attempt_status: failure`이고 표시 사유가 `provider_failed`이면 판정은 그대로 **FAILED**이고, 사유만 `ship_gemini_provider_failure <run_id> <run_attempt>`로 세분한다. automation이 그 run에 올리는 하루 보존 `gemini-provider-error-<run>-<attempt>` 아티팩트의 첫 줄이 `503 UNAVAILABLE`이면 `provider_overloaded`(모델 과부하 — 일시적이므로 나중에 재리뷰), `429 RESOURCE_EXHAUSTED`이면 `provider_quota_exhausted`(API 한도 — 키·결제 확인), 처리 시한 초과면 `provider_timeout`이다. 아티팩트가 없거나 만료됐거나 regular file이 아니면 nonzero를 반환하고 사유는 `provider_failed`로 둔다. 같은 head는 이미 예산 라운드를 소모했으므로 재리뷰에는 `review-budget-override`가 필요하다.
 - **거부 사유 진단 (#159)**: 현재 라운드 run이 `completed`인데 그 run의 성공 증거(Claude/Gemini는 같은 run ID/attempt의 v3 state, OpenCode는 이번 라운드 마커 코멘트)가 없으면 판정은 그대로 **FAILED**이고, 사유만 `ship_workflow_budget_decision <claude|gemini|opencode> <run_id> <run_attempt>`로 채운다. 이 helper는 reviewer별 budget ledger 코멘트(`<!-- automation:review-invocation-budget:<reviewer>:v1 -->` + `automation-budget-state`)의 `last_decision`이 **같은 run ID/attempt**의 거부 결정일 때만 `SHIP_WORKFLOW_BUDGET_DECISION`을 채운다. `duplicate_head`·`duplicate_effective_diff`는 `override_required`로, 같은 head를 다시 리뷰하려면 `review-budget-override` 라벨과 수동 force dispatch가 필요하다(문서 머리 참조). `round_budget_exhausted`·`input_budget_exhausted`·`total_usage_budget_exhausted`는 `budget_exhausted`이고, `state_invalid`·`diff_unavailable`은 `review_input_invalid`다. ledger가 없거나 하나가 아니거나, 다른 run을 가리키거나, 거부 결정이 아니면 nonzero를 반환하고 사유는 `budget_decision_unavailable`로 보고한다. ledger는 사유 표시용일 뿐이다 — CLEAN·FEEDBACK·머지 판정의 근거로 쓰지 않는다.
 - **트리거 실패/미응답 분리**: 현재 라운드 요청 댓글 생성이나 workflow run 시작을 확인하지 못하면 `TRIGGER_FAILED`; 시작은 확인했지만 끝까지 PENDING이면 `TIMEOUT`으로 보고한다. 둘 다 머지를 차단한다.
 
