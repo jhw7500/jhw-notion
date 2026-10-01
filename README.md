@@ -226,11 +226,19 @@ PR 리뷰 정책 예시:
 /jhw:pr --review              — 저장소 설정과 무관하게 현재 head AI 리뷰 요청
 /jhw:pr --no-review           — review:skip 적용, AI 리뷰 생략
 /jhw:pr --review --auto-fix   — 최대 5라운드 수정·재리뷰
+/jhw:pr --review --approve-app-review codex:<token>
+                              — Codex App 정상 리뷰 3회 뒤 현재 snapshot의 1회 요청 승인
+/jhw:pr --review --override-app-review codex:<token> --override-reason "<reason>"
+                              — 정상 리뷰 5회 이상에서 사유를 남기는 강한 1회 예외 승인
 /jhw:ship ...                 — deprecated; 같은 인자로 /jhw:pr 실행
 ```
 
 `--review`/`--no-review`를 생략하면 저장소 설정을 따르며, 현재 설정처럼 `review.auto`와
 `workflows.<name>.auto`가 모두 없으면 호환 기본값은 review-off다.
+Codex와 Gemini Code Assist App 요청은 `(repo, PR, reviewer)` 누적 원장을 PR 숨은 코멘트로 공유한다.
+정상 terminal 리뷰 3회 뒤에는 현재 `head/base/diff`에 결합된 token이 필요하고, 5회부터는 token과 사유가
+모두 필요하다. 일반적인 `다음`/`진행`은 승인으로 취급하지 않으며, P0/P1이 없고 P2/P3만 남으면 추가 리뷰보다
+PR 진행을 기본 권고한다. provider 실패와 timeout은 정상 완료 횟수에서 분리해 보고한다.
 review-on은 GitHub mutation 전에 관리 workflow의 active 상태·고정 파일 경로·Actions 표시 이름과 기본 브랜치 event 계약, 동일 저장소 App canary를 확인하고,
 증명되지 않은 workflow/App은 `UNAVAILABLE`로 남겨 mention하지 않는다. Codex App canary가 bracketed/unbracketed
 actor 중 정확히 하나를 증명하면 그 identity만 현재 리뷰 라운드에 고정한다. App canary의 quota·connector·review 불가

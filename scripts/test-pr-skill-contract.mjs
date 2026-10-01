@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -30,6 +31,8 @@ const roundStartedAt = "2026-08-29T00:00:00Z";
 const requestCreatedAt = "2026-08-29T00:01:00Z";
 const startEpoch = Date.parse(roundStartedAt) / 1000;
 const requestEpoch = Date.parse(requestCreatedAt) / 1000;
+const appBudgetDiff = "diff --git a/file b/file\n+review budget change\n";
+const appBudgetDiffHash = createHash("sha256").update(appBudgetDiff).digest("hex");
 const namedCodexReview = "ROUND_EXPECTED_REVIEWERS=codex; export ROUND_EXPECTED_REVIEWERS; ";
 const requestMarker = `<!-- jhw-pr:review-request reviewer=codex head=${currentHead} base=${currentBaseOid} -->`;
 const requestBody = `@codex review\n\n${requestMarker}`;
@@ -641,6 +644,16 @@ if (argv[0] === "rev-parse" && argv[1] === "--show-toplevel") {
   process.exit(0);
 }
 
+if (argv[0] === "diff" && argv.includes("--numstat") && argv.includes("--no-ext-diff")) {
+  process.stdout.write(state.diffNumstat || "");
+  process.exit(0);
+}
+
+if (argv[0] === "diff" && argv.includes("--binary") && argv.includes("--no-ext-diff")) {
+  process.stdout.write(state.diffText || "");
+  process.exit(0);
+}
+
 if (argv[0] === "remote" && argv[1] === "get-url" && argv[2] === "--all" && argv[3] === "origin") {
   process.stdout.write((state.originFetchUrls || ["https://github.com/example/repo.git"]).join("\n") + "\n");
   process.exit(0);
@@ -794,6 +807,8 @@ function baseState(overrides = {}) {
     pushUpdatesPrHead: true,
     nextId: 9002,
     postCreatedAt: requestCreatedAt,
+    diffText: appBudgetDiff,
+    diffNumstat: "10\t2\tfile\n",
     issueComments: [],
     reviews: [],
     pullComments: [],
@@ -847,6 +862,86 @@ function baseState(overrides = {}) {
   };
 }
 
+function encodedMarker(prefix, state) {
+  return `<!-- ${prefix}:${Buffer.from(JSON.stringify(state)).toString("base64")} -->`;
+}
+
+function appBudgetAttempt(index, options = {}) {
+  const reviewer = options.reviewer || "codex";
+  const head = options.head || String((index % 8) + 1).repeat(40);
+  const baseOid = options.baseOid || currentBaseOid;
+  const diffHash = options.diffHash || String((index % 8) + 1).repeat(64);
+  const snapshot = options.snapshot || String(((index + 2) % 8) + 1).repeat(64);
+  const id = options.id || 9300 + index;
+  const approval = options.approval || { level: "none", token: "", reason_b64: "" };
+  const command = reviewer === "codex" ? "@codex review" : "/gemini review";
+  const state = {
+    schema: 1,
+    reviewer,
+    pr: 42,
+    head,
+    base_oid: baseOid,
+    diff_hash: diffHash,
+    snapshot,
+    approval,
+  };
+  return {
+    id,
+    actor: "jhw7500",
+    createdAt: new Date(Date.parse(requestCreatedAt) + index * 120_000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    body: [
+      command,
+      "",
+      `<!-- jhw-pr:review-request reviewer=${reviewer} head=${head} base=${baseOid} -->`,
+      "<!-- jhw-pr:app-review-attempt:v1 -->",
+      encodedMarker("jhw-pr:app-review-attempt-state", state),
+    ].join("\n"),
+    budgetState: state,
+  };
+}
+
+function appBudgetResult(attempt, index, options = {}) {
+  const status = options.status || "CLEAN";
+  const blockingCount = options.blockingCount ?? (status === "FEEDBACK" ? 1 : 0);
+  const state = {
+    schema: 1,
+    reviewer: attempt.budgetState.reviewer,
+    pr: 42,
+    request_comment_id: attempt.id,
+    head: attempt.budgetState.head,
+    base_oid: attempt.budgetState.base_oid,
+    diff_hash: attempt.budgetState.diff_hash,
+    snapshot: attempt.budgetState.snapshot,
+    status,
+    reason: options.reason || "",
+    blocking_count: blockingCount,
+    finding_digest: options.findingDigest || (blockingCount > 0 ? String((index % 8) + 1).repeat(64) : "none"),
+    elapsed_seconds: options.elapsedSeconds ?? 60,
+  };
+  return {
+    id: options.id || 10300 + index,
+    actor: "jhw7500",
+    createdAt: new Date(Date.parse(attempt.createdAt) + 60_000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    body: [
+      "<!-- jhw-pr:app-review-result:v1 -->",
+      encodedMarker("jhw-pr:app-review-result-state", state),
+    ].join("\n"),
+  };
+}
+
+function appBudgetHistory(completed, options = {}) {
+  const comments = [];
+  for (let index = 0; index < completed; index += 1) {
+    const attempt = appBudgetAttempt(index + 1, options.attempt || {});
+    comments.push(attempt);
+    comments.push(appBudgetResult(attempt, index + 1, {
+      status: index === completed - 1 && options.lastBlocking ? "FEEDBACK" : "CLEAN",
+      blockingCount: index === completed - 1 && options.lastBlocking ? options.lastBlocking : 0,
+    }));
+  }
+  return comments;
+}
+
 async function main() {
   const prText = await readFile(canonicalPr, "utf8");
   const aliasText = await readFile(shipAlias, "utf8");
@@ -865,6 +960,9 @@ async function main() {
   assert.doesNotMatch(aliasText, /pr-round-contract: trigger-and-scope:begin/);
   assert.match(prText, /\| Effective command policy \| Managed workflows \| Apps \| AI wait \|/);
   assert.doesNotMatch(prText, /기본 (?:\*\*)?3(?:라운드|\b)/);
+  assert.match(prText, /vars\.REVIEW_MAX_ROUNDS[\s\S]{0,80}미설정 시 5/,
+    "managed review documentation must match automation's five-round default");
+  assert.doesNotMatch(prText, /vars\.REVIEW_MAX_ROUNDS[\s\S]{0,80}미설정 시 2/);
   assert.doesNotMatch(prText, /최초 PR 라운드는 기존 자동 트리거/);
   assert.match(prText, /jhw_pr_request_app_review codex "\$head"/);
   assert.match(
@@ -1108,6 +1206,22 @@ async function main() {
     assert.equal((await run(baseState(), "jhw_pr_max_rounds_from_args")).stdout.trim(), "5");
     assert.equal((await run(baseState(), "jhw_pr_max_rounds_from_args --auto-fix --max-rounds 7")).stdout.trim(), "7");
     assert.notEqual((await runResult(baseState(), "jhw_pr_max_rounds_from_args --max-rounds 0")).code, 0);
+    const parserToken = "a".repeat(64);
+    const parsedAppApproval = await run(
+      baseState(),
+      `jhw_pr_app_review_authorization_from_args --approve-app-review codex:app-review-approve-v1-${parserToken}\nprintf '%s\\n' "$JHW_PR_APP_REVIEW_APPROVAL"`,
+    );
+    assert.equal(parsedAppApproval.stdout.trim(), `codex:app-review-approve-v1-${parserToken}`);
+    const genericContinuation = await run(
+      baseState(),
+      "jhw_pr_app_review_authorization_from_args 다음 진행\nprintf 'approval=%s override=%s\\n' \"$JHW_PR_APP_REVIEW_APPROVAL\" \"$JHW_PR_APP_REVIEW_OVERRIDE\"",
+    );
+    assert.equal(genericContinuation.stdout.trim(), "approval= override=",
+      "generic continuation words must never become App review authorization");
+    assert.notEqual((await runResult(
+      baseState(),
+      `jhw_pr_app_review_authorization_from_args --override-app-review codex:app-review-override-v1-${parserToken}`,
+    )).code, 0, "override authorization requires an explicit reason");
 
     await writeFile(configPath, "review:\n  auto: true\n");
     assert.equal((await run(baseState(), `jhw_pr_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "true");
@@ -2549,16 +2663,16 @@ async function main() {
       "a same-head request for a different base OID must not be reused after the diff base changes");
     assert.equal(countPosts(codexMissingBase), 1,
       "a same-head request without a base OID must not be reused");
-    assert.equal(codexOldBase.state.issueComments.at(-1).body, genericCodexBody,
+    assert.ok(codexOldBase.state.issueComments.at(-1).body.startsWith(genericCodexBody),
       "the replacement request must bind the current head and immutable base OID");
     assert.equal(countPosts(codexOldHead), 1);
     assert.notEqual(codexDuplicate.code, 0);
     assert.match(codexDuplicate.stderr, /TRIGGER_FAILED/);
     assert.notEqual(unsupportedApp.code, 0);
     assert.equal(countPosts(unsupportedApp), 0);
-    assert.equal(codexRequest.state.issueComments.at(-1).body, genericCodexBody);
-    assert.equal(geminiRequest.state.issueComments.at(-1).body, genericGeminiBody);
-    assert.equal(legacyGeminiRequest.state.issueComments.at(-1).body, genericGeminiBody);
+    assert.ok(codexRequest.state.issueComments.at(-1).body.startsWith(genericCodexBody));
+    assert.ok(geminiRequest.state.issueComments.at(-1).body.startsWith(genericGeminiBody));
+    assert.ok(legacyGeminiRequest.state.issueComments.at(-1).body.startsWith(genericGeminiBody));
 
     const codexPrimaryCompatibility = await run(
       baseState({
@@ -2602,6 +2716,200 @@ async function main() {
     assert.notEqual(codexMixedCompatibilityDuplicate.code, 0);
     assert.match(codexMixedCompatibilityDuplicate.stderr, /TRIGGER_FAILED/);
     assert.equal(countPosts(codexMixedCompatibilityDuplicate), 0);
+
+    const twoCompletedAppReviews = appBudgetHistory(2);
+    const thirdAppReview = await run(
+      baseState({ issueComments: twoCompletedAppReviews }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+    );
+    assert.equal(countPosts(thirdAppReview), 1,
+      "the first three completed App reviews must not require approval");
+    assert.match(thirdAppReview.state.issueComments.at(-1).body, /jhw-pr:app-review-attempt:v1/,
+      "every new App request must carry its durable budget receipt");
+
+    const threeCompletedWithBlocker = appBudgetHistory(3, { lastBlocking: 1 });
+    const fourthBlocked = await run(
+      baseState({ issueComments: threeCompletedWithBlocker }),
+      [
+        "set +e",
+        `jhw_pr_request_app_review codex ${currentHead}`,
+        "rc=$?",
+        "set -e",
+        "printf 'rc=%s status=%s reason=%s token=%s summary=%s\\n' \"$rc\" \"$JHW_PR_APP_BUDGET_STATUS\" \"$JHW_PR_APP_REQUEST_REASON\" \"$JHW_PR_APP_APPROVAL_TOKEN\" \"$JHW_PR_APP_BUDGET_SUMMARY\"",
+      ].join("\n"),
+    );
+    assert.equal(countPosts(fourthBlocked), 0,
+      "the fourth completed-review request must stop before posting without approval");
+    assert.match(fourthBlocked.stdout, /^rc=4 status=APPROVAL_REQUIRED reason=app_review_approval_required token=app-review-approve-v1-[0-9a-f]{64}/m);
+    assert.match(fourthBlocked.stdout, /attempts=3 completed=3 provider_failures=0 timeouts=0 remaining_blockers=1 novelty=new_or_changed changed_lines=12 changed_files=1 elapsed_seconds=180/);
+    const approvalToken = fourthBlocked.stdout.match(/token=(app-review-approve-v1-[0-9a-f]{64})/)?.[1];
+    assert.ok(approvalToken);
+
+    const threeCompletedWithoutBlockers = appBudgetHistory(3);
+    const fourthNotWorthwhile = await run(
+      baseState({ issueComments: threeCompletedWithoutBlockers }),
+      [
+        "set +e",
+        `jhw_pr_request_app_review codex ${currentHead}`,
+        "rc=$?",
+        "set -e",
+        "printf 'rc=%s status=%s reason=%s\\n' \"$rc\" \"$JHW_PR_APP_BUDGET_STATUS\" \"$JHW_PR_APP_REQUEST_REASON\"",
+      ].join("\n"),
+    );
+    assert.equal(countPosts(fourthNotWorthwhile), 0);
+    assert.match(fourthNotWorthwhile.stdout,
+      /^rc=4 status=STOP_RECOMMENDED reason=app_review_not_worthwhile$/m,
+      "a blocker-free third review must recommend stopping instead of asking for another review");
+
+    const fourthApproved = await run(
+      baseState({ issueComments: threeCompletedWithBlocker }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+      { JHW_PR_APP_REVIEW_APPROVAL: `codex:${approvalToken}` },
+    );
+    assert.equal(countPosts(fourthApproved), 1);
+    assert.match(fourthApproved.state.issueComments.at(-1).body, /jhw-pr:app-review-attempt-state:/);
+    assert.match(
+      Buffer.from(
+        fourthApproved.state.issueComments.at(-1).body.match(/jhw-pr:app-review-attempt-state:([A-Za-z0-9+/]+=*)/)?.[1] || "",
+        "base64",
+      ).toString("utf8"),
+      /"approval":\{"level":"standard","token":"app-review-approve-v1-/,
+      "the request comment itself must be the one-shot approval consumption receipt",
+    );
+    const approvalReplay = await run(
+      fourthApproved.state,
+      `jhw_pr_request_app_review codex ${currentHead}`,
+      { JHW_PR_APP_REVIEW_APPROVAL: `codex:${approvalToken}` },
+    );
+    assert.equal(countPosts(approvalReplay), 0,
+      "replaying a consumed approval against the same snapshot must reuse the one request, not post another");
+
+    const staleApproval = await run(
+      baseState({ issueComments: threeCompletedWithBlocker }),
+      [
+        "set +e",
+        `jhw_pr_request_app_review codex ${oldHead}`,
+        "rc=$?",
+        "set -e",
+        "printf 'rc=%s status=%s reason=%s\\n' \"$rc\" \"$JHW_PR_APP_BUDGET_STATUS\" \"$JHW_PR_APP_REQUEST_REASON\"",
+      ].join("\n"),
+      { JHW_PR_APP_REVIEW_APPROVAL: `codex:${approvalToken}` },
+    );
+    assert.equal(countPosts(staleApproval), 0);
+    assert.match(staleApproval.stdout, /^rc=4 status=APPROVAL_REQUIRED reason=app_review_approval_stale$/m,
+      "an approval must be stale after the head/base/diff snapshot changes");
+
+    const fiveCompleted = appBudgetHistory(5, { lastBlocking: 1 });
+    const overrideBlocked = await run(
+      baseState({ issueComments: fiveCompleted }),
+      [
+        "set +e",
+        `jhw_pr_request_app_review codex ${currentHead}`,
+        "rc=$?",
+        "set -e",
+        "printf 'rc=%s status=%s reason=%s token=%s\\n' \"$rc\" \"$JHW_PR_APP_BUDGET_STATUS\" \"$JHW_PR_APP_REQUEST_REASON\" \"$JHW_PR_APP_OVERRIDE_TOKEN\"",
+      ].join("\n"),
+    );
+    assert.match(overrideBlocked.stdout, /^rc=4 status=OVERRIDE_REQUIRED reason=app_review_override_required token=app-review-override-v1-[0-9a-f]{64}/m);
+    const overrideToken = overrideBlocked.stdout.match(/token=(app-review-override-v1-[0-9a-f]{64})/)?.[1];
+    assert.ok(overrideToken);
+    const overrideWithoutReason = await run(
+      baseState({ issueComments: fiveCompleted }),
+      [
+        "set +e",
+        `jhw_pr_request_app_review codex ${currentHead}`,
+        "rc=$?",
+        "set -e",
+        "printf 'rc=%s reason=%s\\n' \"$rc\" \"$JHW_PR_APP_REQUEST_REASON\"",
+      ].join("\n"),
+      { JHW_PR_APP_REVIEW_OVERRIDE: `codex:${overrideToken}` },
+    );
+    assert.match(overrideWithoutReason.stdout, /^rc=4 reason=app_review_override_reason_required$/m);
+    assert.equal(countPosts(overrideWithoutReason), 0);
+    const overrideApproved = await run(
+      baseState({ issueComments: fiveCompleted }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+      {
+        JHW_PR_APP_REVIEW_OVERRIDE: `codex:${overrideToken}`,
+        JHW_PR_APP_REVIEW_OVERRIDE_REASON: "P1 fix changed the authorization boundary",
+      },
+    );
+    assert.equal(countPosts(overrideApproved), 1);
+
+    const fifteenCompleted = appBudgetHistory(15, { lastBlocking: 1 });
+    const fifteenRegression = await run(
+      baseState({ issueComments: fifteenCompleted }),
+      [
+        "set +e",
+        `jhw_pr_request_app_review codex ${currentHead}`,
+        "rc=$?",
+        "set -e",
+        "printf 'rc=%s status=%s summary=%s\\n' \"$rc\" \"$JHW_PR_APP_BUDGET_STATUS\" \"$JHW_PR_APP_BUDGET_SUMMARY\"",
+      ].join("\n"),
+    );
+    assert.equal(countPosts(fifteenRegression), 0);
+    assert.match(fifteenRegression.stdout, /^rc=4 status=OVERRIDE_REQUIRED summary=.*attempts=15 completed=15/m,
+      "the original fifteen-review regression must fail closed at the cumulative gate");
+
+    const pendingAttempt = appBudgetAttempt(91, {
+      id: 9391,
+      head: currentHead,
+      diffHash: appBudgetDiffHash,
+      snapshot: "9".repeat(64),
+    });
+    const recordedTimeout = await run(
+      baseState({ issueComments: [pendingAttempt] }),
+      [
+        "jhw_pr_record_app_review_result codex 9391 TIMEOUT review_timeout 0 none",
+        "jhw_pr_record_app_review_result codex 9391 TIMEOUT review_timeout 0 none",
+      ].join("\n"),
+    );
+    assert.equal(countPosts(recordedTimeout), 1,
+      "terminal result recording must be idempotent for the same request");
+    assert.match(recordedTimeout.state.issueComments.at(-1).body, /jhw-pr:app-review-result:v1/);
+    const timeoutSeparated = await run(
+      recordedTimeout.state,
+      [
+        `jhw_pr_request_app_review codex ${oldHead}`,
+        "printf '%s\\n' \"$JHW_PR_APP_BUDGET_SUMMARY\"",
+      ].join("\n"),
+    );
+    assert.match(timeoutSeparated.stdout, /attempts=1 completed=0 provider_failures=0 timeouts=1/,
+      "timeouts must be reported separately from normal completed reviews");
+
+    const abandonedAttempt = appBudgetAttempt(93, { id: 9393, head: oldHead });
+    abandonedAttempt.createdAt = requestCreatedAt;
+    const resumedAfterTimeout = await run(
+      baseState({ issueComments: [abandonedAttempt] }),
+      `jhw_pr_request_app_review codex ${currentHead}`,
+      { SHIP_NOW_EPOCH: String(requestEpoch + 20 * 60) },
+    );
+    assert.equal(countPosts(resumedAfterTimeout), 2,
+      "a later session must first terminalize an expired pending attempt, then create its new request");
+    assert.match(resumedAfterTimeout.state.issueComments.at(-2).body, /jhw-pr:app-review-result:v1/);
+    assert.match(resumedAfterTimeout.state.issueComments.at(-1).body, /jhw-pr:app-review-attempt:v1/);
+
+    const failedAttempt = appBudgetAttempt(92, { id: 9392 });
+    const failedResult = appBudgetResult(failedAttempt, 92, {
+      status: "FAILED",
+      reason: "provider_unavailable",
+      blockingCount: 0,
+      findingDigest: "none",
+    });
+    const providerFailureSeparated = await run(
+      baseState({ issueComments: [failedAttempt, failedResult] }),
+      [
+        `jhw_pr_request_app_review codex ${currentHead}`,
+        "printf '%s\\n' \"$JHW_PR_APP_BUDGET_SUMMARY\"",
+      ].join("\n"),
+    );
+    assert.match(providerFailureSeparated.stdout, /attempts=1 completed=0 provider_failures=1 timeouts=0/,
+      "provider failures must not consume the normal completed-review threshold");
+
+    assert.match(prText, /--approve-app-review/);
+    assert.match(prText, /--override-app-review/);
+    assert.match(prText, /일반적인 `다음`\/`진행`/,
+      "generic continuation text must never be documented as App review approval");
 
     const requiredChecks = await run(
       baseState({ prHead: currentHead }),
@@ -3189,9 +3497,8 @@ async function main() {
     assert.match(idempotent.stdout, new RegExp(`second=STARTED,9002,${currentHead},false`));
     assert.equal(idempotent.log.filter((args) => args.includes("POST")).length, 1,
       "a round/head must create exactly one Codex request");
-    assert.equal(
-      idempotent.state.issueComments.find((item) => item.id === 9002).body,
-      genericCodexBody,
+    assert.ok(
+      idempotent.state.issueComments.find((item) => item.id === 9002).body.startsWith(genericCodexBody),
       "auto-fix rounds must create the same canonical head-scoped Codex request as the first round",
     );
     assert.match(idempotent.roundState, /request_comment_id=9002/);
