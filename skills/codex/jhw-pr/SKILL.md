@@ -1,6 +1,6 @@
 ---
 name: jhw-pr
-description: "--review 리뷰요청 · --no-review 리뷰생략 · --merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix) Use when the user invokes `/jhw:pr`, `$jhw-pr`, or asks to run the JHW pr command."
+description: "--review 리뷰요청 · --no-review 리뷰생략 · --merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix) · App 누적 리뷰 승인/override Use when the user invokes `/jhw:pr`, `$jhw-pr`, or asks to run the JHW pr command."
 ---
 
 # jhw-pr

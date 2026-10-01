@@ -1,6 +1,6 @@
 ---
-description: "--review 리뷰요청 · --no-review 리뷰생략 · --merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix)"
-argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--reviewers a,b] [--timeout <min>] [--max-rounds <n>] [--block-on must-fix|should-fix]"
+description: "--review 리뷰요청 · --no-review 리뷰생략 · --merge 자동머지 · --target[=cmd] 타겟테스트 게이트 · --auto-fix 자동수정·재리뷰 · --base PR base · --reviewers 대기리뷰어 · --timeout 라운드대기 · --max-rounds 라운드상한 · --block-on 블로킹임계(기본 must-fix) · App 누적 리뷰 승인/override"
+argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix] [--base <branch>] [--reviewers a,b] [--timeout <min>] [--max-rounds <n>] [--block-on must-fix|should-fix] [--approve-app-review <reviewer>:<token>] [--override-app-review <reviewer>:<token> --override-reason <reason>]"
 ---
 
 # /jhw:pr — PR 생성 + 리뷰 라운드 모니터링 + 조건부 머지
@@ -42,7 +42,7 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
   App의 `/gemini review`는 별도 `gemini-code-assist` 정책을 따르며 현재 비활성이다.
 
 **라운드가 소진되면 `review-budget-override` 라벨이 필요하다.** 관리 리뷰어는 PR당 자동 라운드 상한
-(automation `v1.60`부터 `vars.REVIEW_MAX_ROUNDS`, 미설정 시 2)을 소진하면 더 실행되지 않는다. 한 번의
+(automation `v1.60`부터 `vars.REVIEW_MAX_ROUNDS`, 미설정 시 5)을 소진하면 더 실행되지 않는다. 한 번의
 bounded override는 그 저장소에 `review-budget-override` 라벨을 붙이고 해당 워크플로를 `workflow_dispatch`
 + `force_review=true`로 실행해야 얻는다 — 라벨 없이 `force_review`만 쓰면 **첫 리뷰여도**
 budget이 `round_budget_exhausted`로 거부하고 run은 `force-review was not authorized by the bounded review budget`으로
@@ -105,6 +105,9 @@ Enterprise 재활성화를 위해 보존하지만 아래 명시적 정책이 기
 | `--reviewers <list>` | 대기할 리뷰어 부분집합 (예: `codex,gemini-code-assist`) | 감지된 전체 채널 |
 | `--timeout <min>` | **한 라운드**의 폴링 최대 대기 (간격 ~60s) | 20분 |
 | `--max-rounds <n>` | `--auto-fix` 재리뷰 라운드 상한 | 5 |
+| `--approve-app-review <reviewer>:<token>` | 정상 App 리뷰 3회 뒤 현재 snapshot의 다음 1회를 승인 | off |
+| `--override-app-review <reviewer>:<token>` | 정상 App 리뷰 5회 뒤 사유와 함께 다음 1회를 예외 승인 | off |
+| `--override-reason <reason>` | `--override-app-review`의 필수 감사 사유 | 없음 |
 
 각 옵션 상세:
 
@@ -121,7 +124,9 @@ Enterprise 재활성화를 위해 보존하지만 아래 명시적 정책이 기
 - `--base <branch>` — PR base. 기본 `main`(리포 기본 브랜치).
 - `--reviewers <list>` — 대기할 리뷰어 부분집합(예: `codex,gemini-code-assist`). 기본 전체. 정책상 비활성 reviewer는 지정해도 요청·대기하지 않고 `UNAVAILABLE(policy_disabled)`로 보고한다.
 - `--timeout <min>` — **한 라운드**의 폴링 최대 대기. 기본 20분, 폴링 간격 ~60s.
-- `--max-rounds <n>` — `--auto-fix` 시 재리뷰 라운드 상한(기본 5). `--timeout`이 한 라운드 한도라면, 이 값은 라운드 수를 제한.
+- `--max-rounds <n>` — 현재 `jhw-pr` 실행의 `--auto-fix` 재리뷰 라운드 상한(기본 5). 세션·명령을 바꾸면 다시 시작하는 invocation-local 값이며, 아래 PR-global App 누적 예산을 대체하거나 초기화하지 않는다.
+- `--approve-app-review <reviewer>:<token>` — App reviewer별 정상 terminal 리뷰가 3회 끝난 뒤, gate가 제시한 현재 `head/base/diff` snapshot token으로 다음 요청 1회만 승인한다. 일반적인 `다음`/`진행`/`승인`은 이 옵션을 대신하지 않는다.
+- `--override-app-review <reviewer>:<token>` + `--override-reason <reason>` — 정상 terminal 리뷰가 5회 이상이면 필요한 강한 예외 승인이다. token은 현재 snapshot에만 유효하고 사유는 요청 댓글의 숨은 영수증에 base64로 보존된다.
 - `--block-on <severity>` — CLEAN 판정의 **블로킹 심각도 임계**(기본 `must-fix`). 이 미만 지적(should-fix/minor/nit 등)은 보고만 하고 머지/종료를 막지 않는다. `should-fix`로 올리면 더 엄격.
 
 ## Effective review policy
@@ -593,6 +598,60 @@ jhw_pr_max_rounds_from_args() {
   done
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "invalid --max-rounds" >&2; return 2; }
   printf '%s\n' "$value"
+}
+
+jhw_pr_app_review_authorization_from_args() {
+  local value='' override_reason='' saw_approval=0 saw_override=0 saw_reason=0
+  JHW_PR_APP_REVIEW_APPROVAL=''
+  JHW_PR_APP_REVIEW_OVERRIDE=''
+  JHW_PR_APP_REVIEW_OVERRIDE_REASON=''
+  while (( $# > 0 )); do
+    case "$1" in
+      --approve-app-review)
+        (( saw_approval == 0 && $# >= 2 )) || { echo "invalid --approve-app-review" >&2; return 2; }
+        saw_approval=1; value="$2"; shift 2; continue ;;
+      --approve-app-review=*)
+        (( saw_approval == 0 )) || { echo "duplicate --approve-app-review" >&2; return 2; }
+        saw_approval=1; value="${1#--approve-app-review=}" ;;
+      --override-app-review)
+        (( saw_override == 0 && $# >= 2 )) || { echo "invalid --override-app-review" >&2; return 2; }
+        saw_override=1; JHW_PR_APP_REVIEW_OVERRIDE="$2"; shift 2; continue ;;
+      --override-app-review=*)
+        (( saw_override == 0 )) || { echo "duplicate --override-app-review" >&2; return 2; }
+        saw_override=1; JHW_PR_APP_REVIEW_OVERRIDE="${1#--override-app-review=}" ;;
+      --override-reason)
+        (( saw_reason == 0 && $# >= 2 )) || { echo "invalid --override-reason" >&2; return 2; }
+        saw_reason=1; override_reason="$2"; shift 2; continue ;;
+      --override-reason=*)
+        (( saw_reason == 0 )) || { echo "duplicate --override-reason" >&2; return 2; }
+        saw_reason=1; override_reason="${1#--override-reason=}" ;;
+    esac
+    shift
+  done
+  (( saw_approval == 0 || saw_override == 0 )) || {
+    echo "App review approval and override are mutually exclusive" >&2
+    return 2
+  }
+  (( saw_reason == 0 || saw_override == 1 )) || {
+    echo "--override-reason requires --override-app-review" >&2
+    return 2
+  }
+  if (( saw_approval == 1 )); then
+    [[ "$value" =~ ^(codex|gemini-code-assist):app-review-approve-v1-[0-9a-f]{64}$ ]] || {
+      echo "invalid --approve-app-review" >&2
+      return 2
+    }
+    JHW_PR_APP_REVIEW_APPROVAL="$value"
+  fi
+  if (( saw_override == 1 )); then
+    [[ "$JHW_PR_APP_REVIEW_OVERRIDE" =~ ^(codex|gemini-code-assist):app-review-override-v1-[0-9a-f]{64}$ ]] || {
+      echo "invalid --override-app-review" >&2
+      return 2
+    }
+    [[ -n "$override_reason" ]] || { echo "--override-reason is required" >&2; return 2; }
+    JHW_PR_APP_REVIEW_OVERRIDE_REASON="$override_reason"
+  fi
+  export JHW_PR_APP_REVIEW_APPROVAL JHW_PR_APP_REVIEW_OVERRIDE JHW_PR_APP_REVIEW_OVERRIDE_REASON
 }
 
 jhw_pr_repo_root() {
@@ -1534,7 +1593,7 @@ jhw_pr_apply_existing_pr_policy() {
 ## 동작 순서
 
 1. **사전 점검**
-   - 첫 mutation 전에 `jhw_pr_review_mode_from_args "$@"`로 `request|skip|auto`를 확정한다. `--review --no-review`는 즉시 실패한다.
+   - 첫 mutation 전에 `jhw_pr_review_mode_from_args "$@"`로 `request|skip|auto`를 확정하고 `jhw_pr_app_review_authorization_from_args "$@"`로 App 승인/override를 파싱한다. `--review --no-review`, 승인과 override 동시 지정, 사유 없는 override는 즉시 실패한다.
    - write permission과 고정 라벨 정의를 확인한다. 누락 라벨 생성 외에는 아직 변경하지 않는다.
    - `git status` — 커밋되지 않은 변경 있으면 먼저 커밋(없으면 "변경 없음" 중단)
    - 현재 브랜치가 base(`main`)이면 **브랜치 생성 후** 진행 (전역 규칙: 기본 브랜치 직접 PR 금지)
@@ -1621,6 +1680,284 @@ ship_at_or_after() {
   (( value_epoch >= boundary_epoch ))
 }
 
+jhw_pr_app_snapshot() {
+  local reviewer="$1" head="$2" diff_hash metrics snapshot approve_token override_token
+  [[ "$reviewer" == codex || "$reviewer" == gemini-code-assist ]] || return 2
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
+  [[ "$ROUND_BASE_OID" =~ ^[0-9a-f]{40}$ ]] || return 2
+  diff_hash="$(git diff --binary --no-ext-diff "$ROUND_BASE_OID" "$head" | node -e '
+    const { createHash } = require("node:crypto");
+    const chunks = [];
+    process.stdin.on("data", chunk => chunks.push(chunk));
+    process.stdin.on("end", () => process.stdout.write(createHash("sha256").update(Buffer.concat(chunks)).digest("hex")));
+  ')" || return 1
+  [[ "$diff_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+  metrics="$(git diff --numstat --no-ext-diff "$ROUND_BASE_OID" "$head" | node -e '
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => input += chunk);
+    process.stdin.on("end", () => {
+      let lines = 0;
+      let files = 0;
+      for (const row of input.split(/\n/)) {
+        if (!row) continue;
+        const fields = row.split("\t");
+        if (fields.length < 3) process.exit(2);
+        files += 1;
+        if (/^[0-9]+$/.test(fields[0])) lines += Number(fields[0]);
+        if (/^[0-9]+$/.test(fields[1])) lines += Number(fields[1]);
+      }
+      process.stdout.write(`${lines}\t${files}`);
+    });
+  ')" || return 1
+  IFS=$'\t' read -r JHW_PR_APP_CHANGED_LINES JHW_PR_APP_CHANGED_FILES <<<"$metrics"
+  [[ "$JHW_PR_APP_CHANGED_LINES" =~ ^[0-9]+$ && "$JHW_PR_APP_CHANGED_FILES" =~ ^[0-9]+$ ]] || return 1
+  snapshot="$(printf '%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+    v1 "$REPO_NWO" "$PR" "$reviewer" "$head" "$ROUND_BASE_OID" "$diff_hash" | node -e '
+      const { createHash } = require("node:crypto");
+      const chunks = [];
+      process.stdin.on("data", chunk => chunks.push(chunk));
+      process.stdin.on("end", () => process.stdout.write(createHash("sha256").update(Buffer.concat(chunks)).digest("hex")));
+    ')" || return 1
+  [[ "$snapshot" =~ ^[0-9a-f]{64}$ ]] || return 1
+  approve_token="$(printf 'standard\0%s' "$snapshot" | node -e '
+    const { createHash } = require("node:crypto");
+    const chunks = [];
+    process.stdin.on("data", chunk => chunks.push(chunk));
+    process.stdin.on("end", () => process.stdout.write("app-review-approve-v1-" + createHash("sha256").update(Buffer.concat(chunks)).digest("hex")));
+  ')" || return 1
+  override_token="$(printf 'override\0%s' "$snapshot" | node -e '
+    const { createHash } = require("node:crypto");
+    const chunks = [];
+    process.stdin.on("data", chunk => chunks.push(chunk));
+    process.stdin.on("end", () => process.stdout.write("app-review-override-v1-" + createHash("sha256").update(Buffer.concat(chunks)).digest("hex")));
+  ')" || return 1
+  JHW_PR_APP_DIFF_HASH="$diff_hash"
+  JHW_PR_APP_SNAPSHOT="$snapshot"
+  JHW_PR_APP_APPROVAL_TOKEN="$approve_token"
+  JHW_PR_APP_OVERRIDE_TOKEN="$override_token"
+  export JHW_PR_APP_DIFF_HASH JHW_PR_APP_SNAPSHOT JHW_PR_APP_APPROVAL_TOKEN JHW_PR_APP_OVERRIDE_TOKEN
+  export JHW_PR_APP_CHANGED_LINES JHW_PR_APP_CHANGED_FILES
+}
+
+jhw_pr_app_comment_rows() {
+  local endpoint
+  endpoint="repos/$REPO_NWO/issues/$PR/comments?per_page=100"
+  "${JHW_PR_GH_BIN:-gh}" api "$endpoint" --paginate \
+    --jq '.[] | [.id, .user.login, .created_at, ((.body // "") | @base64)] | @tsv'
+}
+
+jhw_pr_app_budget_load() {
+  local reviewer="$1" actor="$2" raw parsed now_epoch
+  local attempts completed provider_failures timeouts pending remaining novelty elapsed expired_pending extra
+  now_epoch="$(ship_now_epoch)" || return 1
+  raw="$(jhw_pr_app_comment_rows 2>/dev/null)" || return 1
+  parsed="$(printf '%s\n' "$raw" | JHW_APP_REVIEWER="$reviewer" JHW_APP_ACTOR="$actor" JHW_APP_PR="$PR" \
+    JHW_APP_NOW_EPOCH="$now_epoch" JHW_APP_TIMEOUT_SECONDS="$(( SHIP_TIMEOUT_MIN * 60 ))" node -e '
+    const reviewer = process.env.JHW_APP_REVIEWER;
+    const actor = process.env.JHW_APP_ACTOR;
+    const pr = Number(process.env.JHW_APP_PR);
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => input += chunk);
+    process.stdin.on("end", () => {
+      const decode = value => {
+        if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) throw new Error("invalid base64");
+        return Buffer.from(value, "base64").toString("utf8");
+      };
+      const markerState = (body, name) => {
+        const matches = [...body.matchAll(new RegExp(`<!-- ${name}:([A-Za-z0-9+/]+=*) -->`, "g"))];
+        if (matches.length !== 1) return null;
+        return JSON.parse(decode(matches[0][1]));
+      };
+      const comments = input.split(/\n/).filter(Boolean).map(line => {
+        const fields = line.split("\t");
+        if (fields.length !== 4 || !/^[1-9][0-9]*$/.test(fields[0])) throw new Error("invalid comment row");
+        return { id: Number(fields[0]), actor: fields[1], createdAt: fields[2], body: decode(fields[3]) };
+      }).filter(item => item.actor === actor);
+      const attempts = new Map();
+      const results = new Map();
+      for (const item of comments) {
+        if (item.body.includes("<!-- jhw-pr:app-review-attempt:v1 -->")) {
+          const state = markerState(item.body, "jhw-pr:app-review-attempt-state");
+          if (!state) throw new Error("invalid attempt state");
+          if (state.reviewer !== reviewer) continue;
+          if (state.schema !== 1 || state.pr !== pr ||
+              !/^[0-9a-f]{40}$/.test(state.head) || !/^[0-9a-f]{40}$/.test(state.base_oid) ||
+              !/^[0-9a-f]{64}$/.test(state.diff_hash) || !/^[0-9a-f]{64}$/.test(state.snapshot) ||
+              !state.approval || !["none", "standard", "override"].includes(state.approval.level) ||
+              typeof state.approval.token !== "string" || typeof state.approval.reason_b64 !== "string") throw new Error("invalid attempt state");
+          const requestMarker = `<!-- jhw-pr:review-request reviewer=${reviewer} head=${state.head} base=${state.base_oid} -->`;
+          if (!item.body.includes(requestMarker) || attempts.has(item.id)) throw new Error("invalid attempt marker");
+          attempts.set(item.id, { ...item, state });
+        }
+        if (item.body.includes("<!-- jhw-pr:app-review-result:v1 -->")) {
+          const state = markerState(item.body, "jhw-pr:app-review-result-state");
+          if (!state) throw new Error("invalid result state");
+          if (state.reviewer !== reviewer) continue;
+          if (state.schema !== 1 || state.pr !== pr ||
+              !Number.isInteger(state.request_comment_id) || state.request_comment_id < 1 ||
+              !["CLEAN", "FEEDBACK", "FAILED", "TRIGGER_FAILED", "TIMEOUT"].includes(state.status) ||
+              !Number.isInteger(state.blocking_count) || state.blocking_count < 0 ||
+              !(state.finding_digest === "none" || /^[0-9a-f]{64}$/.test(state.finding_digest)) ||
+              !Number.isInteger(state.elapsed_seconds) || state.elapsed_seconds < 0) throw new Error("invalid result state");
+          if (results.has(state.request_comment_id)) throw new Error("duplicate result state");
+          results.set(state.request_comment_id, state);
+        }
+      }
+      for (const [requestId, result] of results) {
+        const attempt = attempts.get(requestId);
+        if (!attempt || result.head !== attempt.state.head || result.base_oid !== attempt.state.base_oid ||
+            result.diff_hash !== attempt.state.diff_hash || result.snapshot !== attempt.state.snapshot) throw new Error("orphan result state");
+      }
+      let completed = 0;
+      let providerFailures = 0;
+      let timeouts = 0;
+      let pending = 0;
+      const expiredPending = [];
+      let elapsed = 0;
+      let latestNormal = null;
+      const previousDigests = new Set();
+      for (const attempt of attempts.values()) {
+        const result = results.get(attempt.id);
+        if (!result) {
+          pending += 1;
+          const createdEpoch = Date.parse(attempt.createdAt) / 1000;
+          if (!Number.isInteger(createdEpoch)) throw new Error("invalid attempt timestamp");
+          if (Number(process.env.JHW_APP_NOW_EPOCH) - createdEpoch >= Number(process.env.JHW_APP_TIMEOUT_SECONDS)) {
+            expiredPending.push(attempt.id);
+          }
+          continue;
+        }
+        elapsed += result.elapsed_seconds;
+        if (result.status === "CLEAN" || result.status === "FEEDBACK") {
+          completed += 1;
+          if (!latestNormal || Date.parse(attempt.createdAt) >= Date.parse(latestNormal.attempt.createdAt)) {
+            if (latestNormal && latestNormal.result.finding_digest !== "none") previousDigests.add(latestNormal.result.finding_digest);
+            latestNormal = { attempt, result };
+          } else if (result.finding_digest !== "none") previousDigests.add(result.finding_digest);
+        } else if (result.status === "TIMEOUT") {
+          timeouts += 1;
+        } else if (/(provider|quota|usage|connector|reviewer_response_failed)/i.test(result.reason || "")) {
+          providerFailures += 1;
+        }
+      }
+      const remaining = latestNormal ? latestNormal.result.blocking_count : 0;
+      let novelty = "none";
+      if (latestNormal && latestNormal.result.finding_digest !== "none") {
+        novelty = previousDigests.has(latestNormal.result.finding_digest) ? "repeated" : "new_or_changed";
+      }
+      process.stdout.write([attempts.size, completed, providerFailures, timeouts, pending, remaining, novelty, elapsed,
+        expiredPending.length > 0 ? expiredPending.join(",") : "-"].join("\t"));
+    });
+  ')" || return 1
+  IFS=$'\t' read -r attempts completed provider_failures timeouts pending remaining novelty elapsed expired_pending extra <<<"$parsed"
+  [[ "$attempts" =~ ^[0-9]+$ && "$completed" =~ ^[0-9]+$ && "$provider_failures" =~ ^[0-9]+$ &&
+    "$timeouts" =~ ^[0-9]+$ && "$pending" =~ ^[0-9]+$ && "$remaining" =~ ^[0-9]+$ &&
+    "$novelty" =~ ^(none|repeated|new_or_changed)$ && "$elapsed" =~ ^[0-9]+$ &&
+    "$expired_pending" =~ ^(-|[1-9][0-9]*(,[1-9][0-9]*)*)$ && -z "$extra" ]] || return 1
+  JHW_PR_APP_ATTEMPTS="$attempts"
+  JHW_PR_APP_COMPLETED="$completed"
+  JHW_PR_APP_PROVIDER_FAILURES="$provider_failures"
+  JHW_PR_APP_TIMEOUTS="$timeouts"
+  JHW_PR_APP_PENDING="$pending"
+  JHW_PR_APP_REMAINING_BLOCKERS="$remaining"
+  JHW_PR_APP_NOVELTY="$novelty"
+  JHW_PR_APP_ELAPSED_SECONDS="$elapsed"
+  JHW_PR_APP_EXPIRED_PENDING="$expired_pending"
+  JHW_PR_APP_BUDGET_SUMMARY="attempts=$attempts completed=$completed provider_failures=$provider_failures timeouts=$timeouts remaining_blockers=$remaining novelty=$novelty changed_lines=$JHW_PR_APP_CHANGED_LINES changed_files=$JHW_PR_APP_CHANGED_FILES elapsed_seconds=$elapsed"
+  export JHW_PR_APP_ATTEMPTS JHW_PR_APP_COMPLETED JHW_PR_APP_PROVIDER_FAILURES JHW_PR_APP_TIMEOUTS
+  export JHW_PR_APP_PENDING JHW_PR_APP_REMAINING_BLOCKERS JHW_PR_APP_NOVELTY JHW_PR_APP_ELAPSED_SECONDS
+  export JHW_PR_APP_EXPIRED_PENDING
+  export JHW_PR_APP_BUDGET_SUMMARY
+}
+
+jhw_pr_app_budget_blocked() {
+  JHW_PR_APP_BUDGET_STATUS="$1"
+  JHW_PR_APP_REQUEST_STATUS="$1"
+  JHW_PR_APP_REQUEST_REASON="$2"
+  JHW_PR_APP_REQUEST_COMMENT_ID=""
+  JHW_PR_APP_REQUESTED_AT=""
+  JHW_PR_APP_REQUEST_BASE_OID=""
+  JHW_PR_APP_REQUEST_CREATED=false
+  export JHW_PR_APP_BUDGET_STATUS JHW_PR_APP_REQUEST_REASON
+  echo "$1: $2; ${JHW_PR_APP_BUDGET_SUMMARY:-budget unavailable}" >&2
+  return 4
+}
+
+jhw_pr_app_budget_gate() {
+  local reviewer="$1" actor="$2" expected reason reason_bytes request_id
+  jhw_pr_app_snapshot "$reviewer" "$3" || return 1
+  jhw_pr_app_budget_load "$reviewer" "$actor" || {
+    jhw_pr_app_request_failed budget_ledger_invalid
+    return
+  }
+  if [[ "$JHW_PR_APP_EXPIRED_PENDING" != - ]]; then
+    while IFS= read -r request_id; do
+      [[ -n "$request_id" ]] || continue
+      jhw_pr_record_app_review_result "$reviewer" "$request_id" TIMEOUT review_timeout 0 none || {
+        jhw_pr_app_request_failed timeout_receipt_failed
+        return
+      }
+    done < <(tr ',' '\n' <<<"$JHW_PR_APP_EXPIRED_PENDING")
+    jhw_pr_app_budget_load "$reviewer" "$actor" || {
+      jhw_pr_app_request_failed budget_ledger_invalid
+      return
+    }
+  fi
+  JHW_PR_APP_BUDGET_STATUS=ALLOWED
+  JHW_PR_APP_APPROVAL_LEVEL=none
+  JHW_PR_APP_APPROVAL_REASON_B64=''
+  if (( JHW_PR_APP_PENDING > 0 )); then
+    jhw_pr_app_budget_blocked PENDING app_review_pending
+    return
+  fi
+  if (( JHW_PR_APP_COMPLETED >= 5 )); then
+    expected="$reviewer:$JHW_PR_APP_OVERRIDE_TOKEN"
+    if [[ -z "${JHW_PR_APP_REVIEW_OVERRIDE:-}" ]]; then
+      jhw_pr_app_budget_blocked OVERRIDE_REQUIRED app_review_override_required
+      return
+    fi
+    if [[ "$JHW_PR_APP_REVIEW_OVERRIDE" != "$expected" ]]; then
+      jhw_pr_app_budget_blocked OVERRIDE_REQUIRED app_review_override_stale
+      return
+    fi
+    reason="${JHW_PR_APP_REVIEW_OVERRIDE_REASON:-}"
+    reason_bytes="$(printf '%s' "$reason" | node -e '
+      const chunks = [];
+      process.stdin.on("data", chunk => chunks.push(chunk));
+      process.stdin.on("end", () => process.stdout.write(String(Buffer.concat(chunks).length)));
+    ')" || return 1
+    if [[ -z "$reason" || "$reason" == *$'\n'* || "$reason" == *$'\r'* ||
+      ! "$reason_bytes" =~ ^[0-9]+$ || "$reason_bytes" -gt 512 ]]; then
+      jhw_pr_app_budget_blocked OVERRIDE_REQUIRED app_review_override_reason_required
+      return
+    fi
+    JHW_PR_APP_APPROVAL_LEVEL=override
+    JHW_PR_APP_APPROVAL_REASON_B64="$(printf '%s' "$reason" | node -e '
+      const chunks = [];
+      process.stdin.on("data", chunk => chunks.push(chunk));
+      process.stdin.on("end", () => process.stdout.write(Buffer.concat(chunks).toString("base64")));
+    ')" || return 1
+  elif (( JHW_PR_APP_COMPLETED >= 3 )); then
+    expected="$reviewer:$JHW_PR_APP_APPROVAL_TOKEN"
+    if [[ -z "${JHW_PR_APP_REVIEW_APPROVAL:-}" ]]; then
+      if (( JHW_PR_APP_REMAINING_BLOCKERS == 0 )); then
+        jhw_pr_app_budget_blocked STOP_RECOMMENDED app_review_not_worthwhile
+      else
+        jhw_pr_app_budget_blocked APPROVAL_REQUIRED app_review_approval_required
+      fi
+      return
+    fi
+    if [[ "$JHW_PR_APP_REVIEW_APPROVAL" != "$expected" ]]; then
+      jhw_pr_app_budget_blocked APPROVAL_REQUIRED app_review_approval_stale
+      return
+    fi
+    JHW_PR_APP_APPROVAL_LEVEL=standard
+  fi
+  export JHW_PR_APP_BUDGET_STATUS JHW_PR_APP_APPROVAL_LEVEL JHW_PR_APP_APPROVAL_REASON_B64
+}
+
 jhw_pr_app_request_failed() {
   JHW_PR_APP_REQUEST_STATUS=TRIGGER_FAILED
   JHW_PR_APP_REQUEST_REASON="$1"
@@ -1633,7 +1970,7 @@ jhw_pr_app_request_failed() {
 }
 
 jhw_pr_request_app_review() {
-  local reviewer="$1" head="$2" command actor marker body endpoint query raw line
+  local reviewer="$1" head="$2" command actor marker body endpoint query raw line attempt_state approval_token
   local id created_at extra
   local -a matches=()
 
@@ -1677,9 +2014,6 @@ jhw_pr_request_app_review() {
   }
 
   marker="<!-- jhw-pr:review-request reviewer=${reviewer} head=${head} base=${ROUND_BASE_OID} -->"
-  body="$command
-
-$marker"
   endpoint="repos/$REPO_NWO/issues/$PR/comments?per_page=100"
   query=".[] | select(.user.login == \"$actor\" and ((.body // \"\") | contains(\"$marker\"))) | [.id, .created_at] | @tsv"
   raw="$(gh api "$endpoint" --paginate --jq "$query" 2>/dev/null)" || {
@@ -1695,6 +2029,35 @@ $marker"
 
   case "${#matches[@]}" in
     0)
+      jhw_pr_app_budget_gate "$reviewer" "$actor" "$head" || return
+      approval_token=''
+      [[ "$JHW_PR_APP_APPROVAL_LEVEL" != standard ]] || approval_token="$JHW_PR_APP_APPROVAL_TOKEN"
+      [[ "$JHW_PR_APP_APPROVAL_LEVEL" != override ]] || approval_token="$JHW_PR_APP_OVERRIDE_TOKEN"
+      attempt_state="$(JHW_APP_REVIEWER="$reviewer" JHW_APP_PR="$PR" JHW_APP_HEAD="$head" \
+        JHW_APP_BASE="$ROUND_BASE_OID" JHW_APP_DIFF_HASH="$JHW_PR_APP_DIFF_HASH" \
+        JHW_APP_SNAPSHOT="$JHW_PR_APP_SNAPSHOT" JHW_APP_APPROVAL_LEVEL="$JHW_PR_APP_APPROVAL_LEVEL" \
+        JHW_APP_APPROVAL_TOKEN="$approval_token" JHW_APP_APPROVAL_REASON_B64="$JHW_PR_APP_APPROVAL_REASON_B64" node -e '
+          const state = {
+            schema: 1,
+            reviewer: process.env.JHW_APP_REVIEWER,
+            pr: Number(process.env.JHW_APP_PR),
+            head: process.env.JHW_APP_HEAD,
+            base_oid: process.env.JHW_APP_BASE,
+            diff_hash: process.env.JHW_APP_DIFF_HASH,
+            snapshot: process.env.JHW_APP_SNAPSHOT,
+            approval: {
+              level: process.env.JHW_APP_APPROVAL_LEVEL,
+              token: process.env.JHW_APP_APPROVAL_TOKEN,
+              reason_b64: process.env.JHW_APP_APPROVAL_REASON_B64,
+            },
+          };
+          process.stdout.write(Buffer.from(JSON.stringify(state)).toString("base64"));
+        ')" || return 1
+      body="$command
+
+$marker
+<!-- jhw-pr:app-review-attempt:v1 -->
+<!-- jhw-pr:app-review-attempt-state:$attempt_state -->"
       raw="$(gh api "$endpoint" -X POST -f "body=$body" --jq '[.id, .created_at] | @tsv' 2>/dev/null)" || {
         jhw_pr_app_request_failed request_post_failed
         return
@@ -1735,6 +2098,90 @@ $marker"
   JHW_PR_APP_REQUEST_REVIEWER="$reviewer"
   JHW_PR_APP_REQUEST_HEAD="$head"
   JHW_PR_APP_REQUEST_BASE_OID="$ROUND_BASE_OID"
+}
+
+jhw_pr_record_app_review_result() {
+  local reviewer="$1" request_id="$2" status="$3" reason="$4" blocking_count="$5" finding_digest="$6"
+  local actor endpoint raw parsed action head base_oid diff_hash snapshot requested_at elapsed state_b64 body
+  [[ "$reviewer" != gemini-assist ]] || reviewer=gemini-code-assist
+  [[ "$reviewer" == codex || "$reviewer" == gemini-code-assist ]] || return 2
+  [[ "$request_id" =~ ^[1-9][0-9]*$ ]] || return 2
+  [[ "$status" =~ ^(CLEAN|FEEDBACK|FAILED|TRIGGER_FAILED|TIMEOUT)$ ]] || return 2
+  [[ "$reason" =~ ^[A-Za-z0-9_.:-]*$ ]] || return 2
+  [[ "$blocking_count" =~ ^[0-9]+$ ]] || return 2
+  [[ "$finding_digest" == none || "$finding_digest" =~ ^[0-9a-f]{64}$ ]] || return 2
+  actor="$("${JHW_PR_GH_BIN:-gh}" api user --jq '.login' 2>/dev/null)" || return 1
+  [[ "$actor" =~ ^[A-Za-z0-9-]+$ ]] || return 1
+  endpoint="repos/$REPO_NWO/issues/$PR/comments?per_page=100"
+  raw="$(jhw_pr_app_comment_rows 2>/dev/null)" || return 1
+  parsed="$(printf '%s\n' "$raw" | JHW_APP_REVIEWER="$reviewer" JHW_APP_ACTOR="$actor" JHW_APP_PR="$PR" \
+    JHW_APP_REQUEST_ID="$request_id" JHW_APP_STATUS="$status" JHW_APP_REASON="$reason" \
+    JHW_APP_BLOCKING_COUNT="$blocking_count" JHW_APP_FINDING_DIGEST="$finding_digest" node -e '
+      const reviewer = process.env.JHW_APP_REVIEWER;
+      const actor = process.env.JHW_APP_ACTOR;
+      const pr = Number(process.env.JHW_APP_PR);
+      const requestId = Number(process.env.JHW_APP_REQUEST_ID);
+      let input = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", chunk => input += chunk);
+      process.stdin.on("end", () => {
+        const decode = value => Buffer.from(value, "base64").toString("utf8");
+        const stateOf = (body, name) => {
+          const matches = [...body.matchAll(new RegExp(`<!-- ${name}:([A-Za-z0-9+/]+=*) -->`, "g"))];
+          if (matches.length !== 1) throw new Error("invalid state marker");
+          return JSON.parse(decode(matches[0][1]));
+        };
+        const comments = input.split(/\n/).filter(Boolean).map(line => {
+          const fields = line.split("\t");
+          if (fields.length !== 4) throw new Error("invalid row");
+          return { id: Number(fields[0]), actor: fields[1], createdAt: fields[2], body: decode(fields[3]) };
+        }).filter(item => item.actor === actor);
+        const requestComments = comments.filter(item => item.id === requestId);
+        if (requestComments.length !== 1) throw new Error("request comment missing");
+        const attempts = requestComments.filter(item => item.body.includes("<!-- jhw-pr:app-review-attempt:v1 -->"));
+        if (attempts.length === 0) { process.stdout.write("LEGACY"); return; }
+        if (attempts.length !== 1) throw new Error("request attempt ambiguous");
+        const attempt = attempts[0];
+        const state = stateOf(attempt.body, "jhw-pr:app-review-attempt-state");
+        if (state.schema !== 1 || state.reviewer !== reviewer || state.pr !== pr) throw new Error("request mismatch");
+        const matchingResults = comments.filter(item => item.body.includes("<!-- jhw-pr:app-review-result:v1 -->"))
+          .map(item => stateOf(item.body, "jhw-pr:app-review-result-state"))
+          .filter(result => result.request_comment_id === requestId);
+        if (matchingResults.length > 1) throw new Error("duplicate result");
+        if (matchingResults.length === 1) {
+          const result = matchingResults[0];
+          const same = result.status === process.env.JHW_APP_STATUS && result.reason === process.env.JHW_APP_REASON &&
+            result.blocking_count === Number(process.env.JHW_APP_BLOCKING_COUNT) && result.finding_digest === process.env.JHW_APP_FINDING_DIGEST;
+          if (!same) throw new Error("result conflict");
+          process.stdout.write("EXISTING");
+          return;
+        }
+        process.stdout.write(["CREATE", state.head, state.base_oid, state.diff_hash, state.snapshot, attempt.createdAt].join("\t"));
+      });
+    ' 2>/dev/null)" || return 1
+  [[ "$parsed" != EXISTING && "$parsed" != LEGACY ]] || return 0
+  IFS=$'\t' read -r action head base_oid diff_hash snapshot requested_at <<<"$parsed"
+  [[ "$action" == CREATE && "$head" =~ ^[0-9a-f]{40}$ && "$base_oid" =~ ^[0-9a-f]{40}$ &&
+    "$diff_hash" =~ ^[0-9a-f]{64}$ && "$snapshot" =~ ^[0-9a-f]{64}$ ]] || return 1
+  elapsed="$(( $(ship_now_epoch) - $(ship_timestamp_epoch "$requested_at") ))" || return 1
+  (( elapsed >= 0 )) || elapsed=0
+  state_b64="$(JHW_APP_REVIEWER="$reviewer" JHW_APP_PR="$PR" JHW_APP_REQUEST_ID="$request_id" \
+    JHW_APP_HEAD="$head" JHW_APP_BASE="$base_oid" JHW_APP_DIFF_HASH="$diff_hash" JHW_APP_SNAPSHOT="$snapshot" \
+    JHW_APP_STATUS="$status" JHW_APP_REASON="$reason" JHW_APP_BLOCKING_COUNT="$blocking_count" \
+    JHW_APP_FINDING_DIGEST="$finding_digest" JHW_APP_ELAPSED="$elapsed" node -e '
+      const state = {
+        schema: 1, reviewer: process.env.JHW_APP_REVIEWER, pr: Number(process.env.JHW_APP_PR),
+        request_comment_id: Number(process.env.JHW_APP_REQUEST_ID), head: process.env.JHW_APP_HEAD,
+        base_oid: process.env.JHW_APP_BASE, diff_hash: process.env.JHW_APP_DIFF_HASH,
+        snapshot: process.env.JHW_APP_SNAPSHOT, status: process.env.JHW_APP_STATUS,
+        reason: process.env.JHW_APP_REASON, blocking_count: Number(process.env.JHW_APP_BLOCKING_COUNT),
+        finding_digest: process.env.JHW_APP_FINDING_DIGEST, elapsed_seconds: Number(process.env.JHW_APP_ELAPSED),
+      };
+      process.stdout.write(Buffer.from(JSON.stringify(state)).toString("base64"));
+    ')" || return 1
+  body="<!-- jhw-pr:app-review-result:v1 -->
+<!-- jhw-pr:app-review-result-state:$state_b64 -->"
+  "${JHW_PR_GH_BIN:-gh}" api "$endpoint" -X POST -f "body=$body" --jq '[.id, .created_at] | @tsv' >/dev/null || return 1
 }
 
 ship_write_codex_trigger_state() {
@@ -1784,7 +2231,7 @@ ship_write_codex_trigger_state() {
 }
 
 jhw_pr_request_eligible_apps() {
-  local head="$1" eligible="$2" reviewer status reason comment_id requested_at base_oid created
+  local head="$1" eligible="$2" reviewer status reason comment_id requested_at base_oid created request_rc
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
   if grep -Fqx -- codex <<<"$eligible"; then
     case "${JHW_PR_CODEX_APP_ACTOR:-$SHIP_CODEX_LOGIN}" in
@@ -1800,10 +2247,10 @@ jhw_pr_request_eligible_apps() {
     [[ "$reviewer" != gemini-assist ]] || reviewer=gemini-code-assist
     case "$reviewer" in
       codex)
-        jhw_pr_request_app_review codex "$head"
+        jhw_pr_request_app_review codex "$head" && request_rc=0 || request_rc=$?
         ;;
       gemini-code-assist)
-        jhw_pr_request_app_review gemini-code-assist "$head"
+        jhw_pr_request_app_review gemini-code-assist "$head" && request_rc=0 || request_rc=$?
         ;;
       *) return 2 ;;
     esac
@@ -1815,6 +2262,11 @@ jhw_pr_request_eligible_apps() {
     created="${JHW_PR_APP_REQUEST_CREATED:-false}"
     [[ -z "$JHW_PR_APP_REQUEST_RESULTS" ]] || JHW_PR_APP_REQUEST_RESULTS+=$'\n'
     JHW_PR_APP_REQUEST_RESULTS+="$reviewer"$'\t'"$status"$'\t'"$reason"$'\t'"$comment_id"$'\t'"$requested_at"$'\t'"$created"$'\t'"$head"$'\t'"$base_oid"
+    if (( request_rc != 0 )); then
+      export JHW_PR_APP_REQUEST_RESULTS
+      (( request_rc == 4 )) && return 4
+      return "$request_rc"
+    fi
     if [[ "$reviewer" == codex ]]; then
       case "$status" in STARTED|TRIGGER_FAILED) ;; *) return 1 ;; esac
       SHIP_CODEX_TRIGGER_STATUS="$status"
@@ -1858,10 +2310,17 @@ ship_codex_trigger_failed() {
 }
 
 ship_codex_trigger() {
+  local request_rc
   SHIP_CODEX_TRIGGER_STATUS=""
   SHIP_CODEX_TRIGGER_REASON=""
   SHIP_CODEX_REQUEST_CREATED=false
-  if ! jhw_pr_request_app_review codex "$ROUND_HEAD"; then
+  jhw_pr_request_app_review codex "$ROUND_HEAD" && request_rc=0 || request_rc=$?
+  if (( request_rc == 4 )); then
+    SHIP_CODEX_TRIGGER_STATUS="$JHW_PR_APP_REQUEST_STATUS"
+    SHIP_CODEX_TRIGGER_REASON="$JHW_PR_APP_REQUEST_REASON"
+    return 4
+  fi
+  if (( request_rc != 0 )); then
     ship_codex_trigger_failed "${JHW_PR_APP_REQUEST_REASON:-request_failed}"
     return
   fi
@@ -2268,12 +2727,16 @@ process.stdout.write((outcomes.size === 1 ? latest[0].outcome : "AMBIGUOUS") + "
 '
 }
 
-ship_codex_signal_status() {
+_ship_codex_signal_status() {
   local reviews pull_comments issue_comments issue_reactions comment_reactions request_epoch occurred_epoch now_epoch deadline
   local actor review_id comment_id reaction_id review_state commit_id original_commit_id occurred_at body_b64 body_status content
   local outcome source safe_id group event_line latest_status current_base_oid
   local dismissed_review_ids=""
   local signal_events="" has_eyes=false has_active_blocker=false
+
+  SHIP_CODEX_BLOCKING_COUNT=0
+  SHIP_CODEX_FINDING_BODIES=''
+  SHIP_CODEX_FINDING_DIGEST=none
 
   if [[ "$SHIP_CODEX_TRIGGER_STATUS" != STARTED ]]; then
     SHIP_CODEX_REVIEW_STATUS="${SHIP_CODEX_TRIGGER_STATUS:-TRIGGER_FAILED}"
@@ -2373,6 +2836,9 @@ ship_codex_signal_status() {
         if [[ "$outcome" != FAILED ]]; then
           outcome=FEEDBACK
           has_active_blocker=true
+          SHIP_CODEX_BLOCKING_COUNT=$(( SHIP_CODEX_BLOCKING_COUNT + 1 ))
+          [[ -z "$SHIP_CODEX_FINDING_BODIES" ]] || SHIP_CODEX_FINDING_BODIES+=$'\n'
+          SHIP_CODEX_FINDING_BODIES+="$body_b64"
         fi
       else
         body_status=$?
@@ -2416,6 +2882,9 @@ ship_codex_signal_status() {
       if [[ "$outcome" != FAILED ]]; then
         outcome=FEEDBACK
         has_active_blocker=true
+        SHIP_CODEX_BLOCKING_COUNT=$(( SHIP_CODEX_BLOCKING_COUNT + 1 ))
+        [[ -z "$SHIP_CODEX_FINDING_BODIES" ]] || SHIP_CODEX_FINDING_BODIES+=$'\n'
+        SHIP_CODEX_FINDING_BODIES+="$body_b64"
       fi
     else
       body_status=$?
@@ -2529,6 +2998,33 @@ ship_codex_signal_status() {
       [[ "$has_eyes" == true ]] && SHIP_CODEX_REVIEW_REASON=acknowledged
     fi
   fi
+}
+
+ship_codex_signal_status() {
+  local signal_rc reason
+  _ship_codex_signal_status && signal_rc=0 || signal_rc=$?
+  case "${SHIP_CODEX_REVIEW_STATUS:-}" in
+    CLEAN|FEEDBACK|FAILED|TIMEOUT)
+      if [[ "${SHIP_CODEX_REVIEW_STATUS:-}" == FEEDBACK && -n "${SHIP_CODEX_FINDING_BODIES:-}" ]]; then
+        SHIP_CODEX_FINDING_DIGEST="$(printf '%s\n' "$SHIP_CODEX_FINDING_BODIES" | LC_ALL=C sort -u | node -e '
+          const { createHash } = require("node:crypto");
+          const chunks = [];
+          process.stdin.on("data", chunk => chunks.push(chunk));
+          process.stdin.on("end", () => process.stdout.write(createHash("sha256").update(Buffer.concat(chunks)).digest("hex")));
+        ')" || return 1
+      fi
+      reason="${SHIP_CODEX_REVIEW_REASON:-}"
+      [[ -n "$reason" ]] || reason=none
+      jhw_pr_record_app_review_result codex "$SHIP_CODEX_REQUEST_COMMENT_ID" \
+        "$SHIP_CODEX_REVIEW_STATUS" "$reason" "${SHIP_CODEX_BLOCKING_COUNT:-0}" \
+        "${SHIP_CODEX_FINDING_DIGEST:-none}" || {
+          SHIP_CODEX_REVIEW_STATUS=FAILED
+          SHIP_CODEX_REVIEW_REASON=result_record_failed
+          return 1
+        }
+      ;;
+  esac
+  return "$signal_rc"
 }
 
 ship_signal_dirs_match() {
@@ -2752,7 +3248,9 @@ case "$?" in
 esac
 ```
 
-`jhw_pr_request_eligible_apps`는 각 요청을 `reviewer/status/reason/comment_id/requested_at/created/head/base_oid` 행으로 보존한다. Codex 행은 다음 App을 요청하기 전에 request comment ID·요청 시각·head·base OID를 Codex 폴링 및 라운드 상태에 즉시 복사하므로 Gemini 결과가 generic 변수를 덮어써도 좌표가 유지된다. 같은 head라도 base OID가 바뀌면 기존 요청과 결과를 재사용하지 않으며 poll과 merge가 모두 scope drift로 실패한다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. PR 루트 reaction은 요청 좌표가 없으므로 요청 시각보다 엄격히 나중인 초만 인정하고, 정확한 요청 댓글 endpoint의 reaction은 같은 초도 그 요청에 귀속한다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다. 중앙 workflow가 `UNAVAILABLE`이면 보고하고 다른 planned reviewer를 계속하되, 유예 안에 run이 없거나 모호한 같은-head run은 `TRIGGER_FAILED`다. 시작된 run이 `SHIP_TIMEOUT_MIN`을 넘기면 `TIMEOUT`이다.
+`jhw_pr_request_eligible_apps`는 각 요청을 `reviewer/status/reason/comment_id/requested_at/created/head/base_oid` 행으로 보존한다. 새 Codex/Gemini Code Assist 요청 코멘트에는 `app-review-attempt:v1` 영수증을 함께 넣고, terminal 판정 직후 `jhw_pr_record_app_review_result <reviewer> <request_comment_id> <status> <reason> <blocking_count> <finding_digest>`로 `app-review-result:v1`을 한 번만 append한다. 이 원장은 세션과 HEAD 변경을 넘어 `(repo, PR, reviewer)`별 정상 완료·provider 실패·timeout·잔여 blocker·novelty·변경량·소요 시간을 분리 집계한다. 정상 완료 3회 뒤에는 현재 reviewer/PR/head/base OID/diff hash에 결합된 `--approve-app-review` token, 5회부터는 `--override-app-review` token과 `--override-reason`이 필요하다. 승인 token은 요청 코멘트 자체에 소비 영수증으로 원자 기록되며 다른 snapshot이나 다음 요청에 재사용할 수 없다. blocker가 0이면 `STOP_RECOMMENDED`로 추가 리뷰보다 PR 진행을 권고한다.
+
+Codex 행은 다음 App을 요청하기 전에 request comment ID·요청 시각·head·base OID를 Codex 폴링 및 라운드 상태에 즉시 복사하므로 Gemini 결과가 generic 변수를 덮어써도 좌표가 유지된다. 같은 head라도 base OID가 바뀌면 기존 요청과 결과를 재사용하지 않으며 poll과 merge가 모두 scope drift로 실패한다. `eyes`는 요청 시작 확인일 뿐이라 PENDING이며, current-head review/inline comment 또는 요청 이후 `+1`만 terminal 신호다. PR 루트 reaction은 요청 좌표가 없으므로 요청 시각보다 엄격히 나중인 초만 인정하고, 정확한 요청 댓글 endpoint의 reaction은 같은 초도 그 요청에 귀속한다. inline comment는 `commit_id`와 `original_commit_id`가 모두 현재 HEAD여야 하므로 과거 diff에서 재매핑된 코멘트는 무시한다. 중앙 workflow가 `UNAVAILABLE`이면 보고하고 다른 planned reviewer를 계속하되, 유예 안에 run이 없거나 모호한 같은-head run은 `TRIGGER_FAILED`다. 시작된 run이 `SHIP_TIMEOUT_MIN`을 넘기면 `TIMEOUT`이다.
 
 인자 파서는 `--reviewers`의 쉼표 목록을 `JHW_PR_REVIEWERS_FILTER`에 그대로 한 번만 저장하며,
 옵션이 없으면 그 변수 자체를 unset 상태로 둔다. `jhw_pr_select_expected_reviewers`가
