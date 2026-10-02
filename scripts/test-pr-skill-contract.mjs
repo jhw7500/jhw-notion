@@ -55,6 +55,29 @@ const validPrBody = [
 ].join("\n");
 const validatorRef = "0d97a63891ba4473a3a189eae643f8059b76eb56";
 const validatorEndpoint = `repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=${validatorRef}`;
+// The fakes exit with process.exit() right after writing; under CPU load an asynchronous pipe
+// write can be cut short, so every fake writes its output synchronously before exiting.
+const syncOutputPrelude = String.raw`
+const syncOutputPause = new Int32Array(new SharedArrayBuffer(4));
+for (const [stream, fd] of [[process.stdout, 1], [process.stderr, 2]]) {
+  stream.write = (chunk, encoding, callback) => {
+    if (typeof encoding === "function") callback = encoding;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), typeof encoding === "string" ? encoding : "utf8");
+    let offset = 0;
+    while (offset < bytes.length) {
+      try {
+        offset += fs.writeSync(fd, bytes, offset);
+      } catch (error) {
+        if (error.code !== "EAGAIN") throw error;
+        Atomics.wait(syncOutputPause, 0, 0, 1);
+      }
+    }
+    if (typeof callback === "function") callback();
+    return true;
+  };
+}
+`;
+
 const fakeValidatorSource = String.raw`#!/usr/bin/env python3
 import argparse
 import json
@@ -191,6 +214,7 @@ function collectorContractBlock(markdown) {
 
 const fakeGhSource = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
+${syncOutputPrelude}
 
 const statePath = process.env.FAKE_GH_STATE;
 const logPath = process.env.FAKE_GH_LOG;
@@ -720,6 +744,7 @@ process.exit(2);
 
 const fakeGitSource = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
+${syncOutputPrelude}
 
 const statePath = process.env.FAKE_GH_STATE;
 const logPath = process.env.FAKE_GH_LOG;
@@ -841,6 +866,7 @@ process.exit(2);
 
 const fakeDateSource = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
+${syncOutputPrelude}
 
 const argv = process.argv.slice(2);
 if (argv.length === 1 && argv[0] === "+%s") {
