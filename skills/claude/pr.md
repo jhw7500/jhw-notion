@@ -1491,8 +1491,221 @@ jhw_pr_workflow_run_floor() {
   printf '%s\n' "$selected"
 }
 
+JHW_PR_CHANGE_EVIDENCE_VALIDATOR_REF='0d97a63891ba4473a3a189eae643f8059b76eb56'
+JHW_PR_CHANGE_EVIDENCE_VALIDATOR_ENDPOINT="repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=$JHW_PR_CHANGE_EVIDENCE_VALIDATOR_REF"
+
+jhw_pr_validate_change_evidence_snapshot() {
+  local body_snapshot="$1" validator rc=0
+  [[ -f "$body_snapshot" && ! -L "$body_snapshot" ]] || return 2
+  validator="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-change-evidence-validator.XXXXXX")" || return 2
+  if [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == true ]]; then
+    JHW_PR_ACTIVE_VALIDATOR_FILE="$validator"
+  fi
+  if ! gh api -H 'Accept: application/vnd.github.raw+json' \
+    "$JHW_PR_CHANGE_EVIDENCE_VALIDATOR_ENDPOINT" >"$validator"; then
+    echo "failed to fetch the pinned Change Evidence Contract validator" >&2
+    rc=1
+  elif ! python3 "$validator" --kind pull-request --path "$body_snapshot" \
+    --expected-version v1 --format json >/dev/null; then
+    echo "PR body does not satisfy Change Evidence Contract v1" >&2
+    rc=1
+  fi
+  rm -f -- "$validator" || return 2
+  [[ "${JHW_PR_ACTIVE_VALIDATOR_FILE:-}" != "$validator" ]] || unset JHW_PR_ACTIVE_VALIDATOR_FILE
+  return "$rc"
+}
+
+jhw_pr_snapshot_new_pr_body() {
+  local source_file="$1" snapshot rc=0
+  unset JHW_PR_VALIDATED_BODY_FILE
+  snapshot="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-pr-body.XXXXXX")" || return 2
+  if [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == true ]]; then
+    JHW_PR_ACTIVE_BODY_SNAPSHOT="$snapshot"
+  fi
+  if ! python3 - "$source_file" "$snapshot" <<'PY'
+import os
+import stat
+import sys
+
+source_path, snapshot_path = sys.argv[1:]
+if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+    raise SystemExit(2)
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW | os.O_NONBLOCK
+try:
+    source_fd = os.open(source_path, flags)
+except OSError:
+    raise SystemExit(2)
+try:
+    before = os.fstat(source_fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > 65536:
+        raise SystemExit(2)
+    if before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) != 0o600:
+        raise SystemExit(2)
+    destination_flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    destination_fd = os.open(snapshot_path, destination_flags)
+    try:
+        destination = os.fstat(destination_fd)
+        if not stat.S_ISREG(destination.st_mode) or destination.st_uid != os.getuid():
+            raise SystemExit(2)
+        os.fchmod(destination_fd, 0o600)
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 65536)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > 65536:
+                raise SystemExit(2)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                view = view[written:]
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+    after = os.fstat(source_fd)
+    path_state = os.stat(source_path, follow_symlinks=False)
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if identity(before) != identity(after) or identity(after) != identity(path_state):
+        raise SystemExit(2)
+finally:
+    os.close(source_fd)
+PY
+  then
+    echo "PR body source changed or failed private-file verification" >&2
+    rc=2
+  elif ! jhw_pr_validate_change_evidence_snapshot "$snapshot"; then
+    rc=1
+  fi
+  if (( rc != 0 )); then
+    rm -f -- "$snapshot" || return 2
+    [[ "${JHW_PR_ACTIVE_BODY_SNAPSHOT:-}" != "$snapshot" ]] || unset JHW_PR_ACTIVE_BODY_SNAPSHOT
+    return "$rc"
+  fi
+  JHW_PR_VALIDATED_BODY_FILE="$snapshot"
+}
+
+jhw_pr_preflight_new_pr_title() {
+  [[ -n "${JHW_PR_TITLE:-}" && "$JHW_PR_TITLE" != *$'\n'* && "$JHW_PR_TITLE" != *$'\r'* ]] || {
+    echo "set JHW_PR_TITLE to an explicit single-line PR title" >&2
+    return 2
+  }
+  [[ -n "${JHW_PR_BODY_FILE:-}" ]] || {
+    echo "set JHW_PR_BODY_FILE to a private Change Evidence Contract v1 body file" >&2
+    return 2
+  }
+}
+
+jhw_pr_validate_existing_pr_body() {
+  local pr="$1" body_file rc=0
+  jhw_pr_body_cleanup_install || return 2
+  if ! body_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-pr-body.XXXXXX")"; then
+    jhw_pr_body_cleanup_finish || return 2
+    return 2
+  fi
+  JHW_PR_ACTIVE_BODY_SNAPSHOT="$body_file"
+  if ! gh pr view "$pr" --repo "$REPO_NWO" --json body --jq .body >"$body_file"; then
+    rc=1
+  elif ! jhw_pr_validate_change_evidence_snapshot "$body_file"; then
+    echo "existing PR body is legacy or invalid; update it with gh pr edit --body-file using the v1 fields before proceeding" >&2
+    rc=1
+  fi
+  jhw_pr_body_cleanup_finish || return 2
+  return "$rc"
+}
+
+jhw_pr_body_cleanup_all() {
+  local path
+  for path in "${JHW_PR_ACTIVE_VALIDATOR_FILE:-}" "${JHW_PR_ACTIVE_BODY_SNAPSHOT:-}"; do
+    [[ -z "$path" ]] || rm -f -- "$path" || return 2
+  done
+  unset JHW_PR_ACTIVE_VALIDATOR_FILE JHW_PR_ACTIVE_BODY_SNAPSHOT JHW_PR_VALIDATED_BODY_FILE
+}
+
+jhw_pr_body_restore_traps() {
+  local signal spec
+  for signal in EXIT HUP INT TERM; do
+    case "$signal" in
+      EXIT) spec="${JHW_PR_BODY_PREV_EXIT_TRAP:-}" ;;
+      HUP) spec="${JHW_PR_BODY_PREV_HUP_TRAP:-}" ;;
+      INT) spec="${JHW_PR_BODY_PREV_INT_TRAP:-}" ;;
+      TERM) spec="${JHW_PR_BODY_PREV_TERM_TRAP:-}" ;;
+    esac
+    if [[ -n "$spec" ]]; then
+      [[ "$spec" == 'trap -- '* ]] || return 2
+      eval "$spec"
+    else
+      trap - "$signal"
+    fi
+  done
+}
+
+jhw_pr_body_cleanup_on_exit() {
+  local status="$1" previous_spec="${JHW_PR_BODY_PREV_EXIT_TRAP:-}"
+  jhw_pr_body_cleanup_all >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  JHW_PR_BODY_CLEANUP_ACTIVE=false
+  if [[ -n "$previous_spec" ]]; then
+    ( eval "$previous_spec"; exit "$status" ) || true
+  fi
+  exit "$status"
+}
+
+jhw_pr_body_handle_signal() {
+  local signal="$1" status="$2" previous_spec=''
+  case "$signal" in
+    HUP) previous_spec="${JHW_PR_BODY_PREV_HUP_TRAP:-}" ;;
+    INT) previous_spec="${JHW_PR_BODY_PREV_INT_TRAP:-}" ;;
+    TERM) previous_spec="${JHW_PR_BODY_PREV_TERM_TRAP:-}" ;;
+    *) return 2 ;;
+  esac
+  jhw_pr_body_cleanup_all >/dev/null 2>&1 || true
+  jhw_pr_body_restore_traps >/dev/null 2>&1 || trap - EXIT HUP INT TERM
+  JHW_PR_BODY_CLEANUP_ACTIVE=false
+  [[ -z "$previous_spec" ]] || kill -s "$signal" "$$"
+  exit "$status"
+}
+
+jhw_pr_body_cleanup_install() {
+  [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == false ]] || return 2
+  JHW_PR_BODY_PREV_EXIT_TRAP="$(trap -p EXIT)" || return 2
+  JHW_PR_BODY_PREV_HUP_TRAP="$(trap -p HUP)" || return 2
+  JHW_PR_BODY_PREV_INT_TRAP="$(trap -p INT)" || return 2
+  JHW_PR_BODY_PREV_TERM_TRAP="$(trap -p TERM)" || return 2
+  trap 'jhw_pr_body_cleanup_on_exit "$?"' EXIT
+  trap 'jhw_pr_body_handle_signal HUP 129' HUP
+  trap 'jhw_pr_body_handle_signal INT 130' INT
+  trap 'jhw_pr_body_handle_signal TERM 143' TERM
+  JHW_PR_BODY_CLEANUP_ACTIVE=true
+}
+
+jhw_pr_body_cleanup_finish() {
+  local rc=0
+  [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == true ]] || return 2
+  jhw_pr_body_cleanup_all || rc=2
+  jhw_pr_body_restore_traps || rc=2
+  JHW_PR_BODY_CLEANUP_ACTIVE=false
+  unset JHW_PR_BODY_PREV_EXIT_TRAP JHW_PR_BODY_PREV_HUP_TRAP
+  unset JHW_PR_BODY_PREV_INT_TRAP JHW_PR_BODY_PREV_TERM_TRAP
+  return "$rc"
+}
+
 jhw_pr_apply_new_pr_policy() {
+  local mode="$1" rc=0
+  jhw_pr_preflight_new_pr_title || return
+  jhw_pr_body_cleanup_install || return 2
+  if jhw_pr_snapshot_new_pr_body "$JHW_PR_BODY_FILE"; then
+    jhw_pr_apply_new_pr_policy_with_snapshot "$mode" "$JHW_PR_VALIDATED_BODY_FILE" || rc=$?
+  else
+    rc=$?
+  fi
+  jhw_pr_body_cleanup_finish || return 2
+  return "$rc"
+}
+
+jhw_pr_apply_new_pr_policy_with_snapshot() {
   local mode="$1" local_head actual_local_head draft expected_base workflow_trigger_event created_pr_url
+  local body_snapshot="$2"
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
   case "$mode" in
     request|auto) workflow_trigger_event=pull_request ;;
@@ -1511,7 +1724,8 @@ jhw_pr_apply_new_pr_policy() {
   git push -u origin HEAD || return 1
   actual_local_head="$(git rev-parse HEAD)" || return 1
   [[ "$actual_local_head" == "$local_head" ]] || { echo "local head changed during push" >&2; return 1; }
-  created_pr_url="$(gh pr create --repo "$REPO_NWO" --base "$expected_base" --draft --fill)" || return 1
+  created_pr_url="$(gh pr create --repo "$REPO_NWO" --base "$expected_base" --draft \
+    --title "$JHW_PR_TITLE" --body-file "$body_snapshot")" || return 1
   PR="$(gh pr view "$created_pr_url" --repo "$REPO_NWO" --json number --jq .number)" || return 1
   [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid created PR" >&2; return 1; }
   jhw_pr_reconcile_review_labels "$mode" || return
@@ -1531,6 +1745,7 @@ jhw_pr_apply_existing_pr_policy() {
   actual_local_head="$(git rev-parse HEAD)" || return 1
   [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed before policy reconciliation" >&2; return 1; }
   expected_base="$(jhw_pr_expected_base)" || return
+  jhw_pr_validate_existing_pr_body "$PR" || return
   jhw_pr_require_write_permission || return
   remote_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
   [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid remote head" >&2; return 1; }
@@ -1590,17 +1805,21 @@ jhw_pr_apply_existing_pr_policy() {
 ```
 <!-- pr-review-mode-contract:end -->
 
+새 PR 게시와 기존 PR 본문 검증의 private 임시 파일은 생성 전 등록한 `EXIT/HUP/INT/TERM` 정리 핸들러가 관리한다. 정상 반환 시 파일을 지우고 기존 caller trap을 복원한다.
+
 ## 동작 순서
 
 1. **사전 점검**
    - 첫 mutation 전에 `jhw_pr_review_mode_from_args "$@"`로 `request|skip|auto`를 확정하고 `jhw_pr_app_review_authorization_from_args "$@"`로 App 승인/override를 파싱한다. `--review --no-review`, 승인과 override 동시 지정, 사유 없는 override는 즉시 실패한다.
+   - 새 PR은 실제 관측한 내용으로 `JHW_PR_TITLE`과 mode `0600`의 일반 파일 `JHW_PR_BODY_FILE`을 준비한다. 본문은 `### Contract version` → `### Summary` → `### Changes` → `### Validation` → `### Impact and risks` → `### Related issue` 순서의 Change Evidence Contract `v1`이어야 한다. 검증 명령·결과나 Issue 관계를 추측하지 않는다. 스킬은 원본을 no-follow로 열어 type/owner/mode/identity를 확인하고 private snapshot을 만든 뒤, automation commit `0d97a63891ba4473a3a189eae643f8059b76eb56`의 canonical validator로 push 전에 검증한다. 검증한 같은 snapshot만 `gh pr create --body-file`에 전달하고 종료 경로에서 삭제한다. validator fetch 실패도 fail-closed한다.
+   - 기존 PR도 첫 policy mutation 전에 현재 본문을 같은 규칙으로 검증한다. legacy/invalid 본문이면 실제 근거로 private body file을 작성해 `gh pr edit <PR> --body-file <file>`로 갱신한 뒤 다시 실행한다.
    - write permission과 고정 라벨 정의를 확인한다. 누락 라벨 생성 외에는 아직 변경하지 않는다.
    - `git status` — 커밋되지 않은 변경 있으면 먼저 커밋(없으면 "변경 없음" 중단)
    - 현재 브랜치가 base(`main`)이면 **브랜치 생성 후** 진행 (전역 규칙: 기본 브랜치 직접 PR 금지)
    - `REPO_NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # Owner/Repo (nameWithOwner)`
 2. **PR 생성 또는 감지**
    - `--base`는 새 PR과 기존 PR 모두에 적용한다. 기존 PR의 base가 다르면 review-triggering 라벨 변경이나 push 전에 `gh pr edit --base`로 맞추고 `baseRefName`을 재조회한다. 수정·재조회가 실패하면 리뷰를 요청하지 않는다.
-   - 새 PR: reviewer plan·현재 head workflow run-ID floor 캡처 → push → `gh pr create --draft --fill`(commit metadata로 비대화식 title/body 확정) → mode 라벨 reconcile/read-back → head/base/draft 검증 → ready 순서다. `jhw_pr_apply_new_pr_policy`가 push와 ready보다 먼저 floor를 잡는다.
+   - 새 PR: explicit title/body contract preflight → reviewer plan·현재 head workflow run-ID floor 캡처 → push → `gh pr create --draft --title "$JHW_PR_TITLE" --body-file "$body_snapshot"` → mode 라벨 reconcile/read-back → head/base/draft 검증 → ready 순서다. `jhw_pr_apply_new_pr_policy`가 push와 ready보다 먼저 floor를 잡는다.
    - 기존 PR의 새 head: reviewer plan·현재 local head workflow run-ID floor 캡처 → base reconcile/read-back → mode 라벨 reconcile/read-back → push → 새 원격 head/base 검증 순서다. 기존 draft는 push와 검증 뒤 ready/read-back하여 새 head의 `ready_for_review`를 발생시킨다. `jhw_pr_apply_existing_pr_policy`가 base/label/push/ready mutation 전에 floor를 잡는다.
    - 이미 ready인 같은 head의 명시적 `request`는 synchronize push를 생략하고 `review:request`의 `labeled` event run을 사용한다. 라벨이 이미 붙어 있으면 떼었다 다시 붙여 새 `labeled` 이벤트를 만든다. `workflow_dispatch`는 보내지 않는다 — override 라벨 없는 `force_review` dispatch는 budget이 항상 거부하고, 그 거부를 이번 라운드로 판정하면 성공한 labeled 리뷰를 FAILED로 오보한다(#156). 변경 없는 ready `auto=true`는 리뷰 이벤트가 생기지 않으므로 어떤 mutation보다 먼저 멈추고 `--review` 재실행을 안내한다. 새 PR·draft PR 또는 새 head를 push하는 `request|auto=true`는 `ready_for_review|synchronize`의 `pull_request` event run을 사용한다.
    - `PR=<번호>`, `SHA="$(git rev-parse HEAD)"`, `ROUND_BASE_OID="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)"` (push·base reconcile 후 기준 — 재푸시마다 갱신)

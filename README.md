@@ -218,7 +218,26 @@ TUI에서 `/jhw:` 접두사로 사용. 통합 진입점 위주:
 /jhw:cclog    — Claude Code 세션 대화 기록 조회 (Notion 아님)
 /jhw:pr       — PR 생성·head-scoped AI 리뷰·필수 게이트·조건부 머지
 /jhw:issue    — 좁은 GitHub Issue 생성·지원 reviewer 요청·bounded wait
+/jhw:commit   — Change Evidence Contract v1 커밋 작성 (직접 커밋·PR 작업 공용)
 ```
+
+`/jhw:issue`, `/jhw:pr`, `/jhw:commit`은
+[Change Evidence Contract v1](https://github.com/jhw7500/automation/blob/0d97a63891ba4473a3a189eae643f8059b76eb56/docs/change-evidence-contract-v1.md)의
+Issue·PR·commit 필드를 작성한다. 계약 버전은 `v1`, 참조 validator는 automation
+`0d97a63891ba4473a3a189eae643f8059b76eb56`에 고정한다. 실행하지 않은 검증은
+결과를 만들지 않고 `Not run: <사유>`로 기록한다. 직접 커밋에는 확인된 Issue를
+연결하고, PR 본문에는 Issue 번호 또는 URL을 연결한다.
+Issue·PR 생성 경로는 GitHub API에서 해당 commit의 정본 Python validator를 읽어
+비공개 임시 파일에서 실행한 뒤 변경한다. 이 읽기나 검증이 실패하면 생성·push 전에
+중단한다. 실행 환경에 `gh`와 `python3`가 필요하다.
+
+`jhw-commit`은 새 스킬 이름이므로 Codex 설치의 개별 skill/prompt 링크 집합이 바뀐다.
+기존 설치에 이 버전을 적용할 때 일반 `--activate`는
+`DEPLOY_WIRING_TOPOLOGY_CHANGED`로 거부될 수 있다. 준비한 release와 사용 중인
+consumer가 없는 유지보수 상태를 확인한 뒤 위 배포 절차의 guarded
+`--uninstall` → `--activate '<exact retained RELEASE_ID>'`를 따른다. 실제 배포는
+별도 승인 후 수행한다. Claude Code·Gemini CLI·OpenCode의 디렉터리 링크는
+release 전환 시 새 스킬을 가리킨다.
 
 PR 리뷰 정책 예시:
 

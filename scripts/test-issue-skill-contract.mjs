@@ -25,6 +25,26 @@ const requestScopedRunName = "run-name: jhw-review-comment-${{ github.event.comm
 const issueCreatedAt = "2026-09-01T00:00:00Z";
 const requestCreatedAt = "2026-09-01T00:01:00Z";
 const requestEpoch = Date.parse(requestCreatedAt) / 1000;
+const pinnedValidatorEndpoint = "repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=0d97a63891ba4473a3a189eae643f8059b76eb56";
+const validIssueBody = [
+  "### Contract version",
+  "v1",
+  "",
+  "### Context and problem",
+  "The current behavior is demonstrated by a focused regression fixture.",
+  "",
+  "### Goal",
+  "Create an Issue only when its body preserves the required change evidence.",
+  "",
+  "### Non-goals",
+  "Not applicable: this fixture does not change runtime deployment behavior.",
+  "",
+  "### Acceptance criteria",
+  "- [ ] The requested Issue behavior is verifiable.",
+  "",
+  "### Constraints and impact",
+  "Unknown: downstream impact has not been measured by this fixture.",
+].join("\n");
 
 function createContractBlock(markdown) {
   const match = markdown.match(
@@ -44,6 +64,65 @@ function waitContractBlock(markdown) {
 
 const fakeGhSource = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
+
+const pinnedValidatorEndpoint = "repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=0d97a63891ba4473a3a189eae643f8059b76eb56";
+const validatorFixture = ${JSON.stringify(`#!/usr/bin/env python3
+import argparse
+import json
+import os
+import pathlib
+import re
+import signal
+import stat
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--kind")
+parser.add_argument("--path")
+parser.add_argument("--expected-version")
+parser.add_argument("--format")
+args = parser.parse_args()
+if (args.kind, args.expected_version, args.format) != ("issue", "v1", "json"):
+    sys.exit(2)
+text = pathlib.Path(args.path).read_text(encoding="utf-8")
+validator_path = pathlib.Path(__file__)
+body_path = pathlib.Path(args.path)
+expected = ["Contract version", "Context and problem", "Goal", "Non-goals", "Acceptance criteria", "Constraints and impact"]
+matches = list(re.finditer(r"(?m)^ {0,3}###[ \\t]+(.+?)[ \\t]*#*[ \\t]*$", text))
+names = [match.group(1).strip() for match in matches]
+valid = names == expected and "<div>" not in text and "</div>" not in text
+valid = valid and stat.S_IMODE(validator_path.stat().st_mode) == 0o600
+valid = valid and stat.S_IMODE(body_path.stat().st_mode) == 0o600
+fields = {}
+raw_fields = {}
+if names == expected:
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        raw_fields[names[index]] = text[match.end():end]
+        fields[names[index]] = raw_fields[names[index]].strip()
+    valid = valid and all(fields.values()) and fields["Contract version"] == "v1"
+    placeholder = re.compile(r"^(TBD|TODO|N/?A|unknown|미정|추후)$", re.IGNORECASE)
+    valid = valid and not any(placeholder.fullmatch(value) for value in fields.values())
+    sentinel = re.compile(r"^(Unknown|Not applicable):[ \\t]+([^\\r\\n]+)$")
+    for name, value in fields.items():
+        if re.search(r"(?m)^ {0,3}(Unknown|Not applicable):", value):
+            match = sentinel.fullmatch(value)
+            valid = valid and name in ("Non-goals", "Constraints and impact") and match is not None
+            valid = valid and match is not None and not placeholder.fullmatch(match.group(2).strip())
+    in_fence = False
+    checklist = False
+    for line in raw_fields.get("Acceptance criteria", "").splitlines():
+        if re.match(r"^ {0,3}(\`{3,}|~{3,})", line):
+            in_fence = not in_fence
+            continue
+        if not in_fence and re.match(r"^ {0,3}[-*+] \\[[ xX]\\][ \\t]+\\S", line):
+            checklist = True
+    valid = valid and checklist
+print(json.dumps({"valid": valid, "kind": "issue", "version": "v1" if fields.get("Contract version") == "v1" else "", "findings": []}))
+if os.environ.get("JHW_TEST_INTERRUPT_VALIDATOR_SIGNAL"):
+    os.kill(os.getppid(), getattr(signal, os.environ["JHW_TEST_INTERRUPT_VALIDATOR_SIGNAL"]))
+sys.exit(0 if valid else 1)
+`)};
 
 const statePath = process.env.FAKE_GH_STATE;
 const logPath = process.env.FAKE_GH_LOG;
@@ -135,8 +214,24 @@ if (argv[0] === "issue" && argv[1] === "edit") {
   process.exit(0);
 }
 
+if (argv[0] === "api" && argv.includes(pinnedValidatorEndpoint)) {
+  if (state.failValidatorFetch) process.exit(1);
+  if (argv.length !== 4 || argv[1] !== "-H" ||
+      argv[2] !== "Accept: application/vnd.github.raw+json" ||
+      argv[3] !== pinnedValidatorEndpoint) process.exit(2);
+  if (state.interruptValidatorFetchSignal) {
+    process.kill(process.ppid, state.interruptValidatorFetchSignal);
+  }
+  process.stdout.write(validatorFixture);
+  process.exit(0);
+}
+
 if (argv[0] !== "api" || !argv[1]) process.exit(2);
 const endpoint = argv[1];
+if (state.interruptSignalFetchSignal &&
+    endpoint === "repos/example/repo/issues/99/comments?per_page=100") {
+  process.kill(process.ppid, state.interruptSignalFetchSignal);
+}
 if ((state.failEndpoints || []).some((part) => endpoint.includes(part))) process.exit(1);
 
 if (endpoint === "user") {
@@ -412,6 +507,24 @@ async function main() {
   assert.match(readmeText, /Gemini Code Assist.*OpenCode.*PR-only/);
   assert.match(issueText, /Gemini Code Assist.*정책상 비활성/);
   assert.match(readmeText, /Issue를 수정·닫기.*구현/);
+  assert.match(issueText, /Change Evidence Contract `v1`/);
+  assert.match(issueText, /관찰하지 않은 명령, 결과, 영향, tracker 관계를 추측하거나 만들어내지 않는다/);
+  assert.match(issueText, /`Non-goals`와 `Constraints and impact`에서만 `Unknown: 구체적인 이유`/);
+  assert.match(issueText, /`Acceptance criteria`에는 중첩되지 않은/);
+  const issueHeadingOrder = [
+    "### Contract version",
+    "### Context and problem",
+    "### Goal",
+    "### Non-goals",
+    "### Acceptance criteria",
+    "### Constraints and impact",
+  ];
+  let previousHeadingIndex = -1;
+  for (const heading of issueHeadingOrder) {
+    const headingIndex = issueText.indexOf(heading);
+    assert.ok(headingIndex > previousHeadingIndex, `${heading} must appear in canonical order`);
+    previousHeadingIndex = headingIndex;
+  }
   assert.match(issueText, /gemini\) command='@gemini-cli /,
     "standalone Issue requests must use the pinned Gemini dispatcher command");
   assert.doesNotMatch(issueText, /gemini\) command='@gemini /,
@@ -493,6 +606,7 @@ async function main() {
       JHW_ISSUE_CODEX_CANARY_URL: "",
       JHW_ISSUE_STATE_DIR: tempRoot,
       JHW_ISSUE_STATE_FILE: summaryStatePath,
+      JHW_TEST_VALID_ISSUE_BODY: validIssueBody,
       ...envOverrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
@@ -538,6 +652,120 @@ async function main() {
     assert.notEqual((await runIssueResult(issueState(), "jhw_issue_validate_timeout 1.5")).code, 0);
     assert.equal((await runIssue(issueState(), "jhw_issue_validate_timeout 20")).stdout.trim(), "20");
 
+    const invalidIssueBodies = [
+      ["version", validIssueBody.replace("\nv1\n", "\nv2\n")],
+      ["missing field", validIssueBody.replace("\n### Goal\nCreate an Issue only when its body preserves the required change evidence.\n", "\n")],
+      ["field order", validIssueBody.replace(
+        "### Context and problem\nThe current behavior is demonstrated by a focused regression fixture.\n\n### Goal\nCreate an Issue only when its body preserves the required change evidence.",
+        "### Goal\nCreate an Issue only when its body preserves the required change evidence.\n\n### Context and problem\nThe current behavior is demonstrated by a focused regression fixture.",
+      )],
+      ["extra field", `${validIssueBody}\n\n### Evidence\nInvented evidence is forbidden.`],
+      ["sentinel field", validIssueBody.replace(
+        "The current behavior is demonstrated by a focused regression fixture.",
+        "Unknown: the problem evidence was not observed.",
+      )],
+      ["sentinel reason", validIssueBody.replace(
+        "Unknown: downstream impact has not been measured by this fixture.",
+        "Unknown: TODO",
+      )],
+      ["sentinel completeness", validIssueBody.replace(
+        "Unknown: downstream impact has not been measured by this fixture.",
+        "Unknown: downstream impact has not been measured.\nAdditional asserted impact.",
+      )],
+      ["checklist", validIssueBody.replace(
+        "- [ ] The requested Issue behavior is verifiable.",
+        "- The requested Issue behavior is verifiable.",
+      )],
+      ["nested checklist", validIssueBody.replace(
+        "- [ ] The requested Issue behavior is verifiable.",
+        "    - [ ] The requested Issue behavior is verifiable.",
+      )],
+      ["raw HTML evidence", validIssueBody.replace(
+        "The current behavior is demonstrated by a focused regression fixture.",
+        "<div>The current behavior is demonstrated by a focused regression fixture.</div>",
+      )],
+      ["fenced checklist", validIssueBody.replace(
+        "- [ ] The requested Issue behavior is verifiable.",
+        "```markdown\n- [ ] The requested Issue behavior is verifiable.\n```",
+      )],
+    ];
+    for (const [name, invalidBody] of invalidIssueBodies) {
+      const invalid = await runIssueResult(
+        issueState(),
+        `jhw_issue_create 'Invalid ${name}' "$JHW_TEST_INVALID_ISSUE_BODY" skip 20`,
+        { JHW_TEST_INVALID_ISSUE_BODY: invalidBody, TMPDIR: tempRoot },
+      );
+      assert.notEqual(invalid.code, 0, `${name} must fail Change Evidence validation`);
+      assert.deepEqual(invalid.state.mutations, [], `${name} must fail before mutation`);
+      assert.deepEqual(invalid.log, [[
+        "api",
+        "-H",
+        "Accept: application/vnd.github.raw+json",
+        pinnedValidatorEndpoint,
+      ]], `${name} must only fetch the exact pinned validator before failing`);
+      assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-evidence.")), false,
+        `${name} must clean private validator files`);
+    }
+
+    const validatorFetchFailure = await runIssueResult(
+      issueState({ failValidatorFetch: true }),
+      `jhw_issue_create 'Validator unavailable' "$JHW_TEST_VALID_ISSUE_BODY" skip 20`,
+      { TMPDIR: tempRoot },
+    );
+    assert.notEqual(validatorFetchFailure.code, 0);
+    assert.deepEqual(validatorFetchFailure.state.mutations, [],
+      "validator fetch failure must stop before mutation");
+    assert.deepEqual(validatorFetchFailure.log, [[
+      "api",
+      "-H",
+      "Accept: application/vnd.github.raw+json",
+      pinnedValidatorEndpoint,
+    ]]);
+    assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-evidence.")), false,
+      "validator fetch failure must clean private files");
+
+    for (const [signal, expectedCode] of [["SIGHUP", 129], ["SIGTERM", 143]]) {
+      const interruptedValidation = await runIssueResult(
+        issueState({ interruptValidatorFetchSignal: signal }),
+        `jhw_issue_create 'Interrupted validation' "$JHW_TEST_VALID_ISSUE_BODY" skip 20`,
+        { TMPDIR: tempRoot },
+      );
+      assert.equal(interruptedValidation.code, expectedCode,
+        `${signal} during validation must stop Issue creation`);
+      assert.deepEqual(interruptedValidation.state.mutations, [],
+        `${signal} during validation must not mutate the Issue`);
+      assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-evidence.")), false,
+        `${signal} during validation must clean private files`);
+    }
+
+    const interruptedAfterValidation = await runIssueResult(
+      issueState(),
+      `jhw_issue_create 'Interrupted after validation' "$JHW_TEST_VALID_ISSUE_BODY" skip 20`,
+      { TMPDIR: tempRoot, JHW_TEST_INTERRUPT_VALIDATOR_SIGNAL: "SIGTERM" },
+    );
+    assert.equal(interruptedAfterValidation.code, 143,
+      "TERM after successful validator execution must stop Issue creation");
+    assert.deepEqual(interruptedAfterValidation.state.mutations, [],
+      "TERM after successful validator execution must prevent Issue mutation");
+    assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-evidence.")), false,
+      "TERM after successful validator execution must clean private files");
+
+    const interruptedSignalCollection = await runIssueResult(
+      issueState({ issueExists: true, interruptSignalFetchSignal: "SIGTERM" }),
+      [
+        'signal_file="$(jhw_issue_create_signal_file)" || exit $?',
+        `jhw_issue_collect_signals 99 1001 '${issueCreatedAt}' "$signal_file" || exit $?`,
+      ].join("\n"),
+      { TMPDIR: tempRoot },
+    );
+    assert.equal(interruptedSignalCollection.code, 143,
+      "TERM during signal collection must stop the collector");
+    assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-signals.")), false,
+      "TERM during signal collection must clean private files");
+    for (const entry of await readdir(tempRoot)) {
+      if (/^jhw-issue\.signal\..*\.json$/.test(entry)) await rm(join(tempRoot, entry));
+    }
+
     await setRepoFixture({ config: "review:\n  auto: true\n" });
     assert.equal((await runIssue(issueState(), `jhw_issue_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "true");
     await setRepoFixture({ config: "review:\n  auto: false\n" });
@@ -550,7 +778,7 @@ async function main() {
     await setRepoFixture({ config: "review:\n  auto: true\nworkflows: {}\n" });
     const noEligible = await runIssueResult(
       issueState(),
-      `jhw_issue_create 'A title' 'A body' request 20`,
+      `jhw_issue_create 'A title' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
     );
     assert.notEqual(noEligible.code, 0);
     assert.deepEqual(noEligible.state.mutations, [
@@ -575,7 +803,7 @@ async function main() {
     });
     const reviewed = await runIssue(
       issueState(),
-      `jhw_issue_create 'Review this' 'Body text' request 20`,
+      `jhw_issue_create 'Review this' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
     );
     assert.equal(reviewed.stdout.trim(), "https://github.com/example/repo/issues/99");
     assert.deepEqual(reviewed.state.issueLabels, ["review:request"]);
@@ -597,7 +825,7 @@ async function main() {
 
     const metadataFailure = await runIssueResult(
       issueState({ failIssueCreatedAtRead: true }),
-      `jhw_issue_create 'Review this' 'Body text' request 20`,
+      `jhw_issue_create 'Review this' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
     );
     assert.notEqual(metadataFailure.code, 0);
     assert.equal(
@@ -612,21 +840,21 @@ async function main() {
     await setRepoFixture({ config: "review:\n  auto: false\nworkflows: {}\n" });
     const skipped = await runIssue(
       issueState({ labels: ["review:request", "review:skip"] }),
-      `jhw_issue_create 'Skip review' 'Body text' skip 20`,
+      `jhw_issue_create 'Skip review' "$JHW_TEST_VALID_ISSUE_BODY" skip 20`,
     );
     assert.deepEqual(skipped.state.issueLabels, ["review:skip"]);
     assert.equal(skipped.state.issueComments.length, 0);
 
     const autoDisabled = await runIssue(
       issueState({ labels: ["review:request", "review:skip"] }),
-      `jhw_issue_create 'Auto disabled' 'Body text' auto 20`,
+      `jhw_issue_create 'Auto disabled' "$JHW_TEST_VALID_ISSUE_BODY" auto 20`,
     );
     assert.deepEqual(autoDisabled.state.issueLabels, []);
     assert.equal(autoDisabled.state.issueComments.length, 0);
 
     const autoNoLabels = await runIssue(
       issueState({ labels: ["review:request", "review:skip"] }),
-      `jhw_issue_create 'Auto no labels' 'Body text' auto 20`,
+      `jhw_issue_create 'Auto no labels' "$JHW_TEST_VALID_ISSUE_BODY" auto 20`,
     );
     assert.deepEqual(autoNoLabels.state.issueLabels, [],
       "auto mode must succeed when the new Issue has no override labels");
@@ -637,7 +865,7 @@ async function main() {
     });
     const oneEligible = await runIssue(
       issueState({ labels: ["review:request", "review:skip"] }),
-      `jhw_issue_create 'One reviewer' 'Body text' request 20`,
+      `jhw_issue_create 'One reviewer' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
     );
     assert.equal(oneEligible.state.issueComments.length, 1,
       "one eligible reviewer must allow creation even when other reviewers are unavailable");
@@ -731,7 +959,7 @@ async function main() {
         canaryComments: [canaryRequest, canaryResponse],
       }),
       [
-        `jhw_issue_create 'Codex review' 'Body text' request 20`,
+        `jhw_issue_create 'Codex review' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
         "printf 'expected=%s\\n' \"$JHW_ISSUE_EXPECTED_CODEX_BOT\"",
       ].join("\n"),
       { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
@@ -754,7 +982,7 @@ async function main() {
         canaryComments: [canaryRequest, unbracketedCanaryResponse],
       }),
       [
-        `jhw_issue_create 'Unbracketed Codex review' 'Body text' request 20`,
+        `jhw_issue_create 'Unbracketed Codex review' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
         "printf 'expected=%s\\n' \"$JHW_ISSUE_EXPECTED_CODEX_BOT\"",
       ].join("\n"),
       { JHW_ISSUE_CODEX_CANARY_URL: canaryUrl },
@@ -2180,7 +2408,7 @@ async function main() {
         'before_hup="$(trap -p HUP)"',
         'before_int="$(trap -p INT)"',
         'before_term="$(trap -p TERM)"',
-        "if jhw_issue_execute 'Review this' 'Body text' skip 20 >/dev/null; then status=0; else status=$?; fi",
+        "if jhw_issue_execute 'Review this' \"$JHW_TEST_VALID_ISSUE_BODY\" skip 20 >/dev/null; then status=0; else status=$?; fi",
         '[[ "$(trap -p EXIT)" == "$before_exit" ]] || exit 21',
         '[[ "$(trap -p HUP)" == "$before_hup" ]] || exit 22',
         '[[ "$(trap -p INT)" == "$before_int" ]] || exit 23',
@@ -2198,7 +2426,7 @@ async function main() {
       issueState(),
       [
         "jhw_issue_poll_once() { printf '{' > \"$1\"; return 1; }",
-        "jhw_issue_execute 'Review this' 'Body text' request 20",
+        "jhw_issue_execute 'Review this' \"$JHW_TEST_VALID_ISSUE_BODY\" request 20",
         "status=$?",
         "if [[ -n \"${JHW_ISSUE_STATE_FILE:-}\" && ( -e \"$JHW_ISSUE_STATE_FILE\" || -L \"$JHW_ISSUE_STATE_FILE\" ) ]]; then echo state=present; else echo state=gone; fi",
         "if [[ -n \"$(trap -p EXIT HUP INT TERM)\" ]]; then echo traps=present; else echo traps=clear; fi",
@@ -2219,7 +2447,7 @@ async function main() {
 
     const invalidPollingInterval = await runIssueResult(
       issueState(),
-      `jhw_issue_execute 'Review this' 'Body text' request 20`,
+      `jhw_issue_execute 'Review this' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
       {
         JHW_ISSUE_POLL_SECONDS: "0",
         JHW_ISSUE_STATE_FILE: "",
@@ -2237,7 +2465,7 @@ async function main() {
 
     const overflowingPollingInterval = await runIssueResult(
       issueState(),
-      `jhw_issue_execute 'Review this' 'Body text' request 1`,
+      `jhw_issue_execute 'Review this' "$JHW_TEST_VALID_ISSUE_BODY" request 1`,
       {
         JHW_ISSUE_POLL_SECONDS: "18446744073709551617",
         JHW_ISSUE_STATE_FILE: "",
@@ -2285,7 +2513,7 @@ async function main() {
     ];
     const executed = await runIssue(
       issueState({ issueComments: executeResponses, runs: executeRuns }),
-      `jhw_issue_execute 'Review this' 'Body text' request 20`,
+      `jhw_issue_execute 'Review this' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
       {
         JHW_ISSUE_STATE_FILE: "",
         JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]",
@@ -2321,7 +2549,7 @@ async function main() {
         }],
         failCommentReviewers: ["gemini"],
       }),
-      `jhw_issue_execute 'Review this' 'Body text' request 20`,
+      `jhw_issue_execute 'Review this' "$JHW_TEST_VALID_ISSUE_BODY" request 20`,
       {
         JHW_ISSUE_STATE_FILE: "",
         JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]",
@@ -2356,7 +2584,7 @@ async function main() {
           triggeringActor: "jhw7500",
         }],
       }),
-      `jhw_issue_execute 'Review this' 'Body text' request 1`,
+      `jhw_issue_execute 'Review this' "$JHW_TEST_VALID_ISSUE_BODY" request 1`,
       {
         JHW_ISSUE_STATE_FILE: "",
         JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]",
@@ -2383,7 +2611,7 @@ async function main() {
       }),
       [
         "set -e",
-        "jhw_issue_execute 'Review this' 'Body text' request 1",
+        "jhw_issue_execute 'Review this' \"$JHW_TEST_VALID_ISSUE_BODY\" request 1",
         "printf 'strict-poll-complete\\n'",
       ].join("\n"),
       {
@@ -2454,7 +2682,7 @@ async function main() {
     await setRepoFixture({ config: "review:\n  auto: true\n" });
     const noReviewerExecution = await runIssue(
       issueState(),
-      `jhw_issue_execute 'Review this' 'Body text' auto 20`,
+      `jhw_issue_execute 'Review this' "$JHW_TEST_VALID_ISSUE_BODY" auto 20`,
       { JHW_ISSUE_STATE_FILE: "" },
     );
     assert.equal(noReviewerExecution.stdout.split("\n")[0],
@@ -2474,7 +2702,7 @@ async function main() {
     for (const [mode, title] of [["skip", "Skip review"], ["auto", "Auto disabled"]]) {
       const intentionallyUnreviewed = await runIssue(
         issueState(),
-        `jhw_issue_execute '${title}' 'Body text' ${mode} 20`,
+        `jhw_issue_execute '${title}' "$JHW_TEST_VALID_ISSUE_BODY" ${mode} 20`,
         { JHW_ISSUE_STATE_FILE: "" },
       );
       assert.match(intentionallyUnreviewed.stdout, /^Requested reviewers: none$/m);

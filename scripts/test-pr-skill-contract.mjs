@@ -33,6 +33,84 @@ const startEpoch = Date.parse(roundStartedAt) / 1000;
 const requestEpoch = Date.parse(requestCreatedAt) / 1000;
 const appBudgetDiff = "diff --git a/file b/file\n+review budget change\n";
 const appBudgetDiffHash = createHash("sha256").update(appBudgetDiff).digest("hex");
+const validPrBody = [
+  "### Contract version",
+  "v1",
+  "",
+  "### Summary",
+  "Deliver contract-backed PR creation.",
+  "",
+  "### Changes",
+  "- Validate PR evidence before publishing it.",
+  "",
+  "### Validation",
+  "- `npm test` → passed.",
+  "",
+  "### Impact and risks",
+  "Not applicable: the test fixture has no runtime rollout surface.",
+  "",
+  "### Related issue",
+  "Closes #165",
+  "",
+].join("\n");
+const validatorRef = "0d97a63891ba4473a3a189eae643f8059b76eb56";
+const validatorEndpoint = `repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=${validatorRef}`;
+const fakeValidatorSource = String.raw`#!/usr/bin/env python3
+import argparse
+import json
+import re
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--kind", required=True)
+parser.add_argument("--path", required=True)
+parser.add_argument("--expected-version", required=True)
+parser.add_argument("--format", required=True)
+args = parser.parse_args()
+valid = args.kind == "pull-request" and args.expected_version == "v1" and args.format == "json"
+try:
+    text = open(args.path, encoding="utf-8").read()
+except (OSError, UnicodeError):
+    raise SystemExit(2)
+
+if len(text.encode("utf-8")) > 65536 or "\0" in text:
+    valid = False
+if re.search(r"<(?!https?://)[A-Za-z!/][^>]*>", text):
+    valid = False
+expected = ["Contract version", "Summary", "Changes", "Validation", "Impact and risks", "Related issue"]
+matches = list(re.finditer(r"^### ([^\r\n]+)\r?$", text, re.MULTILINE))
+if [match.group(1) for match in matches] != expected:
+    valid = False
+fields = {}
+if len(matches) == len(expected):
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        fields[match.group(1)] = text[match.end():end].strip()
+
+def visible(value):
+    value = re.sub(r"<!--.*?-->", "", value, flags=re.DOTALL)
+    value = re.sub(r"^ {0,3}(\x60{3,}|~{3,}).*?^ {0,3}\1\s*$", "", value, flags=re.MULTILINE | re.DOTALL)
+    return value.strip()
+
+def has_list(value):
+    return re.search(r"^ {0,3}(?:[-+*]|\d+[.)])\s+\S", visible(value), re.MULTILINE) is not None
+
+if fields:
+    if visible(fields["Contract version"]) != "v1": valid = False
+    if not visible(fields["Summary"]): valid = False
+    if not has_list(fields["Changes"]): valid = False
+    validation = visible(fields["Validation"])
+    if not has_list(fields["Validation"]) and not re.fullmatch(r"Not run:\s+\S[^\r\n]*", validation): valid = False
+    impact = visible(fields["Impact and risks"])
+    if not impact or re.fullmatch(r"(?:Unknown|Not applicable):\s*", impact): valid = False
+    related = visible(fields["Related issue"])
+    issue_url = re.search(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*", related)
+    bare_issue = re.search(r"(?<!PR:\s)#[1-9][0-9]*", related)
+    if not issue_url and not bare_issue: valid = False
+else:
+    valid = False
+print(json.dumps({"valid": valid, "kind": "pull-request", "version": "v1" if valid else ""}))
+raise SystemExit(0 if valid else 1)
+`;
 const namedCodexReview = "ROUND_EXPECTED_REVIEWERS=codex; export ROUND_EXPECTED_REVIEWERS; ";
 const requestMarker = `<!-- jhw-pr:review-request reviewer=codex head=${currentHead} base=${currentBaseOid} -->`;
 const requestBody = `@codex review\n\n${requestMarker}`;
@@ -164,13 +242,20 @@ if (argv[0] === "label" && argv[1] === "create") {
 
 if (argv[0] === "pr" && argv[1] === "create") {
   const hasMetadata = argv.includes("--fill") || argv.includes("--fill-first") ||
-    argv.includes("--fill-verbose") || (argv.includes("--title") && argv.includes("--body"));
+    argv.includes("--fill-verbose") ||
+    (argv.includes("--title") && (argv.includes("--body") || argv.includes("--body-file")));
   if (!argv.includes("--draft") || !hasMetadata || state.failPrCreate) process.exit(1);
   state.prExists = true;
   state.prDraft = state.forceReadyOnCreate ? false : true;
   state.prHead = state.remoteBranchHead;
   state.prBase = optionValue("--base");
   state.prBaseOid = state.baseOids?.[state.prBase] || state.prBaseOid;
+  if (argv.includes("--body-file")) {
+    const bodyFile = optionValue("--body-file");
+    state.prBody = fs.readFileSync(bodyFile, "utf8");
+    state.receivedBodyFile = bodyFile;
+    state.receivedBodyMode = fs.statSync(bodyFile).mode & 0o777;
+  }
   save();
   process.stdout.write(state.prUrl + "\n");
   process.exit(0);
@@ -214,6 +299,7 @@ if (argv[0] === "pr" && argv[1] === "view") {
   else if (query === ".headRefName") process.stdout.write(state.prHeadRefName + "\n");
   else if (query === ".isCrossRepository") process.stdout.write(String(state.isCrossRepository) + "\n");
   else if (query === ".isDraft") process.stdout.write(String(state.prDraft) + "\n");
+  else if (query === ".body") process.stdout.write((state.prBody || "") + "\n");
   else if (query.includes(".labels")) rows(state.prLabels || []);
   else {
     const payload = {};
@@ -238,6 +324,9 @@ if (argv[0] === "pr" && argv[1] === "edit") {
       state.prBase = optionValue("--base");
       state.prBaseOid = state.baseOids?.[state.prBase] || state.prBaseOid;
     }
+  }
+  if (argv.includes("--body-file")) {
+    state.prBody = fs.readFileSync(optionValue("--body-file"), "utf8");
   }
   if (!state.freezeLabels) {
     for (let index = 0; index < argv.length; index += 1) {
@@ -324,6 +413,14 @@ if (argv[0] === "workflow" && argv[1] === "run") {
 }
 
 if (argv[0] !== "api" || !argv[1]) process.exit(2);
+const pinnedValidatorEndpoint = "repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=0d97a63891ba4473a3a189eae643f8059b76eb56";
+if (argv.includes(pinnedValidatorEndpoint)) {
+  if (argv.length !== 4 || argv[1] !== "-H" ||
+      argv[2] !== "Accept: application/vnd.github.raw+json" || argv[3] !== pinnedValidatorEndpoint) process.exit(2);
+  if (state.failValidatorFetch) process.exit(1);
+  process.stdout.write(fs.readFileSync(process.env.FAKE_VALIDATOR_SOURCE_PATH, "utf8"));
+  process.exit(0);
+}
 const endpoint = argv[1];
 const visibleGenericSignals = (items, query) => {
   const excludesGeminiCodeAssist = query.includes('.user.login != "gemini-code-assist[bot]"') &&
@@ -724,6 +821,9 @@ if (argv[0] === "push") {
     process.exit(0);
   }
   if (state.failPush) process.exit(1);
+  if (state.mutateBodyOnPush) {
+    fs.writeFileSync(process.env.JHW_PR_BODY_FILE, state.mutatedBody || "attacker-controlled body\n");
+  }
   state.remoteBranchHead = state.localHead;
   if (state.prExists && state.pushUpdatesPrHead !== false) state.prHead = state.localHead;
   if (state.runOnPush) {
@@ -790,6 +890,7 @@ function baseState(overrides = {}) {
     prExists: true,
     prNumber: 42,
     prUrl: "https://github.com/example/repo/pull/42",
+    prBody: validPrBody,
     prDraft: false,
     prMerged: false,
     localHead: currentHead,
@@ -1051,6 +1152,8 @@ async function main() {
   const roundStatePath = join(tempRoot, "round.state");
   const roundStateVictimPath = join(tempRoot, "round-state-victim");
   const nowEpochPath = join(tempRoot, "now-epoch");
+  const validPrBodyPath = join(tempRoot, "pr-body.md");
+  const fakeValidatorPath = join(tempRoot, "validate_change_evidence.py");
 
   await writeFile(fakeGh, fakeGhSource);
   await chmod(fakeGh, 0o755);
@@ -1080,6 +1183,9 @@ async function main() {
   ].join("\n");
   await writeFile(fixtureConfigPath, enabledReviewConfig);
   await writeFile(geminiConfigPath, disabledGeminiCodeAssistConfig);
+  await writeFile(validPrBodyPath, validPrBody, { mode: 0o600 });
+  await chmod(validPrBodyPath, 0o600);
+  await writeFile(fakeValidatorPath, fakeValidatorSource, { mode: 0o600 });
 
   async function run(state, commands, overrides = {}) {
     const {
@@ -1097,6 +1203,7 @@ async function main() {
       FAKE_GH_STATE: statePath,
       FAKE_GH_LOG: logPath,
       FAKE_DATE_EPOCH_FILE: nowEpochPath,
+      FAKE_VALIDATOR_SOURCE_PATH: fakeValidatorPath,
       FAKE_GIT_TOPLEVEL: fixtureRoot,
       REPO_NWO: "example/repo",
       PR: "42",
@@ -1115,6 +1222,8 @@ async function main() {
       SHIP_NOW_EPOCH: String(startEpoch + 60),
       JHW_PR_REPO_ROOT: fixtureRoot,
       JHW_PR_CONFIG_PATH: fixtureConfigPath,
+      JHW_PR_TITLE: "Deliver contract-backed PR creation",
+      JHW_PR_BODY_FILE: validPrBodyPath,
       ...envOverrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
@@ -2113,6 +2222,201 @@ async function main() {
       );
     }
 
+    const notRunBodyPath = join(tempRoot, "pr-body-not-run.md");
+    await writeFile(
+      notRunBodyPath,
+      validPrBody.replace("- `npm test` → passed.", "Not run: documentation-only fixture with no executable behavior."),
+      { mode: 0o600 },
+    );
+    await chmod(notRunBodyPath, 0o600);
+    const validBodies = await run(
+      baseState(),
+      [
+        `jhw_pr_validate_change_evidence_snapshot ${JSON.stringify(validPrBodyPath)}`,
+        `jhw_pr_validate_change_evidence_snapshot ${JSON.stringify(notRunBodyPath)}`,
+        "printf 'valid\\n'",
+      ].join("\n"),
+    );
+    assert.equal(validBodies.stdout, "valid\n",
+      "list validation and a whole-field Not run reason must both be accepted offline");
+
+    const invalidBodies = [
+      ["wrong version", validPrBody.replace("\nv1\n", "\nv2\n")],
+      ["wrong heading order", validPrBody.replace("### Summary", "### Changes").replace("### Changes\n-", "### Summary\n-")],
+      ["extra contract heading", validPrBody.replace("### Related issue", "### Notes\nExtra.\n\n### Related issue")],
+      ["changes without a list", validPrBody.replace("- Validate PR evidence before publishing it.", "Validate PR evidence before publishing it.")],
+      ["validation without a list or sentinel", validPrBody.replace("- `npm test` → passed.", "Tests passed.")],
+      ["pull request URL only", validPrBody.replace("Closes #165", "https://github.com/example/repo/pull/165")],
+      ["PR-labelled number", validPrBody.replace("Closes #165", "PR: #165")],
+      ["fenced issue reference", validPrBody.replace("Closes #165", "```text\n#165\n```")],
+      ["fenced changes list", validPrBody.replace("- Validate PR evidence before publishing it.", "```text\n- hidden change\n```")],
+      ["raw HTML evidence", validPrBody.replace("Deliver contract-backed PR creation.", "<strong>Delivered</strong>")],
+    ];
+    for (const [name, body] of invalidBodies) {
+      const path = join(tempRoot, `invalid-${name.replaceAll(" ", "-")}.md`);
+      await writeFile(path, body, { mode: 0o600 });
+      await chmod(path, 0o600);
+      const invalid = await runResult(
+        baseState(),
+        `jhw_pr_validate_change_evidence_snapshot ${JSON.stringify(path)}`,
+      );
+      assert.equal(invalid.code, 1, name);
+    }
+
+    const publicBodyPath = join(tempRoot, "public-pr-body.md");
+    await writeFile(publicBodyPath, validPrBody, { mode: 0o644 });
+    await chmod(publicBodyPath, 0o644);
+    const publicBody = await runResult(
+      baseState(),
+      `jhw_pr_snapshot_new_pr_body ${JSON.stringify(publicBodyPath)}`,
+    );
+    assert.equal(publicBody.code, 2, "a non-private PR body file must fail closed");
+
+    const snapshotFiles = async () => (await readdir(tempRoot))
+      .filter((name) => name.startsWith("jhw-pr-body.")).sort();
+    const fifoBodyPath = join(tempRoot, "fifo-pr-body");
+    await execFileAsync("mkfifo", [fifoBodyPath]);
+    await chmod(fifoBodyPath, 0o600);
+    const beforeFifo = await snapshotFiles();
+    const fifoBody = await runResult(
+      baseState({ prExists: false }),
+      `timeout --kill-after=1 3 bash -c ${JSON.stringify(
+        `source ${JSON.stringify(contractPath)}; jhw_pr_apply_new_pr_policy request`,
+      )}`,
+      { JHW_PR_BODY_FILE: fifoBodyPath, TMPDIR: tempRoot },
+    );
+    assert.equal(fifoBody.code, 2, "a FIFO body must fail promptly instead of waiting for a writer");
+    assert.deepEqual(fifoBody.log, [], "a FIFO body must fail before GitHub operations");
+    assert.deepEqual(await snapshotFiles(), beforeFifo,
+      "a rejected FIFO body must not leave a temporary snapshot");
+
+    const oversizedBodyPath = join(tempRoot, "oversized-pr-body.md");
+    await writeFile(oversizedBodyPath, Buffer.alloc(65537, "x"), { mode: 0o600 });
+    await chmod(oversizedBodyPath, 0o600);
+    const beforeOversized = await snapshotFiles();
+    const oversizedBody = await runResult(
+      baseState({ prExists: false }),
+      "jhw_pr_apply_new_pr_policy request",
+      { JHW_PR_BODY_FILE: oversizedBodyPath, TMPDIR: tempRoot },
+    );
+    assert.equal(oversizedBody.code, 2, "a body above 64 KiB must fail before copying or validation");
+    assert.deepEqual(oversizedBody.log, [], "an oversized body must fail before GitHub operations");
+    assert.deepEqual(await snapshotFiles(), beforeOversized,
+      "a rejected oversized body must not leave a temporary snapshot");
+
+    for (const [signal, expectedCode] of [["HUP", 129], ["TERM", 143]]) {
+      const snapshotMarker = join(tempRoot, `interrupted-pr-body-${signal}.path`);
+      const beforeSignal = await snapshotFiles();
+      const interruptedPr = await runResult(
+        baseState({ prExists: false }),
+        [
+          "jhw_pr_apply_new_pr_policy_with_snapshot() {",
+          '  printf "%s\\n" "$2" > "$JHW_TEST_SNAPSHOT_MARKER"',
+          `  kill -${signal} "$$"`,
+          "}",
+          "jhw_pr_apply_new_pr_policy request",
+        ].join("\n"),
+        { JHW_TEST_SNAPSHOT_MARKER: snapshotMarker, TMPDIR: tempRoot },
+      );
+      assert.equal(interruptedPr.code, expectedCode,
+        `${signal} must retain its conventional non-success exit status`);
+      assert.equal(existsSync((await readFile(snapshotMarker, "utf8")).trim()), false,
+        `${signal} must remove the private PR body snapshot`);
+      assert.deepEqual(await snapshotFiles(), beforeSignal,
+        `${signal} must not leave another PR body snapshot`);
+    }
+
+    const exitedSnapshotMarker = join(tempRoot, "exited-pr-body.path");
+    const callerBodyExitMarker = join(tempRoot, "pr-body-caller-exit.status");
+    const exitedPr = await runResult(
+      baseState({ prExists: false }),
+      [
+        'trap \'printf "%s\\n" "$?" > "$JHW_TEST_EXIT_MARKER"\' EXIT',
+        "jhw_pr_apply_new_pr_policy_with_snapshot() {",
+        '  printf "%s\\n" "$2" > "$JHW_TEST_SNAPSHOT_MARKER"',
+        "  exit 7",
+        "}",
+        "jhw_pr_apply_new_pr_policy request",
+      ].join("\n"),
+      { JHW_TEST_SNAPSHOT_MARKER: exitedSnapshotMarker, JHW_TEST_EXIT_MARKER: callerBodyExitMarker,
+        TMPDIR: tempRoot },
+    );
+    assert.equal(exitedPr.code, 7);
+    assert.equal(existsSync((await readFile(exitedSnapshotMarker, "utf8")).trim()), false,
+      "an EXIT during PR publication must remove the private body snapshot");
+    assert.equal(await readFile(callerBodyExitMarker, "utf8"), "7\n",
+      "PR body cleanup must preserve the caller EXIT trap and exit status");
+
+    const restoredBodyTraps = await run(
+      baseState({ prExists: false }),
+      [
+        "trap ':' EXIT",
+        "trap ':' HUP",
+        "trap ':' INT",
+        "trap ':' TERM",
+        'before_exit="$(trap -p EXIT)"',
+        'before_hup="$(trap -p HUP)"',
+        'before_int="$(trap -p INT)"',
+        'before_term="$(trap -p TERM)"',
+        "jhw_pr_apply_new_pr_policy_with_snapshot() { :; }",
+        "jhw_pr_apply_new_pr_policy request || exit $?",
+        '[[ "$(trap -p EXIT)" == "$before_exit" ]] || exit 1',
+        '[[ "$(trap -p HUP)" == "$before_hup" ]] || exit 1',
+        '[[ "$(trap -p INT)" == "$before_int" ]] || exit 1',
+        '[[ "$(trap -p TERM)" == "$before_term" ]] || exit 1',
+        "trap - EXIT HUP INT TERM",
+        "printf 'restored\\n'",
+      ].join("\n"),
+      { TMPDIR: tempRoot },
+    );
+    assert.equal(restoredBodyTraps.stdout, "restored\n",
+      "normal PR body cleanup must restore caller-owned traps");
+
+    const validatorFiles = async () => (await readdir(tempRoot))
+      .filter((name) => name.startsWith("jhw-change-evidence-validator.")).sort();
+    for (const [phase, signal, expectedCode] of [
+      ["view", "HUP", 129],
+      ["validator", "TERM", 143],
+    ]) {
+      const beforeBodyFiles = await snapshotFiles();
+      const beforeValidatorFiles = await validatorFiles();
+      const interruptedExistingPr = await runResult(
+        baseState(),
+        [
+          "gh() {",
+          '  if [[ "$1:$2" == pr:view ]]; then',
+          '    [[ "$JHW_TEST_INTERRUPT_PHASE" != view ]] || kill -HUP "$$"',
+          '    cat -- "$JHW_PR_BODY_FILE"',
+          "    return",
+          "  fi",
+          '  if [[ "$1" == api ]]; then kill -TERM "$$"; fi',
+          '  command gh "$@"',
+          "}",
+          "jhw_pr_validate_existing_pr_body 42",
+        ].join("\n"),
+        { JHW_TEST_INTERRUPT_PHASE: phase, TMPDIR: tempRoot },
+      );
+      assert.equal(interruptedExistingPr.code, expectedCode,
+        `${signal} during existing-PR ${phase} must preserve its exit status`);
+      assert.deepEqual(await snapshotFiles(), beforeBodyFiles,
+        `${signal} during existing-PR ${phase} must remove the private body file`);
+      assert.deepEqual(await validatorFiles(), beforeValidatorFiles,
+        `${signal} during existing-PR ${phase} must remove the validator file`);
+    }
+
+    const failedValidatorFetch = await runResult(
+      baseState({ failValidatorFetch: true }),
+      `jhw_pr_validate_change_evidence_snapshot ${JSON.stringify(validPrBodyPath)}`,
+    );
+    assert.equal(failedValidatorFetch.code, 1,
+      "the PR evidence gate must fail closed when the pinned validator cannot be fetched");
+    const validatorFetches = validBodies.log.filter((args) =>
+      args[0] === "api" && args.includes(validatorEndpoint));
+    assert.equal(validatorFetches.length, 2);
+    assert.deepEqual(validatorFetches[0], [
+      "api", "-H", "Accept: application/vnd.github.raw+json", validatorEndpoint,
+    ], "the validator must be fetched from the exact pinned SHA endpoint with raw media type");
+
     const newPr = await run(
       baseState({
         repoLabels: [],
@@ -2139,8 +2443,17 @@ async function main() {
     requireBefore(newPr.log, isWorkflowFloorLookup, isGitPush,
       "workflow run floors must be captured before the new-branch push event");
     requireBefore(newPr.log, isGitPush, createDraft, "new PR push must precede draft creation");
-    assert.equal(newPr.log.some((args) => createDraft(args) && args.includes("--fill")), true,
-      "new PR creation must supply noninteractive title/body metadata");
+    assert.equal(newPr.log.some((args) => createDraft(args) &&
+      hasOption(args, "--title", "Deliver contract-backed PR creation") &&
+      args.includes("--body-file") && args[args.indexOf("--body-file") + 1] !== validPrBodyPath &&
+      !args.includes("--fill")), true,
+      "new PR creation must pass the preflighted explicit title and private body file");
+    assert.equal(newPr.state.prBody, validPrBody,
+      "the fake GitHub boundary must receive the validated body bytes");
+    assert.equal(newPr.state.receivedBodyMode, 0o600,
+      "the validated snapshot passed to GitHub must remain private");
+    assert.equal(existsSync(newPr.state.receivedBodyFile), false,
+      "the validated body snapshot must be cleaned after PR creation");
     assert.equal(newPr.log.filter(createDraft).length, 1,
       "resolving the new PR must not create a duplicate");
     const createdPrLookups = newPr.log.filter(numberLookup);
@@ -2163,6 +2476,54 @@ async function main() {
       "a new request-mode PR must consume its ready_for_review event run");
     assert.equal(newPr.log.filter(isWorkflowDispatch).length, 0,
       "a new request-mode PR must not launch duplicate same-head dispatch runs");
+
+    const invalidNewPrPath = join(tempRoot, "invalid-new-pr.md");
+    await writeFile(invalidNewPrPath, validPrBody.replace("Closes #165", "https://github.com/example/repo/pull/165"),
+      { mode: 0o600 });
+    await chmod(invalidNewPrPath, 0o600);
+    const invalidNewPr = await runResult(
+      baseState({ prExists: false }),
+      "jhw_pr_apply_new_pr_policy request",
+      { JHW_PR_BODY_FILE: invalidNewPrPath },
+    );
+    assert.equal(invalidNewPr.code, 1);
+    assert.equal(invalidNewPr.log.some(isGitPush), false,
+      "invalid PR evidence must stop before push");
+    assert.equal(invalidNewPr.log.some((args) => isGh(args, "label", "create") || createDraft(args)), false,
+      "invalid PR evidence must stop before GitHub mutation");
+
+    const mutableBodyPath = join(tempRoot, "mutable-pr-body.md");
+    await writeFile(mutableBodyPath, validPrBody, { mode: 0o600 });
+    await chmod(mutableBodyPath, 0o600);
+    const mutationSafePr = await run(
+      baseState({
+        prExists: false,
+        prNumber: 732,
+        prUrl: "https://github.com/example/repo/pull/732",
+        mutateBodyOnPush: true,
+        mutatedBody: "attacker-controlled body\n",
+      }),
+      "jhw_pr_apply_new_pr_policy request",
+      { JHW_PR_BODY_FILE: mutableBodyPath },
+    );
+    assert.equal(await readFile(mutableBodyPath, "utf8"), "attacker-controlled body\n",
+      "the adversarial fixture must mutate the caller-owned body after validation");
+    assert.equal(mutationSafePr.state.prBody, validPrBody,
+      "gh pr create must consume the validated snapshot rather than the mutated caller file");
+    assert.notEqual(mutationSafePr.state.receivedBodyFile, mutableBodyPath);
+    assert.equal(existsSync(mutationSafePr.state.receivedBodyFile), false,
+      "the TOCTOU-safe snapshot must be cleaned after use");
+
+    const invalidExistingPr = await runResult(
+      baseState({ prBody: "legacy body" }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+    );
+    assert.equal(invalidExistingPr.code, 1);
+    assert.match(invalidExistingPr.stderr, /legacy or invalid/);
+    assert.equal(invalidExistingPr.log.some(isGitPush), false,
+      "an invalid existing PR body must stop before push");
+    assert.equal(invalidExistingPr.log.some((args) => isGh(args, "pr", "edit")), false,
+      "an invalid existing PR body must stop before policy mutation");
 
     for (const [name, overrides, expectedLookups] of [
       ["creation failure", { failPrCreate: true }, 0],
