@@ -298,8 +298,16 @@ if (argv[0] === "pr" && argv[1] === "view") {
   const query = optionValue("--jq") || optionValue("-q") || "";
   if (query === ".number" && state.failPrNumberLookup) process.exit(1);
   if (query.includes(".state") && query.includes(".mergeCommit.oid") && query.includes("@tsv")) {
-    process.stdout.write((state.prMerged && !state.hideMergeConfirmation ? "MERGED" : "OPEN") + "\t" +
-      (state.prMerged && !state.hideMergeConfirmation ? state.mergeCommit : "") + "\n");
+    if (state.failMergeConfirmQuery) process.exit(1);
+    // GitHub records an indirect merge asynchronously, so confirmation may lag the push.
+    let confirmed = state.prMerged;
+    if (confirmed && (state.mergeConfirmDelayPolls ?? 0) > 0) {
+      state.mergeConfirmDelayPolls -= 1;
+      save();
+      confirmed = false;
+    }
+    process.stdout.write((confirmed ? "MERGED" : state.prClosedUnmerged ? "CLOSED" : "OPEN") + "\t" +
+      (confirmed ? (state.confirmedMergeCommit ?? state.mergeCommit) : "") + "\n");
   }
   else if (query.includes(".headRefOid") && query.includes(".headRefName") &&
       query.includes(".isCrossRepository") && query.includes("@tsv")) {
@@ -833,7 +841,8 @@ if (argv[0] === "push") {
     }
     state.prBaseOid = state.mergeCommit;
     state.prHead = state.mergeCommit;
-    state.prMerged = true;
+    // A successful push only moves the refs; GitHub may still fail to record the PR as merged.
+    state.prMerged = !state.githubIgnoresIndirectMerge;
     save();
     process.exit(0);
   }
@@ -905,6 +914,11 @@ if (argv.length === 6 && argv[0] === "-j" && argv[1] === "-u" && argv[2] === "-f
 }
 
 process.exit(1);
+`;
+
+const fakeSleepSource = String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(["sleep", ...process.argv.slice(2)]) + "\n");
 `;
 
 function baseState(overrides = {}) {
@@ -1164,6 +1178,7 @@ async function main() {
   const fakeGh = join(tempRoot, "gh");
   const fakeGit = join(tempRoot, "git");
   const fakeDate = join(tempRoot, "date");
+  const fakeSleep = join(tempRoot, "sleep");
   const contractPath = join(tempRoot, "contract.bash");
   const configPath = join(tempRoot, "workflow-config.yml");
   const fixtureRoot = join(tempRoot, "repo");
@@ -1187,6 +1202,8 @@ async function main() {
   await chmod(fakeGit, 0o755);
   await writeFile(fakeDate, fakeDateSource);
   await chmod(fakeDate, 0o755);
+  await writeFile(fakeSleep, fakeSleepSource);
+  await chmod(fakeSleep, 0o755);
   await writeFile(contractPath, contract);
   await mkdir(fixtureWorkflowDir, { recursive: true });
   await mkdir(fixtureNestedDir, { recursive: true });
@@ -3673,22 +3690,55 @@ async function main() {
     );
     assert.equal(atomicMerge.state.remoteBranchDeleted, true);
 
+    assert.deepEqual(atomicMerge.log.filter((args) => args[0] === "sleep"), [],
+      "an immediate GitHub confirmation must not wait");
+
+    const mergeAndReport = [
+      `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
+      "printf 'rc=%s delete=%s commit=%s\\n' \"$?\" \"$JHW_PR_BRANCH_DELETE_STATUS\" \"$JHW_PR_MERGE_COMMIT\"",
+    ].join("\n");
+    const atomicPushes = (result) =>
+      result.log.filter((args) => args[0] === "git" && args[1] === "push" && args.includes("--atomic"));
+    const branchDeletes = (result) =>
+      result.log.filter((args) => args[0] === "git" && args[1] === "push" &&
+        args.includes(":refs/heads/task/f28bfecee9de-jhw7500-jhw-notion-99"));
+
+    const delayedConfirmation = await run(
+      baseState({ prHead: currentHead, mergeConfirmDelayPolls: 2 }),
+      mergeAndReport,
+    );
+    assert.match(delayedConfirmation.stdout, new RegExp(`^rc=0 delete=DELETED commit=${mergeCommit}$`, "m"),
+      "a lagging GitHub merge record must still complete once confirmed");
+    assert.deepEqual(delayedConfirmation.log.filter((args) => args[0] === "sleep"),
+      [["sleep", "3"], ["sleep", "3"]]);
+
+    const rejectedCleanup = await run(
+      baseState({ prHead: currentHead, failBranchDelete: true }),
+      mergeAndReport,
+    );
+    assert.equal(rejectedCleanup.state.prMerged, true);
+    assert.match(rejectedCleanup.stdout, new RegExp(`^rc=0 delete=RETAINED commit=${mergeCommit}$`, "m"),
+      "a confirmed merge stays complete even when head cleanup is rejected");
+    assert.notEqual(rejectedCleanup.state.remoteBranchDeleted, true);
+
     for (const [name, overrides] of [
-      ["pending GitHub confirmation", { hideMergeConfirmation: true }],
-      ["rejected branch cleanup", { failBranchDelete: true }],
+      ["GitHub never records the indirect merge", { githubIgnoresIndirectMerge: true, prClosedUnmerged: true }],
+      ["GitHub merge state is unavailable", { failMergeConfirmQuery: true }],
+      ["GitHub records a different merge commit", { confirmedMergeCommit: "f".repeat(40) }],
     ]) {
-      const retainedAfterMerge = await run(
-        baseState({ prHead: currentHead, ...overrides }),
-        [
-          `${namedCodexReview}jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
-          "printf 'delete=%s\\n' \"$JHW_PR_BRANCH_DELETE_STATUS\"",
-        ].join("\n"),
-      );
-      assert.equal(retainedAfterMerge.state.prMerged, true,
-        `${name} must not misreport or undo the completed atomic merge`);
-      assert.notEqual(retainedAfterMerge.state.remoteBranchDeleted, true,
-        `${name} must retain the head branch safely`);
-      assert.match(retainedAfterMerge.stdout, /^delete=RETAINED$/m);
+      const unconfirmed = await run(baseState({ prHead: currentHead, ...overrides }), mergeAndReport);
+      assert.match(unconfirmed.stdout, new RegExp(`^rc=4 delete=RETAINED commit=${mergeCommit}$`, "m"),
+        `${name} must not be reported as a completed merge`);
+      assert.equal(unconfirmed.state.prBaseOid, mergeCommit,
+        `${name} leaves the reviewed merge commit on base`);
+      assert.match(unconfirmed.stderr, new RegExp(`${mergeCommit}.*main`),
+        `${name} must name the merge commit already on base`);
+      assert.match(unconfirmed.stderr, /not confirmed as MERGED/);
+      assert.equal(atomicPushes(unconfirmed).length, 1, `${name} must not re-push the merge commit`);
+      assert.deepEqual(branchDeletes(unconfirmed), [], `${name} must not delete the head branch`);
+      assert.notEqual(unconfirmed.state.remoteBranchDeleted, true);
+      assert.ok(unconfirmed.log.filter((args) => args[0] === "sleep").length <= 9,
+        `${name} must stop polling within the bound`);
     }
 
     const mergeQueueBranch = await runResult(
