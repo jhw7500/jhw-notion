@@ -234,7 +234,10 @@ jhw_issue_validate_change_evidence_body() (
   evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/jhw-issue-evidence.XXXXXXXX")" || return 1
   validator_path="$evidence_dir/validate_change_evidence.py"
   body_path="$evidence_dir/issue-body.md"
-  trap 'rm -f -- "$validator_path" "$body_path"; rmdir -- "$evidence_dir" 2>/dev/null || true' EXIT HUP INT TERM
+  trap 'rm -f -- "$validator_path" "$body_path"; rmdir -- "$evidence_dir" 2>/dev/null || true' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   gh api -H 'Accept: application/vnd.github.raw+json' \
     'repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=0d97a63891ba4473a3a189eae643f8059b76eb56' \
     >"$validator_path" || {
@@ -709,7 +712,10 @@ jhw_issue_collect_signals() (
   comments_path="$signal_dir/comments.json"
   reactions_path="$signal_dir/reactions.json"
   runs_path="$signal_dir/runs.json"
-  trap 'rm -f -- "$comments_path" "$reactions_path" "$runs_path"; rmdir -- "$signal_dir" 2>/dev/null || true' EXIT HUP INT TERM
+  trap 'rm -f -- "$comments_path" "$reactions_path" "$runs_path"; rmdir -- "$signal_dir" 2>/dev/null || true' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   gh api "repos/$REPO_NWO/issues/$issue/comments?per_page=100" \
     --paginate --slurp >"$comments_path" 2>/dev/null || return 1
   gh api "repos/$REPO_NWO/issues/comments/$request_comment_id/reactions?per_page=100" \

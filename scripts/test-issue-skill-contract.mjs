@@ -69,8 +69,10 @@ const pinnedValidatorEndpoint = "repos/jhw7500/automation/contents/scripts/valid
 const validatorFixture = ${JSON.stringify(`#!/usr/bin/env python3
 import argparse
 import json
+import os
 import pathlib
 import re
+import signal
 import stat
 import sys
 
@@ -117,6 +119,8 @@ if names == expected:
             checklist = True
     valid = valid and checklist
 print(json.dumps({"valid": valid, "kind": "issue", "version": "v1" if fields.get("Contract version") == "v1" else "", "findings": []}))
+if os.environ.get("JHW_TEST_INTERRUPT_VALIDATOR_SIGNAL"):
+    os.kill(os.getppid(), getattr(signal, os.environ["JHW_TEST_INTERRUPT_VALIDATOR_SIGNAL"]))
 sys.exit(0 if valid else 1)
 `)};
 
@@ -215,12 +219,19 @@ if (argv[0] === "api" && argv.includes(pinnedValidatorEndpoint)) {
   if (argv.length !== 4 || argv[1] !== "-H" ||
       argv[2] !== "Accept: application/vnd.github.raw+json" ||
       argv[3] !== pinnedValidatorEndpoint) process.exit(2);
+  if (state.interruptValidatorFetchSignal) {
+    process.kill(process.ppid, state.interruptValidatorFetchSignal);
+  }
   process.stdout.write(validatorFixture);
   process.exit(0);
 }
 
 if (argv[0] !== "api" || !argv[1]) process.exit(2);
 const endpoint = argv[1];
+if (state.interruptSignalFetchSignal &&
+    endpoint === "repos/example/repo/issues/99/comments?per_page=100") {
+  process.kill(process.ppid, state.interruptSignalFetchSignal);
+}
 if ((state.failEndpoints || []).some((part) => endpoint.includes(part))) process.exit(1);
 
 if (endpoint === "user") {
@@ -712,6 +723,48 @@ async function main() {
     ]]);
     assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-evidence.")), false,
       "validator fetch failure must clean private files");
+
+    for (const [signal, expectedCode] of [["SIGHUP", 129], ["SIGTERM", 143]]) {
+      const interruptedValidation = await runIssueResult(
+        issueState({ interruptValidatorFetchSignal: signal }),
+        `jhw_issue_create 'Interrupted validation' "$JHW_TEST_VALID_ISSUE_BODY" skip 20`,
+        { TMPDIR: tempRoot },
+      );
+      assert.equal(interruptedValidation.code, expectedCode,
+        `${signal} during validation must stop Issue creation`);
+      assert.deepEqual(interruptedValidation.state.mutations, [],
+        `${signal} during validation must not mutate the Issue`);
+      assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-evidence.")), false,
+        `${signal} during validation must clean private files`);
+    }
+
+    const interruptedAfterValidation = await runIssueResult(
+      issueState(),
+      `jhw_issue_create 'Interrupted after validation' "$JHW_TEST_VALID_ISSUE_BODY" skip 20`,
+      { TMPDIR: tempRoot, JHW_TEST_INTERRUPT_VALIDATOR_SIGNAL: "SIGTERM" },
+    );
+    assert.equal(interruptedAfterValidation.code, 143,
+      "TERM after successful validator execution must stop Issue creation");
+    assert.deepEqual(interruptedAfterValidation.state.mutations, [],
+      "TERM after successful validator execution must prevent Issue mutation");
+    assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-evidence.")), false,
+      "TERM after successful validator execution must clean private files");
+
+    const interruptedSignalCollection = await runIssueResult(
+      issueState({ issueExists: true, interruptSignalFetchSignal: "SIGTERM" }),
+      [
+        'signal_file="$(jhw_issue_create_signal_file)" || exit $?',
+        `jhw_issue_collect_signals 99 1001 '${issueCreatedAt}' "$signal_file" || exit $?`,
+      ].join("\n"),
+      { TMPDIR: tempRoot },
+    );
+    assert.equal(interruptedSignalCollection.code, 143,
+      "TERM during signal collection must stop the collector");
+    assert.equal((await readdir(tempRoot)).some((entry) => entry.startsWith("jhw-issue-signals.")), false,
+      "TERM during signal collection must clean private files");
+    for (const entry of await readdir(tempRoot)) {
+      if (/^jhw-issue\.signal\..*\.json$/.test(entry)) await rm(join(tempRoot, entry));
+    }
 
     await setRepoFixture({ config: "review:\n  auto: true\n" });
     assert.equal((await runIssue(issueState(), `jhw_issue_global_auto_enabled ${JSON.stringify(configPath)}`)).stdout.trim(), "true");
