@@ -2272,6 +2272,38 @@ async function main() {
     );
     assert.equal(publicBody.code, 2, "a non-private PR body file must fail closed");
 
+    const snapshotFiles = async () => (await readdir(tempRoot))
+      .filter((name) => name.startsWith("jhw-pr-body.")).sort();
+    const fifoBodyPath = join(tempRoot, "fifo-pr-body");
+    await execFileAsync("mkfifo", [fifoBodyPath]);
+    await chmod(fifoBodyPath, 0o600);
+    const beforeFifo = await snapshotFiles();
+    const fifoBody = await runResult(
+      baseState({ prExists: false }),
+      `timeout --kill-after=1 3 bash -c ${JSON.stringify(
+        `source ${JSON.stringify(contractPath)}; jhw_pr_apply_new_pr_policy request`,
+      )}`,
+      { JHW_PR_BODY_FILE: fifoBodyPath, TMPDIR: tempRoot },
+    );
+    assert.equal(fifoBody.code, 2, "a FIFO body must fail promptly instead of waiting for a writer");
+    assert.deepEqual(fifoBody.log, [], "a FIFO body must fail before GitHub operations");
+    assert.deepEqual(await snapshotFiles(), beforeFifo,
+      "a rejected FIFO body must not leave a temporary snapshot");
+
+    const oversizedBodyPath = join(tempRoot, "oversized-pr-body.md");
+    await writeFile(oversizedBodyPath, Buffer.alloc(65537, "x"), { mode: 0o600 });
+    await chmod(oversizedBodyPath, 0o600);
+    const beforeOversized = await snapshotFiles();
+    const oversizedBody = await runResult(
+      baseState({ prExists: false }),
+      "jhw_pr_apply_new_pr_policy request",
+      { JHW_PR_BODY_FILE: oversizedBodyPath, TMPDIR: tempRoot },
+    );
+    assert.equal(oversizedBody.code, 2, "a body above 64 KiB must fail before copying or validation");
+    assert.deepEqual(oversizedBody.log, [], "an oversized body must fail before GitHub operations");
+    assert.deepEqual(await snapshotFiles(), beforeOversized,
+      "a rejected oversized body must not leave a temporary snapshot");
+
     const failedValidatorFetch = await runResult(
       baseState({ failValidatorFetch: true }),
       `jhw_pr_validate_change_evidence_snapshot ${JSON.stringify(validPrBodyPath)}`,

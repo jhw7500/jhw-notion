@@ -1521,16 +1521,16 @@ import stat
 import sys
 
 source_path, snapshot_path = sys.argv[1:]
-if not hasattr(os, "O_NOFOLLOW"):
+if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
     raise SystemExit(2)
-flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW | os.O_NONBLOCK
 try:
     source_fd = os.open(source_path, flags)
 except OSError:
     raise SystemExit(2)
 try:
     before = os.fstat(source_fd)
-    if not stat.S_ISREG(before.st_mode):
+    if not stat.S_ISREG(before.st_mode) or before.st_size > 65536:
         raise SystemExit(2)
     if before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) != 0o600:
         raise SystemExit(2)
@@ -1541,10 +1541,14 @@ try:
         if not stat.S_ISREG(destination.st_mode) or destination.st_uid != os.getuid():
             raise SystemExit(2)
         os.fchmod(destination_fd, 0o600)
+        copied = 0
         while True:
             chunk = os.read(source_fd, 65536)
             if not chunk:
                 break
+            copied += len(chunk)
+            if copied > 65536:
+                raise SystemExit(2)
             view = memoryview(chunk)
             while view:
                 written = os.write(destination_fd, view)
