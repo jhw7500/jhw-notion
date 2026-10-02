@@ -2372,6 +2372,38 @@ async function main() {
     assert.equal(restoredBodyTraps.stdout, "restored\n",
       "normal PR body cleanup must restore caller-owned traps");
 
+    const validatorFiles = async () => (await readdir(tempRoot))
+      .filter((name) => name.startsWith("jhw-change-evidence-validator.")).sort();
+    for (const [phase, signal, expectedCode] of [
+      ["view", "HUP", 129],
+      ["validator", "TERM", 143],
+    ]) {
+      const beforeBodyFiles = await snapshotFiles();
+      const beforeValidatorFiles = await validatorFiles();
+      const interruptedExistingPr = await runResult(
+        baseState(),
+        [
+          "gh() {",
+          '  if [[ "$1:$2" == pr:view ]]; then',
+          '    [[ "$JHW_TEST_INTERRUPT_PHASE" != view ]] || kill -HUP "$$"',
+          '    cat -- "$JHW_PR_BODY_FILE"',
+          "    return",
+          "  fi",
+          '  if [[ "$1" == api ]]; then kill -TERM "$$"; fi',
+          '  command gh "$@"',
+          "}",
+          "jhw_pr_validate_existing_pr_body 42",
+        ].join("\n"),
+        { JHW_TEST_INTERRUPT_PHASE: phase, TMPDIR: tempRoot },
+      );
+      assert.equal(interruptedExistingPr.code, expectedCode,
+        `${signal} during existing-PR ${phase} must preserve its exit status`);
+      assert.deepEqual(await snapshotFiles(), beforeBodyFiles,
+        `${signal} during existing-PR ${phase} must remove the private body file`);
+      assert.deepEqual(await validatorFiles(), beforeValidatorFiles,
+        `${signal} during existing-PR ${phase} must remove the validator file`);
+    }
+
     const failedValidatorFetch = await runResult(
       baseState({ failValidatorFetch: true }),
       `jhw_pr_validate_change_evidence_snapshot ${JSON.stringify(validPrBodyPath)}`,

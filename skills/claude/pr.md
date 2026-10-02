@@ -1598,14 +1598,19 @@ jhw_pr_preflight_new_pr_title() {
 
 jhw_pr_validate_existing_pr_body() {
   local pr="$1" body_file rc=0
-  body_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-pr-body.XXXXXX")" || return 2
+  jhw_pr_body_cleanup_install || return 2
+  if ! body_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-pr-body.XXXXXX")"; then
+    jhw_pr_body_cleanup_finish || return 2
+    return 2
+  fi
+  JHW_PR_ACTIVE_BODY_SNAPSHOT="$body_file"
   if ! gh pr view "$pr" --repo "$REPO_NWO" --json body --jq .body >"$body_file"; then
     rc=1
   elif ! jhw_pr_validate_change_evidence_snapshot "$body_file"; then
     echo "existing PR body is legacy or invalid; update it with gh pr edit --body-file using the v1 fields before proceeding" >&2
     rc=1
   fi
-  rm -f -- "$body_file" || return 2
+  jhw_pr_body_cleanup_finish || return 2
   return "$rc"
 }
 
@@ -1800,7 +1805,7 @@ jhw_pr_apply_existing_pr_policy() {
 ```
 <!-- pr-review-mode-contract:end -->
 
-새 PR의 private 본문 스냅샷과 검증기 파일은 생성 전 등록한 `EXIT/HUP/INT/TERM` 정리 핸들러가 관리한다. 정상 반환 시 파일을 지우고 기존 caller trap을 복원한다.
+새 PR 게시와 기존 PR 본문 검증의 private 임시 파일은 생성 전 등록한 `EXIT/HUP/INT/TERM` 정리 핸들러가 관리한다. 정상 반환 시 파일을 지우고 기존 caller trap을 복원한다.
 
 ## 동작 순서
 
