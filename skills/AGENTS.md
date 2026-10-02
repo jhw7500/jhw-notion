@@ -18,7 +18,7 @@ TUI 스킬 정의 파일 컨테이너. install.sh가 이 디렉토리를 각 TUI
 ### Working In This Directory
 - `claude/` 디렉토리가 여러 TUI에서 공유됨 (심링크). Claude 전용이 아님.
 - 스킬 파일은 마크다운 frontmatter (`description`) + 본문 형식.
-- 스킬 추가/수정 시 심링크이므로 TUI 재시작 없이 즉시 반영.
+- 설치된 TUI의 스킬 링크는 `.jhw-runtime/current/skills`를 가리킨다. 정본 수정은 개발 checkout에만 반영되며 운영 반영에는 release `--prepare`/`--activate`가 필요하다. Codex의 새 skill/prompt 이름은 링크 topology를 바꾸므로 README의 guarded 재설치 절차를 따른다.
 
 ### codex/ 는 손대지 말 것
 - `codex/jhw-<cmd>/`는 `claude/*.md`에서 생성된다 (`AGENTS.md`는 제외).

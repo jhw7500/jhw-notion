@@ -5,13 +5,43 @@ argument-hint: "[title/body] [--review|--no-review] [--timeout <min>]"
 
 # /jhw:issue — 좁은 GitHub Issue 생성 + 선택적 리뷰
 
-한 개의 nonempty title/body로 현재 저장소에 Issue를 만든다. `--review`는 실행 시 증명된
+한 개의 nonempty title과 Change Evidence Contract `v1`을 만족하는 body로 현재 저장소에 Issue를 만든다. `--review`는 실행 시 증명된
 지원 reviewer만 요청하고, `--no-review`는 `review:skip`을 적용해 mention을 만들지 않는다.
 두 옵션을 생략하면 전역 `review.auto`를 따르며, **키가 없으면 리뷰를 실행하지 않는다**
 (automation `v1.59`의 `default_auto_false`와 같은 정책).
 
 이 명령은 assignee, milestone, project, bulk edit를 지원하지 않는다. 리뷰 결과를 받아도 Issue를
 수정·닫기·삭제하거나 구현을 시작하지 않으며 URL과 reviewer별 결과만 보고한다.
+
+## Issue body 작성 계약
+
+body는 아래 level-three heading을 정확히 한 번씩, 이 순서로 포함한다. 다른 heading은 추가하지 않는다.
+
+```markdown
+### Contract version
+v1
+
+### Context and problem
+관찰한 문제와 그 문제를 실행 가능한 상태로 만드는 근거
+
+### Goal
+달성할 결과
+
+### Non-goals
+명시적으로 제외할 범위
+
+### Acceptance criteria
+- [ ] 검증 가능한 완료 조건
+
+### Constraints and impact
+호환성, 영향 시스템, rollout 제약
+```
+
+관찰하지 않은 명령, 결과, 영향, tracker 관계를 추측하거나 만들어내지 않는다. 정보 부재가 허용되는
+`Non-goals`와 `Constraints and impact`에서만 `Unknown: 구체적인 이유` 또는
+`Not applicable: 구체적인 이유`를 field 전체 값으로 사용할 수 있다. `TBD`, `TODO`, `N/A`,
+`unknown`, `미정`, `추후` 같은 placeholder는 근거가 아니다. `Acceptance criteria`에는 중첩되지 않은
+실제 Markdown task-list item(`- [ ] ...` 또는 `- [x] ...`)이 하나 이상 있어야 한다.
 
 ## 생성·reviewer preflight 계약
 
@@ -197,6 +227,28 @@ jhw_issue_validate_context() {
     return 2
   }
 }
+
+jhw_issue_validate_change_evidence_body() (
+  local body="$1" evidence_dir validator_path body_path
+  umask 077
+  evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/jhw-issue-evidence.XXXXXXXX")" || return 1
+  validator_path="$evidence_dir/validate_change_evidence.py"
+  body_path="$evidence_dir/issue-body.md"
+  trap 'rm -f -- "$validator_path" "$body_path"; rmdir -- "$evidence_dir" 2>/dev/null || true' EXIT HUP INT TERM
+  gh api -H 'Accept: application/vnd.github.raw+json' \
+    'repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=0d97a63891ba4473a3a189eae643f8059b76eb56' \
+    >"$validator_path" || {
+      echo "Change Evidence validator fetch failed" >&2
+      return 1
+    }
+  printf '%s' "$body" >"$body_path" || return 1
+  chmod 0600 "$validator_path" "$body_path" || return 1
+  [[ -f "$validator_path" && ! -L "$validator_path" && -f "$body_path" && ! -L "$body_path" ]] || return 1
+  python3 "$validator_path" --kind issue --path "$body_path" --expected-version v1 --format json >/dev/null || {
+    echo "Issue body does not satisfy Change Evidence Contract v1" >&2
+    return 2
+  }
+)
 
 jhw_issue_require_write_permission() {
   local permission
@@ -568,6 +620,7 @@ jhw_issue_create() {
   [[ -n "${title//[[:space:]]/}" ]] || { echo "Issue title is required" >&2; return 2; }
   [[ -n "${body//[[:space:]]/}" ]] || { echo "Issue body is required" >&2; return 2; }
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
+  jhw_issue_validate_change_evidence_body "$body" || return
   timeout="$(jhw_issue_validate_timeout "$timeout")" || return
   JHW_ISSUE_TIMEOUT_MIN="$timeout"
   jhw_issue_validate_context || return

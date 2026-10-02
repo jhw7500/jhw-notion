@@ -3713,6 +3713,7 @@ test_unsupported_tuis_receive_no_guard_wiring
 REPO_ROOT="$SOURCE_REPO_ROOT"
 node "$REPO_ROOT/scripts/test-pr-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-issue-skill-contract.mjs"
+node "$REPO_ROOT/scripts/test-commit-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-review-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-task-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-skill-alias-contract.mjs"
