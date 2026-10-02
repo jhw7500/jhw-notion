@@ -2304,6 +2304,74 @@ async function main() {
     assert.deepEqual(await snapshotFiles(), beforeOversized,
       "a rejected oversized body must not leave a temporary snapshot");
 
+    for (const [signal, expectedCode] of [["HUP", 129], ["TERM", 143]]) {
+      const snapshotMarker = join(tempRoot, `interrupted-pr-body-${signal}.path`);
+      const beforeSignal = await snapshotFiles();
+      const interruptedPr = await runResult(
+        baseState({ prExists: false }),
+        [
+          "jhw_pr_apply_new_pr_policy_with_snapshot() {",
+          '  printf "%s\\n" "$2" > "$JHW_TEST_SNAPSHOT_MARKER"',
+          `  kill -${signal} "$$"`,
+          "}",
+          "jhw_pr_apply_new_pr_policy request",
+        ].join("\n"),
+        { JHW_TEST_SNAPSHOT_MARKER: snapshotMarker, TMPDIR: tempRoot },
+      );
+      assert.equal(interruptedPr.code, expectedCode,
+        `${signal} must retain its conventional non-success exit status`);
+      assert.equal(existsSync((await readFile(snapshotMarker, "utf8")).trim()), false,
+        `${signal} must remove the private PR body snapshot`);
+      assert.deepEqual(await snapshotFiles(), beforeSignal,
+        `${signal} must not leave another PR body snapshot`);
+    }
+
+    const exitedSnapshotMarker = join(tempRoot, "exited-pr-body.path");
+    const callerBodyExitMarker = join(tempRoot, "pr-body-caller-exit.status");
+    const exitedPr = await runResult(
+      baseState({ prExists: false }),
+      [
+        'trap \'printf "%s\\n" "$?" > "$JHW_TEST_EXIT_MARKER"\' EXIT',
+        "jhw_pr_apply_new_pr_policy_with_snapshot() {",
+        '  printf "%s\\n" "$2" > "$JHW_TEST_SNAPSHOT_MARKER"',
+        "  exit 7",
+        "}",
+        "jhw_pr_apply_new_pr_policy request",
+      ].join("\n"),
+      { JHW_TEST_SNAPSHOT_MARKER: exitedSnapshotMarker, JHW_TEST_EXIT_MARKER: callerBodyExitMarker,
+        TMPDIR: tempRoot },
+    );
+    assert.equal(exitedPr.code, 7);
+    assert.equal(existsSync((await readFile(exitedSnapshotMarker, "utf8")).trim()), false,
+      "an EXIT during PR publication must remove the private body snapshot");
+    assert.equal(await readFile(callerBodyExitMarker, "utf8"), "7\n",
+      "PR body cleanup must preserve the caller EXIT trap and exit status");
+
+    const restoredBodyTraps = await run(
+      baseState({ prExists: false }),
+      [
+        "trap ':' EXIT",
+        "trap ':' HUP",
+        "trap ':' INT",
+        "trap ':' TERM",
+        'before_exit="$(trap -p EXIT)"',
+        'before_hup="$(trap -p HUP)"',
+        'before_int="$(trap -p INT)"',
+        'before_term="$(trap -p TERM)"',
+        "jhw_pr_apply_new_pr_policy_with_snapshot() { :; }",
+        "jhw_pr_apply_new_pr_policy request || exit $?",
+        '[[ "$(trap -p EXIT)" == "$before_exit" ]] || exit 1',
+        '[[ "$(trap -p HUP)" == "$before_hup" ]] || exit 1',
+        '[[ "$(trap -p INT)" == "$before_int" ]] || exit 1',
+        '[[ "$(trap -p TERM)" == "$before_term" ]] || exit 1',
+        "trap - EXIT HUP INT TERM",
+        "printf 'restored\\n'",
+      ].join("\n"),
+      { TMPDIR: tempRoot },
+    );
+    assert.equal(restoredBodyTraps.stdout, "restored\n",
+      "normal PR body cleanup must restore caller-owned traps");
+
     const failedValidatorFetch = await runResult(
       baseState({ failValidatorFetch: true }),
       `jhw_pr_validate_change_evidence_snapshot ${JSON.stringify(validPrBodyPath)}`,

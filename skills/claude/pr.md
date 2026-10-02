@@ -1498,6 +1498,9 @@ jhw_pr_validate_change_evidence_snapshot() {
   local body_snapshot="$1" validator rc=0
   [[ -f "$body_snapshot" && ! -L "$body_snapshot" ]] || return 2
   validator="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-change-evidence-validator.XXXXXX")" || return 2
+  if [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == true ]]; then
+    JHW_PR_ACTIVE_VALIDATOR_FILE="$validator"
+  fi
   if ! gh api -H 'Accept: application/vnd.github.raw+json' \
     "$JHW_PR_CHANGE_EVIDENCE_VALIDATOR_ENDPOINT" >"$validator"; then
     echo "failed to fetch the pinned Change Evidence Contract validator" >&2
@@ -1508,6 +1511,7 @@ jhw_pr_validate_change_evidence_snapshot() {
     rc=1
   fi
   rm -f -- "$validator" || return 2
+  [[ "${JHW_PR_ACTIVE_VALIDATOR_FILE:-}" != "$validator" ]] || unset JHW_PR_ACTIVE_VALIDATOR_FILE
   return "$rc"
 }
 
@@ -1515,6 +1519,9 @@ jhw_pr_snapshot_new_pr_body() {
   local source_file="$1" snapshot rc=0
   unset JHW_PR_VALIDATED_BODY_FILE
   snapshot="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-pr-body.XXXXXX")" || return 2
+  if [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == true ]]; then
+    JHW_PR_ACTIVE_BODY_SNAPSHOT="$snapshot"
+  fi
   if ! python3 - "$source_file" "$snapshot" <<'PY'
 import os
 import stat
@@ -1572,6 +1579,7 @@ PY
   fi
   if (( rc != 0 )); then
     rm -f -- "$snapshot" || return 2
+    [[ "${JHW_PR_ACTIVE_BODY_SNAPSHOT:-}" != "$snapshot" ]] || unset JHW_PR_ACTIVE_BODY_SNAPSHOT
     return "$rc"
   fi
   JHW_PR_VALIDATED_BODY_FILE="$snapshot"
@@ -1601,17 +1609,92 @@ jhw_pr_validate_existing_pr_body() {
   return "$rc"
 }
 
-jhw_pr_apply_new_pr_policy() {
-  local mode="$1" body_snapshot rc=0
-  jhw_pr_preflight_new_pr_title || return
-  jhw_pr_snapshot_new_pr_body "$JHW_PR_BODY_FILE" || return
-  body_snapshot="$JHW_PR_VALIDATED_BODY_FILE"
-  jhw_pr_apply_new_pr_policy_with_snapshot "$mode" "$body_snapshot" || rc=$?
-  if ! rm -f -- "$body_snapshot"; then
-    unset JHW_PR_VALIDATED_BODY_FILE
-    return 2
+jhw_pr_body_cleanup_all() {
+  local path
+  for path in "${JHW_PR_ACTIVE_VALIDATOR_FILE:-}" "${JHW_PR_ACTIVE_BODY_SNAPSHOT:-}"; do
+    [[ -z "$path" ]] || rm -f -- "$path" || return 2
+  done
+  unset JHW_PR_ACTIVE_VALIDATOR_FILE JHW_PR_ACTIVE_BODY_SNAPSHOT JHW_PR_VALIDATED_BODY_FILE
+}
+
+jhw_pr_body_restore_traps() {
+  local signal spec
+  for signal in EXIT HUP INT TERM; do
+    case "$signal" in
+      EXIT) spec="${JHW_PR_BODY_PREV_EXIT_TRAP:-}" ;;
+      HUP) spec="${JHW_PR_BODY_PREV_HUP_TRAP:-}" ;;
+      INT) spec="${JHW_PR_BODY_PREV_INT_TRAP:-}" ;;
+      TERM) spec="${JHW_PR_BODY_PREV_TERM_TRAP:-}" ;;
+    esac
+    if [[ -n "$spec" ]]; then
+      [[ "$spec" == 'trap -- '* ]] || return 2
+      eval "$spec"
+    else
+      trap - "$signal"
+    fi
+  done
+}
+
+jhw_pr_body_cleanup_on_exit() {
+  local status="$1" previous_spec="${JHW_PR_BODY_PREV_EXIT_TRAP:-}"
+  jhw_pr_body_cleanup_all >/dev/null 2>&1 || true
+  trap - EXIT HUP INT TERM
+  JHW_PR_BODY_CLEANUP_ACTIVE=false
+  if [[ -n "$previous_spec" ]]; then
+    ( eval "$previous_spec"; exit "$status" ) || true
   fi
-  unset JHW_PR_VALIDATED_BODY_FILE
+  exit "$status"
+}
+
+jhw_pr_body_handle_signal() {
+  local signal="$1" status="$2" previous_spec=''
+  case "$signal" in
+    HUP) previous_spec="${JHW_PR_BODY_PREV_HUP_TRAP:-}" ;;
+    INT) previous_spec="${JHW_PR_BODY_PREV_INT_TRAP:-}" ;;
+    TERM) previous_spec="${JHW_PR_BODY_PREV_TERM_TRAP:-}" ;;
+    *) return 2 ;;
+  esac
+  jhw_pr_body_cleanup_all >/dev/null 2>&1 || true
+  jhw_pr_body_restore_traps >/dev/null 2>&1 || trap - EXIT HUP INT TERM
+  JHW_PR_BODY_CLEANUP_ACTIVE=false
+  [[ -z "$previous_spec" ]] || kill -s "$signal" "$$"
+  exit "$status"
+}
+
+jhw_pr_body_cleanup_install() {
+  [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == false ]] || return 2
+  JHW_PR_BODY_PREV_EXIT_TRAP="$(trap -p EXIT)" || return 2
+  JHW_PR_BODY_PREV_HUP_TRAP="$(trap -p HUP)" || return 2
+  JHW_PR_BODY_PREV_INT_TRAP="$(trap -p INT)" || return 2
+  JHW_PR_BODY_PREV_TERM_TRAP="$(trap -p TERM)" || return 2
+  trap 'jhw_pr_body_cleanup_on_exit "$?"' EXIT
+  trap 'jhw_pr_body_handle_signal HUP 129' HUP
+  trap 'jhw_pr_body_handle_signal INT 130' INT
+  trap 'jhw_pr_body_handle_signal TERM 143' TERM
+  JHW_PR_BODY_CLEANUP_ACTIVE=true
+}
+
+jhw_pr_body_cleanup_finish() {
+  local rc=0
+  [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == true ]] || return 2
+  jhw_pr_body_cleanup_all || rc=2
+  jhw_pr_body_restore_traps || rc=2
+  JHW_PR_BODY_CLEANUP_ACTIVE=false
+  unset JHW_PR_BODY_PREV_EXIT_TRAP JHW_PR_BODY_PREV_HUP_TRAP
+  unset JHW_PR_BODY_PREV_INT_TRAP JHW_PR_BODY_PREV_TERM_TRAP
+  return "$rc"
+}
+
+jhw_pr_apply_new_pr_policy() {
+  local mode="$1" rc=0
+  jhw_pr_preflight_new_pr_title || return
+  jhw_pr_body_cleanup_install || return 2
+  if jhw_pr_snapshot_new_pr_body "$JHW_PR_BODY_FILE"; then
+    jhw_pr_apply_new_pr_policy_with_snapshot "$mode" "$JHW_PR_VALIDATED_BODY_FILE" || rc=$?
+  else
+    rc=$?
+  fi
+  jhw_pr_body_cleanup_finish || return 2
   return "$rc"
 }
 
@@ -1716,6 +1799,8 @@ jhw_pr_apply_existing_pr_policy() {
 }
 ```
 <!-- pr-review-mode-contract:end -->
+
+새 PR의 private 본문 스냅샷과 검증기 파일은 생성 전 등록한 `EXIT/HUP/INT/TERM` 정리 핸들러가 관리한다. 정상 반환 시 파일을 지우고 기존 caller trap을 복원한다.
 
 ## 동작 순서
 
