@@ -37,8 +37,10 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 **Codex는 설치된 GitHub App이라 위 표(상류 워크플로우) 밖에 있다.** 트리거는 PR 코멘트 `@codex review`이며,
 이 스킬도 같은 문자열로 Codex를 요청한다(`jhw_pr_request_app_review`). 응답 신호와 CLEAN 판정은 아래
 리뷰어 레지스트리의 Codex 행을 따른다. 위치 조건과 작성자 권한 조건은 측정하지 않았으므로, 수동으로 부를 때는
-`@codex review`를 다른 멘션과 섞지 않고 별도 코멘트에 단독으로 쓴다. 보안 전용 `@codex security`는 Codex 요약
-코멘트의 안내로만 확인됐고 시험하지 않았다.
+`@codex review`를 다른 멘션과 섞지 않고 별도 코멘트에 단독으로 쓴다. 보안 전용 트리거는 `@codex security review`다.
+Codex 요약 코멘트(jhw-notion PR #174, max9296 PR #98·#99)의 안내로만 확인됐고 시험하지 않았다. 같은 요약에 따르면
+멘션 없이도 PR을 리뷰용으로 열 때와 draft를 ready로 바꿀 때 Codex 리뷰가 자동으로 시작된다. 이 자동 트리거는
+저장소별 Codex 설정을 따르므로, 다른 저장소에서는 그 PR의 Codex 요약 코멘트로 확인한다.
 
 함정 둘:
 
