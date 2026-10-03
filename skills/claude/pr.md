@@ -32,7 +32,15 @@ argument-hint: "[--review|--no-review] [--merge] [--target[=<cmd>]] [--auto-fix]
 | OpenCode | `/oc` 또는 `/opencode` | 코멘트 **맨 앞**, 또는 **바로 앞이 공백** | `opencode.yml` job `if:` — `startsWith(body,'/oc') \|\| contains(body,' /oc')` |
 | Gemini | `@gemini-cli /review` | 코멘트 **맨 앞** | `gemini-dispatch.yml` — `request.startsWith("@gemini-cli /review")` |
 
-세 리뷰어 모두 작성자가 `OWNER`/`MEMBER`/`COLLABORATOR`여야 한다. 함정 둘:
+위 표의 세 워크플로우 리뷰어는 모두 작성자가 `OWNER`/`MEMBER`/`COLLABORATOR`여야 한다.
+
+**Codex는 설치된 GitHub App이라 위 표(상류 워크플로우) 밖에 있다.** 트리거는 PR 코멘트 `@codex review`이며,
+이 스킬도 같은 문자열로 Codex를 요청한다(`jhw_pr_request_app_review`). 응답 신호와 CLEAN 판정은 아래
+리뷰어 레지스트리의 Codex 행을 따른다. 위치 조건과 작성자 권한 조건은 측정하지 않았으므로, 수동으로 부를 때는
+`@codex review`를 다른 멘션과 섞지 않고 별도 코멘트에 단독으로 쓴다. 보안 전용 `@codex security`는 Codex 요약
+코멘트의 안내로만 확인됐고 시험하지 않았다.
+
+함정 둘:
 
 - **한 코멘트에 여러 멘션을 몰아 쓰면 첫 줄의 리뷰어만 반응한다.** OpenCode 조건은 `/oc` 앞의
   **공백**을 요구하는데 줄바꿈은 공백이 아니라서, 둘째 줄 이후의 `/oc`는 매치되지 않는다.
