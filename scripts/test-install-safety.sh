@@ -2308,6 +2308,65 @@ codex-prompt|.codex|.codex/prompts/task.md|symlink
 EOF
 }
 
+home_snapshot() {
+  (cd "$1" && find . -printf '%p %y %m %i %T@ %s %l\n' | LC_ALL=C sort &&
+    find . -type f -exec sha256sum {} + | LC_ALL=C sort)
+}
+
+run_plan() {
+  local home="$1"
+  HOME="$home" bash -c '
+    set -euo pipefail
+    SCRIPT_DIR="$1"
+    source "$SCRIPT_DIR/scripts/install-wiring.sh"
+    initialize_wiring_directories
+    select_managed_wiring
+    plan_wiring "$SCRIPT_DIR/skills"
+  ' plan-fixture "$REPO_ROOT"
+}
+
+test_plan_wiring_is_read_only() {
+  local home before output rc label expected
+  home="$ROOT/plan-clear-home"
+  make_tui_roots "$home"
+  provision_valid_control_host "$home"
+  before="$(home_snapshot "$home")"
+  rc=0; output="$(run_plan "$home")" || rc=$?
+  [ "$rc" -eq 0 ] && [ "$output" = clear ] || { echo "plan did not clear an empty HOME: $rc $output" >&2; return 1; }
+  [ "$(home_snapshot "$home")" = "$before" ] || { echo "clear plan wrote into HOME" >&2; return 1; }
+  while IFS='|' read -r label expected; do
+    home="$ROOT/plan-$label-home"
+    make_tui_roots "$home"
+    provision_valid_control_host "$home"
+    case "$label" in
+      no-host) rm "$home/.local/bin/jhw-control-host" ;;
+      claude-root-link) mv "$home/.claude" "$home/claude-real"; ln -s "$home/claude-real" "$home/.claude" ;;
+      codex-txn) mkdir -m 0700 "$home/.codex/.hooks.json.jhw-txn.abc123" ;;
+      skills-file) printf 'x' >"$home/.codex/skills" ;;
+      codex-toml) printf '[mcp_servers.jhw-notion]\ncommand = "python"\nargs = []\n' >"$home/.codex/config.toml" ;;
+      malformed-hooks) printf '{' >"$home/.codex/hooks.json" ;;
+      claude-json) printf '[]' >"$home/.claude.json" ;;
+      skill) mkdir -p "$home/.codex/skills/jhw-task" ;;
+      control) ln -s "$ROOT/outside" "$home/.local/bin/jhw-control" ;;
+    esac
+    before="$(home_snapshot "$home")"
+    rc=0; output="$(run_plan "$home")" || rc=$?
+    [ "$rc" -eq 3 ] && [ "$output" = "conflict $expected" ] ||
+      { echo "plan missed $label: $rc $output" >&2; return 1; }
+    [ "$(home_snapshot "$home")" = "$before" ] || { echo "conflict plan wrote into HOME: $label" >&2; return 1; }
+  done <<'EOF'
+no-host|control_host
+claude-root-link|tui_root
+codex-txn|pending_transaction
+skills-file|parent_unusable
+codex-toml|mcp_entry
+malformed-hooks|hook_config
+claude-json|mcp_entry
+skill|skill_link
+control|control_link
+EOF
+}
+
 test_uninstall_preserves_foreign_links() {
   local home="$ROOT/foreign-links-home" outside="$ROOT/outside"
   make_tui_roots "$home"
@@ -3638,6 +3697,7 @@ esac
 
 test_foreign_skill_fails_closed
 test_every_tui_foreign_target_fails_closed
+test_plan_wiring_is_read_only
 test_uninstall_preserves_foreign_links
 test_foreign_json_mcp_fails_closed
 test_foreign_opencode_mcp_fails_closed

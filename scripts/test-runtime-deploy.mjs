@@ -38,9 +38,250 @@ test('owned legacy MCP and exact launcher migrate; foreign hook launcher refuses
  const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.claude'),{mode:0o700});write(f.root,'mcp-server/dist/index.js','old');fs.symlinkSync(path.join(f.root,'scripts/jhw-control-hook'),path.join(f.home,'.local/bin/jhw-control-hook'));
  write(f.home,'.claude.json',JSON.stringify({foreign:{keep:true},mcpServers:{'jhw-notion':{command:'node',args:[path.join(f.root,'mcp-server/dist/index.js')]}}}),0o600);
  const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home,'.claude.json'))).foreign,{keep:true});assert.equal(fs.readlinkSync(path.join(f.home,'.local/bin/jhw-control-hook')),path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-hook'));
- const g=fixture(t);host(g);fs.symlinkSync('/foreign/launcher',path.join(g.home,'.local/bin/jhw-control-hook'));const r=await g.run(['--prepare']);await assert.rejects(g.run(['--activate',r.releaseId]),{code:'DEPLOY_WIRING_FAILED'});assert.equal(fs.readlinkSync(path.join(g.home,'.local/bin/jhw-control-hook')),'/foreign/launcher');const status=await g.run(['--status']);assert.equal(status.recoveryPending,1);
+ const g=fixture(t);host(g);fs.symlinkSync('/foreign/launcher',path.join(g.home,'.local/bin/jhw-control-hook'));const r=await g.run(['--prepare']);await assert.rejects(g.run(['--activate',r.releaseId]),{code:'DEPLOY_WIRING_CONFLICT',reason:'hook_link'});assert.equal(fs.readlinkSync(path.join(g.home,'.local/bin/jhw-control-hook')),'/foreign/launcher');const status=await g.run(['--status']);assert.equal(status.recoveryPending,0);
 });
 
+// Every destination class install_wiring refuses must be refused by the
+// read-only plan before any journal, bootstrap, pointer, or HOME mutation.
+// Each occupant returns the single decoy path whose removal must suffice, or
+// a function that undoes exactly the occupied state.
+const hostContract = h => fs.readFileSync(path.join(h,'.local/bin/jhw-control-host'));
+const foreignDestinations = [
+ ['control_host', 'missing-host', (h,f)=>{fs.unlinkSync(path.join(h,'.local/bin/jhw-control-host'));return ()=>host(f);}],
+ ['control_host', 'host-contract', (h,f)=>{write(h,'.local/bin/jhw-control-host',String(hostContract(h)).replace('"version":5','"version":4'),0o755);return ()=>host(f);}],
+ ['tui_root', 'claude-root-link', h=>{const real=path.join(path.dirname(h),'claude-real');fs.mkdirSync(real,{mode:0o700});fs.symlinkSync(real,path.join(h,'.claude'));return '.claude';}],
+ ['tui_root', 'codex-root-link', h=>{const real=path.join(path.dirname(h),'codex-real');fs.mkdirSync(real,{mode:0o700});fs.symlinkSync(real,path.join(h,'.codex'));return '.codex';}],
+ ['pending_transaction', 'codex-hook-txn', h=>{fs.mkdirSync(path.join(h,'.codex/.hooks.json.jhw-txn.abc123'),{recursive:true,mode:0o700});return '.codex/.hooks.json.jhw-txn.abc123';}],
+ ['pending_transaction', 'claude-hook-txn', h=>{fs.mkdirSync(path.join(h,'.claude/.settings.json.jhw-txn.abc123'),{recursive:true,mode:0o700});return '.claude/.settings.json.jhw-txn.abc123';}],
+ ['pending_transaction', 'launcher-txn', h=>{fs.mkdirSync(path.join(h,'.local/bin/.jhw-control-hook-link-txn.abc123'),{mode:0o700});return '.local/bin/.jhw-control-hook-link-txn.abc123';}],
+ ['pending_transaction', 'codex-legacy-txn', (h,f)=>{fs.mkdirSync(path.join(h,'.codex/commands/.jhw-control-hook-link-txn.abc123'),{recursive:true,mode:0o700});fs.symlinkSync(path.join(f.root,'.jhw-runtime/current/skills/claude'),path.join(h,'.codex/commands/jhw'));
+  // Removing an owned legacy link resolves current/, which a first activation has not published yet.
+  return ()=>{fs.rmdirSync(path.join(h,'.codex/commands/.jhw-control-hook-link-txn.abc123'));fs.unlinkSync(path.join(h,'.codex/commands/jhw'));};}],
+ ['unsafe_parent', 'launcher-parent-link', (h,f)=>{const bin=path.join(h,'.local/bin'),real=path.join(path.dirname(h),'bin-real');fs.renameSync(bin,real);fs.symlinkSync(real,bin);fs.symlinkSync(path.join(f.root,'scripts/jhw-control-hook'),path.join(real,'jhw-control-hook'));return ()=>{fs.unlinkSync(bin);fs.renameSync(real,bin);};}],
+ ['parent_unusable', 'codex-skills-file', h=>{write(h,'.codex/skills','foreign');return '.codex/skills';}],
+ ['parent_unusable', 'claude-commands-file', h=>{write(h,'.claude/commands','foreign');return '.claude/commands';}],
+ ['parent_unusable', 'codex-prompts-readonly', h=>{fs.mkdirSync(path.join(h,'.codex/prompts'),{recursive:true,mode:0o700});fs.chmodSync(path.join(h,'.codex/prompts'),0o555);return '.codex/prompts';}],
+ ['plan_unverified', 'unreadable-mcp-config', h=>{fs.mkdirSync(path.join(h,'.claude'),{mode:0o700});write(h,'.claude.json','{}',0o600);fs.chmodSync(path.join(h,'.claude.json'),0);return ()=>fs.chmodSync(path.join(h,'.claude.json'),0o600);}],
+ ['control_link', 'cli', h=>{fs.symlinkSync('/foreign/control',path.join(h,'.local/bin/jhw-control'));return '.local/bin/jhw-control';}],
+ ['hook_link', 'hook', h=>{write(h,'.local/bin/jhw-control-hook','#!/bin/sh\n',0o755);return '.local/bin/jhw-control-hook';}],
+ ['command_dir', 'claude', h=>{fs.mkdirSync(path.join(h,'.claude/commands/jhw'),{recursive:true,mode:0o700});write(h,'.claude/commands/jhw/marker','foreign');return '.claude/commands/jhw';}],
+ ['command_dir', 'gemini', h=>{fs.mkdirSync(path.join(h,'.gemini/commands'),{recursive:true});fs.symlinkSync('/foreign/commands',path.join(h,'.gemini/commands/jhw'));return '.gemini/commands/jhw';}],
+ ['command_dir', 'opencode', h=>{write(h,'.config/opencode/skills/jhw','foreign');return '.config/opencode/skills/jhw';}],
+ ['command_dir', 'codex-legacy', h=>{fs.mkdirSync(path.join(h,'.codex'),{mode:0o700});write(h,'.codex/commands/jhw','foreign');return '.codex/commands/jhw';}],
+ ['skill_link', 'codex-skill', h=>{fs.mkdirSync(path.join(h,'.codex'),{mode:0o700});fs.mkdirSync(path.join(h,'.codex/skills/jhw-task'),{recursive:true});return '.codex/skills/jhw-task';}],
+ ['prompt_link', 'codex-prompt', h=>{fs.mkdirSync(path.join(h,'.codex/prompts'),{recursive:true,mode:0o700});fs.symlinkSync('/foreign/task.md',path.join(h,'.codex/prompts/task.md'));return '.codex/prompts/task.md';}],
+ ['mcp_entry', 'claude-mcp', h=>{fs.mkdirSync(path.join(h,'.claude'),{mode:0o700});write(h,'.claude.json','{"mcpServers":{"jhw-notion":{"command":"node","args":["/foreign/index.js"]}}}',0o600);return '.claude.json';}],
+ ['mcp_entry', 'gemini-mcp', h=>{write(h,'.gemini/settings.json','{"mcpServers":{"jhw-notion":{"command":"python","args":[]}}}',0o600);return '.gemini/settings.json';}],
+ ['mcp_entry', 'opencode-mcp', h=>{write(h,'.config/opencode/opencode.json','{"mcp":{"jhw-notion":{"type":"remote"}}}',0o600);return '.config/opencode/opencode.json';}],
+ ['mcp_entry', 'codex-mcp', h=>{fs.mkdirSync(path.join(h,'.codex'),{mode:0o700});write(h,'.codex/config.toml','[mcp_servers.jhw-notion]\ncommand = "python"\nargs = []\n',0o600);return '.codex/config.toml';}],
+ ['hook_config', 'claude-hooks', h=>{fs.mkdirSync(path.join(h,'.claude'),{mode:0o700});fs.symlinkSync('/foreign/settings.json',path.join(h,'.claude/settings.json'));return '.claude/settings.json';}],
+ ['hook_config', 'codex-hooks', h=>{fs.mkdirSync(path.join(h,'.codex/hooks.json'),{recursive:true,mode:0o700});return '.codex/hooks.json';}],
+];
+for (const [reason, label, occupy] of foreignDestinations) {
+ test(`first activation plan refuses foreign ${label} destination with zero mutation`, async t => {
+  const f=fixture(t);host(f);const decoy=occupy(f.home,f);
+  const runtime=path.join(f.root,'.jhw-runtime');
+  const release=await f.run(['--prepare']);
+  const runtimeBefore=fs.readdirSync(runtime).sort();
+  const home=homeObservation(f.home);const phases=[];
+  await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:async ({phase})=>{phases.push(phase);}}),{code:'DEPLOY_WIRING_CONFLICT',reason});
+  assert.deepEqual(phases,[]);
+  assert.deepEqual(homeObservation(f.home),home);
+  assert.deepEqual(fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')),[]);
+  assert.deepEqual(fs.readdirSync(runtime).filter(name=>!name.endsWith('.lock')).sort(),runtimeBefore.filter(name=>!name.endsWith('.lock')));
+  for(const name of ['current','bootstrap','wiring.json'])assert.equal(fs.existsSync(path.join(runtime,name)),false,name);
+  const status=await f.run(['--status']);assert.equal(status.releaseId,null);assert.equal(status.recoveryPending,0);
+  // Removing only the decoy must suffice: the refusal left no residue.
+  if(typeof decoy==='function')decoy();else fs.rmSync(path.join(f.home,decoy),{recursive:true,force:true});
+  const activated=await f.run(['--activate',release.releaseId]);
+  assert.equal(activated.code,'DEPLOY_ACTIVATED');assert.equal(activated.releaseId,release.releaseId);
+ });
+}
+test('first activation plan timeout is unverified and leaves zero mutation', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude','.codex'])fs.mkdirSync(path.join(f.home,p),{mode:0o700});
+ const runtime=path.join(f.root,'.jhw-runtime');const release=await f.run(['--prepare']);const home=homeObservation(f.home);
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],planTimeoutMs:1}),{code:'DEPLOY_WIRING_CONFLICT',reason:'plan_unverified'});
+ assert.deepEqual(homeObservation(f.home),home);
+ assert.deepEqual(fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')||['current','bootstrap','wiring.json'].includes(name)),[]);
+ assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATED');
+});
+// Type, link target, bytes, and mode of every HOME entry; restore may change
+// directory mtimes and inode numbers of restored entries, so those are omitted.
+const homeShape = home => homeObservation(home).map(({name,mode,content})=>({name,mode,content}));
+function assertFirstActivationRolledBack(f, shape) {
+ const runtime=path.join(f.root,'.jhw-runtime');
+ assert.equal(fs.existsSync(path.join(runtime,'current')),false);assert.equal(fs.existsSync(path.join(runtime,'wiring.json')),false);
+ const journals=fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')).map(name=>JSON.parse(fs.readFileSync(path.join(runtime,name,'state.json'))));
+ assert.deepEqual(journals.map(state=>[state.status,state.phase]),[['complete','wire_rolled_back']]);
+ assert.deepEqual(homeShape(f.home),shape);
+}
+const lateWireFailures = [
+ ['home-not-writable', h=>{fs.mkdirSync(path.join(h,'.claude'),{mode:0o700});fs.mkdirSync(path.join(h,'.codex'),{mode:0o700});fs.chmodSync(h,0o500);}, h=>fs.chmodSync(h,0o700)],
+ ['gemini-not-writable', (h,f)=>{fs.mkdirSync(path.join(h,'.gemini/commands'),{recursive:true});fs.chmodSync(path.join(h,'.gemini/commands'),0o700);fs.symlinkSync(path.join(f.root,'.jhw-runtime/current/skills/claude'),path.join(h,'.gemini/commands/jhw'));fs.chmodSync(path.join(h,'.gemini'),0o555);}, h=>fs.chmodSync(path.join(h,'.gemini'),0o700)],
+];
+for (const [label, occupy, fix] of lateWireFailures) {
+ test(`first activation late wire failure (${label}) restores HOME before any pointer`, async t => {
+  const f=fixture(t);host(f);const release=await f.run(['--prepare']);occupy(f.home,f);
+  try {
+  const shape=homeShape(f.home);
+  await assert.rejects(f.run(['--activate',release.releaseId]),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+  assertFirstActivationRolledBack(f,shape);
+  const status=await f.run(['--status']);assert.equal(status.releaseId,null);assert.equal(status.recoveryPending,0);
+  // The inert bootstrap installed before wire is reused unchanged by the retry.
+  const bootstrap=fs.statSync(path.join(f.root,'.jhw-runtime/bootstrap')).ino;
+  fix(f.home);
+  assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATED');
+  assert.equal(fs.statSync(path.join(f.root,'.jhw-runtime/bootstrap')).ino,bootstrap);
+  assert.deepEqual(fs.readdirSync(path.join(f.root,'.jhw-runtime')).filter(name=>name.startsWith('.bootstrap.')),[]);
+  } finally {fix(f.home);}
+ });
+}
+test('first activation refuses an unsearchable destination directory at preimage capture', async t => {
+ const f=fixture(t);host(f);const release=await f.run(['--prepare']);
+ fs.mkdirSync(path.join(f.home,'.codex/skills'),{recursive:true,mode:0o700});const shape=homeShape(f.home);fs.chmodSync(path.join(f.home,'.codex/skills'),0o600);
+ try{await assert.rejects(f.run(['--activate',release.releaseId]),{code:'DEPLOY_FAILED'});}finally{fs.chmodSync(path.join(f.home,'.codex/skills'),0o700);}
+ assert.deepEqual(homeShape(f.home),shape);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/current')),false);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+test('first activation rolls back hooks, MCP, links, and launcher migration after a late wire failure', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude','.codex','.gemini'])fs.mkdirSync(path.join(f.home,p),{mode:0o700});
+ fs.symlinkSync(path.join(f.root,'scripts/jhw-control-hook'),path.join(f.home,'.local/bin/jhw-control-hook'));
+ write(f.home,'.claude/settings.json','{"hooks":{}}\n',0o600);
+ const release=await f.run(['--prepare']);const shape=homeShape(f.home);const hooks=path.join(f.home,'.codex/hooks.json');let wired=false;
+ // A foreign Codex hooks object appears only while wire runs, so every earlier wire mutation must be undone.
+ const phaseRunner=async options=>{
+  if(options.phase!=='wire')return deploy.wiringPhase(options);
+  fs.mkdirSync(hooks,{mode:0o700});
+  try{return await deploy.wiringPhase(options);}finally{wired=fs.existsSync(path.join(f.home,'.claude.json'));fs.rmdirSync(hooks);}
+ };
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+ assert.equal(wired,true);
+ assertFirstActivationRolledBack(f,shape);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+ assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATED');
+ assert.equal(fs.readlinkSync(path.join(f.home,'.local/bin/jhw-control-hook')),path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-hook'));
+});
+// Wire with a foreign Codex hooks object present only while wire runs: every
+// earlier wire mutation (links, MCP, Claude hooks) must then be undone.
+const lateCodexHookFailure = (f, {beforeRestore}={}) => async options => {
+ const hooks=path.join(f.home,'.codex/hooks.json');
+ if(options.phase!=='wire')return deploy.wiringPhase(options);
+ fs.mkdirSync(hooks,{mode:0o700});
+ try{return await deploy.wiringPhase(options);}finally{fs.rmdirSync(hooks);beforeRestore?.();}
+};
+test('first activation rollback restores Codex config and preserves every pre-existing editor backup', async t => {
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.codex'),{mode:0o700});
+ const config=path.join(f.home,'.codex/config.toml');write(f.home,'.codex/config.toml','[other]\nkey = 1\n',0o600);
+ const old=['20200101000000','20210101000000','20220101000000'].map((stamp,index)=>`config.toml.bak.jhw-notion.${stamp}.0000000${index}-0000-4000-8000-000000000000`);
+ for(const name of old)write(f.home,`.codex/${name}`,`backup ${name}\n`,0o600);
+ const release=await f.run(['--prepare']);const shape=homeShape(f.home);
+ let wiredBackups;const countBackups=()=>{wiredBackups=fs.readdirSync(path.join(f.home,'.codex')).filter(name=>name.startsWith('config.toml.bak.')).length;};
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:lateCodexHookFailure(f,{beforeRestore:countBackups})}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+ assert.equal(wiredBackups,4);
+ assertFirstActivationRolledBack(f,shape);
+ assert.deepEqual(fs.readdirSync(path.join(f.home,'.codex')).filter(name=>name.startsWith('config.toml.bak.')).sort(),old);
+ for(const name of old)assert.equal(fs.readFileSync(path.join(f.home,'.codex',name),'utf8'),`backup ${name}\n`);
+ assert.equal(fs.readFileSync(config,'utf8'),'[other]\nkey = 1\n');
+});
+test('first activation removes an owned legacy Codex commands link before current is published', async t => {
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.codex/commands'),{recursive:true,mode:0o700});
+ fs.symlinkSync(path.join(f.root,'.jhw-runtime/current/skills/claude'),path.join(f.home,'.codex/commands/jhw'));
+ const release=await f.run(['--prepare']);
+ assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATED');
+ assert.deepEqual(fs.readdirSync(path.join(f.home,'.codex/commands')),[]);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+test('first activation rollback fails closed when a wire helper rollback step fails', async t => {
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.claude'),{mode:0o700});
+ const release=await f.run(['--prepare']);const bin=path.join(f.home,'.local/bin');fs.chmodSync(f.home,0o500);
+ try {
+  // The launcher removal transaction cannot allocate while bin is read-only; the driver restore could.
+  const phaseRunner=async options=>{
+   if(options.phase!=='rollback')return deploy.wiringPhase(options);
+   fs.chmodSync(bin,0o500);try{return await deploy.wiringPhase(options);}finally{fs.chmodSync(bin,0o700);}
+  };
+  await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'wire_rollback_failed'});
+  assert.equal((await f.run(['--status'])).recoveryPending,1);
+ } finally {fs.chmodSync(f.home,0o700);}
+});
+test('first activation rollback fails closed when a wire transaction artifact remains', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude','.codex'])fs.mkdirSync(path.join(f.home,p),{mode:0o700});
+ const release=await f.run(['--prepare']);const leftover=path.join(f.home,'.codex/commands/.jhw-control-hook-link-txn.abc123');
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:lateCodexHookFailure(f,{beforeRestore:()=>fs.mkdirSync(leftover,{recursive:true,mode:0o700})})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'wire_rollback_failed'});
+ assert.equal(fs.existsSync(leftover),true);assert.equal((await f.run(['--status'])).recoveryPending,1);
+});
+test('first activation restore never follows a symlink swapped in between inspection and read', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude','.codex'])fs.mkdirSync(path.join(f.home,p),{mode:0o700});
+ const release=await f.run(['--prepare']);const config=path.join(f.home,'.claude.json');const outside=path.join(path.dirname(f.home),'outside.json');
+ // Swap the wired config for a symlink to identical bytes at the moment restore reads it.
+ let armed=false;const realOpen=fs.openSync,realRead=fs.readFileSync;
+ const swap=name=>{if(armed&&typeof name==='string'&&name.endsWith('/.claude.json')){armed=false;fs.renameSync(config,outside);fs.symlinkSync(outside,config);}};
+ fs.openSync=function(name,...rest){swap(name);return realOpen.call(this,name,...rest);};
+ fs.readFileSync=function(name,...rest){swap(name);return realRead.call(this,name,...rest);};
+ try {
+  await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:lateCodexHookFailure(f,{beforeRestore:()=>{armed=true;}})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'wire_rollback_failed'});
+ } finally {fs.openSync=realOpen;fs.readFileSync=realRead;}
+ assert.equal(armed,false);assert.equal(fs.readlinkSync(config),outside);assert.equal(fs.existsSync(outside),true);
+});
+test('first activation restore never deletes an object swapped in before a destructive step', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude','.codex'])fs.mkdirSync(path.join(f.home,p),{mode:0o700});
+ const release=await f.run(['--prepare']);const control=path.join(f.home,'.local/bin/jhw-control');
+ // Replace the verified wired link with a foreign one at the moment restore removes or moves it.
+ let armed=false;const realUnlink=fs.unlinkSync,realRename=fs.renameSync,realSymlink=fs.symlinkSync;
+ const swap=name=>{if(armed&&typeof name==='string'&&name.endsWith('/jhw-control')){armed=false;realUnlink(control);realSymlink('/foreign/control',control);}};
+ fs.unlinkSync=function(name,...rest){swap(name);return realUnlink.call(this,name,...rest);};
+ fs.renameSync=function(name,...rest){swap(name);return realRename.call(this,name,...rest);};
+ try {
+  await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:lateCodexHookFailure(f,{beforeRestore:()=>{armed=true;}})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'wire_rollback_failed'});
+ } finally {fs.unlinkSync=realUnlink;fs.renameSync=realRename;}
+ assert.equal(armed,false);assert.equal(fs.readlinkSync(control),'/foreign/control');
+ assert.equal((await f.run(['--status'])).recoveryPending,1);
+});
+test('owned-link removal accepts the unpublished managed skill root only for command directories', async t => {
+ const f=fixture(t);const skills=path.join(f.root,'.jhw-runtime/current/skills/claude');
+ const remove=relative=>{
+  const link=path.join(f.home,relative);fs.mkdirSync(path.dirname(link),{recursive:true,mode:0o700});fs.chmodSync(path.dirname(link),0o700);fs.symlinkSync(skills,link);
+  const transaction=path.join(path.dirname(link),'.jhw-control-hook-link-txn.test01');fs.mkdirSync(transaction,{mode:0o700});
+  const result=spawnSync(process.execPath,[path.join(f.root,'scripts/install-config.mjs'),'remove-control-hook-link-transaction',link,skills,f.root,transaction],{env:{...process.env,HOME:f.home},stdio:'ignore'});
+  return {status:result.status,link};
+ };
+ const command=remove('.codex/commands/jhw');assert.equal(command.status,0);assert.equal(fs.existsSync(command.link)||fs.lstatSync(path.dirname(command.link)).isDirectory()&&fs.readdirSync(path.dirname(command.link)).includes('jhw'),false);
+ const control=remove('.local/bin/jhw-control');assert.notEqual(control.status,0);assert.equal(fs.readlinkSync(control.link),skills);
+});
+test('first activation keeps a pending journal when a wired destination is replaced by a foreign object', async t => {
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.claude'),{mode:0o700});
+ const release=await f.run(['--prepare']);const control=path.join(f.home,'.local/bin/jhw-control');fs.chmodSync(f.home,0o500);
+ try {
+ const phaseRunner=async options=>{
+  if(options.phase!=='wire')return deploy.wiringPhase(options);
+  try{return await deploy.wiringPhase(options);}finally{fs.unlinkSync(control);fs.symlinkSync('/foreign/control',control);}
+ };
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'wire_rollback_failed'});
+ assert.equal(fs.readlinkSync(control),'/foreign/control');
+ assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/current')),false);
+ const runtime=path.join(f.root,'.jhw-runtime');
+ const states=fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')).map(name=>JSON.parse(fs.readFileSync(path.join(runtime,name,'state.json'))));
+ assert.deepEqual(states.map(state=>[state.status,state.phase]),[['pending','wire_rollback_failed']]);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);
+ await assert.rejects(f.run(['--activate',release.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ } finally {fs.chmodSync(f.home,0o700);}
+});
+test('first activation plan accepts destinations already exactly owned by this checkout', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude/commands','.gemini','.codex/skills','.codex/prompts','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const runtime=path.join(f.root,'.jhw-runtime');
+ fs.symlinkSync(path.join(runtime,'bootstrap/jhw-runtime-control'),path.join(f.home,'.local/bin/jhw-control'));
+ fs.symlinkSync(path.join(f.root,'scripts/jhw-control-hook'),path.join(f.home,'.local/bin/jhw-control-hook'));
+ fs.symlinkSync(path.join(runtime,'current/skills/claude'),path.join(f.home,'.claude/commands/jhw'));
+ fs.symlinkSync(path.join(runtime,'current/skills/codex/jhw-task'),path.join(f.home,'.codex/skills/jhw-task'));
+ fs.symlinkSync(path.join(runtime,'current/skills/claude/task.md'),path.join(f.home,'.codex/prompts/task.md'));
+ write(f.root,'mcp-server/dist/index.js','old');
+ write(f.home,'.claude.json',JSON.stringify({mcpServers:{'jhw-notion':{command:'node',args:[path.join(f.root,'mcp-server/dist/index.js')]}}}),0o600);
+ const release=await f.run(['--prepare']);
+ const activated=await f.run(['--activate',release.releaseId]);
+ assert.equal(activated.code,'DEPLOY_ACTIVATED');
+ assert.equal(fs.readlinkSync(path.join(f.home,'.local/bin/jhw-control-hook')),path.join(runtime,'bootstrap/jhw-runtime-hook'));
+ assert.equal(fs.readlinkSync(path.join(f.home,'.codex/skills/jhw-task')),path.join(runtime,'current/skills/codex/jhw-task'));
+});
 
 test('second inventory runs after both real leases and refuses a racing consumer before publication',async t=>{
  const f=fixture(t);const release=await f.run(['--prepare']);const original=fs.openSync;let added=false;
@@ -49,7 +290,7 @@ test('second inventory runs after both real leases and refuses a racing consumer
  assert.equal(added,true);assert.equal(readActivation({repositoryRoot:f.root}),null);assert.deepEqual(fs.readdirSync(f.home),[]);
 });
 test('validation opens admission while deployment remains serialized; failed reacquisition preserves pending state',async t=>{
- const f=fixture(t);const release=await f.run(['--prepare']);let shared;const phases=[];
+ const f=fixture(t);host(f);const release=await f.run(['--prepare']);let shared;const phases=[];
  try{await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:async options=>{
    phases.push(options.phase);
    assert.throws(()=>acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock')),{code:'DEPLOY_LOCK_CONTENDED'});
@@ -146,7 +387,9 @@ test('failed rollback validation requires manual recovery instead of another rol
 test('real mutation worker retains writer leases after its parent exits and never restores on EOF',async t=>{
  const f=fixture(t);host(f);const hostPath=path.join(f.home,'.local/bin/jhw-control-host');const original=fs.readFileSync(hostPath,'utf8');
  const ready=path.join(f.home,'worker-ready'),resume=path.join(f.home,'worker-resume');
- fs.writeFileSync(hostPath,`#!/bin/sh\ntouch '${ready}'\nwhile [ ! -f '${resume}' ]; do /bin/sleep 0.01; done\n${original.split('\n').slice(1).join('\n')}`);
+ const planned=path.join(f.home,'plan-seen');
+ // The read-only plan queries the host first; block only the mutation worker.
+ fs.writeFileSync(hostPath,`#!/bin/sh\nif [ ! -f '${planned}' ]; then touch '${planned}'; else touch '${ready}'\nwhile [ ! -f '${resume}' ]; do /bin/sleep 0.01; done; fi\n${original.split('\n').slice(1).join('\n')}`);
  const release=await f.run(['--prepare']);
  const code=`import fs from 'node:fs';import {runDeployment} from ${JSON.stringify(new URL('./runtime-deploy.mjs',import.meta.url).href)};setInterval(()=>{if(fs.existsSync(${JSON.stringify(ready)}))process.exit(19);},5);await runDeployment(${JSON.stringify({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate',release.releaseId]})});`;
  const child=spawn(process.execPath,['--input-type=module','-e',code],{stdio:['ignore','ignore','ignore']});await once(child,'exit');
@@ -181,7 +424,7 @@ test('later foreign MCP replacement is preserved and refused before pointer chan
 
 
 test('deployment journal parent substitution cannot redirect checkpoint writes',async t=>{
- const f=fixture(t);const release=await f.run(['--prepare']);const foreign=path.join(f.home,'foreign');fs.mkdirSync(foreign,{mode:0o700});const original=fs.openSync;let swapped=false;
+ const f=fixture(t);host(f);const release=await f.run(['--prepare']);const foreign=path.join(f.home,'foreign');fs.mkdirSync(foreign,{mode:0o700});const original=fs.openSync;let swapped=false;
  fs.openSync=function(name,...args){if(!swapped&&path.basename(String(name)).startsWith('.write.')){const runtime=path.join(f.root,'.jhw-runtime');const candidate=fs.readdirSync(runtime).find(n=>/^\.deploy\./.test(n));if(candidate){swapped=true;const dir=path.join(runtime,candidate);fs.renameSync(dir,dir+'.retained');fs.symlinkSync(foreign,dir);}}return original.call(this,name,...args);};
  try{await assert.rejects(f.run(['--activate',release.releaseId]));}finally{fs.openSync=original;}
  assert.equal(swapped,true);assert.deepEqual(fs.readdirSync(foreign),[]);assert.equal(readActivation({repositoryRoot:f.root}),null);
@@ -268,12 +511,12 @@ test('public CLI inventories real sessions and rejects arguments with bounded no
 
 
 test('bounded mutation worker timeout preserves evidence and leases until its own process exits',async t=>{
- const f=fixture(t);host(f);const hostPath=path.join(f.home,'.local/bin/jhw-control-host');fs.writeFileSync(hostPath,fs.readFileSync(hostPath,'utf8').replace('#!/bin/sh\n','#!/bin/sh\n/bin/sleep 1\n'));const release=await f.run(['--prepare']);await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseTimeoutMs:50}),{code:'DEPLOY_WIRING_FAILED'});assert.equal((await f.run(['--status'])).recoveryPending,1);assert.throws(()=>acquireLease(path.join(f.root,'.jhw-runtime/admission.lock')),{code:'DEPLOY_LOCK_CONTENDED'});const end=Date.now()+5000;while(true){try{const lock=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));lock.close();break;}catch(error){if(error.code!=='DEPLOY_LOCK_CONTENDED'||Date.now()>end)throw error;await new Promise(resolve=>setTimeout(resolve,20));}}
+ const f=fixture(t);host(f);const hostPath=path.join(f.home,'.local/bin/jhw-control-host');fs.writeFileSync(hostPath,fs.readFileSync(hostPath,'utf8').replace('#!/bin/sh\n','#!/bin/sh\n/bin/sleep 1\n'));const release=await f.run(['--prepare']);await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseTimeoutMs:50}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'wire_rollback_failed'});assert.equal(readActivation({repositoryRoot:f.root}),null);assert.equal((await f.run(['--status'])).recoveryPending,1);assert.throws(()=>acquireLease(path.join(f.root,'.jhw-runtime/admission.lock')),{code:'DEPLOY_LOCK_CONTENDED'});const end=Date.now()+5000;while(true){try{const lock=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));lock.close();break;}catch(error){if(error.code!=='DEPLOY_LOCK_CONTENDED'||Date.now()>end)throw error;await new Promise(resolve=>setTimeout(resolve,20));}}
 });
 
 
 test('journal directory replacement cannot chmod a foreign symlink target',async t=>{
- const f=fixture(t);const release=await f.run(['--prepare']);const foreign=path.join(f.home,'foreign-mode');fs.mkdirSync(foreign,{mode:0o755});fs.chmodSync(foreign,0o755);const original=fs.mkdirSync;let swapped=false;
+ const f=fixture(t);host(f);const release=await f.run(['--prepare']);const foreign=path.join(f.home,'foreign-mode');fs.mkdirSync(foreign,{mode:0o755});fs.chmodSync(foreign,0o755);const original=fs.mkdirSync;let swapped=false;
  fs.mkdirSync=function(name,...args){const result=original.call(this,name,...args);if(!swapped&&path.basename(String(name)).startsWith('.deploy.')){swapped=true;fs.renameSync(name,String(name)+'.retained');fs.symlinkSync(foreign,name);}return result;};
  try{await assert.rejects(f.run(['--activate',release.releaseId]));}finally{fs.mkdirSync=original;}
  assert.equal(swapped,true);assert.equal(fs.statSync(foreign).mode&0o777,0o755);assert.deepEqual(fs.readdirSync(foreign),[]);
@@ -296,7 +539,7 @@ function homeObservation(home) {
       const info = fs.lstatSync(file, {bigint:true});
       entries.push({
         name:relative, mode:String(info.mode), ino:String(info.ino), mtimeNs:String(info.mtimeNs),
-        content:info.isSymbolicLink() ? fs.readlinkSync(file) : info.isFile() ? fs.readFileSync(file).toString('base64') : null,
+        content:info.isSymbolicLink() ? fs.readlinkSync(file) : info.isFile() ? ((info.mode & 0o400n) ? fs.readFileSync(file).toString('base64') : 'unreadable') : null,
       });
       if (info.isDirectory()) visit(relative);
     }
