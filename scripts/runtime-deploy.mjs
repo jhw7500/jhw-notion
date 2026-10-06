@@ -16,7 +16,37 @@ function parse(argv) {
  if(argv.length===0)return {operation:'default'};
  if(argv.length===1&&['--prepare','--status','--rollback','--uninstall','--help','-h'].includes(argv[0]))return {operation:argv[0].replace(/^--?/,'')};
  if(argv.length===2&&argv[0]==='--activate'&&RELEASE.test(argv[1]))return {operation:'activate',releaseId:argv[1]};
+ if(argv.length===4&&argv[0]==='--activate'&&RELEASE.test(argv[1])&&argv[2]==='--adopt-from'&&argv[3]!=='')return {operation:'activate',releaseId:argv[1],adoptFrom:argv[3]};
  fail('DEPLOY_ARGUMENTS_INVALID');
+}
+// --adopt-from names a distinct, canonical sibling checkout of this repository.
+function validateAdoptSource(repositoryRoot,source) {
+ const invalid=()=>fail('DEPLOY_WIRING_CONFLICT','adopt_source_invalid');
+ if(!path.isAbsolute(source)||source!==path.resolve(source)||source.split('/').includes('..'))invalid();
+ let real;let root;try{real=fs.realpathSync(source);root=fs.realpathSync(repositoryRoot);}catch{invalid();}
+ if(real!==source)invalid();
+ const within=(parent,child)=>{const relative=path.relative(parent,child);return relative===''||(!relative.startsWith('..')&&!path.isAbsolute(relative));};
+ if(within(source,root)||within(root,source))invalid();
+ // P must itself be a work-tree root: discovery may not climb above P.
+ const git=(directory,args,ceiling)=>{
+  const env={PATH:'/usr/bin:/bin',LC_ALL:'C',HOME:'/nonexistent',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',...(ceiling?{GIT_CEILING_DIRECTORIES:path.dirname(directory)}:{})};
+  const result=spawnSync('git',['-C',directory,'rev-parse',...args],{env,encoding:'utf8',stdio:['ignore','pipe','ignore'],timeout:10000,maxBuffer:64*1024});
+  if(result.status!==0||!result.stdout.endsWith('\n'))invalid();
+  return result.stdout.slice(0,-1);
+ };
+ const canonical=candidate=>{try{return fs.realpathSync(candidate);}catch{invalid();}};
+ if(git(source,['--is-inside-git-dir'],true)!=='false'||canonical(git(source,['--show-toplevel'],true))!==source)invalid();
+ if(canonical(path.resolve(source,git(source,['--git-common-dir'],true)))!==canonical(path.resolve(root,git(root,['--git-common-dir']))))invalid();
+ // A checkout that already runs managed wiring is not a legacy install.
+ const wiring=path.join(source,'.jhw-runtime/wiring.json');
+ if(exists(wiring)) {
+  let installed;try{const info=fs.lstatSync(wiring);if(!info.isFile()||info.size>4096)invalid();installed=JSON.parse(fs.readFileSync(wiring,'utf8')).installed;}catch{invalid();}
+  if(installed!==false)invalid();
+ }
+}
+// The adopt root reaches helpers only through this variable, never inherited.
+function adoptEnvironment(env,adoptFrom) {
+ delete env.JHW_ADOPT_FROM;if(adoptFrom)env.JHW_ADOPT_FROM=adoptFrom;return env;
 }
 function pinnedDirectory(directory) {
  const before=trustedDirectory(directory);
@@ -66,7 +96,7 @@ function privateRead(file,{limit=256*1024}={}) {
 const WIRE_PARENTS=['.local','.local/bin','.claude/commands','.gemini/commands','.config/opencode/skills','.codex/skills','.codex/prompts'];
 // Retained first-migration evidence only. No automatic restoration and no scan
 // of unrelated HOME content. Every byte read is bounded and descriptor-relative.
-function wiringPreimages({repositoryRoot,home,releaseId}) {
+function wiringPreimages({repositoryRoot,home,releaseId,adoptFrom}) {
  // Directories wire may create come first so a restore visits them last.
  const names=[...WIRE_PARENTS,'.local/bin/jhw-control','.local/bin/jhw-control-hook','.claude.json','.claude/settings.json','.gemini/settings.json','.codex/config.toml','.codex/hooks.json','.config/opencode/opencode.json','.claude/commands/jhw','.gemini/commands/jhw','.config/opencode/skills/jhw','.codex/commands/jhw'];
  if(releaseId) {
@@ -74,6 +104,16 @@ function wiringPreimages({repositoryRoot,home,releaseId}) {
   for(const [source,target,pattern] of [['claude','.codex/prompts',/^(?!AGENTS\.md$).+\.md$/],['codex','.codex/skills',/^jhw-/]]) {
    const directory=path.join(skills,source);
    if(exists(directory))for(const name of fs.readdirSync(directory).filter(n=>pattern.test(n)))names.push(`${target}/${name}`);
+  }
+ }
+ // Adoption may remove adopt-root links whose names this release does not ship.
+ if(adoptFrom) {
+  for(const directory of ['.codex/skills','.codex/prompts']) {
+   const parent=path.join(home,directory);if(!exists(parent))continue;
+   for(const name of fs.readdirSync(parent)) {
+    const file=path.join(parent,name);
+    if(fs.lstatSync(file).isSymbolicLink()&&fs.readlinkSync(file).startsWith(`${adoptFrom}/`)&&!names.includes(`${directory}/${name}`))names.push(`${directory}/${name}`);
+   }
   }
  }
  if(names.length>1024)fail('DEPLOY_RECOVERY_REQUIRED');
@@ -242,19 +282,19 @@ function withEntry(home,name,visit,limit) {
 }
 // Replays the candidate config editor on a private copy of the preimage: the
 // bytes its wire would have published (null when it would not have written).
-function wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry}) {
+function wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry,adoptFrom}) {
  const operation=MCP_REGISTRATION[entry.path];if(!operation)return null;
  const copy=path.join(scratch,randomBytes(8).toString('hex'));
  if(entry.type==='file')fs.writeFileSync(copy,Buffer.from(entry.bytes,'base64'),{mode:entry.mode,flag:'wx'});
  const editor=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts/install-config.mjs');trustedFile(editor);
- const result=spawnSync(process.execPath,[editor,operation,copy,path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry'),repositoryRoot,'20000101000000'],{env:{HOME:home,PATH:[path.dirname(process.execPath),'/usr/bin','/bin'].join(':')},stdio:'ignore',timeout:15000});
+ const result=spawnSync(process.execPath,[editor,operation,copy,path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry'),repositoryRoot,'20000101000000'],{env:adoptEnvironment({HOME:home,PATH:[path.dirname(process.execPath),'/usr/bin','/bin'].join(':')},adoptFrom),stdio:'ignore',timeout:15000});
  return result.status===0&&fs.lstatSync(copy).size<=16*FILE_LIMIT?fs.readFileSync(copy):null;
 }
 // Bounded first-activation restore after a failed wire. Only an object this
 // deployment's wire provably produced is removed or replaced; any other
 // difference fails closed. Every preimage path and every directory listing
 // wire could write into must then equal its pre-mutation record.
-function restoreFirstWiring({repositoryRoot,home,releaseId,directory}) {
+function restoreFirstWiring({repositoryRoot,home,releaseId,directory,adoptFrom}) {
  const {entries}=privateRead(path.join(directory,'before.json'),{limit:PREIMAGE_LIMIT});
  const listings=privateRead(path.join(directory,'listings.json'),{limit:LISTING_LIMIT});
  const scratch=createPrivateDirectory(directory,'restore');
@@ -264,7 +304,7 @@ function restoreFirstWiring({repositoryRoot,home,releaseId,directory}) {
   // A registration may legitimately grow an accepted preimage past FILE_LIMIT
   // (e.g. pretty-printing); the read bound covers exactly that replayed output.
   const link=wiredLinkTarget(repositoryRoot,entry.path);
-  const wired=!link&&['file','special'].includes(live)?wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry}):null;
+  const wired=!link&&['file','special'].includes(live)?wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry,adoptFrom}):null;
   const limit=Math.max(FILE_LIMIT,wired?.length??0);
   const restored=withEntry(home,entry.path,(parent,view)=>{
    if(matchesPreimage(view,entry))return true;
@@ -372,12 +412,13 @@ initialize_wiring_directories
 select_managed_wiring
 plan_wiring "$4"
 `;
-const PLAN_CONFLICTS = ['control_host','tui_root','pending_transaction','unsafe_parent','parent_unusable','control_link','hook_link','command_dir','skill_link','prompt_link','mcp_entry','hook_config'];
-async function planWiring({repositoryRoot,home,environment,releaseId,planTimeoutMs}) {
+const PLAN_CONFLICTS = ['adopt_env_unpreservable','control_host','tui_root','pending_transaction','unsafe_parent','parent_unusable','control_link','hook_link','command_dir','skill_link','prompt_link','mcp_entry','hook_config'];
+async function planWiring({repositoryRoot,home,environment,releaseId,planTimeoutMs,adoptFrom}) {
  const release=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId);
  const library=path.join(release,'scripts/install-wiring.sh');const editor=path.join(release,'scripts/install-config.mjs');trustedFile(library);trustedFile(editor);
  const env={...environment,HOME:home,PATH:[path.dirname(process.execPath),'/usr/local/bin','/usr/bin','/bin'].join(':')};
  for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV','SHELLOPTS','BASHOPTS'])delete env[key];
+ adoptEnvironment(env,adoptFrom);
  // Own process group: the plan is read-only, so any straggler is killed outright.
  const child=spawn('/bin/bash',['-c',PLAN_WORKER,'jhw-wiring-plan',repositoryRoot,library,editor,path.join(release,'skills')],{cwd:release,env,stdio:['ignore','pipe','ignore'],detached:true});
  const killGroup=()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}};
@@ -394,7 +435,7 @@ async function planWiring({repositoryRoot,home,environment,releaseId,planTimeout
  fail('DEPLOY_WIRING_CONFLICT',code===3&&!overflow&&PLAN_CONFLICTS.includes(conflict?.[1])?conflict[1]:'plan_unverified');
 }
 
-export async function wiringPhase({repositoryRoot,home,environment,phase,managed,deployLease,admissionLease,directory,state,phaseTimeoutMs,candidateReleaseId}) {
+export async function wiringPhase({repositoryRoot,home,environment,phase,managed,deployLease,admissionLease,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom}) {
  // Before pointer publication a first activation names its validated candidate.
  const selected=candidateReleaseId?{releaseId:candidateReleaseId}:managed?readActivation({repositoryRoot}):null;
  const scripts=selected?path.join(repositoryRoot,'.jhw-runtime/releases',selected.releaseId,'scripts'):path.join(repositoryRoot,'scripts');
@@ -407,6 +448,7 @@ export async function wiringPhase({repositoryRoot,home,environment,phase,managed
   const env={...environment,HOME:home,PATH:[path.dirname(process.execPath),'/usr/local/bin','/usr/bin','/bin'].join(':')};
   // Never pass Node loader or shell startup injection into maintenance workers.
   for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV','SHELLOPTS','BASHOPTS'])delete env[key];
+  adoptEnvironment(env,adoptFrom);
   logDirectory.verify();
   const skillSource=candidateReleaseId?path.join(repositoryRoot,'.jhw-runtime/releases',candidateReleaseId,'skills'):'';
   const child=spawn('/bin/bash',['-c',WORKER,'jhw-wiring-phase',repositoryRoot,library,phase,managed?'managed':'legacy',editor,skillSource],{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd,admissionLease?.fd??'ignore','pipe']});
@@ -427,6 +469,7 @@ export async function wiringPhase({repositoryRoot,home,environment,phase,managed
 async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,logFd}) {
  const env={...environment,HOME:home,PATH:[path.dirname(process.execPath),'/usr/local/bin','/usr/bin','/bin'].join(':')};
  for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV'])delete env[key];
+ adoptEnvironment(env);
  const child=spawn(process.execPath,[path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp'],{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd]});
  let input='';let bytes=0;let stderrBytes=0;let stage=0;let failure=false;let logging=true;
  child.stdin.on('error',()=>{failure=true;});
@@ -457,7 +500,7 @@ async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,l
 export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000,planTimeoutMs=45000}={}) {
  const command=parse(argv);
  if([phaseTimeoutMs,planTimeoutMs].some(value=>!Number.isInteger(value)||value<1||value>45000))fail('DEPLOY_ARGUMENTS_INVALID');
- if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate RELEASE_ID','--rollback','--uninstall']};
+ if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--rollback','--uninstall']};
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
  const runtime=path.join(repositoryRoot,'.jhw-runtime');
@@ -468,13 +511,16 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
  if(command.operation==='default'&&existingInstallation(repositoryRoot,home))return {code:'DEPLOY_EXPLICIT_ACTIVATION_REQUIRED',next:['--prepare','--activate RELEASE_ID']};
  if(command.operation==='prepare')return {code:'DEPLOY_PREPARED',...await prepareRelease({repositoryRoot,build})};
  if(command.operation==='default'){const release=await prepareRelease({repositoryRoot,build});command.operation='activate';command.releaseId=release.releaseId;}
- const before=requireQuiescence(inventoryOptions); // Before any shared mutation.
+ if(command.adoptFrom)validateAdoptSource(repositoryRoot,command.adoptFrom);
+ // Adoption also requires the legacy checkout to have no consumers.
+ const quiesce=()=>{const result=requireQuiescence(inventoryOptions);if(command.adoptFrom)requireQuiescence({...inventoryOptions,repositoryRoot:command.adoptFrom});return result;};
+ const before=quiesce(); // Before any shared mutation.
  prepareStore(repositoryRoot);
  let writer;let admission;let directory;let state;
  try {
   writer=acquireLease(path.join(runtime,'deploy.lock'),{create:true});
   admission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
-  const after=requireQuiescence(inventoryOptions);
+  const after=quiesce();
   const previous=readActivation({repositoryRoot});
   const abandoned=pending(runtime);
   let recovery;
@@ -501,21 +547,22 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   const wiringFile=path.join(runtime,'wiring.json');
   const wiringPreviouslyInstalled = exists(wiringFile) && privateRead(wiringFile).installed === true;
   let managed = wiringPreviouslyInstalled;
+  if(command.adoptFrom&&managed)fail('DEPLOY_ARGUMENTS_INVALID','adopt_requires_first_activation');
   if(recovery&&!managed)fail('DEPLOY_RECOVERY_REQUIRED');
   if(command.operation==='activate')validateRelease({repositoryRoot,releaseId:command.releaseId});
   if(command.operation==='rollback'&&!previous?.predecessorActivationId)fail('DEPLOY_PREDECESSOR_INVALID');
   // First managed activation: refuse foreign wiring destinations before any mutation.
-  if(command.operation==='activate'&&!managed)await planWiring({repositoryRoot,home,environment,releaseId:command.releaseId,planTimeoutMs});
+  if(command.operation==='activate'&&!managed)await planWiring({repositoryRoot,home,environment,releaseId:command.releaseId,planTimeoutMs,adoptFrom:command.adoptFrom});
   directory=createPrivateDirectory(runtime,`.deploy.${randomBytes(16).toString('hex')}`);
   state={version:1,status:'pending',operation:command.operation,phase:'before_mutation',previous,variables:{}};checkpoint(directory,state);
-  const run=async (phase,candidateReleaseId)=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs,candidateReleaseId});};
+  const run=async (phase,candidateReleaseId)=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom:command.adoptFrom});};
   const pointerIntent=destination=>{state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);};
   let current=previous;
   if(managed&&command.operation!=='uninstall') {
    await run('verify');
    requireCompatibleWiringTopology({repositoryRoot,home,previous,command});
   }
-  if(!managed||command.operation==='uninstall')privateWrite(path.join(directory,'before.json'),wiringPreimages({repositoryRoot,home,releaseId:command.releaseId??previous?.releaseId}),{exclusive:true});
+  if(!managed||command.operation==='uninstall')privateWrite(path.join(directory,'before.json'),wiringPreimages({repositoryRoot,home,releaseId:command.releaseId??previous?.releaseId,adoptFrom:command.adoptFrom}),{exclusive:true});
   if(!managed&&command.operation==='activate')privateWrite(path.join(directory,'listings.json'),wiringListings(home),{exclusive:true});
   if(command.operation==='uninstall') {
    state.mutationStarted=true;checkpoint(directory,state);
@@ -527,7 +574,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    const undoFirstWiring=async()=>{
     let restored=false;
     if(!state.stateIncomplete&&!state.workerDetached) {
-     try {await run('rollback',command.releaseId);restored=restoreFirstWiring({repositoryRoot,home,releaseId:command.releaseId,directory});}catch{restored=false;}
+     try {await run('rollback',command.releaseId);restored=restoreFirstWiring({repositoryRoot,home,releaseId:command.releaseId,directory,adoptFrom:command.adoptFrom});}catch{restored=false;}
     }
     if(restored){state.status='complete';state.phase='wire_rolled_back';checkpoint(directory,state);fail('DEPLOY_WIRING_FAILED','first_activation_rolled_back');}
     state.phase='wire_rollback_failed';checkpoint(directory,state);fail('DEPLOY_RECOVERY_REQUIRED','wire_rollback_failed');
@@ -575,7 +622,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    // Every later mutation requires actual reacquisition and another inventory.
    try {
     admission = acquireLease(path.join(runtime, 'admission.lock'));
-    requireQuiescence(inventoryOptions);
+    quiesce();
    } catch {
     state.phase = 'recovery_blocked';
     checkpoint(directory, state);

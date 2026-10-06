@@ -744,3 +744,161 @@ test('managed phases tolerate a retained release library that predates a worker 
  assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/wiring.json'))).installed,false);
  assert.equal((await f.run(['--status'])).recoveryPending,0);
 });
+// --adopt-from: a legacy install from sibling checkout P of the same repository.
+function privateDirectory(root, relative) {
+ let current=root;for(const part of relative.split('/')){current=path.join(current,part);if(!fs.existsSync(current))fs.mkdirSync(current);fs.chmodSync(current,0o700);}
+ return current;
+}
+const hookGroups = adapter => JSON.stringify({hooks:{SessionEnd:[{hooks:[{type:'command',command:`"$HOME/.local/bin/jhw-control-hook" --adapter ${adapter} --event SessionEnd`,timeout:3}]}]}},null,2)+'\n';
+function adoptFixture(t) {
+ const f=fixture(t);host(f);const outer=path.dirname(f.root);const P=path.join(outer,'legacy');
+ assert.equal(spawnSync('git',['-C',f.root,'worktree','add','-q','--detach',P]).status,0);
+ write(P,'mcp-server/dist/index.js','legacy mcp');write(P,'mcp-server/dist/control/cli.js','#!/bin/sh\n',0o755);
+ write(P,'skills/codex/jhw-old/SKILL.md','legacy only');write(P,'skills/claude/old.md','legacy only');
+ const h=f.home;for(const d of ['.local/bin','.claude/commands','.gemini/commands','.config/opencode/skills','.codex/skills','.codex/prompts'])privateDirectory(h,d);
+ const index=path.join(P,'mcp-server/dist/index.js');
+ fs.symlinkSync(path.join(P,'mcp-server/dist/control/cli.js'),path.join(h,'.local/bin/jhw-control'));
+ fs.symlinkSync(path.join(P,'scripts/jhw-control-hook'),path.join(h,'.local/bin/jhw-control-hook'));
+ for(const d of ['.claude/commands/jhw','.gemini/commands/jhw','.config/opencode/skills/jhw'])fs.symlinkSync(path.join(P,'skills/claude'),path.join(h,d));
+ for(const n of ['jhw-task','jhw-old'])fs.symlinkSync(path.join(P,'skills/codex',n),path.join(h,'.codex/skills',n));
+ for(const n of ['task.md','old.md'])fs.symlinkSync(path.join(P,'skills/claude',n),path.join(h,'.codex/prompts',n));
+ write(h,'.claude.json',JSON.stringify({projects:{keep:true},mcpServers:{'jhw-notion':{type:'stdio',command:'node',args:[index],env:{NOTION_API_KEY:'${NOTION_API_KEY}'}}}},null,2)+'\n',0o600);
+ write(h,'.gemini/settings.json',JSON.stringify({mcpServers:{'jhw-notion':{command:'node',args:[index],env:{NOTION_API_KEY:'real-secret-value'}}}},null,2)+'\n',0o600);
+ write(h,'.config/opencode/opencode.json',JSON.stringify({mcp:{'jhw-notion':{type:'local',command:['node',index],enabled:true,environment:{NOTION_API_KEY:'opencode-value'}}}},null,2)+'\n',0o600);
+ write(h,'.codex/config.toml',`[other]\nkey = 1\n\n[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([index])}\nenv_vars = ["NOTION_API_KEY"]\n`,0o600);
+ write(h,'.claude/settings.json',hookGroups('claude'),0o600);write(h,'.codex/hooks.json',hookGroups('codex'),0o600);
+ const adopt=async (argv=[],options={})=>{const release=await f.run(['--prepare']);return deploy.runDeployment({...f.options,argv:['--activate',release.releaseId,'--adopt-from',argv[0]??P],...options});};
+ return {f,P,index,adopt};
+}
+function treeDigest(root) {
+ return fs.readdirSync(root,{recursive:true}).sort().map(name=>{const file=path.join(root,name);const info=fs.lstatSync(file);return [name,info.mode,info.isSymbolicLink()?fs.readlinkSync(file):info.isFile()?fs.readFileSync(file).toString('base64'):null];});
+}
+test('adopt-from takes over every legacy destination of sibling checkout P', async t => {
+ const {f,P,adopt}=adoptFixture(t);const legacy=treeDigest(P);const h=f.home;const runtime=path.join(f.root,'.jhw-runtime');
+ assert.equal((await adopt()).code,'DEPLOY_ACTIVATED');
+ assert.equal(fs.readlinkSync(path.join(h,'.local/bin/jhw-control')),path.join(runtime,'bootstrap/jhw-runtime-control'));
+ assert.equal(fs.readlinkSync(path.join(h,'.local/bin/jhw-control-hook')),path.join(runtime,'bootstrap/jhw-runtime-hook'));
+ for(const d of ['.claude/commands/jhw','.gemini/commands/jhw','.config/opencode/skills/jhw'])assert.equal(fs.readlinkSync(path.join(h,d)),path.join(runtime,'current/skills/claude'));
+ assert.deepEqual(fs.readdirSync(path.join(h,'.codex/skills')),['jhw-task']);assert.deepEqual(fs.readdirSync(path.join(h,'.codex/prompts')),['task.md']);
+ assert.equal(fs.readlinkSync(path.join(h,'.codex/skills/jhw-task')),path.join(runtime,'current/skills/codex/jhw-task'));
+ const entry=[path.join(runtime,'bootstrap/jhw-runtime-entry'),'mcp'];
+ const claude=JSON.parse(fs.readFileSync(path.join(h,'.claude.json')));assert.deepEqual(claude.mcpServers['jhw-notion'].args,entry);assert.deepEqual(claude.mcpServers['jhw-notion'].env,{NOTION_API_KEY:'${NOTION_API_KEY}'});assert.deepEqual(claude.projects,{keep:true});
+ const gemini=JSON.parse(fs.readFileSync(path.join(h,'.gemini/settings.json')));assert.deepEqual(gemini.mcpServers['jhw-notion'].args,entry);assert.deepEqual(gemini.mcpServers['jhw-notion'].env,{NOTION_API_KEY:'real-secret-value'});
+ const opencode=JSON.parse(fs.readFileSync(path.join(h,'.config/opencode/opencode.json')));assert.deepEqual(opencode.mcp['jhw-notion'].command,['node',...entry]);assert.deepEqual(opencode.mcp['jhw-notion'].environment,{NOTION_API_KEY:'opencode-value'});
+ const toml=fs.readFileSync(path.join(h,'.codex/config.toml'),'utf8');assert.match(toml,/env_vars = \["NOTION_API_KEY"\]/);assert.match(toml,/"mcp"\]/);assert.doesNotMatch(toml,/legacy\/mcp-server/);
+ assert.equal(fs.readFileSync(path.join(h,'.claude/settings.json'),'utf8'),hookGroups('claude'));
+ assert.deepEqual(treeDigest(P),legacy);
+});
+const adoptDecoys = [
+ ['third checkout link', {code:'DEPLOY_WIRING_CONFLICT',reason:'command_dir'}, ({f})=>{const Q=path.join(path.dirname(f.root),'third');assert.equal(spawnSync('git',['-C',f.root,'worktree','add','-q','--detach',Q]).status,0);const d=path.join(f.home,'.claude/commands/jhw');fs.unlinkSync(d);fs.symlinkSync(path.join(Q,'skills/claude'),d);}],
+ ['prefix-sharing link', {code:'DEPLOY_WIRING_CONFLICT',reason:'command_dir'}, ({f,P})=>{fs.mkdirSync(`${P}-other/skills/claude`,{recursive:true});const d=path.join(f.home,'.claude/commands/jhw');fs.unlinkSync(d);fs.symlinkSync(`${P}-other/skills/claude`,d);}],
+ ['relative link into P', {code:'DEPLOY_WIRING_CONFLICT',reason:'command_dir'}, ({f,P})=>{const d=path.join(f.home,'.claude/commands/jhw');fs.unlinkSync(d);fs.symlinkSync(path.relative(path.dirname(d),path.join(P,'skills/claude')),d);}],
+ ['trailing-slash link', {code:'DEPLOY_WIRING_CONFLICT',reason:'skill_link'}, ({f,P})=>{const d=path.join(f.home,'.codex/skills/jhw-task');fs.unlinkSync(d);fs.symlinkSync(path.join(P,'skills/codex/jhw-task')+'/',d);}],
+ ['P-only link with a non-exact target', {code:'DEPLOY_WIRING_CONFLICT',reason:'prompt_link'}, ({f,P})=>{fs.symlinkSync(path.join(P,'skills/codex/jhw-old/SKILL.md'),path.join(f.home,'.codex/prompts/stray.md'));}],
+ ['MCP entry with extra args', {code:'DEPLOY_WIRING_CONFLICT',reason:'mcp_entry'}, ({f,index})=>{write(f.home,'.claude.json',JSON.stringify({mcpServers:{'jhw-notion':{command:'node',args:[index,'--debug']}}}),0o600);}],
+ ['MCP entry with an unpreservable key', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_env_unpreservable'}, ({f,index})=>{write(f.home,'.gemini/settings.json',JSON.stringify({mcpServers:{'jhw-notion':{command:'node',args:[index],cwd:'/tmp'}}}),0o600);}],
+ ['P through a symlink', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({f,P})=>{const alias=path.join(path.dirname(f.root),'alias');fs.symlinkSync(P,alias);return alias;}],
+ ['P from another repository', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({f})=>{const other=path.join(path.dirname(f.root),'other');fs.mkdirSync(other);assert.equal(spawnSync('git',['init','-q',other]).status,0);return other;}],
+ ['P equal to W', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({f})=>f.root],
+ ['P ancestor of W', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({f})=>path.dirname(f.root)],
+ ['P with a dot-dot segment', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({f,P})=>`${f.root}/../${path.basename(P)}`],
+ ['newline-suffixed link into P', {code:'DEPLOY_WIRING_CONFLICT',reason:'command_dir'}, ({f,P})=>{const d=path.join(f.home,'.claude/commands/jhw');fs.unlinkSync(d);fs.symlinkSync(`${path.join(P,'skills/claude')}\n`,d);}],
+ ['newline-suffixed P-only link', {code:'DEPLOY_WIRING_CONFLICT',reason:'skill_link'}, ({f,P})=>{const d=path.join(f.home,'.codex/skills/jhw-old');fs.unlinkSync(d);fs.symlinkSync(`${path.join(P,'skills/codex/jhw-old')}\n`,d);}],
+ ['a sub-directory of a sibling checkout', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({P})=>path.join(P,'skills')],
+ ['the repository git directory', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({f})=>path.join(f.root,'.git')],
+ ['a checkout that already runs managed wiring', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({P})=>{privateDirectory(P,'.jhw-runtime');write(P,'.jhw-runtime/wiring.json','{"version":1,"installed":true}\n',0o600);}],
+ ['Codex entry with an unpreservable key', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_env_unpreservable'}, ({f,index})=>{write(f.home,'.codex/config.toml',`[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([index])}\ncwd = "/tmp"\n`,0o600);}],
+ ['a real directory at a Codex skill name', {code:'DEPLOY_WIRING_CONFLICT',reason:'skill_link'}, ({f})=>{const d=path.join(f.home,'.codex/skills/jhw-task');fs.unlinkSync(d);fs.mkdirSync(d,{mode:0o700});}],
+];
+for (const [label, expected, decoy] of adoptDecoys) {
+ test(`adopt-from refuses ${label} with zero mutation`, async t => {
+  const fixture=adoptFixture(t);const {f,P,adopt}=fixture;const source=decoy(fixture)??P;
+  const shape=homeShape(f.home);const legacy=treeDigest(P);const phases=[];
+  await assert.rejects(adopt([source],{phaseRunner:async ({phase})=>{phases.push(phase);}}),expected);
+  assert.deepEqual(phases,[]);assert.deepEqual(homeShape(f.home),shape);assert.deepEqual(treeDigest(P),legacy);
+  const runtime=path.join(f.root,'.jhw-runtime');
+  assert.deepEqual(fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')||['current','bootstrap','wiring.json'].includes(name)),[]);
+ });
+}
+test('adopt-from is refused for an already managed installation', async t => {
+ const {f,P}=adoptFixture(t);const release=await f.run(['--prepare']);
+ for(const p of ['.local/bin/jhw-control','.local/bin/jhw-control-hook','.claude/commands/jhw','.gemini/commands/jhw','.config/opencode/skills/jhw','.codex/skills/jhw-task','.codex/skills/jhw-old','.codex/prompts/task.md','.codex/prompts/old.md','.claude.json','.gemini/settings.json','.config/opencode/opencode.json','.codex/config.toml'])fs.rmSync(path.join(f.home,p),{force:true});
+ await f.run(['--activate',release.releaseId]);const shape=homeShape(f.home);
+ await assert.rejects(f.run(['--activate',release.releaseId,'--adopt-from',P]),{code:'DEPLOY_ARGUMENTS_INVALID',reason:'adopt_requires_first_activation'});
+ assert.deepEqual(homeShape(f.home),shape);
+ for(const argv of [['--rollback','--adopt-from',P],['--uninstall','--adopt-from',P],['--prepare','--adopt-from',P],['--adopt-from',P]])await assert.rejects(f.run(argv),{code:'DEPLOY_ARGUMENTS_INVALID'});
+});
+for (const script of ['mcp-server/dist/index.js','mcp-server/dist/control/cli.js']) {
+ test(`adopt-from refuses while node runs ${script} of P`, async t => {
+  const {f,P,adopt}=adoptFixture(t);const shape=homeShape(f.home);
+  // Only an inventory rooted at P classifies this process; W's cannot.
+  const p=path.join(f.procRoot,'200');fs.mkdirSync(p);write(p,'status',`Uid:\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\n`,0o600);write(p,'stat','200 (fixture) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0\n',0o600);write(p,'cmdline',`node\0${path.join(P,script)}\0`,0o600);fs.symlinkSync('/',path.join(p,'cwd'));
+  await assert.rejects(adopt(),{code:'DEPLOY_CONSUMERS_ACTIVE'});
+  assert.deepEqual(homeShape(f.home),shape);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/current')),false);
+  const status=await f.run(['--status']);assert.equal(status.inventory.clear,true);
+ });
+}
+test('adopt-from wire failure restores every legacy link and entry of P exactly', async t => {
+ const {f,P,adopt}=adoptFixture(t);const shape=homeShape(f.home);const legacy=treeDigest(P);
+ const hooks=path.join(f.home,'.codex/hooks.json');const aside=path.join(path.dirname(f.root),'hooks-aside');let adopted;
+ // Codex hooks become foreign only while wire runs: every adopted destination precedes them.
+ const phaseRunner=async options=>{
+  if(options.phase!=='wire')return deploy.wiringPhase(options);
+  fs.renameSync(hooks,aside);fs.mkdirSync(hooks,{mode:0o700});
+  try{return await deploy.wiringPhase(options);}finally{adopted=fs.readlinkSync(path.join(f.home,'.claude/commands/jhw'));fs.rmdirSync(hooks);fs.renameSync(aside,hooks);}
+ };
+ await assert.rejects(adopt([],{phaseRunner}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+ assert.equal(adopted,path.join(f.root,'.jhw-runtime/current/skills/claude'));
+ assertFirstActivationRolledBack(f,shape);assert.deepEqual(treeDigest(P),legacy);
+ assert.equal(fs.readlinkSync(path.join(f.home,'.codex/skills/jhw-old')),path.join(P,'skills/codex/jhw-old'));
+});
+test('an inherited JHW_ADOPT_FROM never enables adoption without --adopt-from', async t => {
+ const {f,P}=adoptFixture(t);const release=await f.run(['--prepare']);const shape=homeShape(f.home);
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],environment:{...process.env,JHW_ADOPT_FROM:P}}),{code:'DEPLOY_WIRING_CONFLICT',reason:'control_link'});
+ assert.deepEqual(homeShape(f.home),shape);
+});
+test('a newline-suffixed link is never treated as this checkout\'s exact link', async t => {
+ const f=fixture(t);host(f);privateDirectory(f.home,'.claude/commands');
+ const link=path.join(f.home,'.claude/commands/jhw');const target=`${path.join(f.root,'.jhw-runtime/current/skills/claude')}\n`;fs.symlinkSync(target,link);
+ const release=await f.run(['--prepare']);
+ await assert.rejects(f.run(['--activate',release.releaseId]),{code:'DEPLOY_WIRING_CONFLICT',reason:'command_dir'});
+ assert.equal(fs.readlinkSync(link),target);
+});
+test('adopt-from preserves a Codex env child table', async t => {
+ const {f,index,adopt}=adoptFixture(t);
+ write(f.home,'.codex/config.toml',`[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([index])}\nenv_vars = ["NOTION_API_KEY"]\n\n[mcp_servers.jhw-notion.env]\nNOTION_VERSION = "2022-06-28"\n\n[other]\nkey = 1\n`,0o600);
+ assert.equal((await adopt()).code,'DEPLOY_ACTIVATED');
+ const toml=fs.readFileSync(path.join(f.home,'.codex/config.toml'),'utf8');
+ assert.match(toml,/\[mcp_servers\.jhw-notion\]\ncommand = "node"\nargs = \[[^\n]*"mcp"\]\nstartup_timeout_sec = 60\.0\nenv_vars = \["NOTION_API_KEY"\]\n\n?\[mcp_servers\.jhw-notion\.env\]\nNOTION_VERSION = "2022-06-28"\n\n\[other\]\nkey = 1\n$/);
+});
+test('adopt-from rolls back when P disappears between plan and wire', async t => {
+ const {f,P,adopt}=adoptFixture(t);const shape=homeShape(f.home);const aside=`${P}-moved`;
+ const phaseRunner=async options=>{
+  if(options.phase!=='wire')return deploy.wiringPhase(options);
+  fs.renameSync(P,aside);try{return await deploy.wiringPhase(options);}finally{fs.renameSync(aside,P);}
+ };
+ await assert.rejects(adopt([],{phaseRunner}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+ assertFirstActivationRolledBack(f,shape);
+});
+test('an inherited JHW_ADOPT_FROM is ignored by wire and rollback', async t => {
+ const f=fixture(t);host(f);privateDirectory(f.home,'.claude/commands');const P=path.join(path.dirname(f.root),'legacy');
+ assert.equal(spawnSync('git',['-C',f.root,'worktree','add','-q','--detach',P]).status,0);
+ const release=await f.run(['--prepare']);const link=path.join(f.home,'.claude/commands/jhw');
+ // An exact legacy link appears only while wire runs; wire must not adopt it from the environment.
+ const phaseRunner=async options=>{
+  if(options.phase==='wire')fs.symlinkSync(path.join(P,'skills/claude'),link);
+  return deploy.wiringPhase(options);
+ };
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],environment:{...process.env,JHW_ADOPT_FROM:P},phaseRunner}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'wire_rollback_failed'});
+ assert.equal(fs.readlinkSync(link),path.join(P,'skills/claude'));
+});
+test('adopt-from publication failure at the origin pointer restores every legacy destination of P', async t => {
+ const {f,P,adopt}=adoptFixture(t);const shape=homeShape(f.home);const legacy=treeDigest(P);
+ let armed=false;let injected=false;const realRename=fs.renameSync;
+ fs.renameSync=function(source,destination,...rest){if(armed&&path.basename(String(destination))==='current'){armed=false;injected=true;throw new Error('injected publication failure');}return realRename.call(this,source,destination,...rest);};
+ try {
+  await assert.rejects(adopt([],{phaseRunner:armAfterWire(()=>{armed=true;})}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+ } finally {fs.renameSync=realRename;}
+ assert.equal(injected,true);assertFirstActivationRolledBack(f,shape);assert.deepEqual(treeDigest(P),legacy);
+ assert.equal(fs.readlinkSync(path.join(f.home,'.codex/skills/jhw-old')),path.join(P,'skills/codex/jhw-old'));
+});
