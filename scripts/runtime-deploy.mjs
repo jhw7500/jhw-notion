@@ -190,17 +190,17 @@ function wiringListings(home) {
  return listings;
 }
 // Descriptor-anchored, no-follow, bounded view of one entry in a pinned parent.
-function anchoredEntry(parent,name) {
+function anchoredEntry(parent,name,limit=FILE_LIMIT) {
  const at=parent.at(name);let info;
  try {info=fs.lstatSync(at);}catch(error){if(error.code==='ENOENT')return {type:'absent'};throw error;}
  if(info.isSymbolicLink())return {type:'symlink',info,target:fs.readlinkSync(at)};
- if(!info.isFile()||info.nlink!==1||info.size>FILE_LIMIT)return {type:info.isDirectory()?'directory':'special',info};
+ if(!info.isFile()||info.nlink!==1||info.size>limit)return {type:info.isDirectory()?'directory':'special',info};
  const fd=fs.openSync(at,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
  try {
   const opened=fs.fstatSync(fd);if(opened.dev!==info.dev||opened.ino!==info.ino)return {type:'special',info};
-  const bytes=Buffer.alloc(FILE_LIMIT+1);let length=0;
+  const bytes=Buffer.alloc(limit+1);let length=0;
   while(length<bytes.length){const count=fs.readSync(fd,bytes,length,bytes.length-length,null);if(!count)break;length+=count;}
-  if(length>FILE_LIMIT)return {type:'special',info};
+  if(length>limit)return {type:'special',info};
   return {type:'file',info,bytes:bytes.subarray(0,length)};
  } finally {fs.closeSync(fd);}
 }
@@ -219,11 +219,11 @@ function sameObject(view,expected) {
 // Moves an inspected object aside inside its pinned parent and returns it only
 // if the moved object is exactly what was inspected. Anything else is put back
 // (never over a reoccupied name) and the restore fails closed.
-function quarantine(parent,name,view) {
+function quarantine(parent,name,view,limit) {
  const aside=`.jhw-quarantine.${randomBytes(8).toString('hex')}`;
  if(anchoredEntry(parent,aside).type!=='absent')return null;
  fs.renameSync(parent.at(name),parent.at(aside));
- if(sameObject(anchoredEntry(parent,aside),view))return aside;
+ if(sameObject(anchoredEntry(parent,aside,limit),view))return aside;
  if(anchoredEntry(parent,name).type==='absent')fs.renameSync(parent.at(aside),parent.at(name));
  return null;
 }
@@ -233,12 +233,12 @@ function discard(parent,name,aside,view) {
 }
 // Visits one preimage path through its pinned parent; an absent parent means
 // the entry is absent.
-function withEntry(home,name,visit) {
+function withEntry(home,name,visit,limit) {
  const file=path.join(home,name);
  try {if(!fs.lstatSync(path.dirname(file)).isDirectory())return visit(null,{type:'absent'});}
  catch(error){if(error.code==='ENOENT')return visit(null,{type:'absent'});throw error;}
  const parent=pinnedDirectory(path.dirname(file));
- try {return visit(parent,anchoredEntry(parent,path.basename(file)));} finally {parent.close();}
+ try {return visit(parent,anchoredEntry(parent,path.basename(file),limit));} finally {parent.close();}
 }
 // Replays the candidate config editor on a private copy of the preimage: the
 // bytes its wire would have published (null when it would not have written).
@@ -248,7 +248,7 @@ function wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry}) {
  if(entry.type==='file')fs.writeFileSync(copy,Buffer.from(entry.bytes,'base64'),{mode:entry.mode,flag:'wx'});
  const editor=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts/install-config.mjs');trustedFile(editor);
  const result=spawnSync(process.execPath,[editor,operation,copy,path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry'),repositoryRoot,'20000101000000'],{env:{HOME:home,PATH:[path.dirname(process.execPath),'/usr/bin','/bin'].join(':')},stdio:'ignore',timeout:15000});
- return result.status===0?fs.readFileSync(copy):null;
+ return result.status===0&&fs.lstatSync(copy).size<=16*FILE_LIMIT?fs.readFileSync(copy):null;
 }
 // Bounded first-activation restore after a failed wire. Only an object this
 // deployment's wire provably produced is removed or replaced; any other
@@ -259,18 +259,24 @@ function restoreFirstWiring({repositoryRoot,home,releaseId,directory}) {
  const listings=privateRead(path.join(directory,'listings.json'),{limit:LISTING_LIMIT});
  const scratch=createPrivateDirectory(directory,'restore');
  for(const entry of [...entries].reverse()) {
+  const live=withEntry(home,entry.path,(parent,view)=>matchesPreimage(view,entry)?null:view.type);
+  if(live===null)continue;
+  // A registration may legitimately grow an accepted preimage past FILE_LIMIT
+  // (e.g. pretty-printing); the read bound covers exactly that replayed output.
+  const link=wiredLinkTarget(repositoryRoot,entry.path);
+  const wired=!link&&['file','special'].includes(live)?wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry}):null;
+  const limit=Math.max(FILE_LIMIT,wired?.length??0);
   const restored=withEntry(home,entry.path,(parent,view)=>{
    if(matchesPreimage(view,entry))return true;
    if(!parent)return false;
    const name=path.basename(entry.path);const at=parent.at(name);
-   const link=wiredLinkTarget(repositoryRoot,entry.path);
-   const ours=link?view.type==='symlink'&&view.target===link:view.type==='file'&&Boolean(wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry})?.equals(view.bytes));
+   const ours=link?view.type==='symlink'&&view.target===link:view.type==='file'&&Boolean(wired?.equals(view.bytes));
    const removable=entry.type==='absent'&&(ours||(WIRE_PARENTS.includes(entry.path)&&view.type==='directory'));
    const replaceable=(entry.type==='symlink'||entry.type==='file')&&(ours||(entry.type==='symlink'&&view.type==='absent'));
    if(!removable&&!replaceable)return false;
    // Destructive steps act only on the quarantined, re-verified object; new
    // content is placed with no-clobber link/symlink semantics.
-   const aside=view.type==='absent'?null:quarantine(parent,name,view);
+   const aside=view.type==='absent'?null:quarantine(parent,name,view,limit);
    if(view.type!=='absent'&&!aside)return false;
    try {
     if(entry.type==='symlink')fs.symlinkSync(entry.target,at);
@@ -286,7 +292,7 @@ function restoreFirstWiring({repositoryRoot,home,releaseId,directory}) {
    }
    if(aside)discard(parent,name,aside,view);
    fs.fsyncSync(parent.fd);parent.verify();return true;
-  });
+  },limit);
   if(!restored)return false;
  }
  for(const [config,pattern] of WIRE_BACKUPS) {

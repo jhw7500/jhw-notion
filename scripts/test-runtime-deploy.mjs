@@ -170,6 +170,32 @@ const lateCodexHookFailure = (f, {beforeRestore}={}) => async options => {
  fs.mkdirSync(hooks,{mode:0o700});
  try{return await deploy.wiringPhase(options);}finally{fs.rmdirSync(hooks);beforeRestore?.();}
 };
+// A preimage under the 2 MiB bound whose registration pretty-prints past it
+// must still be recognised as this deployment's output and restored.
+test('first activation rollback restores an MCP config that registration grew past 2 MiB', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude','.codex'])fs.mkdirSync(path.join(f.home,p),{mode:0o700});
+ const compact=JSON.stringify({padding:Array.from({length:300000},()=>[1])});
+ assert.ok(compact.length<2*1024*1024);
+ write(f.home,'.claude.json',compact,0o600);
+ const release=await f.run(['--prepare']);const shape=homeShape(f.home);let wiredSize;
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:lateCodexHookFailure(f,{beforeRestore:()=>{wiredSize=fs.statSync(path.join(f.home,'.claude.json')).size;}})}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+ assert.ok(wiredSize>2*1024*1024);
+ assertFirstActivationRolledBack(f,shape);
+ assert.equal(fs.readFileSync(path.join(f.home,'.claude.json'),'utf8'),compact);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// An entry already equal to its preimage needs no editor replay, so an
+// unusable editor at restore time cannot fail an otherwise complete rollback.
+test('first activation rollback does not replay the editor for entries already at their preimage', async t => {
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.claude'),{mode:0o700});write(f.home,'.claude.json','{"other":1}\n',0o600);
+ const release=await f.run(['--prepare']);const shape=homeShape(f.home);
+ const editor=path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs');const mode=fs.statSync(editor).mode&0o7777;
+ // Wire fails before any HOME write; the editor becomes untrusted before the restore.
+ const phaseRunner=async ({phase})=>{if(phase==='wire')throw new Error('injected wire failure');if(phase==='rollback')fs.chmodSync(editor,0o666);};
+ try {await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});}
+ finally {fs.chmodSync(editor,mode);}
+ assertFirstActivationRolledBack(f,shape);
+});
 test('first activation rollback restores Codex config and preserves every pre-existing editor backup', async t => {
  const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.codex'),{mode:0o700});
  const config=path.join(f.home,'.codex/config.toml');write(f.home,'.codex/config.toml','[other]\nkey = 1\n',0o600);
