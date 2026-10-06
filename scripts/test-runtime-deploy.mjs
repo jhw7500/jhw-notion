@@ -57,6 +57,7 @@ const foreignDestinations = [
  ['pending_transaction', 'codex-legacy-txn', (h,f)=>{fs.mkdirSync(path.join(h,'.codex/commands/.jhw-control-hook-link-txn.abc123'),{recursive:true,mode:0o700});fs.symlinkSync(path.join(f.root,'.jhw-runtime/current/skills/claude'),path.join(h,'.codex/commands/jhw'));
   // Removing an owned legacy link resolves current/, which a first activation has not published yet.
   return ()=>{fs.rmdirSync(path.join(h,'.codex/commands/.jhw-control-hook-link-txn.abc123'));fs.unlinkSync(path.join(h,'.codex/commands/jhw'));};}],
+ ['pending_transaction', 'codex-commands-txn-without-link', h=>{fs.mkdirSync(path.join(h,'.codex/commands/.jhw-control-hook-link-txn.abc123'),{recursive:true,mode:0o700});return '.codex/commands/.jhw-control-hook-link-txn.abc123';}],
  ['unsafe_parent', 'launcher-parent-link', (h,f)=>{const bin=path.join(h,'.local/bin'),real=path.join(path.dirname(h),'bin-real');fs.renameSync(bin,real);fs.symlinkSync(real,bin);fs.symlinkSync(path.join(f.root,'scripts/jhw-control-hook'),path.join(real,'jhw-control-hook'));return ()=>{fs.unlinkSync(bin);fs.renameSync(real,bin);};}],
  ['parent_unusable', 'codex-skills-file', h=>{write(h,'.codex/skills','foreign');return '.codex/skills';}],
  ['parent_unusable', 'claude-commands-file', h=>{write(h,'.claude/commands','foreign');return '.claude/commands';}],

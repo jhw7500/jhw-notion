@@ -1331,7 +1331,7 @@ plan_wiring() {
   ( require_control_host ) >/dev/null 2>&1 || { plan_conflict control_host; return; }
   ( validate_supported_tui_root "$CLAUDE_DIR" "Claude Code" &&
     validate_supported_tui_root "$CODEX_DIR" "Codex CLI" ) >/dev/null 2>&1 || { plan_conflict tui_root; return; }
-  reject_all_private_hook_transactions >/dev/null 2>&1 || { plan_conflict pending_transaction; return; }
+  reject_first_wiring_transactions || { plan_conflict pending_transaction; return; }
   if is_migratable_legacy_hook_launcher; then
     plan_transaction_parent "$CONTROL_HOOK_LINK" || return
   fi
@@ -1352,8 +1352,6 @@ plan_wiring() {
   fi
   if [ -d "$CODEX_DIR" ]; then
     if [ -e "$CODEX_DIR/commands/jhw" ] || [ -L "$CODEX_DIR/commands/jhw" ]; then
-      CONTROL_HOOK_LINK="$CODEX_DIR/commands/jhw" reject_stale_control_hook_link_transactions >/dev/null 2>&1 ||
-        { plan_conflict pending_transaction; return; }
       plan_transaction_parent "$CODEX_DIR/commands/jhw" || return
       is_foreign_link_destination "$CODEX_DIR/commands/jhw" "$SKILL_ROOT/claude" && { plan_conflict command_dir; return; }
     fi
@@ -1411,10 +1409,17 @@ rollback_first_wiring() {
 }
 
 # Every private transaction this wire may open must be gone after rollback.
-rollback_first_wiring_complete() {
-  rollback_first_wiring || return 1
+# Every private-transaction location a first-activation wire may leave behind.
+# The read-only plan refuses on it and rollback completion requires it to be
+# clear, through this one scan, so the two can never disagree.
+reject_first_wiring_transactions() {
   reject_all_private_hook_transactions >/dev/null 2>&1 || return 1
   CONTROL_HOOK_LINK="$HOME/.codex/commands/jhw" reject_stale_control_hook_link_transactions >/dev/null 2>&1
+}
+
+rollback_first_wiring_complete() {
+  rollback_first_wiring || return 1
+  reject_first_wiring_transactions
 }
 
 finalize_wiring() {
