@@ -808,6 +808,10 @@ const adoptDecoys = [
  ['the repository git directory', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({f})=>path.join(f.root,'.git')],
  ['a checkout that already runs managed wiring', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_source_invalid'}, ({P})=>{privateDirectory(P,'.jhw-runtime');write(P,'.jhw-runtime/wiring.json','{"version":1,"installed":true}\n',0o600);}],
  ['Codex entry with an unpreservable key', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_env_unpreservable'}, ({f,index})=>{write(f.home,'.codex/config.toml',`[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([index])}\ncwd = "/tmp"\n`,0o600);}],
+ ['NODE_OPTIONS in a JSON env', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_env_unpreservable'}, ({f,index})=>{write(f.home,'.gemini/settings.json',JSON.stringify({mcpServers:{'jhw-notion':{command:'node',args:[index],env:{NOTION_API_KEY:'x',NODE_OPTIONS:'--require=/tmp/inject.js'}}}}),0o600);}],
+ ['a loader variable in an OpenCode environment', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_env_unpreservable'}, ({f,index})=>{write(f.home,'.config/opencode/opencode.json',JSON.stringify({mcp:{'jhw-notion':{type:'local',command:['node',index],enabled:true,environment:{LD_PRELOAD:'/tmp/inject.so'}}}}),0o600);}],
+ ['NODE_OPTIONS in Codex env_vars', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_env_unpreservable'}, ({f,index})=>{write(f.home,'.codex/config.toml',`[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([index])}\nenv_vars = ["NOTION_API_KEY", "NODE_OPTIONS"]\n`,0o600);}],
+ ['NODE_OPTIONS in a Codex env table', {code:'DEPLOY_WIRING_CONFLICT',reason:'adopt_env_unpreservable'}, ({f,index})=>{write(f.home,'.codex/config.toml',`[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([index])}\n\n[mcp_servers.jhw-notion.env]\nNODE_OPTIONS = "--require=/tmp/inject.js"\n`,0o600);}],
  ['a real directory at a Codex skill name', {code:'DEPLOY_WIRING_CONFLICT',reason:'skill_link'}, ({f})=>{const d=path.join(f.home,'.codex/skills/jhw-task');fs.unlinkSync(d);fs.mkdirSync(d,{mode:0o700});}],
 ];
 for (const [label, expected, decoy] of adoptDecoys) {

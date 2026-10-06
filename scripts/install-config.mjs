@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
-import { validateBootstrap } from "./runtime-entry.mjs";
+import { validateBootstrap, STARTUP_ENVIRONMENT } from "./runtime-entry.mjs";
 
 const [operation, configFileArgument, mcpEntry, repositoryRoot, backupStampArgument, transactionEvidence] = process.argv.slice(2);
 let configFile = configFileArgument;
@@ -126,8 +126,16 @@ function stringMap(value) {
 }
 // An adopted entry is re-registered for this checkout keeping its environment;
 // any other key cannot be carried over, so adoption refuses.
+// Variables node or the dynamic loader reads before the managed runtime can
+// strip them (its own STARTUP_ENVIRONMENT plus loader prefixes); adoption never
+// carries them into the managed node entry.
+function isLoaderVariable(name) {
+  const upper = String(name).toUpperCase();
+  return STARTUP_ENVIRONMENT.includes(upper) || /^(NODE_|LD_|DYLD_)/.test(upper);
+}
 function requirePreservable(entry, keys, environmentKey) {
-  if (!Object.keys(entry).every((key) => keys.includes(key)) || !stringMap(entry[environmentKey])) process.exit(ADOPT_UNPRESERVABLE);
+  if (!Object.keys(entry).every((key) => keys.includes(key)) || !stringMap(entry[environmentKey]) ||
+      Object.keys(entry[environmentKey] ?? {}).some(isLoaderVariable)) process.exit(ADOPT_UNPRESERVABLE);
 }
 function isOwnedOpenCode(entry) { return entry && Array.isArray(entry.command) && ownedVector(entry.command[0], entry.command.slice(1)); }
 
@@ -1813,6 +1821,15 @@ function inspectCodexRegistration() {
     if (!parent.every((line) => /^\s*(#.*)?$/.test(line) || /^\s*(command|args|startup_timeout_sec|env_vars)\s*=/.test(line)) ||
         !children.every((line) => !/^\s*\[/.test(line) || line.trim() === "[mcp_servers.jhw-notion.env]")) process.exit(ADOPT_UNPRESERVABLE);
     preserved = [...parent.filter((line) => /^\s*env_vars\s*=/.test(line)), ...children];
+    // Preserved names must be readable and never loader/runtime-control variables.
+    for (const line of preserved) {
+      if (/^\s*(#.*)?$/.test(line) || /^\s*\[/.test(line)) continue;
+      const envVars = /^\s*env_vars\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(line));
+      let names;
+      if (envVars) { try { names = JSON.parse(envVars[1]); } catch { names = undefined; } }
+      else { const keys = tomlAssignmentKeys(line); names = keys?.length === 1 ? keys : undefined; }
+      if (!Array.isArray(names) || !names.every((name) => typeof name === "string") || names.some(isLoaderVariable)) process.exit(ADOPT_UNPRESERVABLE);
+    }
   }
   return { current, inspected, preserved };
 }
