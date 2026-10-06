@@ -419,11 +419,16 @@ described as proof.
 - Rollback validation failure: return `DEPLOY_VALIDATION_FAILED` /
   `rollback_recovery_required`; keep maintenance and evidence for manual review.
   Another `--rollback` refuses with `DEPLOY_RECOVERY_REQUIRED`.
-- First-migration wiring failure: return `DEPLOY_WIRING_FAILED` and preserve
-  complete releases, exact known-wiring preimages, and configuration/hook
-  transaction evidence. First-migration validation failure returns
-  `DEPLOY_VALIDATION_FAILED` / `first_migration_recovery_required`. Neither has
-  a managed predecessor, legacy rollback, or automatic restore command.
+- First-migration wiring: a read-only plan refuses known foreign destinations
+  before any mutation with `DEPLOY_WIRING_CONFLICT` and a path-free reason.
+  Wire then runs before the activation pointer is published. A wire failure is
+  undone from the journal's known-wiring preimages, ending with
+  `DEPLOY_WIRING_FAILED` / `first_activation_rolled_back` and no pending
+  journal; if any destination cannot be proven restored, the journal stays
+  pending with `DEPLOY_RECOVERY_REQUIRED` / `wire_rollback_failed`.
+  First-migration validation failure returns `DEPLOY_VALIDATION_FAILED` /
+  `first_migration_recovery_required`; it has no managed predecessor, legacy
+  rollback, or automatic restore command.
 - Exclusive-admission reacquisition or final inventory failure: record
   `recovery_blocked` and `maintenance_reacquisition_failed`; keep maintenance
   open for private evidence review.

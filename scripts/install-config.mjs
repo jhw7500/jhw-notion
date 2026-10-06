@@ -10,6 +10,9 @@ let configFile = configFileArgument;
 let backupStamp = backupStampArgument;
 if (!operation || !configFile || !mcpEntry || !repositoryRoot) process.exit(2);
 const logicalConfigFile = configFile;
+// check-* operations are the read-only first-activation plan. They never write,
+// back up, lock, or open transactions; bootstrap is installed before wiring.
+const planning = operation.startsWith("check-");
 const hookAdapter = operation.includes("-claude-hooks") ? "claude" : "codex";
 
 const CHANGED = 0;
@@ -85,6 +88,7 @@ function isOwnedEntryPath(candidate) {
 
 function managedEntry(candidate) {
   if (candidate !== path.join(path.resolve(repositoryRoot), ".jhw-runtime/bootstrap/jhw-runtime-entry")) return false;
+  if (planning) return true;
   try { validateBootstrap({ repositoryRoot: path.resolve(repositoryRoot) }); return true; } catch { return false; }
 }
 function stdioArgs() {
@@ -806,6 +810,32 @@ function recoverCaptureOrActivationError(directory) {
   return AMBIGUOUS;
 }
 
+function buildRegisteredHooksForScope(current, scope) {
+  if (scope === "session-end-only") {
+    // Keep the unprovisioned Guard deactivation policy, but retain the
+    // independent, advisory SessionEnd path in the same atomic transaction.
+    const text = buildUnregisteredCodexHooks(current, codexHookEvents.filter((event) => event !== "SessionEnd"));
+    return buildRegisteredCodexHooks({ ...current, text }, ["SessionEnd"]);
+  }
+  return buildRegisteredCodexHooks(current);
+}
+
+// Read-only mirror of registerCodexHooksTransaction's foreign classification:
+// a non-file live path, or bytes the registration builder rejects.
+function checkCodexHooks() {
+  const scope = transactionEvidence ?? "all";
+  if (scope !== "all" && scope !== "session-end-only") failForeign();
+  const initially = lstatMaybe(configFile);
+  if (!initially) process.exit(CHANGED);
+  if (hookKind(initially) !== "file") failForeign();
+  try {
+    buildRegisteredHooksForScope({ exists: true, mode: initially.mode & 0o777, text: exactUtf8(fs.readFileSync(configFile)) }, scope);
+  } catch {
+    failForeign();
+  }
+  process.exit(CHANGED);
+}
+
 function registerCodexHooksTransaction() {
   const scope = transactionEvidence ?? "all";
   if (scope !== "all" && scope !== "session-end-only") return FOREIGN;
@@ -823,14 +853,7 @@ function registerCodexHooksTransaction() {
     let next;
     try {
       if (current.exists) current.text = exactUtf8(originalBytes);
-      if (scope === "session-end-only") {
-        // Keep the unprovisioned Guard deactivation policy, but retain the
-        // independent, advisory SessionEnd path in the same atomic transaction.
-        const text = buildUnregisteredCodexHooks(current, codexHookEvents.filter((event) => event !== "SessionEnd"));
-        next = buildRegisteredCodexHooks({ ...current, text }, ["SessionEnd"]);
-      } else {
-        next = buildRegisteredCodexHooks(current);
-      }
+      next = buildRegisteredHooksForScope(current, scope);
     } catch {
       if (current.exists) backupCapturedMalformedHooks(originalBytes);
       return restoreCapturedOriginal(directory, manifest, "foreign-restored") === CHANGED ? FOREIGN : CAS_MISMATCH;
@@ -1063,7 +1086,12 @@ function expectedControlHookTarget() {
     relative === ".claude/commands/jhw" || relative === ".gemini/commands/jhw" ||
     relative === ".config/opencode/skills/jhw" || relative === ".codex/commands/jhw" ||
     /^\.codex\/skills\/jhw-[^/]+$/.test(relative) || /^\.codex\/prompts\/[^/]+\.md$/.test(relative);
-  if (!allowed || expected !== mcpEntry || !isOwnedEntryPath(expected)) {
+  // The managed skill root is an exact constant under the runtime store; a first
+  // activation removes a legacy link to it before current/ is published.
+  // Only the four command-directory links ever target it.
+  const commandDirectory = [".claude/commands/jhw", ".gemini/commands/jhw", ".config/opencode/skills/jhw", ".codex/commands/jhw"].includes(relative);
+  const managedSkills = commandDirectory && expected === path.join(root, ".jhw-runtime/current/skills/claude");
+  if (!allowed || expected !== mcpEntry || !(managedSkills || isOwnedEntryPath(expected))) {
     throw new Error("owned link transaction is restricted to an exact repository source and supported HOME target");
   }
   if (expected.startsWith(path.join(root, ".jhw-runtime/bootstrap") + path.sep)) {
@@ -1439,13 +1467,18 @@ function verifyManagedConfiguration() {
   process.exit(CHANGED);
 }
 
-function registerStdio() {
+function inspectStdioRegistration() {
   const current = safeExistingFile(configFile);
   const settings = parsedJson(current.text);
   if (settings.mcpServers !== undefined && !objectMap(settings.mcpServers)) failForeign();
-  settings.mcpServers ??= {};
-  const existing = settings.mcpServers["jhw-notion"];
+  const existing = settings.mcpServers?.["jhw-notion"];
   if (existing !== undefined && !isOwnedStdio(existing)) failForeign();
+  return { current, settings };
+}
+
+function registerStdio() {
+  const { current, settings } = inspectStdioRegistration();
+  settings.mcpServers ??= {};
   settings.mcpServers["jhw-notion"] = {
     type: "stdio",
     command: "node",
@@ -1467,7 +1500,7 @@ function unregisterStdio() {
   saveIfChanged(configFile, current.text, settings, current.mode);
 }
 
-function registerOpenCode() {
+function inspectOpenCodeRegistration() {
   const current = safeExistingFile(configFile);
   const settings = parsedJson(current.text);
   if (settings.mcp !== undefined && !objectMap(settings.mcp)) failForeign();
@@ -1476,6 +1509,11 @@ function registerOpenCode() {
   const legacy = settings.mcpServers?.["jhw-notion"];
   if (existing !== undefined && !isOwnedOpenCode(existing)) failForeign();
   if (legacy !== undefined && !isOwnedStdio(legacy)) failForeign();
+  return { current, settings, legacy };
+}
+
+function registerOpenCode() {
+  const { current, settings, legacy } = inspectOpenCodeRegistration();
   settings["$schema"] ??= "https://opencode.ai/config.json";
   settings.mcp ??= {};
   settings.mcp["jhw-notion"] = { type: "local", command: ["node", ...stdioArgs()], enabled: true };
@@ -1713,11 +1751,16 @@ function saveToml(current, next) {
   process.exit(CHANGED);
 }
 
-function registerCodex() {
+function inspectCodexRegistration() {
   const current = safeExistingFile(configFile);
   const inspected = ownedToml(current.text);
   if ((inspected.range.start !== undefined && !inspected.owned) ||
       (inspected.range.start === undefined && inspected.range.hasOrphan)) failForeign();
+  return { current, inspected };
+}
+
+function registerCodex() {
+  const { current, inspected } = inspectCodexRegistration();
   let output;
   if (inspected.range.start !== undefined) {
     const suffix = inspected.range.lines.slice(inspected.range.end);
@@ -1756,6 +1799,14 @@ try {
     anchorHookTransactionPaths();
   }
   if (["verify-stdio","verify-opencode","verify-codex","verify-claude-hooks","verify-codex-hooks"].includes(operation)) verifyManagedConfiguration();
+  if (operation === "check-transaction-parent") {
+    try { anchorHookTransactionPaths(); } catch { failForeign(); }
+    process.exit(CHANGED);
+  }
+  if (operation === "check-stdio") { inspectStdioRegistration(); process.exit(CHANGED); }
+  if (operation === "check-opencode") { inspectOpenCodeRegistration(); process.exit(CHANGED); }
+  if (operation === "check-codex") { inspectCodexRegistration(); process.exit(CHANGED); }
+  if (operation === "check-codex-hooks" || operation === "check-claude-hooks") checkCodexHooks();
   if (operation === "register-stdio") registerStdio();
   if (operation === "unregister-stdio") unregisterStdio();
   if (operation === "register-opencode") registerOpenCode();

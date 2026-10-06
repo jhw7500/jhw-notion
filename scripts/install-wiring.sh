@@ -90,6 +90,14 @@ is_repo_owned_symlink() {
   esac
 }
 
+# Read-only ownership predicate shared by install_wiring and plan_wiring:
+# succeeds when $1 exists and is not exactly a symlink to $2.
+is_foreign_link_destination() {
+  local target="$1" source="$2"
+  [ -e "$target" ] || [ -L "$target" ] || return 1
+  ! { [ -L "$target" ] && [ "$(readlink -- "$target" 2>/dev/null)" = "$source" ]; }
+}
+
 install_control_cli() {
   if [ ! -x "$CONTROL_ENTRY" ]; then
     fail "jhw-control 빌드 결과가 없거나 실행할 수 없습니다: $CONTROL_ENTRY"
@@ -97,13 +105,13 @@ install_control_cli() {
   fi
 
   mkdir -p "$(dirname "$CONTROL_LINK")"
-  if [ -e "$CONTROL_LINK" ] || [ -L "$CONTROL_LINK" ]; then
-    if [ -L "$CONTROL_LINK" ] && [ "$(readlink -- "$CONTROL_LINK" 2>/dev/null)" = "$CONTROL_ENTRY" ]; then
-      skip "$CONTROL_LINK 이미 최신"
-      return
-    fi
+  if is_foreign_link_destination "$CONTROL_LINK" "$CONTROL_ENTRY"; then
     fail "$CONTROL_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
     exit 1
+  fi
+  if [ -L "$CONTROL_LINK" ]; then
+    skip "$CONTROL_LINK 이미 최신"
+    return
   fi
   ln -s "$CONTROL_ENTRY" "$CONTROL_LINK"
   ok "$CONTROL_LINK → $CONTROL_ENTRY"
@@ -136,6 +144,7 @@ CONTROL_HOOK_LINK_TRANSACTION_PRESERVE=0
 CONTROL_HOOK_LINK_REMOVE_OUTCOME=""
 INSTALL_UNPROTECTED=0
 MIGRATION_HOOK_TRANSACTION_DIR=""
+CODEX_BACKUP_PRUNE_FILE=""
 
 validate_control_artifacts() {
   if [ ! -x "$CONTROL_ENTRY" ]; then
@@ -150,12 +159,9 @@ validate_control_artifacts() {
     fail "$CONTROL_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
     exit 1
   fi
-  if [ -e "$CONTROL_HOOK_LINK" ] || [ -L "$CONTROL_HOOK_LINK" ]; then
-    if ! { [ -L "$CONTROL_HOOK_LINK" ] &&
-           [ "$(readlink -- "$CONTROL_HOOK_LINK" 2>/dev/null)" = "$CONTROL_HOOK_ENTRY" ]; }; then
-      fail "$CONTROL_HOOK_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
-      exit 1
-    fi
+  if is_foreign_link_destination "$CONTROL_HOOK_LINK" "$CONTROL_HOOK_ENTRY"; then
+    fail "$CONTROL_HOOK_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
+    exit 1
   fi
 }
 
@@ -165,15 +171,14 @@ install_control_hook() {
     exit 1
   fi
   mkdir -p "$(dirname "$CONTROL_HOOK_LINK")"
-  if [ -e "$CONTROL_HOOK_LINK" ] || [ -L "$CONTROL_HOOK_LINK" ]; then
-    if [ -L "$CONTROL_HOOK_LINK" ] &&
-       [ "$(readlink -- "$CONTROL_HOOK_LINK" 2>/dev/null)" = "$CONTROL_HOOK_ENTRY" ]; then
-      HOOK_LINK_CREATED=0
-      skip "$CONTROL_HOOK_LINK 이미 최신"
-      return
-    fi
+  if is_foreign_link_destination "$CONTROL_HOOK_LINK" "$CONTROL_HOOK_ENTRY"; then
     fail "$CONTROL_HOOK_LINK 가 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
     exit 1
+  fi
+  if [ -L "$CONTROL_HOOK_LINK" ]; then
+    HOOK_LINK_CREATED=0
+    skip "$CONTROL_HOOK_LINK 이미 최신"
+    return
   fi
   ln -s -- "$CONTROL_HOOK_ENTRY" "$CONTROL_HOOK_LINK"
   HOOK_LINK_CREATED=1
@@ -593,22 +598,27 @@ rollback_current_guard_hook_transaction() {
   return 0
 }
 
-rollback_install_transaction_on_exit() {
-  local rc=$? hooks_rollback_ok=1
-  if [ "$rc" -ne 0 ] && [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
-    if ! rollback_current_guard_hook_transaction; then hooks_rollback_ok=0; fi
-    if [ -n "$CLAUDE_HOOKS_TRANSACTION_DIR" ]; then
-      if load_claude_hook_transaction && rollback_current_guard_hook_transaction; then
-        clear_saved_claude_hook_transaction
-        clear_current_hook_transaction
-      else
-        hooks_rollback_ok=0
-      fi
-    fi
-    if [ "$hooks_rollback_ok" -eq 1 ]; then
-      if ! rollback_new_control_hook; then :; fi
+# Undo this install's unfinalized hook transactions and new launcher link.
+# Returns nonzero when a hook transaction could not be rolled back.
+rollback_install_transaction() {
+  local hooks_rollback_ok=1
+  [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ] || return 0
+  if ! rollback_current_guard_hook_transaction; then hooks_rollback_ok=0; fi
+  if [ -n "$CLAUDE_HOOKS_TRANSACTION_DIR" ]; then
+    if load_claude_hook_transaction && rollback_current_guard_hook_transaction; then
+      clear_saved_claude_hook_transaction
+      clear_current_hook_transaction
+    else
+      hooks_rollback_ok=0
     fi
   fi
+  [ "$hooks_rollback_ok" -eq 1 ] || return 1
+  rollback_new_control_hook
+}
+
+rollback_install_transaction_on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then rollback_install_transaction || :; fi
   trap - EXIT
   exit "$rc"
 }
@@ -646,13 +656,13 @@ install_owned_symlink() {
   local source="$2"
   local label="$3"
   mkdir -p "$(dirname "$target")"
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    if [ -L "$target" ] && [ "$(readlink -- "$target" 2>/dev/null)" = "$source" ]; then
-      skip "$label 이미 최신"
-      return
-    fi
+  if is_foreign_link_destination "$target" "$source"; then
     fail "$label 대상이 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
     exit 1
+  fi
+  if [ -L "$target" ]; then
+    skip "$label 이미 최신"
+    return
   fi
   ln -s -- "$source" "$target"
   ok "$label 심링크 설치"
@@ -746,8 +756,9 @@ register_codex_mcp() {
     "Codex: jhw-notion 서버 추가" \
     "Codex: config.toml 이미 최신 (백업 생성 안 함)" \
     "$(date +%Y%m%d%H%M%S)"
+  # Pruning deletes older backups irreversibly, so it waits for finalize.
   if [ "$CONFIG_EDITOR_CHANGED" -eq 1 ]; then
-    prune_codex_backups "$config_file"
+    CODEX_BACKUP_PRUNE_FILE="$config_file"
   fi
 }
 
@@ -1080,10 +1091,16 @@ select_managed_wiring() {
   SKILL_ROOT="$SCRIPT_DIR/.jhw-runtime/current/skills"
 }
 
+# The exact legacy launcher is owned and migrated by install_wiring.
+is_migratable_legacy_hook_launcher() {
+  [[ "$CONTROL_HOOK_ENTRY" = "$SCRIPT_DIR/.jhw-runtime/bootstrap/jhw-runtime-hook" && -L "$CONTROL_HOOK_LINK" &&
+     "$(readlink -- "$CONTROL_HOOK_LINK")" = "$SCRIPT_DIR/scripts/jhw-control-hook" ]]
+}
+
 migrate_legacy_hook_launcher() {
   local managed="$SCRIPT_DIR/.jhw-runtime/bootstrap/jhw-runtime-hook"
   local legacy="$SCRIPT_DIR/scripts/jhw-control-hook"
-  if [[ "$CONTROL_HOOK_ENTRY" = "$managed" && -L "$CONTROL_HOOK_LINK" && "$(readlink -- "$CONTROL_HOOK_LINK")" = "$legacy" ]]; then
+  if is_migratable_legacy_hook_launcher; then
     CONTROL_HOOK_ENTRY="$legacy"
     remove_control_hook_link_transaction retain || exit 1
     [[ "$CONTROL_HOOK_LINK_REMOVE_OUTCOME" = removed ]] || exit 1
@@ -1094,6 +1111,9 @@ migrate_legacy_hook_launcher() {
 }
 
 install_wiring() {
+# Names come from the candidate release; links still target SKILL_ROOT. A first
+# managed activation wires before the current pointer is published.
+local skill_source="${SKILL_SOURCE_ROOT:-$SKILL_ROOT}"
 require_control_host
 
 CLAUDE_DIR="$HOME/.claude"
@@ -1153,17 +1173,18 @@ if [ -d "$CODEX_DIR" ]; then
 
   mkdir -p "$CODEX_DIR/skills"
   LINKED=0
-  for SRC in "$SKILL_ROOT"/codex/jhw-*; do
+  for SRC in "$skill_source"/codex/jhw-*; do
     [ -d "$SRC" ] || continue
     NAME="$(basename "$SRC")"
+    SRC="$SKILL_ROOT/codex/$NAME"
     TARGET="$CODEX_DIR/skills/$NAME"
-    if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
-      if [ -L "$TARGET" ] && [ "$(readlink -- "$TARGET" 2>/dev/null)" = "$SRC" ]; then
-        LINKED=$((LINKED + 1))
-        continue
-      fi
+    if is_foreign_link_destination "$TARGET" "$SRC"; then
       fail "Codex 스킬 이름 충돌을 보존하기 위해 설치를 중단합니다."
       exit 1
+    fi
+    if [ -L "$TARGET" ]; then
+      LINKED=$((LINKED + 1))
+      continue
     fi
     ln -s -- "$SRC" "$TARGET"
     LINKED=$((LINKED + 1))
@@ -1174,17 +1195,18 @@ if [ -d "$CODEX_DIR" ]; then
   # review.md/status.md 같은 흔한 이름이 이미 있으면 남의 프롬프트를 밀어내지 않고 건너뛴다.
   mkdir -p "$CODEX_DIR/prompts"
   PLINKED=0
-  for SRC in "$SKILL_ROOT"/claude/*.md; do
+  for SRC in "$skill_source"/claude/*.md; do
     NAME="$(basename "$SRC")"
     [ "$NAME" = "AGENTS.md" ] && continue
+    SRC="$SKILL_ROOT/claude/$NAME"
     TARGET="$CODEX_DIR/prompts/$NAME"
-    if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
-      if [ -L "$TARGET" ] && [ "$(readlink -- "$TARGET" 2>/dev/null)" = "$SRC" ]; then
-        PLINKED=$((PLINKED + 1))
-        continue
-      fi
+    if is_foreign_link_destination "$TARGET" "$SRC"; then
       fail "Codex 프롬프트 이름 충돌을 보존하기 위해 설치를 중단합니다."
       exit 1
+    fi
+    if [ -L "$TARGET" ]; then
+      PLINKED=$((PLINKED + 1))
+      continue
     fi
     ln -s -- "$SRC" "$TARGET"
     PLINKED=$((PLINKED + 1))
@@ -1248,6 +1270,158 @@ fi
 
 }
 
+# Read-only first-activation plan. Evaluates, in install_wiring order, every
+# refusal that depends only on pre-existing HOME/host state, by calling the
+# same functions and predicates install_wiring uses. It never writes, creates
+# directories, makes backups, or opens transactions. $1 is the candidate
+# release skill root; link targets stay the managed SKILL_ROOT paths.
+# Prints "clear" (status 0) or "conflict <class>" (status 3); any other status
+# is an unverified plan.
+plan_conflict() {
+  printf 'conflict %s\n' "$1"
+  return 3
+}
+
+# Succeeds when `mkdir -p "$1"` (and, with $2=1, creating an entry in it)
+# would fail on existing state: the nearest existing component is not a
+# directory, or a directory that must be written to is not writable.
+directory_path_unusable() {
+  local directory="$1" need_write="${2:-0}" nearest="$1"
+  while [ ! -e "$nearest" ] && [ ! -L "$nearest" ]; do nearest="$(dirname "$nearest")"; done
+  [ -d "$nearest" ] || return 0
+  if [ "$nearest" != "$directory" ] || [ "$need_write" = 1 ]; then
+    [ -w "$nearest" ] || return 0
+  fi
+  return 1
+}
+
+plan_config_destination() {
+  local class="$1" operation="$2" file="$3" scope="${4:-all}" rc=0
+  node "$CONFIG_EDITOR" "$operation" "$file" "$MCP_ENTRY" "$SCRIPT_DIR" unused "$scope" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    4) plan_conflict "$class" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The descriptor anchor every hook/link transaction takes on its parent.
+plan_transaction_parent() {
+  local rc=0
+  node "$CONFIG_EDITOR" check-transaction-parent "$1" "$MCP_ENTRY" "$SCRIPT_DIR" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) ;;
+    4) plan_conflict unsafe_parent; return ;;
+    *) return 1 ;;
+  esac
+  directory_path_unusable "$(dirname "$1")" 1 && { plan_conflict parent_unusable; return; }
+  return 0
+}
+
+plan_link_destination() {
+  local class="$1" target="$2" source="$3" need_write=1
+  is_foreign_link_destination "$target" "$source" && { plan_conflict "$class"; return; }
+  [ -L "$target" ] && need_write=0
+  directory_path_unusable "$(dirname "$target")" "$need_write" && { plan_conflict parent_unusable; return; }
+  return 0
+}
+
+plan_wiring() {
+  local candidate="$1" src name scope=all
+  ( require_control_host ) >/dev/null 2>&1 || { plan_conflict control_host; return; }
+  ( validate_supported_tui_root "$CLAUDE_DIR" "Claude Code" &&
+    validate_supported_tui_root "$CODEX_DIR" "Codex CLI" ) >/dev/null 2>&1 || { plan_conflict tui_root; return; }
+  reject_first_wiring_transactions || { plan_conflict pending_transaction; return; }
+  if is_migratable_legacy_hook_launcher; then
+    plan_transaction_parent "$CONTROL_HOOK_LINK" || return
+  fi
+  plan_link_destination control_link "$CONTROL_LINK" "$CONTROL_ENTRY" || return
+  if is_migratable_legacy_hook_launcher; then
+    directory_path_unusable "$(dirname "$CONTROL_HOOK_LINK")" 1 && { plan_conflict parent_unusable; return; }
+  else
+    plan_link_destination hook_link "$CONTROL_HOOK_LINK" "$CONTROL_HOOK_ENTRY" || return
+  fi
+  if [ -d "$CLAUDE_DIR" ]; then
+    plan_link_destination command_dir "$CLAUDE_DIR/commands/jhw" "$SKILL_ROOT/claude" || return
+  fi
+  if [ -d "$GEMINI_DIR" ]; then
+    plan_link_destination command_dir "$GEMINI_DIR/commands/jhw" "$SKILL_ROOT/claude" || return
+  fi
+  if [ -d "$OPENCODE_DIR" ]; then
+    plan_link_destination command_dir "$OPENCODE_DIR/skills/jhw" "$SKILL_ROOT/claude" || return
+  fi
+  if [ -d "$CODEX_DIR" ]; then
+    if [ -e "$CODEX_DIR/commands/jhw" ] || [ -L "$CODEX_DIR/commands/jhw" ]; then
+      plan_transaction_parent "$CODEX_DIR/commands/jhw" || return
+      is_foreign_link_destination "$CODEX_DIR/commands/jhw" "$SKILL_ROOT/claude" && { plan_conflict command_dir; return; }
+    fi
+    directory_path_unusable "$CODEX_DIR/skills" && { plan_conflict parent_unusable; return; }
+    for src in "$candidate"/codex/jhw-*; do
+      [ -d "$src" ] || continue
+      name="$(basename "$src")"
+      plan_link_destination skill_link "$CODEX_DIR/skills/$name" "$SKILL_ROOT/codex/$name" || return
+    done
+    directory_path_unusable "$CODEX_DIR/prompts" && { plan_conflict parent_unusable; return; }
+    for src in "$candidate"/claude/*.md; do
+      name="$(basename "$src")"
+      [ "$name" = "AGENTS.md" ] && continue
+      plan_link_destination prompt_link "$CODEX_DIR/prompts/$name" "$SKILL_ROOT/claude/$name" || return
+    done
+  fi
+  if [ -d "$CLAUDE_DIR" ]; then
+    plan_config_destination mcp_entry check-stdio "$HOME/.claude.json" || return
+  fi
+  if [ -d "$GEMINI_DIR" ]; then
+    plan_config_destination mcp_entry check-stdio "$GEMINI_DIR/settings.json" || return
+  fi
+  if [ -d "$OPENCODE_DIR" ]; then
+    plan_config_destination mcp_entry check-opencode "$OPENCODE_DIR/opencode.json" || return
+  fi
+  if [ -d "$CODEX_DIR" ]; then
+    plan_config_destination mcp_entry check-codex "$CODEX_DIR/config.toml" || return
+  fi
+  if control_coordinates_absent; then scope=session-end-only; fi
+  if [ -d "$CLAUDE_DIR" ]; then
+    plan_transaction_parent "$CLAUDE_DIR/settings.json" || return
+    plan_config_destination hook_config check-claude-hooks "$CLAUDE_DIR/settings.json" "$scope" || return
+  fi
+  if [ -d "$CODEX_DIR" ]; then
+    plan_transaction_parent "$CODEX_DIR/hooks.json" || return
+    plan_config_destination hook_config check-codex-hooks "$CODEX_DIR/hooks.json" "$scope" || return
+  fi
+  printf 'clear\n'
+}
+
+# First managed activation whose wire failed before pointer publication: undo
+# the wire's own transactions and restore a migrated legacy launcher with the
+# same finalize the successful path uses. The driver restores the rest from
+# its preimages and verifies every destination.
+rollback_first_wiring() {
+  rollback_install_transaction || return 1
+  INSTALL_TRANSACTION_ACTIVE=0
+  [ -n "$MIGRATION_HOOK_TRANSACTION_DIR" ] || return 0
+  if [ ! -e "$CONTROL_HOOK_LINK" ] && [ ! -L "$CONTROL_HOOK_LINK" ]; then
+    ln -s -- "$SCRIPT_DIR/scripts/jhw-control-hook" "$CONTROL_HOOK_LINK" || return 1
+  fi
+  [ "$(readlink -- "$CONTROL_HOOK_LINK")" = "$SCRIPT_DIR/scripts/jhw-control-hook" ] || return 1
+  node "$CONFIG_EDITOR" finalize-control-hook-link-transaction "$CONTROL_HOOK_LINK" "$SCRIPT_DIR/scripts/jhw-control-hook" "$SCRIPT_DIR" "$MIGRATION_HOOK_TRANSACTION_DIR" removed-owned >/dev/null || return 1
+  MIGRATION_HOOK_TRANSACTION_DIR=""
+}
+
+# Every private transaction this wire may open must be gone after rollback.
+# Every private-transaction location a first-activation wire may leave behind.
+# The read-only plan refuses on it and rollback completion requires it to be
+# clear, through this one scan, so the two can never disagree.
+reject_first_wiring_transactions() {
+  reject_all_private_hook_transactions >/dev/null 2>&1 || return 1
+  CONTROL_HOOK_LINK="$HOME/.codex/commands/jhw" reject_stale_control_hook_link_transactions >/dev/null 2>&1
+}
+
+rollback_first_wiring_complete() {
+  rollback_first_wiring || return 1
+  reject_first_wiring_transactions
+}
+
 finalize_wiring() {
   if [[ -n "$MIGRATION_HOOK_TRANSACTION_DIR" ]]; then
     node "$CONFIG_EDITOR" finalize-control-hook-link-transaction "$CONTROL_HOOK_LINK" "$SCRIPT_DIR/scripts/jhw-control-hook" "$SCRIPT_DIR" "$MIGRATION_HOOK_TRANSACTION_DIR" removed-owned || return 1
@@ -1256,6 +1430,10 @@ finalize_wiring() {
   finalize_registered_guard_hooks || return 1
   finalize_saved_claude_guard_hooks || return 1
   INSTALL_TRANSACTION_ACTIVE=0
+  if [[ -n "$CODEX_BACKUP_PRUNE_FILE" ]]; then
+    prune_codex_backups "$CODEX_BACKUP_PRUNE_FILE"
+    CODEX_BACKUP_PRUNE_FILE=""
+  fi
 }
 
 uninstall_wiring() {

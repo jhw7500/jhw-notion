@@ -1,14 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {randomBytes} from 'node:crypto';
-import {spawn} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, requireQuiescence} from './runtime-safety.mjs';
 import {prepareRelease, validateRelease, readActivation, publishActivation, rollbackActivation} from './runtime-store.mjs';
 import {installBootstrap, validateBootstrap} from './runtime-entry.mjs';
 
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
-const KEYS = ['HOOK_LINK_CREATED','INSTALL_TRANSACTION_ACTIVE','HOOKS_CONFIG_CHANGED','HOOKS_CONFIG_FILE','HOOKS_ADAPTER','HOOKS_DISPLAY_NAME','HOOKS_TRANSACTION_DIR','HOOKS_TRANSACTION_STAGE','HOOKS_TRANSACTION_METADATA','HOOKS_TRANSACTION_PRESERVE','CLAUDE_HOOKS_CONFIG_CHANGED','CLAUDE_HOOKS_CONFIG_FILE','CLAUDE_HOOKS_TRANSACTION_DIR','CLAUDE_HOOKS_TRANSACTION_STAGE','CLAUDE_HOOKS_TRANSACTION_METADATA','CLAUDE_HOOKS_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_TRANSACTION_DIR','CONTROL_HOOK_LINK_TRANSACTION_STAGE','CONTROL_HOOK_LINK_TRANSACTION_METADATA','CONTROL_HOOK_LINK_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_REMOVE_OUTCOME','INSTALL_UNPROTECTED','MIGRATION_HOOK_TRANSACTION_DIR'];
+const KEYS = ['HOOK_LINK_CREATED','INSTALL_TRANSACTION_ACTIVE','HOOKS_CONFIG_CHANGED','HOOKS_CONFIG_FILE','HOOKS_ADAPTER','HOOKS_DISPLAY_NAME','HOOKS_TRANSACTION_DIR','HOOKS_TRANSACTION_STAGE','HOOKS_TRANSACTION_METADATA','HOOKS_TRANSACTION_PRESERVE','CLAUDE_HOOKS_CONFIG_CHANGED','CLAUDE_HOOKS_CONFIG_FILE','CLAUDE_HOOKS_TRANSACTION_DIR','CLAUDE_HOOKS_TRANSACTION_STAGE','CLAUDE_HOOKS_TRANSACTION_METADATA','CLAUDE_HOOKS_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_TRANSACTION_DIR','CONTROL_HOOK_LINK_TRANSACTION_STAGE','CONTROL_HOOK_LINK_TRANSACTION_METADATA','CONTROL_HOOK_LINK_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_REMOVE_OUTCOME','INSTALL_UNPROTECTED','MIGRATION_HOOK_TRANSACTION_DIR','CODEX_BACKUP_PRUNE_FILE'];
 const fail = (code,reason) => {throw new DeploymentError(code,reason);};
 function exists(file) {try {fs.lstatSync(file);return true;}catch(e){if(e.code==='ENOENT')return false;throw e;}}
 function parse(argv) {
@@ -49,12 +49,12 @@ function privateWrite(file,value,{exclusive=false}={}) {
   fs.fsyncSync(directory.fd);directory.verify();
  }finally{directory.close();}
 }
-function privateRead(file) {
+function privateRead(file,{limit=256*1024}={}) {
  const directory=pinnedDirectory(path.dirname(file));let fd;
  try {
   fd=fs.openSync(directory.at(path.basename(file)),fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
   const before=fs.fstatSync(fd,{bigint:true});
-  if(!before.isFile()||before.uid!==BigInt(process.getuid())||before.nlink!==1n||(before.mode&0o7777n)!==0o600n||before.size>256n*1024n)fail('DEPLOY_RECOVERY_REQUIRED');
+  if(!before.isFile()||before.uid!==BigInt(process.getuid())||before.nlink!==1n||(before.mode&0o7777n)!==0o600n||before.size>BigInt(limit))fail('DEPLOY_RECOVERY_REQUIRED');
   const bytes=Buffer.alloc(Number(before.size)+1);let length=0;
   while(length<bytes.length){const count=fs.readSync(fd,bytes,length,bytes.length-length,null);if(!count)break;length+=count;}
   const same=value=>['dev','ino','uid','gid','mode','nlink','size','ctimeNs','mtimeNs'].every(key=>before[key]===value[key]);
@@ -63,10 +63,12 @@ function privateRead(file) {
  }finally{if(fd!==undefined)fs.closeSync(fd);directory.close();}
 }
 
+const WIRE_PARENTS=['.local','.local/bin','.claude/commands','.gemini/commands','.config/opencode/skills','.codex/skills','.codex/prompts'];
 // Retained first-migration evidence only. No automatic restoration and no scan
 // of unrelated HOME content. Every byte read is bounded and descriptor-relative.
 function wiringPreimages({repositoryRoot,home,releaseId}) {
- const names=['.local/bin/jhw-control','.local/bin/jhw-control-hook','.claude.json','.claude/settings.json','.gemini/settings.json','.codex/config.toml','.codex/hooks.json','.config/opencode/opencode.json','.claude/commands/jhw','.gemini/commands/jhw','.config/opencode/skills/jhw','.codex/commands/jhw'];
+ // Directories wire may create come first so a restore visits them last.
+ const names=[...WIRE_PARENTS,'.local/bin/jhw-control','.local/bin/jhw-control-hook','.claude.json','.claude/settings.json','.gemini/settings.json','.codex/config.toml','.codex/hooks.json','.config/opencode/opencode.json','.claude/commands/jhw','.gemini/commands/jhw','.config/opencode/skills/jhw','.codex/commands/jhw'];
  if(releaseId) {
   const skills=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'skills');
   for(const [source,target,pattern] of [['claude','.codex/prompts',/^(?!AGENTS\.md$).+\.md$/],['codex','.codex/skills',/^jhw-/]]) {
@@ -79,6 +81,13 @@ function wiringPreimages({repositoryRoot,home,releaseId}) {
  for(const name of names) {
   const file=path.join(home,name);let initial;
   try {initial=fs.lstatSync(file,{bigint:true});}catch(error){if(error.code==='ENOENT'){entries.push({path:name,type:'absent'});continue;}throw error;}
+  // A wire-created parent needs only its identity: no bytes are read.
+  if(WIRE_PARENTS.includes(name)) {
+   const base={path:name,mode:Number(initial.mode&0o7777n),dev:String(initial.dev),ino:String(initial.ino)};
+   if(initial.isSymbolicLink()){const target=fs.readlinkSync(file);if(Buffer.byteLength(target)>4096)fail('DEPLOY_UNTRUSTED_PATH');entries.push({...base,type:'symlink',target});}
+   else entries.push({...base,type:initial.isDirectory()?'directory':'special'});
+   continue;
+  }
   const directory=pinnedDirectory(path.dirname(file));let fd;
   try {
    const anchored=directory.at(path.basename(file));
@@ -150,6 +159,160 @@ function requireCompatibleWiringTopology({repositoryRoot, home, previous, comman
   }
 }
 
+// The exact object this deployment's wire writes at a preimage path, or null.
+function wiredLinkTarget(repositoryRoot,name) {
+ const runtime=path.join(repositoryRoot,'.jhw-runtime');const skills=path.join(runtime,'current/skills');
+ if(name==='.local/bin/jhw-control')return path.join(runtime,'bootstrap/jhw-runtime-control');
+ if(name==='.local/bin/jhw-control-hook')return path.join(runtime,'bootstrap/jhw-runtime-hook');
+ if(['.claude/commands/jhw','.gemini/commands/jhw','.config/opencode/skills/jhw'].includes(name))return path.join(skills,'claude');
+ if(/^\.codex\/skills\/[^/]+$/.test(name))return path.join(skills,'codex',path.basename(name));
+ if(/^\.codex\/prompts\/[^/]+$/.test(name))return path.join(skills,'claude',path.basename(name));
+ return null;
+}
+const MCP_REGISTRATION={'.claude.json':'register-stdio','.gemini/settings.json':'register-stdio','.config/opencode/opencode.json':'register-opencode','.codex/config.toml':'register-codex'};
+const PREIMAGE_LIMIT=4*1024*1024;const LISTING_LIMIT=16*1024*1024;const FILE_LIMIT=2*1024*1024;
+// Every directory a first-activation wire may create an entry in.
+const WIRE_DIRECTORIES=['','.local','.local/bin','.claude','.claude/commands','.gemini','.gemini/commands','.config/opencode','.config/opencode/skills','.codex','.codex/commands','.codex/skills','.codex/prompts'];
+// Editor backups a wire may create, keyed by the preimage they copy.
+const WIRE_BACKUPS=[['.codex/config.toml',/^config\.toml\.bak\.jhw-notion\.\d{14}\.[0-9a-f-]{36}$/],['.codex/hooks.json',/^hooks\.json\.bak\.(?:\d{14}|invalid)\.[0-9a-f-]{36}$/],['.claude/settings.json',/^settings\.json\.bak\.(?:\d{14}|invalid)\.[0-9a-f-]{36}$/]];
+function wiringListings(home) {
+ const listings={};
+ for(const name of WIRE_DIRECTORIES) {
+  let fd;
+  try {fd=fs.openSync(path.join(home,name),fs.constants.O_RDONLY|fs.constants.O_DIRECTORY);}
+  catch(error){if(['ENOENT','ENOTDIR'].includes(error.code)){listings[name]=null;continue;}throw error;}
+  try {
+   const info=fs.fstatSync(fd);const names=fs.readdirSync(`/proc/self/fd/${fd}`).sort();
+   if(names.length>4096)fail('DEPLOY_UNTRUSTED_PATH');
+   listings[name]={dev:String(info.dev),ino:String(info.ino),names};
+  } finally {fs.closeSync(fd);}
+ }
+ return listings;
+}
+// Descriptor-anchored, no-follow, bounded view of one entry in a pinned parent.
+function anchoredEntry(parent,name,limit=FILE_LIMIT) {
+ const at=parent.at(name);let info;
+ try {info=fs.lstatSync(at);}catch(error){if(error.code==='ENOENT')return {type:'absent'};throw error;}
+ if(info.isSymbolicLink())return {type:'symlink',info,target:fs.readlinkSync(at)};
+ if(!info.isFile()||info.nlink!==1||info.size>limit)return {type:info.isDirectory()?'directory':'special',info};
+ const fd=fs.openSync(at,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
+ try {
+  const opened=fs.fstatSync(fd);if(opened.dev!==info.dev||opened.ino!==info.ino)return {type:'special',info};
+  const bytes=Buffer.alloc(limit+1);let length=0;
+  while(length<bytes.length){const count=fs.readSync(fd,bytes,length,bytes.length-length,null);if(!count)break;length+=count;}
+  if(length>limit)return {type:'special',info};
+  return {type:'file',info,bytes:bytes.subarray(0,length)};
+ } finally {fs.closeSync(fd);}
+}
+function matchesPreimage(view,entry) {
+ if(entry.type==='absent')return view.type==='absent';
+ if(entry.type==='symlink')return view.type==='symlink'&&view.target===entry.target;
+ if(entry.type==='file')return view.type==='file'&&(view.info.mode&0o7777)===entry.mode&&view.bytes.equals(Buffer.from(entry.bytes,'base64'));
+ return view.type===entry.type&&String(view.info.dev)===entry.dev&&String(view.info.ino)===entry.ino;
+}
+function sameObject(view,expected) {
+ if(view.type!==expected.type||view.info?.dev!==expected.info?.dev||view.info?.ino!==expected.info?.ino)return false;
+ if(view.type==='symlink')return view.target===expected.target;
+ if(view.type==='file')return view.bytes.equals(expected.bytes);
+ return true;
+}
+// Moves an inspected object aside inside its pinned parent and returns it only
+// if the moved object is exactly what was inspected. Anything else is put back
+// (never over a reoccupied name) and the restore fails closed.
+function quarantine(parent,name,view,limit) {
+ const aside=`.jhw-quarantine.${randomBytes(8).toString('hex')}`;
+ if(anchoredEntry(parent,aside).type!=='absent')return null;
+ fs.renameSync(parent.at(name),parent.at(aside));
+ if(sameObject(anchoredEntry(parent,aside,limit),view))return aside;
+ if(anchoredEntry(parent,name).type==='absent')fs.renameSync(parent.at(aside),parent.at(name));
+ return null;
+}
+function discard(parent,name,aside,view) {
+ try {if(view.type==='directory')fs.rmdirSync(parent.at(aside));else fs.unlinkSync(parent.at(aside));}
+ catch(error) {if(anchoredEntry(parent,name).type==='absent')fs.renameSync(parent.at(aside),parent.at(name));throw error;}
+}
+// Visits one preimage path through its pinned parent; an absent parent means
+// the entry is absent.
+function withEntry(home,name,visit,limit) {
+ const file=path.join(home,name);
+ try {if(!fs.lstatSync(path.dirname(file)).isDirectory())return visit(null,{type:'absent'});}
+ catch(error){if(error.code==='ENOENT')return visit(null,{type:'absent'});throw error;}
+ const parent=pinnedDirectory(path.dirname(file));
+ try {return visit(parent,anchoredEntry(parent,path.basename(file),limit));} finally {parent.close();}
+}
+// Replays the candidate config editor on a private copy of the preimage: the
+// bytes its wire would have published (null when it would not have written).
+function wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry}) {
+ const operation=MCP_REGISTRATION[entry.path];if(!operation)return null;
+ const copy=path.join(scratch,randomBytes(8).toString('hex'));
+ if(entry.type==='file')fs.writeFileSync(copy,Buffer.from(entry.bytes,'base64'),{mode:entry.mode,flag:'wx'});
+ const editor=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts/install-config.mjs');trustedFile(editor);
+ const result=spawnSync(process.execPath,[editor,operation,copy,path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry'),repositoryRoot,'20000101000000'],{env:{HOME:home,PATH:[path.dirname(process.execPath),'/usr/bin','/bin'].join(':')},stdio:'ignore',timeout:15000});
+ return result.status===0&&fs.lstatSync(copy).size<=16*FILE_LIMIT?fs.readFileSync(copy):null;
+}
+// Bounded first-activation restore after a failed wire. Only an object this
+// deployment's wire provably produced is removed or replaced; any other
+// difference fails closed. Every preimage path and every directory listing
+// wire could write into must then equal its pre-mutation record.
+function restoreFirstWiring({repositoryRoot,home,releaseId,directory}) {
+ const {entries}=privateRead(path.join(directory,'before.json'),{limit:PREIMAGE_LIMIT});
+ const listings=privateRead(path.join(directory,'listings.json'),{limit:LISTING_LIMIT});
+ const scratch=createPrivateDirectory(directory,'restore');
+ for(const entry of [...entries].reverse()) {
+  const live=withEntry(home,entry.path,(parent,view)=>matchesPreimage(view,entry)?null:view.type);
+  if(live===null)continue;
+  // A registration may legitimately grow an accepted preimage past FILE_LIMIT
+  // (e.g. pretty-printing); the read bound covers exactly that replayed output.
+  const link=wiredLinkTarget(repositoryRoot,entry.path);
+  const wired=!link&&['file','special'].includes(live)?wiredConfigBytes({repositoryRoot,home,releaseId,scratch,entry}):null;
+  const limit=Math.max(FILE_LIMIT,wired?.length??0);
+  const restored=withEntry(home,entry.path,(parent,view)=>{
+   if(matchesPreimage(view,entry))return true;
+   if(!parent)return false;
+   const name=path.basename(entry.path);const at=parent.at(name);
+   const ours=link?view.type==='symlink'&&view.target===link:view.type==='file'&&Boolean(wired?.equals(view.bytes));
+   const removable=entry.type==='absent'&&(ours||(WIRE_PARENTS.includes(entry.path)&&view.type==='directory'));
+   const replaceable=(entry.type==='symlink'||entry.type==='file')&&(ours||(entry.type==='symlink'&&view.type==='absent'));
+   if(!removable&&!replaceable)return false;
+   // Destructive steps act only on the quarantined, re-verified object; new
+   // content is placed with no-clobber link/symlink semantics.
+   const aside=view.type==='absent'?null:quarantine(parent,name,view,limit);
+   if(view.type!=='absent'&&!aside)return false;
+   try {
+    if(entry.type==='symlink')fs.symlinkSync(entry.target,at);
+    else if(entry.type==='file') {
+     const temporary=parent.at(`.jhw-restore.${randomBytes(8).toString('hex')}`);
+     const fd=fs.openSync(temporary,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
+     try{fs.writeFileSync(fd,Buffer.from(entry.bytes,'base64'));fs.fchmodSync(fd,entry.mode);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+     try{fs.linkSync(temporary,at);}finally{fs.unlinkSync(temporary);}
+    }
+   } catch(error) {
+    if(aside&&anchoredEntry(parent,name).type==='absent')fs.renameSync(parent.at(aside),at);
+    throw error;
+   }
+   if(aside)discard(parent,name,aside,view);
+   fs.fsyncSync(parent.fd);parent.verify();return true;
+  },limit);
+  if(!restored)return false;
+ }
+ for(const [config,pattern] of WIRE_BACKUPS) {
+  const preimage=entries.find(entry=>entry.path===config);const before=listings[path.dirname(config)];
+  if(preimage?.type!=='file'||!before)continue;
+  const parent=pinnedDirectory(path.join(home,path.dirname(config)));
+  try {
+   for(const name of fs.readdirSync(parent.at('.')).filter(name=>pattern.test(name)&&!before.names.includes(name))) {
+    const view=anchoredEntry(parent,name);
+    if(view.type!=='file'||view.info.uid!==process.getuid()||!view.bytes.equals(Buffer.from(preimage.bytes,'base64')))continue;
+    const aside=quarantine(parent,name,view);if(!aside)return false;
+    discard(parent,name,aside,view);
+   }
+   fs.fsyncSync(parent.fd);parent.verify();
+  } finally {parent.close();}
+ }
+ return entries.every(entry=>withEntry(home,entry.path,(parent,view)=>matchesPreimage(view,entry)))&&
+  JSON.stringify(wiringListings(home))===JSON.stringify(listings);
+}
+
 function existingInstallation(repositoryRoot,home) {
  return exists(path.join(repositoryRoot,'.jhw-runtime')) || ['.local/bin/jhw-control','.local/bin/jhw-control-hook','.claude.json','.gemini/settings.json','.codex/config.toml','.config/opencode/opencode.json'].some(p=>exists(path.join(home,p)));
 }
@@ -174,15 +337,18 @@ source "$2"
 CONFIG_EDITOR="$5"
 initialize_wiring_directories
 if [[ "$4" = managed ]]; then select_managed_wiring; fi
+if [[ -n "\${6:-}" ]]; then SKILL_SOURCE_ROOT="$6"; fi
 keys=(${KEYS.join(' ')})
 for key in "\${keys[@]}"; do
   IFS= read -r -d '' value || exit 65
   if [[ "$value" != __JHW_UNSET__ ]]; then printf -v "$key" '%s' "$value"; fi
+  # A retained older library may predate this key; never let set -u abort on it.
+  if [[ -z "\${!key+x}" ]]; then printf -v "$key" '%s' ''; fi
 done
 save_phase_state() {
   local rc=$?
   trap - EXIT
-  for key in "\${keys[@]}"; do printf '%s\\0' "\${!key}" >&5; done
+  for key in "\${keys[@]}"; do printf '%s\\0' "\${!key-}" >&5; done
   exit "$rc"
 }
 trap save_phase_state EXIT
@@ -191,12 +357,46 @@ case "$3" in
   wire) install_wiring ;;
   validate) require_control_host; run_guard_preflight ;;
   finalize) finalize_wiring ;;
+  rollback) rollback_first_wiring_complete ;;
   uninstall) uninstall_wiring ;;
   *) exit 64 ;;
 esac
 `;
-async function wiringPhase({repositoryRoot,home,environment,phase,managed,deployLease,admissionLease,directory,state,phaseTimeoutMs}) {
- const selected=managed?readActivation({repositoryRoot}):null;
+// Read-only first-activation plan: runs the candidate release's library before
+// any journal, bootstrap, pointer, or HOME mutation, so it has no journal log.
+const PLAN_WORKER = `set -euo pipefail
+SCRIPT_DIR="$1"
+source "$2"
+CONFIG_EDITOR="$3"
+initialize_wiring_directories
+select_managed_wiring
+plan_wiring "$4"
+`;
+const PLAN_CONFLICTS = ['control_host','tui_root','pending_transaction','unsafe_parent','parent_unusable','control_link','hook_link','command_dir','skill_link','prompt_link','mcp_entry','hook_config'];
+async function planWiring({repositoryRoot,home,environment,releaseId,planTimeoutMs}) {
+ const release=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId);
+ const library=path.join(release,'scripts/install-wiring.sh');const editor=path.join(release,'scripts/install-config.mjs');trustedFile(library);trustedFile(editor);
+ const env={...environment,HOME:home,PATH:[path.dirname(process.execPath),'/usr/local/bin','/usr/bin','/bin'].join(':')};
+ for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV','SHELLOPTS','BASHOPTS'])delete env[key];
+ // Own process group: the plan is read-only, so any straggler is killed outright.
+ const child=spawn('/bin/bash',['-c',PLAN_WORKER,'jhw-wiring-plan',repositoryRoot,library,editor,path.join(release,'skills')],{cwd:release,env,stdio:['ignore','pipe','ignore'],detached:true});
+ const killGroup=()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}};
+ let output='';let overflow=false;let timer;
+ child.stdout.on('data',chunk=>{if(output.length+chunk.length<=4096)output+=chunk.toString('utf8');else overflow=true;});
+ const code=await new Promise(resolve=>{
+  timer=setTimeout(()=>{killGroup();resolve(null);},planTimeoutMs);
+  child.once('error',()=>resolve(null));
+  child.once('close',(code,signal)=>resolve(signal?null:code));
+ });
+ clearTimeout(timer);
+ if(code===0&&!overflow&&output==='clear\n')return;
+ const conflict=/^conflict ([a-z_]+)\n$/.exec(output);
+ fail('DEPLOY_WIRING_CONFLICT',code===3&&!overflow&&PLAN_CONFLICTS.includes(conflict?.[1])?conflict[1]:'plan_unverified');
+}
+
+export async function wiringPhase({repositoryRoot,home,environment,phase,managed,deployLease,admissionLease,directory,state,phaseTimeoutMs,candidateReleaseId}) {
+ // Before pointer publication a first activation names its validated candidate.
+ const selected=candidateReleaseId?{releaseId:candidateReleaseId}:managed?readActivation({repositoryRoot}):null;
  const scripts=selected?path.join(repositoryRoot,'.jhw-runtime/releases',selected.releaseId,'scripts'):path.join(repositoryRoot,'scripts');
  const library=path.join(scripts,'install-wiring.sh');const editor=path.join(scripts,'install-config.mjs');trustedFile(library);trustedFile(editor);
  const log=path.join(directory,`${phase}.${randomBytes(8).toString('hex')}.log`);
@@ -208,11 +408,12 @@ async function wiringPhase({repositoryRoot,home,environment,phase,managed,deploy
   // Never pass Node loader or shell startup injection into maintenance workers.
   for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV','SHELLOPTS','BASHOPTS'])delete env[key];
   logDirectory.verify();
-  const child=spawn('/bin/bash',['-c',WORKER,'jhw-wiring-phase',repositoryRoot,library,phase,managed?'managed':'legacy',editor],{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd,admissionLease?.fd??'ignore','pipe']});
+  const skillSource=candidateReleaseId?path.join(repositoryRoot,'.jhw-runtime/releases',candidateReleaseId,'skills'):'';
+  const child=spawn('/bin/bash',['-c',WORKER,'jhw-wiring-phase',repositoryRoot,library,phase,managed?'managed':'legacy',editor,skillSource],{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd,admissionLease?.fd??'ignore','pipe']});
   const capture=chunk=>{total+=chunk.length;if(logging&&total<=256*1024)fs.writeSync(logFd,chunk);else overflow=true;};child.stdout.on('data',capture);child.stderr.on('data',capture);
   child.stdio[5].on('data',chunk=>{if(output.length+chunk.length<=256*1024)output=Buffer.concat([output,chunk]);else overflow=true;});
   child.stdin.on('error',()=>{});child.stdin.end(KEYS.map(key=>(state.variables?.[key]??'__JHW_UNSET__')+'\0').join(''));
-  const code=await Promise.race([new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>resolve(signal?null:code));}),new Promise(resolve=>{phaseTimer=setTimeout(()=>{child.unref();for(const stream of [child.stdin,child.stdout,child.stderr,child.stdio[5]])stream.unref?.();resolve(null);},phaseTimeoutMs);})]);
+  const code=await Promise.race([new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>resolve(signal?null:code));}),new Promise(resolve=>{phaseTimer=setTimeout(()=>{state.workerDetached=true;child.unref();for(const stream of [child.stdin,child.stdout,child.stderr,child.stdio[5]])stream.unref?.();resolve(null);},phaseTimeoutMs);})]);
   clearTimeout(phaseTimer);
   const values=output.toString('utf8').split('\0');
   if(values.length===KEYS.length+1&&values.at(-1)===''&&!overflow)state.variables=Object.fromEntries(KEYS.map((key,index)=>[key,values[index]]));
@@ -253,9 +454,9 @@ async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,l
 
 /** Module-only fixtures may supply private procRoot/build/phaseRunner. Public
  * argv and environment have no gate bypass, lock-fd, or alternate-root option. */
-export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000}={}) {
+export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000,planTimeoutMs=45000}={}) {
  const command=parse(argv);
- if(!Number.isInteger(phaseTimeoutMs)||phaseTimeoutMs<1||phaseTimeoutMs>45000)fail('DEPLOY_ARGUMENTS_INVALID');
+ if([phaseTimeoutMs,planTimeoutMs].some(value=>!Number.isInteger(value)||value<1||value>45000))fail('DEPLOY_ARGUMENTS_INVALID');
  if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate RELEASE_ID','--rollback','--uninstall']};
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
@@ -303,9 +504,11 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   if(recovery&&!managed)fail('DEPLOY_RECOVERY_REQUIRED');
   if(command.operation==='activate')validateRelease({repositoryRoot,releaseId:command.releaseId});
   if(command.operation==='rollback'&&!previous?.predecessorActivationId)fail('DEPLOY_PREDECESSOR_INVALID');
+  // First managed activation: refuse foreign wiring destinations before any mutation.
+  if(command.operation==='activate'&&!managed)await planWiring({repositoryRoot,home,environment,releaseId:command.releaseId,planTimeoutMs});
   directory=createPrivateDirectory(runtime,`.deploy.${randomBytes(16).toString('hex')}`);
   state={version:1,status:'pending',operation:command.operation,phase:'before_mutation',previous,variables:{}};checkpoint(directory,state);
-  const run=async phase=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs});};
+  const run=async (phase,candidateReleaseId)=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs,candidateReleaseId});};
   const pointerIntent=destination=>{state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);};
   let current=previous;
   if(managed&&command.operation!=='uninstall') {
@@ -313,17 +516,48 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    requireCompatibleWiringTopology({repositoryRoot,home,previous,command});
   }
   if(!managed||command.operation==='uninstall')privateWrite(path.join(directory,'before.json'),wiringPreimages({repositoryRoot,home,releaseId:command.releaseId??previous?.releaseId}),{exclusive:true});
+  if(!managed&&command.operation==='activate')privateWrite(path.join(directory,'listings.json'),wiringListings(home),{exclusive:true});
   if(command.operation==='uninstall') {
    state.mutationStarted=true;checkpoint(directory,state);
    if(previous){validateBootstrap({repositoryRoot});managed=true;}
    await run('uninstall');privateWrite(wiringFile,{version:1,installed:false});
   } else {
    state.mutationStarted=true;checkpoint(directory,state);
+   // Undoes a first-activation wire from its preimages; always throws.
+   const undoFirstWiring=async()=>{
+    let restored=false;
+    if(!state.stateIncomplete&&!state.workerDetached) {
+     try {await run('rollback',command.releaseId);restored=restoreFirstWiring({repositoryRoot,home,releaseId:command.releaseId,directory});}catch{restored=false;}
+    }
+    if(restored){state.status='complete';state.phase='wire_rolled_back';checkpoint(directory,state);fail('DEPLOY_WIRING_FAILED','first_activation_rolled_back');}
+    state.phase='wire_rollback_failed';checkpoint(directory,state);fail('DEPLOY_RECOVERY_REQUIRED','wire_rollback_failed');
+   };
+   let firstWired=false;
    if(command.operation==='activate') {
-    if(!managed)await installBootstrap({repositoryRoot,releaseId:command.releaseId});else validateBootstrap({repositoryRoot});
-    current=publishActivation({repositoryRoot,releaseId:command.releaseId,expectedCurrent:previous,onPointerIntent:pointerIntent});
-   } else {validateBootstrap({repositoryRoot});current=rollbackActivation({repositoryRoot,expectedCurrent:previous,onPointerIntent:pointerIntent});}
-   state.current=current;checkpoint(directory,state);
+    if(!managed) {
+     // First managed activation wires before publication, so a refused wire
+     // is undone from before.json and never leaves a published pointer.
+     await installBootstrap({repositoryRoot,releaseId:command.releaseId});
+     managed=true;
+     try {await run('wire',command.releaseId);}catch{await undoFirstWiring();}
+     firstWired=true;
+    } else validateBootstrap({repositoryRoot});
+   }
+   try {
+    if(firstWired){state.phase='wired';checkpoint(directory,state);}
+    if(command.operation==='activate')current=publishActivation({repositoryRoot,releaseId:command.releaseId,expectedCurrent:previous,onPointerIntent:pointerIntent});
+    else {validateBootstrap({repositoryRoot});current=rollbackActivation({repositoryRoot,expectedCurrent:previous,onPointerIntent:pointerIntent});}
+    state.current=current;checkpoint(directory,state);
+   } catch(error) {
+    if(!firstWired)throw error;
+    // Publication after a completed first wire failed. Only a pointer proven
+    // still at the origin makes the wired HOME safe to undo; otherwise the new
+    // wiring may already be live, so nothing is guessed or restored.
+    let pointer;try{pointer=readActivation({repositoryRoot});}catch{pointer=undefined;}
+    if(pointer!==undefined&&JSON.stringify(pointer)===JSON.stringify(previous))await undoFirstWiring();
+    state.phase='publication_uncertain';try{checkpoint(directory,state);}catch{}
+    fail('DEPLOY_RECOVERY_REQUIRED','publication_uncertain');
+   }
    if (!managed) {
     managed = true;
     await run('wire');
