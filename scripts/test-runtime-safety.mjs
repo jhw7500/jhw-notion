@@ -386,3 +386,53 @@ test('inventory covers final closed managed launchers and SHA256 release IDs', t
   entries.forEach((entry, index) => addProcess(options, 100 + index, ['node', entry]));
   assert.deepEqual(inspectConsumers(options), {clear:false,counts:{tui:0,app_server:0,legacy:0,managed:entries.length},uncertain:0});
 });
+
+test('verified boolean Node flags do not consume the runtime script position', t => {
+  const options = procFixture(t);
+  addProcess(options, 100, ['node', '--watch', '--watch-preserve-output', '--node-snapshot', '--no-node-snapshot', 'mcp-server/dist/index.js']);
+  addProcess(options, 101, ['node', '--watch', '--watch-preserve-output', '--experimental-strip-types', 'src/main.ts']);
+  assert.deepEqual(inspectConsumers(options), { clear: false, counts: { tui: 0, app_server: 0, legacy: 1, managed: 0 }, uncertain: 0 });
+});
+
+test('relative entries that cannot name a runtime file are classified without cwd', t => {
+  const options = procFixture(t);
+  for (const [pid, argv] of [[100, ['sleep', '0.1']], [101, ['sshd: user@pts/0']], [102, ['(sd-pam)']], [103, ['node', 'src/main.ts']]]) {
+    const directory = addProcess(options, pid, argv);
+    fs.unlinkSync(path.join(directory, 'cwd'));
+  }
+  assert.deepEqual(inspectConsumers(options), clearInventory);
+});
+
+test('relative entries that can still resolve to a runtime file require cwd', t => {
+  const cases = [
+    ['node', 'index.js'], ['node', 'dist/control/cli.js'], ['node', '../hook-adapter.js'], ['jhw-control-hook-x/../jhw-control-hook'],
+    ['node', 'runtime-entry.mjs'], ['node', ''], ['node', '.'], ['node', 'a/..'], ['node', '../..'],
+  ];
+  for (const argv of cases) {
+    const options = procFixture(t);
+    const directory = addProcess(options, 100, argv);
+    fs.unlinkSync(path.join(directory, 'cwd'));
+    assert.equal(inspectConsumers(options).uncertain, 1, JSON.stringify(argv));
+  }
+});
+
+test('non-dumpable current-user tasks with kernel-owned records are classified', async t => {
+  const options = procFixture(t);
+  const bootstrap = path.join(options.repositoryRoot, '.jhw-runtime', 'bootstrap');
+  fs.mkdirSync(bootstrap, { recursive: true });
+  const script = file(path.join(bootstrap, 'runtime-entry.mjs'), [
+    'import ctypes, sys, time',
+    'assert ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) == 0  # PR_SET_DUMPABLE',
+    'sys.stdout.write("ready\\n"); sys.stdout.flush()',
+    'time.sleep(60)',
+  ].join('\n'));
+  const child = spawn('python3', [script], { cwd: options.repositoryRoot, stdio: ['ignore', 'pipe', 'inherit'] });
+  t.after(() => child.kill('SIGKILL'));
+  const [chunk] = await once(child.stdout, 'data');
+  assert.equal(String(chunk), 'ready\n');
+  // Precondition printed next to the verdict: the kernel, not the fixture, owns the records.
+  const precondition = { directory: fs.statSync(`/proc/${child.pid}`).uid, record: fs.statSync(`/proc/${child.pid}/cmdline`).uid };
+  assert.deepEqual(precondition, { directory: uid, record: 0 });
+  const result = inspectConsumers({ repositoryRoot: options.repositoryRoot, excludePids: [process.pid] });
+  assert.equal(result.counts.managed, 1, JSON.stringify({ precondition, result }));
+});
