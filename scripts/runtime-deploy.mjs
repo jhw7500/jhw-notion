@@ -515,25 +515,41 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    await run('uninstall');privateWrite(wiringFile,{version:1,installed:false});
   } else {
    state.mutationStarted=true;checkpoint(directory,state);
+   // Undoes a first-activation wire from its preimages; always throws.
+   const undoFirstWiring=async()=>{
+    let restored=false;
+    if(!state.stateIncomplete&&!state.workerDetached) {
+     try {await run('rollback',command.releaseId);restored=restoreFirstWiring({repositoryRoot,home,releaseId:command.releaseId,directory});}catch{restored=false;}
+    }
+    if(restored){state.status='complete';state.phase='wire_rolled_back';checkpoint(directory,state);fail('DEPLOY_WIRING_FAILED','first_activation_rolled_back');}
+    state.phase='wire_rollback_failed';checkpoint(directory,state);fail('DEPLOY_RECOVERY_REQUIRED','wire_rollback_failed');
+   };
+   let firstWired=false;
    if(command.operation==='activate') {
     if(!managed) {
      // First managed activation wires before publication, so a refused wire
      // is undone from before.json and never leaves a published pointer.
      await installBootstrap({repositoryRoot,releaseId:command.releaseId});
      managed=true;
-     try {await run('wire',command.releaseId);}
-     catch {
-      let restored=false;
-      if(!state.stateIncomplete&&!state.workerDetached) {
-       try {await run('rollback',command.releaseId);restored=restoreFirstWiring({repositoryRoot,home,releaseId:command.releaseId,directory});}catch{restored=false;}
-      }
-      if(restored){state.status='complete';state.phase='wire_rolled_back';checkpoint(directory,state);fail('DEPLOY_WIRING_FAILED','first_activation_rolled_back');}
-      state.phase='wire_rollback_failed';checkpoint(directory,state);fail('DEPLOY_RECOVERY_REQUIRED','wire_rollback_failed');
-     }
+     try {await run('wire',command.releaseId);}catch{await undoFirstWiring();}
+     firstWired=true;
     } else validateBootstrap({repositoryRoot});
-    current=publishActivation({repositoryRoot,releaseId:command.releaseId,expectedCurrent:previous,onPointerIntent:pointerIntent});
-   } else {validateBootstrap({repositoryRoot});current=rollbackActivation({repositoryRoot,expectedCurrent:previous,onPointerIntent:pointerIntent});}
-   state.current=current;checkpoint(directory,state);
+   }
+   try {
+    if(firstWired){state.phase='wired';checkpoint(directory,state);}
+    if(command.operation==='activate')current=publishActivation({repositoryRoot,releaseId:command.releaseId,expectedCurrent:previous,onPointerIntent:pointerIntent});
+    else {validateBootstrap({repositoryRoot});current=rollbackActivation({repositoryRoot,expectedCurrent:previous,onPointerIntent:pointerIntent});}
+    state.current=current;checkpoint(directory,state);
+   } catch(error) {
+    if(!firstWired)throw error;
+    // Publication after a completed first wire failed. Only a pointer proven
+    // still at the origin makes the wired HOME safe to undo; otherwise the new
+    // wiring may already be live, so nothing is guessed or restored.
+    let pointer;try{pointer=readActivation({repositoryRoot});}catch{pointer=undefined;}
+    if(pointer!==undefined&&JSON.stringify(pointer)===JSON.stringify(previous))await undoFirstWiring();
+    state.phase='publication_uncertain';try{checkpoint(directory,state);}catch{}
+    fail('DEPLOY_RECOVERY_REQUIRED','publication_uncertain');
+   }
    if (!managed) {
     managed = true;
     await run('wire');

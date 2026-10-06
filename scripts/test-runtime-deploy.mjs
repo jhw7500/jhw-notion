@@ -651,3 +651,54 @@ test('rollback destination topology is checked after an explicitly reinstalled r
   assert.deepEqual(homeObservation(f.home), home);
   assert.equal((await f.run(['--status'])).recoveryPending, 0);
 });
+
+// Publication failures after a completed first wire.
+const armAfterWire = arm => async options => {
+ const result=await deploy.wiringPhase(options);
+ if(options.phase==='wire')arm();
+ return result;
+};
+function firstWireFixture(t) {
+ const f=fixture(t);host(f);for(const p of ['.claude','.codex'])fs.mkdirSync(path.join(f.home,p),{mode:0o700});return f;
+}
+for (const [label, isTarget] of [
+ ['before the pointer switch', destination=>path.basename(String(destination))==='current'],
+ ['while staging the activation record', destination=>/^a-[a-f0-9]{32}$/.test(path.basename(String(destination)))],
+]) {
+ test(`first activation publication failure ${label} restores HOME at the origin pointer`, async t => {
+  const f=firstWireFixture(t);const release=await f.run(['--prepare']);const shape=homeShape(f.home);
+  let armed=false;let injected=false;const realRename=fs.renameSync;
+  fs.renameSync=function(source,destination,...rest){if(armed&&isTarget(destination)){armed=false;injected=true;throw new Error('injected publication failure');}return realRename.call(this,source,destination,...rest);};
+  try {
+   await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:armAfterWire(()=>{armed=true;})}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+  } finally {fs.renameSync=realRename;}
+  assert.equal(injected,true);
+  assertFirstActivationRolledBack(f,shape);
+  assert.equal((await f.run(['--status'])).recoveryPending,0);
+  assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATED');
+ });
+}
+function assertPublicationUncertain(f) {
+ const runtime=path.join(f.root,'.jhw-runtime');
+ assert.equal(fs.readlinkSync(path.join(f.home,'.claude/commands/jhw')),path.join(runtime,'current/skills/claude'));
+ assert.equal(fs.readlinkSync(path.join(f.home,'.local/bin/jhw-control')),path.join(runtime,'bootstrap/jhw-runtime-control'));
+ const states=fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')).map(name=>JSON.parse(fs.readFileSync(path.join(runtime,name,'state.json'))));
+ assert.deepEqual(states.map(state=>[state.status,state.phase]),[['pending','publication_uncertain']]);
+}
+test('first activation publication failure after the pointer moved keeps HOME wired and the journal pending', async t => {
+ const f=firstWireFixture(t);const release=await f.run(['--prepare']);const runtime=path.join(f.root,'.jhw-runtime');
+ let armed=false;let replaced=false;let injected=false;const realRename=fs.renameSync,realFsync=fs.fsyncSync;
+ fs.renameSync=function(source,destination,...rest){const result=realRename.call(this,source,destination,...rest);if(armed&&path.basename(String(destination))==='current')replaced=true;return result;};
+ fs.fsyncSync=function(fd,...rest){let descriptor='';try{descriptor=fs.readlinkSync(`/proc/self/fd/${fd}`);}catch{}if(replaced&&!injected&&descriptor===runtime){injected=true;throw new Error('injected pointer fsync failure');}return realFsync.call(this,fd,...rest);};
+ try {
+  await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:armAfterWire(()=>{armed=true;})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'publication_uncertain'});
+ } finally {fs.renameSync=realRename;fs.fsyncSync=realFsync;}
+ assert.equal(injected,true);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,release.releaseId);
+ assertPublicationUncertain(f);assert.equal((await f.run(['--status'])).recoveryPending,1);
+});
+test('first activation publication failure with a foreign pointer never restores HOME', async t => {
+ const f=firstWireFixture(t);const release=await f.run(['--prepare']);const pointer=path.join(f.root,'.jhw-runtime/current');
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner:armAfterWire(()=>fs.symlinkSync('activations/a-00000000000000000000000000000000',pointer))}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'publication_uncertain'});
+ assert.equal(fs.readlinkSync(pointer),'activations/a-00000000000000000000000000000000');
+ assertPublicationUncertain(f);
+});
