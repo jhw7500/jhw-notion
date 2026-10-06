@@ -50,8 +50,9 @@ control/hook link 또는 지원 TUI 설정 파일이 하나라도 있으면 buil
 | `./install.sh --prepare` | private stage에서 `npm ci`와 build를 수행하고 immutable release를 검증·보존한다. live pointer와 HOME은 그대로다. |
 | `./install.sh --status` | 선택된 release, predecessor 유무, pending recovery 수와 `tui`·`app_server`·`legacy`·`managed` 집계만 반환하는 advisory 조회다. |
 | `./install.sh --activate RELEASE_ID` | 두 번의 consumer inventory와 exclusive admission을 통과한 정확한 retained release만 활성화한다. |
+| `./install.sh --activate RELEASE_ID --adopt-from LEGACY_CHECKOUT` | 첫 managed activation 전용. 같은 저장소의 다른 checkout(정규 절대경로, 같은 git common dir)이 남긴 legacy 설치를 넘겨받는다. 그 checkout을 정확히 가리키는 legacy 링크와 `node <LEGACY_CHECKOUT>/mcp-server/dist/index.js` MCP 항목만 adopt하며 env 키는 보존하고, 이 release에 없는 이름의 legacy Codex 링크는 제거한다(실패 시 preimage로 복원). 두 checkout 모두 consumer가 없어야 한다. 보존된 기본값 외 env는 이후 `--uninstall`에서 항목과 함께 사라지므로 재설치 뒤 다시 입력해야 한다. |
 | `./install.sh --rollback` | 현재 activation manifest에 기록된 validated predecessor 하나만 같은 gate 아래 활성화한다. |
-| `./install.sh --uninstall` | 확인된 installer-owned HOME wiring만 제거한다. release, activation, `current`, bootstrap, recovery evidence는 보존한다. |
+| `./install.sh --uninstall` | 확인된 installer-owned HOME wiring만 제거한다. release, activation, `current`, bootstrap, recovery evidence는 보존한다. 결과의 `envDropped`는 제거된 jhw-notion MCP 항목이 설치기 기본값과 다른 env(`env`·`environment`·`env_vars`·env 테이블)를 갖고 있던 adapter 이름만 나열한다(값·경로 없음). 이 env는 저장되지 않으므로 다음 `--activate` 뒤 직접 다시 입력해야 한다. |
 
 첫 활성화는 legacy entry를 stable bootstrap으로 옮긴다. 성공 뒤 MCP/control/hook은
 `.jhw-runtime/bootstrap/jhw-runtime-{entry,control,hook}`를 거쳐 admission lease를 잡고,
@@ -119,7 +120,8 @@ deployment journal은 자동 삭제하지 않는다. stage와 private evidence�
 | `DEPLOY_LOCK_CONTENDED`, managed entry의 `DEPLOY_MAINTENANCE` | 진행 중인 정상 작업이 끝나기를 기다린다. lock file을 지우거나 holder를 종료하지 않는다. |
 | `DEPLOY_SOURCE_INVALID`, `DEPLOY_SOURCE_CHANGED`, `DEPLOY_UNTRUSTED_PATH`, `DEPLOY_RELEASE_INVALID`, `DEPLOY_CURRENT_CHANGED` | 승인 revision의 전용 canonical trusted runtime checkout과 retained manifest/pointer를 검사한다. 임의 tree를 `chmod`하거나 trust 검사를 완화하지 않는다. |
 | `DEPLOY_WIRING_TOPOLOGY_CHANGED` / `guarded_uninstall_reinstall_required` | maintenance gate 아래 `--uninstall`, 이어서 원하는 exact retained release의 `--activate`를 실행한다. |
-| `DEPLOY_WIRING_CONFLICT` / `control_host`, `tui_root`, `pending_transaction`, `unsafe_parent`, `parent_unusable`, `control_link`, `hook_link`, `command_dir`, `skill_link`, `prompt_link`, `mcp_entry`, `hook_config`, `plan_unverified` | 첫 managed activation의 read-only plan이 변경 전에 거부했다. journal·pointer·HOME 변경은 없다. reason이 가리키는 대상(host 계약, TUI root, 남은 transaction, 부모 디렉터리, 기존 링크·MCP·hook 설정)을 operator가 정리한 뒤 같은 `--activate`를 다시 실행한다. |
+| `DEPLOY_WIRING_CONFLICT` / `control_host`, `tui_root`, `pending_transaction`, `unsafe_parent`, `parent_unusable`, `control_link`, `hook_link`, `command_dir`, `skill_link`, `prompt_link`, `mcp_entry`, `hook_config`, `plan_unverified`, `adopt_source_invalid`, `adopt_env_unpreservable` | 첫 managed activation의 read-only plan이 변경 전에 거부했다. journal·pointer·HOME 변경은 없다. reason이 가리키는 대상(host 계약, TUI root, 남은 transaction, 부모 디렉터리, 기존 링크·MCP·hook 설정)을 operator가 정리한 뒤 같은 `--activate`를 다시 실행한다. |
+| `DEPLOY_ARGUMENTS_INVALID` / `adopt_requires_first_activation` | 이미 managed wiring이 설치돼 있어 `--adopt-from`을 받지 않는다. 변경은 없다. |
 | `DEPLOY_WIRING_FAILED` / `first_activation_rolled_back` | 첫 managed activation의 wire가 pointer 게시 전에 실패했다. 모든 known-wiring 경로가 preimage의 type·target·bytes·mode로, wire가 쓸 수 있는 디렉터리의 이름 목록이 시작 시점과 같아졌음을 확인했다(디렉터리 mtime은 다를 수 있다). 이번 wire가 만든 편집기 백업은 제거되고 기존 백업은 그대로다(prune은 finalize에서만 실행). `before.json`·`listings.json`을 담은 complete journal과 비활성 bootstrap이 남고, bootstrap은 재시도 때 재사용된다. 원인을 해소한 뒤 같은 `--activate`를 다시 실행한다. |
 | `DEPLOY_RECOVERY_REQUIRED` / `publication_uncertain` | 첫 managed activation의 wire는 끝났지만 pointer 게시가 실패했고, pointer가 출발점에 그대로라고 증명되지 않았다(목적지로 이미 바뀌었거나 다른 pointer가 있거나 읽을 수 없음). 새 wiring이 이미 유효할 수 있어 HOME을 복원하지 않으며 journal은 pending으로 남는다. maintenance를 유지하고 operator가 `.jhw-runtime/current`와 HOME wiring을 검토한다. pointer가 출발점에 그대로이면 같은 경우가 `first_activation_rolled_back`으로 자동 복원된다. |
 | `DEPLOY_RECOVERY_REQUIRED` / `wire_rollback_failed` | 실패한 첫 wire를 복원했다고 증명하지 못했다. pointer는 게시되지 않았지만 journal은 pending으로 남는다. maintenance와 evidence를 유지하고 operator가 HOME wiring을 수동 검토한다. wire 동안 HOME 루트 등 감시 디렉터리에 무관한 파일이 생겨도 fail-closed로 이 결과가 된다. 수동 복구 전에 pending journal의 `listings.json` 이름 목록을 실제 디렉터리 목록과 비교해 차이(`.jhw-quarantine.*` 포함)를 확인한다. |
@@ -376,6 +378,10 @@ cd <canonical-trusted-runtime-checkout>
 # maintenance 승인 뒤, 출력에서 보관한 exact release ID 사용
 ./install.sh --activate '<exact retained RELEASE_ID>'
 ```
+
+다른 checkout에서 설치한 legacy wiring을 넘겨받을 때는 같은 maintenance window에서
+`./install.sh --prepare` → `./install.sh --status`로 consumer 0·recovery 0 확인(legacy checkout의 consumer는 activate가 함께 검사) →
+`./install.sh --activate '<RELEASE_ID>' --adopt-from '<legacy checkout 절대경로>'` 순서로 실행한다.
 
 source checkout의 `npm run build`나 skill file 변경은 live runtime에 즉시 반영되지 않는다.
 MCP와 skill은 activation이 선택한 immutable generation에서 함께 제공된다. 첫 live rollout의

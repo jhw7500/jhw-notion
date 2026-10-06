@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url';
 const C = fs.constants;
 const FILES = ['jhw-runtime-control', 'jhw-runtime-entry', 'jhw-runtime-hook', 'runtime-entry.mjs', 'runtime-safety.mjs', 'runtime-store.mjs'];
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
-const STARTUP_ENVIRONMENT = ['NODE_OPTIONS','NODE_PATH','NODE_REPL_EXTERNAL_MODULE','BASH_ENV','ENV'];
+export const STARTUP_ENVIRONMENT = ['NODE_OPTIONS','NODE_PATH','NODE_REPL_EXTERNAL_MODULE','BASH_ENV','ENV'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const modeFor = name => name.startsWith('jhw-') ? 0o755 : 0o644;
 function runtimeEnvironment() {

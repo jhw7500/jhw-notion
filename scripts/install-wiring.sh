@@ -11,6 +11,9 @@ CONTROL_HOOK_ENTRY="$SCRIPT_DIR/scripts/jhw-control-hook"
 CONTROL_HOOK_LINK="$HOME/.local/bin/jhw-control-hook"
 CONFIG_EDITOR="$SCRIPT_DIR/scripts/install-config.mjs"
 SKILL_ROOT="$SCRIPT_DIR/skills"
+# --adopt-from: sibling checkout of the same repository whose legacy install a
+# first managed activation takes over. The deployment driver validates it.
+ADOPT_ROOT="${JHW_ADOPT_FROM:-}"
 
 # Colors
 RED='\033[0;31m'
@@ -76,14 +79,31 @@ usage() {
   exit 0
 }
 
+# Runs a command that prints one path (readlink/realpath) and stores it exactly
+# in EXACT_PATH. Command substitution strips every trailing newline, so a
+# sentinel keeps newlines that belong to the path; only the printed one goes.
+exact_path_output() {
+  local value
+  value="$("$@" 2>/dev/null; status=$?; printf x; exit "$status")" || return 1
+  value="${value%x}"
+  EXACT_PATH="${value%$'\n'}"
+}
+
+# Succeeds when $1 is a symlink whose target string is exactly $2.
+is_exact_link() {
+  [ -L "$1" ] && exact_path_output readlink -- "$1" && [ "$EXACT_PATH" = "$2" ]
+}
+
 # readlink -f 결과가 저장소 root와 같거나 그 아래일 때만 project-owned로
 # 취급한다. 단순 문자열 prefix 비교(`/repo-foreign`)는 허용하지 않는다.
 is_repo_owned_symlink() {
   local link="$1"
   local resolved_link resolved_repo
   [ -L "$link" ] || return 1
-  resolved_link="$(readlink -f -- "$link" 2>/dev/null)" || return 1
-  resolved_repo="$(readlink -f -- "$SCRIPT_DIR" 2>/dev/null)" || return 1
+  exact_path_output readlink -f -- "$link" || return 1
+  resolved_link="$EXACT_PATH"
+  exact_path_output readlink -f -- "$SCRIPT_DIR" || return 1
+  resolved_repo="$EXACT_PATH"
   case "$resolved_link" in
     "$resolved_repo"|"$resolved_repo"/*) return 0 ;;
     *) return 1 ;;
@@ -95,7 +115,25 @@ is_repo_owned_symlink() {
 is_foreign_link_destination() {
   local target="$1" source="$2"
   [ -e "$target" ] || [ -L "$target" ] || return 1
-  ! { [ -L "$target" ] && [ "$(readlink -- "$target" 2>/dev/null)" = "$source" ]; }
+  ! is_exact_link "$target" "$source"
+}
+
+# Succeeds when $1 is exactly the link the legacy installer wrote from the adopt
+# root for legacy relative path $2, and that path is a real file or directory
+# inside the adopt root (no symlink on the way, no relative link string).
+is_adoptable_link() {
+  local link="$1" relative="$2" expected
+  [ -n "$ADOPT_ROOT" ] || return 1
+  expected="$ADOPT_ROOT/$relative"
+  is_exact_link "$link" "$expected" || return 1
+  exact_path_output realpath -e -- "$expected" && [ "$EXACT_PATH" = "$expected" ] || return 1
+  [ -f "$expected" ] || [ -d "$expected" ]
+}
+
+# Wire removes an adoptable legacy link so the normal install path re-creates
+# it for this checkout; preimages restore it if the first activation fails.
+release_adopted_link() {
+  if is_adoptable_link "$1" "$2"; then rm -f -- "$1"; fi
 }
 
 install_control_cli() {
@@ -145,6 +183,8 @@ CONTROL_HOOK_LINK_REMOVE_OUTCOME=""
 INSTALL_UNPROTECTED=0
 MIGRATION_HOOK_TRANSACTION_DIR=""
 CODEX_BACKUP_PRUNE_FILE=""
+# Adapters whose removed owned MCP entry carried non-default env (names only).
+ENV_DROPPED=""
 
 validate_control_artifacts() {
   if [ ! -x "$CONTROL_ENTRY" ]; then
@@ -656,6 +696,7 @@ install_owned_symlink() {
   local source="$2"
   local label="$3"
   mkdir -p "$(dirname "$target")"
+  release_adopted_link "$target" skills/claude
   if is_foreign_link_destination "$target" "$source"; then
     fail "$label 대상이 다른 파일/링크입니다. 보존을 위해 설치를 중단합니다."
     exit 1
@@ -685,7 +726,8 @@ run_config_editor() {
   case "$operation" in
     register-*) mkdir -p "$(dirname "$settings_file")" ;;
   esac
-  if node "$CONFIG_EDITOR" "$operation" "$settings_file" "$MCP_ENTRY" "$SCRIPT_DIR" "$stamp"; then
+  CONFIG_EDITOR_OUTPUT=""
+  if CONFIG_EDITOR_OUTPUT="$(node "$CONFIG_EDITOR" "$operation" "$settings_file" "$MCP_ENTRY" "$SCRIPT_DIR" "$stamp")"; then
     CONFIG_EDITOR_CHANGED=1
     ok "$changed_message"
     return
@@ -762,6 +804,13 @@ register_codex_mcp() {
   fi
 }
 
+# Records adapter $1 when the entry the editor just removed carried non-default env.
+record_env_dropped() {
+  if [ "$CONFIG_EDITOR_CHANGED" -eq 1 ] && [ "$CONFIG_EDITOR_OUTPUT" = env-dropped ]; then
+    ENV_DROPPED="${ENV_DROPPED:+$ENV_DROPPED }$1"
+  fi
+}
+
 unregister_mcp() {
   local settings_file="$1"
   local tui_name="$2"
@@ -770,6 +819,7 @@ unregister_mcp() {
     "unregister-stdio" "$settings_file" \
     "$tui_name: jhw-notion 서버 제거" \
     "$tui_name: 소유한 jhw-notion 등록 없음"
+  record_env_dropped "${tui_name,,}"
 }
 
 unregister_codex_mcp() {
@@ -780,6 +830,7 @@ unregister_codex_mcp() {
     "Codex: jhw-notion 서버 제거" \
     "Codex: 소유한 jhw-notion 등록 없음" \
     "$(date +%Y%m%d%H%M%S)"
+  record_env_dropped codex
   if [ "$CONFIG_EDITOR_CHANGED" -eq 1 ]; then
     prune_codex_backups "$config_file"
   fi
@@ -792,6 +843,7 @@ unregister_opencode_mcp() {
     "unregister-opencode" "$settings_file" \
     "OpenCode: jhw-notion 서버 제거" \
     "OpenCode: 소유한 jhw-notion 등록 없음"
+  record_env_dropped opencode
 }
 
 register_guard_hooks() {
@@ -1093,8 +1145,8 @@ select_managed_wiring() {
 
 # The exact legacy launcher is owned and migrated by install_wiring.
 is_migratable_legacy_hook_launcher() {
-  [[ "$CONTROL_HOOK_ENTRY" = "$SCRIPT_DIR/.jhw-runtime/bootstrap/jhw-runtime-hook" && -L "$CONTROL_HOOK_LINK" &&
-     "$(readlink -- "$CONTROL_HOOK_LINK")" = "$SCRIPT_DIR/scripts/jhw-control-hook" ]]
+  [[ "$CONTROL_HOOK_ENTRY" = "$SCRIPT_DIR/.jhw-runtime/bootstrap/jhw-runtime-hook" ]] &&
+    is_exact_link "$CONTROL_HOOK_LINK" "$SCRIPT_DIR/scripts/jhw-control-hook"
 }
 
 migrate_legacy_hook_launcher() {
@@ -1132,6 +1184,8 @@ echo ""
 echo ""
 echo "[2/6] control 심링크"
 migrate_legacy_hook_launcher
+release_adopted_link "$CONTROL_LINK" mcp-server/dist/control/cli.js
+release_adopted_link "$CONTROL_HOOK_LINK" scripts/jhw-control-hook
 validate_control_artifacts
 install_control_cli
 install_control_hook
@@ -1163,6 +1217,7 @@ if [ -d "$CODEX_DIR" ]; then
   # Codex는 $CODEX_HOME/skills 의 스킬 디렉토리를 자동 발견한다.
   # (~/.codex/commands/*.toml은 스캔하지 않으므로 예전 TOML 배선은 제거한다.)
   LEGACY="$CODEX_DIR/commands/jhw"
+  release_adopted_link "$LEGACY" skills/claude
   if [ -e "$LEGACY" ] || [ -L "$LEGACY" ]; then
     remove_owned_link_transaction "$LEGACY" "$SKILL_ROOT/claude" "Codex: legacy commands/jhw 배선" || exit 1
     if [ -e "$LEGACY" ] || [ -L "$LEGACY" ]; then
@@ -1178,6 +1233,7 @@ if [ -d "$CODEX_DIR" ]; then
     NAME="$(basename "$SRC")"
     SRC="$SKILL_ROOT/codex/$NAME"
     TARGET="$CODEX_DIR/skills/$NAME"
+    release_adopted_link "$TARGET" "skills/codex/$NAME"
     if is_foreign_link_destination "$TARGET" "$SRC"; then
       fail "Codex 스킬 이름 충돌을 보존하기 위해 설치를 중단합니다."
       exit 1
@@ -1200,6 +1256,7 @@ if [ -d "$CODEX_DIR" ]; then
     [ "$NAME" = "AGENTS.md" ] && continue
     SRC="$SKILL_ROOT/claude/$NAME"
     TARGET="$CODEX_DIR/prompts/$NAME"
+    release_adopted_link "$TARGET" "skills/claude/$NAME"
     if is_foreign_link_destination "$TARGET" "$SRC"; then
       fail "Codex 프롬프트 이름 충돌을 보존하기 위해 설치를 중단합니다."
       exit 1
@@ -1212,6 +1269,12 @@ if [ -d "$CODEX_DIR" ]; then
     PLINKED=$((PLINKED + 1))
   done
   ok "Codex: $CODEX_DIR/prompts/*.md → skills/claude/*.md (심링크 ${PLINKED}개)"
+  # Adopted names this release no longer ships are provably adopt-root links:
+  # remove them (their preimages restore them on rollback) instead of orphaning.
+  if [ -n "$ADOPT_ROOT" ]; then
+    for TARGET in "$CODEX_DIR"/skills/*; do release_adopted_link "$TARGET" "skills/codex/${TARGET##*/}"; done
+    for TARGET in "$CODEX_DIR"/prompts/*; do release_adopted_link "$TARGET" "skills/claude/${TARGET##*/}"; done
+  fi
 fi
 
 # [5/6] MCP 서버 등록
@@ -1301,6 +1364,7 @@ plan_config_destination() {
   case "$rc" in
     0) return 0 ;;
     4) plan_conflict "$class" ;;
+    9) plan_conflict adopt_env_unpreservable ;;
     *) return 1 ;;
   esac
 }
@@ -1319,7 +1383,11 @@ plan_transaction_parent() {
 }
 
 plan_link_destination() {
-  local class="$1" target="$2" source="$3" need_write=1
+  local class="$1" target="$2" source="$3" relative="${4:-}" need_write=1
+  if [ -n "$relative" ] && is_adoptable_link "$target" "$relative"; then
+    directory_path_unusable "$(dirname "$target")" 1 && { plan_conflict parent_unusable; return; }
+    return 0
+  fi
   is_foreign_link_destination "$target" "$source" && { plan_conflict "$class"; return; }
   [ -L "$target" ] && need_write=0
   directory_path_unusable "$(dirname "$target")" "$need_write" && { plan_conflict parent_unusable; return; }
@@ -1335,23 +1403,25 @@ plan_wiring() {
   if is_migratable_legacy_hook_launcher; then
     plan_transaction_parent "$CONTROL_HOOK_LINK" || return
   fi
-  plan_link_destination control_link "$CONTROL_LINK" "$CONTROL_ENTRY" || return
+  plan_link_destination control_link "$CONTROL_LINK" "$CONTROL_ENTRY" mcp-server/dist/control/cli.js || return
   if is_migratable_legacy_hook_launcher; then
     directory_path_unusable "$(dirname "$CONTROL_HOOK_LINK")" 1 && { plan_conflict parent_unusable; return; }
   else
-    plan_link_destination hook_link "$CONTROL_HOOK_LINK" "$CONTROL_HOOK_ENTRY" || return
+    plan_link_destination hook_link "$CONTROL_HOOK_LINK" "$CONTROL_HOOK_ENTRY" scripts/jhw-control-hook || return
   fi
   if [ -d "$CLAUDE_DIR" ]; then
-    plan_link_destination command_dir "$CLAUDE_DIR/commands/jhw" "$SKILL_ROOT/claude" || return
+    plan_link_destination command_dir "$CLAUDE_DIR/commands/jhw" "$SKILL_ROOT/claude" skills/claude || return
   fi
   if [ -d "$GEMINI_DIR" ]; then
-    plan_link_destination command_dir "$GEMINI_DIR/commands/jhw" "$SKILL_ROOT/claude" || return
+    plan_link_destination command_dir "$GEMINI_DIR/commands/jhw" "$SKILL_ROOT/claude" skills/claude || return
   fi
   if [ -d "$OPENCODE_DIR" ]; then
-    plan_link_destination command_dir "$OPENCODE_DIR/skills/jhw" "$SKILL_ROOT/claude" || return
+    plan_link_destination command_dir "$OPENCODE_DIR/skills/jhw" "$SKILL_ROOT/claude" skills/claude || return
   fi
   if [ -d "$CODEX_DIR" ]; then
-    if [ -e "$CODEX_DIR/commands/jhw" ] || [ -L "$CODEX_DIR/commands/jhw" ]; then
+    if is_adoptable_link "$CODEX_DIR/commands/jhw" skills/claude; then
+      directory_path_unusable "$CODEX_DIR/commands" 1 && { plan_conflict parent_unusable; return; }
+    elif [ -e "$CODEX_DIR/commands/jhw" ] || [ -L "$CODEX_DIR/commands/jhw" ]; then
       plan_transaction_parent "$CODEX_DIR/commands/jhw" || return
       is_foreign_link_destination "$CODEX_DIR/commands/jhw" "$SKILL_ROOT/claude" && { plan_conflict command_dir; return; }
     fi
@@ -1359,14 +1429,28 @@ plan_wiring() {
     for src in "$candidate"/codex/jhw-*; do
       [ -d "$src" ] || continue
       name="$(basename "$src")"
-      plan_link_destination skill_link "$CODEX_DIR/skills/$name" "$SKILL_ROOT/codex/$name" || return
+      plan_link_destination skill_link "$CODEX_DIR/skills/$name" "$SKILL_ROOT/codex/$name" "skills/codex/$name" || return
     done
     directory_path_unusable "$CODEX_DIR/prompts" && { plan_conflict parent_unusable; return; }
     for src in "$candidate"/claude/*.md; do
       name="$(basename "$src")"
       [ "$name" = "AGENTS.md" ] && continue
-      plan_link_destination prompt_link "$CODEX_DIR/prompts/$name" "$SKILL_ROOT/claude/$name" || return
+      plan_link_destination prompt_link "$CODEX_DIR/prompts/$name" "$SKILL_ROOT/claude/$name" "skills/claude/$name" || return
     done
+    # Every Codex link into the adopt root, including names this release does
+    # not ship, must be an exact legacy link; wire removes those it cannot re-create.
+    if [ -n "$ADOPT_ROOT" ]; then
+      for src in "$CODEX_DIR"/skills/* "$CODEX_DIR"/prompts/*; do
+        [ -L "$src" ] && exact_path_output readlink -- "$src" || continue
+        case "$EXACT_PATH" in "$ADOPT_ROOT"/*) ;; *) continue ;; esac
+        name="${src##*/}"
+        case "$src" in
+          "$CODEX_DIR"/skills/*) is_adoptable_link "$src" "skills/codex/$name" || { plan_conflict skill_link; return; } ;;
+          *) is_adoptable_link "$src" "skills/claude/$name" || { plan_conflict prompt_link; return; } ;;
+        esac
+        directory_path_unusable "$(dirname "$src")" 1 && { plan_conflict parent_unusable; return; }
+      done
+    fi
   fi
   if [ -d "$CLAUDE_DIR" ]; then
     plan_config_destination mcp_entry check-stdio "$HOME/.claude.json" || return
@@ -1403,7 +1487,7 @@ rollback_first_wiring() {
   if [ ! -e "$CONTROL_HOOK_LINK" ] && [ ! -L "$CONTROL_HOOK_LINK" ]; then
     ln -s -- "$SCRIPT_DIR/scripts/jhw-control-hook" "$CONTROL_HOOK_LINK" || return 1
   fi
-  [ "$(readlink -- "$CONTROL_HOOK_LINK")" = "$SCRIPT_DIR/scripts/jhw-control-hook" ] || return 1
+  is_exact_link "$CONTROL_HOOK_LINK" "$SCRIPT_DIR/scripts/jhw-control-hook" || return 1
   node "$CONFIG_EDITOR" finalize-control-hook-link-transaction "$CONTROL_HOOK_LINK" "$SCRIPT_DIR/scripts/jhw-control-hook" "$SCRIPT_DIR" "$MIGRATION_HOOK_TRANSACTION_DIR" removed-owned >/dev/null || return 1
   MIGRATION_HOOK_TRANSACTION_DIR=""
 }
@@ -1499,20 +1583,20 @@ verify_wiring() {
   for name in jhw-control jhw-control-hook; do
     link="$HOME/.local/bin/$name"
     if [[ "$name" = jhw-control ]]; then target="$CONTROL_ENTRY"; else target="$CONTROL_HOOK_ENTRY"; fi
-    [[ -L "$link" && "$(readlink -- "$link")" = "$target" ]] || return 1
+    is_exact_link "$link" "$target" || return 1
   done
   if control_coordinates_absent; then scope=session-end-only; fi
   if [[ -d "$CLAUDE_DIR" ]]; then
-    [[ -L "$CLAUDE_DIR/commands/jhw" && "$(readlink -- "$CLAUDE_DIR/commands/jhw")" = "$SKILL_ROOT/claude" ]] || return 1
+    is_exact_link "$CLAUDE_DIR/commands/jhw" "$SKILL_ROOT/claude" || return 1
     node "$CONFIG_EDITOR" verify-stdio "$HOME/.claude.json" "$MCP_ENTRY" "$SCRIPT_DIR" || return 1
     node "$CONFIG_EDITOR" verify-claude-hooks "$CLAUDE_DIR/settings.json" "$MCP_ENTRY" "$SCRIPT_DIR" "$scope" || return 1
   fi
   if [[ -d "$GEMINI_DIR" ]]; then
-    [[ -L "$GEMINI_DIR/commands/jhw" && "$(readlink -- "$GEMINI_DIR/commands/jhw")" = "$SKILL_ROOT/claude" ]] || return 1
+    is_exact_link "$GEMINI_DIR/commands/jhw" "$SKILL_ROOT/claude" || return 1
     node "$CONFIG_EDITOR" verify-stdio "$GEMINI_DIR/settings.json" "$MCP_ENTRY" "$SCRIPT_DIR" || return 1
   fi
   if [[ -d "$OPENCODE_DIR" ]]; then
-    [[ -L "$OPENCODE_DIR/skills/jhw" && "$(readlink -- "$OPENCODE_DIR/skills/jhw")" = "$SKILL_ROOT/claude" ]] || return 1
+    is_exact_link "$OPENCODE_DIR/skills/jhw" "$SKILL_ROOT/claude" || return 1
     node "$CONFIG_EDITOR" verify-opencode "$OPENCODE_DIR/opencode.json" "$MCP_ENTRY" "$SCRIPT_DIR" || return 1
   fi
   if [[ -d "$CODEX_DIR" ]]; then
@@ -1521,7 +1605,7 @@ verify_wiring() {
     for src in "$SKILL_ROOT"/codex/jhw-* "$SKILL_ROOT"/claude/*.md; do
       name="$(basename "$src")"; [[ "$name" = AGENTS.md ]] && continue
       if [[ -d "$src" ]]; then link="$CODEX_DIR/skills/$name"; else link="$CODEX_DIR/prompts/$name"; fi
-      [[ -L "$link" && "$(readlink -- "$link")" = "$src" ]] || return 1
+      is_exact_link "$link" "$src" || return 1
     done
   fi
   return 0

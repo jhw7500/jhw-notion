@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
-import { validateBootstrap } from "./runtime-entry.mjs";
+import { validateBootstrap, STARTUP_ENVIRONMENT } from "./runtime-entry.mjs";
 
 const [operation, configFileArgument, mcpEntry, repositoryRoot, backupStampArgument, transactionEvidence] = process.argv.slice(2);
 let configFile = configFileArgument;
@@ -22,6 +22,18 @@ const CAS_MISMATCH = 5;
 const AMBIGUOUS = 6;
 const CLEANUP_UNCONFIRMED = 7;
 const MANUAL_RECOVERY = 8;
+const ADOPT_UNPRESERVABLE = 9;
+// First activation with --adopt-from: the driver validated this sibling
+// checkout of the same repository before passing it.
+const adoptRoot = process.env.JHW_ADOPT_FROM ?? "";
+// The only env the stdio register path writes; anything else on an owned entry
+// was carried over (e.g. adopted) and is lost when uninstall removes the entry.
+const STDIO_DEFAULT_ENV = { NOTION_API_KEY: "${NOTION_API_KEY}" };
+// Value-free marker for the caller: never prints names or values of the env.
+function reportEnvDropped(dropped) {
+  if (dropped) process.stdout.write("env-dropped\n");
+}
+const stdioEnvDropped = (entry) => entry.env !== undefined && JSON.stringify(entry.env) !== JSON.stringify(STDIO_DEFAULT_ENV);
 
 function failForeign() {
   process.exit(FOREIGN);
@@ -104,6 +116,27 @@ function ownedVector(command, args) {
     args.length === 2 && args[1] === "mcp" && managedEntry(args[0]);
 }
 function isOwnedStdio(entry) { return entry && ownedVector(entry.command, entry.args); }
+// The exact vector the legacy installer wrote from the adopt root.
+function adoptedVector(command, args) {
+  return adoptRoot !== "" && command === "node" && Array.isArray(args) && args.length === 1 &&
+    args[0] === `${adoptRoot}/mcp-server/dist/index.js`;
+}
+function stringMap(value) {
+  return value === undefined || (objectMap(value) && Object.values(value).every((item) => typeof item === "string"));
+}
+// An adopted entry is re-registered for this checkout keeping its environment;
+// any other key cannot be carried over, so adoption refuses.
+// Variables node or the dynamic loader reads before the managed runtime can
+// strip them (its own STARTUP_ENVIRONMENT plus loader prefixes); adoption never
+// carries them into the managed node entry.
+function isLoaderVariable(name) {
+  const upper = String(name).toUpperCase();
+  return STARTUP_ENVIRONMENT.includes(upper) || /^(NODE_|LD_|DYLD_)/.test(upper);
+}
+function requirePreservable(entry, keys, environmentKey) {
+  if (!Object.keys(entry).every((key) => keys.includes(key)) || !stringMap(entry[environmentKey]) ||
+      Object.keys(entry[environmentKey] ?? {}).some(isLoaderVariable)) process.exit(ADOPT_UNPRESERVABLE);
+}
 function isOwnedOpenCode(entry) { return entry && Array.isArray(entry.command) && ownedVector(entry.command[0], entry.command.slice(1)); }
 
 function objectMap(value) {
@@ -1472,18 +1505,23 @@ function inspectStdioRegistration() {
   const settings = parsedJson(current.text);
   if (settings.mcpServers !== undefined && !objectMap(settings.mcpServers)) failForeign();
   const existing = settings.mcpServers?.["jhw-notion"];
-  if (existing !== undefined && !isOwnedStdio(existing)) failForeign();
-  return { current, settings };
+  const adopted = existing !== undefined && !isOwnedStdio(existing) && objectMap(existing) && adoptedVector(existing.command, existing.args);
+  if (existing !== undefined && !isOwnedStdio(existing) && !adopted) failForeign();
+  if (adopted) {
+    requirePreservable(existing, ["type", "command", "args", "env"], "env");
+    if (existing.type !== undefined && existing.type !== "stdio") process.exit(ADOPT_UNPRESERVABLE);
+  }
+  return { current, settings, adoptedEnv: adopted ? existing.env : undefined };
 }
 
 function registerStdio() {
-  const { current, settings } = inspectStdioRegistration();
+  const { current, settings, adoptedEnv } = inspectStdioRegistration();
   settings.mcpServers ??= {};
   settings.mcpServers["jhw-notion"] = {
     type: "stdio",
     command: "node",
     args: stdioArgs(),
-    env: { NOTION_API_KEY: "${NOTION_API_KEY}" },
+    env: adoptedEnv ?? STDIO_DEFAULT_ENV,
   };
   saveIfChanged(configFile, current.text, settings, current.mode);
 }
@@ -1497,6 +1535,7 @@ function unregisterStdio() {
   if (existing === undefined || !isOwnedStdio(existing)) process.exit(UNCHANGED);
   delete servers["jhw-notion"];
   if (Object.keys(servers).length === 0) delete settings.mcpServers;
+  reportEnvDropped(stdioEnvDropped(existing));
   saveIfChanged(configFile, current.text, settings, current.mode);
 }
 
@@ -1507,16 +1546,28 @@ function inspectOpenCodeRegistration() {
   if (settings.mcpServers !== undefined && !objectMap(settings.mcpServers)) failForeign();
   const existing = settings.mcp?.["jhw-notion"];
   const legacy = settings.mcpServers?.["jhw-notion"];
-  if (existing !== undefined && !isOwnedOpenCode(existing)) failForeign();
-  if (legacy !== undefined && !isOwnedStdio(legacy)) failForeign();
-  return { current, settings, legacy };
+  const adopted = existing !== undefined && !isOwnedOpenCode(existing) && objectMap(existing) &&
+    Array.isArray(existing.command) && adoptedVector(existing.command[0], existing.command.slice(1));
+  const adoptedLegacy = legacy !== undefined && !isOwnedStdio(legacy) && objectMap(legacy) && adoptedVector(legacy.command, legacy.args);
+  if (existing !== undefined && !isOwnedOpenCode(existing) && !adopted) failForeign();
+  if (legacy !== undefined && !isOwnedStdio(legacy) && !adoptedLegacy) failForeign();
+  if (adopted) {
+    requirePreservable(existing, ["type", "command", "enabled", "environment"], "environment");
+    if ((existing.type !== undefined && existing.type !== "local") || (existing.enabled !== undefined && existing.enabled !== true)) process.exit(ADOPT_UNPRESERVABLE);
+  }
+  // A legacy mcpServers env uses "${VAR}" interpolation; the mcp.environment
+  // format this checkout writes is not proven to interpolate the same way, so
+  // an adopted legacy entry carrying env is refused rather than altered.
+  if (adoptedLegacy) requirePreservable(legacy, ["type", "command", "args"], "env");
+  return { current, settings, legacy, adoptedEnvironment: adopted ? existing.environment : undefined };
 }
 
 function registerOpenCode() {
-  const { current, settings, legacy } = inspectOpenCodeRegistration();
+  const { current, settings, legacy, adoptedEnvironment } = inspectOpenCodeRegistration();
   settings["$schema"] ??= "https://opencode.ai/config.json";
   settings.mcp ??= {};
-  settings.mcp["jhw-notion"] = { type: "local", command: ["node", ...stdioArgs()], enabled: true };
+  settings.mcp["jhw-notion"] = { type: "local", command: ["node", ...stdioArgs()], enabled: true,
+    ...(adoptedEnvironment === undefined ? {} : { environment: adoptedEnvironment }) };
   if (legacy !== undefined) {
     delete settings.mcpServers["jhw-notion"];
     if (Object.keys(settings.mcpServers).length === 0) delete settings.mcpServers;
@@ -1529,9 +1580,11 @@ function unregisterOpenCode() {
   if (!current.exists) process.exit(UNCHANGED);
   const settings = parsedJson(current.text);
   let changed = false;
+  let dropped = false;
   const local = objectMap(settings.mcp);
   const localEntry = local?.["jhw-notion"];
   if (localEntry !== undefined && isOwnedOpenCode(localEntry)) {
+    dropped ||= localEntry.environment !== undefined;
     delete local["jhw-notion"];
     if (Object.keys(local).length === 0) delete settings.mcp;
     changed = true;
@@ -1539,11 +1592,13 @@ function unregisterOpenCode() {
   const legacy = objectMap(settings.mcpServers);
   const legacyEntry = legacy?.["jhw-notion"];
   if (legacyEntry !== undefined && isOwnedStdio(legacyEntry)) {
+    dropped ||= stdioEnvDropped(legacyEntry);
     delete legacy["jhw-notion"];
     if (Object.keys(legacy).length === 0) delete settings.mcpServers;
     changed = true;
   }
   if (!changed) process.exit(UNCHANGED);
+  reportEnvDropped(dropped);
   saveIfChanged(configFile, current.text, settings, current.mode);
 }
 
@@ -1728,7 +1783,8 @@ function ownedToml(source) {
   if (commands.length !== 1 || argsLines.length !== 1 || commands[0][1] !== "node") return { owned: false, range };
   let args;
   try { args = JSON.parse(argsLines[0][1]); } catch { return { owned: false, range }; }
-  return { owned: ownedVector(commands[0][1], args), range };
+  const owned = ownedVector(commands[0][1], args);
+  return { owned, adopted: !owned && adoptedVector(commands[0][1], args), range };
 }
 
 function codexEntry() {
@@ -1754,19 +1810,39 @@ function saveToml(current, next) {
 function inspectCodexRegistration() {
   const current = safeExistingFile(configFile);
   const inspected = ownedToml(current.text);
-  if ((inspected.range.start !== undefined && !inspected.owned) ||
+  if ((inspected.range.start !== undefined && !inspected.owned && !inspected.adopted) ||
       (inspected.range.start === undefined && inspected.range.hasOrphan)) failForeign();
-  return { current, inspected };
+  let preserved = [];
+  if (inspected.adopted) {
+    // Only env_vars and an env child table carry over from the adopted entry.
+    const { lines, start, parentEnd, end } = inspected.range;
+    const parent = lines.slice(start + 1, parentEnd);
+    const children = lines.slice(parentEnd, end);
+    if (!parent.every((line) => /^\s*(#.*)?$/.test(line) || /^\s*(command|args|startup_timeout_sec|env_vars)\s*=/.test(line)) ||
+        !children.every((line) => !/^\s*\[/.test(line) || line.trim() === "[mcp_servers.jhw-notion.env]")) process.exit(ADOPT_UNPRESERVABLE);
+    preserved = [...parent.filter((line) => /^\s*env_vars\s*=/.test(line)), ...children];
+    // Preserved names must be readable and never loader/runtime-control variables.
+    for (const line of preserved) {
+      if (/^\s*(#.*)?$/.test(line) || /^\s*\[/.test(line)) continue;
+      const envVars = /^\s*env_vars\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(line));
+      let names;
+      if (envVars) { try { names = JSON.parse(envVars[1]); } catch { names = undefined; } }
+      else { const keys = tomlAssignmentKeys(line); names = keys?.length === 1 ? keys : undefined; }
+      if (!Array.isArray(names) || !names.every((name) => typeof name === "string") || names.some(isLoaderVariable)) process.exit(ADOPT_UNPRESERVABLE);
+    }
+  }
+  return { current, inspected, preserved };
 }
 
 function registerCodex() {
-  const { current, inspected } = inspectCodexRegistration();
+  const { current, inspected, preserved } = inspectCodexRegistration();
   let output;
   if (inspected.range.start !== undefined) {
     const suffix = inspected.range.lines.slice(inspected.range.end);
     output = [
       ...inspected.range.lines.slice(0, inspected.range.start),
       ...codexEntry(),
+      ...preserved,
       ...(suffix.length === 0 && current.text.endsWith("\n") ? [""] : suffix),
     ].join("\n");
   } else {
@@ -1781,6 +1857,10 @@ function unregisterCodex() {
   if (!current.exists) process.exit(UNCHANGED);
   const inspected = ownedToml(current.text);
   if (!inspected.owned || inspected.range.start === undefined) process.exit(UNCHANGED);
+  // The register path writes neither env_vars nor child tables.
+  const { lines, start, parentEnd, end } = inspected.range;
+  reportEnvDropped(lines.slice(start + 1, parentEnd).some((line) => /^\s*env_vars\s*=/.test(line)) ||
+    lines.slice(parentEnd, end).some((line) => /^\s*\[/.test(line)));
   const output = [
     ...inspected.range.lines.slice(0, inspected.range.start),
     ...inspected.range.lines.slice(inspected.range.end),
