@@ -152,7 +152,9 @@ function readRecord(directoryFd, name, limit, uid) {
   try {
     fd = fs.openSync(`/proc/self/fd/${directoryFd}/${name}`, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
     const before = fs.fstatSync(fd);
-    if (!before.isFile() || before.uid !== uid || !(before.mode & 0o400)) uncertain();
+    // Non-dumpable tasks keep a current-user /proc/<pid> directory, but the
+    // kernel assigns their records to root; any other record owner is foreign.
+    if (!before.isFile() || (before.uid !== uid && before.uid !== 0) || !(before.mode & 0o400)) uncertain();
     const bytes = Buffer.alloc(limit + 1);
     let length = 0;
     while (length <= limit) {
@@ -191,7 +193,7 @@ function parseArgv(bytes) {
 
 const INTERPRETERS = new Set(['node', 'nodejs', 'bun', 'bash', 'sh', 'dash', 'zsh', 'python', 'python3']);
 const NODE_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader', '--conditions', '-C', '--title', '--icu-data-dir', '--openssl-config', '--env-file', '--env-file-if-exists', '--input-type', '--diagnostic-dir', '--redirect-warnings', '--inspect-port']);
-const NODE_BOOLEAN_FLAGS = new Set(['--no-warnings', '--trace-warnings', '--enable-source-maps', '--no-deprecation', '--trace-deprecation', '--experimental-strip-types', '--experimental-transform-types', '--experimental-default-type=module', '--inspect', '--inspect-brk', '--expose-gc']);
+const NODE_BOOLEAN_FLAGS = new Set(['--watch', '--watch-preserve-output', '--node-snapshot', '--no-node-snapshot', '--no-warnings', '--trace-warnings', '--enable-source-maps', '--no-deprecation', '--trace-deprecation', '--experimental-strip-types', '--experimental-transform-types', '--experimental-default-type=module', '--inspect', '--inspect-brk', '--expose-gc']);
 function entryIdentity(argv) {
   const binary = path.basename(argv[0]);
   if (!INTERPRETERS.has(binary)) return { entry: argv[0], args: argv.slice(1) };
@@ -237,17 +239,27 @@ function tuiName(entry) {
   return identities.find(([, pattern]) => pattern.test(entry))?.[0];
 }
 const RUNTIME_ENTRIES = new Set(['mcp-server/dist/index.js', 'mcp-server/dist/control/cli.js', 'mcp-server/dist/control/hook-adapter.js', 'scripts/jhw-control-hook']);
+const BOOTSTRAP_ENTRIES = new Set(['.jhw-runtime/bootstrap/jhw-runtime-entry', '.jhw-runtime/bootstrap/jhw-runtime-control', '.jhw-runtime/bootstrap/jhw-runtime-hook', '.jhw-runtime/bootstrap/runtime-entry.mjs', 'scripts/runtime-entry.mjs']);
+const RUNTIME_BASENAMES = new Set([...RUNTIME_ENTRIES, ...BOOTSTRAP_ENTRIES].map(entry => path.basename(entry)));
+// Resolution against any cwd keeps a normalized relative entry's basename unless
+// it normalizes to '.' or ends in '..'. Other basenames cannot name a runtime file.
+function needsCwd(entry) {
+  const normalized = path.normalize(entry);
+  return normalized === '.' || path.basename(normalized) === '..' || RUNTIME_BASENAMES.has(path.basename(normalized));
+}
 function classify(identity, repositoryRoot, readCwd) {
   if (!identity) return null;
   const name = tuiName(identity.entry);
   if (name) return name === 'codex' && identity.args[0] === 'app-server' ? 'app_server' : 'tui';
   // Relative script paths are meaningful only with a stable, required cwd link.
-  const entry = path.isAbsolute(identity.entry) ? path.normalize(identity.entry) : path.resolve(readCwd(), identity.entry);
-  const relative = path.relative(repositoryRoot, entry);
-  if (RUNTIME_ENTRIES.has(relative)) return 'legacy';
-  if (['.jhw-runtime/bootstrap/jhw-runtime-entry', '.jhw-runtime/bootstrap/jhw-runtime-control', '.jhw-runtime/bootstrap/jhw-runtime-hook', '.jhw-runtime/bootstrap/runtime-entry.mjs', 'scripts/runtime-entry.mjs'].includes(relative)) return 'managed';
-  const match = /^\.jhw-runtime\/(?:current\/|(?:releases\/r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}|activations\/a-[a-f0-9]{32})\/)(.+)$/.exec(relative);
-  if (match && RUNTIME_ENTRIES.has(match[1])) return 'managed';
+  if (path.isAbsolute(identity.entry) || needsCwd(identity.entry)) {
+    const entry = path.isAbsolute(identity.entry) ? path.normalize(identity.entry) : path.resolve(readCwd(), identity.entry);
+    const relative = path.relative(repositoryRoot, entry);
+    if (RUNTIME_ENTRIES.has(relative)) return 'legacy';
+    if (BOOTSTRAP_ENTRIES.has(relative)) return 'managed';
+    const match = /^\.jhw-runtime\/(?:current\/|(?:releases\/r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}|activations\/a-[a-f0-9]{32})\/)(.+)$/.exec(relative);
+    if (match && RUNTIME_ENTRIES.has(match[1])) return 'managed';
+  }
   // Installed links can retain their launcher spelling in argv. These closed
   // executable/script basenames are consumer identities, never argument scans.
   const launcher = path.basename(identity.entry);
