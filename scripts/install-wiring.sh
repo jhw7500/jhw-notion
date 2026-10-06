@@ -183,6 +183,8 @@ CONTROL_HOOK_LINK_REMOVE_OUTCOME=""
 INSTALL_UNPROTECTED=0
 MIGRATION_HOOK_TRANSACTION_DIR=""
 CODEX_BACKUP_PRUNE_FILE=""
+# Adapters whose removed owned MCP entry carried non-default env (names only).
+ENV_DROPPED=""
 
 validate_control_artifacts() {
   if [ ! -x "$CONTROL_ENTRY" ]; then
@@ -724,7 +726,8 @@ run_config_editor() {
   case "$operation" in
     register-*) mkdir -p "$(dirname "$settings_file")" ;;
   esac
-  if node "$CONFIG_EDITOR" "$operation" "$settings_file" "$MCP_ENTRY" "$SCRIPT_DIR" "$stamp"; then
+  CONFIG_EDITOR_OUTPUT=""
+  if CONFIG_EDITOR_OUTPUT="$(node "$CONFIG_EDITOR" "$operation" "$settings_file" "$MCP_ENTRY" "$SCRIPT_DIR" "$stamp")"; then
     CONFIG_EDITOR_CHANGED=1
     ok "$changed_message"
     return
@@ -801,6 +804,13 @@ register_codex_mcp() {
   fi
 }
 
+# Records adapter $1 when the entry the editor just removed carried non-default env.
+record_env_dropped() {
+  if [ "$CONFIG_EDITOR_CHANGED" -eq 1 ] && [ "$CONFIG_EDITOR_OUTPUT" = env-dropped ]; then
+    ENV_DROPPED="${ENV_DROPPED:+$ENV_DROPPED }$1"
+  fi
+}
+
 unregister_mcp() {
   local settings_file="$1"
   local tui_name="$2"
@@ -809,6 +819,7 @@ unregister_mcp() {
     "unregister-stdio" "$settings_file" \
     "$tui_name: jhw-notion 서버 제거" \
     "$tui_name: 소유한 jhw-notion 등록 없음"
+  record_env_dropped "${tui_name,,}"
 }
 
 unregister_codex_mcp() {
@@ -819,6 +830,7 @@ unregister_codex_mcp() {
     "Codex: jhw-notion 서버 제거" \
     "Codex: 소유한 jhw-notion 등록 없음" \
     "$(date +%Y%m%d%H%M%S)"
+  record_env_dropped codex
   if [ "$CONFIG_EDITOR_CHANGED" -eq 1 ]; then
     prune_codex_backups "$config_file"
   fi
@@ -831,6 +843,7 @@ unregister_opencode_mcp() {
     "unregister-opencode" "$settings_file" \
     "OpenCode: jhw-notion 서버 제거" \
     "OpenCode: 소유한 jhw-notion 등록 없음"
+  record_env_dropped opencode
 }
 
 register_guard_hooks() {

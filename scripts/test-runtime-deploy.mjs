@@ -902,3 +902,20 @@ test('adopt-from publication failure at the origin pointer restores every legacy
  assert.equal(injected,true);assertFirstActivationRolledBack(f,shape);assert.deepEqual(treeDigest(P),legacy);
  assert.equal(fs.readlinkSync(path.join(f.home,'.codex/skills/jhw-old')),path.join(P,'skills/codex/jhw-old'));
 });
+// Uninstall drops owned MCP entries whole: adopted non-default env is reported by adapter, never by value.
+function journalTextWithout(root, excluded) {
+ const runtime=path.join(root,'.jhw-runtime');
+ return fs.readdirSync(runtime,{recursive:true}).map(name=>path.join(runtime,name)).filter(file=>path.basename(file)!==excluded&&fs.lstatSync(file).isFile()).map(file=>fs.readFileSync(file,'latin1')).join('\n');
+}
+test('uninstall after adoption reports which adapters lost non-default env without values', async t => {
+ const {f,adopt}=adoptFixture(t);assert.equal((await adopt()).code,'DEPLOY_ACTIVATED');
+ const result=await f.run(['--uninstall']);
+ assert.equal(result.code,'DEPLOY_UNINSTALLED');assert.deepEqual(result.envDropped,['codex','gemini','opencode']);
+ const text=JSON.stringify(result)+journalTextWithout(f.root,'before.json');
+ for(const secret of ['real-secret-value','opencode-value'])assert.equal(text.includes(secret),false,secret);
+});
+test('uninstall of a default installation reports no dropped env', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
+ const result=await f.run(['--uninstall']);assert.equal(result.code,'DEPLOY_UNINSTALLED');assert.deepEqual(result.envDropped,[]);
+});

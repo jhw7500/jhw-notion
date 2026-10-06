@@ -26,6 +26,14 @@ const ADOPT_UNPRESERVABLE = 9;
 // First activation with --adopt-from: the driver validated this sibling
 // checkout of the same repository before passing it.
 const adoptRoot = process.env.JHW_ADOPT_FROM ?? "";
+// The only env the stdio register path writes; anything else on an owned entry
+// was carried over (e.g. adopted) and is lost when uninstall removes the entry.
+const STDIO_DEFAULT_ENV = { NOTION_API_KEY: "${NOTION_API_KEY}" };
+// Value-free marker for the caller: never prints names or values of the env.
+function reportEnvDropped(dropped) {
+  if (dropped) process.stdout.write("env-dropped\n");
+}
+const stdioEnvDropped = (entry) => entry.env !== undefined && JSON.stringify(entry.env) !== JSON.stringify(STDIO_DEFAULT_ENV);
 
 function failForeign() {
   process.exit(FOREIGN);
@@ -1505,7 +1513,7 @@ function registerStdio() {
     type: "stdio",
     command: "node",
     args: stdioArgs(),
-    env: adoptedEnv ?? { NOTION_API_KEY: "${NOTION_API_KEY}" },
+    env: adoptedEnv ?? STDIO_DEFAULT_ENV,
   };
   saveIfChanged(configFile, current.text, settings, current.mode);
 }
@@ -1519,6 +1527,7 @@ function unregisterStdio() {
   if (existing === undefined || !isOwnedStdio(existing)) process.exit(UNCHANGED);
   delete servers["jhw-notion"];
   if (Object.keys(servers).length === 0) delete settings.mcpServers;
+  reportEnvDropped(stdioEnvDropped(existing));
   saveIfChanged(configFile, current.text, settings, current.mode);
 }
 
@@ -1563,9 +1572,11 @@ function unregisterOpenCode() {
   if (!current.exists) process.exit(UNCHANGED);
   const settings = parsedJson(current.text);
   let changed = false;
+  let dropped = false;
   const local = objectMap(settings.mcp);
   const localEntry = local?.["jhw-notion"];
   if (localEntry !== undefined && isOwnedOpenCode(localEntry)) {
+    dropped ||= localEntry.environment !== undefined;
     delete local["jhw-notion"];
     if (Object.keys(local).length === 0) delete settings.mcp;
     changed = true;
@@ -1573,11 +1584,13 @@ function unregisterOpenCode() {
   const legacy = objectMap(settings.mcpServers);
   const legacyEntry = legacy?.["jhw-notion"];
   if (legacyEntry !== undefined && isOwnedStdio(legacyEntry)) {
+    dropped ||= stdioEnvDropped(legacyEntry);
     delete legacy["jhw-notion"];
     if (Object.keys(legacy).length === 0) delete settings.mcpServers;
     changed = true;
   }
   if (!changed) process.exit(UNCHANGED);
+  reportEnvDropped(dropped);
   saveIfChanged(configFile, current.text, settings, current.mode);
 }
 
@@ -1827,6 +1840,10 @@ function unregisterCodex() {
   if (!current.exists) process.exit(UNCHANGED);
   const inspected = ownedToml(current.text);
   if (!inspected.owned || inspected.range.start === undefined) process.exit(UNCHANGED);
+  // The register path writes neither env_vars nor child tables.
+  const { lines, start, parentEnd, end } = inspected.range;
+  reportEnvDropped(lines.slice(start + 1, parentEnd).some((line) => /^\s*env_vars\s*=/.test(line)) ||
+    lines.slice(parentEnd, end).some((line) => /^\s*\[/.test(line)));
   const output = [
     ...inspected.range.lines.slice(0, inspected.range.start),
     ...inspected.range.lines.slice(inspected.range.end),
