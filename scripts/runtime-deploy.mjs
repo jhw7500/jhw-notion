@@ -342,11 +342,13 @@ keys=(${KEYS.join(' ')})
 for key in "\${keys[@]}"; do
   IFS= read -r -d '' value || exit 65
   if [[ "$value" != __JHW_UNSET__ ]]; then printf -v "$key" '%s' "$value"; fi
+  # A retained older library may predate this key; never let set -u abort on it.
+  if [[ -z "\${!key+x}" ]]; then printf -v "$key" '%s' ''; fi
 done
 save_phase_state() {
   local rc=$?
   trap - EXIT
-  for key in "\${keys[@]}"; do printf '%s\\0' "\${!key}" >&5; done
+  for key in "\${keys[@]}"; do printf '%s\\0' "\${!key-}" >&5; done
   exit "$rc"
 }
 trap save_phase_state EXIT

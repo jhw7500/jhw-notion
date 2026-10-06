@@ -729,3 +729,18 @@ test('first activation publication failure with a foreign pointer never restores
  assert.equal(fs.readlinkSync(pointer),'activations/a-00000000000000000000000000000000');
  assertPublicationUncertain(f);
 });
+test('managed phases tolerate a retained release library that predates a worker key', async t => {
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.claude'),{mode:0o700});
+ const library=path.join(f.root,'scripts/install-wiring.sh');const current=fs.readFileSync(library,'utf8');
+ // R0 ships a library that never defines the newest worker key.
+ assert.match(current,/^CODEX_BACKUP_PRUNE_FILE=""\n/m);
+ fs.writeFileSync(library,current.replace(/^CODEX_BACKUP_PRUNE_FILE=""\n/m,''));
+ const old=await f.run(['--prepare']);assert.equal((await f.run(['--activate',old.releaseId])).code,'DEPLOY_ACTIVATED');
+ fs.writeFileSync(library,current);
+ const head=await f.run(['--prepare']);
+ assert.equal((await f.run(['--activate',head.releaseId])).code,'DEPLOY_ACTIVATED');
+ assert.equal((await f.run(['--rollback'])).code,'DEPLOY_ROLLED_BACK');assert.equal(readActivation({repositoryRoot:f.root}).releaseId,old.releaseId);
+ assert.equal((await f.run(['--uninstall'])).code,'DEPLOY_UNINSTALLED');
+ assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/wiring.json'))).installed,false);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
