@@ -13,7 +13,7 @@ const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const skill = await readFile(join(root, "skills/claude/commit.md"), "utf8");
 const readme = await readFile(join(root, "README.md"), "utf8");
-const agents = await readFile(join(root, "skills/claude/AGENTS.md"), "utf8");
+const agents = await readFile(join(root, "skills/COMMANDS.md"), "utf8");
 const generated = await readFile(join(root, "skills/codex/jhw-commit/SKILL.md"), "utf8");
 const reference = join(root, "skills/codex/jhw-commit/references/commit.md");
 

@@ -1,7 +1,7 @@
-<!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-04-30 | Updated: 2026-04-30 -->
+<!-- /jhw:* 명령(skills/claude/*.md)의 공개 인벤토리. skills/claude/ 디렉터리는 통째로 명령으로 배포되므로
+     이 파일은 그 밖에 둔다. pr·issue·commit 계약 테스트가 표의 행을 검사한다. -->
 
-# claude (스킬)
+# skills/claude 명령 인벤토리
 
 ## Purpose
 AI TUI에서 `/jhw:*` 접두사로 호출되는 스킬. 각 스킬은 사용자 의도를 해석하여 적절한 MCP 도구(`jhw_*`)를 호출하는 워크플로우를 정의한다. Claude Code, Gemini CLI, OpenCode에서 심링크로 공유된다.
