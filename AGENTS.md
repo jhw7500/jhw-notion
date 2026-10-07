@@ -124,8 +124,10 @@ node scripts/sync-codex-skills.mjs --check    # skills/codex 드리프트 검사
 ## 하지 않는 것
 
 - `.env`, `docs/notion-architecture-review.md`(로컬 전용)를 커밋하지 않는다.
-- 세션 체크포인트 `HANDOFF.<세션>.md`와 도구 상태 디렉터리를 커밋하지 않는다. 목록은 `.gitignore`가
-  정본이다. 새 도구 디렉터리가 생기면 스테이징 전에 `git status`로 확인한다.
+- 세션 체크포인트 `HANDOFF.<세션>.md`를 커밋하지 않되 `.gitignore`에도 넣지 않는다. 무시된 파일은
+  Task worktree 정리의 `git worktree remove`를 막지 못해 체크포인트가 함께 지워진다.
+- 도구 상태 디렉터리를 커밋하지 않는다. 목록은 `.gitignore`가 정본이다. 새 도구 디렉터리가 생기면
+  스테이징 전에 `git status`로 확인한다.
 - `skills/codex/` 생성물을 직접 고치지 않는다.
 - Project Control Registry·worktree 상태를 직접 편집·삭제하지 않고, 자동 retry·takeover·force-end를
   하지 않는다. Task 조작은 `jhw-control-host`와 `/jhw:task` 절차로만 한다.

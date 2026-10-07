@@ -18,6 +18,3 @@ docs/notion-architecture-review.md
 
 # Immutable runtime releases and private deployment evidence
 .jhw-runtime/
-
-# 세션 체크포인트 (로컬 전용)
-HANDOFF.*.md
