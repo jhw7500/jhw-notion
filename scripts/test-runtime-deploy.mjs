@@ -563,8 +563,36 @@ test('an interrupted refresh-bootstrap blocks other operations until a retried r
  try{await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{if(options.phase==='validate')shared=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true});return deploy.wiringPhase(options);}}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});}finally{shared?.close();}
  assert.equal((await f.run(['--status'])).recoveryPending,1);
  await assert.rejects(f.run(['--activate',a.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_RECOVERY_REQUIRED'});
- const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal((await f.run(['--status'])).recoveryPending,0);
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
  assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'))).sourceReleaseId,b.releaseId);
+});
+// Break caught (A-R1-001): a retry restoring whatever the interrupted attempt left live, or a refused retry clearing the gate.
+test('a retried refresh restores the set live before the first attempt and a refused retry keeps the gate',async t=>{
+ const {f,b,bootstrap,old,oldControl}=await changedHelperFixture(t,'broken selector');let shared;
+ const blocked=async options=>{if(options.phase==='validate'){shared=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true});throw new Error('fixture probe hang');}return deploy.wiringPhase(options);};
+ try{await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:blocked}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});}finally{shared?.close();}
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{if(options.phase==='verify')throw new Error('fixture verify failure');return deploy.wiringPhase(options);}}));
+ assert.equal((await f.run(['--status'])).recoveryPending,1);await assert.rejects(f.run(['--activate',b.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{if(options.phase==='validate')throw new Error('fixture validation failure');return deploy.wiringPhase(options);}}),{code:'DEPLOY_VALIDATION_FAILED',reason:'bootstrap_restored'});
+ assert.deepEqual(fs.readFileSync(path.join(bootstrap,'manifest.json')),old);assert.deepEqual(fs.readFileSync(path.join(bootstrap,'jhw-runtime-control')),oldControl);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught (A-R1-002): a failed restore reporting recovery required while its journal no longer gates other operations.
+test('a failed refresh restore keeps the journal pending until a later refresh proves the live set',async t=>{
+ const {f,a,b,bootstrap}=await changedHelperFixture(t,'broken selector');const original=path.join(f.root,'.jhw-runtime/releases',a.releaseId,'scripts/jhw-runtime-control');
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{if(options.phase==='validate'){fs.chmodSync(original,0o700);throw new Error('fixture validation failure');}return deploy.wiringPhase(options);}}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'bootstrap_restore_failed'});
+ assert.equal((await f.run(['--status'])).recoveryPending,1);await assert.rejects(f.run(['--uninstall']),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ fs.chmodSync(original,0o755);
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught (A-R1-003): reporting the current release as the new pin when unchanged helper bytes kept the old pin.
+test('refresh-bootstrap reports the pin actually kept when helper bytes are unchanged',async t=>{
+ const f=fixture(t);host(f);const a=await f.run(['--prepare']);await f.run(['--activate',a.releaseId]);
+ fs.appendFileSync(path.join(f.root,'skills/claude/task.md'),'\nchanged skill text\n');const b=await f.run(['--prepare']);await f.run(['--activate',b.releaseId]);assert.notEqual(a.releaseId,b.releaseId);
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.releaseId,b.releaseId);assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,a.releaseId);assert.equal(r.bootstrap.previousDirectory,null);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'))).sourceReleaseId,a.releaseId);
 });
 // Break caught: refreshing an unmanaged root, or installing a helper set this checkout's installer does not define.
 test('refresh-bootstrap refuses an unmanaged root and an installer that differs from current',async t=>{

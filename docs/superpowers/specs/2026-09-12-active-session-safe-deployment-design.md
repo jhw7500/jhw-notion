@@ -139,9 +139,12 @@ pins the entry digest and closed set of supported selectors. Ordinary activation
 retains its independently validated `sourceReleaseId`. Changed helper bytes are
 adopted by the separately gated `--refresh-bootstrap` operation: under the same
 maintenance gate it reinstalls the current release's helper set without moving
-`current` or rewiring, validates it live, reinstalls the prior set from its own
-retained source release when validation fails, and preserves every replaced
-helper directory. It refuses when the checkout's `scripts/runtime-entry.mjs`
+`current` or rewiring, validates it live, reinstalls the set that was live
+before the first refresh attempt from its own retained source release when
+validation fails, and preserves every replaced helper directory. Its journal
+completes only when the live set is proven to be the validated new set or that
+original set; otherwise it stays pending, refusing every other operation, and
+only a retried refresh may supersede it. It refuses when the checkout's `scripts/runtime-entry.mjs`
 differs from the current release's. The bootstrap pins its source release, so
 any future release cleanup must retain it.
 

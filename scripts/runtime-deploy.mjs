@@ -567,16 +567,31 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   if(command.operation==='activate')validateRelease({repositoryRoot,releaseId:command.releaseId});
   if(command.operation==='rollback'&&!previous?.predecessorActivationId)fail('DEPLOY_PREDECESSOR_INVALID');
   // A missing bootstrap (interrupted replacement) is reinstalled; an invalid one refuses.
-  let priorBootstrap=null;
+  // A retried refresh restores the set that was live before the first attempt,
+  // never whatever the interrupted attempt left behind.
+  let originalBootstrap=null;
   if(command.operation==='refresh-bootstrap') {
    if(!managed||!previous)fail('DEPLOY_ARGUMENTS_INVALID','refresh_requires_managed_activation');
    requireMatchingInstaller(repositoryRoot,previous.releaseId);
-   if(exists(path.join(runtime,'bootstrap')))priorBootstrap=validateBootstrap({repositoryRoot});
+   const live=exists(path.join(runtime,'bootstrap'))?validateBootstrap({repositoryRoot}):null;
+   if(recovery?.state.bootstrap) {
+    const inherited=recovery.state.bootstrap.prior;
+    if(inherited!==null&&!(inherited&&typeof inherited==='object'&&RELEASE.test(inherited.sourceReleaseId??'')))fail('DEPLOY_RECOVERY_REQUIRED');
+    originalBootstrap=inherited;
+   } else originalBootstrap=live;
   }
   // First managed activation: refuse foreign wiring destinations before any mutation.
   if(command.operation==='activate'&&!managed)await planWiring({repositoryRoot,home,environment,releaseId:command.releaseId,planTimeoutMs,adoptFrom:command.adoptFrom});
   directory=createPrivateDirectory(runtime,`.deploy.${randomBytes(16).toString('hex')}`);
-  state={version:1,status:'pending',operation:command.operation,phase:'before_mutation',previous,variables:{}};checkpoint(directory,state);
+  state={version:1,status:'pending',operation:command.operation,phase:'before_mutation',previous,variables:{}};
+  if(command.operation==='refresh-bootstrap') {
+   state.bootstrap={prior:originalBootstrap,from:originalBootstrap?.sourceReleaseId??null,to:null,previousDirectory:null};
+   // The inherited obligation keeps this journal pending even when the retry is
+   // refused. It is written before the interrupted journal closes, so a crash in
+   // between leaves two pending journals and fails closed.
+   if(recovery){state.mutationStarted=true;state.supersedes=path.basename(recovery.directory);}
+  }
+  checkpoint(directory,state);
   if(recovery&&command.operation==='refresh-bootstrap'){recovery.state.status='complete';recovery.state.recovery='superseded_by_refresh';checkpoint(recovery.directory,recovery.state);recovery=undefined;}
   const run=async (phase,candidateReleaseId)=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom:command.adoptFrom});};
   const pointerIntent=destination=>{state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);};
@@ -593,14 +608,21 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    await run('uninstall');privateWrite(wiringFile,{version:1,installed:false});
   } else if(command.operation==='refresh-bootstrap') {
    // Reinstalls the current release's helper set without moving the pointer or
-   // wiring. A failed live validation reinstalls the prior set from its own
-   // retained source release. Handled outcomes never leave this journal pending.
+   // wiring. A failed live validation reinstalls the original set from its own
+   // retained source release. The journal completes only when the live set is
+   // proven to be the validated new set or the original set; otherwise it stays
+   // pending so every other operation remains refused.
    const settle=(phase,code,reason)=>{state.status='complete';state.phase=phase;checkpoint(directory,state);fail(code,reason);};
-   state.mutationStarted=true;state.bootstrap={from:priorBootstrap?.sourceReleaseId??null,to:previous.releaseId,previousDirectory:null};checkpoint(directory,state);
+   const hold=(phase,reason)=>{state.phase=phase;checkpoint(directory,state);fail('DEPLOY_RECOVERY_REQUIRED',reason);};
+   const liveIsOriginal=()=>{try{return originalBootstrap!==null&&JSON.stringify(validateBootstrap({repositoryRoot}))===JSON.stringify(originalBootstrap);}catch{return false;}};
+   state.mutationStarted=true;checkpoint(directory,state);
    let installed;
    try {installed=await installBootstrap({repositoryRoot,releaseId:previous.releaseId});}
-   catch(error) {settle('bootstrap_install_failed',error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code)?error.code:'DEPLOY_BOOTSTRAP_INVALID','bootstrap_install_failed');}
-   state.bootstrap.previousDirectory=installed.previousDirectory;state.phase='bootstrap_installed';checkpoint(directory,state);
+   catch(error) {
+    if(liveIsOriginal())settle('bootstrap_install_failed',error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code)?error.code:'DEPLOY_BOOTSTRAP_INVALID','bootstrap_install_failed');
+    hold('bootstrap_install_failed','bootstrap_install_unverified');
+   }
+   state.bootstrap.to=installed.manifest.sourceReleaseId;state.bootstrap.previousDirectory=installed.previousDirectory;state.phase='bootstrap_installed';checkpoint(directory,state);
    admission.close();
    admission=undefined;
    let validationError;
@@ -613,12 +635,13 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
     fail('DEPLOY_RECOVERY_REQUIRED','maintenance_reacquisition_failed');
    }
    if(validationError) {
-    if(!installed.previousDirectory)settle('validation_failed','DEPLOY_VALIDATION_FAILED',priorBootstrap?'bootstrap_unchanged':'bootstrap_reinstalled');
+    if(liveIsOriginal())settle('validation_failed','DEPLOY_VALIDATION_FAILED','bootstrap_unchanged');
+    if(originalBootstrap===null)hold('validation_failed','bootstrap_unverified');
     try {
-     const restored=await installBootstrap({repositoryRoot,releaseId:priorBootstrap.sourceReleaseId});
-     if(JSON.stringify(restored.manifest)!==JSON.stringify(priorBootstrap))fail('DEPLOY_BOOTSTRAP_CHANGED');
+     const restored=await installBootstrap({repositoryRoot,releaseId:originalBootstrap.sourceReleaseId});
+     if(JSON.stringify(restored.manifest)!==JSON.stringify(originalBootstrap))fail('DEPLOY_BOOTSTRAP_CHANGED');
      state.bootstrap.failedDirectory=restored.previousDirectory;
-    } catch {settle('bootstrap_restore_failed','DEPLOY_RECOVERY_REQUIRED','bootstrap_restore_failed');}
+    } catch {hold('bootstrap_restore_failed','bootstrap_restore_failed');}
     settle('validation_failed','DEPLOY_VALIDATION_FAILED','bootstrap_restored');
    }
    if(JSON.stringify(readActivation({repositoryRoot}))!==JSON.stringify(current))fail('DEPLOY_CURRENT_CHANGED');
@@ -705,7 +728,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   }
   if(recovery){recovery.state.status='complete';recovery.state.recovery='validated_predecessor_rollback';checkpoint(recovery.directory,recovery.state);}
   state.status='complete';state.phase='complete';checkpoint(directory,state);
-  if(command.operation==='refresh-bootstrap')return {code:'DEPLOY_BOOTSTRAP_REFRESHED',releaseId:current.releaseId,bootstrap:state.bootstrap,inventory:{before,after}};
+  if(command.operation==='refresh-bootstrap')return {code:'DEPLOY_BOOTSTRAP_REFRESHED',releaseId:current.releaseId,bootstrap:{from:state.bootstrap.from,to:state.bootstrap.to,previousDirectory:state.bootstrap.previousDirectory},inventory:{before,after}};
   // Uninstall reports adapters whose removed entry carried non-default env (names only).
   const envDropped=command.operation==='uninstall'?{envDropped:[...new Set((state.variables.ENV_DROPPED??'').split(' '))].filter(name=>ENV_ADAPTERS.includes(name)).sort()}:{};
   return {...envDropped,code:command.operation==='uninstall'?'DEPLOY_UNINSTALLED':command.operation==='rollback'?'DEPLOY_ROLLED_BACK':'DEPLOY_ACTIVATED',previousReleaseId:previous?.releaseId??null,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,inventory:{before,after},unprotected:state.variables.INSTALL_UNPROTECTED==='1'};
