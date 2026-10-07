@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {spawnSync, spawn} from 'node:child_process';
 import {once} from 'node:events';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 import test from 'node:test';
 import {acquireLease} from './runtime-safety.mjs';
 import {prepareRelease, readActivation} from './runtime-store.mjs';
@@ -593,6 +593,35 @@ test('refresh-bootstrap reports the pin actually kept when helper bytes are unch
  fs.appendFileSync(path.join(f.root,'skills/claude/task.md'),'\nchanged skill text\n');const b=await f.run(['--prepare']);await f.run(['--activate',b.releaseId]);assert.notEqual(a.releaseId,b.releaseId);
  const r=await f.run(['--refresh-bootstrap']);assert.equal(r.releaseId,b.releaseId);assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,a.releaseId);assert.equal(r.bootstrap.previousDirectory,null);
  assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'))).sourceReleaseId,a.releaseId);
+});
+// Runs --refresh-bootstrap in a child that SIGKILLs itself during validation
+// ('validate') or right after the old bootstrap is renamed aside ('swap').
+function killedRefresh(f,mode) {
+ const script=`const deploy=await import(${JSON.stringify(pathToFileURL(path.join(source,'runtime-deploy.mjs')).href)});
+const options=JSON.parse(process.argv.at(-1));
+if(options.mode==='swap'){const fs=(await import('node:fs')).default;const rename=fs.renameSync;fs.renameSync=function(from,to){rename.call(this,from,to);if(String(to).includes('.bootstrap.previous.'))process.kill(process.pid,'SIGKILL');};}
+await deploy.runDeployment({repositoryRoot:options.root,home:options.home,procRoot:options.procRoot,argv:['--refresh-bootstrap'],phaseRunner:async o=>{if(options.mode==='validate'&&o.phase==='validate')process.kill(process.pid,'SIGKILL');return deploy.wiringPhase(o);}});`;
+ return spawnSync(process.execPath,['--input-type=module','-e',script,JSON.stringify({mode,root:f.root,home:f.home,procRoot:f.procRoot})],{encoding:'utf8',timeout:60000});
+}
+// Break caught: a refresh killed after the swap leaving an ungated root or no recovery path.
+test('refresh-bootstrap killed during validation leaves a pending journal that a retry recovers',async t=>{
+ const {f,a,b,bootstrap}=await changedHelperFixture(t,'changed selector');
+ const killed=killedRefresh(f,'validate');assert.equal(killed.signal,'SIGKILL',killed.stderr);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);await assert.rejects(f.run(['--activate',a.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught: a refresh killed between the two bootstrap renames leaving no bootstrap and no recovery path.
+test('refresh-bootstrap killed between the bootstrap renames is reinstalled by a retry',async t=>{
+ const {f,a,b,bootstrap,old}=await changedHelperFixture(t,'changed selector');
+ const killed=killedRefresh(f,'swap');assert.equal(killed.signal,'SIGKILL',killed.stderr);
+ assert.equal(fs.existsSync(bootstrap),false);
+ const aside=fs.readdirSync(path.join(f.root,'.jhw-runtime')).filter(n=>/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(n));assert.equal(aside.length,1);
+ assert.deepEqual(fs.readFileSync(path.join(f.root,'.jhw-runtime',aside[0],'manifest.json')),old);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);await assert.rejects(f.run(['--activate',a.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);assert.equal(r.bootstrap.previousDirectory,null);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
 });
 // Break caught: refreshing an unmanaged root, or installing a helper set this checkout's installer does not define.
 test('refresh-bootstrap refuses an unmanaged root and an installer that differs from current',async t=>{
