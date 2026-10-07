@@ -160,6 +160,33 @@ test('closed selectors preserve stdio and status for MCP and bound control launc
   }
 });
 
+// Break caught: a control selector that jhw-control-host cannot run as `node <link>`,
+// or one that falls back to the PATH interpreter under the launcher's fixed PATH.
+test('control selector runs under the invoking node the way jhw-control-host calls it', async t => {
+  const f = await fixture(t); const bin = path.join(f.root,'bin'); fs.mkdirSync(bin,{mode:0o700});
+  fs.symlinkSync('/usr/bin/false',path.join(bin,'node'));
+  fs.symlinkSync(path.join(f.bootstrap,'jhw-runtime-control'),path.join(bin,'jhw-control'));
+  for (const selector of [fs.realpathSync(path.join(f.bootstrap,'jhw-runtime-control')),path.join(bin,'jhw-control')]) {
+    const result = spawnSync(process.execPath,[selector],{input:'input bytes\n',encoding:'utf8',timeout:12000,env:{...process.env,PATH:bin}});
+    assert.equal(result.status,23,result.stderr); assert.equal(result.stdout,'input bytes\n'); assert.equal(result.stderr,'fixture-stderr\n');
+  }
+});
+
+// Break caught: the control selector loading a missing, symlinked or non-executable entry.
+test('control selector refuses an invalid sibling entry under both launch forms', async t => {
+  const f = await fixture(t);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(),'jhw-control-selector-')); t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+  const selector = path.join(directory,'jhw-runtime-control'); const sibling = path.join(directory,'jhw-runtime-entry');
+  fs.copyFileSync(path.join(f.bootstrap,'jhw-runtime-control'),selector); fs.chmodSync(selector,0o755);
+  for (const arrange of [()=>{}, ()=>fs.symlinkSync(path.join(f.bootstrap,'jhw-runtime-entry'),sibling), ()=>fs.writeFileSync(sibling,'',{mode:0o644})]) {
+    fs.rmSync(sibling,{force:true}); arrange();
+    for (const [file,args] of [[process.execPath,[selector]],[selector,[]]]) {
+      const result = spawnSync(file,args,{encoding:'utf8',timeout:12000});
+      assert.equal(result.status,75,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,'DEPLOY_BOOTSTRAP_INVALID\n');
+    }
+  }
+});
+
 // Break caught: reading current before lock acquisition or starting a child under maintenance.
 test('exclusive admission denies before reading corrupt current or executing any child', async t => {
   const f = await fixture(t);
