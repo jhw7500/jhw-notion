@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {spawnSync, spawn} from 'node:child_process';
 import {once} from 'node:events';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 import test from 'node:test';
 import {acquireLease} from './runtime-safety.mjs';
 import {prepareRelease, readActivation} from './runtime-store.mjs';
@@ -25,7 +25,7 @@ function fixture(t) {
 function addConsumer(f,name='codex') {const p=path.join(f.procRoot,'100');fs.mkdirSync(p);write(p,'status',`Uid:\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\n`,0o600);write(p,'stat','100 (fixture) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0\n',0o600);write(p,'cmdline',`${name}\0`,0o600);fs.symlinkSync(f.root,path.join(p,'cwd'));}
 function host(f) {const contract={commands:['unlock','preflight','portfolio status','task start','task child-start','task contract','task completion-ready','task promote','task status','task handoff','task finish','task recover','task assert-owner','board status','board acquire','board with'],credential_policy:'secure-store-only',name:'jhw-control-host',version:5};write(f.home,'.local/bin/jhw-control-host',`#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(contract)}'\n`,0o755);}
 
-test('strict public arguments reject before any store or HOME write',async t=>{const f=fixture(t);for(const argv of [['--force'],['--status','extra'],['--activate'],['--activate','../bad'],['--prepare','--rollback'],['--uninstall','extra']])await assert.rejects(f.run(argv),{code:'DEPLOY_ARGUMENTS_INVALID'});assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime')),false);assert.deepEqual(fs.readdirSync(f.home),[]);});
+test('strict public arguments reject before any store or HOME write',async t=>{const f=fixture(t);for(const argv of [['--force'],['--status','extra'],['--activate'],['--activate','../bad'],['--prepare','--rollback'],['--uninstall','extra'],['--refresh-bootstrap','extra']])await assert.rejects(f.run(argv),{code:'DEPLOY_ARGUMENTS_INVALID'});assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime')),false);assert.deepEqual(fs.readdirSync(f.home),[]);});
 test('prepare permits active consumers and never invokes wiring or touches legacy builds',async t=>{const f=fixture(t);addConsumer(f);write(f.root,'mcp-server/dist/legacy','old');const r=await f.run(['--prepare']);assert.match(r.releaseId,/^r-/);assert.equal(f.builds(),1);assert.deepEqual(fs.readdirSync(f.home),[]);assert.equal(readActivation({repositoryRoot:f.root}),null);assert.equal(fs.readFileSync(path.join(f.root,'mcp-server/dist/legacy'),'utf8'),'old');});
 test('existing default install returns bounded explicit instructions without building',async t=>{const f=fixture(t);write(f.home,'.claude.json','{"mcpServers":{"jhw-notion":{"command":"node","args":["foreign"]}}}');const r=await f.run([]);assert.equal(r.code,'DEPLOY_EXPLICIT_ACTIVATION_REQUIRED');assert.equal(f.builds(),0);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime')),false);});
 test('active and uncertain inventory refuse activation and uninstall before shared mutation',async t=>{const f=fixture(t);const r=await f.run(['--prepare']);addConsumer(f);for(const argv of [['--activate',r.releaseId],['--uninstall'],['--rollback']])await assert.rejects(f.run(argv),{code:'DEPLOY_CONSUMERS_ACTIVE'});assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/admission.lock')),false);fs.unlinkSync(path.join(f.procRoot,'100/status'));await assert.rejects(f.run(['--activate',r.releaseId]),{code:'DEPLOY_INVENTORY_UNCERTAIN'});assert.deepEqual(fs.readdirSync(f.home),[]);});
@@ -527,6 +527,109 @@ for (const refresh of ['helper', 'topology']) {
 
 test('guarded uninstall and reinstall refresh changed bootstrap while retaining previous helpers',async t=>{
  const f=fixture(t);host(f);const a=await f.run(['--prepare']);await f.run(['--activate',a.releaseId]);const old=fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'));fs.appendFileSync(path.join(f.root,'scripts/runtime-safety.mjs'),'\n// changed bootstrap implementation\n');const b=await f.run(['--prepare']);await f.run(['--activate',b.releaseId]);assert.deepEqual(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json')),old);await f.run(['--uninstall']);await f.run(['--activate',b.releaseId]);assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'))).sourceReleaseId,b.releaseId);const previous=fs.readdirSync(path.join(f.root,'.jhw-runtime')).filter(n=>/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(n));assert.equal(previous.length,1);assert.deepEqual(fs.readFileSync(path.join(f.root,'.jhw-runtime',previous[0],'manifest.json')),old);
+});
+// Activates b after changing a helper, so current is b while the bootstrap still pins a.
+async function changedHelperFixture(t,marker) {
+ const f=fixture(t);host(f);const a=await f.run(['--prepare']);await f.run(['--activate',a.releaseId]);
+ const bootstrap=path.join(f.root,'.jhw-runtime/bootstrap');const old=fs.readFileSync(path.join(bootstrap,'manifest.json'));const oldControl=fs.readFileSync(path.join(bootstrap,'jhw-runtime-control'));
+ fs.appendFileSync(path.join(f.root,'scripts/jhw-runtime-control'),`\n// ${marker}\n`);const b=await f.run(['--prepare']);await f.run(['--activate',b.releaseId]);
+ assert.deepEqual(fs.readFileSync(path.join(bootstrap,'manifest.json')),old);
+ return {f,a,b,bootstrap,old,oldControl};
+}
+// Break caught: helper bytes reaching an activated root only through uninstall, or a refresh that moves the pointer or rewires HOME.
+test('refresh-bootstrap installs changed helpers from current without moving the pointer or rewiring HOME',async t=>{
+ const {f,a,b,bootstrap,old}=await changedHelperFixture(t,'changed selector');
+ const link=path.join(f.home,'.local/bin/jhw-control');const wired=fs.lstatSync(link,{bigint:true});const target=fs.readlinkSync(link);const pointer=readActivation({repositoryRoot:f.root});
+ const r=await f.run(['--refresh-bootstrap']);
+ assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.releaseId,b.releaseId);assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);assert.match(r.bootstrap.previousDirectory,/^\.bootstrap\.previous\.[a-f0-9]{32}$/);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);assert.match(fs.readFileSync(path.join(bootstrap,'jhw-runtime-control'),'utf8'),/changed selector/);
+ assert.deepEqual(fs.readFileSync(path.join(f.root,'.jhw-runtime',r.bootstrap.previousDirectory,'manifest.json')),old);
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),pointer);const now=fs.lstatSync(link,{bigint:true});assert.equal(now.ino,wired.ino);assert.equal(now.mtimeNs,wired.mtimeNs);assert.equal(fs.readlinkSync(link),target);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+ const again=await f.run(['--refresh-bootstrap']);assert.equal(again.bootstrap.previousDirectory,null);
+});
+// Break caught: a refreshed helper set that fails live validation staying installed, or its journal blocking every later operation.
+test('refresh-bootstrap validation failure reinstalls the prior helper set and leaves no pending journal',async t=>{
+ const {f,b,bootstrap,old,oldControl}=await changedHelperFixture(t,'broken selector');const phases=[];
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{phases.push(options.phase);if(options.phase==='validate')throw new Error('fixture validation failure');return deploy.wiringPhase(options);}}),{code:'DEPLOY_VALIDATION_FAILED',reason:'bootstrap_restored'});
+ assert.deepEqual(phases,['verify','validate']);
+ assert.deepEqual(fs.readFileSync(path.join(bootstrap,'manifest.json')),old);assert.deepEqual(fs.readFileSync(path.join(bootstrap,'jhw-runtime-control')),oldControl);
+ assert.equal(readActivation({repositoryRoot:f.root}).releaseId,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
+ assert.equal(fs.readdirSync(path.join(f.root,'.jhw-runtime')).filter(n=>/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(n)).length,2);
+});
+// Break caught: an interrupted refresh journal blocking recovery forever, or being superseded by an operation other than refresh.
+test('an interrupted refresh-bootstrap blocks other operations until a retried refresh supersedes it',async t=>{
+ const {f,a,b}=await changedHelperFixture(t,'changed selector');let shared;
+ try{await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{if(options.phase==='validate')shared=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true});return deploy.wiringPhase(options);}}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});}finally{shared?.close();}
+ assert.equal((await f.run(['--status'])).recoveryPending,1);
+ await assert.rejects(f.run(['--activate',a.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'))).sourceReleaseId,b.releaseId);
+});
+// Break caught (A-R1-001): a retry restoring whatever the interrupted attempt left live, or a refused retry clearing the gate.
+test('a retried refresh restores the set live before the first attempt and a refused retry keeps the gate',async t=>{
+ const {f,b,bootstrap,old,oldControl}=await changedHelperFixture(t,'broken selector');let shared;
+ const blocked=async options=>{if(options.phase==='validate'){shared=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true});throw new Error('fixture probe hang');}return deploy.wiringPhase(options);};
+ try{await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:blocked}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});}finally{shared?.close();}
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{if(options.phase==='verify')throw new Error('fixture verify failure');return deploy.wiringPhase(options);}}));
+ assert.equal((await f.run(['--status'])).recoveryPending,1);await assert.rejects(f.run(['--activate',b.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{if(options.phase==='validate')throw new Error('fixture validation failure');return deploy.wiringPhase(options);}}),{code:'DEPLOY_VALIDATION_FAILED',reason:'bootstrap_restored'});
+ assert.deepEqual(fs.readFileSync(path.join(bootstrap,'manifest.json')),old);assert.deepEqual(fs.readFileSync(path.join(bootstrap,'jhw-runtime-control')),oldControl);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught (A-R1-002): a failed restore reporting recovery required while its journal no longer gates other operations.
+test('a failed refresh restore keeps the journal pending until a later refresh proves the live set',async t=>{
+ const {f,a,b,bootstrap}=await changedHelperFixture(t,'broken selector');const original=path.join(f.root,'.jhw-runtime/releases',a.releaseId,'scripts/jhw-runtime-control');
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:async options=>{if(options.phase==='validate'){fs.chmodSync(original,0o700);throw new Error('fixture validation failure');}return deploy.wiringPhase(options);}}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'bootstrap_restore_failed'});
+ assert.equal((await f.run(['--status'])).recoveryPending,1);await assert.rejects(f.run(['--uninstall']),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ fs.chmodSync(original,0o755);
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught (A-R1-003): reporting the current release as the new pin when unchanged helper bytes kept the old pin.
+test('refresh-bootstrap reports the pin actually kept when helper bytes are unchanged',async t=>{
+ const f=fixture(t);host(f);const a=await f.run(['--prepare']);await f.run(['--activate',a.releaseId]);
+ fs.appendFileSync(path.join(f.root,'skills/claude/task.md'),'\nchanged skill text\n');const b=await f.run(['--prepare']);await f.run(['--activate',b.releaseId]);assert.notEqual(a.releaseId,b.releaseId);
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.releaseId,b.releaseId);assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,a.releaseId);assert.equal(r.bootstrap.previousDirectory,null);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'))).sourceReleaseId,a.releaseId);
+});
+// Runs --refresh-bootstrap in a child that SIGKILLs itself during validation
+// ('validate') or right after the old bootstrap is renamed aside ('swap').
+function killedRefresh(f,mode) {
+ const script=`const deploy=await import(${JSON.stringify(pathToFileURL(path.join(source,'runtime-deploy.mjs')).href)});
+const options=JSON.parse(process.argv.at(-1));
+if(options.mode==='swap'){const fs=(await import('node:fs')).default;const rename=fs.renameSync;fs.renameSync=function(from,to){rename.call(this,from,to);if(String(to).includes('.bootstrap.previous.'))process.kill(process.pid,'SIGKILL');};}
+await deploy.runDeployment({repositoryRoot:options.root,home:options.home,procRoot:options.procRoot,argv:['--refresh-bootstrap'],phaseRunner:async o=>{if(options.mode==='validate'&&o.phase==='validate')process.kill(process.pid,'SIGKILL');return deploy.wiringPhase(o);}});`;
+ return spawnSync(process.execPath,['--input-type=module','-e',script,JSON.stringify({mode,root:f.root,home:f.home,procRoot:f.procRoot})],{encoding:'utf8',timeout:60000});
+}
+// Break caught: a refresh killed after the swap leaving an ungated root or no recovery path.
+test('refresh-bootstrap killed during validation leaves a pending journal that a retry recovers',async t=>{
+ const {f,a,b,bootstrap}=await changedHelperFixture(t,'changed selector');
+ const killed=killedRefresh(f,'validate');assert.equal(killed.signal,'SIGKILL',killed.stderr);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);await assert.rejects(f.run(['--activate',a.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught: a refresh killed between the two bootstrap renames leaving no bootstrap and no recovery path.
+test('refresh-bootstrap killed between the bootstrap renames is reinstalled by a retry',async t=>{
+ const {f,a,b,bootstrap,old}=await changedHelperFixture(t,'changed selector');
+ const killed=killedRefresh(f,'swap');assert.equal(killed.signal,'SIGKILL',killed.stderr);
+ assert.equal(fs.existsSync(bootstrap),false);
+ const aside=fs.readdirSync(path.join(f.root,'.jhw-runtime')).filter(n=>/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(n));assert.equal(aside.length,1);
+ assert.deepEqual(fs.readFileSync(path.join(f.root,'.jhw-runtime',aside[0],'manifest.json')),old);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);await assert.rejects(f.run(['--activate',a.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ const r=await f.run(['--refresh-bootstrap']);assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);assert.equal(r.bootstrap.previousDirectory,null);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught: refreshing an unmanaged root, or installing a helper set this checkout's installer does not define.
+test('refresh-bootstrap refuses an unmanaged root and an installer that differs from current',async t=>{
+ const f=fixture(t);host(f);await assert.rejects(f.run(['--refresh-bootstrap']),{code:'DEPLOY_ARGUMENTS_INVALID',reason:'refresh_requires_managed_activation'});
+ const a=await f.run(['--prepare']);await f.run(['--activate',a.releaseId]);const manifest=fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'));
+ fs.appendFileSync(path.join(f.root,'scripts/runtime-entry.mjs'),'\n// newer installer\n');
+ await assert.rejects(f.run(['--refresh-bootstrap']),{code:'DEPLOY_ARGUMENTS_INVALID',reason:'refresh_installer_mismatch'});
+ assert.deepEqual(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json')),manifest);assert.equal((await f.run(['--status'])).recoveryPending,0);
 });
 test('fresh default uses staging and gated activation without touching legacy build outputs',async t=>{const f=fixture(t);host(f);write(f.root,'mcp-server/dist/legacy','old');const result=await f.run([]);assert.equal(result.code,'DEPLOY_ACTIVATED');assert.equal(f.builds(),1);assert.equal(fs.readFileSync(path.join(f.root,'mcp-server/dist/legacy'),'utf8'),'old');});
 test('public CLI inventories real sessions and rejects arguments with bounded no-write diagnostics',async t=>{
