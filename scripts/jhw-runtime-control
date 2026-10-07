@@ -1,11 +1,22 @@
-#!/usr/bin/env bash
-set -u
-# Closed selector only. The canonical entry validates the entire helper set
-# before loading any runtime module; no caller-selected executable is accepted.
-physical=$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || physical=''
-entry="${physical%/*}/jhw-runtime-entry"
-if [[ -n "$physical" && -f "$entry" && -x "$entry" && ! -L "$entry" ]]; then
-  exec "$entry" control "$@"
-fi
-printf 'DEPLOY_BOOTSTRAP_INVALID\n' >&2
-exit 75
+#!/usr/bin/env node
+// Closed selector only. The canonical entry validates the entire helper set
+// before loading any runtime module; no caller-selected executable is accepted.
+// A Node program because callers both execute this link and run it as
+// `node <link>` (jhw-control-host); loading the entry in this process keeps the
+// caller's interpreter, pid and stdio exactly as exec would.
+const fs = require('node:fs');
+const path = require('node:path');
+let entry = '';
+try {
+  const candidate = path.join(path.dirname(fs.realpathSync(__filename)), 'jhw-runtime-entry');
+  const stat = fs.lstatSync(candidate);
+  fs.accessSync(candidate, fs.constants.X_OK);
+  if (stat.isFile()) entry = candidate;
+} catch { entry = ''; }
+if (entry) {
+  process.argv = [process.argv[0], entry, 'control', ...process.argv.slice(2)];
+  require(entry);
+} else {
+  process.stderr.write('DEPLOY_BOOTSTRAP_INVALID\n');
+  process.exitCode = 75;
+}
