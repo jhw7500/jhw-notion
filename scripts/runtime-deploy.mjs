@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import {randomBytes} from 'node:crypto';
+import {createHash, randomBytes} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, requireQuiescence} from './runtime-safety.mjs';
@@ -15,10 +15,17 @@ function exists(file) {try {fs.lstatSync(file);return true;}catch(e){if(e.code==
 function parse(argv) {
  if(!Array.isArray(argv)||argv.some(v=>typeof v!=='string'))fail('DEPLOY_ARGUMENTS_INVALID');
  if(argv.length===0)return {operation:'default'};
- if(argv.length===1&&['--prepare','--status','--rollback','--uninstall','--help','-h'].includes(argv[0]))return {operation:argv[0].replace(/^--?/,'')};
+ if(argv.length===1&&['--prepare','--status','--rollback','--uninstall','--refresh-bootstrap','--help','-h'].includes(argv[0]))return {operation:argv[0].replace(/^--?/,'')};
  if(argv.length===2&&argv[0]==='--activate'&&RELEASE.test(argv[1]))return {operation:'activate',releaseId:argv[1]};
  if(argv.length===4&&argv[0]==='--activate'&&RELEASE.test(argv[1])&&argv[2]==='--adopt-from'&&argv[3]!=='')return {operation:'activate',releaseId:argv[1],adoptFrom:argv[3]};
  fail('DEPLOY_ARGUMENTS_INVALID');
+}
+// --refresh-bootstrap installs the current release's helper set with this
+// checkout's installer, so both must define the same closed helper set.
+function requireMatchingInstaller(repositoryRoot,releaseId) {
+ validateRelease({repositoryRoot,releaseId});
+ const digest=file=>createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+ if(digest(path.join(repositoryRoot,'scripts/runtime-entry.mjs'))!==digest(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts/runtime-entry.mjs')))fail('DEPLOY_ARGUMENTS_INVALID','refresh_installer_mismatch');
 }
 // --adopt-from names a distinct, canonical sibling checkout of this repository.
 function validateAdoptSource(repositoryRoot,source) {
@@ -501,7 +508,7 @@ async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,l
 export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000,planTimeoutMs=45000}={}) {
  const command=parse(argv);
  if([phaseTimeoutMs,planTimeoutMs].some(value=>!Number.isInteger(value)||value<1||value>45000))fail('DEPLOY_ARGUMENTS_INVALID');
- if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--rollback','--uninstall']};
+ if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--rollback','--uninstall','--refresh-bootstrap']};
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
  const runtime=path.join(repositoryRoot,'.jhw-runtime');
@@ -526,8 +533,14 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   const abandoned=pending(runtime);
   let recovery;
   if(abandoned.length) {
-   if(command.operation!=='rollback'||abandoned.length!==1)fail('DEPLOY_RECOVERY_REQUIRED');
+   if(!['rollback','refresh-bootstrap'].includes(command.operation)||abandoned.length!==1)fail('DEPLOY_RECOVERY_REQUIRED');
    const recoveryDirectory=path.join(runtime,abandoned[0]);const prior=privateRead(path.join(recoveryDirectory,'state.json'));
+   // An interrupted refresh never moved the pointer or wiring; only a retried
+   // refresh supersedes it, and only while current is still its origin.
+   if(command.operation==='refresh-bootstrap'&&(prior.operation!=='refresh-bootstrap'||JSON.stringify(prior.previous)!==JSON.stringify(previous)))fail('DEPLOY_RECOVERY_REQUIRED');
+   if(command.operation==='rollback'&&prior.operation==='refresh-bootstrap')fail('DEPLOY_RECOVERY_REQUIRED');
+   if(command.operation==='refresh-bootstrap')recovery={directory:recoveryDirectory,state:prior};
+   else {
    if(!prior.previous)fail('DEPLOY_PREDECESSOR_INVALID');
    const destination=prior.destination;
    const validDestination=destination && Object.keys(destination).sort().join(',')==='activationId,predecessorActivationId,releaseId' &&
@@ -544,6 +557,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
     if(prior.operation!=='activate'||!['validation_failed','recovery_blocked','validate','finalize'].includes(prior.phase)||JSON.stringify(prior.current)!==JSON.stringify(previous)||previous?.predecessorActivationId!==prior.previous.activationId)fail('DEPLOY_RECOVERY_REQUIRED');
     recovery={directory:recoveryDirectory,state:prior};
    }
+   }
   }
   const wiringFile=path.join(runtime,'wiring.json');
   const wiringPreviouslyInstalled = exists(wiringFile) && privateRead(wiringFile).installed === true;
@@ -552,16 +566,24 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   if(recovery&&!managed)fail('DEPLOY_RECOVERY_REQUIRED');
   if(command.operation==='activate')validateRelease({repositoryRoot,releaseId:command.releaseId});
   if(command.operation==='rollback'&&!previous?.predecessorActivationId)fail('DEPLOY_PREDECESSOR_INVALID');
+  // A missing bootstrap (interrupted replacement) is reinstalled; an invalid one refuses.
+  let priorBootstrap=null;
+  if(command.operation==='refresh-bootstrap') {
+   if(!managed||!previous)fail('DEPLOY_ARGUMENTS_INVALID','refresh_requires_managed_activation');
+   requireMatchingInstaller(repositoryRoot,previous.releaseId);
+   if(exists(path.join(runtime,'bootstrap')))priorBootstrap=validateBootstrap({repositoryRoot});
+  }
   // First managed activation: refuse foreign wiring destinations before any mutation.
   if(command.operation==='activate'&&!managed)await planWiring({repositoryRoot,home,environment,releaseId:command.releaseId,planTimeoutMs,adoptFrom:command.adoptFrom});
   directory=createPrivateDirectory(runtime,`.deploy.${randomBytes(16).toString('hex')}`);
   state={version:1,status:'pending',operation:command.operation,phase:'before_mutation',previous,variables:{}};checkpoint(directory,state);
+  if(recovery&&command.operation==='refresh-bootstrap'){recovery.state.status='complete';recovery.state.recovery='superseded_by_refresh';checkpoint(recovery.directory,recovery.state);recovery=undefined;}
   const run=async (phase,candidateReleaseId)=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom:command.adoptFrom});};
   const pointerIntent=destination=>{state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);};
   let current=previous;
   if(managed&&command.operation!=='uninstall') {
    await run('verify');
-   requireCompatibleWiringTopology({repositoryRoot,home,previous,command});
+   if(command.operation!=='refresh-bootstrap')requireCompatibleWiringTopology({repositoryRoot,home,previous,command});
   }
   if(!managed||command.operation==='uninstall')privateWrite(path.join(directory,'before.json'),wiringPreimages({repositoryRoot,home,releaseId:command.releaseId??previous?.releaseId,adoptFrom:command.adoptFrom}),{exclusive:true});
   if(!managed&&command.operation==='activate')privateWrite(path.join(directory,'listings.json'),wiringListings(home),{exclusive:true});
@@ -569,6 +591,38 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    state.mutationStarted=true;checkpoint(directory,state);
    if(previous){validateBootstrap({repositoryRoot});managed=true;}
    await run('uninstall');privateWrite(wiringFile,{version:1,installed:false});
+  } else if(command.operation==='refresh-bootstrap') {
+   // Reinstalls the current release's helper set without moving the pointer or
+   // wiring. A failed live validation reinstalls the prior set from its own
+   // retained source release. Handled outcomes never leave this journal pending.
+   const settle=(phase,code,reason)=>{state.status='complete';state.phase=phase;checkpoint(directory,state);fail(code,reason);};
+   state.mutationStarted=true;state.bootstrap={from:priorBootstrap?.sourceReleaseId??null,to:previous.releaseId,previousDirectory:null};checkpoint(directory,state);
+   let installed;
+   try {installed=await installBootstrap({repositoryRoot,releaseId:previous.releaseId});}
+   catch(error) {settle('bootstrap_install_failed',error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code)?error.code:'DEPLOY_BOOTSTRAP_INVALID','bootstrap_install_failed');}
+   state.bootstrap.previousDirectory=installed.previousDirectory;state.phase='bootstrap_installed';checkpoint(directory,state);
+   admission.close();
+   admission=undefined;
+   let validationError;
+   try {await run('validate');} catch(error) {validationError=error;}
+   try {
+    admission=acquireLease(path.join(runtime,'admission.lock'));
+    quiesce();
+   } catch {
+    state.phase='recovery_blocked';checkpoint(directory,state);
+    fail('DEPLOY_RECOVERY_REQUIRED','maintenance_reacquisition_failed');
+   }
+   if(validationError) {
+    if(!installed.previousDirectory)settle('validation_failed','DEPLOY_VALIDATION_FAILED',priorBootstrap?'bootstrap_unchanged':'bootstrap_reinstalled');
+    try {
+     const restored=await installBootstrap({repositoryRoot,releaseId:priorBootstrap.sourceReleaseId});
+     if(JSON.stringify(restored.manifest)!==JSON.stringify(priorBootstrap))fail('DEPLOY_BOOTSTRAP_CHANGED');
+     state.bootstrap.failedDirectory=restored.previousDirectory;
+    } catch {settle('bootstrap_restore_failed','DEPLOY_RECOVERY_REQUIRED','bootstrap_restore_failed');}
+    settle('validation_failed','DEPLOY_VALIDATION_FAILED','bootstrap_restored');
+   }
+   if(JSON.stringify(readActivation({repositoryRoot}))!==JSON.stringify(current))fail('DEPLOY_CURRENT_CHANGED');
+   await run('finalize');
   } else {
    state.mutationStarted=true;checkpoint(directory,state);
    // Undoes a first-activation wire from its preimages; always throws.
@@ -651,6 +705,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   }
   if(recovery){recovery.state.status='complete';recovery.state.recovery='validated_predecessor_rollback';checkpoint(recovery.directory,recovery.state);}
   state.status='complete';state.phase='complete';checkpoint(directory,state);
+  if(command.operation==='refresh-bootstrap')return {code:'DEPLOY_BOOTSTRAP_REFRESHED',releaseId:current.releaseId,bootstrap:state.bootstrap,inventory:{before,after}};
   // Uninstall reports adapters whose removed entry carried non-default env (names only).
   const envDropped=command.operation==='uninstall'?{envDropped:[...new Set((state.variables.ENV_DROPPED??'').split(' '))].filter(name=>ENV_ADAPTERS.includes(name)).sort()}:{};
   return {...envDropped,code:command.operation==='uninstall'?'DEPLOY_UNINSTALLED':command.operation==='rollback'?'DEPLOY_ROLLED_BACK':'DEPLOY_ACTIVATED',previousReleaseId:previous?.releaseId??null,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,inventory:{before,after},unprotected:state.variables.INSTALL_UNPROTECTED==='1'};

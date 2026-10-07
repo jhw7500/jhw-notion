@@ -136,9 +136,14 @@ unverified symlink. Staging and deployment directories use mode `0700`; private
 state, preimage, manifest, and phase-log files use mode `0600`. Stages and private
 fixture releases are never valid live execution targets. The bootstrap manifest
 pins the entry digest and closed set of supported selectors. Ordinary activation
-retains its independently validated `sourceReleaseId`; adopting changed helper
-bytes requires the separately gated uninstall then exact retained-release
-activation path, and preserves the previous helper directory.
+retains its independently validated `sourceReleaseId`. Changed helper bytes are
+adopted by the separately gated `--refresh-bootstrap` operation: under the same
+maintenance gate it reinstalls the current release's helper set without moving
+`current` or rewiring, validates it live, reinstalls the prior set from its own
+retained source release when validation fails, and preserves every replaced
+helper directory. It refuses when the checkout's `scripts/runtime-entry.mjs`
+differs from the current release's. The bootstrap pins its source release, so
+any future release cleanup must retain it.
 
 Release IDs use a strict closed format derived from the source revision and a
 content digest. A release `manifest.json` records the exact release ID, source
@@ -261,10 +266,11 @@ Subsequent compatible deployments require only the single atomic `current`
 transition and do not rewrite TUI configuration. A candidate whose individually
 installed Codex skill/prompt name set differs is refused before publication with
 `DEPLOY_WIRING_TOPOLOGY_CHANGED` / `guarded_uninstall_reinstall_required`.
-Whole-directory adapters continue to follow `current/skills`. Bootstrap helper
-or Codex topology changes require guarded uninstall followed by activation of
-the exact desired retained release; both commands independently pass the same
-maintenance gate.
+Whole-directory adapters continue to follow `current/skills`. Codex topology
+changes require guarded uninstall followed by activation of the exact desired
+retained release; both commands independently pass the same maintenance gate.
+Bootstrap helper changes use activation followed by `--refresh-bootstrap`
+(section 5), which leaves wiring and MCP entries untouched.
 
 ## 7. Data flow
 
