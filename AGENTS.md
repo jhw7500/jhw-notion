@@ -39,7 +39,7 @@ npm run typecheck      # 테스트 파일까지 타입 검사 (tsconfig.test.jso
 npm test               # vitest
 node --test scripts/test-runtime-safety.mjs scripts/test-runtime-store.mjs \
   scripts/test-runtime-deploy.mjs scripts/test-runtime-entry.mjs
-node scripts/test-pr-skill-contract.mjs      # 스킬 계약 (issue·commit·review·task·skill-alias도 같은 형식)
+node scripts/test-pr-skill-contract.mjs      # 스킬 계약 (issue·commit·review·task·skill-alias·claude-command-dir도 같은 형식)
 bash scripts/test-install-safety.sh           # 격리된 임시 HOME에서 설치기 안전성 (수 분)
 node scripts/sync-codex-skills.mjs --check    # skills/codex 드리프트 검사 (쓰기 없음)
 ```
