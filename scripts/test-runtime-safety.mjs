@@ -146,6 +146,28 @@ test('inventory counts supported binary and interpreter identities and Codex app
   assert.deepEqual(inspectConsumers(options), { clear: false, counts: { tui: 8, app_server: 2, legacy: 0, managed: 0 }, uncertain: 0 });
 });
 
+test('inventory skips Codex global options before app-server and never guesses an unknown one', t => {
+  const cases = [
+    [['codex', '-c', 'features.code_mode_host=true', 'app-server', '--listen', 'unix://'], 'app_server'],
+    [['codex', '--config=features.x=true', '--oss', '--no-daemon', 'app-server'], 'app_server'],
+    [['codex', '--yolo', '--not-so-yolo', 'app-server'], 'app_server'],
+    [['codex', '-cfeatures.x=true', '-m', 'gpt', '-C', '/tmp', 'app-server'], 'app_server'],
+    [['node', '/opt/node_modules/@openai/codex/bin/codex.js', '--enable', 'f', 'app-server'], 'app_server'],
+    // The would-be subcommand is an option value or a prompt: these are TUIs.
+    [['codex', '-c', 'app-server'], 'tui'], [['codex', '-m', 'app-server'], 'tui'], [['codex', '--', 'app-server'], 'tui'],
+    [['codex', '--search', 'app server prompt'], 'tui'],
+    [['codex', '--unknown-flag', 'app-server'], 'uncertain'], [['codex', '-i', 'a.png', 'app-server'], 'uncertain'],
+    [['codex', '-m'], 'uncertain'],
+  ];
+  for (const [argv, expected] of cases) {
+    const options = procFixture(t);
+    addProcess(options, 100, argv);
+    const result = inspectConsumers(options);
+    const actual = result.uncertain ? 'uncertain' : Object.keys(result.counts).find(key => result.counts[key]);
+    assert.equal(actual, expected, JSON.stringify({ argv, result }));
+  }
+});
+
 test('inventory resolves interpreter flags and relative entry paths without matching arbitrary arguments', t => {
   const options = procFixture(t);
   addProcess(options, 100, ['node', '--no-warnings', './mcp-server/dist/index.js']);
