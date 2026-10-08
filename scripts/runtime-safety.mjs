@@ -251,7 +251,8 @@ function needsCwd(entry) {
 // option whose arity is not listed here, such as the multi-value --image, is
 // not guessed: `codex -m app-server` is a TUI whose model is "app-server".
 const CODEX_VALUE_FLAGS = new Set(['-c', '--config', '--enable', '--disable', '--remote', '--remote-auth-token-env', '-m', '--model', '--local-provider', '-p', '--profile', '-s', '--sandbox', '-C', '--cd', '--add-dir', '-a', '--ask-for-approval']);
-const CODEX_BOOLEAN_FLAGS = new Set(['--strict-config', '--oss', '--approve-for-me', '--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust', '--worktree', '--search', '--no-alt-screen', '--no-daemon']);
+// --not-so-yolo and --yolo are hidden aliases of the two approval options.
+const CODEX_BOOLEAN_FLAGS = new Set(['--strict-config', '--oss', '--approve-for-me', '--not-so-yolo', '--dangerously-bypass-approvals-and-sandbox', '--yolo', '--dangerously-bypass-hook-trust', '--worktree', '--search', '--no-alt-screen', '--no-daemon']);
 function codexCategory(args) {
   let index = 0;
   while (index < args.length && args[index].startsWith('-')) {

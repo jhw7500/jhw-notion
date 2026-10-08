@@ -150,6 +150,7 @@ test('inventory skips Codex global options before app-server and never guesses a
   const cases = [
     [['codex', '-c', 'features.code_mode_host=true', 'app-server', '--listen', 'unix://'], 'app_server'],
     [['codex', '--config=features.x=true', '--oss', '--no-daemon', 'app-server'], 'app_server'],
+    [['codex', '--yolo', '--not-so-yolo', 'app-server'], 'app_server'],
     [['codex', '-cfeatures.x=true', '-m', 'gpt', '-C', '/tmp', 'app-server'], 'app_server'],
     [['node', '/opt/node_modules/@openai/codex/bin/codex.js', '--enable', 'f', 'app-server'], 'app_server'],
     // The would-be subcommand is an option value or a prompt: these are TUIs.
