@@ -5628,6 +5628,9 @@ async function main() {
       "a quota_exhausted OpenCode failure must leave only this round's expected set");
     await opencodeCase([opencodeSticky({ successfulHead: oldHead })], opencodeExcluded,
       "a stale sticky that keeps an older success must still report quota_exhausted");
+    await opencodeCase([opencodeSticky({ successfulHead: currentHead, body: "[HIGH] preserved finding for this head" })],
+      opencodeKept("provider_failed"),
+      "a stale sticky whose preserved verdict is for the merged head must keep opencode required");
     for (const reason of ["rate_limited", "authentication_failed", "provider_failed"]) {
       await opencodeCase([opencodeSticky({ reason })], opencodeKept(reason),
         `${reason} must stay a blocking OpenCode failure`);
