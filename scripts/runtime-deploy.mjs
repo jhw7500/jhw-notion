@@ -8,7 +8,7 @@ import {prepareRelease, validateRelease, readActivation, publishActivation, roll
 import {installBootstrap, validateBootstrap} from './runtime-entry.mjs';
 
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
-const KEYS = ['HOOK_LINK_CREATED','INSTALL_TRANSACTION_ACTIVE','HOOKS_CONFIG_CHANGED','HOOKS_CONFIG_FILE','HOOKS_ADAPTER','HOOKS_DISPLAY_NAME','HOOKS_TRANSACTION_DIR','HOOKS_TRANSACTION_STAGE','HOOKS_TRANSACTION_METADATA','HOOKS_TRANSACTION_PRESERVE','CLAUDE_HOOKS_CONFIG_CHANGED','CLAUDE_HOOKS_CONFIG_FILE','CLAUDE_HOOKS_TRANSACTION_DIR','CLAUDE_HOOKS_TRANSACTION_STAGE','CLAUDE_HOOKS_TRANSACTION_METADATA','CLAUDE_HOOKS_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_TRANSACTION_DIR','CONTROL_HOOK_LINK_TRANSACTION_STAGE','CONTROL_HOOK_LINK_TRANSACTION_METADATA','CONTROL_HOOK_LINK_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_REMOVE_OUTCOME','INSTALL_UNPROTECTED','MIGRATION_HOOK_TRANSACTION_DIR','CODEX_BACKUP_PRUNE_FILE','ENV_DROPPED'];
+const KEYS = ['HOOK_LINK_CREATED','INSTALL_TRANSACTION_ACTIVE','HOOKS_CONFIG_CHANGED','HOOKS_CONFIG_FILE','HOOKS_ADAPTER','HOOKS_DISPLAY_NAME','HOOKS_TRANSACTION_DIR','HOOKS_TRANSACTION_STAGE','HOOKS_TRANSACTION_METADATA','HOOKS_TRANSACTION_PRESERVE','CLAUDE_HOOKS_CONFIG_CHANGED','CLAUDE_HOOKS_CONFIG_FILE','CLAUDE_HOOKS_TRANSACTION_DIR','CLAUDE_HOOKS_TRANSACTION_STAGE','CLAUDE_HOOKS_TRANSACTION_METADATA','CLAUDE_HOOKS_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_TRANSACTION_DIR','CONTROL_HOOK_LINK_TRANSACTION_STAGE','CONTROL_HOOK_LINK_TRANSACTION_METADATA','CONTROL_HOOK_LINK_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_REMOVE_OUTCOME','INSTALL_UNPROTECTED','MIGRATION_HOOK_TRANSACTION_DIR','CODEX_BACKUP_PRUNE_FILE','ENV_DROPPED','ENV_DROPPED_REPORTED'];
 const ENV_ADAPTERS=['claude','codex','gemini','opencode'];
 const fail = (code,reason) => {throw new DeploymentError(code,reason);};
 function exists(file) {try {fs.lstatSync(file);return true;}catch(e){if(e.code==='ENOENT')return false;throw e;}}
@@ -381,7 +381,10 @@ function checkpoint(directory,state) {privateWrite(path.join(directory,'state.js
 const WORKER = `set -euo pipefail
 umask 077
 SCRIPT_DIR="$1"
+# A library that predates env-drop reporting never initializes ENV_DROPPED.
+unset ENV_DROPPED
 source "$2"
+JHW_ENV_DROP_REPORTED="\${ENV_DROPPED+1}"
 CONFIG_EDITOR="$5"
 initialize_wiring_directories
 if [[ "$4" = managed ]]; then select_managed_wiring; fi
@@ -393,6 +396,7 @@ for key in "\${keys[@]}"; do
   # A retained older library may predate this key; never let set -u abort on it.
   if [[ -z "\${!key+x}" ]]; then printf -v "$key" '%s' ''; fi
 done
+ENV_DROPPED_REPORTED="$JHW_ENV_DROP_REPORTED"
 save_phase_state() {
   local rc=$?
   trap - EXIT
@@ -729,8 +733,9 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   if(recovery){recovery.state.status='complete';recovery.state.recovery='validated_predecessor_rollback';checkpoint(recovery.directory,recovery.state);}
   state.status='complete';state.phase='complete';checkpoint(directory,state);
   if(command.operation==='refresh-bootstrap')return {code:'DEPLOY_BOOTSTRAP_REFRESHED',releaseId:current.releaseId,bootstrap:{from:state.bootstrap.from,to:state.bootstrap.to,previousDirectory:state.bootstrap.previousDirectory},inventory:{before,after}};
-  // Uninstall reports adapters whose removed entry carried non-default env (names only).
-  const envDropped=command.operation==='uninstall'?{envDropped:[...new Set((state.variables.ENV_DROPPED??'').split(' '))].filter(name=>ENV_ADAPTERS.includes(name)).sort()}:{};
+  // Uninstall reports adapters whose removed entry carried non-default env (names only),
+  // or null when the selected release's library predates that report.
+  const envDropped=command.operation==='uninstall'?{envDropped:state.variables.ENV_DROPPED_REPORTED==='1'?[...new Set((state.variables.ENV_DROPPED??'').split(' '))].filter(name=>ENV_ADAPTERS.includes(name)).sort():null}:{};
   return {...envDropped,code:command.operation==='uninstall'?'DEPLOY_UNINSTALLED':command.operation==='rollback'?'DEPLOY_ROLLED_BACK':'DEPLOY_ACTIVATED',previousReleaseId:previous?.releaseId??null,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,inventory:{before,after},unprotected:state.variables.INSTALL_UNPROTECTED==='1'};
  } catch(error) {if(state&&!state.mutationStarted){try{state.status='complete';state.phase='refused';checkpoint(directory,state);}catch{}}if(error instanceof DeploymentError)throw error;fail('DEPLOY_FAILED');}
  finally {admission?.close();writer?.close();}

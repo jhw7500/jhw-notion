@@ -1026,3 +1026,13 @@ test('uninstall of a default installation reports no dropped env', async t => {
  const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
  const result=await f.run(['--uninstall']);assert.equal(result.code,'DEPLOY_UNINSTALLED');assert.deepEqual(result.envDropped,[]);
 });
+test('uninstall through a release library that predates env-drop reporting does not claim no env was dropped', async t => {
+ const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const library=path.join(f.root,'scripts/install-wiring.sh');const current=fs.readFileSync(library,'utf8');
+ // The selected release ships a library from before ENV_DROPPED existed.
+ assert.match(current,/^ENV_DROPPED=""\n/m);
+ fs.writeFileSync(library,current.replace(/^ENV_DROPPED=""\n/m,''));
+ const old=await f.run(['--prepare']);assert.equal((await f.run(['--activate',old.releaseId])).code,'DEPLOY_ACTIVATED');
+ fs.writeFileSync(library,current);
+ const result=await f.run(['--uninstall']);assert.equal(result.code,'DEPLOY_UNINSTALLED');assert.equal(result.envDropped,null);
+});
