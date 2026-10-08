@@ -247,10 +247,28 @@ function needsCwd(entry) {
   const normalized = path.normalize(entry);
   return normalized === '.' || path.basename(normalized) === '..' || RUNTIME_BASENAMES.has(path.basename(normalized));
 }
+// Codex global options that may precede a subcommand (codex-cli 0.161.0). An
+// option whose arity is not listed here, such as the multi-value --image, is
+// not guessed: `codex -m app-server` is a TUI whose model is "app-server".
+const CODEX_VALUE_FLAGS = new Set(['-c', '--config', '--enable', '--disable', '--remote', '--remote-auth-token-env', '-m', '--model', '--local-provider', '-p', '--profile', '-s', '--sandbox', '-C', '--cd', '--add-dir', '-a', '--ask-for-approval']);
+const CODEX_BOOLEAN_FLAGS = new Set(['--strict-config', '--oss', '--approve-for-me', '--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust', '--worktree', '--search', '--no-alt-screen', '--no-daemon']);
+function codexCategory(args) {
+  let index = 0;
+  while (index < args.length && args[index].startsWith('-')) {
+    const flag = args[index];
+    if (flag === '--') return 'tui';
+    if (CODEX_BOOLEAN_FLAGS.has(flag)) { index++; continue; }
+    if (CODEX_VALUE_FLAGS.has(flag)) { if (index + 1 >= args.length) uncertain(); index += 2; continue; }
+    if (flag.startsWith('--') && flag.includes('=') && CODEX_VALUE_FLAGS.has(flag.split('=')[0])) { index++; continue; }
+    if (/^-[cmpsCa]./.test(flag)) { index++; continue; }
+    uncertain();
+  }
+  return args[index] === 'app-server' ? 'app_server' : 'tui';
+}
 function classify(identity, repositoryRoot, readCwd) {
   if (!identity) return null;
   const name = tuiName(identity.entry);
-  if (name) return name === 'codex' && identity.args[0] === 'app-server' ? 'app_server' : 'tui';
+  if (name) return name === 'codex' ? codexCategory(identity.args) : 'tui';
   // Relative script paths are meaningful only with a stable, required cwd link.
   if (path.isAbsolute(identity.entry) || needsCwd(identity.entry)) {
     const entry = path.isAbsolute(identity.entry) ? path.normalize(identity.entry) : path.resolve(readCwd(), identity.entry);
