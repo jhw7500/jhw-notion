@@ -5574,6 +5574,182 @@ async function main() {
     assert.match(invalidProviderRun.stdout, /^rc=2 reason=provider_failed$/m);
     assert.deepEqual(await readdir(providerTmp), [], "provider-error downloads must not leave temporary directories");
 
+    // automation v1.83 opencode-auto-review.yml publishes this exact sticky layout.
+    const opencodeRunUrl = (runId) => `https://github.com/example/repo/actions/runs/${runId}`;
+    const opencodeSticky = ({
+      id = 9951, actor = "github-actions[bot]", runId = 9951, attempt = 1, head = currentHead,
+      attemptStatus = "failure", successfulHead = null, status, reason = "quota_exhausted", failureLines,
+      body = "OpenCode review attempt failed validation; no review checkpoint was advanced.",
+      schema = 2, reviewer = "opencode", pr = 42,
+    } = {}) => {
+      const succeeded = attemptStatus === "success";
+      const successful = succeeded ? head : successfulHead;
+      const state = {
+        schema, reviewer, pr, run_id: runId, run_attempt: attempt,
+        attempt_head: head, successful_head: successful, attempt_status: attemptStatus,
+        diff_mode: succeeded ? "full" : "unavailable", full_diff_sha256: successful ? "f".repeat(64) : null,
+      };
+      return {
+        id,
+        actor,
+        createdAt: requestCreatedAt,
+        body: [
+          "## OpenCode Review (latest)",
+          "<!-- automation:opencode-auto-review:v2 -->",
+          `<!-- automation-state:${JSON.stringify(state)} -->`,
+          "<!-- automation:opencode-auto-review -->",
+          "",
+          `- Status: ${status ?? (succeeded ? "success" : successful ? "stale" : "failure")}`,
+          `- Run: ${opencodeRunUrl(runId)}`,
+          "- Attestation: 7001",
+          ...(succeeded ? [`- Reviewed: ${head}`] : failureLines ?? [
+            `- Last attempt: failure (${opencodeRunUrl(runId)})`,
+            `- Reason: ${reason}`,
+          ]),
+          "",
+          body,
+        ].join("\n"),
+      };
+    };
+    const opencodeProbe = (runId, attempt) => [
+      `ship_opencode_provider_failure ${runId} ${attempt}`,
+      "printf 'rc=%s reason=%s expected=%s unavailable=%s\\n' \"$?\" \"$SHIP_WORKFLOW_PROVIDER_REASON\" \"${ROUND_EXPECTED_REVIEWERS//$'\\n'/,}\" \"${ROUND_UNAVAILABLE_REVIEWERS//$'\\t'/:}\"",
+    ].join("\n");
+    const opencodeCase = async (comments, expected, message, runId = 9951, attempt = 1) => {
+      const result = await run(
+        baseState({ issueComments: comments }),
+        `ROUND_EXPECTED_REVIEWERS=$'codex\\nopencode'; export ROUND_EXPECTED_REVIEWERS\n${opencodeProbe(runId, attempt)}`,
+      );
+      assert.match(result.stdout, expected, message);
+    };
+    const opencodeExcluded = /^rc=0 reason=quota_exhausted expected=codex unavailable=opencode:quota_exhausted$/m;
+    const opencodeKept = (reason) => new RegExp(`^rc=3 reason=${reason} expected=codex,opencode unavailable=$`, "m");
+    await opencodeCase([opencodeSticky()], opencodeExcluded,
+      "a quota_exhausted OpenCode failure must leave only this round's expected set");
+    await opencodeCase([opencodeSticky({ successfulHead: oldHead })], opencodeExcluded,
+      "a stale sticky that keeps an older success must still report quota_exhausted");
+    await opencodeCase([opencodeSticky({ successfulHead: currentHead, body: "[HIGH] preserved finding for this head" })],
+      opencodeKept("provider_failed"),
+      "a stale sticky whose preserved verdict is for the merged head must keep opencode required");
+    for (const reason of ["rate_limited", "authentication_failed", "provider_failed"]) {
+      await opencodeCase([opencodeSticky({ reason })], opencodeKept(reason),
+        `${reason} must stay a blocking OpenCode failure`);
+    }
+    await opencodeCase([opencodeSticky({ runId: 9950 })], opencodeKept("provider_failed"),
+      "a sticky for another run must not explain the current run");
+    await opencodeCase([opencodeSticky({ attempt: 2 })], opencodeKept("provider_failed"),
+      "a sticky for another attempt must not explain the current attempt");
+    await opencodeCase([opencodeSticky({ head: oldHead })], opencodeKept("provider_failed"),
+      "a sticky for another head must not explain the current head");
+    await opencodeCase([opencodeSticky({ actor: "jhw7500" })], opencodeKept("provider_failed"),
+      "a user-authored copy of the sticky must be ignored");
+    await opencodeCase([opencodeSticky({ attemptStatus: "success", body: "- Reason: quota_exhausted" })],
+      opencodeKept("provider_failed"), "a successful sticky has no failure reason to read");
+    await opencodeCase([opencodeSticky({ status: "failure", successfulHead: oldHead })], opencodeKept("provider_failed"),
+      "a displayed status that disagrees with successful_head must not be trusted");
+    await opencodeCase([opencodeSticky({ reason: "rate_limited", body: "- Reason: quota_exhausted" })],
+      opencodeKept("rate_limited"), "a Reason look-alike in the display body must not replace the metadata reason");
+    await opencodeCase([opencodeSticky({ failureLines: [
+      `- Last attempt: failure (${opencodeRunUrl(9951)})`, "- Reason: quota_exhausted", "- Reason: rate_limited",
+    ] })], opencodeKept("provider_failed"), "a duplicated Reason line must not be trusted");
+    await opencodeCase([opencodeSticky({ failureLines: [
+      `- Last attempt: failure (${opencodeRunUrl(9951)})`, "- Reason: quota_exhausted ",
+    ] })], opencodeKept("provider_failed"), "a trailing-space Reason look-alike must not be trimmed into a match");
+    await opencodeCase([opencodeSticky({ failureLines: [
+      `- Last attempt: failure (${opencodeRunUrl(9950)})`, "- Reason: quota_exhausted",
+    ] })], opencodeKept("provider_failed"), "a failure entry for another run URL must not be read");
+    await opencodeCase([], opencodeKept("provider_failed"), "a missing sticky must keep provider_failed");
+    await opencodeCase([opencodeSticky(), opencodeSticky({ id: 9952 })], opencodeKept("provider_failed"),
+      "two matching stickies are ambiguous and must not be trusted");
+    await opencodeCase([opencodeSticky(), opencodeSticky({ id: 9952, reason: "rate_limited" })],
+      opencodeKept("provider_failed"), "two failure stickies for one run must not be trusted");
+    await opencodeCase([
+      opencodeSticky({ id: 9950, attemptStatus: "success", body: "### New findings\n#### [HIGH] unchecked input" }),
+      opencodeSticky(),
+    ], opencodeKept("provider_failed"),
+    "a success sticky for the same run must not be hidden behind the failure-layout filter");
+    await opencodeCase([opencodeSticky({ id: 9952, actor: "jhw7500", attemptStatus: "success" }), opencodeSticky()],
+      opencodeExcluded, "a user-authored sticky copy is not evidence and must not be counted");
+    await opencodeCase([
+      { id: 9950, actor: "github-actions[bot]", createdAt: requestCreatedAt,
+        body: "## OpenCode Review (latest)\n<!-- automation:opencode-auto-review:v2 -->\n<!-- automation-state:{broken -->" },
+      opencodeSticky(),
+    ], opencodeKept("provider_failed"), "a Bot v2 sticky whose run cannot be identified must fail closed");
+    await opencodeCase([opencodeSticky({ id: 9950, runId: 9940, reason: "rate_limited" }), opencodeSticky()],
+      opencodeExcluded, "a sticky for another run must not count against the current run");
+    for (const [field, value] of [["pr", 41], ["schema", 3], ["reviewer", "claude"]]) {
+      await opencodeCase([opencodeSticky({ [field]: value })], opencodeKept("provider_failed"),
+        `a sticky with a mismatched ${field} must not be trusted`);
+    }
+    const unplannedOpencode = await run(
+      baseState({ issueComments: [opencodeSticky()] }),
+      `ROUND_EXPECTED_REVIEWERS=codex; export ROUND_EXPECTED_REVIEWERS\n${opencodeProbe(9951, 1)}`,
+    );
+    assert.match(unplannedOpencode.stdout, /^rc=0 reason=quota_exhausted expected=codex unavailable=$/m,
+      "an unplanned opencode must not produce a report row");
+    const invalidOpencodeRun = await run(baseState(), opencodeProbe("abc", 1));
+    assert.match(invalidOpencodeRun.stdout, /^rc=2 reason=provider_failed expected= unavailable=$/m);
+    const opencodeCollection = await run(
+      baseState({ issueComments: [
+        opencodeSticky(),
+        { id: 9960, actor: "github-actions[bot]", createdAt: requestCreatedAt,
+          body: "<!-- automation:opencode-auto-review -->\n\nLegacy OpenCode review." },
+      ] }),
+      "ROUND_EXPECTED_REVIEWERS=opencode; export ROUND_EXPECTED_REVIEWERS; collect",
+      { SHA: currentHead },
+    );
+    const collectedWorkflowComments = opencodeCollection.stdout
+      .split("## workflow_comments\n")[1].split("## reactions\n")[0]
+      .split("\n").filter(Boolean).map(JSON.parse);
+    assert.deepEqual(collectedWorkflowComments.map((item) => [item.id, item.type]), [[9951, "Bot"], [9960, "Bot"]],
+      "the signal snapshot must carry OpenCode v2 and legacy stickies with their author type");
+
+    const opencodeMerge = (reviewers, rows) => runResult(
+      baseState({ prHead: currentHead, issueComments: [opencodeSticky(reviewers.reason ? { reason: reviewers.reason } : {})] }),
+      [
+        `ROUND_EXPECTED_REVIEWERS=$'${reviewers.expected}'; export ROUND_EXPECTED_REVIEWERS`,
+        "ship_opencode_provider_failure 9951 1 || true",
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request ${rows}`,
+      ].join("\n"),
+    );
+    const quotaMerge = await opencodeMerge({ expected: "codex\\nopencode" }, "codex=CLEAN");
+    assert.equal(quotaMerge.code, 0, quotaMerge.stderr);
+    assert.equal(quotaMerge.state.prMerged, true,
+      "an OpenCode quota_exhausted round must not block a CLEAN codex merge");
+    const rateLimitedMerge = await opencodeMerge(
+      { expected: "codex\\nopencode", reason: "rate_limited" }, "codex=CLEAN opencode=FAILED");
+    assert.notEqual(rateLimitedMerge.code, 0);
+    assert.match(rateLimitedMerge.stderr, /PR reviewer is not ready: opencode=FAILED/);
+    assert.equal(rateLimitedMerge.state.prMerged, false, "rate_limited must keep blocking the merge");
+    const rateLimitedOmitted = await opencodeMerge(
+      { expected: "codex\\nopencode", reason: "rate_limited" }, "codex=CLEAN");
+    assert.match(rateLimitedOmitted.stderr, /missing PR reviewer status: opencode/);
+    assert.equal(rateLimitedOmitted.state.prMerged, false);
+    const opencodeOnlyMerge = await opencodeMerge({ expected: "opencode" }, "");
+    assert.notEqual(opencodeOnlyMerge.code, 0);
+    assert.match(opencodeOnlyMerge.stderr, /no eligible PR reviewer was planned/);
+    assert.equal(opencodeOnlyMerge.state.prMerged, false,
+      "excluding the only expected reviewer must not become a vacuous CLEAN merge");
+    const opencodeOnlyRow = await opencodeMerge({ expected: "opencode" }, "opencode=UNAVAILABLE");
+    assert.equal(opencodeOnlyRow.state.prMerged, false);
+
+    const opencodeNextRound = await run(
+      baseState({ issueComments: [opencodeSticky()] }),
+      [
+        "JHW_PR_AVAILABLE_WORKFLOWS=opencode-auto-review.yml; JHW_PR_ELIGIBLE_APPS=codex",
+        "export JHW_PR_AVAILABLE_WORKFLOWS JHW_PR_ELIGIBLE_APPS",
+        'ROUND_EXPECTED_REVIEWERS="$(jhw_pr_select_expected_reviewers)" || exit $?; export ROUND_EXPECTED_REVIEWERS',
+        "ship_opencode_provider_failure 9951 1",
+        "printf 'excluded=%s\\n' \"${ROUND_EXPECTED_REVIEWERS//$'\\n'/,}\"",
+        'ROUND_EXPECTED_REVIEWERS="$(jhw_pr_select_expected_reviewers)" || exit $?',
+        "printf 'next=%s available=%s\\n' \"${ROUND_EXPECTED_REVIEWERS//$'\\n'/,}\" \"$JHW_PR_AVAILABLE_WORKFLOWS\"",
+      ].join("\n"),
+    );
+    assert.equal(opencodeNextRound.stdout, "excluded=codex\nnext=opencode,codex available=opencode-auto-review.yml\n",
+      "the quota exclusion must last one round and leave the preflighted workflow list intact");
+    assert.match(prText, /```bash\nROUND_UNAVAILABLE_REVIEWERS=''\nexport ROUND_UNAVAILABLE_REVIEWERS\ncase "\$EFFECTIVE_REVIEW_POLICY" in/,
+      "each round must clear the report-only OpenCode quota row before selecting reviewers");
+
     console.log("pr skill contract: ok");
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
