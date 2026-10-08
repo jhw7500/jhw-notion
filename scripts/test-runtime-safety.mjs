@@ -433,6 +433,8 @@ test('non-dumpable current-user tasks with kernel-owned records are classified',
   // Precondition printed next to the verdict: the kernel, not the fixture, owns the records.
   const precondition = { directory: fs.statSync(`/proc/${child.pid}`).uid, record: fs.statSync(`/proc/${child.pid}/cmdline`).uid };
   assert.deepEqual(precondition, { directory: uid, record: 0 });
-  const result = inspectConsumers({ repositoryRoot: options.repositoryRoot, excludePids: [process.pid] });
+  // Only the child is counted, so consumers already running on this host cannot change the verdict.
+  const others = fs.readdirSync('/proc').filter(name => /^[1-9]\d*$/.test(name)).map(Number).filter(pid => pid !== child.pid);
+  const result = inspectConsumers({ repositoryRoot: options.repositoryRoot, excludePids: others });
   assert.equal(result.counts.managed, 1, JSON.stringify({ precondition, result }));
 });
