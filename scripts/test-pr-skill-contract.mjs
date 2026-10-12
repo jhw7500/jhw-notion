@@ -318,6 +318,17 @@ if (argv[0] === "pr" && argv[1] === "view") {
     ].join("\t") + "\n");
   }
   else if (query === ".number") process.stdout.write(String(state.prNumber) + "\n");
+  else if (query === ".headRefOid" && (state.failHeadReads ?? 0) > 0) {
+    state.failHeadReads -= 1;
+    save();
+    process.exit(1);
+  }
+  else if (query === ".headRefOid" && (state.staleHeadReads ?? 0) > 0) {
+    // GitHub may keep serving the previous PR head for a few reads after accepting a push.
+    state.staleHeadReads -= 1;
+    save();
+    process.stdout.write(state.staleHead + "\n");
+  }
   else if (query === ".headRefOid") process.stdout.write(state.prHead + "\n");
   else if (query === ".baseRefName") process.stdout.write(state.prBase + "\n");
   else if (query === ".baseRefOid") {
@@ -858,6 +869,15 @@ if (argv[0] === "push") {
   if (state.mutateBodyOnPush) {
     fs.writeFileSync(process.env.JHW_PR_BODY_FILE, state.mutatedBody || "attacker-controlled body\n");
   }
+  if (state.staleHeadReadsAfterPush !== undefined) {
+    state.staleHead = state.prHead;
+    state.staleHeadReads = state.staleHeadReadsAfterPush;
+    delete state.staleHeadReadsAfterPush;
+  }
+  if (state.failHeadReadsAfterPush !== undefined) {
+    state.failHeadReads = state.failHeadReadsAfterPush;
+    delete state.failHeadReadsAfterPush;
+  }
   state.remoteBranchHead = state.localHead;
   if (state.prExists && state.pushUpdatesPrHead !== false) state.prHead = state.localHead;
   if (state.runOnPush) {
@@ -1267,6 +1287,9 @@ async function main() {
       JHW_PR_CONFIG_PATH: fixtureConfigPath,
       JHW_PR_TITLE: "Deliver contract-backed PR creation",
       JHW_PR_BODY_FILE: validPrBodyPath,
+      // Empty values select the skill defaults so a developer's exported wait knobs cannot leak in.
+      JHW_PR_REMOTE_HEAD_ATTEMPTS: "",
+      JHW_PR_REMOTE_HEAD_INTERVAL: "",
       ...envOverrides,
     };
     const script = `source ${JSON.stringify(contractPath)}\n${commands}`;
@@ -2996,6 +3019,107 @@ async function main() {
     );
     assert.notEqual(staleHead.code, 0);
     assert.equal(staleHead.log.filter(isGitPush).length, 1);
+
+    const headRead = (args) => isGh(args, "pr", "view") && hasOption(args, "--jq", ".headRefOid");
+    const afterPush = (log) => log.slice(callIndex(log, isGitPush) + 1);
+    const delayedExistingHead = await run(
+      baseState({ prLabels: ["review:request"], prDraft: true, staleHeadReadsAfterPush: 2 }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+    );
+    assert.equal(delayedExistingHead.state.staleHeadReads, 0,
+      "the existing-PR path must keep reading until GitHub serves the pushed head");
+    assert.equal(afterPush(delayedExistingHead.log).filter(headRead).length, 4,
+      "two stale reads, the converged read, and the single verification read");
+    assert.deepEqual(afterPush(delayedExistingHead.log).filter((args) => args[0] === "sleep"),
+      [["sleep", "3"], ["sleep", "3"]], "the default interval must separate head reads");
+    assert.equal(delayedExistingHead.log.filter(isGitPush).length, 1);
+    assert.equal(delayedExistingHead.state.prDraft, false,
+      "a delayed remote head must not stop the existing-PR path before ready");
+
+    const persistentStaleHead = await runResult(
+      baseState({ prLabels: ["review:request"], prDraft: true, staleHeadReadsAfterPush: 1000 }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+      { JHW_PR_REMOTE_HEAD_ATTEMPTS: "3", JHW_PR_REMOTE_HEAD_INTERVAL: "0" },
+    );
+    assert.equal(persistentStaleHead.code, 1);
+    assert.match(persistentStaleHead.stderr, /remote PR head mismatch/);
+    assert.equal(afterPush(persistentStaleHead.log).filter(headRead).length, 4,
+      "the wait must stop after its bounded attempts before the single verification read");
+    assert.deepEqual(afterPush(persistentStaleHead.log).filter((args) => args[0] === "sleep"),
+      [["sleep", "0"], ["sleep", "0"]]);
+    assert.equal(persistentStaleHead.log.filter(isGitPush).length, 1);
+    assert.equal(persistentStaleHead.log.some(ready), false,
+      "an unconverged remote head must stop before ready");
+
+    const failedHeadRead = await run(
+      baseState({ prLabels: ["review:request"], prDraft: true, failHeadReadsAfterPush: 1 }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+      { JHW_PR_REMOTE_HEAD_INTERVAL: "0" },
+    );
+    assert.equal(failedHeadRead.state.failHeadReads, 0);
+    assert.equal(afterPush(failedHeadRead.log).filter(headRead).length, 3,
+      "a failed head read must count as not yet applied rather than abort the wait");
+    assert.equal(failedHeadRead.state.prDraft, false,
+      "a transient head read failure must not stop the existing-PR path before ready");
+
+    const persistentHeadReadFailure = await runResult(
+      baseState({ prLabels: ["review:request"], prDraft: true, failHeadReadsAfterPush: 1000 }),
+      `jhw_pr_apply_existing_pr_policy request ${currentHead}`,
+      { JHW_PR_REMOTE_HEAD_ATTEMPTS: "2", JHW_PR_REMOTE_HEAD_INTERVAL: "0" },
+    );
+    assert.equal(persistentHeadReadFailure.code, 1,
+      "verification must still fail closed when every head read fails");
+    assert.equal(afterPush(persistentHeadReadFailure.log).filter(headRead).length, 3);
+    assert.equal(persistentHeadReadFailure.log.some(ready), false);
+
+    for (const [name, value] of [["JHW_PR_REMOTE_HEAD_ATTEMPTS", "100"], ["JHW_PR_REMOTE_HEAD_INTERVAL", "60"]]) {
+      const boundaryWait = await runResult(baseState(), `jhw_pr_wait_remote_head ${oldHead}`, { [name]: value });
+      assert.equal(boundaryWait.code, 0, `${name}=${value} must be accepted`);
+      assert.equal(boundaryWait.log.filter(headRead).length, 1, `${name}=${value}`);
+    }
+    for (const [name, value] of [
+      ["JHW_PR_REMOTE_HEAD_ATTEMPTS", "0"],
+      ["JHW_PR_REMOTE_HEAD_ATTEMPTS", "-1"],
+      ["JHW_PR_REMOTE_HEAD_ATTEMPTS", "010"],
+      ["JHW_PR_REMOTE_HEAD_ATTEMPTS", "3s"],
+      ["JHW_PR_REMOTE_HEAD_ATTEMPTS", "101"],
+      ["JHW_PR_REMOTE_HEAD_ATTEMPTS", "9".repeat(20)],
+      ["JHW_PR_REMOTE_HEAD_INTERVAL", "-1"],
+      ["JHW_PR_REMOTE_HEAD_INTERVAL", "0.5"],
+      ["JHW_PR_REMOTE_HEAD_INTERVAL", "x"],
+      ["JHW_PR_REMOTE_HEAD_INTERVAL", "61"],
+      ["JHW_PR_REMOTE_HEAD_INTERVAL", "9".repeat(20)],
+    ]) {
+      const invalidWait = await runResult(baseState(), `jhw_pr_wait_remote_head ${currentHead}`, { [name]: value });
+      assert.equal(invalidWait.code, 2, `${name}=${value}`);
+      assert.equal(invalidWait.log.some(headRead), false, `${name}=${value} must fail before reading the head`);
+    }
+    for (const [name, value] of [["JHW_PR_REMOTE_HEAD_ATTEMPTS", "0"], ["JHW_PR_REMOTE_HEAD_INTERVAL", "x"]]) {
+      for (const [state, command] of [
+        [baseState({ prLabels: ["review:request"] }), `jhw_pr_apply_existing_pr_policy request ${currentHead}`],
+        [baseState({ prExists: false }), "jhw_pr_apply_new_pr_policy request"],
+      ]) {
+        const invalidPolicyWait = await runResult(state, command, { [name]: value });
+        assert.equal(invalidPolicyWait.code, 2, `${command} ${name}=${value}`);
+        assert.deepEqual(mutationCalls(invalidPolicyWait.log), [],
+          `${command} must reject ${name}=${value} before labels, push, or PR creation`);
+      }
+    }
+
+    const delayedNewPrHead = await run(
+      baseState({ prExists: false, staleHeadReadsAfterPush: 2 }),
+      "jhw_pr_apply_new_pr_policy request",
+      { JHW_PR_REMOTE_HEAD_INTERVAL: "0" },
+    );
+    assert.equal(delayedNewPrHead.state.staleHeadReads, 0,
+      "the new-PR path must keep reading until GitHub serves the pushed head");
+    assert.equal(delayedNewPrHead.log.filter(headRead).length, 4,
+      "two stale reads, the converged read, and the single verification read");
+    requireBefore(delayedNewPrHead.log, numberLookup, headRead,
+      "the new-PR head wait must use the created PR number");
+    requireBefore(delayedNewPrHead.log, headRead, ready, "the new-PR head wait must precede ready");
+    assert.equal(delayedNewPrHead.state.prDraft, false,
+      "a delayed remote head must not stop the new-PR path before ready");
 
     const unexpectedlyReady = await runResult(
       baseState({ prExists: false, forceReadyOnCreate: true }),

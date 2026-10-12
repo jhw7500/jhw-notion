@@ -1416,6 +1416,30 @@ jhw_pr_expected_base() {
   printf '%s\n' "$base"
 }
 
+jhw_pr_validate_remote_head_wait() {
+  local attempts="${JHW_PR_REMOTE_HEAD_ATTEMPTS:-10}" interval="${JHW_PR_REMOTE_HEAD_INTERVAL:-3}"
+  # The digit-count check runs first so arithmetic never sees a value that could overflow.
+  [[ "$attempts" =~ ^[1-9][0-9]{0,2}$ ]] && (( attempts <= 100 )) || { echo "invalid JHW_PR_REMOTE_HEAD_ATTEMPTS" >&2; return 2; }
+  [[ "$interval" =~ ^(0|[1-9][0-9]?)$ ]] && (( interval <= 60 )) || { echo "invalid JHW_PR_REMOTE_HEAD_INTERVAL" >&2; return 2; }
+}
+
+jhw_pr_wait_remote_head() {
+  local expected_head="$1" attempts="${JHW_PR_REMOTE_HEAD_ATTEMPTS:-10}" interval="${JHW_PR_REMOTE_HEAD_INTERVAL:-3}"
+  local attempt actual_head
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid expected head" >&2; return 2; }
+  jhw_pr_validate_remote_head_wait || return
+  # GitHub applies a push to the PR head asynchronously, so a failed or stale read means "not yet applied";
+  # jhw_pr_verify_remote_policy gives the final verdict after exhaustion.
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    if actual_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" &&
+      [[ "$actual_head" == "$expected_head" ]]; then
+      return 0
+    fi
+    if (( attempt < attempts )); then sleep "$interval"; fi
+  done
+  return 0
+}
+
 jhw_pr_verify_remote_policy() {
   local mode="$1" expected_head="$2" expected_base="$3"
   local labels actual_head actual_base has_request=0 has_skip=0
@@ -1736,6 +1760,7 @@ jhw_pr_apply_new_pr_policy_with_snapshot() {
   JHW_PR_WORKFLOW_TRIGGER_EVENT="$workflow_trigger_event"
   export JHW_PR_WORKFLOW_TRIGGER_EVENT
   expected_base="$(jhw_pr_expected_base)" || return
+  jhw_pr_validate_remote_head_wait || return
   jhw_pr_require_write_permission || return
   jhw_pr_prepare_review_plan "$mode" "$workflow_trigger_event" || return
   jhw_pr_ensure_review_labels || return
@@ -1751,6 +1776,7 @@ jhw_pr_apply_new_pr_policy_with_snapshot() {
   PR="$(gh pr view "$created_pr_url" --repo "$REPO_NWO" --json number --jq .number)" || return 1
   [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "invalid created PR" >&2; return 1; }
   jhw_pr_reconcile_review_labels "$mode" || return
+  jhw_pr_wait_remote_head "$local_head" || return
   jhw_pr_verify_remote_policy "$mode" "$local_head" "$expected_base" || return
   draft="$(gh pr view "$PR" --repo "$REPO_NWO" --json isDraft --jq .isDraft)" || return 1
   [[ "$draft" == true ]] || { echo "new PR left draft before policy verification" >&2; return 1; }
@@ -1767,6 +1793,7 @@ jhw_pr_apply_existing_pr_policy() {
   actual_local_head="$(git rev-parse HEAD)" || return 1
   [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed before policy reconciliation" >&2; return 1; }
   expected_base="$(jhw_pr_expected_base)" || return
+  jhw_pr_validate_remote_head_wait || return
   jhw_pr_validate_existing_pr_body "$PR" || return
   jhw_pr_require_write_permission || return
   remote_head="$(gh pr view "$PR" --repo "$REPO_NWO" --json headRefOid --jq .headRefOid)" || return 1
@@ -1815,6 +1842,7 @@ jhw_pr_apply_existing_pr_policy() {
     git push -u origin HEAD || return 1
     actual_local_head="$(git rev-parse HEAD)" || return 1
     [[ "$actual_local_head" == "$expected_local_head" ]] || { echo "local head changed during push" >&2; return 1; }
+    jhw_pr_wait_remote_head "$expected_local_head" || return
     jhw_pr_verify_remote_policy "$mode" "$expected_local_head" "$expected_base" || return
   fi
   if [[ "$draft" == true ]]; then
@@ -1841,8 +1869,8 @@ jhw_pr_apply_existing_pr_policy() {
    - `REPO_NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # Owner/Repo (nameWithOwner)`
 2. **PR 생성 또는 감지**
    - `--base`는 새 PR과 기존 PR 모두에 적용한다. 기존 PR의 base가 다르면 review-triggering 라벨 변경이나 push 전에 `gh pr edit --base`로 맞추고 `baseRefName`을 재조회한다. 수정·재조회가 실패하면 리뷰를 요청하지 않는다.
-   - 새 PR: explicit title/body contract preflight → reviewer plan·현재 head workflow run-ID floor 캡처 → push → `gh pr create --draft --title "$JHW_PR_TITLE" --body-file "$body_snapshot"` → mode 라벨 reconcile/read-back → head/base/draft 검증 → ready 순서다. `jhw_pr_apply_new_pr_policy`가 push와 ready보다 먼저 floor를 잡는다.
-   - 기존 PR의 새 head: reviewer plan·현재 local head workflow run-ID floor 캡처 → base reconcile/read-back → mode 라벨 reconcile/read-back → push → 새 원격 head/base 검증 순서다. 기존 draft는 push와 검증 뒤 ready/read-back하여 새 head의 `ready_for_review`를 발생시킨다. `jhw_pr_apply_existing_pr_policy`가 base/label/push/ready mutation 전에 floor를 잡는다.
+   - 새 PR: explicit title/body contract preflight → reviewer plan·현재 head workflow run-ID floor 캡처 → push → `gh pr create --draft --title "$JHW_PR_TITLE" --body-file "$body_snapshot"` → mode 라벨 reconcile/read-back → head/base/draft 검증 → ready 순서다. head 검증 전에는 GitHub의 push 반영 지연을 흡수하도록 PR `headRefOid`를 상한 있는 대기(3초 간격 최대 10회가 기본값, `JHW_PR_REMOTE_HEAD_INTERVAL` 0~60·`JHW_PR_REMOTE_HEAD_ATTEMPTS` 1~100으로 조정)로 다시 읽고, 끝까지 다르면 `remote PR head mismatch`로 실패한다. `jhw_pr_apply_new_pr_policy`가 push와 ready보다 먼저 floor를 잡는다.
+   - 기존 PR의 새 head: reviewer plan·현재 local head workflow run-ID floor 캡처 → base reconcile/read-back → mode 라벨 reconcile/read-back → push → 같은 상한 대기로 원격 head 재확인 → 새 원격 head/base 검증 순서다. 기존 draft는 push와 검증 뒤 ready/read-back하여 새 head의 `ready_for_review`를 발생시킨다. `jhw_pr_apply_existing_pr_policy`가 base/label/push/ready mutation 전에 floor를 잡는다.
    - 이미 ready인 같은 head의 명시적 `request`는 synchronize push를 생략하고 `review:request`의 `labeled` event run을 사용한다. 라벨이 이미 붙어 있으면 떼었다 다시 붙여 새 `labeled` 이벤트를 만든다. `workflow_dispatch`는 보내지 않는다 — override 라벨 없는 `force_review` dispatch는 budget이 항상 거부하고, 그 거부를 이번 라운드로 판정하면 성공한 labeled 리뷰를 FAILED로 오보한다(#156). 변경 없는 ready `auto=true`는 리뷰 이벤트가 생기지 않으므로 어떤 mutation보다 먼저 멈추고 `--review` 재실행을 안내한다. 새 PR·draft PR 또는 새 head를 push하는 `request|auto=true`는 `ready_for_review|synchronize`의 `pull_request` event run을 사용한다.
    - `PR=<번호>`, `SHA="$(git rev-parse HEAD)"`, `ROUND_BASE_OID="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)"` (push·base reconcile 후 기준 — 재푸시마다 갱신)
 3. **병렬 게이트 시작**
