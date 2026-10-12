@@ -134,7 +134,7 @@ else:
 print(json.dumps({"valid": valid, "kind": "pull-request", "version": "v1" if valid else ""}))
 raise SystemExit(0 if valid else 1)
 `;
-const namedCodexReview = "ROUND_EXPECTED_REVIEWERS=codex; export ROUND_EXPECTED_REVIEWERS; ";
+const namedCodexReview = "ROUND_EXPECTED_REVIEWERS=codex; ROUND_PLANNED_REVIEWERS=codex; export ROUND_EXPECTED_REVIEWERS ROUND_PLANNED_REVIEWERS; ";
 const requestMarker = `<!-- jhw-pr:review-request reviewer=codex head=${currentHead} base=${currentBaseOid} -->`;
 const requestBody = `@codex review\n\n${requestMarker}`;
 const legacyRequestMarker = `<!-- jhw-ship:codex-review round=2 head=${currentHead} -->`;
@@ -747,6 +747,16 @@ if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
 if (endpoint.includes("/actions/runs?")) {
   const queryIndex = argv.indexOf("--jq");
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
+  if (endpoint.includes("event=workflow_dispatch")) {
+    // This fake emits a fixed field order, so pin the query whose order the skill parses.
+    if (query !== '.workflow_runs[] | [.id, .name, .status, (.conclusion // "null"), .event] | @tsv') {
+      process.stderr.write("unexpected dispatch run query: " + query + "\n");
+      process.exit(2);
+    }
+    rows(state.runs.filter((item) => item.event === "workflow_dispatch").map((item) =>
+      [item.id, item.name, item.status, item.conclusion, item.event].join("\t")));
+    process.exit(0);
+  }
   rows(state.runs.map((item) => {
     const fields = [item.id, item.attempt];
     if (query.includes(".run_number")) fields.push(item.runNumber ?? item.id);
@@ -792,6 +802,26 @@ if (argv[0] === "diff" && argv.includes("--numstat") && argv.includes("--no-ext-
 
 if (argv[0] === "diff" && argv.includes("--binary") && argv.includes("--no-ext-diff")) {
   process.stdout.write(state.diffText || "");
+  process.exit(0);
+}
+
+if (argv[0] === "diff" && argv[1] === "--quiet") {
+  const [base, head, separator, ...paths] = argv.slice(2);
+  const pathspecs = {
+    ".github/workflows .github/workflow-config.yml": (path) =>
+      path.startsWith(".github/workflows/") || path === ".github/workflow-config.yml",
+    ":(glob)**/*.py :(glob)**/*.pyc :(glob)**/*.pyw :(glob)**/*.pyd :(glob)**/*.so": (path) =>
+      /\.(py|pyc|pyw|pyd|so)$/.test(path),
+  };
+  const matches = pathspecs[paths.join(" ")];
+  if (base !== state.reviewedBaseOid || head !== state.reviewedHead || separator !== "--" || !matches) process.exit(2);
+  process.exit((state.changedPaths || []).some(matches) ? 1 : 0);
+}
+
+if (argv[0] === "diff" && argv[1] === "--raw") {
+  if (argv.length !== 5 || argv[2] !== "--no-renames" || argv[3] !== state.reviewedBaseOid ||
+      argv[4] !== state.reviewedHead) process.exit(2);
+  process.stdout.write(state.rawDiff || "");
   process.exit(0);
 }
 
@@ -3788,7 +3818,7 @@ async function main() {
 
     const atomicMerge = await run(
       baseState({ prHead: currentHead }),
-      `ROUND_EXPECTED_REVIEWERS=$'codex\nclaude'; export ROUND_EXPECTED_REVIEWERS; jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN claude=CLEAN`,
+      `ROUND_EXPECTED_REVIEWERS=$'codex\nclaude'; ROUND_PLANNED_REVIEWERS="$ROUND_EXPECTED_REVIEWERS"; export ROUND_EXPECTED_REVIEWERS ROUND_PLANNED_REVIEWERS; jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN claude=CLEAN`,
     );
     assert.equal(atomicMerge.state.prMerged, true);
     assert.deepEqual(
@@ -5664,38 +5694,147 @@ async function main() {
     assert.match(invalidReviewer.stdout, /^rc=2 decision= action=$/m);
 
     const providerTmp = await mkdtemp(join(tmpdir(), "jhw-pr-provider-test-"));
-    const providerProbe = (runId, attempt) => [
-      `ship_gemini_provider_failure ${runId} ${attempt}`,
-      "printf 'rc=%s reason=%s\\n' \"$?\" \"$SHIP_WORKFLOW_PROVIDER_REASON\"",
+    // Round state the #200 exclusion path reads: this round's plan.
+    const roundPlan = (expected) => [
+      `ROUND_EXPECTED_REVIEWERS=$'${expected}'; ROUND_PLANNED_REVIEWERS="$ROUND_EXPECTED_REVIEWERS"`,
+      "export ROUND_EXPECTED_REVIEWERS ROUND_PLANNED_REVIEWERS",
     ].join("\n");
-    const providerCase = async (text, expected, message) => {
-      const result = await run(
-        baseState({ providerErrorArtifacts: text === undefined ? {} : {
-          "gemini-provider-error-9901-1": typeof text === "string" ? { text } : text,
-        } }),
-        providerProbe(9901, 1),
-        { TMPDIR: providerTmp },
-      );
-      assert.match(result.stdout, expected, message);
+    const exclusionProbe = (call) => [
+      call,
+      "rc=$?; unavailable=\"${ROUND_UNAVAILABLE_REVIEWERS//$'\\t'/:}\"",
+      "printf 'rc=%s reason=%s expected=%s unavailable=%s\\n' \"$rc\" \"$SHIP_WORKFLOW_PROVIDER_REASON\" \"${ROUND_EXPECTED_REVIEWERS//$'\\n'/,}\" \"${unavailable//$'\\n'/,}\"",
+    ].join("\n");
+    // automation v1.83 gemini-auto-review.yml: buildState() and metadata() of a failed run.
+    const geminiRunUrl = (runId) => `https://github.com/example/repo/actions/runs/${runId}`;
+    const geminiSticky = ({
+      id = 9901, actor = "github-actions[bot]", runId = 9901, attempt = 1, head = currentHead,
+      successfulHead = null, status, schema = 3, reviewer = "gemini", pr = 42, execution = "performed",
+      body = "### Error\n\nReason: provider_failed\n\nGemini review did not produce a valid covered review.",
+    } = {}) => {
+      const preserved = successfulHead !== null;
+      const state = {
+        schema, reviewer, pr, run_id: runId, run_attempt: attempt, attempt_head: head,
+        successful_head: successfulHead, attempt_status: "failure", diff_mode: "full",
+        ...(execution === null ? {} : { review_execution: execution }),
+        full_diff_sha256: preserved ? "f".repeat(64) : null,
+        quality_schema: 1, accepted_count: preserved ? 1 : null, filtered_count: preserved ? 0 : null,
+        normalized_count: preserved ? 0 : null, filtered_max_severity: preserved ? "none" : null,
+      };
+      return {
+        id,
+        actor,
+        createdAt: requestCreatedAt,
+        body: [
+          "## \u{1F50E} Gemini Code Review",
+          "<!-- automation:gemini-auto-review:v3 -->",
+          `<!-- automation-state:${JSON.stringify(state)} -->`,
+          "",
+          `- Status: ${status ?? (preserved ? "stale" : "failure")}`,
+          ...(execution === null ? [] : [`- Execution: ${execution}`]),
+          `- Run: ${geminiRunUrl(runId)}`,
+          ...(preserved ? [
+            `- Reviewed: ${successfulHead}`,
+            "- Validation: accepted=1; filtered=0; normalized=0; filtered_max=none",
+          ] : []),
+          `- Last attempt: failure (${geminiRunUrl(runId)})`,
+          "",
+          body,
+        ].join("\n"),
+      };
     };
-    await providerCase(
-      "Failed to generate Gemini review: 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand.'}}\n",
-      /^rc=0 reason=provider_overloaded$/m, "a 503 provider error must be reported as an overloaded model");
-    await providerCase(
-      "Failed to generate Gemini review: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429}}\n",
-      /^rc=0 reason=provider_quota_exhausted$/m, "a 429 provider error must be reported as an exhausted quota");
-    await providerCase(
-      "Failed to generate Gemini review: provider request exceeded the process deadline\n",
-      /^rc=0 reason=provider_timeout$/m, "a deadline provider error must be reported as a timeout");
-    await providerCase(
-      "Failed to generate Gemini review: 500 INTERNAL.\n",
-      /^rc=0 reason=provider_failed$/m, "an unrecognized provider error must stay provider_failed");
-    await providerCase(undefined, /^rc=3 reason=provider_failed$/m,
-      "a missing or expired provider-error artifact must keep provider_failed");
-    await providerCase({ symlink: true }, /^rc=3 reason=provider_failed$/m,
+    const geminiErrors = {
+      provider_overloaded: "Failed to generate Gemini review: 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand.'}}\n",
+      provider_quota_exhausted: "Failed to generate Gemini review: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429}}\n",
+      provider_timeout: "Failed to generate Gemini review: provider request exceeded the process deadline\n",
+    };
+    const geminiArtifacts = (text) => text === null ? {} : {
+      "gemini-provider-error-9901-1": typeof text === "string" ? { text } : text,
+    };
+    const geminiCase = ({
+      text = geminiErrors.provider_overloaded, comments = [geminiSticky()], before = "", state = {}, env = {},
+    } = {}) => run(
+      baseState({ issueComments: comments, providerErrorArtifacts: geminiArtifacts(text), ...state }),
+      [roundPlan("codex\\ngemini"), before, exclusionProbe("ship_gemini_provider_failure 9901 1")].join("\n"),
+      { TMPDIR: providerTmp, ...env },
+    );
+    const geminiExcluded = (reason) =>
+      new RegExp(`^rc=0 reason=${reason} expected=codex unavailable=gemini:${reason}:9901:1$`, "m");
+    const geminiKept = (reason) => new RegExp(`^rc=3 reason=${reason} expected=codex,gemini unavailable=$`, "m");
+    for (const [reason, text] of Object.entries(geminiErrors)) {
+      assert.match((await geminiCase({ text })).stdout, geminiExcluded(reason),
+        `a run-bound Gemini ${reason} artifact must exclude gemini from this round`);
+    }
+    for (const [name, text] of [
+      ["an unrecognized provider error", "Failed to generate Gemini review: 500 INTERNAL.\n"],
+      ["an authentication failure", "Failed to generate Gemini review: 400 INVALID_ARGUMENT. API key not valid.\n"],
+      ["an empty model output", "Failed to generate Gemini review: Gemini returned no review text after 3 attempts\n"],
+    ]) {
+      assert.match((await geminiCase({ text })).stdout, geminiKept("provider_failed"),
+        `${name} must stay a blocking Gemini failure`);
+    }
+    assert.match((await geminiCase({ text: null })).stdout, geminiKept("provider_failed"),
+      "a missing or expired provider-error artifact must keep gemini required");
+    assert.match((await geminiCase({ text: { symlink: true } })).stdout, geminiKept("provider_failed"),
       "a symlinked provider-error file must not be read");
-    const invalidProviderRun = await run(baseState(), providerProbe("abc", 1), { TMPDIR: providerTmp });
-    assert.match(invalidProviderRun.stdout, /^rc=2 reason=provider_failed$/m);
+    assert.match((await geminiCase({ comments: [geminiSticky({ body: "### Error\n\nReason: rate_limited" })],
+      text: "Failed to generate Gemini review: 500 INTERNAL.\n" })).stdout, geminiKept("provider_failed"),
+    "the displayed Reason line must never stand in for the artifact");
+    for (const [name, comments] of [
+      ["a missing sticky", []],
+      ["a sticky for another run", [geminiSticky({ runId: 9900 })]],
+      ["a sticky for another attempt", [geminiSticky({ attempt: 2 })]],
+      ["a sticky for another head", [geminiSticky({ head: oldHead })]],
+      ["a sticky for another PR", [geminiSticky({ pr: 41 })]],
+      ["a sticky with another schema", [geminiSticky({ schema: 2 })]],
+      ["a model step that never ran", [geminiSticky({ execution: "not_performed" })]],
+      ["a legacy state without review_execution", [geminiSticky({ execution: null })]],
+      ["a displayed status that disagrees with the state", [geminiSticky({ status: "stale" })]],
+      ["two Bot stickies for one run", [geminiSticky(), geminiSticky({ id: 9902 })]],
+      ["a user-authored copy alone", [geminiSticky({ actor: "jhw7500" })]],
+      ["a preserved success for this head", [geminiSticky({ successfulHead: currentHead })]],
+      ["an open blocker in a preserved older success", [geminiSticky({ successfulHead: oldHead,
+        body: "### Still open\n\n#### RVW-0123456789ab [HIGH] unchecked input" })]],
+    ]) {
+      assert.match((await geminiCase({ comments })).stdout, geminiKept("provider_overloaded"),
+        `${name} must keep gemini required`);
+    }
+    assert.match((await geminiCase({ comments: [geminiSticky({ id: 9902, actor: "jhw7500", runId: 9901 }), geminiSticky()] })).stdout,
+      geminiExcluded("provider_overloaded"), "a user-authored sticky copy is not evidence and must not be counted");
+    assert.match((await geminiCase({ comments: [geminiSticky({ id: 9900, runId: 9900 }), geminiSticky()] })).stdout,
+      geminiExcluded("provider_overloaded"), "a sticky for an earlier run must not count against this run");
+    const mediumOnly = geminiSticky({ successfulHead: oldHead,
+      body: "### Still open\n\n#### RVW-0123456789ab [MEDIUM] naming" });
+    assert.match((await geminiCase({ comments: [mediumOnly] })).stdout, geminiExcluded("provider_overloaded"),
+      "a preserved older success without blocking findings must not keep gemini required");
+    assert.match((await geminiCase({ comments: [mediumOnly], env: { SHIP_BLOCK_ON: "should-fix" } })).stdout,
+      geminiKept("provider_overloaded"), "--block-on should-fix must treat a preserved [MEDIUM] as open");
+    for (const path of ["httpx.py", "google/genai/__init__.py"]) {
+      assert.match((await geminiCase({ state: { changedPaths: [path] } })).stdout, geminiKept("provider_overloaded"),
+        `a PR that changes ${path} can run code in the Gemini model step and must disable its exclusion`);
+    }
+    // git diff --raw lines as git prints them (measured against a real repository).
+    for (const [name, rawDiff] of [
+      ["an extension-less symlink", ":000000 120000 0000000 7f66e4f A\tvendor_link\n"],
+      ["a removed symlink", ":120000 000000 7f66e4f 0000000 D\tvendor_link\n"],
+      ["a submodule", ":000000 160000 0000000 6a9058d A\tsub\n"],
+      ["a type change", ":100644 120000 587be6b 7f66e4f T\ttc\n"],
+    ]) {
+      assert.match((await geminiCase({ state: { rawDiff } })).stdout, geminiKept("provider_overloaded"),
+        `${name} in the reviewed diff must disable the Gemini exclusion`);
+    }
+    assert.match((await geminiCase({ state: { rawDiff: ":100644 100644 7898192 6178079 M\tf.txt\n" } })).stdout,
+      geminiExcluded("provider_overloaded"), "an ordinary file change must not disable the Gemini exclusion");
+    for (const path of [".github/workflows/review.yml", ".github/workflow-config.yml"]) {
+      assert.match((await geminiCase({ state: { changedPaths: ["src/a.ts", path] } })).stdout,
+        geminiKept("provider_overloaded"), `a PR that changes ${path} must disable every exclusion`);
+    }
+    assert.match((await geminiCase({ state: { changedPaths: [".github/CODEOWNERS"] } })).stdout,
+      geminiExcluded("provider_overloaded"), "other .github files must not disable the exclusion");
+    assert.match((await geminiCase({ state: { reviewedBaseOid: oldBaseOid } })).stdout,
+      geminiKept("provider_overloaded"), "an unreadable reviewed diff must fail closed");
+    const invalidProviderRun = await run(baseState(), exclusionProbe("ship_gemini_provider_failure abc 1"),
+      { TMPDIR: providerTmp });
+    assert.match(invalidProviderRun.stdout, /^rc=2 reason=provider_failed expected= unavailable=$/m);
     assert.deepEqual(await readdir(providerTmp), [], "provider-error downloads must not leave temporary directories");
 
     // automation v1.83 opencode-auto-review.yml publishes this exact sticky layout.
@@ -5735,18 +5874,17 @@ async function main() {
         ].join("\n"),
       };
     };
-    const opencodeProbe = (runId, attempt) => [
-      `ship_opencode_provider_failure ${runId} ${attempt}`,
-      "printf 'rc=%s reason=%s expected=%s unavailable=%s\\n' \"$?\" \"$SHIP_WORKFLOW_PROVIDER_REASON\" \"${ROUND_EXPECTED_REVIEWERS//$'\\n'/,}\" \"${ROUND_UNAVAILABLE_REVIEWERS//$'\\t'/:}\"",
-    ].join("\n");
+    const opencodeProbe = (runId, attempt) => exclusionProbe(`ship_opencode_provider_failure ${runId} ${attempt}`);
     const opencodeCase = async (comments, expected, message, runId = 9951, attempt = 1) => {
       const result = await run(
         baseState({ issueComments: comments }),
-        `ROUND_EXPECTED_REVIEWERS=$'codex\\nopencode'; export ROUND_EXPECTED_REVIEWERS\n${opencodeProbe(runId, attempt)}`,
+        `${roundPlan("codex\\nopencode")}\n${opencodeProbe(runId, attempt)}`,
       );
       assert.match(result.stdout, expected, message);
     };
-    const opencodeExcluded = /^rc=0 reason=quota_exhausted expected=codex unavailable=opencode:quota_exhausted$/m;
+    const opencodeExcludedAs = (reason) =>
+      new RegExp(`^rc=0 reason=${reason} expected=codex unavailable=opencode:${reason}:9951:1$`, "m");
+    const opencodeExcluded = opencodeExcludedAs("quota_exhausted");
     const opencodeKept = (reason) => new RegExp(`^rc=3 reason=${reason} expected=codex,opencode unavailable=$`, "m");
     await opencodeCase([opencodeSticky()], opencodeExcluded,
       "a quota_exhausted OpenCode failure must leave only this round's expected set");
@@ -5755,10 +5893,24 @@ async function main() {
     await opencodeCase([opencodeSticky({ successfulHead: currentHead, body: "[HIGH] preserved finding for this head" })],
       opencodeKept("provider_failed"),
       "a stale sticky whose preserved verdict is for the merged head must keep opencode required");
-    for (const reason of ["rate_limited", "authentication_failed", "provider_failed"]) {
+    await opencodeCase([opencodeSticky({ successfulHead: oldHead, body: "#### [HIGH] preserved open finding" })],
+      opencodeKept("provider_failed"), "a stale sticky that preserves an open blocker must keep opencode required");
+    await opencodeCase([opencodeSticky({ successfulHead: oldHead, body: "#### [MEDIUM] preserved nit" })],
+      opencodeExcluded, "a preserved finding below --block-on must not keep opencode required");
+    await opencodeCase([opencodeSticky({ reason: "rate_limited" })], opencodeExcludedAs("rate_limited"),
+      "a rate_limited OpenCode failure must leave only this round's expected set");
+    for (const reason of ["provider_failed", "authentication_failed", "duplicate_head", "round_budget_exhausted",
+      "diff_unavailable", "coverage_input_too_large", "workflow_validation_mismatch", "output_grammar_invalid",
+      "anchor_out_of_scope", "canonicalizer_error", "empty_output", "output_truncated"]) {
       await opencodeCase([opencodeSticky({ reason })], opencodeKept(reason),
         `${reason} must stay a blocking OpenCode failure`);
     }
+    const opencodeWorkflowChange = await run(
+      baseState({ issueComments: [opencodeSticky()], changedPaths: [".github/workflows/review.yml"] }),
+      `${roundPlan("codex\\nopencode")}\n${opencodeProbe(9951, 1)}`,
+    );
+    assert.match(opencodeWorkflowChange.stdout, opencodeKept("quota_exhausted"),
+      "a workflow change must disable the OpenCode exclusion too");
     await opencodeCase([opencodeSticky({ runId: 9950 })], opencodeKept("provider_failed"),
       "a sticky for another run must not explain the current run");
     await opencodeCase([opencodeSticky({ attempt: 2 })], opencodeKept("provider_failed"),
@@ -5771,8 +5923,8 @@ async function main() {
       opencodeKept("provider_failed"), "a successful sticky has no failure reason to read");
     await opencodeCase([opencodeSticky({ status: "failure", successfulHead: oldHead })], opencodeKept("provider_failed"),
       "a displayed status that disagrees with successful_head must not be trusted");
-    await opencodeCase([opencodeSticky({ reason: "rate_limited", body: "- Reason: quota_exhausted" })],
-      opencodeKept("rate_limited"), "a Reason look-alike in the display body must not replace the metadata reason");
+    await opencodeCase([opencodeSticky({ reason: "authentication_failed", body: "- Reason: quota_exhausted" })],
+      opencodeKept("authentication_failed"), "a Reason look-alike in the display body must not replace the metadata reason");
     await opencodeCase([opencodeSticky({ failureLines: [
       `- Last attempt: failure (${opencodeRunUrl(9951)})`, "- Reason: quota_exhausted", "- Reason: rate_limited",
     ] })], opencodeKept("provider_failed"), "a duplicated Reason line must not be trusted");
@@ -5807,7 +5959,7 @@ async function main() {
     }
     const unplannedOpencode = await run(
       baseState({ issueComments: [opencodeSticky()] }),
-      `ROUND_EXPECTED_REVIEWERS=codex; export ROUND_EXPECTED_REVIEWERS\n${opencodeProbe(9951, 1)}`,
+      `${roundPlan("codex")}\n${opencodeProbe(9951, 1)}`,
     );
     assert.match(unplannedOpencode.stdout, /^rc=0 reason=quota_exhausted expected=codex unavailable=$/m,
       "an unplanned opencode must not produce a report row");
@@ -5828,10 +5980,18 @@ async function main() {
     assert.deepEqual(collectedWorkflowComments.map((item) => [item.id, item.type]), [[9951, "Bot"], [9960, "Bot"]],
       "the signal snapshot must carry OpenCode v2 and legacy stickies with their author type");
 
+    const workflowRun = (overrides = {}) => ({
+      id: 9901, attempt: 1, name: "Gemini Auto PR Review", head: currentHead, createdAt: requestCreatedAt,
+      status: "completed", conclusion: "failure", ...overrides,
+    });
+    const opencodeRun = workflowRun({ id: 9951, name: "OpenCode Auto PR Review" });
     const opencodeMerge = (reviewers, rows) => runResult(
-      baseState({ prHead: currentHead, issueComments: [opencodeSticky(reviewers.reason ? { reason: reviewers.reason } : {})] }),
+      baseState({
+        prHead: currentHead, runs: [opencodeRun],
+        issueComments: [opencodeSticky(reviewers.reason ? { reason: reviewers.reason } : {})],
+      }),
       [
-        `ROUND_EXPECTED_REVIEWERS=$'${reviewers.expected}'; export ROUND_EXPECTED_REVIEWERS`,
+        roundPlan(reviewers.expected),
         "ship_opencode_provider_failure 9951 1 || true",
         `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request ${rows}`,
       ].join("\n"),
@@ -5840,15 +6000,15 @@ async function main() {
     assert.equal(quotaMerge.code, 0, quotaMerge.stderr);
     assert.equal(quotaMerge.state.prMerged, true,
       "an OpenCode quota_exhausted round must not block a CLEAN codex merge");
-    const rateLimitedMerge = await opencodeMerge(
-      { expected: "codex\\nopencode", reason: "rate_limited" }, "codex=CLEAN opencode=FAILED");
-    assert.notEqual(rateLimitedMerge.code, 0);
-    assert.match(rateLimitedMerge.stderr, /PR reviewer is not ready: opencode=FAILED/);
-    assert.equal(rateLimitedMerge.state.prMerged, false, "rate_limited must keep blocking the merge");
-    const rateLimitedOmitted = await opencodeMerge(
-      { expected: "codex\\nopencode", reason: "rate_limited" }, "codex=CLEAN");
-    assert.match(rateLimitedOmitted.stderr, /missing PR reviewer status: opencode/);
-    assert.equal(rateLimitedOmitted.state.prMerged, false);
+    const authFailedMerge = await opencodeMerge(
+      { expected: "codex\\nopencode", reason: "authentication_failed" }, "codex=CLEAN opencode=FAILED");
+    assert.notEqual(authFailedMerge.code, 0);
+    assert.match(authFailedMerge.stderr, /PR reviewer is not ready: opencode=FAILED/);
+    assert.equal(authFailedMerge.state.prMerged, false, "authentication_failed must keep blocking the merge");
+    const authFailedOmitted = await opencodeMerge(
+      { expected: "codex\\nopencode", reason: "authentication_failed" }, "codex=CLEAN");
+    assert.match(authFailedOmitted.stderr, /missing PR reviewer status: opencode/);
+    assert.equal(authFailedOmitted.state.prMerged, false);
     const opencodeOnlyMerge = await opencodeMerge({ expected: "opencode" }, "");
     assert.notEqual(opencodeOnlyMerge.code, 0);
     assert.match(opencodeOnlyMerge.stderr, /no eligible PR reviewer was planned/);
@@ -5873,6 +6033,163 @@ async function main() {
       "the quota exclusion must last one round and leave the preflighted workflow list intact");
     assert.match(prText, /```bash\nROUND_UNAVAILABLE_REVIEWERS=''\nexport ROUND_UNAVAILABLE_REVIEWERS\ncase "\$EFFECTIVE_REVIEW_POLICY" in/,
       "each round must clear the report-only OpenCode quota row before selecting reviewers");
+
+    // #200: one allowlist decides every exclusion, and only clear execution failures are on it.
+    const allowlistCases = [
+      ["gemini", "provider_overloaded", true], ["gemini", "provider_quota_exhausted", true],
+      ["gemini", "provider_timeout", true], ["opencode", "quota_exhausted", true], ["opencode", "rate_limited", true],
+      ["claude", "provider_failure", false], ["claude", "quota_exhausted", false], ["claude", "rate_limited", false],
+      ["gemini", "provider_failed", false], ["opencode", "provider_failed", false],
+      ["gemini", "quota_exhausted", false], ["gemini", "rate_limited", false], ["codex", "quota_exhausted", false],
+      ...["authentication_failed", "duplicate_head", "duplicate_effective_diff", "round_budget_exhausted",
+        "input_budget_exhausted", "total_usage_budget_exhausted", "diff_unavailable", "coverage_input_too_large",
+        "workflow_validation_mismatch", "output_grammar_invalid", "anchor_out_of_scope", "canonicalizer_error",
+        "empty_output", "output_truncated"].flatMap((reason) =>
+        ["claude", "gemini", "opencode"].map((reviewer) => [reviewer, reason, false])),
+    ];
+    const allowlist = await run(baseState(), allowlistCases.map(([reviewer, reason]) =>
+      `if jhw_pr_unavailable_reason_allowed ${reviewer} ${reason}; then echo ${reviewer}:${reason}=allowed; else echo ${reviewer}:${reason}=blocked; fi`,
+    ).join("\n"));
+    assert.equal(allowlist.stdout,
+      allowlistCases.map(([reviewer, reason, allowed]) => `${reviewer}:${reason}=${allowed ? "allowed" : "blocked"}\n`).join(""),
+      "catch-all, authentication, budget, author-inducible and output-validation reasons must never be allowlisted");
+    for (const status of ["PENDING", "TIMEOUT", "TRIGGER_FAILED", "FAILED"]) {
+      const notReady = await runResult(
+        baseState({ prHead: currentHead }),
+        `${roundPlan("codex\\ngemini")}\njhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN gemini=${status}`,
+      );
+      assert.match(notReady.stderr, new RegExp(`PR reviewer is not ready: gemini=${status}`));
+      assert.equal(notReady.state.prMerged, false, `${status} must never be excluded from the merge gate`);
+    }
+
+    const exclusionMarker = "<!-- jhw-pr:review-exclusion ";
+    const exclusionComments = (result) =>
+      result.state.issueComments.filter((item) => (item.body || "").includes(exclusionMarker));
+    const exclusionMerge = ({ expected = "codex\\ngemini", runs = [workflowRun()], before = "", rows = "codex=CLEAN", state = {} } = {}) =>
+      runResult(
+        baseState({
+          prHead: currentHead, runs, issueComments: [geminiSticky()],
+          providerErrorArtifacts: geminiArtifacts(geminiErrors.provider_overloaded), ...state,
+        }),
+        [
+          roundPlan(expected),
+          "ship_gemini_provider_failure 9901 1 || true",
+          before,
+          `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request ${rows}`,
+        ].join("\n"),
+        { TMPDIR: providerTmp },
+      );
+    const geminiMerge = await exclusionMerge();
+    assert.equal(geminiMerge.code, 0, geminiMerge.stderr);
+    assert.equal(geminiMerge.state.prMerged, true, "an allowlisted Gemini failure must not block a CLEAN codex merge");
+    assert.deepEqual(exclusionComments(geminiMerge).map((item) => item.body), [[
+      `AI review gate for \`${currentHead}\` excluded reviewers whose review could not run:`,
+      "- `gemini`: `provider_overloaded`",
+      "",
+      `${exclusionMarker}head=${currentHead} excluded=gemini:provider_overloaded -->`,
+    ].join("\n")], "the merge must leave one head-bound comment with reviewer and reason codes only");
+    const newerSkippedRun = await exclusionMerge({ runs: [workflowRun(), workflowRun({ id: 9902, conclusion: "skipped" })] });
+    assert.equal(newerSkippedRun.code, 0, newerSkippedRun.stderr);
+    assert.equal(newerSkippedRun.state.prMerged, true,
+      "a newer run that skipped its review job (a non-request label event) must not block the exclusion");
+    assert.ok(geminiMerge.log.some((args) =>
+      args[0] === "api" && args[1] === "repos/example/repo/actions/runs?event=workflow_dispatch&per_page=100"),
+    "the exclusion re-check must list force-review dispatch runs, which carry the dispatched ref's SHA");
+    const dispatchRun = (overrides = {}) => workflowRun({ head: currentBaseOid, event: "workflow_dispatch", ...overrides });
+    const harmlessDispatch = await exclusionMerge({
+      runs: [dispatchRun({ id: 9800 }), workflowRun(), dispatchRun({ id: 9903, conclusion: "skipped" }),
+        dispatchRun({ id: 9904, name: "Claude Code Review", status: "in_progress", conclusion: "null" })],
+    });
+    assert.equal(harmlessDispatch.code, 0, harmlessDispatch.stderr);
+    assert.equal(harmlessDispatch.state.prMerged, true,
+      "an older finished, a skipped or another workflow's dispatch run must not block the exclusion");
+    const allExcluded = await exclusionMerge({ expected: "gemini", rows: "" });
+    assert.match(allExcluded.stderr, /no eligible PR reviewer was planned/);
+    assert.equal(allExcluded.state.prMerged, false, "excluding every planned reviewer must refuse the merge");
+    for (const [name, options, message] of [
+      ["a tampered expected set", { before: "ROUND_EXPECTED_REVIEWERS=codex; ROUND_UNAVAILABLE_REVIEWERS=''", runs: [] },
+        /planned PR reviewers are not the expected plus excluded reviewers/],
+      ["an excluded reviewer that is still expected", { before: "ROUND_EXPECTED_REVIEWERS=$'codex\\ngemini'",
+        rows: "codex=CLEAN gemini=CLEAN" }, /both expected and excluded/],
+      ["a missing planned set", { before: "unset ROUND_PLANNED_REVIEWERS" }, /round reviewer plan is missing/],
+      ["a non-allowlisted exclusion row", { before: "ROUND_UNAVAILABLE_REVIEWERS=$'gemini\\tprovider_failed\\t9901\\t1'" },
+        /exclusion is not allowlisted: gemini/],
+      ["a newer run for the head", { runs: [workflowRun(), workflowRun({ id: 9902 })] }, /newer or unfinished/],
+      ["a newer run still in progress", { runs: [workflowRun(), workflowRun({ id: 9902, status: "in_progress", conclusion: "null" })] },
+        /newer or unfinished/],
+      ["an unfinished run for the head", { runs: [workflowRun({ id: 9900, status: "in_progress", conclusion: "null" }), workflowRun()] },
+        /newer or unfinished/],
+      ["a newer attempt of the excluded run", { runs: [workflowRun({ attempt: 2 })] }, /newer or unfinished/],
+      ["an excluded run missing from the head", { runs: [workflowRun({ head: oldHead })] }, /not on the reviewed head/],
+      ["a newer force-review dispatch", { runs: [workflowRun(), workflowRun({ id: 9902, head: currentBaseOid, event: "workflow_dispatch" })] },
+        /newer or unfinished Gemini Auto PR Review dispatch run exists/],
+      ["an older force-review dispatch still running", {
+        runs: [workflowRun({ id: 9800, head: currentBaseOid, event: "workflow_dispatch", status: "in_progress", conclusion: "null" }),
+          workflowRun()],
+      }, /newer or unfinished Gemini Auto PR Review dispatch run exists/],
+    ]) {
+      const refused = await exclusionMerge(options);
+      assert.notEqual(refused.code, 0, `${name} must refuse the merge`);
+      assert.match(refused.stderr, message, name);
+      assert.equal(refused.state.prMerged, false, `${name} must refuse the merge`);
+    }
+    const failedExclusionPost = await exclusionMerge({ state: { failPost: true } });
+    assert.match(failedExclusionPost.stderr, /reviewer exclusion comment could not be posted/);
+    assert.equal(failedExclusionPost.state.prMerged, false, "a failed exclusion comment must block the merge");
+    assert.equal(failedExclusionPost.log.some((args) => args[0] === "git" && args[1] === "push"), false);
+    const postTwice = await run(baseState(), [
+      "ROUND_UNAVAILABLE_REVIEWERS=$'gemini\\tprovider_overloaded\\t9901\\t1'; export ROUND_UNAVAILABLE_REVIEWERS",
+      `jhw_pr_post_exclusion_comment 42 ${currentHead}`,
+      `jhw_pr_post_exclusion_comment 42 ${currentHead}`,
+      `jhw_pr_post_exclusion_comment 42 ${oldHead}`,
+    ].join("\n"));
+    assert.deepEqual(exclusionComments(postTwice).map((item) => item.body.split("\n").at(-1)), [
+      `${exclusionMarker}head=${currentHead} excluded=gemini:provider_overloaded -->`,
+      `${exclusionMarker}head=${oldHead} excluded=gemini:provider_overloaded -->`,
+    ], "the exclusion comment must be posted once per head");
+
+    const twoExcluded = await runResult(
+      baseState({
+        prHead: currentHead, runs: [workflowRun(), opencodeRun], issueComments: [geminiSticky(), opencodeSticky()],
+        providerErrorArtifacts: geminiArtifacts(geminiErrors.provider_overloaded),
+      }),
+      [
+        roundPlan("codex\\ngemini\\nopencode"),
+        "ship_gemini_provider_failure 9901 1",
+        "ship_opencode_provider_failure 9951 1",
+        "printf 'unavailable=%s\\n' \"${ROUND_UNAVAILABLE_REVIEWERS//$'\\t'/:}\"",
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=CLEAN`,
+      ].join("\n"),
+      { TMPDIR: providerTmp },
+    );
+    assert.equal(twoExcluded.code, 0, twoExcluded.stderr);
+    assert.match(twoExcluded.stdout, /^unavailable=gemini:provider_overloaded:9901:1\nopencode:quota_exhausted:9951:1$/m,
+      "a second exclusion must append its row, not overwrite the first");
+    assert.equal(twoExcluded.state.prMerged, true);
+    assert.match(exclusionComments(twoExcluded)[0]?.body ?? "",
+      /- `gemini`: `provider_overloaded`\n- `opencode`: `quota_exhausted`\n\n<!-- jhw-pr:review-exclusion head=a{40} excluded=gemini:provider_overloaded,opencode:quota_exhausted -->$/);
+    assert.doesNotMatch(exclusionComments(twoExcluded)[0].body, /high demand|503|automation-state/,
+      "the public comment must not carry provider text");
+
+    const geminiNextRound = await run(
+      baseState({ issueComments: [geminiSticky()], providerErrorArtifacts: geminiArtifacts(geminiErrors.provider_overloaded) }),
+      [
+        "JHW_PR_AVAILABLE_WORKFLOWS=gemini-auto-review.yml; JHW_PR_ELIGIBLE_APPS=codex",
+        "export JHW_PR_AVAILABLE_WORKFLOWS JHW_PR_ELIGIBLE_APPS",
+        'ROUND_EXPECTED_REVIEWERS="$(jhw_pr_select_expected_reviewers)" || exit $?; export ROUND_EXPECTED_REVIEWERS',
+        "ship_gemini_provider_failure 9901 1",
+        "printf 'excluded=%s\\n' \"${ROUND_EXPECTED_REVIEWERS//$'\\n'/,}\"",
+        'ROUND_EXPECTED_REVIEWERS="$(jhw_pr_select_expected_reviewers)" || exit $?',
+        "printf 'next=%s\\n' \"${ROUND_EXPECTED_REVIEWERS//$'\\n'/,}\"",
+      ].join("\n"),
+      { TMPDIR: providerTmp },
+    );
+    assert.equal(geminiNextRound.stdout, "excluded=codex\nnext=gemini,codex\n",
+      "a Gemini exclusion must last one round");
+    assert.match(prText, /\nesac\n# Exclusion edits ROUND_EXPECTED_REVIEWERS only; the merge helper checks it against this copy\.\nROUND_PLANNED_REVIEWERS="\$ROUND_EXPECTED_REVIEWERS"\nexport ROUND_PLANNED_REVIEWERS\n/,
+      "each round must keep its planned reviewers before any exclusion");
+    assert.match(prText, /표시 사유\([^)]*\)와 무관하게 `ship_gemini_provider_failure <run_id> <run_attempt>`를 호출한다/,
+      "Gemini failures must be classified whatever reason the sticky displays");
 
     console.log("pr skill contract: ok");
   } finally {
