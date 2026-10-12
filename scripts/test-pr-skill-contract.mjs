@@ -747,15 +747,25 @@ if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
 if (endpoint.includes("/actions/runs?")) {
   const queryIndex = argv.indexOf("--jq");
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
+  // This fake emits a fixed field order, so pin the unit-separated queries whose order the skill parses.
   if (endpoint.includes("event=workflow_dispatch")) {
-    // This fake emits a fixed field order, so pin the query whose order the skill parses.
-    if (query !== '.workflow_runs[] | [.id, .name, .status, (.conclusion // "null"), .event] | @tsv') {
+    if (query !== '.workflow_runs[] | [(.id | tostring), .name, (.status // "null"), (.conclusion // "null"), .event] | join("\\u001f")') {
       process.stderr.write("unexpected dispatch run query: " + query + "\n");
       process.exit(2);
     }
     rows(state.runs.filter((item) => item.event === "workflow_dispatch").map((item) =>
-      [item.id, item.name, item.status, item.conclusion, item.event].join("\t")));
+      [item.id, item.name, item.status, item.conclusion, item.event].join("\x1f")));
     process.exit(0);
+  }
+  if (query === '.workflow_runs[] | [(.id | tostring), (.run_attempt | tostring), .name, .head_sha, .created_at, (.status // "null"), (.conclusion // "null"), .event] | join("\\u001f")') {
+    // Like the other run queries, every run is returned so the skill's own head filter stays tested.
+    rows(state.runs.map((item) => [item.id, item.attempt, item.name,
+      item.head, item.createdAt, item.status, item.conclusion, item.event || "pull_request"].join("\x1f")));
+    process.exit(0);
+  }
+  if (query.includes("u001f")) {
+    process.stderr.write("unexpected unit-separated run query: " + query + "\n");
+    process.exit(2);
   }
   rows(state.runs.map((item) => {
     const fields = [item.id, item.attempt];
@@ -6095,6 +6105,12 @@ async function main() {
     assert.ok(geminiMerge.log.some((args) =>
       args[0] === "api" && args[1] === "repos/example/repo/actions/runs?event=workflow_dispatch&per_page=100"),
     "the exclusion re-check must list force-review dispatch runs, which carry the dispatched ref's SHA");
+    for (const endpoint of [`repos/example/repo/actions/runs?head_sha=${currentHead}&per_page=100`,
+      "repos/example/repo/actions/runs?event=workflow_dispatch&per_page=100"]) {
+      const calls = geminiMerge.log.filter((args) => args[0] === "api" && args[1] === endpoint);
+      assert.ok(calls.length > 0 && calls.every((args) => args.includes("--paginate")),
+        `the exclusion re-check must read every page of ${endpoint}`);
+    }
     const dispatchRun = (overrides = {}) => workflowRun({ head: currentBaseOid, event: "workflow_dispatch", ...overrides });
     const harmlessDispatch = await exclusionMerge({
       runs: [dispatchRun({ id: 9800 }), workflowRun(), dispatchRun({ id: 9903, conclusion: "skipped" }),
@@ -6103,6 +6119,13 @@ async function main() {
     assert.equal(harmlessDispatch.code, 0, harmlessDispatch.stderr);
     assert.equal(harmlessDispatch.state.prMerged, true,
       "an older finished, a skipped or another workflow's dispatch run must not block the exclusion");
+    const unrelatedMalformed = await exclusionMerge({
+      runs: [workflowRun(), workflowRun({ id: 9906, name: "Skills Sync", status: "" }),
+        dispatchRun({ id: 9905, name: "Claude Code Review", status: "" })],
+    });
+    assert.equal(unrelatedMalformed.code, 0, unrelatedMalformed.stderr);
+    assert.equal(unrelatedMalformed.state.prMerged, true,
+      "a malformed row of another workflow must not block the exclusion");
     const allExcluded = await exclusionMerge({ expected: "gemini", rows: "" });
     assert.match(allExcluded.stderr, /no eligible PR reviewer was planned/);
     assert.equal(allExcluded.state.prMerged, false, "excluding every planned reviewer must refuse the merge");
@@ -6128,6 +6151,24 @@ async function main() {
           workflowRun()],
       }, /newer or unfinished Gemini Auto PR Review dispatch run exists/],
     ]) {
+      const refused = await exclusionMerge(options);
+      assert.notEqual(refused.code, 0, `${name} must refuse the merge`);
+      assert.match(refused.stderr, message, name);
+      assert.equal(refused.state.prMerged, false, `${name} must refuse the merge`);
+    }
+    // #205: an empty field must not shift the columns of a run row, and every refusal must name its cause.
+    const hardeningCases = [
+      ["a force-review dispatch with an empty status",
+        { runs: [workflowRun(), workflowRun({ id: 9902, head: currentBaseOid, event: "workflow_dispatch", status: "" })] },
+        /malformed Gemini Auto PR Review run row \(run 9902\) is in the workflow_dispatch listing/],
+      ["a head run with a non-numeric id", { runs: [workflowRun(), workflowRun({ id: "abc" })] },
+        /malformed Gemini Auto PR Review run row is in the reviewed head listing/],
+      ["a failed head run listing", { state: { failEndpoints: ["/actions/runs?head_sha="] } },
+        /the reviewed head's workflow runs could not be listed/],
+      ["a failed dispatch run listing", { state: { failEndpoints: ["event=workflow_dispatch"] } },
+        /the workflow_dispatch runs could not be listed/],
+    ];
+    for (const [name, options, message] of hardeningCases) {
       const refused = await exclusionMerge(options);
       assert.notEqual(refused.code, 0, `${name} must refuse the merge`);
       assert.match(refused.stderr, message, name);
