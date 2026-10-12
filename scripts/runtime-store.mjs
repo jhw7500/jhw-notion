@@ -332,6 +332,15 @@ function sourceIdentity(root) {
   if (git(root, ['rev-parse', '--show-toplevel']) !== root.name) fail('DEPLOY_SOURCE_INVALID');
   const sourceRevision = git(root, ['rev-parse', '--verify', 'HEAD']);
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sourceRevision)) fail('DEPLOY_SOURCE_INVALID');
+  // status never lists ignored files, yet the source walk would copy them. Exclude
+  // pathspecs are not combined with --ignored (git then lists ignored nested
+  // repositories outside the inputs), so the walk's own rules filter the result.
+  // git does not list an ignored directory that is empty or holds only excluded
+  // names; the walk still copies it as an empty directory.
+  const ignored = git(root, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', ...SOURCE_INPUTS])
+    .split('\0').filter(name => name && allowedSource(name.replace(/\/$/, '')) &&
+      !name.split('/').some(part => EXCLUDED_SOURCE_NAMES.includes(part)));
+  if (ignored.length) throw new DeploymentError('DEPLOY_SOURCE_INVALID', 'ignored_source_files');
   const exclusions = EXCLUDED_SOURCE_NAMES.flatMap(name => [
     `:(glob,exclude)**/${name}`, `:(glob,exclude)**/${name}/**`,
   ]);
