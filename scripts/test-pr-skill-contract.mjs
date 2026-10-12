@@ -747,6 +747,16 @@ if (/\/pulls\/\d+\/comments\?per_page=100$/.test(endpoint)) {
 if (endpoint.includes("/actions/runs?")) {
   const queryIndex = argv.indexOf("--jq");
   const query = queryIndex >= 0 ? argv[queryIndex + 1] : "";
+  if (endpoint.includes("event=workflow_dispatch")) {
+    // This fake emits a fixed field order, so pin the query whose order the skill parses.
+    if (query !== '.workflow_runs[] | [.id, .name, .status, (.conclusion // "null"), .event] | @tsv') {
+      process.stderr.write("unexpected dispatch run query: " + query + "\n");
+      process.exit(2);
+    }
+    rows(state.runs.filter((item) => item.event === "workflow_dispatch").map((item) =>
+      [item.id, item.name, item.status, item.conclusion, item.event].join("\t")));
+    process.exit(0);
+  }
   rows(state.runs.map((item) => {
     const fields = [item.id, item.attempt];
     if (query.includes(".run_number")) fields.push(item.runNumber ?? item.id);
@@ -6082,6 +6092,17 @@ async function main() {
     assert.equal(newerSkippedRun.code, 0, newerSkippedRun.stderr);
     assert.equal(newerSkippedRun.state.prMerged, true,
       "a newer run that skipped its review job (a non-request label event) must not block the exclusion");
+    assert.ok(geminiMerge.log.some((args) =>
+      args[0] === "api" && args[1] === "repos/example/repo/actions/runs?event=workflow_dispatch&per_page=100"),
+    "the exclusion re-check must list force-review dispatch runs, which carry the dispatched ref's SHA");
+    const dispatchRun = (overrides = {}) => workflowRun({ head: currentBaseOid, event: "workflow_dispatch", ...overrides });
+    const harmlessDispatch = await exclusionMerge({
+      runs: [dispatchRun({ id: 9800 }), workflowRun(), dispatchRun({ id: 9903, conclusion: "skipped" }),
+        dispatchRun({ id: 9904, name: "Claude Code Review", status: "in_progress", conclusion: "null" })],
+    });
+    assert.equal(harmlessDispatch.code, 0, harmlessDispatch.stderr);
+    assert.equal(harmlessDispatch.state.prMerged, true,
+      "an older finished, a skipped or another workflow's dispatch run must not block the exclusion");
     const allExcluded = await exclusionMerge({ expected: "gemini", rows: "" });
     assert.match(allExcluded.stderr, /no eligible PR reviewer was planned/);
     assert.equal(allExcluded.state.prMerged, false, "excluding every planned reviewer must refuse the merge");
@@ -6100,6 +6121,12 @@ async function main() {
         /newer or unfinished/],
       ["a newer attempt of the excluded run", { runs: [workflowRun({ attempt: 2 })] }, /newer or unfinished/],
       ["an excluded run missing from the head", { runs: [workflowRun({ head: oldHead })] }, /not on the reviewed head/],
+      ["a newer force-review dispatch", { runs: [workflowRun(), workflowRun({ id: 9902, head: currentBaseOid, event: "workflow_dispatch" })] },
+        /newer or unfinished Gemini Auto PR Review dispatch run exists/],
+      ["an older force-review dispatch still running", {
+        runs: [workflowRun({ id: 9800, head: currentBaseOid, event: "workflow_dispatch", status: "in_progress", conclusion: "null" }),
+          workflowRun()],
+      }, /newer or unfinished Gemini Auto PR Review dispatch run exists/],
     ]) {
       const refused = await exclusionMerge(options);
       assert.notEqual(refused.code, 0, `${name} must refuse the merge`);
