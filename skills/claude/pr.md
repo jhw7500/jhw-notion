@@ -545,14 +545,18 @@ jhw_pr_unavailable_reason_allowed() {
 jhw_pr_validate_round_exclusions() {
   local head="$1" planned="${ROUND_PLANNED_REVIEWERS:-}" covered="${ROUND_EXPECTED_REVIEWERS:-}"
   local reviewer reason run_id run_attempt extra name raw='' dispatched='' found
-  local id attempt run_name run_head created_at status conclusion event
+  local id attempt run_name run_head created_at status conclusion event rid
+  local run_statuses='^(completed|in_progress|queued|waiting|requested|pending)$'
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
   [[ -n "$planned" ]] || { echo "the round reviewer plan is missing" >&2; return 1; }
   if [[ -n "${ROUND_UNAVAILABLE_REVIEWERS:-}" ]]; then
+    # Unit-separated, not @tsv: bash collapses consecutive tab delimiters, so an empty field shifts columns.
     raw="$(gh api "repos/$REPO_NWO/actions/runs?head_sha=$head&per_page=100" --paginate \
-      --jq '.workflow_runs[] | [.id, .run_attempt, .name, .head_sha, .created_at, .status, (.conclusion // "null"), .event] | @tsv' 2>/dev/null)" || return 1
+      --jq '.workflow_runs[] | [(.id | tostring), (.run_attempt | tostring), .name, .head_sha, .created_at, (.status // "null"), (.conclusion // "null"), .event] | join("\u001f")' 2>/dev/null)" ||
+      { echo "the reviewed head's workflow runs could not be listed" >&2; return 1; }
     dispatched="$(gh api "repos/$REPO_NWO/actions/runs?event=workflow_dispatch&per_page=100" --paginate \
-      --jq '.workflow_runs[] | [.id, .name, .status, (.conclusion // "null"), .event] | @tsv' 2>/dev/null)" || return 1
+      --jq '.workflow_runs[] | [(.id | tostring), .name, (.status // "null"), (.conclusion // "null"), .event] | join("\u001f")' 2>/dev/null)" ||
+      { echo "the workflow_dispatch runs could not be listed" >&2; return 1; }
   fi
   while IFS=$'\t' read -r reviewer reason run_id run_attempt extra; do
     [[ -n "$reviewer$reason$run_id$run_attempt$extra" ]] || continue
@@ -573,9 +577,16 @@ jhw_pr_validate_round_exclusions() {
     esac
     # The excluded run must still be the latest finished attempt of that workflow for this head.
     found=0
-    while IFS=$'\t' read -r id attempt run_name run_head created_at status conclusion event extra; do
+    while IFS=$'\x1f' read -r id attempt run_name run_head created_at status conclusion event extra; do
+      [[ -n "$id$attempt$run_name$run_head$created_at$status$conclusion$event$extra" ]] || continue
+      # Only this workflow's rows on this head are judged; the numeric ids before the name keep its column fixed.
       [[ "$run_name" == "$name" && "$run_head" == "$head" ]] || continue
-      [[ "$id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || return 1
+      if [[ ! "$id" =~ ^[1-9][0-9]*$ || ! "$attempt" =~ ^[1-9][0-9]*$ || ! "$status" =~ $run_statuses ||
+        -z "$event" || -n "$extra" ]]; then
+        rid="${id//[^0-9]/}"
+        echo "a malformed $name run row${rid:+ (run $rid)} is in the reviewed head listing" >&2
+        return 1
+      fi
       # The caller runs on every labeled event and skips its job when the label is not a review
       # request; such a run reviewed nothing.
       if (( id != run_id )) && [[ "$status" == completed && "$conclusion" == skipped ]]; then continue; fi
@@ -589,13 +600,20 @@ jhw_pr_validate_round_exclusions() {
     (( found == 1 )) || { echo "the excluded $name run is not on the reviewed head" >&2; return 1; }
     # A force-review dispatch reviews the PR head but carries the dispatched ref's SHA, so the head
     # listing cannot show it. Dispatch runs do not name their PR, so any newer or unfinished one refuses.
-    while IFS=$'\t' read -r id run_name status conclusion event extra; do
-      [[ "$run_name" == "$name" && "$event" == workflow_dispatch ]] || continue
-      [[ "$id" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || return 1
+    while IFS=$'\x1f' read -r id run_name status conclusion event extra; do
+      [[ -n "$id$run_name$status$conclusion$event$extra" ]] || continue
+      # Only this workflow's rows are judged. The event is checked after validation so a null event still refuses.
+      [[ "$run_name" == "$name" ]] || continue
+      if [[ ! "$id" =~ ^[1-9][0-9]*$ || ! "$status" =~ $run_statuses || -z "$event" || -n "$extra" ]]; then
+        rid="${id//[^0-9]/}"
+        echo "a malformed $name run row${rid:+ (run $rid)} is in the workflow_dispatch listing" >&2
+        return 1
+      fi
+      [[ "$event" == workflow_dispatch ]] || continue
       # force_review=false skips the caller job, so that dispatch reviewed nothing.
       if (( id != run_id )) && [[ "$status" == completed && "$conclusion" == skipped ]]; then continue; fi
       if [[ "$status" != completed ]] || (( id > run_id )); then
-        echo "a newer or unfinished $name dispatch run exists" >&2
+        echo "a newer or unfinished $name dispatch run exists; dispatch runs do not name their PR, so it may be another PR's dispatch (recover with a commit that changes the diff, by waiting if it is an older dispatch that has not finished, or with a manual merge decision)" >&2
         return 1
       fi
     done <<<"$dispatched"
@@ -1988,7 +2006,7 @@ jhw_pr_apply_existing_pr_policy() {
    - 앱/봇 리뷰어: 매 간격 `reviews`/`comments`/`issue-comments`/`reactions` 수집
 5. **분류** — 리뷰어별 `PENDING / CLEAN / FEEDBACK / FAILED / TRIGGER_FAILED` 판정. **CLEAN = 열린 블로킹 지적 0건**(블로킹 미만 nit은 보고만), **FEEDBACK = 열린 블로킹 지적 ≥1** (심각도 라벨로 판정 — "심각도 게이트" 참조). `TRIGGER_FAILED`는 리뷰가 시작되지 않은 상태이고, 시작 후 무응답인 `TIMEOUT`과 구분한다. planned reviewer별 terminal 상태를 `ROUND_REVIEW_STATUSES` 배열에 정확히 하나의 `<reviewer>=<STATUS>` 행으로 보존하고 `ROUND_EXPECTED_REVIEWERS`와 이름까지 대조한다. reviewer가 하나도 계획되지 않았으면 빈 배열을 임의의 `CLEAN`으로 바꾸지 않는다.
 6. **(--auto-fix & FEEDBACK)** — `ship_auto_fix_push_ready`가 성공하는 경우, 즉 **모든 expected 리뷰어가 CLEAN/FEEDBACK으로 terminal에 도달하고 FEEDBACK이 하나 이상일 때만** 블로킹 지적을 고쳐 커밋한다. 커밋 뒤 **push 전에** `ROUND_HEAD="$(git rev-parse HEAD)"`와 workflow run-ID floor를 캡처하고, 직후 `ROUND_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`를 잡아 재푸시한다. 성공 직후 `ROUND_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"`, `SHA="$ROUND_HEAD"`, `ROUND_BASE_OID="$(gh pr view "$PR" --repo "$REPO_NWO" --json baseRefOid -q .baseRefOid)"`를 확정한 뒤 아래 라운드 계약을 실행하고 4로 복귀한다. `ROUND_STARTED_AT`은 run 필터 경계이고, ID floor가 같은 초의 이전 run을 분리하며, 180초 생성 유예는 느린 push 시간을 제외하도록 `ROUND_PUSHED_AT`부터 잰다. PENDING뿐 아니라 FAILED/TRIGGER_FAILED/TIMEOUT이 하나라도 있으면 다음 push를 금지하고 보고한다. **수렴 판정**: 한 라운드에서 **새 블로킹 지적이 없으면**(nit만이거나 모두 resolved/declined) → 전원 CLEAN 간주, 루프 종료(7로). `--max-rounds`(기본 5) 도달했는데 블로킹이 남으면 머지 안 하고 보고.
-7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head/base OID 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" "$ROUND_BASE_OID" <merge> "$EFFECTIVE_REVIEW_POLICY" "${ROUND_REVIEW_STATUSES[@]}"`. 이 helper는 review-on policy에서 상태가 0개인 vacuous CLEAN을 거부하고 모든 상태가 `CLEAN`인지 확인한 뒤, `jhw_pr_validate_round_exclusions`로 #200 제외를 다시 검사한다: 라운드 계획 때 잡은 `ROUND_PLANNED_REVIEWERS`가 없으면 거부하고, 그것이 남은 `ROUND_EXPECTED_REVIEWERS`와 `ROUND_UNAVAILABLE_REVIEWERS` 제외 리뷰어의 합과 정확히 같고 둘이 겹치지 않으며, 모든 제외 사유가 허용 목록에 있고, 제외된 run이 reviewed head에서 그 workflow의 가장 새로운 완료 run/attempt(더 새롭거나 진행 중인 run 없음 — `review:request`가 아닌 라벨 이벤트로 job이 건너뛰어진 `skipped` run만 무시)여야 한다. force-review `workflow_dispatch` run은 같은 PR head를 리뷰해도 dispatch한 ref의 SHA를 달아 head 목록에 나오지 않고 대상 PR도 드러내지 않으므로, 그 workflow의 dispatch run이 제외된 run보다 새롭거나 끝나지 않았으면 다른 PR 것이라도 거부한다(`skipped` dispatch만 무시). 그다음 base OID를 즉시 재검증한다. 제외가 있으면 push 직전에 `jhw_pr_post_exclusion_comment`가 head별 제외 코멘트를 남기며, 게시(또는 중복 확인)에 실패하면 머지하지 않는다. native GitHub 정책을 우회하지 않도록 classic protection이 꺼져 있고 적용 active rule이 0개이며 repository가 merge commit을 허용한다는 세 조건을 권위 있게 확인하지 못하면 중단한다. 허용된 direct merge는 GitHub의 `refs/pull/<PR>/merge`가 정확한 reviewed base/head 두 부모를 갖는지 확인한 뒤, base와 동일 저장소 head를 그 merge commit으로 전진시키는 단일 `git push --atomic`에 명시적 두 ref lease를 건다. base 또는 head가 그 사이 바뀌면 어느 ref도 갱신하지 않는다. GitHub는 직접 push만으로 PR을 병합 처리한다고 보장하지 않으므로, push 뒤 GitHub가 해당 commit으로 PR을 `MERGED` 처리했는지 3초 간격 최대 10회 확인한다. 확인된 경우에만 완료로 보고하고 별도 exact lease로 head를 삭제하며, 삭제만 실패하면 완료 보고를 유지하되 branch를 안전하게 남긴다. 끝내 확인되지 않으면(상태 조회 실패·`MERGED` 미기록·다른 merge commit) helper는 **rc 4**로 끝나고 `JHW_PR_MERGE_COMMIT`에 base에 이미 반영된 commit을 남긴다. 이때 머지를 완료로 보고하지 않고, 재머지·재push·head 삭제·PR close/reopen을 하지 않는다. 대신 PR URL, base ref, merge commit SHA, 마지막 GitHub 상태를 보고하고 운영자에게 인계한다. 인계는 사실 보고까지이며, GitHub의 병합 기록 복구는 약속하지 않는다. 보호/ruleset-managed base, squash/rebase와 cross-repository PR은 자동 머지하지 않는다.
+7. **머지 게이트** — `--merge` AND **required CI 성공** AND **현재 head/base OID 불변** AND **전원 `CLEAN`(블로킹 0)** AND (타겟 미요청 또는 타겟 `PASS`) AND mergeable/supported method → `jhw_pr_merge_reviewed_head "$PR" "$ROUND_HEAD" "$ROUND_BASE_OID" <merge> "$EFFECTIVE_REVIEW_POLICY" "${ROUND_REVIEW_STATUSES[@]}"`. 이 helper는 review-on policy에서 상태가 0개인 vacuous CLEAN을 거부하고 모든 상태가 `CLEAN`인지 확인한 뒤, `jhw_pr_validate_round_exclusions`로 #200 제외를 다시 검사한다: 라운드 계획 때 잡은 `ROUND_PLANNED_REVIEWERS`가 없으면 거부하고, 그것이 남은 `ROUND_EXPECTED_REVIEWERS`와 `ROUND_UNAVAILABLE_REVIEWERS` 제외 리뷰어의 합과 정확히 같고 둘이 겹치지 않으며, 모든 제외 사유가 허용 목록에 있고, 제외된 run이 reviewed head에서 그 workflow의 가장 새로운 완료 run/attempt(더 새롭거나 진행 중인 run 없음 — `review:request`가 아닌 라벨 이벤트로 job이 건너뛰어진 `skipped` run만 무시)여야 한다. force-review `workflow_dispatch` run은 같은 PR head를 리뷰해도 dispatch한 ref의 SHA를 달아 head 목록에 나오지 않고 대상 PR도 드러내지 않으므로, 그 workflow의 dispatch run이 제외된 run보다 새롭거나 끝나지 않았으면 다른 PR 것이라도 거부한다(`skipped` dispatch만 무시). 두 run 목록은 빈 필드가 열을 밀지 않도록 단위 구분자로 읽고, 제외된 reviewer의 workflow 행만 판정한다. 그 행의 id·attempt가 양의 정수가 아니거나, `status`가 GitHub run 상태(`completed`·`in_progress`·`queued`·`waiting`·`requested`·`pending`)가 아니거나(빈 값·null 포함), `event`가 비었거나, 필드가 남으면 목록 조회 실패와 마찬가지로 사유를 출력하고 거부한다. 그다음 base OID를 즉시 재검증한다. 제외가 있으면 push 직전에 `jhw_pr_post_exclusion_comment`가 head별 제외 코멘트를 남기며, 게시(또는 중복 확인)에 실패하면 머지하지 않는다. native GitHub 정책을 우회하지 않도록 classic protection이 꺼져 있고 적용 active rule이 0개이며 repository가 merge commit을 허용한다는 세 조건을 권위 있게 확인하지 못하면 중단한다. 허용된 direct merge는 GitHub의 `refs/pull/<PR>/merge`가 정확한 reviewed base/head 두 부모를 갖는지 확인한 뒤, base와 동일 저장소 head를 그 merge commit으로 전진시키는 단일 `git push --atomic`에 명시적 두 ref lease를 건다. base 또는 head가 그 사이 바뀌면 어느 ref도 갱신하지 않는다. GitHub는 직접 push만으로 PR을 병합 처리한다고 보장하지 않으므로, push 뒤 GitHub가 해당 commit으로 PR을 `MERGED` 처리했는지 3초 간격 최대 10회 확인한다. 확인된 경우에만 완료로 보고하고 별도 exact lease로 head를 삭제하며, 삭제만 실패하면 완료 보고를 유지하되 branch를 안전하게 남긴다. 끝내 확인되지 않으면(상태 조회 실패·`MERGED` 미기록·다른 merge commit) helper는 **rc 4**로 끝나고 `JHW_PR_MERGE_COMMIT`에 base에 이미 반영된 commit을 남긴다. 이때 머지를 완료로 보고하지 않고, 재머지·재push·head 삭제·PR close/reopen을 하지 않는다. 대신 PR URL, base ref, merge commit SHA, 마지막 GitHub 상태를 보고하고 운영자에게 인계한다. 인계는 사실 보고까지이며, GitHub의 병합 기록 복구는 약속하지 않는다. 보호/ruleset-managed base, squash/rebase와 cross-repository PR은 자동 머지하지 않는다.
    - 명시적 `--no-review --merge`에서는 AI gate만 면제한다. required CI, 타겟, 현재 head, mergeability와 merge method 검증은 그대로 유지하고 `AI review: explicitly skipped (--no-review; review:skip)` receipt를 남긴다.
    - `review.auto=false`인 implicit auto mode는 zero-review merge exemption이 아니다. 자동 머지를 원하면 사용자가 명시적으로 `--no-review --merge`를 선택해야 한다.
    - 어느 리뷰어든 `{PENDING, FEEDBACK, FAILED, TRIGGER_FAILED, TIMEOUT}` 중 하나이거나 타겟 `FAIL`이면 **머지하지 않고** 보고
