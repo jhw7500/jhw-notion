@@ -10,6 +10,8 @@ import {installBootstrap, validateBootstrap} from './runtime-entry.mjs';
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
 const KEYS = ['HOOK_LINK_CREATED','INSTALL_TRANSACTION_ACTIVE','HOOKS_CONFIG_CHANGED','HOOKS_CONFIG_FILE','HOOKS_ADAPTER','HOOKS_DISPLAY_NAME','HOOKS_TRANSACTION_DIR','HOOKS_TRANSACTION_STAGE','HOOKS_TRANSACTION_METADATA','HOOKS_TRANSACTION_PRESERVE','CLAUDE_HOOKS_CONFIG_CHANGED','CLAUDE_HOOKS_CONFIG_FILE','CLAUDE_HOOKS_TRANSACTION_DIR','CLAUDE_HOOKS_TRANSACTION_STAGE','CLAUDE_HOOKS_TRANSACTION_METADATA','CLAUDE_HOOKS_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_TRANSACTION_DIR','CONTROL_HOOK_LINK_TRANSACTION_STAGE','CONTROL_HOOK_LINK_TRANSACTION_METADATA','CONTROL_HOOK_LINK_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_REMOVE_OUTCOME','INSTALL_UNPROTECTED','MIGRATION_HOOK_TRANSACTION_DIR','CODEX_BACKUP_PRUNE_FILE','ENV_DROPPED','ENV_DROPPED_REPORTED'];
 const ENV_ADAPTERS=['claude','codex','gemini','opencode'];
+// Reacquisition after validation: samples, the wait between them, and the refusals sampled again.
+const REACQUIRE_ATTEMPTS=5;const REACQUIRE_INTERVAL_MS=200;const REACQUIRE_RETRIED=['DEPLOY_LOCK_CONTENDED','DEPLOY_INVENTORY_UNCERTAIN'];
 const fail = (code,reason) => {throw new DeploymentError(code,reason);};
 function exists(file) {try {fs.lstatSync(file);return true;}catch(e){if(e.code==='ENOENT')return false;throw e;}}
 function parse(argv) {
@@ -599,6 +601,22 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   if(recovery&&command.operation==='refresh-bootstrap'){recovery.state.status='complete';recovery.state.recovery='superseded_by_refresh';checkpoint(recovery.directory,recovery.state);recovery=undefined;}
   const run=async (phase,candidateReleaseId)=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom:command.adoptFrom});};
   const pointerIntent=destination=>{state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);};
+  // Validation runs with admission released, so one sample can still see a probe
+  // holding its shared lease or an unrelated process starting or exiting. Only
+  // those two refusals are sampled again, and never a sample that counted a
+  // consumer: an active consumer is not waited out. A final refusal keeps its
+  // code and inventory in the journal.
+  const reacquire=async()=>{
+   for(let attempt=1;;attempt++) {
+    try {admission??=acquireLease(path.join(runtime,'admission.lock'));quiesce();return;}
+    catch(error) {
+     const sawConsumer=Object.values(error?.inventory?.counts??{}).some(count=>count>0);
+     if(attempt<REACQUIRE_ATTEMPTS&&REACQUIRE_RETRIED.includes(error?.code)&&!sawConsumer){await new Promise(resolve=>setTimeout(resolve,REACQUIRE_INTERVAL_MS));continue;}
+     state.phase='recovery_blocked';state.reacquisition={code:error instanceof DeploymentError?error.code:'DEPLOY_FAILED',attempts:attempt,inventory:error?.inventory??null};checkpoint(directory,state);
+     fail('DEPLOY_RECOVERY_REQUIRED','maintenance_reacquisition_failed');
+    }
+   }
+  };
   let current=previous;
   if(managed&&command.operation!=='uninstall') {
    await run('verify');
@@ -631,13 +649,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    admission=undefined;
    let validationError;
    try {await run('validate');} catch(error) {validationError=error;}
-   try {
-    admission=acquireLease(path.join(runtime,'admission.lock'));
-    quiesce();
-   } catch {
-    state.phase='recovery_blocked';checkpoint(directory,state);
-    fail('DEPLOY_RECOVERY_REQUIRED','maintenance_reacquisition_failed');
-   }
+   await reacquire();
    if(validationError) {
     if(liveIsOriginal())settle('validation_failed','DEPLOY_VALIDATION_FAILED','bootstrap_unchanged');
     if(originalBootstrap===null)hold('validation_failed','bootstrap_unverified');
@@ -702,14 +714,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
     validationError = error;
    }
    // Every later mutation requires actual reacquisition and another inventory.
-   try {
-    admission = acquireLease(path.join(runtime, 'admission.lock'));
-    quiesce();
-   } catch {
-    state.phase = 'recovery_blocked';
-    checkpoint(directory, state);
-    fail('DEPLOY_RECOVERY_REQUIRED', 'maintenance_reacquisition_failed');
-   }
+   await reacquire();
    if (validationError) {
     state.phase = 'validation_failed';
     checkpoint(directory, state);

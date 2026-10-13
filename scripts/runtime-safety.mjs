@@ -368,7 +368,8 @@ export function inspectConsumers({ repositoryRoot, procRoot = '/proc', uid = pro
 
 export function requireQuiescence(options) {
   const result = inspectConsumers(options);
-  if (result.uncertain) throw new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN');
-  if (!result.clear) throw new DeploymentError('DEPLOY_CONSUMERS_ACTIVE');
+  // The refusing inventory rides on the error so a caller can record its counts.
+  if (result.uncertain) throw Object.assign(new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN'), { inventory: result });
+  if (!result.clear) throw Object.assign(new DeploymentError('DEPLOY_CONSUMERS_ACTIVE'), { inventory: result });
   return result;
 }
