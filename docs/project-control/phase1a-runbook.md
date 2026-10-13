@@ -500,6 +500,9 @@ rollback 자체의 검증 실패는 `DEPLOY_VALIDATION_FAILED` / `rollback_recov
 추가 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. maintenance를 유지하고
 selected pointer·pending evidence를 보존한 채 operator 수동 검토로 넘긴다.
 `DEPLOY_RECOVERY_REQUIRED`, 특히 `maintenance_reacquisition_failed`도 자동 restore하지 않는다.
+validate 뒤 재획득은 `DEPLOY_LOCK_CONTENDED`·`DEPLOY_INVENTORY_UNCERTAIN`만 짧은 간격으로 정해진
+횟수까지 다시 재고, consumer를 센 표본은 다시 재지 않는다. 그래도 실패하면 마지막 거부 코드, 시도
+횟수, inventory 개수가 pending journal `state.json`의 `reacquisition`에 남으니 review 때 함께 본다.
 다음 read-only 확인만 하고 maintenance를 유지한 채 operator review로 넘긴다.
 
 ```bash

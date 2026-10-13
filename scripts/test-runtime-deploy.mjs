@@ -1040,3 +1040,53 @@ test('uninstall through a release library that predates env-drop reporting does 
  fs.writeFileSync(library,current);
  const result=await f.run(['--uninstall']);assert.equal(result.code,'DEPLOY_UNINSTALLED');assert.equal(result.envDropped,null);
 });
+// #206: the reacquisition after validation is a single sample of the whole host's /proc.
+function pendingJournal(f) {const runtime=path.join(f.root,'.jhw-runtime');const states=fs.readdirSync(runtime).filter(n=>/^\.deploy\.[a-f0-9]{32}$/.test(n)).map(n=>JSON.parse(fs.readFileSync(path.join(runtime,n,'state.json'),'utf8'))).filter(s=>s.status==='pending');assert.equal(states.length,1);return states[0];}
+async function secondReleaseFixture(t) {const f=fixture(t);host(f);const a=await f.run(['--prepare']);await f.run(['--activate',a.releaseId]);write(f.root,'mcp-server/src/index.ts','export const changed=1;');const b=await f.run(['--prepare']);return {f,a,b};}
+// A /proc entry without a readable status makes the inventory uncertain until it is removed.
+function uncertainEntry(f,removeAfterMs) {const p=path.join(f.procRoot,'300');fs.mkdirSync(p);if(removeAfterMs!==undefined)setTimeout(()=>fs.rmSync(p,{recursive:true,force:true}),removeAfterMs);return p;}
+const afterValidate=hook=>async options=>{const result=await deploy.wiringPhase(options);if(options.phase==='validate')hook();return result;};
+// Break caught (#206): one uncertain sample right after validation leaving a validated activation recovery_blocked.
+test('activate samples the reacquisition inventory again when a transient process made it uncertain',async t=>{
+ const {f,b}=await secondReleaseFixture(t);
+ const r=await deploy.runDeployment({...f.options,argv:['--activate',b.releaseId],phaseRunner:afterValidate(()=>uncertainEntry(f,50))});
+ assert.equal(r.code,'DEPLOY_ACTIVATED');assert.equal(readActivation({repositoryRoot:f.root}).releaseId,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught (#206): the refresh path keeping its own single-sample reacquisition.
+test('refresh-bootstrap samples the reacquisition inventory again when a transient process made it uncertain',async t=>{
+ const {f,b,bootstrap}=await changedHelperFixture(t,'changed selector');
+ const r=await deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner:afterValidate(()=>uncertainEntry(f,50))});
+ assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught (#206): a probe that releases its shared admission lease just after validation returns.
+test('activate acquires the admission lease again when validation left it briefly contended',async t=>{
+ const {f,b}=await secondReleaseFixture(t);let shared;
+ try{const r=await deploy.runDeployment({...f.options,argv:['--activate',b.releaseId],phaseRunner:afterValidate(()=>{shared=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true});setTimeout(()=>shared.close(),50);})});assert.equal(r.code,'DEPLOY_ACTIVATED');}finally{shared?.close();}
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught (#206): a lasting refusal leaving no trace of why reacquisition failed, or the trace breaking recovery.
+test('a reacquisition that stays uncertain blocks recovery, records its code and inventory, and still rolls back',async t=>{
+ const {f,a,b}=await secondReleaseFixture(t);let entry;
+ try{await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',b.releaseId],phaseRunner:afterValidate(()=>{entry=uncertainEntry(f);})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});}finally{if(entry)fs.rmSync(entry,{recursive:true,force:true});}
+ const journal=pendingJournal(f);assert.equal(journal.phase,'recovery_blocked');
+ assert.deepEqual(journal.reacquisition,{code:'DEPLOY_INVENTORY_UNCERTAIN',attempts:5,inventory:{clear:false,counts:{tui:0,app_server:0,legacy:0,managed:0},uncertain:1}});
+ const r=await f.run(['--rollback']);assert.equal(r.code,'DEPLOY_ROLLED_BACK');assert.equal(readActivation({repositoryRoot:f.root}).releaseId,a.releaseId);assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+// Break caught (#206): a lease held through every attempt recorded as something other than contention.
+test('a reacquisition that stays contended records the lock code without an inventory',async t=>{
+ const {f,b}=await secondReleaseFixture(t);let shared;
+ try{await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',b.releaseId],phaseRunner:afterValidate(()=>{shared=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true});})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});}finally{shared?.close();}
+ assert.deepEqual(pendingJournal(f).reacquisition,{code:'DEPLOY_LOCK_CONTENDED',attempts:5,inventory:null});
+});
+// Break caught (#206): an active consumer being waited out instead of refused on the first sample.
+test('a reacquisition that finds an active consumer is refused without another sample',async t=>{
+ const {f,b}=await secondReleaseFixture(t);
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',b.releaseId],phaseRunner:afterValidate(()=>{addConsumer(f);setTimeout(()=>fs.rmSync(path.join(f.procRoot,'100'),{recursive:true,force:true}),50);})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});
+ assert.deepEqual(pendingJournal(f).reacquisition,{code:'DEPLOY_CONSUMERS_ACTIVE',attempts:1,inventory:{clear:false,counts:{tui:1,app_server:0,legacy:0,managed:0},uncertain:0}});
+});
+// Break caught (#206 review): a sample that saw a consumer being sampled again because the same sample was also uncertain.
+test('a reacquisition sample that saw a consumer is refused without another sample even when it was also uncertain',async t=>{
+ const {f,b}=await secondReleaseFixture(t);
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',b.releaseId],phaseRunner:afterValidate(()=>{addConsumer(f);const entry=uncertainEntry(f);setTimeout(()=>{fs.rmSync(path.join(f.procRoot,'100'),{recursive:true,force:true});fs.rmSync(entry,{recursive:true,force:true});},50);})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});
+ assert.deepEqual(pendingJournal(f).reacquisition,{code:'DEPLOY_INVENTORY_UNCERTAIN',attempts:1,inventory:{clear:false,counts:{tui:1,app_server:0,legacy:0,managed:0},uncertain:1}});
+});
