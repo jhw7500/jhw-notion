@@ -30,7 +30,29 @@ Claude Code, Gemini CLI, OpenCode는 이 파일을 공유하고 Codex는 생성�
 
 ## 언어
 
-제목의 결과문(`type(scope): ` 뒤)과 필드 내용은 한국어로 쓴다. `type`·`scope`·필드 제목·트레일러·명령·경로·식별자·오류 코드는 원문 그대로 둔다. 저장소와 작성 도구(Claude Code·Codex 등)에 관계없이 같다.
+제목의 결과문(`type(scope): ` 뒤)과 필드 내용은 한국어로 쓴다. `type`·`scope`·필드 제목·트레일러·명령·경로·식별자·오류 코드와 도구가 읽는 고정 문구(`Not run:`, `Closes #N` 같은 닫기 키워드, `review-fix round N`)는 원문 그대로 둔다. 저장소와 작성 도구(Claude Code·Codex 등)에 관계없이 같다.
+
+예:
+
+```text
+fix(deploy): 일시적 프로세스가 검증된 배포를 막지 않게 한다
+
+ ### Contract version
+v1
+
+ ### Why
+검증 직후 한 번만 읽은 inventory 샘플이 호스트 PID 변동에 걸려
+정상 배포가 recovery_blocked로 끝났다.
+
+ ### Changes
+- `reacquire()`가 샘플 창 안에서 다시 읽는다.
+
+ ### Validation
+- `node --test scripts/test-runtime-deploy.mjs`: 통과.
+
+ ### References
+- https://github.com/jhw7500/jhw-notion/issues/206
+```
 
 ## 메시지 형식
 
