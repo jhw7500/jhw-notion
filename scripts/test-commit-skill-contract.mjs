@@ -28,6 +28,7 @@ const repoAgents = await readFile(join(root, "AGENTS.md"), "utf8");
 assert.match(skill, /^## 언어$/m);
 assert.match(skill, /제목의 결과문\(`type\(scope\): ` 뒤\)과 필드 내용은 한국어로 쓴다\./);
 assert.match(skill, /`type`·`scope`·필드 제목·트레일러·명령·경로·식별자·오류 코드와 도구가 읽는 고정 문구\(`Not run:`, `Closes #N` 같은 닫기 키워드, `review-fix round N`\)는 원문 그대로 둔다\./);
+assert.match(skill, /origin이 `github\.com\/jhw7500\/\*`인 저장소에서는 저장소와 작성 도구\(Claude Code·Codex 등\)에 관계없이 같고, 그 밖의 저장소에서는 그 저장소의 언어 관례를 따른다\./);
 const languageExample = skill.match(/## 언어[\s\S]*?```text\n([\s\S]*?)```\n/);
 assert.ok(languageExample, "the 언어 section must show one filled example");
 assert.match(languageExample[1], /^[a-z]+\([a-z-]+\): [^\n]*[가-힣][^\n]*\n\n ### Contract version\nv1\n/);
