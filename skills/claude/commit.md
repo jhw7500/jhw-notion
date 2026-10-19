@@ -28,6 +28,10 @@ Claude Code, Gemini CLI, OpenCode는 이 파일을 공유하고 Codex는 생성�
 5. 커밋 전 메시지와 staged diff를 다시 읽는다. 저장소에 고정된 `v1` validator가 있다면
    완성한 메시지에 `--kind commit --expected-version v1` 검증을 실행한다. 실패하면 수정한다.
 
+## 언어
+
+제목의 결과문(`type(scope): ` 뒤)과 필드 내용은 한국어로 쓴다. `type`·`scope`·필드 제목·트레일러·명령·경로·식별자·오류 코드는 원문 그대로 둔다. 저장소와 작성 도구(Claude Code·Codex 등)에 관계없이 같다.
+
 ## 메시지 형식
 
 아래 `<...>`는 작성 지시 자리이며 그대로 제출하지 않는다. 필드 heading의 맨 앞 ASCII
@@ -36,7 +40,7 @@ Claude Code, Gemini CLI, OpenCode는 이 파일을 공유하고 Codex는 생성�
 
 <!-- change-evidence-commit-template:begin -->
 ```text
-<72자 이내의 결과 중심 제목>
+<type(scope): 72자 이내의 결과 중심 한국어 제목>
 
  ### Contract version
 v1

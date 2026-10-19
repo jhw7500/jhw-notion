@@ -98,7 +98,8 @@ node scripts/sync-codex-skills.mjs --check    # skills/codex 드리프트 검사
 
 - 커밋 메시지는 `/jhw:commit`(Change Evidence Contract v1)을 따른다. 제목은 commitlint 규칙
   (`.github/commitlint.config.mjs`: type `feat|fix|chore|refactor|docs|test|build|ci|perf|style`,
-  header 100자 이하)과 계약의 결과 중심·72자 이하를 함께 지킨다. 관례는 영문 `type(scope): 결과`다.
+  header 100자 이하)과 계약의 결과 중심·72자 이하를 함께 지킨다. 관례는 영문 `type(scope): ` 접두어
+  뒤 한국어 결과이고, 필드 내용도 한국어로 쓴다(`skills/claude/commit.md` 「언어」).
 - 필드 제목 `### `는 앞에 공백 한 칸을 두고 `git commit --cleanup=verbatim --file <msg-file>`로 커밋한다.
 - PR은 `/jhw:pr`로 만든다. 본문은 `Contract version`·`Summary`·`Changes`·`Validation`·
   `Impact and risks`·`Related issue`이고 pinned validator가 push 전에 검증한다. 추가 `##` 제목은
