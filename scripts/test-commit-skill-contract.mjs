@@ -24,6 +24,17 @@ assert.match(skill, /직접 커밋.*Issue/);
 assert.match(skill, /--cleanup=verbatim/);
 assert.match(skill, /Not run: <구체적 사유>/);
 assert.match(skill, /실제로 실행하고 출력을 읽은/);
+const repoAgents = await readFile(join(root, "AGENTS.md"), "utf8");
+assert.match(skill, /^## 언어$/m);
+assert.match(skill, /제목의 결과문\(`type\(scope\): ` 뒤\)과 필드 내용은 한국어로 쓴다\./);
+assert.match(skill, /`type`·`scope`·필드 제목·트레일러·명령·경로·식별자·오류 코드와 도구가 읽는 고정 문구\(`Not run:`, `Closes #N` 같은 닫기 키워드, `review-fix round N`\)는 원문 그대로 둔다\./);
+assert.match(skill, /origin이 `github\.com\/jhw7500\/\*`인 저장소에서는 저장소와 작성 도구\(Claude Code·Codex 등\)에 관계없이 같고, 그 밖의 저장소에서는 그 저장소의 언어 관례를 따른다\./);
+assert.match(skill, /jhw7500 아래의 fork로 외부 upstream 저장소에 기여하는 커밋은 origin과 관계없이 그 upstream 저장소의 언어 관례를 따른다\./);
+const languageExample = skill.match(/## 언어[\s\S]*?```text\n([\s\S]*?)```\n/);
+assert.ok(languageExample, "the 언어 section must show one filled example");
+assert.match(languageExample[1], /^[a-z]+\([a-z-]+\): [^\n]*[가-힣][^\n]*\n\n ### Contract version\nv1\n/);
+assert.equal(languageExample[1].split("\n", 1)[0].length <= 72, true);
+assert.doesNotMatch(repoAgents, /관례는 영문 `type\(scope\): 결과`다\./);
 assert.match(readme, /\/jhw:commit/);
 assert.match(readme, /DEPLOY_WIRING_TOPOLOGY_CHANGED/);
 assert.match(agents, /\| `commit\.md` \|/);
@@ -41,12 +52,13 @@ assert.deepEqual(
 );
 assert.equal((template.match(/^### /gm) ?? []).length, 0, "heading indentation protects edited Git messages");
 assert.match(template, /^v1$/m);
+assert.match(template, /^<type\(scope\): 72자 이내의 결과 중심 제목>$/m);
 
 const values = [
-  "Preserve change evidence in direct commits",
-  "The Issue and PR evidence must remain recoverable from Git history.",
-  "Add one commit authoring skill for every supported TUI.",
-  "node scripts/test-commit-skill-contract.mjs: passed.",
+  "feat(commit): 직접 커밋에도 변경 증거를 남긴다",
+  "Issue와 PR 증거를 Git 이력에서 다시 찾을 수 있어야 한다.",
+  "지원하는 모든 TUI에 커밋 작성 스킬 하나를 추가한다.",
+  "node scripts/test-commit-skill-contract.mjs: 통과.",
   "https://github.com/jhw7500/jhw-notion/issues/165",
 ];
 let index = 0;

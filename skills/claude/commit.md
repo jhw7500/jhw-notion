@@ -28,6 +28,32 @@ Claude Code, Gemini CLI, OpenCode는 이 파일을 공유하고 Codex는 생성�
 5. 커밋 전 메시지와 staged diff를 다시 읽는다. 저장소에 고정된 `v1` validator가 있다면
    완성한 메시지에 `--kind commit --expected-version v1` 검증을 실행한다. 실패하면 수정한다.
 
+## 언어
+
+제목의 결과문(`type(scope): ` 뒤)과 필드 내용은 한국어로 쓴다. `type`·`scope`·필드 제목·트레일러·명령·경로·식별자·오류 코드와 도구가 읽는 고정 문구(`Not run:`, `Closes #N` 같은 닫기 키워드, `review-fix round N`)는 원문 그대로 둔다. origin이 `github.com/jhw7500/*`인 저장소에서는 저장소와 작성 도구(Claude Code·Codex 등)에 관계없이 같고, 그 밖의 저장소에서는 그 저장소의 언어 관례를 따른다. jhw7500 아래의 fork로 외부 upstream 저장소에 기여하는 커밋은 origin과 관계없이 그 upstream 저장소의 언어 관례를 따른다.
+
+예:
+
+```text
+fix(deploy): 일시적 프로세스가 검증된 배포를 막지 않게 한다
+
+ ### Contract version
+v1
+
+ ### Why
+검증 직후 한 번만 읽은 inventory 샘플이 호스트 PID 변동에 걸려
+정상 배포가 recovery_blocked로 끝났다.
+
+ ### Changes
+- `reacquire()`가 샘플 창 안에서 다시 읽는다.
+
+ ### Validation
+- `node --test scripts/test-runtime-deploy.mjs`: 통과.
+
+ ### References
+- https://github.com/jhw7500/jhw-notion/issues/206
+```
+
 ## 메시지 형식
 
 아래 `<...>`는 작성 지시 자리이며 그대로 제출하지 않는다. 필드 heading의 맨 앞 ASCII
@@ -36,7 +62,7 @@ Claude Code, Gemini CLI, OpenCode는 이 파일을 공유하고 Codex는 생성�
 
 <!-- change-evidence-commit-template:begin -->
 ```text
-<72자 이내의 결과 중심 제목>
+<type(scope): 72자 이내의 결과 중심 제목>
 
  ### Contract version
 v1
