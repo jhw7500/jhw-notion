@@ -1,6 +1,6 @@
 ---
-description: Use when the user explicitly requests a Project Control Task start, child start, contract migration, completion readiness, existing-Task resume, promotion, Handoff, finish, a finish-then-start switch, recovery, says 태스크 받아서 or 작업준비, or asks to receive or continue from a HANDOFF*.md file
-argument-hint: "(start | child-start | contract | completion-ready | resume | promote | handoff | finish | switch | recover) <task-or-issue>"
+description: Use when the user explicitly requests a Project Control Task start, child start, contract migration, completion readiness, existing-Task resume (including resume without an ID), promotion, Handoff, finish, a finish-then-start switch, recovery, says 태스크 받아서 or 작업준비, or asks to receive or continue from a HANDOFF*.md file
+argument-hint: "(start | child-start | contract | completion-ready | promote | handoff | finish | switch | recover) <task-or-issue> | resume [<task-or-issue>]"
 ---
 
 # /jhw:task — 명시적 Task 제어
@@ -45,13 +45,13 @@ process.stdout.write(`${JSON.stringify({ task_id, claim_id, branch, worktree_ref
 
 ## 좌표 없는 Task/Handoff 수신 발견
 
-사용자가 `태스크 받아서`, `작업준비`, `HANDOFF*.md`를 받아서/이어서 작업하라는 표현으로 Task 인수를 명시했지만 canonical `task_id`·Issue URL이 없으면 다음 discovery만 먼저 수행한다. 일반 조사 요청에는 자동 실행하지 않는다.
+사용자가 `태스크 받아서`, `작업준비`, `HANDOFF*.md`를 받아서/이어서 작업하라는 표현 또는 인자 없는 `/jhw:task resume`으로 Task 재개를 명시했고, 현재 요청에 canonical `task_id`·Issue URL이 없으면 다음 discovery만 먼저 수행한다. 발견 단계에서는 후보를 조회·표시하며 Task start authorization gate와 launcher start는 후보 선택 뒤에 진행한다. 일반 조사 요청에는 자동 실행하지 않는다.
 
 1. `git rev-parse --show-toplevel`로 현재 저장소를 확정하고, 그 루트에서 `git worktree list --porcelain -z`를 실행한다. NUL field/빈 NUL record 경계로 파싱하고 공백·줄·`eval`로 쪼개거나 C-quoted path를 직접 복원하지 않는다. `-z`를 지원하지 않거나 record가 malformed이면 fail-closed한다. 이 명령이 열거한 **같은 저장소의 worktree**만 대상으로 삼는다.
-2. 각 worktree에서 root 바로 아래의 symlink가 아닌 regular file `HANDOFF*.md`와 canonical local copy `.ai/handoff.md`만 후보로 검사한다. canonical copy는 `.ai` directory와 `handoff.md`가 모두 symlink가 아닐 때만 후보이며 그 밖의 하위 디렉터리, 다른 repository, home, session/history, Notion으로 검색을 넓히지 않는다.
+2. 각 worktree에서 root 바로 아래의 symlink가 아닌 regular file `HANDOFF*.md`와 canonical local copy `.ai/handoff.md`만 후보로 검사한다. `.ai/handoff.md`는 **Task handoff 사본**, `HANDOFF*.md`는 **세션 체크포인트**로 구분한다. canonical copy는 `.ai` directory와 `handoff.md`가 모두 symlink가 아닐 때만 후보이며 그 밖의 하위 디렉터리, 다른 repository, home, session/history, Notion으로 검색을 넓히지 않는다.
 3. 사용자가 파일명을 지정했다면 pathless `HANDOFF*.md` basename 또는 exact literal `.ai/handoff.md`만 받으며 다른 path component·`..`·separator는 거부한다. 지정한 logical name과 일치하는 후보를 모든 worktree에서 먼저 찾고 glob 확장·부분 일치·현재 checkout 우선 선택으로 대체하지 않는다. 파일명을 지정하지 않았을 때만 두 후보 종류를 모두 모은다.
-4. 후보를 원래 logical-name byte와 porcelain record 기준으로 안정 정렬한다. 0개면 발견 실패를 보고하고 멈춘다. 여러 개면 임의로 읽거나 선택하거나 Claim하지 말고 총 개수와 최대 20개만 보여준 뒤 사용자 선택을 기다린다. 각 항목은 `순번 + JSON-style escaped logical name + escaped branch(없으면 detached) + worktree-key`로 표시한다. `worktree-key`는 record의 첫 `worktree ` byte부터 마지막 field byte까지 single-NUL field separator를 보존하고 terminating double NUL은 제외한 raw bytes의 SHA-256 앞 12 hex인 선택용 비권위 식별자다. C0/C1·ESC·bidi/non-printable 문자를 escape하고 원래 name byte로 비교한다. 절대 worktree path는 출력하지 않으며 20개 초과분은 생략 수를 표시한다.
-5. 단일 후보를 읽기 직전과 사용자가 복수 후보를 선택한 뒤에는 `git worktree list --porcelain -z`부터 다시 실행한다. 내부에 보존한 exact worktree root, `worktree-key`, exact logical name이 모두 그대로인지 확인한다. shell의 check-then-read로 대체하지 말고 local Python의 `os.open`을 사용해 root를 `O_DIRECTORY|O_NOFOLLOW`, canonical copy면 `.ai`도 같은 방식, 마지막 파일은 `O_RDONLY|O_NOFOLLOW`로 descriptor-relative open한 뒤 `fstat` regular file을 확인한다. 같은 fd에서 최대 12 KiB와 초과 확인용 1 byte만 읽는다. Python/필수 flag가 없거나 초과·교체·누락·symlink이면 truncate하거나 다른 후보로 넘어가지 말고 멈춘다.
+4. 후보를 원래 logical-name byte와 porcelain record 기준으로 안정 정렬한다. 0개면 canonical Issue URL 또는 Task ID 입력을 안내하고 멈춘다. 후보가 1개여도 총 개수와 최대 20개의 번호 목록을 먼저 보여주고 사용자의 선택을 확인한다. 선택 전에는 후보 내용을 읽거나 `task start`를 실행하지 않는다. 각 항목은 `순번 + 종류(Task handoff 사본/세션 체크포인트) + JSON-style escaped logical name + escaped branch(없으면 detached) + worktree-key`로 표시한다. Task handoff 사본을 기본 추천으로 표시한다. 추천만으로 자동 선택하거나 Claim하지 않는다. `worktree-key`는 record의 첫 `worktree ` byte부터 마지막 field byte까지 single-NUL field separator를 보존하고 terminating double NUL은 제외한 raw bytes의 SHA-256 앞 12 hex인 선택용 비권위 식별자다. C0/C1·ESC·bidi/non-printable 문자를 escape하고 원래 name byte로 비교한다. 절대 worktree path는 출력하지 않으며 20개 초과분은 생략 수를 표시한다.
+5. 사용자가 선택한 후보의 내용을 읽기 직전에 `git worktree list --porcelain -z`부터 다시 실행한다. 내부에 보존한 exact worktree root, `worktree-key`, exact logical name이 모두 그대로인지 확인한다. shell의 check-then-read로 대체하지 말고 local Python의 `os.open`을 사용해 root를 `O_DIRECTORY|O_NOFOLLOW`, canonical copy면 `.ai`도 같은 방식, 마지막 파일은 `O_RDONLY|O_NOFOLLOW`로 descriptor-relative open한 뒤 `fstat` regular file을 확인한다. 같은 fd에서 최대 12 KiB와 초과 확인용 1 byte만 읽는다. Python/필수 flag가 없거나 초과·교체·누락·symlink이면 truncate하거나 다른 후보로 넘어가지 말고 멈춘다.
 6. 선택한 Handoff의 Task/Issue/branch/worktree 표기는 **discovery hint**일 뿐이다. Task를 받아 작업하라는 현재 요청은 명시적 resume이므로, 위 Task start authorization gate 뒤에 기존-Task launcher start를 실행해 Claim을 획득하고 그 성공 결과로만 canonical Task·Claim·owner를 확정한다. `task status`는 이미 active라고 알려진 Claim의 읽기 전용 소유권 확인에만 쓰며 released Handoff 수신을 대신하지 않는다. 다른 owner·충돌·불일치·좌표 부재에서는 작업하거나 자동 takeover하지 않는다.
 
 ## 새 Task 시작
@@ -156,6 +156,12 @@ child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또�
 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED` 또는 `TASK_SESSION_BUSY`이면 검증된 `error.conflicting_claim`에서 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 좌표만 보여주고 멈춘다. session ID, repository path, token, raw message와 그 밖의 필드는 보고하거나 출력하지 않는다. `TASK_SESSION_BUSY`에서 이 좌표는 같은 exact session을 이미 점유한 active Task/Claim이며, `error.retained_task`가 함께 있으면 그것은 등록됐지만 시작되지 못한 새 child이므로 서로 혼동하지 않는다. 자동 status/finish/takeover하지 않으며, 사용자가 명시적으로 Task 전환을 요청한 경우에만 아래 전환 절차에 conflicting Task/Claim 좌표를 사용한다.
 
 ## 기존 Task 재개
+
+재개 진입은 현재 요청의 좌표로 결정한다.
+
+- canonical Task ID가 있으면 아래 기존 재개 계약으로 진행한다.
+- Task ID 없이 canonical Issue URL만 있으면 아래 「checkout과 Issue로 기존 formal Task 발견」으로 진행한다.
+- 두 좌표가 모두 없는 인자 없는 `/jhw:task resume`이면 위 「좌표 없는 Task/Handoff 수신 발견」으로 진행해 후보 선택을 먼저 받는다.
 
 재개는 `status`가 아니라 같은 persistent Task를 다시 claim하는 명시적 start다. registration field를 섞지 않는다.
 

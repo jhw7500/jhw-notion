@@ -755,6 +755,30 @@ function assertStaticStartContract(label, markdown) {
     /수동 재실행[^\n]*`status`[^\n]*`handoff`[^\n]*`assert-owner`[^\n]*`recover --action status`[^\n]*읽기 전용 명령에만 제한/);
 }
 
+function assertCoordinateLessResumeContract(label, markdown) {
+  const discovery = markdown.match(
+    /## 좌표 없는 Task\/Handoff 수신 발견\n([\s\S]*?)\n## 새 Task 시작/,
+  )?.[1];
+  assert.ok(discovery, label + ": coordinate-less discovery must remain available");
+  assert.match(discovery, /인자 없는[^\n]*\/jhw:task resume/,
+    label + ": argument-free resume must enter existing handoff discovery");
+  assert.match(discovery, /\.ai\/handoff\.md[^\n]*Task handoff 사본/);
+  assert.match(discovery, /HANDOFF\*\.md[^\n]*세션 체크포인트/);
+  assert.match(discovery, /Task handoff 사본을 기본 추천/);
+  assert.match(discovery, /추천[^\n]*자동 선택[^\n]*Claim/);
+  assert.match(discovery, /후보가 1개여도[^\n]*사용자[^\n]*확인/);
+  assert.match(discovery, /선택 전에는[^\n]*읽[^\n]*task start/);
+  assert.match(discovery, /0개면[^\n]*Issue URL[^\n]*Task ID[^\n]*멈/);
+
+  const resume = markdown.match(
+    /## 기존 Task 재개\n([\s\S]*?)\n### checkout과 Issue로 기존 formal Task 발견/,
+  )?.[1];
+  assert.ok(resume, label + ": explicit Task resume route must remain available");
+  assert.match(resume, /Task ID[^\n]*기존 재개/);
+  assert.match(resume, /Issue URL[^\n]*checkout과 Issue로 기존 formal Task 발견/);
+  assert.match(resume, /인자 없는[^\n]*\/jhw:task resume[^\n]*좌표 없는 Task\/Handoff 수신 발견/);
+}
+
 const hostOnlyLifecycleCounts = new Map([
   ["child-start", 1],
   ["contract", 2],
@@ -1161,6 +1185,7 @@ async function assertInvalidRepeatableTemporaryInputs(taskPath) {
 
 async function assertConsumerContract(label, taskPath) {
   const markdown = await readFile(taskPath, "utf8");
+  assertCoordinateLessResumeContract(label, markdown);
   assertStaticRecoveryDiscoveryContract(label, markdown);
   assertHostOnlyLifecycleContract(label, markdown);
   for (const route of routes) {
@@ -1208,6 +1233,9 @@ async function main() {
   await assertRepeatableTemporaryInputs(canonicalTask);
   await assertInvalidRepeatableTemporaryInputs(canonicalTask);
   await assertConsumerContract("Claude canonical consumer", canonicalTask);
+  const codexWrapper = await readFile(join(repoRoot, "skills", "codex", "jhw-task", "SKILL.md"), "utf8");
+  assert.match(codexWrapper, /resume without an ID/,
+    "Codex skill discovery must advertise argument-free Task resume");
   assert.equal(await realpath(codexReference), await realpath(canonicalTask),
     "Codex task reference must resolve to the canonical Claude task skill");
   await assertConsumerContract("Codex generated reference consumer", codexReference);
