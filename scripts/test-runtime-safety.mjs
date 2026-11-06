@@ -220,6 +220,64 @@ for (const flag of ['-C', '-r']) {
   });
 }
 
+for (const binary of ['python', 'python3']) {
+  for (const flag of ['-B', '-I']) {
+    test(`${binary} ${flag} leaves unrelated background services quiescent`, t => {
+      const options = procFixture(t);
+      addProcess(options, 100, [binary, flag, '/opt/board-broker.py', '--live-readonly']);
+      addProcess(options, 101, [binary, flag, '/opt/deploy-window.py', '--deploy']);
+      assert.deepEqual(inspectConsumers(options), clearInventory);
+      assert.deepEqual(requireQuiescence(options), clearInventory);
+    });
+
+    test(`${binary} ${flag} preserves legacy and managed consumer identities`, t => {
+      const options = procFixture(t);
+      addProcess(options, 100, [binary, flag, './scripts/jhw-control-hook']);
+      addProcess(options, 101, [binary, flag, `${options.repositoryRoot}/.jhw-runtime/bootstrap/jhw-runtime-control`]);
+      addProcess(options, 102, [binary, flag, '/opt/other.py', './scripts/jhw-control-hook']);
+      assert.deepEqual(inspectConsumers(options), {
+        clear: false, counts: { tui: 0, app_server: 0, legacy: 1, managed: 1 }, uncertain: 0,
+      });
+      assert.throws(() => requireQuiescence(options), { code: 'DEPLOY_CONSUMERS_ACTIVE' });
+    });
+  }
+}
+
+test('separate and repeated Python -B and -I flags never consume the script', t => {
+  for (const flags of [['-B', '-I'], ['-I', '-B'], ['-B', '-B', '-I', '-I']]) {
+    const options = procFixture(t);
+    addProcess(options, 100, ['python3', ...flags, './scripts/jhw-control-hook']);
+    assert.deepEqual(inspectConsumers(options), {
+      clear: false, counts: { tui: 0, app_server: 0, legacy: 1, managed: 0 }, uncertain: 0,
+    }, flags.join(' '));
+  }
+});
+
+test('Python -B and -I preserve code, module, stdin and script-argument boundaries', t => {
+  const options = procFixture(t);
+  const consumer = `${options.repositoryRoot}/scripts/jhw-control-hook`;
+  const commands = [
+    ['python3', '-I', '-B', '-c', 'print("ok")', consumer],
+    ['python3', '-B', '-m', 'example', consumer],
+    ['python3', '-I', '-', consumer],
+    ['python3', '-B', '--', '/opt/other.py', '-I', consumer],
+    ['python3', '-I', '/opt/other.py', '-B', consumer],
+  ];
+  commands.forEach((argv, index) => addProcess(options, 100 + index, argv));
+  assert.deepEqual(inspectConsumers(options), clearInventory);
+});
+
+for (const flag of ['-W', '-X', '--unknown-option', '-Bunknown']) {
+  test(`Python -I keeps unsupported ${flag} uncertain`, t => {
+    const options = procFixture(t);
+    addProcess(options, 100, ['python3', '-I', flag, `${options.repositoryRoot}/scripts/jhw-control-hook`]);
+    assert.deepEqual(inspectConsumers(options), {
+      clear: false, counts: { tui: 0, app_server: 0, legacy: 0, managed: 0 }, uncertain: 1,
+    });
+    assert.throws(() => requireQuiescence(options), { code: 'DEPLOY_INVENTORY_UNCERTAIN' });
+  });
+}
+
 test('inventory matches only exact legacy and known managed runtime entry paths', t => {
   const options = procFixture(t);
   const root = options.repositoryRoot;
