@@ -197,7 +197,7 @@ jhw_pr_skip_merge_receipt() {
 }
 
 jhw_pr_mode_wait_plan() {
-  local mode="$1" auto_enabled="$2"
+  local mode="${1}" auto_enabled="${2}"
   case "$auto_enabled" in
     true|false) ;;
     *) echo "invalid review.auto value" >&2; return 2 ;;
@@ -218,7 +218,7 @@ jhw_pr_mode_wait_plan() {
 }
 
 jhw_pr_base_has_no_required_checks() {
-  local base_ref="$1" encoded_base branch_json classic_empty effective_json effective_empty
+  local base_ref="${1}" encoded_base branch_json classic_empty effective_json effective_empty
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
   [[ -n "$base_ref" && "$base_ref" != *$'\n'* && "$base_ref" != *$'\r'* ]] || return 2
   if encoded_base="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$base_ref")"; then
@@ -279,7 +279,7 @@ jhw_pr_base_has_no_required_checks() {
 }
 
 jhw_pr_base_allows_atomic_direct_merge() {
-  local base_ref="$1" encoded_base branch_json effective_json classic_clear rules_clear merge_allowed
+  local base_ref="${1}" encoded_base branch_json effective_json classic_clear rules_clear merge_allowed
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
   [[ -n "$base_ref" && "$base_ref" != *$'\n'* && "$base_ref" != *$'\r'* ]] || return 2
   if encoded_base="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$base_ref")"; then
@@ -353,7 +353,7 @@ jhw_pr_origin_matches_repo() {
 }
 
 jhw_pr_push_reviewed_merge() {
-  local pr="$1" reviewed_head="$2" reviewed_base_oid="$3" base_ref="$4"
+  local pr="${1}" reviewed_head="${2}" reviewed_base_oid="${3}" base_ref="${4}"
   local head_ref merge_oid parents parent_base parent_head merged_raw merged_state merged_oid extra
   local attempt confirmed
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] || return 2
@@ -426,7 +426,7 @@ jhw_pr_push_reviewed_merge() {
 }
 
 jhw_pr_wait_required_checks() {
-  local pr="$1" expected_head="$2" expected_base_oid="$3"
+  local pr="${1}" expected_head="${2}" expected_base_oid="${3}"
   local actual_head base_ref actual_base actual_base_oid check_output check_status
   local no_required_pattern="^no required checks reported on the '[^']+' branch$"
   [[ "$REPO_NWO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 2
@@ -535,7 +535,7 @@ jhw_pr_validate_review_status_rows() {
 # provider-error artifact, OpenCode's from its run-bound sticky. Claude has none yet: its only
 # infrastructure code is the catch-all provider_failure. Add a reviewer:reason pair here to allow it.
 jhw_pr_unavailable_reason_allowed() {
-  case "$1:$2" in
+  case "${1}:${2}" in
     gemini:provider_overloaded|gemini:provider_quota_exhausted|gemini:provider_timeout) ;;
     opencode:quota_exhausted|opencode:rate_limited) ;;
     *) return 1 ;;
@@ -543,7 +543,7 @@ jhw_pr_unavailable_reason_allowed() {
 }
 
 jhw_pr_validate_round_exclusions() {
-  local head="$1" planned="${ROUND_PLANNED_REVIEWERS:-}" covered="${ROUND_EXPECTED_REVIEWERS:-}"
+  local head="${1}" planned="${ROUND_PLANNED_REVIEWERS:-}" covered="${ROUND_EXPECTED_REVIEWERS:-}"
   local reviewer reason run_id run_attempt extra name raw='' dispatched='' found
   local id attempt run_name run_head created_at status conclusion event rid
   local run_statuses='^(completed|in_progress|queued|waiting|requested|pending)$'
@@ -625,7 +625,7 @@ jhw_pr_validate_round_exclusions() {
 }
 
 jhw_pr_post_exclusion_comment() {
-  local pr="$1" head="$2" reviewer reason extra list='' lines='' actor marker endpoint existing body
+  local pr="${1}" head="${2}" reviewer reason extra list='' lines='' actor marker endpoint existing body
   [[ "$pr" =~ ^[1-9][0-9]*$ && "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
   [[ -n "${ROUND_UNAVAILABLE_REVIEWERS:-}" ]] || return 0
   # Reviewer names and allowlisted reason codes only: provider text never reaches this public comment.
@@ -718,7 +718,7 @@ jhw_pr_merge_reviewed_head() {
 }
 
 jhw_pr_reviewed_receipt() {
-  local head="$1"
+  local head="${1}"
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid reviewed head" >&2; return 2; }
   printf '%s\n' "- Reviewed: $head"
 }
@@ -726,11 +726,11 @@ jhw_pr_reviewed_receipt() {
 jhw_pr_max_rounds_from_args() {
   local value=5 saw=0
   while (( $# > 0 )); do
-    case "$1" in
+    case "${1}" in
       --max-rounds)
         (( saw == 0 && $# >= 2 )) || { echo "invalid --max-rounds" >&2; return 2; }
         saw=1
-        value="$2"
+        value="${2}"
         shift 2
         continue
         ;;
@@ -752,22 +752,22 @@ jhw_pr_app_review_authorization_from_args() {
   JHW_PR_APP_REVIEW_OVERRIDE=''
   JHW_PR_APP_REVIEW_OVERRIDE_REASON=''
   while (( $# > 0 )); do
-    case "$1" in
+    case "${1}" in
       --approve-app-review)
         (( saw_approval == 0 && $# >= 2 )) || { echo "invalid --approve-app-review" >&2; return 2; }
-        saw_approval=1; value="$2"; shift 2; continue ;;
+        saw_approval=1; value="${2}"; shift 2; continue ;;
       --approve-app-review=*)
         (( saw_approval == 0 )) || { echo "duplicate --approve-app-review" >&2; return 2; }
         saw_approval=1; value="${1#--approve-app-review=}" ;;
       --override-app-review)
         (( saw_override == 0 && $# >= 2 )) || { echo "invalid --override-app-review" >&2; return 2; }
-        saw_override=1; JHW_PR_APP_REVIEW_OVERRIDE="$2"; shift 2; continue ;;
+        saw_override=1; JHW_PR_APP_REVIEW_OVERRIDE="${2}"; shift 2; continue ;;
       --override-app-review=*)
         (( saw_override == 0 )) || { echo "duplicate --override-app-review" >&2; return 2; }
         saw_override=1; JHW_PR_APP_REVIEW_OVERRIDE="${1#--override-app-review=}" ;;
       --override-reason)
         (( saw_reason == 0 && $# >= 2 )) || { echo "invalid --override-reason" >&2; return 2; }
-        saw_reason=1; override_reason="$2"; shift 2; continue ;;
+        saw_reason=1; override_reason="${2}"; shift 2; continue ;;
       --override-reason=*)
         (( saw_reason == 0 )) || { echo "duplicate --override-reason" >&2; return 2; }
         saw_reason=1; override_reason="${1#--override-reason=}" ;;
@@ -980,7 +980,7 @@ NODE
 }
 
 jhw_pr_select_app_canary() {
-  local reviewer="$1" source="$2"
+  local reviewer="${1}" source="${2}"
   case "$reviewer" in codex|gemini-code-assist) ;; *) return 2 ;; esac
   case "$source" in rest|graphql) ;; *) return 2 ;; esac
   node -e '
@@ -1024,7 +1024,7 @@ process.stdout.write(identities[0] + "\n");
 }
 
 jhw_pr_repo_has_app_canary() {
-  local reviewer="$1" issue_query inline_query request_query reaction_query
+  local reviewer="${1}" issue_query inline_query request_query reaction_query
   local issue_raw inline_raw request_raw reaction_raw rest_raw review_raw app_actor status
   local request_id request_url extra owner repo_name
   case "$reviewer" in
@@ -1096,7 +1096,7 @@ jhw_pr_discover_app_reviewers() {
 }
 
 jhw_pr_workflow_enabled() {
-  local workflow="$1" config_path="${2-}" root
+  local workflow="${1}" config_path="${2-}" root
   case "$workflow" in
     claude-code-review|gemini-auto-review|opencode-auto-review) ;;
     *) return 2 ;;
@@ -1150,7 +1150,7 @@ NODE
 }
 
 jhw_pr_remote_workflow_contract() {
-  local workflow="$1" mode="$2" content
+  local workflow="${1}" mode="${2}" content
   case "$workflow" in
     claude-code-review.yml|gemini-auto-review.yml|opencode-auto-review.yml) ;;
     *) return 2 ;;
@@ -1267,7 +1267,7 @@ process.exit(required.every((item) => types.includes(item)) ? 0 : 1);
 }
 
 jhw_pr_workflow_metadata_contract() {
-  local workflow="$1" expected_name metadata
+  local workflow="${1}" expected_name metadata
   case "$workflow" in
     claude-code-review.yml) expected_name='Claude Code Review' ;;
     gemini-auto-review.yml) expected_name='Gemini Auto PR Review' ;;
@@ -1288,7 +1288,7 @@ process.exit(value.state === "active" ? 0 : 4);
 }
 
 jhw_pr_preflight_workflow() {
-  local workflow="$1" mode="$2" root path enabled config_path workflow_key contract_status metadata_status
+  local workflow="${1}" mode="${2}" root path enabled config_path workflow_key contract_status metadata_status
   case "$workflow" in
     claude-code-review.yml|gemini-auto-review.yml|opencode-auto-review.yml) ;;
     *) return 2 ;;
@@ -1334,7 +1334,7 @@ jhw_pr_preflight_workflow() {
 }
 
 jhw_pr_prepare_review_plan() {
-  local mode="$1" transport="${2-}" auto_enabled=false preflight_mode workflow row status name reason app_actor
+  local mode="${1}" transport="${2-}" auto_enabled=false preflight_mode workflow row status name reason app_actor
   local gemini_code_assist_enabled=false
   JHW_PR_AVAILABLE_WORKFLOWS=''
   JHW_PR_UNAVAILABLE_WORKFLOWS=''
@@ -1404,7 +1404,7 @@ jhw_pr_select_expected_reviewers() {
   local -a selectors=()
   (( $# <= 1 )) || return 2
   if (( $# == 1 )); then
-    requested="$1"
+    requested="${1}"
     [[ -n "$requested" ]] || { echo "empty --reviewers value" >&2; return 2; }
   fi
 
@@ -1485,7 +1485,7 @@ jhw_pr_ensure_review_labels() {
 }
 
 jhw_pr_reconcile_review_labels() {
-  local mode="$1" refresh="${2-}" labels
+  local mode="${1}" refresh="${2-}" labels
   [[ "${PR:-}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2; }
   case "$mode:$refresh" in request:|request:refresh|skip:|auto:) ;; *) echo "invalid label refresh" >&2; return 2 ;; esac
   labels="$(gh pr view "$PR" --repo "$REPO_NWO" --json labels --jq '.labels[].name')" || return 1
@@ -1548,7 +1548,7 @@ jhw_pr_validate_remote_head_wait() {
 }
 
 jhw_pr_wait_remote_head() {
-  local expected_head="$1" attempts="${JHW_PR_REMOTE_HEAD_ATTEMPTS:-10}" interval="${JHW_PR_REMOTE_HEAD_INTERVAL:-3}"
+  local expected_head="${1}" attempts="${JHW_PR_REMOTE_HEAD_ATTEMPTS:-10}" interval="${JHW_PR_REMOTE_HEAD_INTERVAL:-3}"
   local attempt actual_head
   [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid expected head" >&2; return 2; }
   jhw_pr_validate_remote_head_wait || return
@@ -1565,7 +1565,7 @@ jhw_pr_wait_remote_head() {
 }
 
 jhw_pr_verify_remote_policy() {
-  local mode="$1" expected_head="$2" expected_base="$3"
+  local mode="${1}" expected_head="${2}" expected_base="${3}"
   local labels actual_head actual_base has_request=0 has_skip=0
   [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid expected head" >&2; return 2; }
   [[ -n "$expected_base" && "$expected_base" != *$'\n'* && "$expected_base" != *$'\r'* ]] || {
@@ -1589,7 +1589,7 @@ jhw_pr_verify_remote_policy() {
 }
 
 jhw_pr_workflow_name_for_file() {
-  case "$1" in
+  case "${1}" in
     claude-code-review.yml) printf '%s\n' 'Claude Code Review' ;;
     gemini-auto-review.yml) printf '%s\n' 'Gemini Auto PR Review' ;;
     opencode-auto-review.yml) printf '%s\n' 'OpenCode Auto PR Review' ;;
@@ -1621,7 +1621,7 @@ jhw_pr_mark_round_pushed() {
 }
 
 jhw_pr_capture_workflow_run_floors() {
-  local head="$1" workflows="$2" workflow workflow_name raw
+  local head="${1}" workflows="${2}" workflow workflow_name raw
   local id attempt name run_head created_at status conclusion event extra floor
   local floors=''
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
@@ -1649,7 +1649,7 @@ jhw_pr_capture_workflow_run_floors() {
 }
 
 jhw_pr_workflow_run_floor() {
-  local wanted="$1" name floor extra found=0 selected=''
+  local wanted="${1}" name floor extra found=0 selected=''
   while IFS=$'\t' read -r name floor extra; do
     [[ "$name" == "$wanted" ]] || continue
     [[ "$floor" =~ ^[0-9]+$ && -z "$extra" ]] || return 2
@@ -1665,7 +1665,7 @@ JHW_PR_CHANGE_EVIDENCE_VALIDATOR_REF='0d97a63891ba4473a3a189eae643f8059b76eb56'
 JHW_PR_CHANGE_EVIDENCE_VALIDATOR_ENDPOINT="repos/jhw7500/automation/contents/scripts/validate_change_evidence.py?ref=$JHW_PR_CHANGE_EVIDENCE_VALIDATOR_REF"
 
 jhw_pr_validate_change_evidence_snapshot() {
-  local body_snapshot="$1" validator rc=0
+  local body_snapshot="${1}" validator rc=0
   [[ -f "$body_snapshot" && ! -L "$body_snapshot" ]] || return 2
   validator="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-change-evidence-validator.XXXXXX")" || return 2
   if [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == true ]]; then
@@ -1686,7 +1686,7 @@ jhw_pr_validate_change_evidence_snapshot() {
 }
 
 jhw_pr_snapshot_new_pr_body() {
-  local source_file="$1" snapshot rc=0
+  local source_file="${1}" snapshot rc=0
   unset JHW_PR_VALIDATED_BODY_FILE
   snapshot="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-pr-body.XXXXXX")" || return 2
   if [[ "${JHW_PR_BODY_CLEANUP_ACTIVE:-false}" == true ]]; then
@@ -1767,7 +1767,7 @@ jhw_pr_preflight_new_pr_title() {
 }
 
 jhw_pr_validate_existing_pr_body() {
-  local pr="$1" body_file rc=0
+  local pr="${1}" body_file rc=0
   jhw_pr_body_cleanup_install || return 2
   if ! body_file="$(umask 077; mktemp "${TMPDIR:-/tmp}/jhw-pr-body.XXXXXX")"; then
     jhw_pr_body_cleanup_finish || return 2
@@ -1811,7 +1811,7 @@ jhw_pr_body_restore_traps() {
 }
 
 jhw_pr_body_cleanup_on_exit() {
-  local status="$1" previous_spec="${JHW_PR_BODY_PREV_EXIT_TRAP:-}"
+  local status="${1}" previous_spec="${JHW_PR_BODY_PREV_EXIT_TRAP:-}"
   jhw_pr_body_cleanup_all >/dev/null 2>&1 || true
   trap - EXIT HUP INT TERM
   JHW_PR_BODY_CLEANUP_ACTIVE=false
@@ -1822,7 +1822,7 @@ jhw_pr_body_cleanup_on_exit() {
 }
 
 jhw_pr_body_handle_signal() {
-  local signal="$1" status="$2" previous_spec=''
+  local signal="${1}" status="${2}" previous_spec=''
   case "$signal" in
     HUP) previous_spec="${JHW_PR_BODY_PREV_HUP_TRAP:-}" ;;
     INT) previous_spec="${JHW_PR_BODY_PREV_INT_TRAP:-}" ;;
@@ -1861,7 +1861,7 @@ jhw_pr_body_cleanup_finish() {
 }
 
 jhw_pr_apply_new_pr_policy() {
-  local mode="$1" rc=0
+  local mode="${1}" rc=0
   jhw_pr_preflight_new_pr_title || return
   jhw_pr_body_cleanup_install || return 2
   if jhw_pr_snapshot_new_pr_body "$JHW_PR_BODY_FILE"; then
@@ -1874,8 +1874,8 @@ jhw_pr_apply_new_pr_policy() {
 }
 
 jhw_pr_apply_new_pr_policy_with_snapshot() {
-  local mode="$1" local_head actual_local_head draft expected_base workflow_trigger_event created_pr_url
-  local body_snapshot="$2"
+  local mode="${1}" local_head actual_local_head draft expected_base workflow_trigger_event created_pr_url
+  local body_snapshot="${2}"
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
   case "$mode" in
     request|auto) workflow_trigger_event=pull_request ;;
@@ -1909,7 +1909,7 @@ jhw_pr_apply_new_pr_policy_with_snapshot() {
 }
 
 jhw_pr_apply_existing_pr_policy() {
-  local mode="$1" expected_local_head="$2"
+  local mode="${1}" expected_local_head="${2}"
   local remote_head remote_base actual_local_head expected_base workflow_trigger_event draft label_refresh='' plan_transport auto_enabled
   case "$mode" in request|skip|auto) ;; *) echo "invalid review mode" >&2; return 2 ;; esac
   [[ "${PR:-}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR" >&2; return 2; }
@@ -2060,7 +2060,7 @@ ship_now_epoch() {
 }
 
 ship_timestamp_epoch() {
-  local value="$1"
+  local value="${1}"
   [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
   date -u -d "$value" +%s 2>/dev/null ||
     date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$value" +%s 2>/dev/null
@@ -2068,13 +2068,13 @@ ship_timestamp_epoch() {
 
 ship_at_or_after() {
   local value_epoch boundary_epoch
-  value_epoch="$(ship_timestamp_epoch "$1")" || return 1
-  boundary_epoch="$(ship_timestamp_epoch "$2")" || return 1
+  value_epoch="$(ship_timestamp_epoch "${1}")" || return 1
+  boundary_epoch="$(ship_timestamp_epoch "${2}")" || return 1
   (( value_epoch >= boundary_epoch ))
 }
 
 jhw_pr_app_snapshot() {
-  local reviewer="$1" head="$2" diff_hash metrics snapshot approve_token override_token
+  local reviewer="${1}" head="${2}" diff_hash metrics snapshot approve_token override_token
   [[ "$reviewer" == codex || "$reviewer" == gemini-code-assist ]] || return 2
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
   [[ "$ROUND_BASE_OID" =~ ^[0-9a-f]{40}$ ]] || return 2
@@ -2141,7 +2141,7 @@ jhw_pr_app_comment_rows() {
 }
 
 jhw_pr_app_budget_load() {
-  local reviewer="$1" actor="$2" raw parsed now_epoch
+  local reviewer="${1}" actor="${2}" raw parsed now_epoch
   local attempts completed provider_failures timeouts pending remaining novelty elapsed expired_pending extra
   now_epoch="$(ship_now_epoch)" || return 1
   raw="$(jhw_pr_app_comment_rows 2>/dev/null)" || return 1
@@ -2266,21 +2266,21 @@ jhw_pr_app_budget_load() {
 }
 
 jhw_pr_app_budget_blocked() {
-  JHW_PR_APP_BUDGET_STATUS="$1"
-  JHW_PR_APP_REQUEST_STATUS="$1"
-  JHW_PR_APP_REQUEST_REASON="$2"
+  JHW_PR_APP_BUDGET_STATUS="${1}"
+  JHW_PR_APP_REQUEST_STATUS="${1}"
+  JHW_PR_APP_REQUEST_REASON="${2}"
   JHW_PR_APP_REQUEST_COMMENT_ID=""
   JHW_PR_APP_REQUESTED_AT=""
   JHW_PR_APP_REQUEST_BASE_OID=""
   JHW_PR_APP_REQUEST_CREATED=false
   export JHW_PR_APP_BUDGET_STATUS JHW_PR_APP_REQUEST_REASON
-  echo "$1: $2; ${JHW_PR_APP_BUDGET_SUMMARY:-budget unavailable}" >&2
+  echo "${1}: ${2}; ${JHW_PR_APP_BUDGET_SUMMARY:-budget unavailable}" >&2
   return 4
 }
 
 jhw_pr_app_budget_gate() {
-  local reviewer="$1" actor="$2" expected reason reason_bytes request_id
-  jhw_pr_app_snapshot "$reviewer" "$3" || return 1
+  local reviewer="${1}" actor="${2}" expected reason reason_bytes request_id
+  jhw_pr_app_snapshot "$reviewer" "${3}" || return 1
   jhw_pr_app_budget_load "$reviewer" "$actor" || {
     jhw_pr_app_request_failed budget_ledger_invalid
     return
@@ -2353,17 +2353,17 @@ jhw_pr_app_budget_gate() {
 
 jhw_pr_app_request_failed() {
   JHW_PR_APP_REQUEST_STATUS=TRIGGER_FAILED
-  JHW_PR_APP_REQUEST_REASON="$1"
+  JHW_PR_APP_REQUEST_REASON="${1}"
   JHW_PR_APP_REQUEST_COMMENT_ID=""
   JHW_PR_APP_REQUESTED_AT=""
   JHW_PR_APP_REQUEST_BASE_OID=""
   JHW_PR_APP_REQUEST_CREATED=false
-  echo "TRIGGER_FAILED: $1" >&2
+  echo "TRIGGER_FAILED: ${1}" >&2
   return 1
 }
 
 jhw_pr_request_app_review() {
-  local reviewer="$1" head="$2" command actor marker body endpoint query raw line attempt_state approval_token
+  local reviewer="${1}" head="${2}" command actor marker body endpoint query raw line attempt_state approval_token
   local id created_at extra
   local -a matches=()
 
@@ -2494,7 +2494,7 @@ $marker
 }
 
 jhw_pr_record_app_review_result() {
-  local reviewer="$1" request_id="$2" status="$3" reason="$4" blocking_count="$5" finding_digest="$6"
+  local reviewer="${1}" request_id="${2}" status="${3}" reason="${4}" blocking_count="${5}" finding_digest="${6}"
   local actor endpoint raw parsed action head base_oid diff_hash snapshot requested_at elapsed state_b64 body
   [[ "$reviewer" != gemini-assist ]] || reviewer=gemini-code-assist
   [[ "$reviewer" == codex || "$reviewer" == gemini-code-assist ]] || return 2
@@ -2624,7 +2624,7 @@ ship_write_codex_trigger_state() {
 }
 
 jhw_pr_request_eligible_apps() {
-  local head="$1" eligible="$2" reviewer status reason comment_id requested_at base_oid created request_rc
+  local head="${1}" eligible="${2}" reviewer status reason comment_id requested_at base_oid created request_rc
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
   if grep -Fqx -- codex <<<"$eligible"; then
     case "${JHW_PR_CODEX_APP_ACTOR:-$SHIP_CODEX_LOGIN}" in
@@ -2679,7 +2679,7 @@ jhw_pr_request_eligible_apps() {
 }
 
 jhw_pr_verified_head_ref() {
-  local head="$1" raw remote_head head_ref is_cross extra verified_ref
+  local head="${1}" raw remote_head head_ref is_cross extra verified_ref
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 2
   raw="$(gh pr view "$PR" --repo "$REPO_NWO" \
     --json headRefOid,headRefName,isCrossRepository \
@@ -2693,7 +2693,7 @@ jhw_pr_verified_head_ref() {
 
 ship_codex_trigger_failed() {
   SHIP_CODEX_TRIGGER_STATUS=TRIGGER_FAILED
-  SHIP_CODEX_TRIGGER_REASON="$1"
+  SHIP_CODEX_TRIGGER_REASON="${1}"
   SHIP_CODEX_REQUEST_COMMENT_ID=""
   SHIP_CODEX_REQUESTED_AT=""
   SHIP_CODEX_TARGET_HEAD="$ROUND_HEAD"
@@ -2729,7 +2729,7 @@ ship_codex_trigger() {
 }
 
 ship_workflow_trigger() {
-  local workflow_name="$1" endpoint raw start_epoch pushed_epoch now_epoch elapsed floor expected_event
+  local workflow_name="${1}" endpoint raw start_epoch pushed_epoch now_epoch elapsed floor expected_event
   local run_id attempt run_number name head created_at status conclusion event extra
   local selected_id="" selected_number=0 selected_created="" ambiguous=false
 
@@ -2836,7 +2836,7 @@ ship_workflow_trigger() {
 }
 
 ship_workflow_budget_decision() {
-  local reviewer="$1" run_id="$2" run_attempt="$3" raw decision
+  local reviewer="${1}" run_id="${2}" run_attempt="${3}" raw decision
   SHIP_WORKFLOW_BUDGET_DECISION=""
   SHIP_WORKFLOW_BUDGET_ACTION=""
   case "$reviewer" in claude|gemini|opencode) ;; *) return 2 ;; esac
@@ -2881,7 +2881,7 @@ process.stdout.write(last.decision);
 # reason read from evidence bound to this run, and only when nothing still needs its review. The
 # report row is appended. JHW_PR_AVAILABLE_WORKFLOWS is untouched, so the next round plans it again.
 ship_workflow_exclude_unavailable() {
-  local reviewer="$1" run_id="$2" run_attempt="$3" reason="${SHIP_WORKFLOW_PROVIDER_REASON:-}"
+  local reviewer="${1}" run_id="${2}" run_attempt="${3}" reason="${SHIP_WORKFLOW_PROVIDER_REASON:-}"
   jhw_pr_unavailable_reason_allowed "$reviewer" "$reason" || return 3
   # A workflow change can itself make a review fail, so it disables every exclusion.
   git diff --quiet "$ROUND_BASE_OID" "$ROUND_HEAD" -- .github/workflows .github/workflow-config.yml || return 3
@@ -2893,7 +2893,7 @@ ship_workflow_exclude_unavailable() {
 }
 
 ship_gemini_provider_failure() {
-  local run_id="$1" run_attempt="$2" dir file line='' status=3 raw entries
+  local run_id="${1}" run_attempt="${2}" dir file line='' status=3 raw entries
   SHIP_WORKFLOW_PROVIDER_REASON=provider_failed
   [[ "$run_id" =~ ^[1-9][0-9]*$ && "$run_attempt" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "${ROUND_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || return 2
@@ -2976,7 +2976,7 @@ if (state.schema !== 3 || state.reviewer !== "gemini" || String(state.pr) !== pr
 }
 
 ship_opencode_provider_failure() {
-  local run_id="$1" run_attempt="$2" raw reason
+  local run_id="${1}" run_attempt="${2}" raw reason
   SHIP_WORKFLOW_PROVIDER_REASON=provider_failed
   [[ "$run_id" =~ ^[1-9][0-9]*$ && "$run_attempt" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "${ROUND_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || return 2
@@ -3030,11 +3030,11 @@ process.stdout.write(reason[1]);
 }
 
 ship_codex_author_matches() {
-  [[ "$1" == "$SHIP_CODEX_LOGIN" ]]
+  [[ "${1}" == "$SHIP_CODEX_LOGIN" ]]
 }
 
 ship_codex_body_is_blocking() {
-  local encoded="$1"
+  local encoded="${1}"
   printf '%s' "$encoded" | node -e '
 const fs = require("node:fs");
 const pattern = process.argv[1];
@@ -3104,7 +3104,7 @@ process.exit(1);
 }
 
 ship_codex_body_is_failure() {
-  local encoded="$1"
+  local encoded="${1}"
   printf '%s' "$encoded" | node -e '
 const fs = require("node:fs");
 const encoded = fs.readFileSync(0, "utf8");
@@ -3127,15 +3127,15 @@ const normalize = (line) => {
     previous = normalized;
     normalized = normalized.replace(
       /(\*{1,3}|_{1,3})(\S(?:[\s\S]*?\S)?)\1/g,
-      "$2",
+      (_whole, _marker, content) => content,
     );
   } while (normalized !== previous);
   normalized = normalized
     .replace(/\bI(?:\x27|’)m\b/gi, "I am")
-    .replace(/\b(we|you|they)(?:\x27|’)re\b/gi, "$1 are")
-    .replace(/\b(I|we|you|they)(?:\x27|’)ve\b/gi, "$1 have")
+    .replace(/\b(we|you|they)(?:\x27|’)re\b/gi, (_whole, subject) => subject + " are")
+    .replace(/\b(I|we|you|they)(?:\x27|’)ve\b/gi, (_whole, subject) => subject + " have")
     .replace(/\bcan(?:\x27|’)t\b/gi, "cannot")
-    .replace(/\b(could|was|is|has|had|are|were|have)n(?:\x27|’)t\b/gi, "$1 not");
+    .replace(/\b(could|was|is|has|had|are|were|have)n(?:\x27|’)t\b/gi, (_whole, subject) => subject + " not");
   return normalized.trim();
 };
 const failureEnd = String.raw`(?:[.!]|$)`;
@@ -3190,7 +3190,7 @@ process.exit(hasUncorrectedFailure ? 0 : 1);
 }
 
 ship_codex_signal_event() {
-  local source="$1" safe_id="$2" group="$3" occurred_at="$4" outcome="$5"
+  local source="${1}" safe_id="${2}" group="${3}" occurred_at="${4}" outcome="${5}"
   case "$source" in
     review|pull_comment|issue_comment|issue_reaction|comment_reaction) ;;
     *) return 2 ;;
@@ -3551,7 +3551,7 @@ ship_codex_signal_status() {
 }
 
 ship_signal_dirs_match() {
-  local logical_dir="$1" physical_dir="$2" platform="$3"
+  local logical_dir="${1}" physical_dir="${2}" platform="${3}"
   [[ -n "$logical_dir" && -n "$physical_dir" ]] || return 2
   [[ "$logical_dir" == "$physical_dir" ]] && return 0
   [[ "$platform" == Darwin ]] || return 1
@@ -3605,7 +3605,7 @@ ship_signal_file_prepare() {
 }
 
 ship_signal_file_cleanup() {
-  local signal_file="$1" signal_dir="$2" parent base
+  local signal_file="${1}" signal_dir="${2}" parent base
   [[ -n "$signal_file" && -n "$signal_dir" && "$signal_dir" == /* && "$signal_dir" != / ]] || return 2
   parent="${signal_file%/*}"
   base="${signal_file##*/}"
@@ -3627,7 +3627,7 @@ ship_signal_cleanup_all() {
 }
 
 ship_signal_trap_handler_from_spec() {
-  local spec="$1" signal="$2" expected
+  local spec="${1}" signal="${2}" expected
   case "$signal" in
     EXIT) expected=EXIT ;;
     HUP) expected=SIGHUP ;;
@@ -3640,12 +3640,12 @@ ship_signal_trap_handler_from_spec() {
   # `spec` comes only from Bash `trap -p`; eval reconstructs its shell-quoted argv.
   eval "set -- $spec"
   (( $# == 2 )) || return 1
-  [[ "$2" == "$expected" ]] || return 1
-  printf '%s' "$1"
+  [[ "${2}" == "$expected" ]] || return 1
+  printf '%s' "${1}"
 }
 
 ship_signal_current_trap_spec() {
-  local signal="$1" spec
+  local signal="${1}" spec
   case "$signal" in EXIT|HUP|INT|TERM) ;; *) return 2 ;; esac
   spec="$(trap -p "$signal")" || return 1
   if [[ -n "$spec" ]]; then
@@ -3655,7 +3655,7 @@ ship_signal_current_trap_spec() {
 }
 
 ship_signal_restore_trap_spec() {
-  local spec="$1" signal="$2"
+  local spec="${1}" signal="${2}"
   case "$signal" in EXIT|HUP|INT|TERM) ;; *) return 2 ;; esac
   if [[ -n "$spec" ]]; then
     ship_signal_trap_handler_from_spec "$spec" "$signal" >/dev/null || return 1
@@ -3676,7 +3676,7 @@ ship_signal_restore_traps() {
 }
 
 ship_signal_cleanup_on_exit() {
-  local status="$1" previous_spec="${SHIP_SIGNAL_PREV_EXIT_TRAP:-}"
+  local status="${1}" previous_spec="${SHIP_SIGNAL_PREV_EXIT_TRAP:-}"
   ship_signal_cleanup_all >/dev/null 2>&1 || true
   trap - EXIT HUP INT TERM
   SHIP_SIGNAL_CLEANUP_INSTALLED=false
@@ -3688,7 +3688,7 @@ ship_signal_cleanup_on_exit() {
 }
 
 ship_signal_handle_signal() {
-  local signal="$1" status="$2" previous_spec=''
+  local signal="${1}" status="${2}" previous_spec=''
   case "$signal" in
     HUP) previous_spec="${SHIP_SIGNAL_PREV_HUP_TRAP:-}" ;;
     INT) previous_spec="${SHIP_SIGNAL_PREV_INT_TRAP:-}" ;;
@@ -3804,7 +3804,7 @@ legacy v2 코멘트를 읽을 때도 `jhw_pr_reviewed_receipt "$ROUND_HEAD"`가 
 
 ```bash
 REPO_NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # Owner/Repo (nameWithOwner)
-PR="$1"   # PR 번호
+PR="${1}"   # PR 번호
 BR="$(git rev-parse --abbrev-ref HEAD)"; SHA="$(git rev-parse HEAD)"   # 푸시(생성·재푸시)마다 SHA 재계산 필수
 
 collect() {   # CLEAN/FEEDBACK 분류엔 본문이 필요하므로 reviews/comments는 body 전체를 base64로 수집한다.

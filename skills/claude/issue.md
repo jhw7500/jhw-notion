@@ -175,7 +175,7 @@ NODE
 }
 
 jhw_issue_workflow_enabled() {
-  local workflow_key="$1" config_path="${2-}" root
+  local workflow_key="${1}" config_path="${2-}" root
   case "$workflow_key" in claude|gemini-dispatch) ;; *) return 2 ;; esac
   if [[ -z "$config_path" ]]; then
     root="$(jhw_issue_repo_root)" || return
@@ -229,7 +229,7 @@ jhw_issue_validate_context() {
 }
 
 jhw_issue_validate_change_evidence_body() (
-  local body="$1" evidence_dir validator_path body_path
+  local body="${1}" evidence_dir validator_path body_path
   umask 077
   evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/jhw-issue-evidence.XXXXXXXX")" || return 1
   validator_path="$evidence_dir/validate_change_evidence.py"
@@ -277,7 +277,7 @@ jhw_issue_ensure_review_labels() {
 }
 
 jhw_issue_remote_workflow_eligible() {
-  local workflow="$1" expected_name="$2" metadata content
+  local workflow="${1}" expected_name="${2}" metadata content
   case "$workflow" in claude.yml|gemini-dispatch.yml) ;; *) return 2 ;; esac
   case "$expected_name" in 'Claude Code'|'Gemini Dispatch') ;; *) return 2 ;; esac
   metadata="$(gh api "repos/$REPO_NWO/actions/workflows/$workflow" 2>/dev/null)" || return 1
@@ -407,7 +407,7 @@ process.exit(supportsIssueComment ? 0 : 1);
 }
 
 jhw_issue_is_utc_timestamp() {
-  [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+  [[ "${1}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 }
 
 jhw_issue_codex_canary_response_successful() {
@@ -426,7 +426,7 @@ process.exit(failed ? 1 : 0);
 }
 
 jhw_issue_codex_canary_eligible() {
-  local canary_url="$1" canary_repo canary_issue actor endpoint query raw line
+  local canary_url="${1}" canary_repo canary_issue actor endpoint query raw line
   local request_id request_at extra response_id response_actor response_at response_url response_body identity=""
   local -a requests=()
   [[ -n "$canary_url" ]] || return 1
@@ -478,7 +478,7 @@ jhw_issue_codex_canary_eligible() {
 }
 
 jhw_issue_discover_reviewers() {
-  local mode="$1" auto_enabled="$2" root config_path
+  local mode="${1}" auto_enabled="${2}" root config_path
   local codex_identity="${3-}" codex_identity_supplied=false
   if (( $# >= 3 )); then codex_identity_supplied=true; fi
   case "$mode" in request|skip|auto) ;; *) return 2 ;; esac
@@ -508,7 +508,7 @@ jhw_issue_discover_reviewers() {
 }
 
 jhw_issue_unavailable_reviewers() {
-  local mode="$1" auto_enabled="$2" eligible="$3" reviewer
+  local mode="${1}" auto_enabled="${2}" eligible="${3}" reviewer
   case "$mode" in request|skip|auto) ;; *) return 2 ;; esac
   case "$auto_enabled" in true|false) ;; *) return 2 ;; esac
   [[ "$mode" == request || ( "$mode" == auto && "$auto_enabled" == true ) ]] || return 0
@@ -520,7 +520,7 @@ jhw_issue_unavailable_reviewers() {
 }
 
 jhw_issue_reconcile_and_verify_policy() {
-  local issue="$1" mode="$2" labels has_request=0 has_skip=0
+  local issue="${1}" mode="${2}" labels has_request=0 has_skip=0
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
   labels="$(gh issue view "$issue" --repo "$REPO_NWO" --json labels --jq '.labels[].name')" || return 1
   case "$mode" in
@@ -563,7 +563,7 @@ jhw_issue_reconcile_and_verify_policy() {
 }
 
 jhw_issue_request_reviewer() {
-  local issue="$1" reviewer="$2" command marker body actor endpoint query raw line id created_at extra
+  local issue="${1}" reviewer="${2}" command marker body actor endpoint query raw line id created_at extra
   local -a matches=()
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
   case "$reviewer" in
@@ -609,7 +609,7 @@ $marker"
 }
 
 jhw_issue_create() {
-  local title="$1" body="$2" mode="$3" timeout="$4"
+  local title="${1}" body="${2}" mode="${3}" timeout="${4}"
   local auto_enabled=false reviewers unavailable issue_url issue issue_created_at request_id reviewer
   local codex_identity=""
   JHW_ISSUE_NUMBER=''
@@ -693,11 +693,13 @@ agent harness가 약 60초 간격으로 모든 요청 reviewer가 terminal이거
 workflow run은 `jhw-review-comment-<request_comment_id>`라는 정확한 `display_title`을 가진 경우에만
 그 reviewer 요청의 acknowledgment·failure 좌표로 사용한다. 뒤이은 다른 reviewer/Codex 멘션이 깨운
 같은 이름의 run은 request comment ID가 다르므로 현재 판정에서 제외한다.
+워크플로 파일은 `path`의 `<workflow-file>`과 `<workflow-file>@<ref>` 형식을 모두 받아 정확히
+비교한다. ref가 붙으면 비어 있거나 공백을 포함한 값은 거부한다.
 
 <!-- issue-review-wait-contract:begin -->
 ```bash
 jhw_issue_collect_signals() (
-  local issue="$1" request_comment_id="$2" issue_created_at="$3" snapshot_path="$4"
+  local issue="${1}" request_comment_id="${2}" issue_created_at="${3}" snapshot_path="${4}"
   local actor issue_title signal_dir comments_path reactions_path runs_path
   [[ "$issue" =~ ^[1-9][0-9]*$ ]] || return 2
   [[ "$request_comment_id" =~ ^[1-9][0-9]*$ ]] || return 2
@@ -789,6 +791,7 @@ const snapshot = {
     .map((item) => ({
       id: item?.id,
       name: item?.name,
+      path: item?.path,
       event: item?.event,
       status: item?.status,
       conclusion: item?.conclusion || "null",
@@ -816,7 +819,7 @@ jhw_issue_create_signal_file() {
 }
 
 jhw_issue_cleanup_signal_file() {
-  local file="$1" state_dir="${JHW_ISSUE_STATE_DIR:-${TMPDIR:-/tmp}}"
+  local file="${1}" state_dir="${JHW_ISSUE_STATE_DIR:-${TMPDIR:-/tmp}}"
   [[ -d "$state_dir" && ! -L "$state_dir" ]] || return 1
   [[ "$file" == "$state_dir"/jhw-issue.signal.*.json ]] || return 2
   [[ -f "$file" && ! -L "$file" ]] || return 1
@@ -824,8 +827,8 @@ jhw_issue_cleanup_signal_file() {
 }
 
 jhw_issue_classify_reviewer() {
-  local reviewer="$1" now_epoch="$2" trigger_deadline="$3" review_deadline="$4" signal_file="$5"
-  local expected_bot workflow_name result state response diagnostic extra eligible
+  local reviewer="${1}" now_epoch="${2}" trigger_deadline="${3}" review_deadline="${4}" signal_file="${5}"
+  local expected_bot workflow_path result state response diagnostic extra eligible
   [[ "$now_epoch" =~ ^[0-9]+$ && "$trigger_deadline" =~ ^[0-9]+$ && "$review_deadline" =~ ^[0-9]+$ ]] || return 2
   (( review_deadline >= trigger_deadline )) || return 2
   [[ -f "$signal_file" && ! -L "$signal_file" ]] || return 2
@@ -834,24 +837,24 @@ jhw_issue_classify_reviewer() {
   case "$reviewer" in
     claude)
       expected_bot="${JHW_ISSUE_EXPECTED_CLAUDE_BOT-}"
-      workflow_name='Claude Code'
+      workflow_path='.github/workflows/claude.yml'
       ;;
     gemini)
       expected_bot="${JHW_ISSUE_EXPECTED_GEMINI_BOT-}"
-      workflow_name='Gemini Dispatch'
+      workflow_path='.github/workflows/gemini-dispatch.yml'
       ;;
     codex)
       expected_bot="${JHW_ISSUE_EXPECTED_CODEX_BOT-}"
       [[ -n "$expected_bot" ]] || return 2
-      workflow_name=''
+      workflow_path=''
       ;;
     *) return 2 ;;
   esac
   [[ -z "$expected_bot" || "$expected_bot" =~ ^[A-Za-z0-9_.-]+(\[bot\])?$ ]] || return 2
   result="$(node - "$reviewer" "$now_epoch" "$trigger_deadline" "$review_deadline" \
-    "$expected_bot" "$workflow_name" "$eligible" "$signal_file" <<'NODE'
+    "$expected_bot" "$workflow_path" "$eligible" "$signal_file" <<'NODE'
 const fs = require("node:fs");
-const [reviewer, nowRaw, triggerRaw, reviewRaw, expectedBot, workflowName, eligibleRaw, signalFile] = process.argv.slice(2);
+const [reviewer, nowRaw, triggerRaw, reviewRaw, expectedBot, workflowPath, eligibleRaw, signalFile] = process.argv.slice(2);
 const now = Number(nowRaw);
 const triggerDeadline = Number(triggerRaw);
 const reviewDeadline = Number(reviewRaw);
@@ -925,8 +928,12 @@ const comments = effectiveBot ? laterBotComments.filter((comment) =>
   comment.actor === effectiveBot && !isGeminiAcknowledgment(comment)) : [];
 const reactions = effectiveBot ? snapshot.reactions.filter((reaction) =>
   reaction.actor === effectiveBot && atOrAfterRequest(reaction.created_at)) : [];
-const runs = workflowName === "" ? [] : snapshot.runs.filter((run) =>
-  run.name === workflowName && run.event === "issue_comment" && atOrAfterRequest(run.created_at) &&
+const workflowFile = (value) => {
+  if (typeof value !== "string") return null;
+  return value.match(/^([^@\s]+)(?:@\S+)?$/)?.[1] ?? null;
+};
+const runs = workflowPath === "" ? [] : snapshot.runs.filter((run) =>
+  workflowFile(run.path) === workflowPath && run.event === "issue_comment" && atOrAfterRequest(run.created_at) &&
   run.display_title === expectedRunTitle &&
   (run.triggering_actor === snapshot.request_actor || run.actor === snapshot.request_actor));
 
@@ -982,7 +989,7 @@ const isCurrentRunComment = (comment) => {
   return followsAttemptStart &&
     latestRunReference?.test(comment.body || "") === true;
 };
-const awaitingWorkflowRun = workflowName !== "" && latestRunEpoch === null;
+const awaitingWorkflowRun = workflowPath !== "" && latestRunEpoch === null;
 const currentComments = awaitingWorkflowRun
   ? []
   : latestRunEpoch === null
@@ -1090,7 +1097,7 @@ jhw_issue_create_state_file() {
 }
 
 jhw_issue_render_summary() {
-  local issue_url="$1" state_file="$2" issue_repo
+  local issue_url="${1}" state_file="${2}" issue_repo
   if [[ "$issue_url" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/[1-9][0-9]*$ ]]; then
     issue_repo="${BASH_REMATCH[1]}"
   else
@@ -1150,7 +1157,7 @@ NODE
 }
 
 jhw_issue_cleanup_state_file() {
-  local state_file="$1" state_dir="${JHW_ISSUE_STATE_DIR:-${TMPDIR:-/tmp}}"
+  local state_file="${1}" state_dir="${JHW_ISSUE_STATE_DIR:-${TMPDIR:-/tmp}}"
   local parent base
   [[ -n "${JHW_ISSUE_STATE_FILE:-}" && "$state_file" == "$JHW_ISSUE_STATE_FILE" ]] || return 2
   parent="${state_file%/*}"
@@ -1190,7 +1197,7 @@ jhw_issue_cleanup_execution_files() {
 }
 
 jhw_issue_trap_handler_from_spec() {
-  local spec="$1" signal="$2" expected
+  local spec="${1}" signal="${2}" expected
   case "$signal" in
     EXIT) expected=EXIT ;;
     HUP) expected=SIGHUP ;;
@@ -1203,12 +1210,12 @@ jhw_issue_trap_handler_from_spec() {
   # `spec` comes only from Bash `trap -p`; eval reconstructs its shell-quoted argv.
   eval "set -- $spec"
   (( $# == 2 )) || return 1
-  [[ "$2" == "$expected" ]] || return 1
-  printf '%s' "$1"
+  [[ "${2}" == "$expected" ]] || return 1
+  printf '%s' "${1}"
 }
 
 jhw_issue_current_trap_spec() {
-  local signal="$1" spec
+  local signal="${1}" spec
   case "$signal" in EXIT|HUP|INT|TERM) ;; *) return 2 ;; esac
   spec="$(trap -p "$signal")" || return 1
   if [[ -n "$spec" ]]; then
@@ -1218,7 +1225,7 @@ jhw_issue_current_trap_spec() {
 }
 
 jhw_issue_restore_trap_spec() {
-  local spec="$1" signal="$2"
+  local spec="${1}" signal="${2}"
   case "$signal" in EXIT|HUP|INT|TERM) ;; *) return 2 ;; esac
   if [[ -n "$spec" ]]; then
     jhw_issue_trap_handler_from_spec "$spec" "$signal" >/dev/null || return 1
@@ -1239,7 +1246,7 @@ jhw_issue_restore_execution_traps() {
 }
 
 jhw_issue_cleanup_on_exit() {
-  local status="$1" previous_spec="${JHW_ISSUE_PREV_EXIT_TRAP:-}"
+  local status="${1}" previous_spec="${JHW_ISSUE_PREV_EXIT_TRAP:-}"
   jhw_issue_cleanup_execution_files >/dev/null 2>&1 || true
   trap - EXIT HUP INT TERM
   JHW_ISSUE_EXECUTION_CLEANUP_INSTALLED=false
@@ -1251,7 +1258,7 @@ jhw_issue_cleanup_on_exit() {
 }
 
 jhw_issue_handle_execution_signal() {
-  local signal="$1" status="$2" previous_spec=''
+  local signal="${1}" status="${2}" previous_spec=''
   case "$signal" in
     HUP) previous_spec="${JHW_ISSUE_PREV_HUP_TRAP:-}" ;;
     INT) previous_spec="${JHW_ISSUE_PREV_INT_TRAP:-}" ;;
@@ -1291,7 +1298,7 @@ jhw_issue_clear_execution_cleanup() {
 }
 
 jhw_issue_initialize_state_file() {
-  local state_file="$1"
+  local state_file="${1}"
   [[ -n "${JHW_ISSUE_STATE_FILE:-}" && "$state_file" == "$JHW_ISSUE_STATE_FILE" ]] || return 2
   [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
   JHW_ISSUE_INIT_NUMBER="$JHW_ISSUE_NUMBER" \
@@ -1365,7 +1372,7 @@ NODE
 }
 
 jhw_issue_state_metadata() {
-  local state_file="$1"
+  local state_file="${1}"
   [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
   node - "$state_file" <<'NODE'
 const fs = require("node:fs");
@@ -1377,7 +1384,7 @@ NODE
 }
 
 jhw_issue_pending_requests() {
-  local state_file="$1"
+  local state_file="${1}"
   [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
   node - "$state_file" <<'NODE'
 const fs = require("node:fs");
@@ -1393,7 +1400,7 @@ NODE
 }
 
 jhw_issue_update_result() {
-  local state_file="$1" reviewer="$2" status="$3" response="$4" diagnostic="$5"
+  local state_file="${1}" reviewer="${2}" status="${3}" response="${4}" diagnostic="${5}"
   [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
   node - "$state_file" "$reviewer" "$status" "$response" "$diagnostic" <<'NODE'
 const fs = require("node:fs");
@@ -1412,7 +1419,7 @@ NODE
 }
 
 jhw_issue_pending_count() {
-  local state_file="$1"
+  local state_file="${1}"
   [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
   node - "$state_file" <<'NODE'
 const fs = require("node:fs");
@@ -1423,7 +1430,7 @@ NODE
 }
 
 jhw_issue_fail_pending() {
-  local state_file="$1" diagnostic="$2" pending reviewer request_id
+  local state_file="${1}" diagnostic="${2}" pending reviewer request_id
   pending="$(jhw_issue_pending_requests "$state_file")" || return 1
   while IFS=$'\t' read -r reviewer request_id; do
     [[ -n "$reviewer" ]] || continue
@@ -1432,7 +1439,7 @@ jhw_issue_fail_pending() {
 }
 
 jhw_issue_poll_once() {
-  local state_file="$1" trigger_deadline="$2" review_deadline="$3"
+  local state_file="${1}" trigger_deadline="${2}" review_deadline="${3}"
   local metadata issue issue_url issue_created_at extra pending reviewer request_id signal_file now_epoch remaining update_status
   [[ "$trigger_deadline" =~ ^[0-9]+$ && "$review_deadline" =~ ^[0-9]+$ ]] || return 2
   metadata="$(jhw_issue_state_metadata "$state_file")" || return 1
@@ -1474,7 +1481,7 @@ jhw_issue_poll_once() {
 }
 
 jhw_issue_execute() {
-  local title="$1" body="$2" mode="$3" timeout="$4"
+  local title="${1}" body="${2}" mode="${3}" timeout="${4}"
   local start_epoch trigger_deadline review_deadline interval poll_status render_status=0
   interval="${JHW_ISSUE_POLL_SECONDS:-60}"
   case "$interval" in

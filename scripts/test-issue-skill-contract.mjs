@@ -390,6 +390,7 @@ if (endpoint === "repos/example/repo/actions/runs") {
     process.stdout.write(JSON.stringify([{ workflow_runs: state.runs.map((item) => ({
       id: item.id,
       name: item.name,
+      path: item.path,
       event: item.event,
       status: item.status,
       conclusion: item.conclusion,
@@ -407,6 +408,7 @@ if (endpoint === "repos/example/repo/actions/runs") {
   process.stdout.write(JSON.stringify(state.runs.map((item) => ({
     id: item.id,
     name: item.name,
+    path: item.path,
     event: item.event,
     status: item.status,
     conclusion: item.conclusion,
@@ -490,6 +492,11 @@ function issueState(overrides = {}) {
 
 async function main() {
   const issueText = await readFile(canonicalIssue, "utf8");
+  for (const args of [["--no-review", "--repo"], ["--review", "--timeout", "20", "a", "b", "c", "d", "e", "f"]]) {
+    const rendered = issueText.replace(/\$([1-9])/g, (token, index) => args[Number(index) - 1] ?? token);
+    assert.ok(rendered === issueText,
+      "slash-command argument substitution must preserve the executable Issue contract bytes");
+  }
   const installSafetyText = await readFile(installSafetyPath, "utf8");
   const agentsText = await readFile(agentsPath, "utf8");
   const readmeText = await readFile(readmePath, "utf8");
@@ -529,8 +536,8 @@ async function main() {
     "standalone Issue requests must use the pinned Gemini dispatcher command");
   assert.doesNotMatch(issueText, /gemini\) command='@gemini /,
     "the unsupported @gemini command must not be emitted");
-  assert.match(issueText, /workflow_name='Claude Code'/);
-  assert.match(issueText, /workflow_name='Gemini Dispatch'/);
+  assert.match(issueText, /workflow_path='\.github\/workflows\/claude\.yml'/);
+  assert.match(issueText, /workflow_path='\.github\/workflows\/gemini-dispatch\.yml'/);
   assert.match(issueText, /jhw_issue_execute\(\)/,
     "the public Issue command must connect creation to bounded review waiting");
   assert.doesNotMatch(issueText, /JHW_ISSUE_(?:COMMENT|REACTION|RUN)_PAGES_JSON=/,
@@ -1223,7 +1230,8 @@ async function main() {
         issueCommentPages: state.issueCommentPages?.map((page) => page.map(decorate)),
         runs: [{
           id: runId,
-          name: reviewer === "claude" ? "Claude Code" : "Gemini Dispatch",
+          name: "jhw-review-comment-1001",
+          path: reviewer === "claude" ? ".github/workflows/claude.yml" : ".github/workflows/gemini-dispatch.yml",
           event: "issue_comment",
           status: "completed",
           conclusion: "success",
@@ -1267,6 +1275,56 @@ async function main() {
     );
     assert.equal(clean.stdout.split("\n")[0], "CLEAN");
     assert.match(clean.stdout, /issuecomment-1002/);
+
+    for (const reviewer of ["claude", "gemini"]) {
+      const waiting = bindDefaultWorkflowRun(issueState({
+        issueExists: true,
+        issueComments: [{
+          ...requestComment,
+          body: reviewer === "claude" ? requestComment.body : requestComment.body
+            .replace("@claude", "@gemini-cli").replace("reviewer=claude", "reviewer=gemini"),
+        }],
+      }), reviewer);
+      waiting.runs[0].status = "in_progress";
+      waiting.runs[0].conclusion = null;
+      const acknowledgedRun = await classify(waiting, reviewer, triggerDeadline + 1);
+      assert.equal(acknowledgedRun.stdout.split("\n")[0], "PENDING",
+        `${reviewer}: the request-scoped workflow path must acknowledge a run after the trigger deadline`);
+      assert.match(acknowledgedRun.stdout, /acknowledged/);
+    }
+
+    for (const reviewer of ["claude", "gemini"]) {
+      const workflow = reviewer === "claude" ? ".github/workflows/claude.yml" : ".github/workflows/gemini-dispatch.yml";
+      const otherWorkflow = reviewer === "claude" ? ".github/workflows/gemini-dispatch.yml" : ".github/workflows/claude.yml";
+      const scopedRequest = {
+        ...requestComment,
+        body: reviewer === "claude" ? requestComment.body : requestComment.body
+          .replace("@claude", "@gemini-cli").replace("reviewer=claude", "reviewer=gemini"),
+      };
+      const stateForPath = (path) => {
+        const state = bindDefaultWorkflowRun(issueState({
+          issueExists: true,
+          issueComments: [scopedRequest, response("No blockers found.")],
+        }), reviewer);
+        state.runs[0].path = path;
+        return state;
+      };
+      const overrides = { JHW_ISSUE_EXPECTED_GEMINI_BOT: expectedBot };
+      for (const suffix of ["", "@main", "@refs/heads/release", "@refs/pull/42/merge"]) {
+        const accepted = await classify(stateForPath(workflow + suffix), reviewer, triggerDeadline + 1, overrides);
+        assert.equal(accepted.stdout.split("\n")[0], "CLEAN",
+          `${reviewer}: accept the exact workflow file with or without an API ref suffix`);
+      }
+      for (const path of [undefined, null, "", `${workflow}@`, `${workflow}@ `,
+        `${workflow}-other@main`, otherWorkflow, `${otherWorkflow}@main`, ".github/workflows/foreign.yml"]) {
+        const unrelated = stateForPath(path);
+        unrelated.runs[0].name = reviewer === "claude" ? "Claude Code" : "Gemini Dispatch";
+        const rejected = await classify(unrelated, reviewer, triggerDeadline + 1, overrides);
+        assert.equal(rejected.stdout.split("\n")[0], "FAILED",
+          "a familiar run name must not authorize a missing, malformed or different workflow path");
+        assert.match(rejected.stdout, /trigger_unacknowledged/);
+      }
+    }
 
     for (const verdict of ["No findings.", "No issues found."]) {
       const explicitNoFindings = await classify(
@@ -1326,7 +1384,8 @@ async function main() {
         issueComments: [requestComment, response("No blockers found.")],
         runs: [{
           id: 499,
-          name: "Claude Code",
+          name: "jhw-review-comment-9999",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "completed",
           conclusion: "success",
@@ -1371,7 +1430,8 @@ async function main() {
         ],
         runs: [{
           id: 500,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "completed",
           conclusion: "success",
@@ -1401,7 +1461,8 @@ async function main() {
         ],
         runs: [{
           id: 500,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "in_progress",
           conclusion: "null",
@@ -1421,7 +1482,8 @@ async function main() {
 
     const retryRun = {
       id: 500,
-      name: "Claude Code",
+      name: "jhw-review-comment-1001",
+      path: ".github/workflows/claude.yml",
       event: "issue_comment",
       status: "completed",
       conclusion: "success",
@@ -1500,7 +1562,8 @@ async function main() {
         ],
         runs: [{
           id: 500,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "in_progress",
           conclusion: "null",
@@ -1537,7 +1600,8 @@ async function main() {
           ],
           runs: [{
             id: 500,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "in_progress",
             conclusion: "null",
@@ -1573,7 +1637,8 @@ async function main() {
           ],
           runs: [{
             id: 500,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "in_progress",
             conclusion: "null",
@@ -1605,7 +1670,8 @@ async function main() {
         runs: [
           {
             id: 499,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "success",
@@ -1617,7 +1683,8 @@ async function main() {
           },
           {
             id: 500,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "in_progress",
             conclusion: "null",
@@ -1759,7 +1826,8 @@ async function main() {
         issueComments: [requestComment],
         runs: [{
           id: 501,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "completed",
           conclusion: "failure",
@@ -1783,7 +1851,8 @@ async function main() {
         runs: [
           {
             id: 508,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "in_progress",
             conclusion: "null",
@@ -1795,7 +1864,8 @@ async function main() {
           },
           {
             id: 509,
-            name: "Claude Code",
+            name: "jhw-review-comment-1002",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "failure",
@@ -1829,7 +1899,8 @@ async function main() {
         runs: [
           {
             id: 508,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "success",
@@ -1841,7 +1912,8 @@ async function main() {
           },
           {
             id: 509,
-            name: "Claude Code",
+            name: "jhw-review-comment-1002",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "success",
@@ -1877,7 +1949,8 @@ async function main() {
         ],
         runs: [{
           id: 508,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "completed",
           conclusion: "success",
@@ -1914,7 +1987,8 @@ async function main() {
         runs: [
           {
             id: 504,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "failure",
@@ -1926,7 +2000,8 @@ async function main() {
           },
           {
             id: 505,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "success",
@@ -1952,7 +2027,8 @@ async function main() {
         runs: [
           {
             id: 506,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "failure",
@@ -1964,7 +2040,8 @@ async function main() {
           },
           {
             id: 507,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "in_progress",
             conclusion: "null",
@@ -1989,7 +2066,8 @@ async function main() {
         issueComments: [requestComment],
         runs: [{
           id: 503,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "completed",
           conclusion: "failure",
@@ -2014,7 +2092,8 @@ async function main() {
           issueComments: [requestComment],
           runs: [{
             id: "9007199254740993",
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "in_progress",
             conclusion: "null",
@@ -2041,7 +2120,8 @@ async function main() {
         issueComments: [requestComment],
         runs: [{
           id: 502,
-          name: "Claude Code",
+          name: "jhw-review-comment-9999",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "completed",
           conclusion: "failure",
@@ -2320,19 +2400,21 @@ async function main() {
         runs: [
           ...Array.from({ length: 900 }, (_, index) => ({
             id: 3000 + index,
-            name: "Claude Code",
+            name: `jhw-review-comment-${7000 + index}`,
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "success",
             createdAt: "2026-09-01T00:02:00Z",
             url: `https://github.com/example/repo/actions/runs/${3000 + index}`,
-            displayTitle: `Other Issue ${index}`,
+            displayTitle: `jhw-review-comment-${7000 + index}`,
             actor: "jhw7500",
             triggeringActor: "jhw7500",
           })),
           {
             id: 5000,
-            name: "Claude Code",
+            name: "jhw-review-comment-1001",
+            path: ".github/workflows/claude.yml",
             event: "issue_comment",
             status: "completed",
             conclusion: "success",
@@ -2488,7 +2570,8 @@ async function main() {
     const executeRuns = [
       {
         id: 6101,
-        name: "Claude Code",
+        name: "jhw-review-comment-1001",
+        path: ".github/workflows/claude.yml",
         event: "issue_comment",
         status: "completed",
         conclusion: "success",
@@ -2500,7 +2583,8 @@ async function main() {
       },
       {
         id: 6102,
-        name: "Gemini Dispatch",
+        name: "jhw-review-comment-1002",
+        path: ".github/workflows/gemini-dispatch.yml",
         event: "issue_comment",
         status: "completed",
         conclusion: "success",
@@ -2537,7 +2621,8 @@ async function main() {
         })],
         runs: [{
           id: 6201,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "completed",
           conclusion: "success",
@@ -2573,7 +2658,8 @@ async function main() {
       issueState({
         runs: [{
           id: 601,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "in_progress",
           conclusion: "null",
@@ -2598,7 +2684,8 @@ async function main() {
       issueState({
         runs: [{
           id: 602,
-          name: "Claude Code",
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
           event: "issue_comment",
           status: "in_progress",
           conclusion: "null",

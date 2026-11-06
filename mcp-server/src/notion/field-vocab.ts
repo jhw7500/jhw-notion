@@ -55,10 +55,10 @@ const KB_TAGS_ALLOW = [
   "sed", "grep", "TypeScript", "javascript", "playwright",
   // AI 워크플로우/도구
   "Claude Code", "opencode", "codex", "gemini", "MCP", "Notion", "notion-api",
-  "hooks", "stop-hook", "slash-command", "skill", "automation", "GitHub Actions",
+  "hooks", "stop-hook", "slash-command", "skill", "automation", "GitHub Actions", "claude-config",
   "ci", "code-review", "ultrareview",
   // 패턴/개념
-  "race-condition", "idempotent", "defense-in-depth", "encoding", "security",
+  "race-condition", "idempotent", "defense-in-depth", "encoding", "security", "보안",
   "causality", "deprecated", "pitfall", "verification",
 ] as const;
 

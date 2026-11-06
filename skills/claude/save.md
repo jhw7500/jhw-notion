@@ -33,6 +33,7 @@ argument-hint: "[--db <db>] [--delete <id>] [--hard] [--force-tag] [내용]"
 |---|---|
 | `pim-check` / `pim-test*` | pim-test |
 | `pim-app*` | pim-app |
+| `pim-package*` | pim-app |
 | `pim-driver-cam*` | pim-driver-cam |
 | `pim-driver-spi*` | pim-driver-spi |
 | `wlan-package*` | wlan-app |
