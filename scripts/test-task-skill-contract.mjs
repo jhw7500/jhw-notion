@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,13 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const canonicalTask = join(repoRoot, "skills", "claude", "task.md");
 const codexReference = join(repoRoot, "skills", "codex", "jhw-task", "references", "task.md");
+const canonicalFinishRunner = join(repoRoot, "skills", "claude", "scripts", "task-finish.sh");
+const finishRunnerPaths = {
+  claude: [".claude", "commands", "jhw", "scripts", "task-finish.sh"],
+  codex: [".codex", "skills", "jhw-task", "references", "task-finish.sh"],
+  gemini: [".gemini", "commands", "jhw", "scripts", "task-finish.sh"],
+  opencode: [".config", "opencode", "skills", "jhw", "scripts", "task-finish.sh"],
+};
 const currentTaskId = "tsk-018f1234-5678-7abc-8def-0123456789ab";
 const targetTaskId = "tsk-028f1234-5678-7abc-8def-0123456789ab";
 const currentClaimId = "clm-018f1234-5678-7abc-8def-0123456789ac";
@@ -351,6 +358,14 @@ async function installFakeLauncher(root) {
   return { home, launcher };
 }
 
+async function installFinishRunner(home, adapter = originAdapter) {
+  const installed = join(home, ...finishRunnerPaths[adapter]);
+  await mkdir(dirname(installed), { recursive: true });
+  await copyFile(canonicalFinishRunner, installed);
+  await chmod(installed, 0o755);
+  return installed;
+}
+
 async function installFakeRawControl(root) {
   const bashEnv = join(root, "fake-raw-control.bash");
   await writeFile(bashEnv, fakeRawControlBashEnv);
@@ -525,22 +540,18 @@ async function runStartReportingRecipe(markdown) {
   return JSON.parse(result.stdout);
 }
 
-async function runFinishWorkflow(markdown, { finishInput, finishExit = 0 }) {
+async function runFinishWorkflow(markdown, { finishInput, finishExit = 0, adapter = originAdapter }) {
   const root = await mkdtemp(join(tmpdir(), "jhw-task-finish-contract-"));
   try {
     const log = join(root, "launcher.log");
     const rawLog = join(root, "raw-control.log");
     const checkoutRoot = await createCheckout(root);
     const { home } = await installFakeLauncher(root);
+    const installed = await installFinishRunner(home, adapter);
     const bashEnv = await installFakeRawControl(root);
-    const canonical = optionalLifecycleContractBlock(markdown, "finish");
-    const command = canonical ?? materializeLegacyLifecycle(
-      lifecycleContractBlock(markdown, "finish-standalone"),
-      { status: finishInput.status, finishInput },
-    );
-    const result = await execFileAsync("bash", ["-c", command, "task-finish-contract", ...finishInput.validations], {
+    const result = await execFileAsync("bash", [installed, ...finishInput.validations], {
       cwd: checkoutRoot,
-      env: launcherEnv({ home, log, rawLog, bashEnv, checkoutRoot, finishExit, finishInput }),
+      env: { ...launcherEnv({ home, log, rawLog, bashEnv, checkoutRoot, finishExit, finishInput }), JHW_ORIGIN_ADAPTER: adapter },
     }).then(
       ({ stdout, stderr }) => ({ exitCode: 0, stdout, stderr }),
       (error) => ({ exitCode: error.code, stdout: error.stdout ?? "", stderr: error.stderr ?? "" }),
@@ -563,6 +574,7 @@ async function runSwitchWorkflow(markdown, {
   taskStartError = "",
   invalidTargetRoot = false,
   adversarialTargetRoot = false,
+  missingFinishRunner = false,
   finishInput = makeFinishInput(status),
 }) {
   const root = await mkdtemp(join(tmpdir(), "jhw-task-switch-contract-"));
@@ -574,6 +586,7 @@ async function runSwitchWorkflow(markdown, {
       adversarialTargetRoot ? adversarialCheckoutName : "checkout",
     );
     const { home } = await installFakeLauncher(root);
+    if (!missingFinishRunner) await installFinishRunner(home);
     const bashEnv = await installFakeRawControl(root);
     const targetValue = invalidTargetRoot ? "relative-target" : checkoutRoot;
     const command = composedSwitchCommand(markdown, target, {
@@ -881,7 +894,8 @@ function assertHostOnlyLifecycleContract(label, markdown) {
   }
 }
 
-function assertStaticFinishContract(label, markdown) {
+async function assertStaticFinishContract(label, markdown) {
+  const finishSource = await readFile(canonicalFinishRunner, "utf8");
   const lifecycleBlocks = [
     lifecycleContractBlock(markdown, "finish"),
     lifecycleContractBlock(markdown, "switch-target-root"),
@@ -895,11 +909,11 @@ function assertStaticFinishContract(label, markdown) {
     assert.doesNotMatch(block, /jhw-control-host" preflight|portfolio status|\.env|source [^\n]*/,
       `${label}: lifecycle blocks rely only on launcher hidden preflight`);
   }
-  assert.equal(markdown.match(/finish_args=\(task finish/g)?.length, 1,
+  assert.equal(finishSource.match(/finish_args=\(task finish/g)?.length, 1,
     `${label}: task finish argv builder must have one canonical executable source`);
-  assert.equal(markdown.match(/jhw-control-host" "\$\{finish_args\[@\]\}"/g)?.length, 1,
+  assert.equal(finishSource.match(/jhw-control-host" "\$\{finish_args\[@\]\}"/g)?.length, 1,
     `${label}: absolute host finish invocation must have one canonical executable source`);
-  assert.equal(markdown.match(/case "\$finish_status" in/g)?.length, 1,
+  assert.equal(finishSource.match(/case "\$finish_status" in/g)?.length, 1,
     `${label}: status dispatch must exist only in the canonical finish block`);
   for (const removedMarker of ["finish-standalone", "switch-formal", "switch-temporary", "switch-resume"]) {
     assert.doesNotMatch(markdown, new RegExp(`task-lifecycle-contract: ${removedMarker}:begin`),
@@ -1228,6 +1242,19 @@ async function assertConsumerContract(label, taskPath) {
 }
 
 async function main() {
+  const task = await readFile(canonicalTask, "utf8");
+  const missing = await runSwitchWorkflow(task, {
+    status: "handoff", target: "formal", missingFinishRunner: true,
+  });
+  assert.notEqual(missing.exitCode, 0, "missing installed finish runner must stop before releasing the current Claim");
+  assert.deepEqual(missing.calls, [], "missing runner must neither finish nor start and must not fall back to Markdown code");
+  for (const adapter of Object.keys(finishRunnerPaths)) {
+    const finishInput = makeFinishInput("handoff", { validations: validationValues, nextStep: nextStepValue });
+    const finished = await runFinishWorkflow(task, { finishInput, adapter });
+    assert.equal(finished.exitCode, 0, `${adapter}: installed file execution must succeed without bash -c`);
+    assert.deepEqual(finished.calls, [expectedFinishArgs(finishInput)], `${adapter}: installed runner must preserve exact argv and call once`);
+    assert.deepEqual(finished.rawCalls, []);
+  }
   assertLauncherV3Fixtures();
   await assertStrictLauncherOracle();
   await assertRepeatableTemporaryInputs(canonicalTask);

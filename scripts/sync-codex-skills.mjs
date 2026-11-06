@@ -33,6 +33,10 @@ const EXCLUDED = new Set(["AGENTS.md"]);
 
 // references/<cmd>.md → skills/claude/<cmd>.md (상대 경로 심링크)
 const REF_TARGET = (cmd) => join("..", "..", "..", "claude", `${cmd}.md`);
+const RUNNER_REFERENCES = {
+  issue: ["issue-contract.sh"],
+  task: ["task-finish.sh"],
+};
 
 const checkOnly = process.argv.includes("--check");
 
@@ -168,6 +172,24 @@ for (const file of sources) {
       symlinkSync(REF_TARGET(cmd), refPath);
     }
   }
+
+  for (const runner of RUNNER_REFERENCES[cmd] ?? []) {
+    const sourcePath = join(SRC_DIR, "scripts", runner);
+    const source = lstatSync(sourcePath);
+    if (!source.isFile() || (source.mode & 0o7777) !== 0o755) {
+      throw new Error(`${sourcePath}: 실행 계약은 mode 0755의 일반 파일이어야 합니다`);
+    }
+    const runnerPath = join(dir, "references", runner);
+    const target = join("..", "..", "..", "claude", "scripts", runner);
+    if (symlinkTargetOf(runnerPath) !== target) {
+      drifted.push(`jhw-${cmd}/references/${runner}`);
+      if (!checkOnly) {
+        mkdirSync(join(dir, "references"), { recursive: true });
+        rmSync(runnerPath, { force: true, recursive: true });
+        symlinkSync(target, runnerPath);
+      }
+    }
+  }
 }
 
 // 정본이 사라진 스킬은 남겨두면 삭제된 커맨드가 계속 노출된다.
@@ -193,12 +215,13 @@ for (const name of expected) {
   const cmd = name.slice("jhw-".length);
   const dir = join(OUT_DIR, name);
   const allowed = new Set(["SKILL.md", "references"]);
+  const allowedReferences = new Set([`${cmd}.md`, ...(RUNNER_REFERENCES[cmd] ?? [])]);
 
   for (const entry of readdirSafe(dir)) {
     if (!allowed.has(entry)) orphans.push(`${name}/${entry}`);
   }
   for (const entry of readdirSafe(join(dir, "references"))) {
-    if (entry !== `${cmd}.md`) orphans.push(`${name}/references/${entry}`);
+    if (!allowedReferences.has(entry)) orphans.push(`${name}/references/${entry}`);
   }
 }
 orphans.sort();

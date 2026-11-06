@@ -278,59 +278,27 @@ parent의 required child는 `completed|abandoned` terminal이어야 한다. requ
 
 `PARENT_CHILDREN_INCOMPLETE`, `PARENT_DISPOSITION_REQUIRED`, `PARENT_INTEGRATION_VALIDATION_REQUIRED`, `INVALID_PARENT_COMPLETION`이면 증거나 child 상태를 정확히 수정한 뒤 재실행한다. `COMPLETION_EVIDENCE_CONFLICT`는 같은 Claim에 다른 evidence를 덮어쓰려는 시도다. completed formal finish의 `COMPLETION_EVIDENCE_REQUIRED|COMPLETION_EVIDENCE_MISMATCH`는 현재 Claim과 정확히 일치하는 evidence가 없다는 뜻이다. ordinary `task finish`나 다른 subcommand에 completion evidence flag를 붙이면 `INVALID_CLI_ARGUMENT`다.
 
-아래 block이 standalone과 switch가 함께 사용하는 **유일한 status-sensitive finish contract**다. 수집한 scalar는 shell source에 치환하지 않고 process environment의 각 named value로, validation은 `bash -c <block> lifecycle <validation>...`의 positional argv로 전달한다. 빈 optional value는 환경에서 생략하거나 empty로 전달한다. Handoff의 `--progress`, `--failures`, `--next-step`, `--related-adr-and-evidence`, retained `--source-task-revision`, `--active-work-minutes`는 각각 optional이고 validation은 repeatable이다. 사용자가 제공한 것만 exact 한 argv로 append한다.
+실제 status-sensitive finish contract의 정본은 `skills/claude/scripts/task-finish.sh`이며 standalone과 switch가 같은 설치 파일을 사용한다. 수집한 scalar는 shell source에 치환하지 않고 process environment의 각 named value로, validation은 `bash <설치된 task-finish.sh> <validation>...`의 positional argv로 전달한다. 긴 계약 본문을 복사하거나 `bash -c`로 실행하지 않는다. 현재 도구의 설치 경로는 다음과 같고 Claude 전용 경로를 다른 도구의 fallback으로 사용하지 않는다.
+
+| 도구 | 설치된 실행 파일 |
+|---|---|
+| Claude | `$HOME/.claude/commands/jhw/scripts/task-finish.sh` |
+| Codex | `$HOME/.codex/skills/jhw-task/references/task-finish.sh` |
+| Gemini | `$HOME/.gemini/commands/jhw/scripts/task-finish.sh` |
+| OpenCode | `$HOME/.config/opencode/skills/jhw/scripts/task-finish.sh` |
+
+standalone은 현재 도구의 파일 경로를 확정해 직접 실행한다. 아래 짧은 adapter 선택·실행 block은 switch와 같은 순서·종료코드를 소비하는 기준이다. `JHW_ORIGIN_ADAPTER`는 현재 도구의 `claude|codex|gemini|opencode` 값이며 사용자 문서나 Task 파일에서 추출하지 않는다. 빈 optional value는 환경에서 생략하거나 empty로 전달한다. Handoff의 `--progress`, `--failures`, `--next-step`, `--related-adr-and-evidence`, retained `--source-task-revision`, `--active-work-minutes`는 각각 optional이고 validation은 repeatable이다. 사용자가 제공한 것만 exact 한 argv로 append한다.
 
 <!-- task-lifecycle-contract: finish:begin -->
 ```bash
-finish_status="$JHW_FINISH_STATUS"
-current_task_id="$JHW_CURRENT_TASK_ID"
-current_claim_id="$JHW_CURRENT_CLAIM_ID"
-finish_outcome="${JHW_FINISH_OUTCOME-}"
-source_task_revision="${JHW_SOURCE_TASK_REVISION-}"
-active_work_minutes="${JHW_ACTIVE_WORK_MINUTES-}"
-handoff_progress="${JHW_HANDOFF_PROGRESS-}"
-handoff_failures="${JHW_HANDOFF_FAILURES-}"
-handoff_next_step="${JHW_HANDOFF_NEXT_STEP-}"
-handoff_related_evidence="${JHW_HANDOFF_RELATED_EVIDENCE-}"
-
-test -n "$current_task_id" || exit 1
-test -n "$current_claim_id" || exit 1
-test "$#" -ge 1 || exit 1
-finish_args=(task finish --task "$current_task_id" --claim "$current_claim_id" --status "$finish_status")
-case "$finish_status" in
-  completed)
-    test -n "$finish_outcome" || exit 1
-    test -z "$source_task_revision$handoff_progress$handoff_failures$handoff_next_step$handoff_related_evidence" || exit 1
-    finish_args+=(--outcome "$finish_outcome")
-    ;;
-  handoff)
-    test -z "$finish_outcome" || exit 1
-    if [ -n "$handoff_progress" ]; then finish_args+=(--progress "$handoff_progress"); fi
-    if [ -n "$handoff_failures" ]; then finish_args+=(--failures "$handoff_failures"); fi
-    if [ -n "$handoff_next_step" ]; then finish_args+=(--next-step "$handoff_next_step"); fi
-    if [ -n "$handoff_related_evidence" ]; then
-      finish_args+=(--related-adr-and-evidence "$handoff_related_evidence")
-    fi
-    if [ -n "$source_task_revision" ]; then
-      test "$source_task_revision" != "unknown" || exit 1
-      finish_args+=(--source-task-revision "$source_task_revision")
-    fi
-    ;;
-  abandoned)
-    test -z "$finish_outcome$source_task_revision$handoff_progress$handoff_failures$handoff_next_step$handoff_related_evidence" || exit 1
-    ;;
+case "${JHW_ORIGIN_ADAPTER-}" in
+  claude) finish_script="$HOME/.claude/commands/jhw/scripts/task-finish.sh" ;;
+  codex) finish_script="$HOME/.codex/skills/jhw-task/references/task-finish.sh" ;;
+  gemini) finish_script="$HOME/.gemini/commands/jhw/scripts/task-finish.sh" ;;
+  opencode) finish_script="$HOME/.config/opencode/skills/jhw/scripts/task-finish.sh" ;;
   *) exit 1 ;;
 esac
-
-if [ -n "$active_work_minutes" ]; then
-  finish_args+=(--active-work-minutes "$active_work_minutes")
-fi
-for validation in "$@"; do
-  test -n "$validation" || exit 1
-  finish_args+=(--validation "$validation")
-done
-
-"$HOME/.local/bin/jhw-control-host" "${finish_args[@]}"
+bash "$finish_script" "$@"
 finish_rc=$?
 test "$finish_rc" -eq 0 || exit "$finish_rc"
 ```
@@ -351,7 +319,7 @@ Formal Task의 `--status completed`는 같은 Claim에 기록된 completion evid
 3. **(필요 시) Issue를 먼저 만든다.** 대상 Issue가 아직 없으면 사용자 제공 제목·본문으로 `gh issue create --repo <owner>/<repo>`를 실행하고, 반환된 URL만 authority coordinate로 사용한다. Issue 생성이 실패하면 finish 전이므로 아무것도 변하지 않은 상태다 — 멈추고 보고한다.
 4. **대상의 absolute exact Git root를 finish 전에 검증하고 보존한다.** path가 absolute가 아니거나 `git -C ... rev-parse --show-toplevel` 결과와 exact match하지 않으면 lifecycle call 없이 멈춘다. `--status handoff`이면 `--next-step`에 대상 Issue URL 또는 Task 좌표를 남긴다. 별도 preflight·portfolio lookup은 실행하지 않는다. launcher가 finish/start 각각에서 hidden preflight를 수행한다. finish가 nonzero이면 **start를 실행하지 않고** 멈추며, finish 뒤에 target gate를 다시 실행하지 않는다.
 
-target checkout도 shell source에 치환하지 않고 process environment의 `JHW_TARGET_CHECKOUT` 한 argv value로 전달한다. 다음 shared block을 finish 전에 한 번 실행하고, 이어서 위 canonical finish block 하나와 선택한 start tail 하나를 같은 shell에서 순서대로 compose한다.
+target checkout도 shell source에 치환하지 않고 process environment의 `JHW_TARGET_CHECKOUT` 한 argv value로 전달한다. 다음 shared block을 finish 전에 한 번 실행하고, 이어서 위 adapter 선택·설치 파일 실행 block과 선택한 start tail 하나를 같은 shell에서 순서대로 compose한다. finish 실행 파일이 없거나 nonzero이면 start하지 않으며, 문서 본문이나 raw control 호출로 fallback하지 않는다.
 
 <!-- task-lifecycle-contract: switch-target-root:begin -->
 ```bash

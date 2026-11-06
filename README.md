@@ -269,6 +269,18 @@ consumer가 없는 유지보수 상태를 확인한 뒤 위 배포 절차의 gua
 별도 승인 후 수행한다. Claude Code·Gemini CLI·OpenCode의 디렉터리 링크는
 release 전환 시 새 스킬을 가리킨다.
 
+Issue 생성·리뷰 대기와 Task 종료 계약은 `skills/claude/scripts/issue-contract.sh`와
+`task-finish.sh`에 있다. 긴 shell 코드를 복사하지 않고 설치된 파일을 직접 실행한다.
+Claude·Gemini·OpenCode는 설치된 `jhw/scripts/`, Codex는 각 스킬의 `references/`에서
+같은 실행 파일을 사용한다. 정확한 `$HOME` 경로와 인자는 `skills/claude/issue.md`와
+`skills/claude/task.md`를 따른다. Issue 생성과 대기는 한 프로세스에서 연결되고,
+실제 Task 변경은 계속 `jhw-control-host`가 담당한다. 새 bootstrap 진입점과 공용 HOME 링크는
+추가하지 않는다. helper는 release의 hash·mode 검증 대상이며, helper가 없는 이전 retained
+release의 검증·rollback 계약도 유지한다.
+
+helper 참조 생성은 `node --test scripts/test-skill-runner-references.mjs`로,
+실제 실행 계약은 기존 Issue·Task 스킬 계약 테스트로 검증한다.
+
 PR 리뷰 정책 예시:
 
 ```text

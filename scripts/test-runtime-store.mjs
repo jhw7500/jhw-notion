@@ -101,6 +101,31 @@ test('preparation publishes complete private releases without changing legacy ar
   unchanged(root);
 });
 
+test('skill runner bytes and modes are manifest-bound without requiring them in retained releases', async t => {
+  const root = fixture(t);
+  const retained = await prepare(root);
+  for (const [commandName, runner] of [['issue', 'issue-contract.sh'], ['task', 'task-finish.sh']]) {
+    const source = fs.readFileSync(new URL('../skills/claude/scripts/' + runner, import.meta.url), 'utf8');
+    write(root, 'skills/claude/scripts/' + runner, source, 0o755);
+    const references = path.join(root, 'skills/codex/jhw-' + commandName + '/references');
+    fs.mkdirSync(references, { recursive: true, mode: 0o755 });
+    fs.symlinkSync('../../../claude/scripts/' + runner, path.join(references, runner));
+  }
+  const current = await prepare(root);
+  const published = releasePath(root, current);
+  for (const [commandName, runner] of [['issue', 'issue-contract.sh'], ['task', 'task-finish.sh']]) {
+    const file = path.join(published, 'skills/claude/scripts', runner);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o755);
+    assert.equal(fs.readFileSync(file, 'utf8'), fs.readFileSync(path.join(root, 'skills/claude/scripts', runner), 'utf8'));
+    assert.equal(fs.realpathSync(path.join(published, 'skills/codex/jhw-' + commandName + '/references', runner)), file);
+  }
+  assert.deepEqual(store.validateRelease({ repositoryRoot: root, releaseId: retained.releaseId }), retained);
+  fs.chmodSync(path.join(published, 'skills/claude/scripts/task-finish.sh'), 0o644);
+  assert.throws(() => store.validateRelease({ repositoryRoot: root, releaseId: current.releaseId }),
+    error => error.code?.startsWith('DEPLOY_'));
+  assert.deepEqual(store.validateRelease({ repositoryRoot: root, releaseId: retained.releaseId }), retained);
+});
+
 test('build failure removes only its staging directory and preserves previous prepared releases', async t => {
   const root = fixture(t);
   const first = await prepare(root);
