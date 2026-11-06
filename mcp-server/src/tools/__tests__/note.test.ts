@@ -103,7 +103,7 @@ describe("jhw_note", () => {
       content: "내용",
       summary: "한줄 요약",
       category: "문제해결",
-      tags: "iMX93, BSP",
+      tags: "보안, claude-config",
       report: "wlan-bsp",
     });
 
@@ -113,8 +113,8 @@ describe("jhw_note", () => {
     );
     expect(createCall.properties.category.select.name).toBe("문제해결");
     expect(createCall.properties.tags.multi_select).toEqual([
-      { name: "iMX93" },
-      { name: "BSP" },
+      { name: "보안" },
+      { name: "claude-config" },
     ]);
     expect(createCall.properties.report.select.name).toBe("wlan-bsp");
   });

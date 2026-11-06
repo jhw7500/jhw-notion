@@ -22,10 +22,10 @@ argument-hint: "[--match] [--control]"
 
    | 본문 도메인 신호 | 추정 report |
    |---|---|
-   | gstApp / 녹화 / mux / RTSP / parser.cpp | pim-app |
+   | gstApp / 녹화 / mux / RTSP / parser.cpp / chk_cam_operate / cam_liveness / cam_recovery / pim-package / 카메라 운영 / 패키지 릴리스 | pim-app |
    | 카메라 드라이버 / max9296 / AP1302 / AR0234 / edgeconf VHL_CAM / ISP / GMSL | pim-driver-cam |
    | SPI / sc16is7xx | pim-driver-spi |
-   | pim-check / 검증 자동화 / setup.py / verify_retry / chk_cam_operate | pim-test |
+   | pim-check / 검증 자동화 / setup.py / verify_retry | pim-test |
    | meta-pim / u-boot-imx / linux-imx / Laird(meta-laird-cp) / Yocto 이미지 빌드 (pim 카메라 BSP) | pim-bsp |
    | mlan / moal / mcstiercfg / wbridge / L2 bridge / wlan 드라이버 | wlan-driver |
    | pcap / tshark / 802.11 캡처 / RTT / decrypt | wlan-test |

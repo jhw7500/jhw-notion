@@ -1145,6 +1145,11 @@ function appBudgetHistory(completed, options = {}) {
 
 async function main() {
   const prText = await readFile(canonicalPr, "utf8");
+  for (const args of [["--review", "--merge"], ["--review", "--timeout", "20", "a", "b", "c", "d", "e", "f"]]) {
+    const rendered = prText.replace(/\$([1-9])/g, (token, index) => args[Number(index) - 1] ?? token);
+    assert.ok(rendered === prText,
+      "slash-command argument substitution must preserve the executable PR contract bytes");
+  }
   const aliasText = await readFile(shipAlias, "utf8");
   const agentsText = await readFile(agentsPath, "utf8");
   const readmeText = await readFile(readmePath, "utf8");

@@ -12,7 +12,31 @@ const codexReference = join(repoRoot, "skills", "codex", "jhw-review", "referenc
 const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
 const runbook = readFileSync(join(repoRoot, "docs", "project-control", "phase1a-runbook.md"), "utf8");
 const review = readFileSync(canonicalReview, "utf8");
+const save = readFileSync(join(repoRoot, "skills", "claude", "save.md"), "utf8");
 const failures = [];
+
+function markdownRows(source) {
+  return source.split(/\r?\n/).flatMap((line) => {
+    const cells = line.trim().split("|");
+    if (cells.length < 4 || cells[0] !== "" || cells.at(-1) !== "") return [];
+    const normalized = cells.slice(1, -1).map((cell) => cell.trim());
+    if (normalized.every((cell) => /^-+$/.test(cell))) return [];
+    return [normalized];
+  });
+}
+
+function reportForSlug(slug) {
+  for (const [pattern, report] of markdownRows(save)) {
+    if (!pattern || !report) continue;
+    for (const candidate of pattern.split(" / ").map((value) => value.replaceAll("`", ""))) {
+      const matches = candidate.endsWith("*")
+        ? slug.startsWith(candidate.slice(0, -1))
+        : slug === candidate;
+      if (matches) return report;
+    }
+  }
+  return undefined;
+}
 
 for (const [label, source] of [["README", readme], ["runbook", runbook]]) {
   for (const marker of [
@@ -81,6 +105,49 @@ for (const marker of required) {
   if (!review.includes(marker)) failures.push(`missing review contract marker: ${marker}`);
 }
 
+const reportSignalRows = markdownRows(review);
+const signalsFor = (report) => {
+  const row = reportSignalRows.find((candidate) => candidate[1] === report);
+  return row?.[0].split(" / ").map((signal) => signal.trim()) ?? [];
+};
+const pimAppSignals = signalsFor("pim-app");
+for (const signal of [
+  "chk_cam_operate",
+  "cam_liveness",
+  "cam_recovery",
+  "pim-package",
+  "카메라 운영",
+  "패키지 릴리스",
+]) {
+  if (!pimAppSignals.includes(signal)) {
+    failures.push(`pim-app content mapping missing signal: ${signal}`);
+  }
+}
+const pimTestSignals = signalsFor("pim-test");
+for (const signal of ["pim-check", "검증 자동화", "setup.py", "verify_retry"]) {
+  if (!pimTestSignals.includes(signal)) {
+    failures.push(`pim-test content mapping missing pim-check signal: ${signal}`);
+  }
+}
+for (const signal of ["chk_cam_operate", "cam_liveness", "cam_recovery", "pim-package"]) {
+  if (pimTestSignals.includes(signal)) {
+    failures.push(`camera operations must not map to pim-test: ${signal}`);
+  }
+}
+for (const signal of ["max9296", "AP1302"]) {
+  if (!signalsFor("pim-driver-cam").includes(signal)) {
+    failures.push(`pim-driver-cam content mapping missing signal: ${signal}`);
+  }
+}
+if (!/cwd와 후보 본문 도메인이 명백히 다르면 `\(추정\)`을 같이 제시/.test(review)) {
+  failures.push("review must preserve the cwd/body-domain mismatch suggestion rule");
+}
+for (const slug of ["pim-package", "pim-package-jhw"]) {
+  if (reportForSlug(slug) !== "pim-app") {
+    failures.push(`save cwd mapping must classify ${slug} as pim-app`);
+  }
+}
+
 function section(title) {
   const match = review.match(new RegExp(`^## ${title}\\n([\\s\\S]*?)(?=^## |\\Z)`, "m"));
   if (!match) {
@@ -106,13 +173,9 @@ const requiredMatrixRows = [
   ["이미 완료된 작업 + active Task 없음", "Issue close·Project update 등 남은 tracker 작업만 제안", "소급 Task 생성"],
   ["control lookup unavailable", "stable diagnostic과 수동 확인 제안", "cached/session 기억으로 owner 판정"],
 ];
-const matrixRows = control.split(/\r?\n/).flatMap((line) => {
-  const cells = line.trim().split("|");
-  if (cells.length !== 5 || cells[0] !== "" || cells[4] !== "") return [];
-  const normalized = cells.slice(1, -1).map((cell) => cell.trim().replaceAll(/\s+/g, " "));
-  if (normalized.every((cell) => /^-+$/.test(cell))) return [];
-  return [normalized];
-});
+const matrixRows = markdownRows(control)
+  .filter((row) => row.length === 3)
+  .map((row) => row.map((cell) => cell.replaceAll(/\s+/g, " ")));
 for (const row of requiredMatrixRows) {
   const normalized = row.map((cell) => cell.replaceAll(/\s+/g, " "));
   if (!matrixRows.some((actual) => actual.length === normalized.length &&
