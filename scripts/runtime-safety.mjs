@@ -194,6 +194,7 @@ function parseArgv(bytes) {
 const INTERPRETERS = new Set(['node', 'nodejs', 'bun', 'bash', 'sh', 'dash', 'zsh', 'python', 'python3']);
 const NODE_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader', '--conditions', '-C', '--title', '--icu-data-dir', '--openssl-config', '--env-file', '--env-file-if-exists', '--input-type', '--diagnostic-dir', '--redirect-warnings', '--inspect-port']);
 const NODE_BOOLEAN_FLAGS = new Set(['--watch', '--watch-preserve-output', '--node-snapshot', '--no-node-snapshot', '--no-warnings', '--trace-warnings', '--enable-source-maps', '--no-deprecation', '--trace-deprecation', '--experimental-strip-types', '--experimental-transform-types', '--experimental-default-type=module', '--inspect', '--inspect-brk', '--expose-gc']);
+const PYTHON_BOOLEAN_FLAGS = new Set(['-B', '-I']);
 function entryIdentity(argv) {
   const binary = path.basename(argv[0]);
   if (!INTERPRETERS.has(binary)) return { entry: argv[0], args: argv.slice(1) };
@@ -218,6 +219,7 @@ function entryIdentity(argv) {
       if (NODE_BOOLEAN_FLAGS.has(flag) || /^--[a-z][a-z0-9-]*=/.test(flag)) { index++; continue; }
     } else if (binary === 'python' || binary === 'python3') {
       if (flag === '-' || /^-[cm]/.test(flag)) return null;
+      if (PYTHON_BOOLEAN_FLAGS.has(flag)) { index++; continue; }
     } else if (binary === 'bun') {
       if (['-e', '--eval', '-p', '--print', '-'].includes(flag) || /^-[ep].+/.test(flag) || /^--(?:eval|print)=/.test(flag)) return null;
     }
