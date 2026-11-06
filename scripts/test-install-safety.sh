@@ -2688,6 +2688,58 @@ test_empty_uninstall_creates_nothing() {
   }
 }
 
+assert_installed_contract_runners() {
+  node - "$1" <<'NODE'
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const home = process.argv[2];
+const host = path.join(home, '.local/bin/jhw-control-host');
+const saved = fs.readFileSync(host);
+const savedMode = fs.statSync(host).mode & 0o777;
+const log = path.join(home, 'installed-contract-finish.log');
+const ghLog = path.join(home, 'unexpected-contract-gh.log');
+const fakeBin = path.join(home, 'contract-test-bin');
+fs.mkdirSync(fakeBin, { mode: 0o755 });
+fs.writeFileSync(path.join(fakeBin, 'gh'),
+  '#!/bin/sh\nprintf unexpected-gh >> "$JHW_RUNNER_GH_LOG"\nexit 91\n', { mode: 0o755 });
+const adapters = [
+  ['.claude/commands/jhw/scripts', '.claude/commands/jhw/scripts'],
+  ['.gemini/commands/jhw/scripts', '.gemini/commands/jhw/scripts'],
+  ['.config/opencode/skills/jhw/scripts', '.config/opencode/skills/jhw/scripts'],
+  ['.codex/skills/jhw-task/references', '.codex/skills/jhw-issue/references'],
+];
+try {
+  fs.writeFileSync(host, '#!' + process.execPath + '\n' +
+    'require("node:fs").appendFileSync(process.env.JHW_RUNNER_INSTALL_LOG, JSON.stringify(process.argv.slice(2))+"\\n");\n',
+    { mode: 0o755 });
+  const env = {
+    HOME: home, PATH: fakeBin + ':' + process.env.PATH,
+    JHW_FINISH_STATUS: 'handoff', JHW_CURRENT_TASK_ID: 'fixture-task',
+    JHW_CURRENT_CLAIM_ID: 'fixture-claim', JHW_RUNNER_INSTALL_LOG: log, JHW_RUNNER_GH_LOG: ghLog,
+  };
+  for (const [taskDir, issueDir] of adapters) {
+    const task = path.join(home, taskDir, 'task-finish.sh');
+    const issue = path.join(home, issueDir, 'issue-contract.sh');
+    assert.equal(fs.statSync(task).mode & 0o777, 0o755);
+    assert.equal(fs.statSync(issue).mode & 0o777, 0o755);
+    const finished = spawnSync('bash', [task, 'literal $(not-executed)', 'second validation'], { env, encoding: 'utf8' });
+    assert.equal(finished.status, 0, finished.stderr);
+    const invalidIssue = spawnSync('bash', [issue], { env, encoding: 'utf8' });
+    assert.equal(invalidIssue.status, 2, 'installed Issue entrypoint must reject missing arguments before gh');
+  }
+  assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse),
+    Array.from({ length: 4 }, () => ['task', 'finish', '--task', 'fixture-task', '--claim', 'fixture-claim',
+      '--status', 'handoff', '--validation', 'literal $(not-executed)', '--validation', 'second validation']));
+  assert.equal(fs.existsSync(ghLog), false, 'invalid installed Issue entry must not call real or fake gh');
+} finally {
+  fs.writeFileSync(host, saved);
+  fs.chmodSync(host, savedMode);
+}
+NODE
+}
+
 test_owned_round_trip() {
   local home="$ROOT/round trip 'home" json codex first_hash first_claude_config
   make_tui_roots "$home"
@@ -2714,6 +2766,7 @@ test_owned_round_trip() {
     [ -L "$link" ] || { echo "owned skill link missing: $link" >&2; return 1; }
   done
   [ -L "$home/.codex/skills/jhw-task" ] || return 1
+  assert_installed_contract_runners "$home"
   [ -L "$home/.codex/prompts/task.md" ] || return 1
   assert_file_text "$home/.codex/prompts/unrelated.md" "foreign-unrelated"
   json="$home/.gemini/settings.json"

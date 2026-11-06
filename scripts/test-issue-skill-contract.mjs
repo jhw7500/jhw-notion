@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync, lstatSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const canonicalIssue = join(repoRoot, "skills", "claude", "issue.md");
+const canonicalIssueContract = join(repoRoot, "skills", "claude", "scripts", "issue-contract.sh");
 const installSafetyPath = join(repoRoot, "scripts", "test-install-safety.sh");
 const agentsPath = join(repoRoot, "skills", "COMMANDS.md");
 const readmePath = join(repoRoot, "README.md");
@@ -45,22 +46,6 @@ const validIssueBody = [
   "### Constraints and impact",
   "Unknown: downstream impact has not been measured by this fixture.",
 ].join("\n");
-
-function createContractBlock(markdown) {
-  const match = markdown.match(
-    /<!-- issue-review-create-contract:begin -->\n```bash\n([\s\S]*?)```\n<!-- issue-review-create-contract:end -->/,
-  );
-  assert.ok(match, "issue skill must expose an executable review-create contract");
-  return match[1];
-}
-
-function waitContractBlock(markdown) {
-  const match = markdown.match(
-    /<!-- issue-review-wait-contract:begin -->\n```bash\n([\s\S]*?)```\n<!-- issue-review-wait-contract:end -->/,
-  );
-  assert.ok(match, "issue skill must expose an executable review-wait contract");
-  return match[1];
-}
 
 const fakeGhSource = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
@@ -457,6 +442,30 @@ if (argv[0] === "rev-parse" && argv[1] === "--show-toplevel") {
 process.exit(2);
 `;
 
+const fakePythonSource = String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const argv = process.argv.slice(2);
+let input;
+if (argv[0] === "-I" && argv[1] === "-") {
+  input = fs.readFileSync(0, "utf8");
+}
+if (process.env.JHW_TEST_REPLACE_BODY_WITH && input !== undefined) {
+  const needle = "    fd_stat = os.fstat(fd)\n";
+  if (!input.includes(needle)) process.exit(97);
+  input = input.replace(needle,
+    needle + "    os.replace(os.environ['JHW_TEST_REPLACE_BODY_WITH'], path)\n");
+}
+const result = spawnSync("/usr/bin/python3", argv, {
+  env: process.env,
+  input,
+  maxBuffer: 1024 * 1024,
+});
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+process.exit(result.status ?? 1);
+`;
+
 function issueState(overrides = {}) {
   return {
     actor: "jhw7500",
@@ -492,6 +501,13 @@ function issueState(overrides = {}) {
 
 async function main() {
   const issueText = await readFile(canonicalIssue, "utf8");
+  const contract = await readFile(canonicalIssueContract, "utf8");
+  assert.equal(lstatSync(dirname(canonicalIssueContract)).mode & 0o777, 0o755,
+    "the canonical Issue contract directory must install with mode 0755");
+  assert.equal(lstatSync(canonicalIssueContract).mode & 0o777, 0o755,
+    "the canonical Issue contract must install with mode 0755");
+  assert.doesNotMatch(contract, /^set -e(?:uo pipefail)?$/m,
+    "the sourceable Issue contract must not impose global strict-shell state");
   for (const args of [["--no-review", "--repo"], ["--review", "--timeout", "20", "a", "b", "c", "d", "e", "f"]]) {
     const rendered = issueText.replace(/\$([1-9])/g, (token, index) => args[Number(index) - 1] ?? token);
     assert.ok(rendered === issueText,
@@ -513,6 +529,12 @@ async function main() {
   assert.match(readmeText, /Codex.*동일 저장소.*canary/);
   assert.match(readmeText, /Gemini Code Assist.*OpenCode.*PR-only/);
   assert.match(issueText, /Gemini Code Assist.*정책상 비활성/);
+  assert.match(issueText, /\$HOME\/\.claude\/commands\/jhw\/scripts\/issue-contract\.sh/);
+  assert.match(issueText, /\$HOME\/\.gemini\/commands\/jhw\/scripts\/issue-contract\.sh/);
+  assert.match(issueText, /\$HOME\/\.config\/opencode\/skills\/jhw\/scripts\/issue-contract\.sh/);
+  assert.match(issueText, /\$HOME\/\.codex\/skills\/jhw-issue\/references\/issue-contract\.sh/);
+  assert.match(issueText, /Markdown 코드로 fallback하지 않고 중단/);
+  assert.match(issueText, /env -u GITHUB_TOKEN bash <adapter-path>/);
   assert.match(readmeText, /Issue를 수정·닫기.*구현/);
   assert.match(issueText, /Change Evidence Contract `v1`/);
   assert.match(issueText, /관찰하지 않은 명령, 결과, 영향, tracker 관계를 추측하거나 만들어내지 않는다/);
@@ -532,17 +554,17 @@ async function main() {
     assert.ok(headingIndex > previousHeadingIndex, `${heading} must appear in canonical order`);
     previousHeadingIndex = headingIndex;
   }
-  assert.match(issueText, /gemini\) command='@gemini-cli /,
+  assert.match(contract, /gemini\) command='@gemini-cli /,
     "standalone Issue requests must use the pinned Gemini dispatcher command");
-  assert.doesNotMatch(issueText, /gemini\) command='@gemini /,
+  assert.doesNotMatch(contract, /gemini\) command='@gemini /,
     "the unsupported @gemini command must not be emitted");
-  assert.match(issueText, /workflow_path='\.github\/workflows\/claude\.yml'/);
-  assert.match(issueText, /workflow_path='\.github\/workflows\/gemini-dispatch\.yml'/);
-  assert.match(issueText, /jhw_issue_execute\(\)/,
+  assert.match(contract, /workflow_path='\.github\/workflows\/claude\.yml'/);
+  assert.match(contract, /workflow_path='\.github\/workflows\/gemini-dispatch\.yml'/);
+  assert.match(contract, /jhw_issue_execute\(\)/,
     "the public Issue command must connect creation to bounded review waiting");
-  assert.doesNotMatch(issueText, /JHW_ISSUE_(?:COMMENT|REACTION|RUN)_PAGES_JSON=/,
+  assert.doesNotMatch(contract, /JHW_ISSUE_(?:COMMENT|REACTION|RUN)_PAGES_JSON=/,
     "raw paginated payloads must not cross the exec environment boundary");
-  assert.doesNotMatch(issueText, /JHW_ISSUE_SIGNAL_JSON/,
+  assert.doesNotMatch(contract, /JHW_ISSUE_SIGNAL_JSON/,
     "the compact signal snapshot must not cross the exec environment boundary");
   assert.ok(existsSync(codexIssueSkill));
   assert.ok(lstatSync(codexIssueReference).isSymbolicLink());
@@ -554,14 +576,14 @@ async function main() {
       `${workflowPath}: Issue-comment runs must expose the triggering comment ID in display_title`,
     );
   }
-  const contract = `${createContractBlock(issueText)}\n${waitContractBlock(issueText)}`;
-
   const tempRoot = await mkdtemp(join(tmpdir(), "jhw-issue-contract-"));
   const fakeGh = join(tempRoot, "gh");
   const fakeDate = join(tempRoot, "date");
   const fakeSleep = join(tempRoot, "sleep");
   const fakeGit = join(tempRoot, "git");
-  const contractPath = join(tempRoot, "contract.bash");
+  const fakePythonDir = join(tempRoot, "python-wrapper");
+  const fakePython = join(fakePythonDir, "python3");
+  const contractPath = canonicalIssueContract;
   const statePath = join(tempRoot, "gh-state.json");
   const logPath = join(tempRoot, "gh-log.jsonl");
   const summaryStatePath = join(tempRoot, "jhw-issue.summary.state");
@@ -570,6 +592,7 @@ async function main() {
   const fixtureNestedDir = join(fixtureRoot, "nested", "cwd");
   const workflowDir = join(fixtureRoot, ".github", "workflows");
   const configPath = join(fixtureRoot, ".github", "workflow-config.yml");
+  const installedClaudeContract = join(tempRoot, "home", ".claude", "commands", "jhw", "scripts", "issue-contract.sh");
 
   await writeFile(fakeGh, fakeGhSource);
   await chmod(fakeGh, 0o755);
@@ -579,7 +602,12 @@ async function main() {
   await chmod(fakeSleep, 0o755);
   await writeFile(fakeGit, fakeGitSource);
   await chmod(fakeGit, 0o755);
-  await writeFile(contractPath, contract);
+  await mkdir(fakePythonDir);
+  await writeFile(fakePython, fakePythonSource);
+  await chmod(fakePython, 0o755);
+  await mkdir(dirname(installedClaudeContract), { recursive: true });
+  await copyFile(canonicalIssueContract, installedClaudeContract);
+  await chmod(installedClaudeContract, 0o755);
 
   async function setRepoFixture({ claude = false, gemini = false, config = "" } = {}) {
     await rm(join(fixtureRoot, ".github"), { recursive: true, force: true });
@@ -644,7 +672,203 @@ async function main() {
     }
   }
 
+  async function runInstalledIssueResult(scriptPath, state, args, overrides = {}) {
+    const {
+      FAKE_DATE_INITIAL_EPOCH = requestEpoch,
+      ...envOverrides
+    } = overrides;
+    await writeFile(statePath, JSON.stringify(state, null, 2));
+    await writeFile(logPath, "");
+    await writeFile(nowEpochPath, String(FAKE_DATE_INITIAL_EPOCH));
+    const env = {
+      ...process.env,
+      PATH: `${tempRoot}:${process.env.PATH}`,
+      FAKE_GH_STATE: statePath,
+      FAKE_GH_LOG: logPath,
+      FAKE_DATE_EPOCH_FILE: nowEpochPath,
+      FAKE_GIT_TOPLEVEL: fixtureRoot,
+      REPO_NWO: "example/repo",
+      JHW_ISSUE_REPO_ROOT: fixtureRoot,
+      JHW_ISSUE_CONFIG_PATH: configPath,
+      JHW_ISSUE_STATE_DIR: tempRoot,
+      ...envOverrides,
+    };
+    try {
+      const result = await execFileAsync("bash", [scriptPath, ...args], {
+        env,
+        maxBuffer: 1024 * 1024,
+      });
+      return {
+        code: 0,
+        ...result,
+        state: JSON.parse(await readFile(statePath, "utf8")),
+        log: (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse),
+      };
+    } catch (error) {
+      return {
+        code: Number.isInteger(error.code) ? error.code : 1,
+        stdout: error.stdout ?? "",
+        stderr: error.stderr ?? "",
+        state: JSON.parse(await readFile(statePath, "utf8")),
+        log: (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse),
+      };
+    }
+  }
+
   try {
+    await setRepoFixture({ config: "review:\n  auto: false\n" });
+    const installedBodyPath = join(tempRoot, "installed-body.md");
+    const installedTitle = "Installed $() ` \\\" ' ; title";
+    const installedBody = validIssueBody.replace(
+      "The current behavior is demonstrated by a focused regression fixture.",
+      "Literal $() ` \\\" ' ; content must remain data.",
+    ) + "\n\n";
+    await writeFile(installedBodyPath, installedBody);
+    await chmod(installedBodyPath, 0o600);
+    const sharedBodyPath = join(tempRoot, "shared-body.md");
+    await writeFile(sharedBodyPath, validIssueBody);
+    await chmod(sharedBodyPath, 0o664);
+    const sharedBody = await runInstalledIssueResult(
+      installedClaudeContract,
+      issueState(),
+      ["Shared body", sharedBodyPath, "skip", "20"],
+    );
+    assert.notEqual(sharedBody.code, 0,
+      "the installed runner must reject a body file readable by group or other users");
+    assert.deepEqual(sharedBody.state.mutations, []);
+    assert.deepEqual(sharedBody.log, []);
+
+    const hardlinkSourcePath = join(tempRoot, "hardlink-source.md");
+    const hardlinkBodyPath = join(tempRoot, "hardlink-body.md");
+    await writeFile(hardlinkSourcePath, validIssueBody);
+    await chmod(hardlinkSourcePath, 0o600);
+    await link(hardlinkSourcePath, hardlinkBodyPath);
+    const oversizedBodyPath = join(tempRoot, "oversized-body.md");
+    await writeFile(oversizedBodyPath, Buffer.alloc(65537, 0x61));
+    await chmod(oversizedBodyPath, 0o600);
+    const symlinkBodyPath = join(tempRoot, "symlink-body.md");
+    await symlink(installedBodyPath, symlinkBodyPath);
+    const invalidUtf8BodyPath = join(tempRoot, "invalid-utf8-body.md");
+    await writeFile(invalidUtf8BodyPath, Buffer.from([0xff]));
+    await chmod(invalidUtf8BodyPath, 0o600);
+    const nulBodyPath = join(tempRoot, "nul-body.md");
+    await writeFile(nulBodyPath, Buffer.from("invalid\0body", "utf8"));
+    await chmod(nulBodyPath, 0o600);
+    for (const [name, unsafeBodyPath] of [
+      ["hard-linked", hardlinkBodyPath],
+      ["oversized", oversizedBodyPath],
+      ["symlinked", symlinkBodyPath],
+      ["non-regular", tempRoot],
+      ["invalid UTF-8", invalidUtf8BodyPath],
+      ["NUL-containing", nulBodyPath],
+    ]) {
+      const unsafeBody = await runInstalledIssueResult(
+        installedClaudeContract,
+        issueState(),
+        [`${name} body`, unsafeBodyPath, "skip", "20"],
+      );
+      assert.notEqual(unsafeBody.code, 0, `${name} body must be rejected before execution`);
+      assert.deepEqual(unsafeBody.state.mutations, [], `${name} body must not mutate GitHub`);
+      assert.deepEqual(unsafeBody.log, [], `${name} body must not call GitHub`);
+    }
+
+    const replaceBodyPath = join(tempRoot, "replace-body.md");
+    const replacementBodyPath = join(tempRoot, "replacement-body.md");
+    await writeFile(replaceBodyPath, validIssueBody);
+    await writeFile(replacementBodyPath, validIssueBody.replace(
+      "Create an Issue only when its body preserves the required change evidence.",
+      "Replacement content must not cross the guarded read boundary.",
+    ));
+    await chmod(replaceBodyPath, 0o600);
+    await chmod(replacementBodyPath, 0o600);
+    const replacedDuringRead = await runInstalledIssueResult(
+      installedClaudeContract,
+      issueState(),
+      ["Replaced body", replaceBodyPath, "skip", "20"],
+      {
+        JHW_TEST_REPLACE_BODY_WITH: replacementBodyPath,
+        PATH: `${fakePythonDir}:${tempRoot}:${process.env.PATH}`,
+      },
+    );
+    assert.notEqual(replacedDuringRead.code, 0,
+      "replacing the path after the guarded fd opens must fail closed");
+    assert.deepEqual(replacedDuringRead.state.mutations, []);
+    assert.deepEqual(replacedDuringRead.log, []);
+
+    const installedSkip = await runInstalledIssueResult(
+      installedClaudeContract,
+      issueState(),
+      [installedTitle, installedBodyPath, "skip", "20"],
+    );
+    assert.equal(installedSkip.code, 0,
+      "the installed Issue contract must execute the canonical create/wait flow directly");
+    assert.equal(installedSkip.state.issueTitle, installedTitle);
+    assert.equal(installedSkip.state.issueBody, installedBody);
+    assert.deepEqual(installedSkip.state.mutations, [
+      "label:create:review:request",
+      "label:create:review:skip",
+      "issue:create",
+      "issue:edit",
+    ]);
+
+    await setRepoFixture({
+      claude: true,
+      config: "review:\n  auto: true\nworkflows:\n  claude:\n    enabled: true\n",
+    });
+    const installedTimeout = await runInstalledIssueResult(
+      installedClaudeContract,
+      issueState({
+        runs: [{
+          id: 701,
+          name: "jhw-review-comment-1001",
+          path: ".github/workflows/claude.yml",
+          event: "issue_comment",
+          status: "in_progress",
+          conclusion: "null",
+          createdAt: "2026-09-01T00:01:30Z",
+          url: "https://github.com/example/repo/actions/runs/701",
+          displayTitle: "jhw-review-comment-1001",
+          actor: "jhw7500",
+          triggeringActor: "jhw7500",
+        }],
+      }),
+      ["Installed timeout", installedBodyPath, "request", "1"],
+      { JHW_ISSUE_EXPECTED_CLAUDE_BOT: "claude-review[bot]" },
+    );
+    assert.equal(installedTimeout.code, 0);
+    assert.match(installedTimeout.stdout, /^claude \| TIMEOUT \| .* \| review_timeout$/m,
+      "the installed runner must preserve the bounded PENDING-to-timeout behavior");
+    assert.equal(installedTimeout.log.filter((args) => args[0] === "sleep").length, 1);
+
+    for (const [name, args] of [
+      ["missing arguments", []],
+      ["missing body", ["Missing body", join(tempRoot, "missing-body.md"), "skip", "20"]],
+      ["invalid body", ["Invalid body", tempRoot, "skip", "20"]],
+      ["invalid mode", ["Invalid mode", installedBodyPath, "unexpected", "20"]],
+    ]) {
+      const invalidInstalled = await runInstalledIssueResult(
+        installedClaudeContract,
+        issueState(),
+        args,
+      );
+      assert.notEqual(invalidInstalled.code, 0, `${name} must reject direct execution`);
+      assert.deepEqual(invalidInstalled.state.mutations, [], `${name} must not mutate GitHub`);
+      assert.deepEqual(invalidInstalled.log, [], `${name} must not call GitHub`);
+    }
+
+    const missingInstalledContract = join(
+      tempRoot, "home", ".gemini", "commands", "jhw", "scripts", "issue-contract.sh",
+    );
+    const missingInstalled = await runInstalledIssueResult(
+      missingInstalledContract,
+      issueState(),
+      ["No fallback", installedBodyPath, "skip", "20"],
+    );
+    assert.notEqual(missingInstalled.code, 0);
+    assert.deepEqual(missingInstalled.state.mutations, [],
+      "a missing installed helper must fail without executing Markdown as a fallback");
+    assert.deepEqual(missingInstalled.log, []);
+
     assert.equal((await runIssue(issueState(), "jhw_issue_review_mode_from_args --review")).stdout.trim(), "request");
     assert.equal((await runIssue(issueState(), "jhw_issue_review_mode_from_args --no-review")).stdout.trim(), "skip");
     assert.equal((await runIssue(issueState(), "jhw_issue_review_mode_from_args")).stdout.trim(), "auto");
