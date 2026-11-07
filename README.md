@@ -127,6 +127,10 @@ retained predecessor가 있어도 unfinished wiring을 pointer rollback으로 �
 deployment journal은 자동 삭제하지 않는다. stage와 private evidence를 임의 cleanup하거나
 임의 checkout의 mode를 완화해 trust 검사를 우회하지 않는다.
 
+검증 뒤 admission 재획득은 consumer가 관측되지 않은 uncertainty·lock 경합만 최대
+5회(200 ms 간격) 재시도한다. 전체 PID 관측 유지와 `recovery_blocked` 복구 경로의
+설계 근거는 [배포 재획득 정책](docs/deployment-reacquisition-policy.md)에 기록한다.
+
 공개 성공 결과는 `DEPLOY_PREPARED`, `DEPLOY_STATUS`, `DEPLOY_ACTIVATED`,
 `DEPLOY_ROLLED_BACK`, `DEPLOY_UNINSTALLED`, `DEPLOY_BOOTSTRAP_REFRESHED` 중 하나와 bounded release/consumer 정보만
 포함한다. 오류도 PID, argv, 환경변수, 절대 경로, Task/session 좌표를 내보내지 않는다.
@@ -183,6 +187,10 @@ Claude/Codex hook 등록은 설치기가 hook을 임의 신뢰하지 않는다. 
 hook config 등록·rollback·uninstall과 launcher symlink 제거는 current-user-owned real parent를 no-follow로 열고 retained descriptor에 고정한 same-parent private `0700` namespace(`.settings.json.jhw-txn.*`, `.hooks.json.jhw-txn.*`, `.jhw-control-hook-link-txn.*`)를 사용한다. 논리 parent path가 열린 뒤 다른 directory나 symlink로 교체되어도 작업은 처음 연 directory 밖으로 이동하지 않으며, launcher transaction은 반환 직전 논리 parent가 같은 inode·owner·mode인지 다시 확인해 교체를 실패로 남긴다. Claude transaction은 Codex 등록과 최종 preflight가 끝날 때까지 finalize하지 않으므로 뒤 단계 실패 시 두 설정을 함께 되돌린다. Node는 live path를 capture하기 전에 intent를 fsync하고, capture 후 실제 type·mode·identity와 exact bytes를 `0600` manifest/evidence에 기록한다. symlink/FIFO는 follow하지 않고 exclusive hard-link로 원 객체를 복구한다. launcher 제거도 owned symlink를 private `captured-link`로 atomic rename한 뒤 identity/target을 재검증하며, 경합 교체된 외부 object는 absent live path에만 no-clobber republish한다. winner가 있으면 덮어쓰거나 지우지 않고 evidence를 보존한다. 경합 중 capture된 directory는 Node 표준 API로 안전한 no-clobber rename을 할 수 없으므로 private `captured-live` subtree와 launcher를 보존하고 `manual recovery required`로 중단하며, live path를 복구했다고 주장하지 않는다. rollback의 live candidate도 이동 전에 별도 intent를 fsync한다. 이동 직후 기록이 끊기면 recovery는 live parent와 transaction directory를 먼저 fsync하고 surviving `candidate-live` identity를 manifest에 인수한 뒤, 종류와 무관하게 exact candidate 경로와 launcher를 보존한 `manual-recovery-required` 상태에서 중단한다. Node의 pathname-only hard-link API로는 기록한 inode와 이후 publication source를 원자적으로 결속할 수 없으므로 이 interrupted-intent 경로는 live config를 자동 재게시하지 않는다. 정상적으로 중단 없이 진행되는 등록·복구·rollback만 준비된 inode를 absent live path에 exclusive link하는 방식으로 publish한다. 그 사이 다른 path가 생기면 해당 winner를 덮어쓰거나 지우지 않고 launcher와 original/published/candidate evidence를 보존한다. 어느 namespace든 기존 transaction directory가 남아 있으면 다음 install/uninstall은 새 transaction을 만들기 전에 그 exact path를 안내하고 fail-closed한다.
 
 helper 결과나 fsync가 불명확한 경우 installer는 현재 path 상태를 단정하지 않으며, 검증된 manifest의 존재하는 evidence 경로와 실제 mode만 안내한다. register와 unregister 모두 inspector가 durable `manual-recovery-required`와 실제 `captured-live`를 확인하면 helper 종료 코드와 무관하게 그 exact evidence를 선택한다. rollback은 재검증된 durable stage와 실제 `candidate-live`, launcher 제거는 전용 manifest stage와 실제 `captured-link`를 기준으로 안내한다. 따라서 stage commit 직후 helper가 비정상 종료해도 해당 exact 경로를 표시한다. parent fsync 전에 실패한 `rollback-capture-intent`도 검증 가능한 candidate가 남아 있으면 내구성 완료를 주장하지 않은 채 그 경로와 live unknown/absent 상태만 안내한다. live config를 exclusive link하고 parent를 sync한 뒤 private `published-ready`를 떼기 전에는 `activation-detach-intent`와 exact delete target을 먼저 기록한다. 중단 시 이 stage만 `published-ready` 하나의 누락을 허용하므로 surviving live config와 transaction evidence를 검사할 수 있지만, installer는 완료를 주장하지 않고 launcher와 private transaction을 보존한다. finalize는 각 artifact의 recorded identity와 durable delete-intent를 확인해 재시도하고 unexpected loss/substitution을 삭제하지 않는다. transaction directory 제거 뒤 parent fsync가 실패하면 evidence가 제거됐다는 사실과 durability 미확인 상태를 그대로 알리고 launcher를 유지하며, evidence가 보존됐다고 말하거나 완료를 주장하지 않는다. Gemini/OpenCode Guard는 현재 지원하지 않는다.
+
+`allowNewTags: true`의 자동 태그 등록은 스키마 전체 옵션을 전송한다. public API가
+옵션 100개 상한으로 거부하면 Notion 화면에서 옵션을 추가한 뒤 다시 저장하도록
+안내한다. [실측 결과와 대응 절차](docs/notion-multi-select-option-limit.md)를 참조한다.
 
 ### Notion API Key 설정
 

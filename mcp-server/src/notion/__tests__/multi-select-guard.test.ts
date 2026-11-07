@@ -141,6 +141,65 @@ describe("multi_select 옵션 자동 등록 (옵션 B)", () => {
       expect(warnings.join(" ")).toContain("자동등록 실패");
     });
 
+    it.each([101, 102])("옵션 %i개 전송이 거부되면 100개 상한과 Notion 화면 추가 후 재시도를 안내한다", async (count) => {
+      notion.dataSources.retrieve.mockResolvedValue({
+        properties: {
+          tags: {
+            type: "multi_select",
+            multi_select: { options: Array.from({ length: count - 1 }, (_, index) => ({
+              id: `existing-${index}`,
+              name: index === 0 ? "iMX93" : `existing-tag-${index}`,
+              color: "blue",
+            })) },
+          },
+        },
+      });
+      const message = `body failed validation: body.properties.tags.multi_select.options.length should be ≤ \`100\`, instead was \`${count}\`.`;
+      notion.dataSources.update.mockRejectedValue(Object.assign(new Error(message), {
+        name: "APIResponseError",
+        status: 400,
+        code: "validation_error",
+        headers: new Headers(),
+        request_id: "request-option-limit",
+        body: JSON.stringify({ object: "error", status: 400, code: "validation_error", message }),
+      }));
+      const warnings: string[] = [];
+
+      const names = await applyMultiSelectGuard(
+        notion as any, "knowledgeBase", "tags", ["iMX93", "zzz미등록"],
+        { allowNew: true, warnings }
+      );
+
+      expect(names).toEqual(["iMX93"]);
+      expect(warnings.join(" ")).toContain("옵션 100개 상한");
+      expect(warnings.join(" ")).toContain("Notion 화면");
+      expect(warnings.join(" ")).toContain("--force-tag");
+      expect(warnings.join(" ")).toContain("zzz미등록");
+    });
+
+    it.each([
+      { status: 400, code: "validation_error", message: "body.properties.tags.rich_text.length should be ≤ `100`" },
+      { status: 400, code: "validation_error", message: "data source schema options exceed size limit of 50KB" },
+      { status: 403, code: "restricted_resource", message: "body.properties.tags.multi_select.options.length should be ≤ `100`, instead was `101`." },
+    ])("다른 API 거부는 옵션 개수 상한으로 안내하지 않는다: $status $code $message", async ({ status, code, message }) => {
+      notion.dataSources.retrieve.mockRejectedValue(Object.assign(new Error(message), {
+        name: "APIResponseError", status, code, headers: new Headers(),
+        request_id: "request-unrelated-error",
+        body: JSON.stringify({ object: "error", status, code, message }),
+      }));
+      const warnings: string[] = [];
+
+      const names = await applyMultiSelectGuard(
+        notion as any, "knowledgeBase", "tags", ["iMX93", "zzz미등록"],
+        { allowNew: true, warnings }
+      );
+
+      expect(names).toEqual(["iMX93"]);
+      expect(warnings.join(" ")).toContain("자동등록 실패");
+      expect(warnings.join(" ")).not.toContain("옵션 100개 상한");
+      expect(warnings.join(" ")).not.toContain("Notion 화면");
+    });
+
     it("allowNew=true: Notion엔 있으나 vocab엔 없는 dropped는 canonical 보정·자동등록 카운트 제외", async () => {
       // CustomTag는 field-vocab엔 없어 dropped이지만 Notion 옵션엔 존재(대소문자만 다름).
       notion.dataSources.retrieve.mockResolvedValue({
