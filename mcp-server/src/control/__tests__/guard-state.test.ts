@@ -388,6 +388,37 @@ describe("exact prompt approval", () => {
 });
 
 describe("secure request state", () => {
+  it("explicit initialization creates only a missing empty private store", async () => {
+    const { stateDir, store } = await fixture();
+    await expect(store.inspect()).resolves.toEqual({ status: "not_initialized", requests: [] });
+    await expect(lstat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(store.ensureInitialized()).resolves.toEqual({ created: true });
+    await expect(store.inspect()).resolves.toEqual({ status: "ready", requests: [] });
+    expect((await lstat(join(stateDir, "guard-requests.yaml"))).mode & 0o777).toBe(0o600);
+    expect((await lstat(stateDir)).mode & 0o777).toBe(0o700);
+  });
+
+  it("initialization preserves existing requests and does not expire or rewrite them", async () => {
+    const { stateDir, store } = await fixture();
+    await pending(store);
+    const file = join(stateDir, "guard-requests.yaml");
+    const bytes = await readFile(file);
+    const info = await lstat(file);
+    vi.setSystemTime(START + 24 * 60 * 60 * 1000);
+    await expect(store.ensureInitialized()).resolves.toEqual({ created: false });
+    expect(await readFile(file)).toEqual(bytes);
+    expect(await lstat(file)).toMatchObject({ ino: info.ino, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs });
+  });
+
+  it("serializes concurrent initialization with the real Guard lock", async () => {
+    const { stateDir } = await fixture();
+    const first = new GuardRequestStore(configFor(stateDir), { environment: { PATH: process.env.PATH }, journal: new MemoryJournal() });
+    const second = new GuardRequestStore(configFor(stateDir), { environment: { PATH: process.env.PATH }, journal: new MemoryJournal() });
+    const results = await Promise.all([first.ensureInitialized(), second.ensureInitialized()]);
+    expect(results.map((result) => result.created).sort()).toEqual([false, true]);
+    await expect(first.inspect()).resolves.toEqual({ status: "ready", requests: [] });
+  });
+
   it("reports missing read-only inspection as not_initialized without creating the directory", async () => {
     const { stateDir, store } = await fixture();
 
@@ -420,6 +451,7 @@ describe("secure request state", () => {
       }
 
       await expect(store.inspect()).rejects.toMatchObject({ code: "GUARD_UNAVAILABLE" });
+      await expect(store.ensureInitialized()).rejects.toMatchObject({ code: "GUARD_UNAVAILABLE" });
       await expect(store.createOrReusePending(operation())).rejects.toMatchObject({ code: "GUARD_UNAVAILABLE" });
       if (variant === "symlink" || variant === "hardlink") {
         expect(await readFile(external, "utf8")).toBe(empty);

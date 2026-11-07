@@ -1,4 +1,4 @@
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -114,6 +114,23 @@ describe("RegistryGit", () => {
       code: "REMOTE_DIVERGED",
     });
     expect(await git(registryDir, "status", "--porcelain")).toBe("");
+  });
+
+  it("proves remote equality without changing FETCH_HEAD, refs, index, or root mode", async () => {
+    const { registryDir } = await fixture();
+    const registry = fixtureRegistryGit(configFor(registryDir), new ProcessRunner());
+    const fetchHead = await readFile(join(registryDir, ".git", "FETCH_HEAD")).catch(() => Buffer.alloc(0));
+    const refs = await git(registryDir, "show-ref");
+    const index = await stat(join(registryDir, ".git", "index"));
+    const root = await stat(registryDir);
+
+    await expect(registry.assertReadyReadOnly()).resolves.toMatch(/^[0-9a-f]{40,64}$/);
+
+    expect(await readFile(join(registryDir, ".git", "FETCH_HEAD")).catch(() => Buffer.alloc(0))).toEqual(fetchHead);
+    expect(await git(registryDir, "show-ref")).toBe(refs);
+    const afterIndex = await stat(join(registryDir, ".git", "index"));
+    expect({ size: afterIndex.size, mtimeMs: afterIndex.mtimeMs }).toEqual({ size: index.size, mtimeMs: index.mtimeMs });
+    expect((await stat(registryDir)).mode & 0o777).toBe(root.mode & 0o777);
   });
 
   it("creates one commit, pushes fast-forward, refetches, and verifies remote HEAD", async () => {

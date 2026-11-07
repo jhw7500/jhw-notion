@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, readFile, realpath, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -14,6 +14,13 @@ import type { ControlConfig } from "./config.js";
 import { ControlError } from "./errors.js";
 import { githubSlugFromCheckout } from "./github-source.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
+import {
+  historicalCleanupProofSha256,
+  verifyHistoricalCleanupBackupOnly,
+  withVerifiedHistoricalCleanupProof,
+  type SourceTrustPort,
+  type VerifiedHistoricalCleanupProof,
+} from "./worktree-cleanup-proof.js";
 
 const STATE_VERSION = 2;
 const WORKTREE_STATE_FILE = "worktrees.json";
@@ -44,7 +51,7 @@ const canonicalRepositoryId = /^repo-[a-z0-9][a-z0-9-]{1,62}$/;
 const canonicalGitObjectId = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const logicalRef = /^wt-[a-z0-9][a-z0-9-]{1,120}$/;
 
-export type WorktreeLifecycle = "pending-create" | "active" | "pending-remove" | "removed";
+export type WorktreeLifecycle = "pending-create" | "active" | "pending-remove" | "pending-remove-equivalent" | "removed";
 
 export interface WorktreePlan {
   branch: string;
@@ -85,6 +92,17 @@ export interface WorktreeRemovalResult {
   /** True when this invocation completed a prior durable pending-remove intent. */
   recovered: boolean;
   lifecycle: "removed";
+  cleanup_policy?: "ancestor" | "historical-exact-patch-v1";
+  branch_preserved?: true;
+  proof_sha256?: string;
+}
+
+export interface WorktreeCleanupOptions {
+  proofPath?: string;
+  registryHead?: string;
+  historySha256?: string;
+  repositorySlug?: string;
+  revalidate?: () => Promise<void>;
 }
 
 export interface WorktreeMappingRepairInput {
@@ -167,6 +185,19 @@ interface WorktreeMapping {
   path: string;
   base_sha: string;
   lifecycle: WorktreeLifecycle;
+  cleanup_intent?: {
+    version: 1;
+    policy: "historical-exact-patch-v1";
+    proof_sha256: string;
+    proof_path: string;
+    registry_head: string;
+    history_sha256: string;
+    repository_slug: string;
+    mapping_sha256: string;
+    source_head: string;
+    worktree_head: string;
+    inventory_sha256: string;
+  };
 }
 
 interface WorktreeState {
@@ -234,7 +265,8 @@ function validateClaim(claim: WorktreeClaim): WorktreePlan {
 }
 
 function isLifecycle(value: unknown): value is WorktreeLifecycle {
-  return value === "pending-create" || value === "active" || value === "pending-remove" || value === "removed";
+  return value === "pending-create" || value === "active" || value === "pending-remove" ||
+    value === "pending-remove-equivalent" || value === "removed";
 }
 
 function asMapping(value: unknown, ref: string): WorktreeMapping {
@@ -256,11 +288,22 @@ function asMapping(value: unknown, ref: string): WorktreeMapping {
     "base_sha",
     "lifecycle",
   ];
+  const intent = record.cleanup_intent;
+  const intentKeys = ["version", "policy", "proof_sha256", "proof_path", "registry_head", "history_sha256", "repository_slug", "mapping_sha256", "source_head", "worktree_head", "inventory_sha256"];
+  const validIntent = record.lifecycle === "pending-remove-equivalent" && intent !== null && typeof intent === "object" && !Array.isArray(intent) &&
+    Object.keys(intent).length === intentKeys.length && intentKeys.every((key) => key in intent) &&
+    (intent as Record<string, unknown>).version === 1 &&
+    (intent as Record<string, unknown>).policy === "historical-exact-patch-v1" &&
+    typeof (intent as Record<string, unknown>).proof_path === "string" && isAbsolute((intent as Record<string, string>).proof_path) &&
+    typeof (intent as Record<string, unknown>).repository_slug === "string" &&
+    ["proof_sha256", "history_sha256", "mapping_sha256", "inventory_sha256"].every((key) => /^[0-9a-f]{64}$/.test((intent as Record<string, string>)[key] ?? "")) &&
+    ["registry_head", "source_head", "worktree_head"].every((key) => canonicalGitObjectId.test((intent as Record<string, string>)[key] ?? ""));
   if (
-    Object.keys(record).length !== required.length ||
+    Object.keys(record).length !== required.length + (intent === undefined ? 0 : 1) ||
     required.some((key) => !(key in record)) ||
     required.slice(0, -1).some((key) => typeof record[key] !== "string") ||
-    !isLifecycle(record.lifecycle)
+    !isLifecycle(record.lifecycle) ||
+    (record.lifecycle === "pending-remove-equivalent" ? !validIntent : intent !== undefined)
   ) {
     throw new ControlError("INVALID_WORKTREE_STATE", "Worktree mapping has invalid fields", { worktree_ref: ref });
   }
@@ -328,6 +371,7 @@ export class WorktreeManager {
     private readonly config: ControlConfig,
     private readonly runner: WorktreeRunner = new ProcessRunner(),
     private readonly stateHooks: WorktreeStateHooks = {},
+    private readonly proofSourceTrust?: SourceTrustPort,
   ) {}
 
   async createOrReuse(claim: WorktreeClaim, repositoryPath: string): Promise<WorktreeCreateResult> {
@@ -340,7 +384,7 @@ export class WorktreeManager {
 
     if (mapping) {
       this.assertCoordinates(mapping, claim, repository.identity, root);
-      if (mapping.lifecycle === "pending-remove") {
+      if (mapping.lifecycle === "pending-remove" || mapping.lifecycle === "pending-remove-equivalent") {
         throw new ControlError(
           "WORKTREE_CLEANUP_REQUIRED",
           "A released worktree generation requires explicit cleanup recovery before Task start",
@@ -438,7 +482,7 @@ export class WorktreeManager {
       retainedMatches && lifecycleAllowed
     ) return;
     if (mapping.lifecycle === "pending-create" && retainedMatches && lifecycleAllowed) return;
-    if (mapping.lifecycle === "active" || mapping.lifecycle === "pending-remove") {
+    if (mapping.lifecycle === "active" || mapping.lifecycle === "pending-remove" || mapping.lifecycle === "pending-remove-equivalent") {
       throw new ControlError(
         "WORKTREE_CLEANUP_REQUIRED",
         "A released worktree generation requires explicit cleanup recovery before Task start",
@@ -448,7 +492,7 @@ export class WorktreeManager {
   }
 
   /** Clean up exactly one committed, released Claim generation. */
-  async cleanupReleased(rawHistory: ClaimHistory): Promise<WorktreeRemovalResult> {
+  async cleanupReleased(rawHistory: ClaimHistory, options: WorktreeCleanupOptions = {}): Promise<WorktreeRemovalResult> {
     const result = ClaimHistorySchema.safeParse(rawHistory);
     if (!result.success || !result.data.task_alias) {
       throw new ControlError("INVALID_CLAIM_HISTORY", "Cleanup requires canonical released Claim history");
@@ -490,7 +534,273 @@ export class WorktreeManager {
         worktree_ref: history.worktree_ref,
       });
     }
-    return this.removeIfSafe(history);
+    if (options.proofPath !== undefined) {
+      if (!options.registryHead || !options.historySha256 || !options.repositorySlug || !options.revalidate) {
+        throw new ControlError("WORKTREE_EQUIVALENCE_REQUIRED", "Historical cleanup requires a Registry-bound proof context");
+      }
+      if (mapping.lifecycle === "pending-remove") {
+        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Ancestor cleanup intent cannot be replaced", {
+          reason: "snapshot_changed",
+        });
+      }
+      return this.cleanupEquivalent(history, root, {
+        proofPath: options.proofPath,
+        registryHead: options.registryHead,
+        historySha256: options.historySha256,
+        repositorySlug: options.repositorySlug,
+        revalidate: options.revalidate,
+      }, mapping.lifecycle === "pending-remove-equivalent");
+    }
+    if (mapping.lifecycle === "pending-remove-equivalent") {
+      throw new ControlError("WORKTREE_EQUIVALENCE_REQUIRED", "Equivalent cleanup can resume only with the same explicit proof");
+    }
+    const removed = await this.removeIfSafe(history);
+    return { ...removed, cleanup_policy: "ancestor", branch_preserved: true };
+  }
+
+  private mappingSnapshotSha256(mapping: WorktreeMapping): string {
+    const digest = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
+    return createHash("sha256").update(JSON.stringify({
+      task_id: mapping.task_id,
+      project_id: mapping.project_id,
+      repo_id: mapping.repo_id,
+      claim_id: mapping.claim_id,
+      host: mapping.host,
+      branch: mapping.branch,
+      base_sha: mapping.base_sha,
+      lifecycle: mapping.lifecycle,
+      repository_identity: digest(mapping.repository_identity),
+      path: digest(mapping.path),
+    }), "utf8").digest("hex");
+  }
+
+  private async cleanupEquivalent(
+    history: ClaimHistory & { task_alias: string },
+    root: string,
+    options: Required<Pick<WorktreeCleanupOptions, "proofPath" | "registryHead" | "historySha256" | "repositorySlug" | "revalidate">>,
+    recovered: boolean,
+  ): Promise<WorktreeRemovalResult> {
+    let state = await this.loadState();
+    let mapping = state.worktrees[history.worktree_ref];
+    if (!mapping) throw new ControlError("WORKTREE_NOT_MAPPED", "Equivalent cleanup mapping disappeared");
+    this.assertCoordinates(mapping, history, mapping.repository_identity, root);
+    await this.assertUniqueCleanupMapping(state, mapping, root, history.worktree_ref);
+
+    if (mapping.lifecycle === "pending-remove-equivalent" && !await this.mappedWorktreeExists(mapping.path, root)) {
+      const intent = mapping.cleanup_intent;
+      if (!intent || intent.proof_path !== options.proofPath || intent.registry_head !== options.registryHead ||
+        intent.history_sha256 !== options.historySha256 || intent.repository_slug.toLowerCase() !== options.repositorySlug.toLowerCase() ||
+        await historicalCleanupProofSha256(options.proofPath) !== intent.proof_sha256) {
+        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup retry proof changed", { reason: "snapshot_changed" });
+      }
+      const registered = (await this.git(["-C", mapping.repository_path, "worktree", "list", "--porcelain", "-z"])).stdout
+        .split("\0").some((entry) => entry === `worktree ${mapping.path}`);
+      const branchHead = (await this.git(["-C", mapping.repository_path, "show-ref", "--verify", "--hash", `refs/heads/${mapping.branch}`])).stdout.trim();
+      if (registered || branchHead !== intent.worktree_head) {
+        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Absent checkout metadata is not a completed Git removal", { reason: "snapshot_changed" });
+      }
+      const backup = await verifyHistoricalCleanupBackupOnly({
+        proofPath: options.proofPath,
+        sourcePath: mapping.repository_path,
+        worktreePath: mapping.path,
+        commonGitDir: mapping.repository_identity,
+        managedRoots: [this.config.stateDir, this.config.worktreeRoot],
+        runner: this.runner,
+      });
+      if (backup.proofSha256 !== intent.proof_sha256 || backup.manifest.inventory_sha256 !== intent.inventory_sha256) {
+        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Recovery backup changed after Git removal", { reason: "backup_invalid" });
+      }
+      await options.revalidate();
+      mapping.lifecycle = "removed";
+      delete mapping.cleanup_intent;
+      await this.saveState(state);
+      return {
+        removed: true,
+        recovered: true,
+        lifecycle: "removed",
+        cleanup_policy: "historical-exact-patch-v1",
+        branch_preserved: true,
+        proof_sha256: intent.proof_sha256,
+      };
+    }
+
+    const repository = await this.repositoryForMappedWorktree(mapping);
+    this.assertExactGeneration(
+      mapping,
+      history,
+      repository.identity,
+      root,
+      mapping.lifecycle === "pending-remove-equivalent" ? "pending-remove-equivalent" : "active",
+    );
+    const { inspection, status_entries } = await this.inspectMappedFull(mapping, history, root, repository.root);
+    if (removalBlockingEntries(status_entries).length > 0) {
+      throw new ControlError("WORKTREE_DIRTY", "Refusing equivalent cleanup of a dirty worktree", {
+        worktree_ref: history.worktree_ref,
+        dirty_files: inspection.dirty_files,
+      });
+    }
+    const mappingSha256 = mapping.lifecycle === "pending-remove-equivalent"
+      ? mapping.cleanup_intent?.mapping_sha256
+      : this.mappingSnapshotSha256(mapping);
+    if (!mappingSha256) throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup intent is incomplete", { reason: "snapshot_changed" });
+    return withVerifiedHistoricalCleanupProof({
+      proofPath: options.proofPath,
+      history,
+      registryHead: options.registryHead,
+      historySha256: options.historySha256,
+      mappingSha256,
+      sourcePath: repository.root,
+      worktreePath: mapping.path,
+      commonGitDir: repository.identity,
+      repositorySlug: options.repositorySlug,
+      managedRoots: [this.config.stateDir, this.config.worktreeRoot],
+      runner: this.runner,
+      ...(this.proofSourceTrust ? { sourceTrust: this.proofSourceTrust } : {}),
+    }, async ({ verified, assertArtifactsUnchanged }) => {
+      if (mapping.lifecycle === "active") {
+        mapping.lifecycle = "pending-remove-equivalent";
+        mapping.cleanup_intent = this.cleanupIntent(options, mappingSha256, verified);
+        await this.saveState(state);
+        state = await this.loadState();
+        mapping = state.worktrees[history.worktree_ref];
+        if (!mapping) throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup intent disappeared", { reason: "snapshot_changed" });
+      } else {
+        this.assertMatchingCleanupIntent(mapping, options, verified);
+      }
+
+      const frozen = JSON.stringify(mapping);
+      await options.revalidate();
+      const lastState = await this.loadState();
+      const selected = lastState.worktrees[history.worktree_ref];
+      if (!selected || JSON.stringify(selected) !== frozen) {
+        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup state changed at final removal fence", { reason: "snapshot_changed" });
+      }
+      const last = selected;
+      await this.assertUniqueCleanupMapping(lastState, last, root, history.worktree_ref);
+      const [sourceRef, sourceHead] = await Promise.all([
+        this.git(["-C", repository.root, "symbolic-ref", "-q", "HEAD"]).then((result) => result.stdout.trim()),
+        this.git(["-C", repository.root, "rev-parse", "HEAD"]).then((result) => result.stdout.trim()),
+      ]);
+      const fast = await this.inspectMappedFull(last, history, root, repository.root);
+      if (sourceRef !== verified.sourceRef ||
+        sourceHead !== verified.sourceHead || fast.inspection.head_sha !== verified.worktreeHead ||
+        removalBlockingEntries(fast.status_entries).length > 0) {
+        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Git state changed at final removal fence", { reason: "snapshot_changed" });
+      }
+      await assertArtifactsUnchanged();
+      await this.git(["-C", last.repository_path, "worktree", "remove", last.path]);
+      last.lifecycle = "removed";
+      delete last.cleanup_intent;
+      await this.saveState(lastState);
+      return {
+        removed: true,
+        recovered,
+        lifecycle: "removed" as const,
+        cleanup_policy: "historical-exact-patch-v1" as const,
+        branch_preserved: true as const,
+        proof_sha256: verified.proofSha256,
+      };
+    });
+  }
+
+  private cleanupIntent(
+    options: Required<Pick<WorktreeCleanupOptions, "proofPath" | "registryHead" | "historySha256" | "repositorySlug">>,
+    mappingSha256: string,
+    verified: VerifiedHistoricalCleanupProof,
+  ): NonNullable<WorktreeMapping["cleanup_intent"]> {
+    return {
+      version: 1,
+      policy: "historical-exact-patch-v1",
+      proof_sha256: verified.proofSha256,
+      proof_path: options.proofPath,
+      registry_head: options.registryHead,
+      history_sha256: options.historySha256,
+      repository_slug: options.repositorySlug,
+      mapping_sha256: mappingSha256,
+      source_head: verified.sourceHead,
+      worktree_head: verified.worktreeHead,
+      inventory_sha256: verified.inventorySha256,
+    };
+  }
+
+  private assertMatchingCleanupIntent(
+    mapping: WorktreeMapping,
+    options: Required<Pick<WorktreeCleanupOptions, "proofPath" | "registryHead" | "historySha256" | "repositorySlug">>,
+    verified: VerifiedHistoricalCleanupProof,
+  ): void {
+    const intent = mapping.cleanup_intent;
+    if (!intent || intent.proof_path !== options.proofPath || intent.registry_head !== options.registryHead ||
+      intent.history_sha256 !== options.historySha256 || intent.repository_slug.toLowerCase() !== options.repositorySlug.toLowerCase() || intent.proof_sha256 !== verified.proofSha256 ||
+      intent.source_head !== verified.sourceHead || intent.worktree_head !== verified.worktreeHead ||
+      intent.inventory_sha256 !== verified.inventorySha256) {
+      throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup retry proof changed", { reason: "snapshot_changed" });
+    }
+  }
+
+  /** Read-only exact-generation discovery. It never initializes state or the worktree root. */
+  async releasedCleanupStatus(rawHistory: ClaimHistory): Promise<{
+    target: "matched" | "removed" | "unmapped" | "blocked";
+    reason?: string;
+    snapshot_sha256: string;
+    source_ref?: string;
+    source_head?: string;
+    worktree_head?: string;
+  }> {
+    const result = ClaimHistorySchema.safeParse(rawHistory);
+    if (!result.success || !result.data.task_alias) {
+      throw new ControlError("INVALID_CLAIM_HISTORY", "Discovery requires canonical released Claim history");
+    }
+    const history = result.data as ClaimHistory & { task_alias: string };
+    validateClaim(history);
+    this.assertLocalHost(history);
+    const state = await this.loadReadOnlyState();
+    const mapping = state.worktrees[history.worktree_ref];
+    const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+    if (!mapping) {
+      return { target: "unmapped", snapshot_sha256: digest(null) };
+    }
+    const snapshotSha256 = this.mappingSnapshotSha256(mapping);
+    if (
+      mapping.task_id !== history.task_id || mapping.project_id !== history.project_id ||
+      mapping.repo_id !== history.repo_id || mapping.claim_id !== history.claim_id ||
+      mapping.host !== history.host || mapping.branch !== history.branch
+    ) {
+      return { target: "blocked", reason: "snapshot_changed", snapshot_sha256: snapshotSha256 };
+    }
+    if (mapping.lifecycle === "pending-create") {
+      return { target: "blocked", reason: "scope_unsupported", snapshot_sha256: snapshotSha256 };
+    }
+    if (mapping.lifecycle === "removed") {
+      return { target: "removed", snapshot_sha256: snapshotSha256 };
+    }
+    // Root validation is deliberately deferred until a mapping exists; an
+    // uninitialized host remains a read-only, unmapped result.
+    const root = await this.readOnlyWorktreeRoot();
+    await this.assertUniqueCleanupMapping(state, mapping, root, history.worktree_ref);
+    const repository = await this.repositoryForMappedWorktree(mapping);
+    this.assertExactGeneration(mapping, history, repository.identity, root, mapping.lifecycle);
+    const inspection = await this.inspectMappedFull(mapping, history, root, repository.root);
+    if (
+      inspection.inspection.head_sha !== history.head_sha ||
+      removalBlockingEntries(inspection.status_entries).length > 0
+    ) {
+      return { target: "blocked", reason: "snapshot_changed", snapshot_sha256: snapshotSha256 };
+    }
+    const sourceRef = (await this.git(["-C", repository.root, "symbolic-ref", "-q", "HEAD"])).stdout.trim();
+    if (!sourceRef) return { target: "blocked", reason: "integration_untrusted", snapshot_sha256: snapshotSha256 };
+    const finalState = await this.loadReadOnlyState();
+    const finalMapping = finalState.worktrees[history.worktree_ref];
+    if (!finalMapping || JSON.stringify(finalMapping) !== JSON.stringify(mapping)) {
+      return { target: "blocked", reason: "snapshot_changed", snapshot_sha256: snapshotSha256 };
+    }
+    await this.assertUniqueCleanupMapping(finalState, finalMapping, root, history.worktree_ref);
+    return {
+      target: "matched",
+      snapshot_sha256: snapshotSha256,
+      source_ref: sourceRef,
+      source_head: repository.head,
+      worktree_head: inspection.inspection.head_sha,
+    };
   }
 
   async inspect(claim: WorktreeClaim): Promise<WorktreeInspection> {
@@ -1248,6 +1558,36 @@ export class WorktreeManager {
     return direct;
   }
 
+  private async assertUniqueCleanupMapping(
+    state: WorktreeState,
+    target: WorktreeMapping,
+    root: string,
+    targetRef: string,
+  ): Promise<void> {
+    const targetPath = await this.physicalMappingPath(target, root, targetRef);
+    const targetRepository = await this.physicalRepositoryIdentity(target.repository_identity, targetRef);
+    for (const [ref, mapping] of Object.entries(state.worktrees)) {
+      if (ref === targetRef || mapping.lifecycle === "removed") continue;
+      if (mapping.task_id === target.task_id || resolve(mapping.path) === resolve(target.path)) {
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Cleanup mapping is duplicated or aliased", {
+          reason: "mapping_duplicate", worktree_ref: ref,
+        });
+      }
+      const physicalPath = await this.physicalUnrelatedMappingPath(mapping, root, ref);
+      if (physicalPath !== undefined && physicalPath === targetPath) {
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Cleanup mapping has a physical path alias", {
+          reason: "mapping_duplicate", worktree_ref: ref,
+        });
+      }
+      if (mapping.branch === target.branch &&
+        await this.physicalRepositoryIdentity(mapping.repository_identity, ref) === targetRepository) {
+        throw new ControlError("WORKTREE_MAPPING_AMBIGUOUS", "Cleanup mapping duplicates repository and branch", {
+          reason: "mapping_duplicate", worktree_ref: ref,
+        });
+      }
+    }
+  }
+
   private async physicalRepositoryIdentity(identity: string, worktreeRef: string): Promise<string> {
     try {
       const entry = await lstat(identity);
@@ -1565,6 +1905,6 @@ export class WorktreeManager {
   }
 
   private async git(args: string[]): Promise<ProcessResult> {
-    return this.runner.run("git", args);
+    return this.runner.run("git", ["--no-optional-locks", ...args]);
   }
 }

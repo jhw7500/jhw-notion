@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, sep } from "node:path";
 
@@ -103,6 +104,7 @@ export class RegistryGit {
     holders: number;
     ready: Promise<void>;
   };
+  private readonly readOnlyGit = new AsyncLocalStorage<boolean>();
 
   /**
    * Requires an exact path in the current clean HEAD tree to be a regular file.
@@ -195,6 +197,10 @@ export class RegistryGit {
     scope.ready = (async () => { scope.commit = await this.headCommit(); })();
     this.committedTree = scope;
     return this.releasingCommittedTree(scope, read);
+  }
+
+  async withCommittedTreeReadOnly<T>(relativeDirectories: readonly string[], read: () => Promise<T>): Promise<T> {
+    return this.withReadOnlyGit(() => this.withCommittedTree(relativeDirectories, read));
   }
 
   private async releasingCommittedTree<T>(
@@ -449,7 +455,12 @@ export class RegistryGit {
     if (typeof rawRunner.runRaw !== "function") {
       throw new ControlError("REGISTRY_CORRUPT", "Registry runner cannot capture exact HEAD tree bytes");
     }
-    return rawRunner.runRaw("git", args, { cwd: this.config.registryDir }, maximumBytes);
+    return rawRunner.runRaw(
+      "git",
+      this.readOnlyGit.getStore() === true ? ["--no-optional-locks", ...args] : args,
+      { cwd: this.config.registryDir },
+      maximumBytes,
+    );
   }
 
   private decodeNulRows(bytes: Buffer): string[] {
@@ -601,6 +612,29 @@ export class RegistryGit {
     }
 
     return initialHead;
+  }
+
+  /** Proves current remote equality without fetch or optional Git locks. */
+  async assertReadyReadOnly(): Promise<string> {
+    return this.withReadOnlyGit(async () => {
+      await this.assertRemoteIdentity();
+      await this.assertVisibleIndex();
+      if ((await this.registryStatus()).length > 0) {
+        throw new ControlError("REGISTRY_DIRTY", "Registry checkout has pre-existing or ignored changes");
+      }
+      const head = await this.revision("HEAD");
+      const remote = (await this.git([
+        "ls-remote", "--exit-code", this.config.registryRemote, `refs/heads/${this.config.registryBranch}`,
+      ])).stdout.trim();
+      const rows = remote.split("\n").filter(Boolean);
+      if (rows.length !== 1 || rows[0] !== `${head}\trefs/heads/${this.config.registryBranch}`) {
+        throw new ControlError("REMOTE_DIVERGED", "Registry checkout is not at the remote branch head", {
+          local: head,
+          remote: `${this.config.registryRemote}/${this.config.registryBranch}`,
+        });
+      }
+      return head;
+    });
   }
 
   private async assertRemoteIdentity(): Promise<void> {
@@ -769,7 +803,15 @@ export class RegistryGit {
   }
 
   private async git(args: string[]): Promise<ProcessResult> {
-    return this.runner.run("git", args, { cwd: this.config.registryDir });
+    return this.runner.run(
+      "git",
+      this.readOnlyGit.getStore() === true ? ["--no-optional-locks", ...args] : args,
+      { cwd: this.config.registryDir },
+    );
+  }
+
+  private async withReadOnlyGit<T>(operation: () => Promise<T>): Promise<T> {
+    return this.readOnlyGit.run(true, operation);
   }
 
   private async revision(ref: string): Promise<string> {

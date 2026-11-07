@@ -50,10 +50,13 @@ control/hook link 또는 지원 TUI 설정 파일이 하나라도 있으면 buil
 | `./install.sh --prepare` | private stage에서 `npm ci`와 build를 수행하고 immutable release를 검증·보존한다. live pointer와 HOME은 그대로다. source 입력(`skills`, `mcp-server/src`, `mcp-server/scripts` 등) 아래에 git이 무시하는 파일이 있으면 `DEPLOY_SOURCE_INVALID` / `ignored_source_files`로 거부한다. 검사는 복사·build 전에 하고 build 뒤에 다시 한다(`.git`·`.ai`·`.superpowers`·`node_modules`·`dist` 아래는 release에서 빠지므로 대상이 아니다). 추적되지 않았지만 무시되지 않은 파일은 release에 복사되고 `dirty: true`로 보고된다. git은 빈 무시 디렉터리를 나열하지 않으므로, 비어 있거나 내용이 모두 제외 이름(`node_modules` 등) 아래에 있는 무시 디렉터리는 거부되지 않고 `dirty`에도 반영되지 않은 채 빈 디렉터리로 release에 복사된다. 인자 없는 첫 설치도 같은 staged build를 거치므로 같은 검사를 받는다. |
 | `./install.sh --status` | 선택된 release, predecessor 유무, pending recovery 수와 `tui`·`app_server`·`legacy`·`managed` 집계만 반환하는 advisory 조회다. |
 | `./install.sh --activate RELEASE_ID` | 두 번의 consumer inventory와 exclusive admission을 통과한 정확한 retained release만 활성화한다. |
+| `./install.sh --activate RELEASE_ID --guard-observe` | 기존 managed 설치를 명시적 host 관찰 모드로 전환한다. 현재 배선을 먼저 검증하고 Claude·Codex 네 이벤트를 배선한 뒤 private policy를 마지막에 게시한다. 첫 설치와 `--adopt-from` 조합은 거부한다. 이미 관찰 모드면 일반 activate와 같다. |
 | `./install.sh --activate RELEASE_ID --adopt-from LEGACY_CHECKOUT` | 첫 managed activation 전용. 같은 저장소의 다른 checkout(정규 절대경로, 같은 git common dir)이 남긴 legacy 설치를 넘겨받는다. 그 checkout을 정확히 가리키는 legacy 링크와 `node <LEGACY_CHECKOUT>/mcp-server/dist/index.js` MCP 항목만 adopt하며 env 키는 보존하고, 이 release에 없는 이름의 legacy Codex 링크는 제거한다(실패 시 preimage로 복원). 두 checkout 모두 consumer가 없어야 한다. 보존된 기본값 외 env는 이후 `--uninstall`에서 항목과 함께 사라지므로 재설치 뒤 다시 입력해야 한다. |
 | `./install.sh --rollback` | 현재 activation manifest에 기록된 validated predecessor 하나만 같은 gate 아래 활성화한다. |
 | `./install.sh --uninstall` | 확인된 installer-owned HOME wiring만 제거한다. release, activation, `current`, bootstrap, recovery evidence는 보존한다. 결과의 `envDropped`는 제거된 jhw-notion MCP 항목이 설치기 기본값과 다른 env(`env`·`environment`·`env_vars`·env 테이블)를 갖고 있던 adapter 이름만 나열한다(값·경로 없음). 이 env는 저장되지 않으므로 다음 `--activate` 뒤 직접 다시 입력해야 한다. 선택된 release의 wiring 라이브러리가 이 보고보다 오래되어 제거 여부를 알 수 없으면 `envDropped`는 `null`이다. |
 | `./install.sh --refresh-bootstrap` | managed 설치 전용. 같은 gate 아래 현재 release의 stable bootstrap helper 세트를 다시 설치한다. pointer, HOME wiring, MCP 항목과 그 env는 바꾸지 않으며, 교체 뒤 live validation이 실패하면 원래 helper 세트를 다시 설치한다. 결과의 `bootstrap.from`/`to`는 refresh 전후 bootstrap이 실제로 고정한 release이며, helper 바이트가 같으면 `to`는 기존 release 그대로다. |
+| `./install.sh --prune` | 기록 보존·정리 계획만 읽는다. 파일을 만들거나 지우지 않는다. |
+| `./install.sh --prune --apply` | consumer·두 lease gate 아래 계획을 다시 검증한다. 모든 후보의 복구 복사본을 검증·내구화한 뒤 원본을 정리하며 pending·불명 상태가 있으면 전체 삭제를 거부한다. |
 
 첫 활성화는 legacy entry를 stable bootstrap으로 옮긴다. 성공 뒤 MCP/control/hook은
 `.jhw-runtime/bootstrap/jhw-runtime-{entry,control,hook}`를 거쳐 admission lease를 잡고,
@@ -166,6 +169,34 @@ Control 좌표가 전혀 없어 exact `INVALID_CONFIG` 경로로 Guard group을 
 뜻이다. 둘 다 보호 완료로 기록하지 않는다. hook wiring이 존재하거나 activation이
 `DEPLOY_ACTIVATED`를 반환했다는 사실만으로 Guard protection을 주장할 수 없다.
 
+배포 기록은 기본적으로 30일과 최근 정상 기록 32개를 유지하며, 순서나 성공을 증명할 수 없는
+기록·복구 증거는 보존한다. `--prune --apply`는 최대 64 MiB의 추가 복구 사본을 먼저 만들고
+파일·디렉터리 sync와 bytes/hash/mode를 검증한다. 실패한 정리를 자동 재개하지 않는다.
+자세한 한도와 중단 시 조치는 [배포 기록 보존 정책](docs/deployment-retention.md)을 따른다.
+
+host observe 전환은 `$HOME/.config/jhw-control/guard-policy.json`의 canonical
+`{"version":1,"mode":"observe"}`와 두 hook 설정을 같은 복구 단위로 관리한다. 정책과
+`control.env`는 current-user-owned 단일 링크 `0600`이며 안전한 no-follow 부모를 요구한다.
+좌표 env가 하나라도 있으면 파일과 섞지 않고 전체 env만 검증한다. 좌표 env가 없을 때만
+명시 policy 아래의 data-only 11개 좌표를 Guard hook과 `guard status|preflight`가 사용한다.
+일반 CLI와 credential launcher는 env-only다. policy가 없으면 기존 env 기반 모드를 유지한다.
+
+관찰 모드의 일반 Task/Claim 위반은 별도 필수 audit stream에 남기며, 전용 프로세스 잠금 안에서
+같은 FD의 전체 형식·owner·mode·link를 검증하고 append·fsync·재검증한 뒤에만 허용한다.
+기록 실패·손상·잠금 실패는 `GUARD_UNAVAILABLE`로 차단하고 자동 수리하지 않는다. 기록 성공 뒤
+optional legacy journal만 실패하면 warning을 반환한다. protocol·unavailable·self-approval도
+차단한다. 진단은 request/key를 초기화하지 않으며 첫 유효 hook만 missing store를 준비한다.
+`unprotected: false`, `runtime_mode: observe`, `enforced: false`는 배선·관찰 상태이며 강제 보호 완료가 아니다.
+
+전환 전후 세 파일의 bytes·mode와 frozen activation은 private `.deploy.*/before.json`에 보존된다.
+정상 `--rollback`이 opt-in activation을 넘어갈 때만 원래 policy와 두 설정을 함께 복원한다.
+중간의 일반 activation을 되돌릴 때는 관찰 모드를 유지한다. 이후 사용자가 바꾼 설정은 덮지 않고
+복구를 중단한다. 중단된 reverse 복원은 같은 진행 기록에서 명시적으로 재개한다. 재개 시 파일과
+parent, 진행 기록의 fsync 의무 및 exact link 귀속을 다시 확인한다.
+불완전한 ready·알 수 없는 transaction/context·복수 pending은 증거를 보존해 수동 검토로 넘긴다.
+구버전 호환은 새 driver가 retained 구버전 helper를 선택하는 경로이며, 구버전 installer 자체가
+새 증거를 복구한다고 보장하지 않는다. bootstrap refresh만으로 Guard 배선이 전환되지는 않는다.
+
 모든 canonical/legacy skill target과 same-name MCP entry는 이 저장소 소유임이 증명될 때만 교체한다. 다른 file/symlink/registration이 있으면 그대로 보존하고 install은 fail-closed한다. JSON/TOML 설정은 기존 mode를 보존한 private same-directory temp에서 fsync 후 atomic publish한다. Codex backup도 이 설치기의 명시적 namespace만 관리한다.
 
 Claude/Codex hook의 canonical command는 다음 문자열이다. `$HOME` 값을 미리 보간하지 않고 double-quoted shell expansion으로 남기므로 공백·apostrophe·double quote가 포함된 HOME도 하나의 launcher argv가 된다.
@@ -176,7 +207,7 @@ Claude/Codex hook의 canonical command는 다음 문자열이다. `$HOME` 값을
 
 installer는 adapter별 canonical command만 자기 소유로 보며, Codex에 한해 이전 installer가 만든 exact legacy absolute launcher command도 소유로 인정한다. install은 소유가 증명된 Codex legacy만 canonical로 migration하고 uninstall은 exact owned variant만 제거한다. 유사 command, wrapper, matcher가 추가된 group, 다중 handler, 외부 group은 수정하지 않는다. 각 이벤트에서 Guard group은 맨 앞에 추가되며 기존 외부 group은 lexical byte content와 기존 상대 순서를 유지한다.
 
-`jhw-control guard status`는 기존 Plan 2의 고정 `pending` coverage를 유지하며 설치 상태를 추론하지 않는다. 설치된 Codex 0.153.4는 같은 이벤트의 matching synchronous local handler를 함께 실행하므로 local config에 Guard가 존재하거나 첫 위치라는 사실만으로 보호를 주장하지 않는다. `jhw-control guard preflight`의 Codex `enforced: true`는 `enforce` mode에서 네 이벤트마다 exact trusted synchronous Guard가 하나이고, Guard 외에 활성·실행 가능한 synchronous `command`/`mcpTool` handler가 없음을 read-only runtime inventory로 확인할 때만 가능하다. legacy wiring은 owned launcher가 이 저장소의 exact executable `scripts/jhw-control-hook`와 `mcp-server/dist/control/hook-adapter.js`를 가리켜야 한다. managed wiring은 canonical store ancestry의 bounded no-follow bootstrap manifest·helper bytes와 selected release의 wrapper/core digest를 함께 검증한 exact `bootstrap/jhw-runtime-hook` 관계여야 한다. 두 경우 모두 저장된 PreToolUse command의 bounded shell probe가 stderr 없이 exact `GUARD_PROTOCOL_MISMATCH` deny를 반환해야 한다. `command` variant의 `async: false`만 synchronous이고 `mcpTool` variant는 항상 synchronous다. 실행 가능한 foreign handler는 trusted 또는 managed 항목이며 untrusted·modified·disabled handler와 asynchronous command는 충돌로 보지 않는다. variant별 `command`/`async` 또는 `server`/`tool`, trust metadata, probe를 검증할 수 없으면 `enforced: false`/`NO-GO`다. project-source inventory는 이 명령을 실행한 current working directory 범위이므로 진단은 대상 worktree에서 실행한다. 미신뢰 훅 실행을 강제로 우회 허용한 별도 Codex 런타임은 이 판정의 전제 밖이므로 사용하지 않는다.
+`jhw-control guard status`는 기존 Plan 2의 고정 `pending` coverage를 유지하며 설치 상태를 추론하지 않는다. 기존 검증의 Codex 0.153.4는 같은 이벤트의 matching synchronous local handler를 함께 실행하므로 local config에 Guard가 존재하거나 첫 위치라는 사실만으로 보호를 주장하지 않는다. `jhw-control guard preflight`의 Codex `enforced: true`는 `enforce` mode에서 네 이벤트마다 exact trusted synchronous Guard가 하나이고, Guard 외에 활성·실행 가능한 synchronous `command`/`mcpTool` handler가 없음을 read-only runtime inventory로 확인할 때만 가능하다. legacy wiring은 owned launcher가 이 저장소의 exact executable `scripts/jhw-control-hook`와 `mcp-server/dist/control/hook-adapter.js`를 가리켜야 한다. managed wiring은 canonical store ancestry의 bounded no-follow bootstrap manifest·helper bytes와 selected release의 wrapper/core digest를 함께 검증한 exact `bootstrap/jhw-runtime-hook` 관계여야 한다. 두 경우 모두 저장된 PreToolUse command의 bounded shell probe가 stderr 없이 exact `GUARD_PROTOCOL_MISMATCH` deny를 반환해야 한다. `command` variant의 `async: false`만 synchronous이고 `mcpTool` variant는 항상 synchronous다. 실행 가능한 foreign handler는 trusted 또는 managed 항목이며 untrusted·modified·disabled handler와 asynchronous command는 충돌로 보지 않는다. variant별 `command`/`async` 또는 `server`/`tool`, trust metadata, probe를 검증할 수 없으면 `enforced: false`/`NO-GO`다. project-source inventory는 이 명령을 실행한 current working directory 범위이므로 진단은 대상 worktree에서 실행한다. 미신뢰 훅 실행을 강제로 우회 허용한 별도 Codex 런타임은 이 판정의 전제 밖이므로 사용하지 않는다.
 
 Claude `enforced: true`도 `enforce` mode에서만 가능하다. preflight는 standard `HOME/.claude` 설정 source(`CLAUDE_CONFIG_DIR`가 없거나 같은 절대 경로), 네 exact first-position group, 단일 owned launcher symlink와 executable core를 먼저 확인한다. global source는 filesystem root부터 `HOME/.claude`까지 전체 absolute directory chain을 descriptor-relative no-follow로 열어 root/current-user ownership과 group/world non-writable mode(root-owned sticky directory 제외)를 검증하되 마지막 `.claude`는 current-user-owned여야 하며, 읽은 뒤 같은 live pathname chain인지 다시 확인한다. `settings.json`도 current-user-owned regular 단일 link·group/world non-writable인지와 읽기 전후 identity/mode/size/time 안정성을 검증한다. launcher symlink, 그 exact target, core도 각 absolute parent chain을 같은 방식으로 열어 단일 link, executable regular type, bounded full-read 전후 안정성, current-path identity를 검증한다. 빌드는 새 `dist`를 `umask 022`로 생성하고 executable core를 정확히 `0755`로 고정한다. 또한 진단 cwd의 전체 parent chain도 같은 directory trust와 live-path 재검증을 통과해야 하며, filesystem root까지 Claude가 발견할 수 있는 `.claude/settings.json`과 `.claude/settings.local.json`을 열린 ancestor descriptor에 상대적으로 no-follow 조회한다. 현재 사용자 소유의 안정된 regular file이 아니거나 JSON·UTF-8·top-level `disableAllHooks` key가 모호하면 fail-closed하며, 어느 source든 명시 값이 정확히 `false`가 아니면 runtime probe를 시작하지 않는다. 다른 hook 내용은 실행하거나 probe 설정에 복제하지 않는다.
 
@@ -389,6 +420,18 @@ current-context는 같은 repository의 active Claim 중 `session_id`·adapter·
 
 승인된 takeover는 direct target mapping을 먼저 완전 검증한다. 다른 active mapping은 저장된 task/path/repository+branch 좌표가 충돌할 수 있을 때만 physical identity를 검사하므로, checkout이 이미 사라진 명백히 무관한 mapping은 takeover를 막지 않는다. 같은 Task, lexical/physical path alias, 같은 repository+branch, direct target 손상, removed checkout 재등장은 계속 fail-closed한다.
 
+checkout·Issue를 사용한 recovery discovery는 fetch·index 갱신·host state 초기화·Pilot/Board
+journal append 없이 latest released generation도 조회한다. `released.available: true`의
+`repository_slug`, Registry/history/mapping/source/worktree 좌표는 증거를 만드는 frozen 값이며
+삭제 허가가 아니다. `cleanup.target: matched`일 때만 별도의 private proof를 준비한다.
+
+ancestor가 아닌 작업본은 명시적인 `--action cleanup --cleanup-proof <absolute-private-manifest.json>`
+경로에서만 역사적 통합을 검증한다. 전체 linear suffix(최대 32)의 ordered/distinct ancestor 대응과
+raw path·old/new blob·mode·type tuple이 exact여야 하며, 이후 source 변경·revert는 허용한다.
+manifest·full bundle·ignored artifact 백업을 검증한 FD는 최종 확인까지 유지한다. branch와 외부
+backup은 보존하며 active successor·snapshot drift·불완전 backup은 거부한다. 실제 정리는 별도 승인 후
+`jhw-control-host`로 실행한다. [Task 절차](skills/claude/task.md)의 exact generation 절차를 따른다.
+
 Claim은 release됐지만 host mapping만 남고 checkout은 사라진 경우에도 파일을 직접 지우거나 Registry를 손편집하지 않는다. status/error가 반환한 exact 세 좌표를 사용하고, takeover와 별개의 실행 직전 사용자 승인을 받은 뒤에만 다음 복구를 실행한다.
 
 ```bash
@@ -403,7 +446,7 @@ Claim은 release됐지만 host mapping만 남고 checkout은 사라진 경우에
 
 정상 Claude/Codex 세션 종료의 `SessionEnd`는 최대 3초의 advisory evidence hook이다. exact active Claim과 cwd/worktree가 검증될 때만 bounded `session-ended` Git 좌표를 derived Guard journal에 기록한다. recovery reader는 secure state directory의 no-follow regular journal(`0600`, 단일 link, 최대 8 MiB/8192행/행당 8 KiB)을 descriptor-bound로 읽고 전체 schema와 read 전후 identity/size/time 안정성을 검증한다. exact Task/Claim 후보가 하나이고 현재 adapter/worktree/branch/HEAD/dirty/ahead/behind와 모두 같을 때만 `recorded`다. session ID, absolute path, transcript 내용은 저장·출력하지 않으며 Claim release·finish·force-end·takeover·mapping repair 권한이 없다. crash/kill이나 timeout이면 evidence가 없을 수 있으므로 다음 세션은 언제나 위 recovery status와 명시적 승인 절차로 복구한다.
 
-종료 훅에 Control 좌표 환경변수가 하나도 전달되지 않으면 `$HOME/.config/jhw-control/control.env`의 기존 non-secret host 좌표를 읽는다(`HOME` 자체가 없으면 OS 사용자 홈 사용). 파일은 현재 사용자 소유의 단일 링크 regular file, 정확히 `0600`, 최대 16 KiB여야 하며 symlink·미등록/중복 key·credential key·셸 표현식은 거부한다. secure host의 11개 좌표가 모두 필요하고, 환경변수에 좌표가 하나라도 있으면 파일과 합치지 않고 환경변수만 검증한다. 파일 fallback은 종료 증거 기록에서 사용하지 않는 ambient `JHW_GUARD_MODE`·`JHW_GUARD_ALLOW_OBSERVE`를 전달받지 않는다. 이 fallback은 `SessionEnd` 전용으로 Guard/CLI 설정이나 credential launcher를 활성화하지 않으며, 환경변수 기반 일반 Guard 설정 검증은 그대로 유지한다. 설정이 없거나 안전하지 않으면 종료 증거를 남기지 않으며 공개 hook launcher는 중립 `{}`로 종료한다.
+종료 훅에 Control 좌표 환경변수가 하나도 전달되지 않으면 `$HOME/.config/jhw-control/control.env`의 기존 non-secret host 좌표를 읽는다(`HOME` 자체가 없으면 OS 사용자 홈 사용). 파일은 현재 사용자 소유의 단일 링크 regular file, 정확히 `0600`, 최대 16 KiB여야 하며 symlink·미등록/중복 key·credential key·셸 표현식은 거부한다. secure host의 11개 좌표가 모두 필요하고, 환경변수에 좌표가 하나라도 있으면 파일과 합치지 않고 환경변수만 검증한다. 파일 fallback은 종료 증거 기록에서 사용하지 않는 ambient `JHW_GUARD_MODE`·`JHW_GUARD_ALLOW_OBSERVE`를 전달받지 않는다. 이 fallback 자체는 `SessionEnd` 전용이며 Guard나 credential launcher를 활성화하지 않는다. Guard의 별도 host observe opt-in은 위 정책 절차를 따르고, 일반 CLI는 계속 env-only다. 설정이 없거나 안전하지 않으면 종료 증거를 남기지 않으며 공개 hook launcher는 중립 `{}`로 종료한다.
 
 파일 fallback은 선택한 홈 디렉터리를 기준으로 `.config`와 `jhw-control`을 열린 부모 descriptor에 상대적으로 하나씩 검사한다. 두 상위 구성요소가 symlink이거나 디렉터리가 아니면 거부하고, 마지막 `control.env`도 no-follow로 연다. 성공·실패 모두 config 파일과 디렉터리 descriptor를 닫는다.
 

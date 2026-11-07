@@ -54,7 +54,15 @@ export interface SourceCatalogPort {
     githubNodeId: string,
     use: (repository: RepositoryRecord) => Promise<T>,
   ): Promise<T>;
+  withPinnedRepositoryByGitHubNodeReadOnly?<T>(
+    githubNodeId: string,
+    use: (repository: RepositoryRecord) => Promise<T>,
+  ): Promise<T>;
   withPinnedFormalTaskByGitHubNode<T>(
+    githubNodeId: string,
+    use: (task: FormalTask) => Promise<T>,
+  ): Promise<T>;
+  withPinnedFormalTaskByGitHubNodeReadOnly?<T>(
     githubNodeId: string,
     use: (task: FormalTask) => Promise<T>,
   ): Promise<T>;
@@ -384,6 +392,34 @@ export class GitHubSourceService {
     });
   }
 
+  async withResolvedExistingFormalTaskReadOnly<T>(
+    input: { repository_path: string; issue_url: string },
+    use: (resolved: ExistingFormalTaskResolution) => Promise<T>,
+  ): Promise<T> {
+    issueCoordinates(input.issue_url);
+    this.assertCheckoutSafe({ issue_url: input.issue_url }, input.repository_path);
+    return this.withResolvedCheckoutContextReadOnly(input.repository_path, async (context) => {
+      const issue = await this.resolveIssue(context.repository, input.issue_url);
+      this.assertCheckoutSafe(issue, input.repository_path);
+      const readOnly = this.options.catalog.withPinnedFormalTaskByGitHubNodeReadOnly as
+        | (<R>(githubNodeId: string, callback: (task: FormalTask) => Promise<R>) => Promise<R>)
+        | undefined;
+      if (!readOnly) throw new ControlError("REGISTRY_CORRUPT", "Read-only Task source resolver is unavailable");
+      const invoke = <R>(callback: (task: FormalTask) => Promise<R>): Promise<R> =>
+        readOnly.call(this.options.catalog, issue.issue_node_id, callback) as Promise<R>;
+      return invoke<T>(async (task) => {
+        if (
+          task.project_id !== context.project_id || task.repo_id !== context.repo_id ||
+          task.issue_node_id !== issue.issue_node_id || task.issue_url !== issue.issue_url ||
+          !task.aliases.includes(issue.alias)
+        ) throw new ControlError("FORMAL_TASK_SOURCE_MISMATCH", "Verified Issue and canonical Task source disagree");
+        const resolved = { task, alias: issue.alias };
+        this.assertCheckoutSafe(resolved, input.repository_path);
+        return use(resolved);
+      });
+    });
+  }
+
   async withResolvedTaskStatusContext<T>(
     input: { repository_path: string },
     use: (context: ResolvedTaskStatusContext) => Promise<T>,
@@ -537,6 +573,28 @@ export class GitHubSourceService {
       this.assertCheckoutSafe(context, repositoryPath);
       return use(context);
     });
+  }
+
+  private async withResolvedCheckoutContextReadOnly<T>(repositoryPath: string, use: (context: VerifiedTaskContext) => Promise<T>): Promise<T> {
+    const checkoutSlug = await githubSlugFromCheckout({
+      run: (command, args, options) => this.options.runner.run(command, ["--no-optional-locks", ...args], options),
+    }, repositoryPath);
+    const live = await this.readLiveRepository(checkoutSlug);
+    this.assertCheckoutSafe(live, repositoryPath);
+    const pin = this.options.catalog.withPinnedRepositoryByGitHubNodeReadOnly as
+      | (<R>(node: string, callback: (repository: RepositoryRecord) => Promise<R>) => Promise<R>) | undefined;
+    if (!pin) throw new ControlError("REGISTRY_CORRUPT", "Read-only Repository source resolver is unavailable");
+    return pin.call(this.options.catalog, live.node_id, async (repository) => {
+      this.assertCheckoutSafe(repository, repositoryPath);
+      if (!sameSlug(checkoutSlug, repository.slug) || !sameSlug(live.full_name, repository.slug) || live.node_id !== repository.github_node_id) {
+        throw new ControlError("REPOSITORY_IDENTITY_MISMATCH", "Checkout, GitHub, and Registry disagree");
+      }
+      this.assertRepositoryPolicy(live, repository);
+      const project = await this.options.projects.resolveUniqueProjectForRepository(repository.id);
+      const context: VerifiedTaskContext = { project_id: project.project_id, repo_id: repository.id, repository, project_source_revision: project.source_revision };
+      this.assertCheckoutSafe(context, repositoryPath);
+      return use(context);
+    }) as Promise<T>;
   }
 
   private async checkoutSlug(repositoryPath: string): Promise<string> {

@@ -777,7 +777,7 @@ describe("GuardService", () => {
   it("checks all apply_patch targets and rejects one escaping target", async () => {
     const patch = "*** Begin Patch\n*** Update File: src/file.ts\n*** Update File: ../outside.ts\n*** End Patch";
 
-    await expect(fixture.service().evaluatePreTool(preTool(fixture.root, "apply_patch", patch)))
+    await expect(fixture.service().evaluatePreTool(preTool(fixture.root, "apply_patch", { command: patch })))
       .resolves.toMatchObject({ decision: "DENY", code: "GUARD_WORKTREE_MISMATCH" });
   });
 
@@ -1610,13 +1610,79 @@ describe("GuardService", () => {
     fixture.currentClaim = activeClaim(fixture.currentContract);
     fixture.activeClaims = [fixture.currentClaim];
 
-    await expect(fixture.service({ mode: "observe", inspect_guard_state: async () => true })
+    const stateDir = join(fixture.root, "observe-state");
+    await expect(fixture.service({
+      mode: "observe",
+      inspect_guard_state: async () => true,
+      guard_journal: new GuardJournal(stateDir),
+    })
       .evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
       decision: "ALLOW",
       observed_decision: "PERMIT_REQUIRED",
     });
+    expect(JSON.parse(await readFile(join(stateDir, "guard-observe-journal.v1.jsonl"), "utf8")))
+      .toMatchObject({ mode: "observe", observed_decision: "PERMIT_REQUIRED" });
     expect(fixture.permitCalls).toBe(0);
     expect(fixture.barrierCalls).toBe(1);
+  });
+
+  it("hard-denies an observed policy result when no trusted observation writer is available", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    await expect(fixture.service({ mode: "observe", inspect_guard_state: async () => true })
+      .evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+      decision: "DENY",
+      code: "GUARD_UNAVAILABLE",
+    });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("allows after durable observation when only the optional legacy row fails", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const stateDir = join(fixture.root, "legacy-warning-state");
+    await mkdir(stateDir, { mode: 0o700 });
+    const legacyPath = join(stateDir, "guard-journal.jsonl");
+    await writeFile(legacyPath, "legacy remains unchanged\n", { mode: 0o600 });
+    await chmod(legacyPath, 0o644);
+
+    await expect(fixture.service({
+      mode: "observe",
+      inspect_guard_state: async () => true,
+      guard_journal: new GuardJournal(stateDir),
+    }).evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+      decision: "ALLOW",
+      observed_decision: "PERMIT_REQUIRED",
+      journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+    });
+    expect(await readFile(legacyPath, "utf8")).toBe("legacy remains unchanged\n");
+    expect(JSON.parse(await readFile(join(stateDir, "guard-observe-journal.v1.jsonl"), "utf8")))
+      .toMatchObject({ mode: "observe", observed_decision: "PERMIT_REQUIRED" });
+  });
+
+  it("does not trust an overridden observation writer", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const journal = new GuardJournal(join(fixture.root, "forged-observe-state"));
+    const forged = vi.fn(async () => ({}));
+    Object.defineProperty(journal, "appendObservedDecision", { value: forged });
+
+    await expect(fixture.service({
+      mode: "observe",
+      inspect_guard_state: async () => true,
+      guard_journal: journal,
+    }).evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
+      decision: "DENY",
+      code: "GUARD_UNAVAILABLE",
+    });
+    expect(forged).not.toHaveBeenCalled();
   });
 
   it.each([

@@ -771,6 +771,21 @@ export class Catalog {
     });
   }
 
+  async withPinnedRepositoryByGitHubNodeReadOnly<T>(githubNodeId: string, use: (repository: RepositoryRecord) => Promise<T>): Promise<T> {
+    const parsed = githubNodeIdSchema.safeParse(githubNodeId);
+    if (!parsed.success) throw new ControlError("INVALID_REPOSITORY_ID", "GitHub Repository node ID is invalid");
+    await this.registry.assertReadyReadOnly();
+    return this.registry.withCommittedTreeReadOnly(["repositories"], async () => {
+      await this.auditRepositorySourceIndexesWithin();
+      const indexed = await this.repositoryForSource(repositorySourceRelativePath(parsed.data), parsed.data);
+      if (!indexed) throw new ControlError("REPOSITORY_NOT_FOUND", "Canonical Repository source is not registered");
+      this.sensitiveData.assertSafe(indexed.repository);
+      const result = await use(indexed.repository);
+      await this.registry.assertCommittedViewCurrent();
+      return result;
+    });
+  }
+
   async withPinnedFormalTaskByGitHubNode<T>(
     githubNodeId: string,
     use: (task: FormalTask) => Promise<T>,
@@ -789,6 +804,24 @@ export class Catalog {
       }
       this.sensitiveData.assertSafe(indexed.task);
       const result = await use(indexed.task);
+      await this.registry.assertCommittedViewCurrent();
+      return result;
+    });
+  }
+
+  async withPinnedFormalTaskByGitHubNodeReadOnly<T>(
+    githubNodeId: string,
+    use: (task: FormalTask) => Promise<T>,
+  ): Promise<T> {
+    const parsed = githubNodeIdSchema.safeParse(githubNodeId);
+    if (!parsed.success) throw new ControlError("INVALID_ISSUE_ID", "GitHub Issue node ID is invalid");
+    await this.registry.assertReadyReadOnly();
+    return this.registry.withCommittedTreeReadOnly(["tasks", "repositories"], async () => {
+      await this.auditTaskSourceIndexesWithin();
+      const taskIndexed = await this.formalTaskForSource(taskSourceRelativePath(parsed.data), parsed.data);
+      if (!taskIndexed) throw new ControlError("TASK_NOT_FOUND", "Verified Issue has no canonical Task");
+      this.sensitiveData.assertSafe(taskIndexed.task);
+      const result = await use(taskIndexed.task);
       await this.registry.assertCommittedViewCurrent();
       return result;
     });

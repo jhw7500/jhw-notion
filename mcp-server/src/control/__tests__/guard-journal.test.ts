@@ -484,6 +484,51 @@ describe("GuardJournal", () => {
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(event());
   });
 
+  it("requires the durable observation stream before the optional legacy decision row", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const legacyPath = join(stateDir, "guard-journal.jsonl");
+    const observePath = join(stateDir, "guard-observe-journal.v1.jsonl");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(legacyPath, "legacy remains unchanged\n", { mode: 0o600 });
+    await chmod(legacyPath, 0o644);
+    const decision = event({ event: "decision" });
+
+    await expect(new GuardJournal(stateDir).appendObservedDecision(
+      decision,
+      { observed_decision: "DENY", decision_code: "GUARD_CLAIM_REQUIRED" },
+    )).resolves.toEqual({ legacy_journal_warning: "GUARD_JOURNAL_UNAVAILABLE" });
+
+    expect(await readFile(legacyPath, "utf8")).toBe("legacy remains unchanged\n");
+    expect(JSON.parse(await readFile(observePath, "utf8"))).toEqual({
+      ...decision,
+      mode: "observe",
+      observed_decision: "DENY",
+      decision_code: "GUARD_CLAIM_REQUIRED",
+    });
+  });
+
+  it("does not let a writable legacy row substitute for an unsafe observation stream", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const legacyPath = join(stateDir, "guard-journal.jsonl");
+    const observePath = join(stateDir, "guard-observe-journal.v1.jsonl");
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(legacyPath, "", { mode: 0o600 });
+    await writeFile(observePath, "unsafe\n", { mode: 0o600 });
+    await chmod(observePath, 0o644);
+
+    await expect(new GuardJournal(stateDir).appendObservedDecision(
+      event({ event: "decision" }),
+      { observed_decision: "PERMIT_REQUIRED" },
+    )).rejects.toMatchObject({ code: "GUARD_JOURNAL_UNAVAILABLE" });
+
+    expect(await readFile(legacyPath, "utf8")).toBe("");
+    expect(await readFile(observePath, "utf8")).toBe("unsafe\n");
+  });
+
   it("appends the finite schema-valid maximum event without dropping canonical requirements", async () => {
     const root = await mkdtemp(join(tmpdir(), "jhw-guard-journal-"));
     roots.push(root);

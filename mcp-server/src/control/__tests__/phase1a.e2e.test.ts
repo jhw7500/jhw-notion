@@ -218,6 +218,9 @@ function cliDependencies(graph: Graph, overrides: Partial<CliDependencies> = {})
       withResolvedExistingFormalTask: async () => {
         throw new ControlError("TASK_NOT_FOUND", "checkout recovery discovery is not configured by this fixture");
       },
+      withResolvedExistingFormalTaskReadOnly: async () => {
+        throw new ControlError("TASK_NOT_FOUND", "read-only checkout recovery discovery is not configured by this fixture");
+      },
       withResolvedTaskStatusContext: async (_input, use) => graph.catalog.withPinnedRepositoryByGitHubNode(
         repositoryInput.github_node_id,
         async (repository) => use({ project_id: "prj-control", repo_id: repository.id, repository_slug: repository.slug }),
@@ -1876,11 +1879,19 @@ describe("Phase 1A deterministic adversarial gate", () => {
     expect(forceEnded.exitCode).toBe(0);
     const afterForceEnd = await runCli(discoveryArgs, dependencies);
     expect(afterForceEnd.exitCode).toBe(0);
-    expect(JSON.parse(afterForceEnd.stdout).result).toEqual({
+    expect(JSON.parse(afterForceEnd.stdout).result).toMatchObject({
       kind: "resolved",
       task_id: formal.id,
       state: "inactive",
       handoff: { available: false },
+      released: {
+        available: true,
+        unique_latest: true,
+        claim_id: replacementClaimId,
+        status: "force-ended",
+        repository_slug: "jhw7500/control",
+        cleanup: { target: "blocked", reason: "snapshot_changed" },
+      },
     });
     expect(await exists(join(fixture.cloneA, "handoffs", formal.id, `${firstClaimId}.md`))).toBe(true);
   }, 30_000);

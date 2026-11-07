@@ -175,6 +175,21 @@ CLAUDE_HOOKS_TRANSACTION_DIR=""
 CLAUDE_HOOKS_TRANSACTION_STAGE=""
 CLAUDE_HOOKS_TRANSACTION_METADATA=""
 CLAUDE_HOOKS_TRANSACTION_PRESERVE=0
+CODEX_HOOKS_CONFIG_CHANGED=0
+CODEX_HOOKS_CONFIG_FILE=""
+CODEX_HOOKS_TRANSACTION_DIR=""
+CODEX_HOOKS_TRANSACTION_STAGE=""
+CODEX_HOOKS_TRANSACTION_METADATA=""
+CODEX_HOOKS_TRANSACTION_PRESERVE=0
+GUARD_HOOK_SCOPE=""
+GUARD_POLICY_FILE=""
+GUARD_POLICY_TRANSITION=""
+GUARD_POLICY_CHANGED=0
+GUARD_POLICY_TRANSACTION_DIR=""
+GUARD_POLICY_TRANSACTION_STAGE=""
+GUARD_POLICY_TRANSACTION_FINALIZE_FROM=""
+GUARD_POLICY_TRANSACTION_METADATA=""
+GUARD_POLICY_TRANSACTION_PRESERVE=0
 CONTROL_HOOK_LINK_TRANSACTION_DIR=""
 CONTROL_HOOK_LINK_TRANSACTION_STAGE=""
 CONTROL_HOOK_LINK_TRANSACTION_METADATA=""
@@ -452,6 +467,38 @@ clear_saved_claude_hook_transaction() {
   CLAUDE_HOOKS_TRANSACTION_PRESERVE=0
 }
 
+save_codex_hook_transaction() {
+  [ "$HOOKS_ADAPTER" = "codex" ] || return 1
+  CODEX_HOOKS_CONFIG_CHANGED="$HOOKS_CONFIG_CHANGED"
+  CODEX_HOOKS_CONFIG_FILE="$HOOKS_CONFIG_FILE"
+  CODEX_HOOKS_TRANSACTION_DIR="$HOOKS_TRANSACTION_DIR"
+  CODEX_HOOKS_TRANSACTION_STAGE="$HOOKS_TRANSACTION_STAGE"
+  CODEX_HOOKS_TRANSACTION_METADATA="$HOOKS_TRANSACTION_METADATA"
+  CODEX_HOOKS_TRANSACTION_PRESERVE="$HOOKS_TRANSACTION_PRESERVE"
+  clear_current_hook_transaction
+}
+
+load_codex_hook_transaction() {
+  [ -n "$CODEX_HOOKS_TRANSACTION_DIR" ] || return 1
+  HOOKS_ADAPTER="codex"
+  HOOKS_DISPLAY_NAME="Codex"
+  HOOKS_CONFIG_CHANGED="$CODEX_HOOKS_CONFIG_CHANGED"
+  HOOKS_CONFIG_FILE="$CODEX_HOOKS_CONFIG_FILE"
+  HOOKS_TRANSACTION_DIR="$CODEX_HOOKS_TRANSACTION_DIR"
+  HOOKS_TRANSACTION_STAGE="$CODEX_HOOKS_TRANSACTION_STAGE"
+  HOOKS_TRANSACTION_METADATA="$CODEX_HOOKS_TRANSACTION_METADATA"
+  HOOKS_TRANSACTION_PRESERVE="$CODEX_HOOKS_TRANSACTION_PRESERVE"
+}
+
+clear_saved_codex_hook_transaction() {
+  CODEX_HOOKS_CONFIG_CHANGED=0
+  CODEX_HOOKS_CONFIG_FILE=""
+  CODEX_HOOKS_TRANSACTION_DIR=""
+  CODEX_HOOKS_TRANSACTION_STAGE=""
+  CODEX_HOOKS_TRANSACTION_METADATA=""
+  CODEX_HOOKS_TRANSACTION_PRESERVE=0
+}
+
 reject_stale_hook_transactions() {
   local directory="$1" pattern="$2" display_name="$3" candidate found=0
   [ -d "$directory" ] || return 0
@@ -476,6 +523,10 @@ reject_stale_codex_hook_transactions() {
 
 reject_stale_claude_hook_transactions() {
   reject_stale_hook_transactions "$HOME/.claude" '.settings.json.jhw-txn.*' Claude
+}
+
+reject_stale_guard_policy_transactions() {
+  reject_stale_hook_transactions "$HOME/.config/jhw-control" '.guard-policy.json.jhw-txn.*' "Guard policy"
 }
 
 reject_stale_control_hook_link_transactions() {
@@ -571,7 +622,7 @@ finalize_codex_hook_transaction() {
 }
 
 rollback_codex_hooks() {
-  local rc
+  local rc finalize_mode="${1:-finalize}"
   [ "$HOOKS_CONFIG_CHANGED" -eq 1 ] && [ "$HOOKS_TRANSACTION_PRESERVE" -eq 0 ] || return 1
   if node "$CONFIG_EDITOR" "rollback-${HOOKS_ADAPTER}-hooks-transaction" "$HOOKS_CONFIG_FILE" \
       "$MCP_ENTRY" "$SCRIPT_DIR" "$HOOKS_TRANSACTION_DIR" 2>/dev/null; then
@@ -588,12 +639,15 @@ rollback_codex_hooks() {
     return 1
   fi
   if [ "$rc" -eq 0 ] && [ "$HOOKS_TRANSACTION_STAGE" = "rollback-restored" ]; then
+    HOOKS_CONFIG_CHANGED=0
+    if [ "$finalize_mode" = retain ]; then
+      return 0
+    fi
     if ! finalize_codex_hook_transaction "rollback-restored"; then
       fail "확인된 rollback의 private evidence 정리에 실패했습니다."
       report_codex_hook_transaction
       return 1
     fi
-    HOOKS_CONFIG_CHANGED=0
     return 0
   fi
   if [ "$HOOKS_TRANSACTION_STAGE" = "rollback-capture-intent" ] &&
@@ -625,9 +679,9 @@ rollback_codex_hooks() {
 }
 
 rollback_current_guard_hook_transaction() {
-  local rc
+  local rc finalize_mode="${1:-finalize}"
   if [ "$HOOKS_CONFIG_CHANGED" -eq 1 ] && [ "$HOOKS_TRANSACTION_PRESERVE" -eq 0 ]; then
-    rollback_codex_hooks
+    rollback_codex_hooks "$finalize_mode"
     rc=$?
     return "$rc"
   fi
@@ -638,21 +692,56 @@ rollback_current_guard_hook_transaction() {
   return 0
 }
 
+preserve_all_guard_transactions() {
+  GUARD_POLICY_TRANSACTION_PRESERVE=1
+  HOOKS_TRANSACTION_PRESERVE=1
+  CLAUDE_HOOKS_TRANSACTION_PRESERVE=1
+  CODEX_HOOKS_TRANSACTION_PRESERVE=1
+}
+
 # Undo this install's unfinalized hook transactions and new launcher link.
 # Returns nonzero when a hook transaction could not be rolled back.
 rollback_install_transaction() {
-  local hooks_rollback_ok=1
+  local current_was_codex=0
   [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ] || return 0
-  if ! rollback_current_guard_hook_transaction; then hooks_rollback_ok=0; fi
-  if [ -n "$CLAUDE_HOOKS_TRANSACTION_DIR" ]; then
-    if load_claude_hook_transaction && rollback_current_guard_hook_transaction; then
-      clear_saved_claude_hook_transaction
-      clear_current_hook_transaction
-    else
-      hooks_rollback_ok=0
+  if ! rollback_guard_policy_transaction retain; then
+    preserve_all_guard_transactions
+    return 1
+  fi
+  if [ -n "$HOOKS_TRANSACTION_DIR" ]; then
+    [ "$HOOKS_ADAPTER" = codex ] && current_was_codex=1
+    if ! rollback_current_guard_hook_transaction retain; then
+      preserve_all_guard_transactions
+      return 1
+    fi
+    if [ "$current_was_codex" -eq 1 ]; then
+      save_codex_hook_transaction || { preserve_all_guard_transactions; return 1; }
     fi
   fi
-  [ "$hooks_rollback_ok" -eq 1 ] || return 1
+  if [ -n "$CLAUDE_HOOKS_TRANSACTION_DIR" ]; then
+    if ! load_claude_hook_transaction || ! rollback_current_guard_hook_transaction retain; then
+      preserve_all_guard_transactions
+      return 1
+    fi
+  fi
+
+  # No evidence is finalized until policy and every present adapter have all
+  # reached the conclusively restored state.
+  if [ -n "$HOOKS_TRANSACTION_DIR" ]; then
+    finalize_codex_hook_transaction rollback-restored || { preserve_all_guard_transactions; return 1; }
+    clear_saved_claude_hook_transaction
+    clear_current_hook_transaction
+  fi
+  if [ -n "$CODEX_HOOKS_TRANSACTION_DIR" ]; then
+    load_codex_hook_transaction || { preserve_all_guard_transactions; return 1; }
+    finalize_codex_hook_transaction rollback-restored || { preserve_all_guard_transactions; return 1; }
+    clear_saved_codex_hook_transaction
+    clear_current_hook_transaction
+  fi
+  if [ -n "$GUARD_POLICY_TRANSACTION_DIR" ]; then
+    finalize_guard_policy_transaction rollback-restored || { preserve_all_guard_transactions; return 1; }
+    GUARD_POLICY_CHANGED=0
+  fi
   rollback_new_control_hook
 }
 
@@ -688,7 +777,8 @@ reject_all_private_hook_transactions() {
     return 1
   fi
   reject_stale_codex_hook_transactions || return 1
-  reject_stale_claude_hook_transactions
+  reject_stale_claude_hook_transactions || return 1
+  reject_stale_guard_policy_transactions
 }
 
 install_owned_symlink() {
@@ -931,6 +1021,231 @@ finalize_saved_claude_guard_hooks() {
   clear_current_hook_transaction
 }
 
+plan_guard_observe_transition() {
+  local current="$1" transition
+  [ "$current" = absent ] || [ "$current" = observe ] || return 2
+  transition="$current:observe"
+  node "$CONFIG_EDITOR" check-guard-policy-target "$HOME/.config/jhw-control/guard-policy.json" \
+    "$MCP_ENTRY" "$SCRIPT_DIR" "" "$transition" >/dev/null 2>&1 || return 1
+  if [ -d "$CLAUDE_DIR" ]; then
+    node "$CONFIG_EDITOR" check-claude-hooks "$CLAUDE_DIR/settings.json" \
+      "$MCP_ENTRY" "$SCRIPT_DIR" "" all >/dev/null 2>&1 || return 1
+  fi
+  if [ -d "$CODEX_DIR" ]; then
+    node "$CONFIG_EDITOR" check-codex-hooks "$CODEX_DIR/hooks.json" \
+      "$MCP_ENTRY" "$SCRIPT_DIR" "" all >/dev/null 2>&1 || return 1
+  fi
+}
+
+resolve_guard_hook_scope() {
+  if ! control_coordinates_absent; then
+    GUARD_HOOK_SCOPE=all
+    return 0
+  fi
+  if node "$CONFIG_EDITOR" check-guard-policy "$HOME/.config/jhw-control/guard-policy.json" \
+      "$MCP_ENTRY" "$SCRIPT_DIR" "" observe:observe >/dev/null 2>&1; then
+    GUARD_HOOK_SCOPE=all
+    return 0
+  fi
+  if node "$CONFIG_EDITOR" check-guard-policy "$HOME/.config/jhw-control/guard-policy.json" \
+      "$MCP_ENTRY" "$SCRIPT_DIR" "" absent:observe >/dev/null 2>&1; then
+    GUARD_HOOK_SCOPE=session-end-only
+    return 0
+  fi
+  fail "live Guard policy가 없거나 안전한 observe policy가 아닙니다."
+  return 1
+}
+
+allocate_guard_policy_transaction() {
+  local directory="$HOME/.config/jhw-control"
+  [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+  GUARD_POLICY_FILE="$directory/guard-policy.json"
+  GUARD_POLICY_TRANSACTION_DIR="$(mktemp -d "$directory/.guard-policy.json.jhw-txn.XXXXXX")" || return 1
+  chmod 0700 "$GUARD_POLICY_TRANSACTION_DIR"
+  GUARD_POLICY_CHANGED=0
+  GUARD_POLICY_TRANSACTION_STAGE=""
+  GUARD_POLICY_TRANSACTION_FINALIZE_FROM=""
+  GUARD_POLICY_TRANSACTION_METADATA=""
+  GUARD_POLICY_TRANSACTION_PRESERVE=0
+}
+
+inspect_guard_policy_transaction() {
+  [ -n "$GUARD_POLICY_TRANSACTION_DIR" ] || return 1
+  GUARD_POLICY_TRANSACTION_METADATA="$(node "$CONFIG_EDITOR" inspect-guard-policy-transaction \
+    "$GUARD_POLICY_FILE" "$MCP_ENTRY" "$SCRIPT_DIR" "$GUARD_POLICY_TRANSACTION_DIR" \
+    "$GUARD_POLICY_TRANSITION" 2>/dev/null)" || return 1
+  GUARD_POLICY_TRANSACTION_STAGE="$(node -e '
+    const value = JSON.parse(process.argv[1]);
+    if (!value || typeof value.stage !== "string") process.exit(1);
+    process.stdout.write(value.stage);
+  ' "$GUARD_POLICY_TRANSACTION_METADATA" 2>/dev/null)"
+  GUARD_POLICY_TRANSACTION_FINALIZE_FROM="$(node -e '
+    const value = JSON.parse(process.argv[1]);
+    if (value.finalizeFrom === undefined) process.exit(0);
+    if (typeof value.finalizeFrom !== "string") process.exit(1);
+    process.stdout.write(value.finalizeFrom);
+  ' "$GUARD_POLICY_TRANSACTION_METADATA" 2>/dev/null)"
+}
+
+load_guard_policy_transaction_context() {
+  local policy_file="$1" transaction_dir="$2" transition="$3" expected_stage="$4"
+  [ -z "$GUARD_POLICY_TRANSACTION_DIR" ] || return 1
+  [ "$policy_file" = "$HOME/.config/jhw-control/guard-policy.json" ] || return 1
+  [ "$(dirname "$transaction_dir")" = "$HOME/.config/jhw-control" ] || return 1
+  case "$(basename "$transaction_dir")" in
+    .guard-policy.json.jhw-txn.*) ;;
+    *) return 1 ;;
+  esac
+  case "$transition" in absent:observe|observe:observe) ;; *) return 1 ;; esac
+  case "$expected_stage" in
+    activated|rollback-restored|rollback-capture-intent|rollback-captured|manual-recovery-required|ambiguous) ;;
+    *) return 1 ;;
+  esac
+  GUARD_POLICY_FILE="$policy_file"
+  GUARD_POLICY_TRANSACTION_DIR="$transaction_dir"
+  GUARD_POLICY_TRANSITION="$transition"
+  if ! inspect_guard_policy_transaction || {
+      [ "$GUARD_POLICY_TRANSACTION_STAGE" != "$expected_stage" ] &&
+      { [ "$GUARD_POLICY_TRANSACTION_STAGE" != finalize-intent ] ||
+        [ "$GUARD_POLICY_TRANSACTION_FINALIZE_FROM" != "$expected_stage" ]; };
+    }; then
+    GUARD_POLICY_FILE=""
+    GUARD_POLICY_TRANSACTION_DIR=""
+    GUARD_POLICY_TRANSITION=""
+    GUARD_POLICY_TRANSACTION_STAGE=""
+    GUARD_POLICY_TRANSACTION_FINALIZE_FROM=""
+    GUARD_POLICY_TRANSACTION_METADATA=""
+    return 1
+  fi
+  case "$expected_stage" in
+    activated|rollback-capture-intent|rollback-captured) GUARD_POLICY_CHANGED=1; GUARD_POLICY_TRANSACTION_PRESERVE=0 ;;
+    rollback-restored) GUARD_POLICY_CHANGED=0; GUARD_POLICY_TRANSACTION_PRESERVE=0 ;;
+    manual-recovery-required|ambiguous) GUARD_POLICY_CHANGED=1; GUARD_POLICY_TRANSACTION_PRESERVE=1 ;;
+  esac
+}
+
+report_guard_policy_transaction() {
+  [ -e "$GUARD_POLICY_TRANSACTION_DIR" ] || [ -L "$GUARD_POLICY_TRANSACTION_DIR" ] || {
+    fail "Guard policy transaction evidence was removed; parent-directory durability is unconfirmed"
+    return
+  }
+  fail "private Guard policy transaction path: $GUARD_POLICY_TRANSACTION_DIR"
+  if inspect_guard_policy_transaction; then
+    fail "Guard policy transaction metadata: $GUARD_POLICY_TRANSACTION_METADATA"
+  else
+    fail "Guard policy transaction metadata를 안전하게 확인할 수 없습니다. directory를 그대로 보존합니다."
+  fi
+}
+
+finalize_guard_policy_transaction() {
+  local expected_stage="$1" rc
+  [ -n "$GUARD_POLICY_TRANSACTION_DIR" ] || return 0
+  if node "$CONFIG_EDITOR" finalize-guard-policy-transaction "$GUARD_POLICY_FILE" \
+      "$MCP_ENTRY" "$SCRIPT_DIR" "$GUARD_POLICY_TRANSACTION_DIR" "$expected_stage" >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 7 ]; then
+    fail "Guard policy transaction evidence was removed; parent-directory durability is unconfirmed"
+    return 7
+  fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  GUARD_POLICY_TRANSACTION_DIR=""
+  GUARD_POLICY_TRANSACTION_STAGE=""
+  GUARD_POLICY_TRANSACTION_FINALIZE_FROM=""
+  GUARD_POLICY_TRANSACTION_METADATA=""
+}
+
+register_guard_policy_transition() {
+  local rc
+  if node "$CONFIG_EDITOR" register-guard-policy-transaction "$GUARD_POLICY_FILE" \
+      "$MCP_ENTRY" "$SCRIPT_DIR" "$GUARD_POLICY_TRANSACTION_DIR" "$GUARD_POLICY_TRANSITION" >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if ! inspect_guard_policy_transaction; then
+    GUARD_POLICY_TRANSACTION_PRESERVE=1
+    report_guard_policy_transaction
+    return 1
+  fi
+  if [ "$rc" -eq 0 ] && [ "$GUARD_POLICY_TRANSACTION_STAGE" = activated ]; then
+    GUARD_POLICY_CHANGED=1
+    return 0
+  fi
+  if [ "$rc" -eq 3 ] && [ "$GUARD_POLICY_TRANSACTION_STAGE" = unchanged-restored ]; then
+    finalize_guard_policy_transaction unchanged-restored || return 1
+    return 0
+  fi
+  if [ "$rc" -eq 4 ] && { [ "$GUARD_POLICY_TRANSACTION_STAGE" = foreign-restored ] ||
+      [ "$GUARD_POLICY_TRANSACTION_STAGE" = foreign-untouched ]; }; then
+    finalize_guard_policy_transaction "$GUARD_POLICY_TRANSACTION_STAGE" || return 1
+    fail "Guard policy current state가 요청한 transition과 일치하지 않습니다."
+    return 1
+  fi
+  GUARD_POLICY_TRANSACTION_PRESERVE=1
+  report_guard_policy_transaction
+  return 1
+}
+
+rollback_guard_policy_transaction() {
+  local rc finalize_mode="${1:-finalize}"
+  [ -n "$GUARD_POLICY_TRANSACTION_DIR" ] || return 0
+  if [ "$GUARD_POLICY_CHANGED" -ne 1 ] || [ "$GUARD_POLICY_TRANSACTION_PRESERVE" -ne 0 ]; then
+    report_guard_policy_transaction
+    return 1
+  fi
+  if node "$CONFIG_EDITOR" rollback-guard-policy-transaction "$GUARD_POLICY_FILE" \
+      "$MCP_ENTRY" "$SCRIPT_DIR" "$GUARD_POLICY_TRANSACTION_DIR" "$GUARD_POLICY_TRANSITION" >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if ! inspect_guard_policy_transaction || [ "$rc" -ne 0 ] ||
+      [ "$GUARD_POLICY_TRANSACTION_STAGE" != rollback-restored ]; then
+    GUARD_POLICY_TRANSACTION_PRESERVE=1
+    report_guard_policy_transaction
+    return 1
+  fi
+  GUARD_POLICY_CHANGED=0
+  if [ "$finalize_mode" = retain ]; then return 0; fi
+  finalize_guard_policy_transaction rollback-restored || return 1
+}
+
+# Begins one coordinated local transaction. The two hook candidates become live
+# first; the explicit observe policy is the final publication. The caller keeps
+# rollback_install_transaction_on_exit armed until finalize_wiring succeeds.
+begin_guard_observe_transition() {
+  local current="$1"
+  plan_guard_observe_transition "$current" || return 1
+  reject_all_private_hook_transactions || return 1
+  INSTALL_TRANSACTION_ACTIVE=1
+  if [ -d "$CLAUDE_DIR" ]; then
+    allocate_claude_hook_transaction "$CLAUDE_DIR/settings.json"
+    register_claude_hooks "$CLAUDE_DIR/settings.json"
+    save_claude_hook_transaction || return 1
+  fi
+  if [ -d "$CODEX_DIR" ]; then
+    allocate_codex_hook_transaction "$CODEX_DIR/hooks.json"
+    register_codex_hooks "$CODEX_DIR/hooks.json"
+  fi
+  GUARD_POLICY_TRANSITION="$current:observe"
+  allocate_guard_policy_transaction || return 1
+  register_guard_policy_transition
+}
+
+verify_guard_observe_transition() {
+  node "$CONFIG_EDITOR" check-guard-policy "$HOME/.config/jhw-control/guard-policy.json" \
+    "$MCP_ENTRY" "$SCRIPT_DIR" "" observe:observe >/dev/null 2>&1 || return 1
+  if [ -d "$CLAUDE_DIR" ]; then
+    node "$CONFIG_EDITOR" check-claude-hooks "$CLAUDE_DIR/settings.json" "$MCP_ENTRY" "$SCRIPT_DIR" "" all || return 1
+  fi
+  if [ -d "$CODEX_DIR" ]; then
+    node "$CONFIG_EDITOR" check-codex-hooks "$CODEX_DIR/hooks.json" "$MCP_ENTRY" "$SCRIPT_DIR" "" all || return 1
+  fi
+}
+
 control_coordinates_absent() {
   local key
   for key in \
@@ -946,6 +1261,8 @@ control_coordinates_absent() {
 is_unprovisioned_control_diagnostic() {
   local output="$1" rc="$2"
   [ "$rc" -eq 78 ] && control_coordinates_absent || return 1
+  resolve_guard_hook_scope || return 1
+  [ "$GUARD_HOOK_SCOPE" = session-end-only ] || return 1
   node -e '
     const fs = require("node:fs");
     let payload;
@@ -1296,7 +1613,8 @@ fi
 # [6/6] Guard hook 등록. 런타임 신뢰 여부는 preflight가 별도로 검증한다.
 echo ""
 echo "[6/6] Guard hook 등록"
-if control_coordinates_absent; then
+resolve_guard_hook_scope || exit 1
+if [ "$GUARD_HOOK_SCOPE" = session-end-only ]; then
   if [ -d "$CLAUDE_DIR" ]; then
     allocate_claude_hook_transaction "$CLAUDE_DIR/settings.json"
     register_claude_hooks "$CLAUDE_DIR/settings.json" "session-end-only"
@@ -1464,7 +1782,8 @@ plan_wiring() {
   if [ -d "$CODEX_DIR" ]; then
     plan_config_destination mcp_entry check-codex "$CODEX_DIR/config.toml" || return
   fi
-  if control_coordinates_absent; then scope=session-end-only; fi
+  resolve_guard_hook_scope || return 1
+  scope="$GUARD_HOOK_SCOPE"
   if [ -d "$CLAUDE_DIR" ]; then
     plan_transaction_parent "$CLAUDE_DIR/settings.json" || return
     plan_config_destination hook_config check-claude-hooks "$CLAUDE_DIR/settings.json" "$scope" || return
@@ -1513,6 +1832,16 @@ finalize_wiring() {
   fi
   finalize_registered_guard_hooks || return 1
   finalize_saved_claude_guard_hooks || return 1
+  if [[ -n "$GUARD_POLICY_TRANSACTION_DIR" ]]; then
+    if ! inspect_guard_policy_transaction || [ "$GUARD_POLICY_TRANSACTION_STAGE" != activated ] ||
+        ! finalize_guard_policy_transaction activated; then
+      GUARD_POLICY_TRANSACTION_PRESERVE=1
+      fail "Guard policy는 publish됐지만 private transaction finalize를 확인하지 못했습니다."
+      report_guard_policy_transaction
+      return 1
+    fi
+    GUARD_POLICY_CHANGED=0
+  fi
   INSTALL_TRANSACTION_ACTIVE=0
   if [[ -n "$CODEX_BACKUP_PRUNE_FILE" ]]; then
     prune_codex_backups "$CODEX_BACKUP_PRUNE_FILE"
@@ -1585,7 +1914,8 @@ verify_wiring() {
     if [[ "$name" = jhw-control ]]; then target="$CONTROL_ENTRY"; else target="$CONTROL_HOOK_ENTRY"; fi
     is_exact_link "$link" "$target" || return 1
   done
-  if control_coordinates_absent; then scope=session-end-only; fi
+  resolve_guard_hook_scope || return 1
+  scope="$GUARD_HOOK_SCOPE"
   if [[ -d "$CLAUDE_DIR" ]]; then
     is_exact_link "$CLAUDE_DIR/commands/jhw" "$SKILL_ROOT/claude" || return 1
     node "$CONFIG_EDITOR" verify-stdio "$HOME/.claude.json" "$MCP_ENTRY" "$SCRIPT_DIR" || return 1

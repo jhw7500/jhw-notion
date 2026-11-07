@@ -1694,6 +1694,66 @@ describe("WorktreeManager", () => {
       .rejects.toMatchObject({ code: "HOST_MISMATCH" });
   });
 
+  it("discovers a released cleanup target without changing mapping, refs, index, or directory modes", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+    const history: ClaimHistory = {
+      ...active,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "completed",
+      outcome: "done",
+      head_sha: (await git(join(fixture.root, "worktrees", active.worktree_ref), "rev-parse", "HEAD")).trim(),
+      validation_summary: "tests: pass",
+    };
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const beforeState = await readFile(statePath);
+    const beforeStateInfo = await stat(statePath);
+    const beforeRootInfo = await stat(join(fixture.root, "worktrees"));
+    const beforeRefs = await git(repoDir, "show-ref");
+    const beforeIndex = await stat(join(repoDir, ".git", "index"));
+
+    await expect(manager.releasedCleanupStatus(history)).resolves.toMatchObject({
+      target: "matched",
+      snapshot_sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      source_ref: "refs/heads/main",
+      source_head: expect.stringMatching(/^[0-9a-f]{40,64}$/),
+      worktree_head: history.head_sha,
+    });
+
+    expect(await readFile(statePath)).toEqual(beforeState);
+    expect((await stat(statePath)).mode & 0o777).toBe(beforeStateInfo.mode & 0o777);
+    expect((await stat(join(fixture.root, "worktrees"))).mode & 0o777).toBe(beforeRootInfo.mode & 0o777);
+    expect(await git(repoDir, "show-ref")).toBe(beforeRefs);
+    const afterIndex = await stat(join(repoDir, ".git", "index"));
+    expect({ size: afterIndex.size, mtimeMs: afterIndex.mtimeMs }).toEqual({ size: beforeIndex.size, mtimeMs: beforeIndex.mtimeMs });
+  });
+
+  it("blocks released discovery when another mapping aliases the same Task or physical path", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    const duplicateRef = "wt-duplicate-cleanup-alias";
+    state.worktrees[duplicateRef] = { ...state.worktrees[active.worktree_ref] };
+    await writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+    const history: ClaimHistory = {
+      ...active,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "completed",
+      outcome: "done",
+      head_sha: (await git(join(fixture.root, "worktrees", active.worktree_ref), "rev-parse", "HEAD")).trim(),
+      validation_summary: "tests: pass",
+    };
+
+    await expect(manager.releasedCleanupStatus(history)).rejects.toMatchObject({
+      code: "WORKTREE_MAPPING_AMBIGUOUS",
+      details: { reason: "mapping_duplicate", worktree_ref: duplicateRef },
+    });
+  });
+
   it("does not remove a worktree for archived Project/Repository scope drift", async () => {
     const { repoDir, manager } = await worktreeFixture();
     const active = claim();
@@ -1800,6 +1860,37 @@ describe("WorktreeManager", () => {
     await expect(manager.removeIfSafe(successor)).rejects.toMatchObject({ code: "WORKTREE_CLAIM_MISMATCH" });
     await expect(manager.removeIfSafe(active)).resolves.toMatchObject({ removed: true, recovered: true, lifecycle: "removed" });
     await expect(stat(created.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("recognizes but never overwrites a durable equivalent-cleanup intent", async () => {
+    const { fixture, repoDir, manager } = await worktreeFixture();
+    const active = claim();
+    await manager.createOrReuse(active, repoDir);
+    const statePath = join(fixture.root, "state", "worktrees.json");
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    state.worktrees[active.worktree_ref].lifecycle = "pending-remove-equivalent";
+    state.worktrees[active.worktree_ref].cleanup_intent = {
+      version: 1,
+      policy: "historical-exact-patch-v1",
+      proof_sha256: "a".repeat(64),
+      proof_path: join(fixture.root, "private", "proof.json"),
+      registry_head: "b".repeat(40),
+      history_sha256: "c".repeat(64),
+      repository_slug: CANONICAL_SLUG,
+      mapping_sha256: "d".repeat(64),
+      source_head: "e".repeat(40),
+      worktree_head: "f".repeat(40),
+      inventory_sha256: "1".repeat(64),
+    };
+    await writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+    await chmod(statePath, 0o600);
+
+    await expect(manager.createOrReuse(active, repoDir)).rejects.toMatchObject({ code: "WORKTREE_CLEANUP_REQUIRED" });
+    await expect(manager.assertStartReady(active.task_id, active.task_alias)).rejects.toMatchObject({
+      code: "WORKTREE_CLEANUP_REQUIRED",
+    });
+    const unchanged = JSON.parse(await readFile(statePath, "utf8"));
+    expect(unchanged.worktrees[active.worktree_ref].cleanup_intent).toEqual(state.worktrees[active.worktree_ref].cleanup_intent);
   });
 
   it("re-reads the pending-remove generation before deletion and rejects a successor swap", async () => {

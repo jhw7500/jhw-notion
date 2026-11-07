@@ -3824,6 +3824,7 @@ test_hooks_config_symlink_and_nonregular_fail_closed
 test_new_hooks_file_is_private
 test_unsupported_tuis_receive_no_guard_wiring
 REPO_ROOT="$SOURCE_REPO_ROOT"
+node "$REPO_ROOT/scripts/test-guard-policy-wiring.mjs"
 node "$REPO_ROOT/scripts/test-pr-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-issue-skill-contract.mjs"
 node "$REPO_ROOT/scripts/test-commit-skill-contract.mjs"

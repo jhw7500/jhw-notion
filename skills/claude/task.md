@@ -439,6 +439,19 @@ Claim은 release됐지만 exact host mapping만 남고 checkout은 사라졌다�
 
 exact `pending-remove`는 cleanup이 재개하는 상태다. active successor/cross-host/coordinate mismatch, dirty worktree, source checkout에 통합되지 않은 commit, `pending-create`, 또는 다른 generation의 ambiguous pending state에서만 멈춘다. 파일 삭제나 새 Claim으로 우회하지 않는다. worktree의 commit이 이미 병합됐으면 commit 수와 무관하게 제거된다. `WORKTREE_UNPUSHED`는 이 cleanup 경로에서만 보인다 — 아직 병합되지 않았거나 source checkout이 detached인 것이므로, 병합과 checkout 상태를 확인하고 다시 실행한다. `task finish`는 이 코드를 표면화하지 않고 `worktree_removed: false`와 `cleanup_error`만 반환하므로, 사유를 알려면 위 cleanup을 실행한다.
 
+inactive discovery의 `released.available: true`는 timestamp 동률이 없는 exact latest released generation을 다시 exact history로 결속한 결과다. `registry_head`, `history_sha256`, `cleanup.snapshot_sha256`, `cleanup.source_ref`, `cleanup.source_head`, `cleanup.worktree_head`는 private cleanup manifest를 만드는 frozen 좌표이며 삭제 허가 자체가 아니다. `cleanup.target`이 `matched`가 아니면 proof cleanup을 만들지 않는다.
+
+non-ancestor history를 정리할 때만 별도로 검토·보존한 private manifest를 명시한다.
+
+```bash
+"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <released-claim-id> \
+  --action cleanup --cleanup-proof <absolute-private-manifest.json>
+```
+
+`historical-exact-patch-v1`은 pinned Repository record의 `repository_slug`와 source origin fetch/push URL·remote default ref를 먼저 결속하고, worktree의 전체 non-integrated linear suffix(최대 32)가 source HEAD의 서로 다른 ancestor commit에 같은 순서로 존재하며 각 commit의 전체 old/new blob OID·mode·type·raw path bytes tuple이 exact 1:1임을 뜻한다. patch-id만 같거나 일부 commit만 대응하면 허용하지 않는다. 통합 뒤의 후속 변경과 revert는 허용하므로 현재 파일 내용 동일성 증명은 아니다. manifest와 bundle은 current-user regular `0600`, 부모 directory는 `0700`이어야 하며 full bundle 복원·연결성과 ignored artifact 전수 bytes/hash/mode/별개 inode를 검증한다. 성공해도 task branch와 외부 backup은 보존한다.
+
+`pending-remove-equivalent`는 private proof와 frozen Registry/history/mapping/source/worktree/inventory를 묶은 삭제 intent다. 같은 proof를 명시한 cleanup만 재개할 수 있다. 이 lifecycle을 모르는 이전 도구는 fail-closed하며, rollback된 도구에서는 복구 전 다른 worktree 작업도 잠시 막힐 수 있다.
+
 ## raw Git 공유 경계
 
 push, PR, merge, deploy 각각의 직전에 실행한다.
@@ -472,7 +485,11 @@ jhw-control guard preflight
 
 `guard status`는 protocol version, `enforce|observe` runtime mode, request/key 안전 상태, persisted request 상태별 count, Registry/Claim read availability, optional exact-session match, adapter coverage만 bounded 결과로 보여준다. raw request/command/path/key는 표시하지 않으며 손상 상태를 고치거나 만료 row를 정리하지 않는다. Plan 2에서 `claude|codex|gemini|opencode`의 prompt-origin·pre-tool blocking·execution-recheck는 모두 `pending`이며 loose file만 보고 installed로 간주하지 않는다.
 
-`guard preflight`는 read-only GO/NO-GO 진단이다. key/state/Registry/protocol/mode가 안전하지 않거나 필수 adapter/execution coverage가 `pending`이면 bounded `NO-GO`와 stable `GUARD_UNAVAILABLE`(exit 78)를 반환한다. 기본 mode는 `enforce`다. `observe`는 개발·fixture에서만 exact `JHW_GUARD_MODE=observe`와 exact `JHW_GUARD_ALLOW_OBSERVE=true`를 함께 설정하며, 어떤 실패도 자동으로 observe로 강등하지 않는다.
+`guard preflight`는 read-only GO/NO-GO 진단이다. key/state/Registry/protocol/mode가 안전하지 않거나 필수 adapter/execution coverage가 `pending`이면 bounded `NO-GO`와 stable `GUARD_UNAVAILABLE`(exit 78)를 반환한다. 기본 mode는 `enforce`다. 명시 env 설정은 exact `JHW_GUARD_MODE=observe`와 exact `JHW_GUARD_ALLOW_OBSERVE=true`를 함께 사용하며, 어떤 실패도 자동으로 observe로 강등하지 않는다.
+
+호스트가 별도로 opt-in한 `$HOME/.config/jhw-control/guard-policy.json`의 exact `{version:1,mode:"observe"}`도 Guard 전용 관찰 모드를 선택한다. policy는 current-user-owned 단일 링크 regular `0600`이고 안전한 no-follow 부모 경로여야 한다. Guard 이벤트와 `guard status`/`guard preflight`에만 적용하며, 일반 CLI·credential launcher의 env-only 계약은 유지한다. 좌표 env가 하나라도 있으면 전체 env만 검증하며 private `control.env`와 섞지 않는다. 좌표 env가 전혀 없을 때만 명시 policy 아래의 안전한 data-only 11개 좌표를 사용한다. 명시 enforce와 policy observe가 충돌하거나 일부 env·unsafe policy이면 fail-closed다.
+
+관찰 모드는 일반 Task/Claim 규칙 위반을 별도 versioned observe journal에 기록하고 permit을 발급하지 않는다. protocol mismatch·Guard unavailable·self-approval 같은 안전 오류는 계속 차단한다. 첫 유효 hook composition만 기존 store를 보존하며 missing request store와 digest key를 준비하고, 읽기 전용 진단은 상태 파일을 만들지 않는다. `runtime_mode: observe`, `enforced: false`는 배선 및 관찰을 뜻하며 강제 보호 완료가 아니다.
 
 ## 결과 해석
 
@@ -483,6 +500,11 @@ jhw-control guard preflight
 - `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_checkout_unsafe`: 정확한 repair 대상 경로가 symlink 등 안전하지 않은 형태다. 경로의 실제 형태를 확인하고 자동 repair를 중단한다.
 - `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_lifecycle_uncertain`: mapping이 create/remove 중간 상태다. 해당 lifecycle 복구 절차를 먼저 수행한다.
 - `WORKTREE_MAPPING_REPAIR_UNSAFE` + `repair_state_changed`: 검사와 CAS 사이 mapping bytes가 바뀌었다. 새 상태를 다시 진단하고 이전 요청을 재사용하지 않는다.
+- `WORKTREE_EQUIVALENCE_UNSAFE` + `scope_unsupported`: merge/root/empty/복잡한 DAG, 32 commit 초과, symlink/gitlink/특수 객체처럼 v1 범위 밖이다. 자동 완화하지 않는다.
+- `WORKTREE_EQUIVALENCE_UNSAFE` + `patch_mismatch`: 전체 commit 대응 또는 exact old/new tuple이 다르다. patch-id나 일부 일치로 우회하지 않는다.
+- `WORKTREE_EQUIVALENCE_UNSAFE` + `integration_untrusted`: source ref/remote default branch 또는 integration ancestor·순서를 신뢰할 수 없다. trusted source checkout을 복구한다.
+- `WORKTREE_EQUIVALENCE_UNSAFE` + `backup_invalid`: manifest/full bundle/ignored artifact의 owner·mode·hash·bytes·inode·inventory·복원 검증이 실패했다. worktree와 branch를 유지하고 backup을 다시 만든다.
+- `WORKTREE_EQUIVALENCE_UNSAFE` + `snapshot_changed`: Registry/history/mapping/ref/HEAD/worktree/inventory가 frozen proof 또는 최종 fence에서 바뀌었다. 기존 proof를 재사용하지 않고 새 discovery부터 다시 시작한다.
 - `LOCK_CONTENDED` + `registry_state_lock`이면 같은 호스트의 Registry writer가 최대 30초 대기 뒤에도 실행 중인 것이다. optional `lock_holder`의 `command`, `acquired_at`, `elapsed_ms`, `pid_state`만 보고하며 `registry.lock`을 삭제하거나 holder를 자동 종료하지 않는다.
 - Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.

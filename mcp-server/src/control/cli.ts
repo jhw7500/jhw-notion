@@ -4,11 +4,14 @@ import {
   chmod,
   lstat,
   mkdtemp,
+  mkdir,
   open,
   readlink,
   realpath,
   rm,
   stat,
+  symlink,
+  writeFile,
   type FileHandle,
 } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, parse, resolve as resolvePath, sep } from "node:path";
@@ -34,6 +37,7 @@ import { Catalog } from "./catalog.js";
 import { RegistryRecordStore } from "./codec.js";
 import { ClaimService } from "./claim-service.js";
 import { loadControlConfig } from "./config.js";
+import { resolveGuardEnvironment } from "./guard-policy.js";
 import { ControlContractAuthority } from "./contract-authority.js";
 import { ControlError } from "./errors.js";
 import { GuardAdapterSchema, GuardWorktreeRefSchema, type GuardAdapter } from "./guard-protocol.js";
@@ -136,6 +140,46 @@ const CommandFailureSourceSchema = z.union([
     cause: z.string(),
   }).strict(),
 ]);
+
+const GitObjectIdSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
+const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
+const ReleasedRecoveryDiscoverySchema = z.union([
+  z.object({ available: z.literal(false) }).strict(),
+  z.object({
+    available: z.literal(true),
+    unique_latest: z.literal(true),
+    repository_slug: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/),
+    claim_id: z.string().regex(CLAIM_ID),
+    status: z.enum(["completed", "handoff", "abandoned", "force-ended", "taken-over"]),
+    released_at: z.string().datetime({ offset: true }),
+    host: ClaimCoordinateSchema,
+    branch: ClaimCoordinateSchema,
+    worktree_ref: GuardWorktreeRefSchema,
+    registry_head: GitObjectIdSchema,
+    history_sha256: Sha256Schema,
+    cleanup: z.object({
+      target: z.enum(["matched", "removed", "unmapped", "blocked"]),
+      reason: ErrorReasonSchema.optional(),
+      snapshot_sha256: Sha256Schema,
+      source_ref: ClaimCoordinateSchema.refine((ref) => ref.startsWith("refs/heads/")).optional(),
+      source_head: GitObjectIdSchema.optional(),
+      worktree_head: GitObjectIdSchema.optional(),
+    }).strict(),
+  }).strict(),
+]);
+const CleanupRecoveryProjectionSchema = z.object({
+  claim_id: z.string().regex(CLAIM_ID),
+  worktree_ref: GuardWorktreeRefSchema,
+  removed: z.boolean(),
+  recovered: z.boolean(),
+  lifecycle: z.literal("removed"),
+  cleanup_policy: z.enum(["ancestor", "historical-exact-patch-v1"]).optional(),
+  branch_preserved: z.literal(true).optional(),
+  proof_sha256: Sha256Schema.optional(),
+}).strict().refine((result) => result.cleanup_policy === "historical-exact-patch-v1"
+  ? result.branch_preserved === true && result.proof_sha256 !== undefined
+  : result.proof_sha256 === undefined && (result.cleanup_policy === "ancestor"
+    ? result.branch_preserved === true : result.branch_preserved === undefined));
 
 const GuardRequestInspectionSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("not_initialized"), requests: z.array(GuardRequestSchema).length(0) }).strict(),
@@ -332,7 +376,8 @@ export interface CliDependencies {
   catalog: Pick<Catalog, "registerFormalTask" | "registerTemporaryTask" | "registerChildTask" | "configureInactiveTask">;
   source: Pick<GitHubSourceService,
     "registerRepository" | "registerFormalTask" | "registerTemporaryTask" | "prepareExistingTask" |
-    "withResolvedExistingFormalTask" | "withResolvedTaskStatusContext" | "promoteTemporaryTask">;
+    "withResolvedExistingFormalTask" | "withResolvedExistingFormalTaskReadOnly" |
+    "withResolvedTaskStatusContext" | "promoteTemporaryTask">;
   portfolio: PortfolioPort;
   preflight: PreflightPort;
   guardMode: "enforce" | "observe";
@@ -372,6 +417,15 @@ class RetainedTaskFailure extends Error {
     super("Task start failed after child registration");
     this.retainedTask = RetainedTaskSummarySchema.parse({ task_id: taskId });
   }
+}
+
+/** Host policy is a Guard-only input; ordinary control commands remain env-only. */
+export function createCommandCliDependencies(
+  argv: readonly string[],
+  environment: NodeJS.ProcessEnv = process.env,
+): CliDependencies {
+  const guard = argv[0] === "guard" && (argv[1] === "status" || argv[1] === "preflight");
+  return createCliDependencies(guard ? resolveGuardEnvironment(environment).environment : environment);
 }
 
 /** Builds the production graph while retaining explicitly injectable future ports. */
@@ -575,11 +629,14 @@ function values(flags: ParsedFlags, flag: string): string[] {
 /** Rejects content flags while treating the checkout path only as a protected term. */
 function assertSafeFlags(flags: ParsedFlags, dependencies: CliDependencies): void {
   const checkout = value(flags, "--repo-path");
+  const proof = value(flags, "--cleanup-proof");
   const policy = createSensitiveDataPolicy(dependencies.env, [
     dependencies.stateDir,
     ...(checkout && isAbsolute(checkout) ? [checkout] : []),
+    ...(proof && isAbsolute(proof) ? [proof] : []),
   ]);
-  policy.assertSafe(Object.fromEntries([...flags].filter(([name]) => name !== "--repo-path")));
+  policy.assertSafe(Object.fromEntries([...flags].filter(([name]) =>
+    name !== "--repo-path" && name !== "--cleanup-proof")));
 }
 
 function required(flags: ParsedFlags, flag: string): string {
@@ -2114,6 +2171,27 @@ async function runBoundedClaudeProbe(
   });
 }
 
+/** Probe hooks may initialize only this disposable policy/state, never the operator HOME. */
+async function createClaudeProbeHome(directory: string, operatorHome: string): Promise<string> {
+  const home = join(directory, "home");
+  const config = join(home, ".config", "jhw-control");
+  const bin = join(home, ".local", "bin");
+  await mkdir(config, { recursive: true, mode: 0o700 });
+  await mkdir(bin, { recursive: true, mode: 0o700 });
+  await symlink(join(operatorHome, ".local", "bin", "jhw-control-hook"), join(bin, "jhw-control-hook"));
+  const coordinates = {
+    JHW_REGISTRY_DIR: join(home, "registry"), JHW_REGISTRY_REMOTE: "origin", JHW_REGISTRY_BRANCH: "main",
+    JHW_WORKTREE_ROOT: join(home, "worktrees"), JHW_CONTROL_STATE_DIR: join(home, "state"),
+    JHW_BUILD_HOST: "preflight-fixture", JHW_GITHUB_OWNER: "preflight-fixture", JHW_PROJECT_NUMBER: "1",
+    JHW_REGISTRY_REPOSITORY: "preflight-fixture/registry",
+    JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_preflight", JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+  };
+  await writeFile(join(config, "control.env"), Object.entries(coordinates)
+    .map(([key, value]) => `${key}=${value}\n`).join(""), { flag: "wx", mode: 0o600 });
+  await writeFile(join(config, "guard-policy.json"), '{"version":1,"mode":"observe"}\n', { flag: "wx", mode: 0o600 });
+  return home;
+}
+
 async function probeClaudePromptHooks(
   env: NodeJS.ProcessEnv,
   home: string,
@@ -2129,6 +2207,7 @@ async function probeClaudePromptHooks(
   try {
     probeConfigDir = await mkdtemp(join(tmpdir(), "jhw-claude-hook-preflight-"));
     await chmod(probeConfigDir, 0o700);
+    const probeHome = await createClaudeProbeHome(probeConfigDir, home);
     const signalPath = join(probeConfigDir, "owned-hook-complete");
     const ownedCommand = `${expectedHookCommand("claude", "UserPromptSubmit")}; status=$?; ` +
       `/usr/bin/touch -- "$JHW_CLAUDE_PROBE_SIGNAL"; exit "$status"`;
@@ -2164,7 +2243,7 @@ async function probeClaudePromptHooks(
       "--max-budget-usd", "0.000001",
       "jhw-claude-preflight-probe",
     ];
-    const childEnvironment = minimalProbeEnvironment(env, home, probeConfigDir);
+    const childEnvironment = minimalProbeEnvironment(env, probeHome, probeConfigDir);
     childEnvironment.CLAUDE_CONFIG_DIR = probeConfigDir;
     childEnvironment.JHW_CLAUDE_PROBE_SIGNAL = signalPath;
     childEnvironment.ANTHROPIC_API_KEY = "jhw-preflight-no-network";
@@ -2201,12 +2280,13 @@ async function probeClaudeHookCommand(
   const probeDirectory = await mkdtemp(join(tmpdir(), "jhw-claude-command-preflight-"));
   await chmod(probeDirectory, 0o700);
   try {
+    const probeHome = await createClaudeProbeHome(probeDirectory, home);
     return await runBoundedClaudeProbe(
       "/usr/bin/bash",
-      [join(home, ".local", "bin", "jhw-control-hook"), "--adapter", "claude", "--event", "PreToolUse"],
+      [join(probeHome, ".local", "bin", "jhw-control-hook"), "--adapter", "claude", "--event", "PreToolUse"],
       {
         cwd: probeDirectory,
-        env: minimalProbeEnvironment(env, home, probeDirectory),
+        env: minimalProbeEnvironment(env, probeHome, probeDirectory),
         stdin: '{"hook_event_name":"PreToolUse"}\n',
         timeoutMs: 9_000,
         timeoutMessage: "Claude hook command probe timed out",
@@ -3255,7 +3335,7 @@ async function execute(
   if (command === "task recover") {
     const flags = parseTaskFlags(new Set([
       "--task", "--expect", "--action", "--session", "--origin-adapter",
-      "--resolve-from-checkout", "--repo-path", "--issue-url", "--worktree-ref",
+      "--resolve-from-checkout", "--repo-path", "--issue-url", "--worktree-ref", "--cleanup-proof",
     ]));
     const actionName = required(flags, "--action");
     const discoveryNames = [
@@ -3273,13 +3353,14 @@ async function execute(
         flags.has("--expect") ||
         flags.has("--session") ||
         flags.has("--origin-adapter") ||
-        flags.has("--worktree-ref")
+        flags.has("--worktree-ref") ||
+        flags.has("--cleanup-proof")
       ) {
         usage("Recovery discovery requires only checkout, Issue, and status");
       }
       const repository_path = required(flags, "--repo-path");
       if (!repository_path.startsWith("/")) usage("Repository path must be absolute");
-      const discovered = await dependencies.source.withResolvedExistingFormalTask({
+      const discovered = await dependencies.source.withResolvedExistingFormalTaskReadOnly({
         repository_path,
         issue_url: required(flags, "--issue-url"),
       }, async ({ task }) => ({
@@ -3298,6 +3379,14 @@ async function execute(
           }),
         };
       }
+      const released = validatedPortResult(
+        ReleasedRecoveryDiscoverySchema, discovered.snapshot.released, "INVALID_RECOVERY_RESULT",
+      );
+      try {
+        createSensitiveDataPolicy(dependencies.env, [dependencies.stateDir, repository_path]).assertSafe(released);
+      } catch {
+        throw new ControlError("INVALID_RECOVERY_RESULT", "Recovery discovery returned unsafe public coordinates");
+      }
       if (!discovered.snapshot.handoff.available) {
         return {
           flags,
@@ -3306,6 +3395,7 @@ async function execute(
             task_id: discovered.task_id,
             state: "inactive",
             handoff: { available: false },
+            released,
           }),
         };
       }
@@ -3318,6 +3408,7 @@ async function execute(
             kind: "resolved",
             task_id: discovered.task_id,
             state: "inactive",
+            released,
             handoff: {
               available: true,
               claim_id: handoff.claim_id,
@@ -3336,7 +3427,16 @@ async function execute(
     if (actionName !== "repair-mapping" && flags.has("--worktree-ref")) {
       usage("Only repair-mapping accepts --worktree-ref");
     }
-    if (actionName === "status" || actionName === "force-end" || actionName === "cleanup") {
+    if (actionName !== "cleanup" && flags.has("--cleanup-proof")) {
+      usage("Only cleanup accepts --cleanup-proof");
+    }
+    if (actionName === "cleanup") {
+      const proof = value(flags, "--cleanup-proof");
+      if (proof !== undefined && (!isNonEmpty(proof) || !isAbsolute(proof) || /[\u0000-\u001f\u007f]/u.test(proof))) {
+        usage("Cleanup proof path must be absolute");
+      }
+      action = { kind: "cleanup", ...(proof === undefined ? {} : { cleanup_proof: proof }) };
+    } else if (actionName === "status" || actionName === "force-end") {
       // The documented session is advisory for non-takeover recovery.
       action = { kind: actionName };
     } else if (actionName === "takeover") {
@@ -3356,11 +3456,28 @@ async function execute(
       usage("Invalid recovery action");
     }
     const recovered = await dependencies.taskService.recover({ task_id, claim_id, action });
+    let cleanupProjection: z.infer<typeof CleanupRecoveryProjectionSchema> | undefined;
+    if (recovered.kind === "cleanup") {
+      if (recovered.history.task_id !== task_id || recovered.history.claim_id !== claim_id) {
+        throw new ControlError("INVALID_RECOVERY_RESULT", "Cleanup returned another released generation");
+      }
+      cleanupProjection = validatedPortResult(CleanupRecoveryProjectionSchema, {
+        claim_id,
+        worktree_ref: recovered.history.worktree_ref,
+        removed: recovered.worktree.removed,
+        recovered: recovered.worktree.recovered,
+        lifecycle: recovered.worktree.lifecycle,
+        ...(recovered.worktree.cleanup_policy === undefined ? {} : { cleanup_policy: recovered.worktree.cleanup_policy }),
+        ...(recovered.worktree.branch_preserved === undefined ? {} : { branch_preserved: recovered.worktree.branch_preserved }),
+        ...(recovered.worktree.proof_sha256 === undefined ? {} : { proof_sha256: recovered.worktree.proof_sha256 }),
+      }, "INVALID_RECOVERY_RESULT");
+    }
     return {
       flags,
       result: resultJson(command, {
         kind: recovered.kind,
         task_id,
+        ...cleanupProjection,
         ...(recovered.kind === "status" ? {
           claim_id,
           process_exists: recovered.process_exists,
@@ -3512,6 +3629,21 @@ async function execute(
 }
 
 /** Testable command dispatcher. It never writes streams or exits the process. */
+/** Structural routing only: success and failure of this probe must never append a journal. */
+function isReadOnlyRecoveryDiscovery(argv: readonly string[]): boolean {
+  if (argv[0] !== "task" || argv[1] !== "recover") return false;
+  try {
+    const flags = parseFlags(argv.slice(2), new Set([
+      "--action", "--resolve-from-checkout", "--repo-path", "--issue-url",
+    ]));
+    return flags.size === 4 && value(flags, "--action") === "status" &&
+      value(flags, "--resolve-from-checkout") === "true" &&
+      isAbsolute(required(flags, "--repo-path")) && isNonEmpty(required(flags, "--issue-url"));
+  } catch {
+    return false;
+  }
+}
+
 export async function runCli(argv: string[], dependencies: CliDependencies): Promise<CliResult> {
   const started = dependencies.now?.() ?? new Date();
   const command = commandFor(argv);
@@ -3551,7 +3683,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies): Pro
   // Guard diagnostics are operational safety probes, not Pilot/Board trial
   // measurements. Returning here also prevents a derived journal failure from
   // changing an already-computed bounded status or NO-GO result.
-  if (command.startsWith("guard ")) return result;
+  if (command.startsWith("guard ") || isReadOnlyRecoveryDiscovery(argv)) return result;
 
   // A warning here means the record is unusable, so this registration leaves no
   // coordinates to resume from — and a failure is exactly when the operator is
@@ -3825,7 +3957,7 @@ async function main(): Promise<void> {
     return;
   }
   try {
-    const result = await runCli(argv, createCliDependencies(process.env));
+    const result = await runCli(argv, createCommandCliDependencies(argv, process.env));
     await writeStream(process.stdout, result.stdout);
     await writeStream(process.stderr, result.stderr);
     process.exitCode = result.exitCode;

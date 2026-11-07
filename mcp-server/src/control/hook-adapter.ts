@@ -15,6 +15,7 @@ import {
   type GuardSideEventResult,
 } from "./guard-service.js";
 import { createProductionGuardJournal } from "./guard-journal.js";
+import { resolveGuardEnvironment } from "./guard-policy.js";
 import {
   GuardDigestKey,
   GuardRequestStore,
@@ -216,6 +217,8 @@ export async function runHookAdapter(
 }
 
 async function createProductionHookGuard(environment: NodeJS.ProcessEnv): Promise<HookGuardPort> {
+  const resolution = resolveGuardEnvironment(environment);
+  environment = resolution.environment;
   const dependencies = createCliDependencies(environment);
   const catalog = dependencies.catalog as unknown as Catalog;
   const claims = dependencies.guardClaims as unknown as ClaimService;
@@ -230,6 +233,7 @@ async function createProductionHookGuard(environment: NodeJS.ProcessEnv): Promis
   });
   const guardJournal = createProductionGuardJournal(dependencies.stateDir, environment);
   const digest = await digestKey.loadOrCreate();
+  if (resolution.source === "private-policy") await requestStore.ensureInitialized();
   const composition = createGuardServiceComposition(mutationLock, {
     host: environment.JHW_BUILD_HOST ?? "",
     digest_key: digest,

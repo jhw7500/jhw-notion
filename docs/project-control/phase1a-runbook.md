@@ -375,6 +375,17 @@ jhw-control task recover --task <tsk-id> --expect <released-claim-id> --action c
 
 exact `pending-remove`는 이 cleanup이 재개하는 상태다. active successor, 다른 host/coordinates, dirty worktree, source checkout에 통합되지 않은 commit, `pending-create`, 또는 다른 generation의 ambiguous pending state면 stop하고 evidence를 보존한다. 자동 reset/rebase/force push, 경로 삭제, Claim 재생성으로 우회하지 않는다.
 
+inactive discovery가 `released.available: true`를 반환하면 exact latest released Claim과 `cleanup.target`을 먼저 확인한다. `registry_head`, `history_sha256`, `cleanup.snapshot_sha256`, `cleanup.source_ref`, `cleanup.source_head`, `cleanup.worktree_head`는 다음 proof의 frozen 입력이며 cleanup 허가가 아니다. timestamp 동률, generation/mapping 불일치, alias, active successor, detached source면 멈춘다.
+
+non-ancestor commit이 별도 integration commit으로 반영된 경우에는 `historical-exact-patch-v1` private manifest를 외부 `0700` directory의 `0600` regular file로 준비한다. manifest는 exact Task/Claim/Project/Repository/`repository_slug`/host/branch/worktree ref, 위 세 digest/HEAD, 전체 commit 1:1 대응, full bundle, ignored artifact 전수 inventory를 담는다. canonical `repository_slug`는 caller 입력이 아니라 pinned Repository record에서 얻고 source origin의 fetch/push URL과 remote default ref에 결속한다. full bundle은 scratch 복원과 object 연결성을 검증하고 artifact는 raw path bytes·bytes·SHA-256·mode·별개 inode를 전수 검증한다. patch-id만으로 만들거나 일부 commit을 생략하지 않는다.
+
+```bash
+jhw-control task recover --task <tsk-id> --expect <released-claim-id> --action cleanup \
+  --cleanup-proof <absolute-private-manifest.json>
+```
+
+이 정책은 통합 commit 뒤의 후속 변경과 revert를 허용하며 현재 파일 동일성을 주장하지 않는다. 삭제 intent는 `pending-remove-equivalent`로 durable하게 남고 같은 proof 명시 재실행만 재개한다. 삭제 직전 Registry HEAD, exact history, active successor 부재, mapping/source/worktree/inventory를 다시 확인한다. 성공 후 branch와 외부 bundle/artifact backup은 보존한다. 이전 parser는 새 lifecycle을 fail-closed하므로 rollback 도구에서는 복구가 끝날 때까지 관련 worktree 작업이 막힐 수 있다.
+
 worktree 제거는 commit 개수가 아니라 **통합 여부**로 판정한다. source checkout이 branch를 체크아웃한 상태에서 그 HEAD가 worktree의 HEAD에 도달 가능하면 허용하고, 도달 불가능하거나 checkout이 detached면 `WORKTREE_UNPUSHED`로 멈춘다. detached HEAD는 통합 지점이 아니므로 신뢰하지 않는다. 제거해도 **commit은 `refs/heads/task/...` branch ref에 그대로 남아** `git worktree add <path> <branch>`로 완전 복원된다. 다만 **gitignore된 로컬 파일은 worktree와 함께 삭제된다**(`dist/`·`node_modules/` 등) — 재생성 불가능한 로컬 산출물을 worktree 안에 두지 않는다. 따라서 병합 전에 `completed`로 끝내면 worktree가 남는다. **병합을 먼저 하고 나서 종료하거나, 이미 종료했다면 병합 뒤 위 cleanup을 released Claim ID로 실행한다.** 이 판정이 도입되기 전에 완료돼 남아 있는 worktree도 같은 방법으로 정리한다.
 
 ## 9. audit와 즉시 중단 조건

@@ -33,7 +33,7 @@ async function fixture(t, body = "process.stdin.pipe(process.stdout); process.st
   fs.chmodSync(root, 0o700);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const [name, bytes] of Object.entries({ '.gitignore':'.jhw-runtime/\n', 'mcp-server/package.json':'{"type":"module"}', 'mcp-server/package-lock.json':'{"lockfileVersion":3}', 'mcp-server/tsconfig.json':'{}', 'mcp-server/src/index.ts':'export {};', 'mcp-server/scripts/clean-dist.mjs':'', 'scripts/sync-codex-skills.mjs':'', 'skills/claude/task.md':'fixture' })) write(root, name, bytes);
-  for (const name of [...helpers, 'jhw-control-hook']) {
+  for (const name of [...helpers, 'runtime-prune.mjs', 'jhw-control-hook']) {
     const original=fs.readFileSync(path.join(source,name));
     write(root,`scripts/${name}`,helperEdits[name] ? helperEdits[name](original.toString(),root) : original,name.startsWith('jhw-') ? 0o755 : 0o644);
   }

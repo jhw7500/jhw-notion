@@ -6,9 +6,11 @@ import {fileURLToPath} from 'node:url';
 import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, requireQuiescence} from './runtime-safety.mjs';
 import {prepareRelease, validateRelease, readActivation, publishActivation, rollbackActivation} from './runtime-store.mjs';
 import {installBootstrap, validateBootstrap} from './runtime-entry.mjs';
+import {DEPLOY_VARIABLE_KEYS,applyRuntimePrune,planRuntimePrune,recordDeploymentRetention} from './runtime-prune.mjs';
+import {readGuardHostPolicy,captureGuardTransitionEvidence,writeGuardTransitionEvidence,readGuardTransitionEvidence,recordGuardPolicyContext,recordGuardPublishedSnapshots,recordGuardDestination,markGuardTransitionFinalized,findGuardTransitionEvidence,prepareGuardRollbackEvidence,prepareIncompleteGuardRollbackEvidence,restoreGuardRollbackEvidence} from './runtime-guard.mjs';
 
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
-const KEYS = ['HOOK_LINK_CREATED','INSTALL_TRANSACTION_ACTIVE','HOOKS_CONFIG_CHANGED','HOOKS_CONFIG_FILE','HOOKS_ADAPTER','HOOKS_DISPLAY_NAME','HOOKS_TRANSACTION_DIR','HOOKS_TRANSACTION_STAGE','HOOKS_TRANSACTION_METADATA','HOOKS_TRANSACTION_PRESERVE','CLAUDE_HOOKS_CONFIG_CHANGED','CLAUDE_HOOKS_CONFIG_FILE','CLAUDE_HOOKS_TRANSACTION_DIR','CLAUDE_HOOKS_TRANSACTION_STAGE','CLAUDE_HOOKS_TRANSACTION_METADATA','CLAUDE_HOOKS_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_TRANSACTION_DIR','CONTROL_HOOK_LINK_TRANSACTION_STAGE','CONTROL_HOOK_LINK_TRANSACTION_METADATA','CONTROL_HOOK_LINK_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_REMOVE_OUTCOME','INSTALL_UNPROTECTED','MIGRATION_HOOK_TRANSACTION_DIR','CODEX_BACKUP_PRUNE_FILE','ENV_DROPPED','ENV_DROPPED_REPORTED'];
+const KEYS = DEPLOY_VARIABLE_KEYS;
 const ENV_ADAPTERS=['claude','codex','gemini','opencode'];
 // Reacquisition after validation: samples, the wait between them, and the refusals sampled again.
 const REACQUIRE_ATTEMPTS=5;const REACQUIRE_INTERVAL_MS=200;const REACQUIRE_RETRIED=['DEPLOY_LOCK_CONTENDED','DEPLOY_INVENTORY_UNCERTAIN'];
@@ -18,7 +20,10 @@ function parse(argv) {
  if(!Array.isArray(argv)||argv.some(v=>typeof v!=='string'))fail('DEPLOY_ARGUMENTS_INVALID');
  if(argv.length===0)return {operation:'default'};
  if(argv.length===1&&['--prepare','--status','--rollback','--uninstall','--refresh-bootstrap','--help','-h'].includes(argv[0]))return {operation:argv[0].replace(/^--?/,'')};
+ if(argv.length===1&&argv[0]==='--prune')return {operation:'prune',apply:false};
+ if(argv.length===2&&argv[0]==='--prune'&&argv[1]==='--apply')return {operation:'prune',apply:true};
  if(argv.length===2&&argv[0]==='--activate'&&RELEASE.test(argv[1]))return {operation:'activate',releaseId:argv[1]};
+ if(argv.length===3&&argv[0]==='--activate'&&RELEASE.test(argv[1])&&argv[2]==='--guard-observe')return {operation:'activate',releaseId:argv[1],guardObserve:true};
  if(argv.length===4&&argv[0]==='--activate'&&RELEASE.test(argv[1])&&argv[2]==='--adopt-from'&&argv[3]!=='')return {operation:'activate',releaseId:argv[1],adoptFrom:argv[3]};
  fail('DEPLOY_ARGUMENTS_INVALID');
 }
@@ -399,19 +404,29 @@ for key in "\${keys[@]}"; do
   if [[ -z "\${!key+x}" ]]; then printf -v "$key" '%s' ''; fi
 done
 ENV_DROPPED_REPORTED="$JHW_ENV_DROP_REPORTED"
+guard_action="\${7:-}"
+if [[ -n "\${9:-}" ]]; then
+  declare -F load_guard_policy_transaction_context >/dev/null || exit 64
+  load_guard_policy_transaction_context "$8" "$9" "\${10}" "\${11}" || exit 65
+fi
 save_phase_state() {
   local rc=$?
   trap - EXIT
+  if [[ "$guard_action" = begin && "$rc" -ne 0 ]]; then rollback_install_transaction || :; fi
   for key in "\${keys[@]}"; do printf '%s\\0' "\${!key-}" >&5; done
+  if [[ -n "$guard_action" ]]; then
+    node -e 'const [file,directory,transition,stage]=process.argv.slice(1);process.stdout.write(JSON.stringify(directory?{version:1,file,directory,transition,stage}:null)+"\\n");' \
+      "\${GUARD_POLICY_FILE:-}" "\${GUARD_POLICY_TRANSACTION_DIR:-}" "\${GUARD_POLICY_TRANSITION:-}" "\${GUARD_POLICY_TRANSACTION_STAGE:-}" >&6 || :
+  fi
   exit "$rc"
 }
 trap save_phase_state EXIT
 case "$3" in
   verify) verify_wiring ;;
-  wire) install_wiring ;;
+  wire) if [[ "$guard_action" = begin ]]; then begin_guard_observe_transition absent; else install_wiring; fi ;;
   validate) require_control_host; run_guard_preflight ;;
   finalize) finalize_wiring ;;
-  rollback) rollback_first_wiring_complete ;;
+  rollback) if [[ "$guard_action" = rollback ]]; then rollback_install_transaction; else rollback_first_wiring_complete; fi ;;
   uninstall) uninstall_wiring ;;
   *) exit 64 ;;
 esac
@@ -424,17 +439,21 @@ source "$2"
 CONFIG_EDITOR="$3"
 initialize_wiring_directories
 select_managed_wiring
-plan_wiring "$4"
+if [[ -n "\${5:-}" ]]; then
+  declare -F plan_guard_observe_transition >/dev/null || exit 64
+  plan_guard_observe_transition "$5"
+  printf 'clear\\n'
+else plan_wiring "$4"; fi
 `;
 const PLAN_CONFLICTS = ['adopt_env_unpreservable','control_host','tui_root','pending_transaction','unsafe_parent','parent_unusable','control_link','hook_link','command_dir','skill_link','prompt_link','mcp_entry','hook_config'];
-async function planWiring({repositoryRoot,home,environment,releaseId,planTimeoutMs,adoptFrom}) {
+async function planWiring({repositoryRoot,home,environment,releaseId,planTimeoutMs,adoptFrom,guardPolicy}) {
  const release=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId);
  const library=path.join(release,'scripts/install-wiring.sh');const editor=path.join(release,'scripts/install-config.mjs');trustedFile(library);trustedFile(editor);
  const env={...environment,HOME:home,PATH:[path.dirname(process.execPath),'/usr/local/bin','/usr/bin','/bin'].join(':')};
  for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV','SHELLOPTS','BASHOPTS'])delete env[key];
  adoptEnvironment(env,adoptFrom);
  // Own process group: the plan is read-only, so any straggler is killed outright.
- const child=spawn('/bin/bash',['-c',PLAN_WORKER,'jhw-wiring-plan',repositoryRoot,library,editor,path.join(release,'skills')],{cwd:release,env,stdio:['ignore','pipe','ignore'],detached:true});
+ const child=spawn('/bin/bash',['-c',PLAN_WORKER,'jhw-wiring-plan',repositoryRoot,library,editor,path.join(release,'skills'),guardPolicy??''],{cwd:release,env,stdio:['ignore','pipe','ignore'],detached:true});
  const killGroup=()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}};
  let output='';let overflow=false;let timer;
  child.stdout.on('data',chunk=>{if(output.length+chunk.length<=4096)output+=chunk.toString('utf8');else overflow=true;});
@@ -449,7 +468,7 @@ async function planWiring({repositoryRoot,home,environment,releaseId,planTimeout
  fail('DEPLOY_WIRING_CONFLICT',code===3&&!overflow&&PLAN_CONFLICTS.includes(conflict?.[1])?conflict[1]:'plan_unverified');
 }
 
-export async function wiringPhase({repositoryRoot,home,environment,phase,managed,deployLease,admissionLease,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom}) {
+export async function wiringPhase({repositoryRoot,home,environment,phase,managed,deployLease,admissionLease,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom,guardTransition}) {
  // Before pointer publication a first activation names its validated candidate.
  const selected=candidateReleaseId?{releaseId:candidateReleaseId}:managed?readActivation({repositoryRoot}):null;
  const scripts=selected?path.join(repositoryRoot,'.jhw-runtime/releases',selected.releaseId,'scripts'):path.join(repositoryRoot,'scripts');
@@ -457,7 +476,7 @@ export async function wiringPhase({repositoryRoot,home,environment,phase,managed
  const log=path.join(directory,`${phase}.${randomBytes(8).toString('hex')}.log`);
  const logDirectory=pinnedDirectory(directory);
  const logFd=fs.openSync(logDirectory.at(path.basename(log)),fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);fs.fchmodSync(logFd,0o600);
- let total=0;let output=Buffer.alloc(0);let overflow=false;let logging=true;let phaseTimer;
+ let total=0;let output=Buffer.alloc(0);let policyOutput=Buffer.alloc(0);let overflow=false;let logging=true;let phaseTimer;
  try {
   const env={...environment,HOME:home,PATH:[path.dirname(process.execPath),'/usr/local/bin','/usr/bin','/bin'].join(':')};
   // Never pass Node loader or shell startup injection into maintenance workers.
@@ -465,11 +484,13 @@ export async function wiringPhase({repositoryRoot,home,environment,phase,managed
   adoptEnvironment(env,adoptFrom);
   logDirectory.verify();
   const skillSource=candidateReleaseId?path.join(repositoryRoot,'.jhw-runtime/releases',candidateReleaseId,'skills'):'';
-  const child=spawn('/bin/bash',['-c',WORKER,'jhw-wiring-phase',repositoryRoot,library,phase,managed?'managed':'legacy',editor,skillSource],{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd,admissionLease?.fd??'ignore','pipe']});
+  const context=guardTransition?.context;
+  const child=spawn('/bin/bash',['-c',WORKER,'jhw-wiring-phase',repositoryRoot,library,phase,managed?'managed':'legacy',editor,skillSource,guardTransition?.action??'',context?.file??'',context?.directory??'',context?.transition??'',context?.stage??''],{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd,admissionLease?.fd??'ignore','pipe','pipe']});
   const capture=chunk=>{total+=chunk.length;if(logging&&total<=256*1024)fs.writeSync(logFd,chunk);else overflow=true;};child.stdout.on('data',capture);child.stderr.on('data',capture);
   child.stdio[5].on('data',chunk=>{if(output.length+chunk.length<=256*1024)output=Buffer.concat([output,chunk]);else overflow=true;});
+  child.stdio[6].on('data',chunk=>{if(policyOutput.length+chunk.length<=16*1024)policyOutput=Buffer.concat([policyOutput,chunk]);else overflow=true;});
   child.stdin.on('error',()=>{});child.stdin.end(KEYS.map(key=>(state.variables?.[key]??'__JHW_UNSET__')+'\0').join(''));
-  const code=await Promise.race([new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>resolve(signal?null:code));}),new Promise(resolve=>{phaseTimer=setTimeout(()=>{state.workerDetached=true;child.unref();for(const stream of [child.stdin,child.stdout,child.stderr,child.stdio[5]])stream.unref?.();resolve(null);},phaseTimeoutMs);})]);
+  const code=await Promise.race([new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>resolve(signal?null:code));}),new Promise(resolve=>{phaseTimer=setTimeout(()=>{state.workerDetached=true;child.unref();for(const stream of [child.stdin,child.stdout,child.stderr,child.stdio[5],child.stdio[6]])stream.unref?.();resolve(null);},phaseTimeoutMs);})]);
   clearTimeout(phaseTimer);
   const values=output.toString('utf8').split('\0');
   if(values.length===KEYS.length+1&&values.at(-1)===''&&!overflow)state.variables=Object.fromEntries(KEYS.map((key,index)=>[key,values[index]]));
@@ -477,6 +498,10 @@ export async function wiringPhase({repositoryRoot,home,environment,phase,managed
   checkpoint(directory,state);
   if(code!==0||overflow||state.stateIncomplete)fail(phase==='validate'?'DEPLOY_VALIDATION_FAILED':'DEPLOY_WIRING_FAILED');
   if(phase==='validate')await mcpProbe({repositoryRoot,home,environment,deployLease,directory,logFd});
+  if(guardTransition) {
+   let guardPolicyContext;try{guardPolicyContext=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(policyOutput));}catch{fail('DEPLOY_RECOVERY_REQUIRED','guard_context_unverified');}
+   return {guardPolicyContext};
+  }
  } finally {logging=false;clearTimeout(phaseTimer);fs.fsyncSync(logFd);fs.closeSync(logFd);try{logDirectory.verify();}finally{logDirectory.close();}}
 }
 
@@ -514,10 +539,20 @@ async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,l
 export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000,planTimeoutMs=45000}={}) {
  const command=parse(argv);
  if([phaseTimeoutMs,planTimeoutMs].some(value=>!Number.isInteger(value)||value<1||value>45000))fail('DEPLOY_ARGUMENTS_INVALID');
- if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--rollback','--uninstall','--refresh-bootstrap']};
+ if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--activate RELEASE_ID --guard-observe','--rollback','--uninstall','--refresh-bootstrap','--prune','--prune --apply']};
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
  const runtime=path.join(repositoryRoot,'.jhw-runtime');
+ if(command.operation==='prune'&&!command.apply)return planRuntimePrune({repositoryRoot});
+ if(command.operation==='prune') {
+  const before=requireQuiescence(inventoryOptions);let pruneWriter;let pruneAdmission;
+  try {
+   pruneWriter=acquireLease(path.join(runtime,'deploy.lock'),{create:true});
+   pruneAdmission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
+   const after=requireQuiescence(inventoryOptions);
+   return {...applyRuntimePrune({repositoryRoot}),inventory:{before,after}};
+  } finally {pruneAdmission?.close();pruneWriter?.close();}
+ }
  if(command.operation==='status') {
   const inventory=inspectConsumers(inventoryOptions);const current=exists(runtime)?readActivation({repositoryRoot}):null;
   return {code:'DEPLOY_STATUS',advisory:true,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,recoveryPending:pending(runtime).length,inventory};
@@ -537,10 +572,25 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   const after=quiesce();
   const previous=readActivation({repositoryRoot});
   const abandoned=pending(runtime);
-  let recovery;
+  let recovery;let guardRecovery;
   if(abandoned.length) {
    if(!['rollback','refresh-bootstrap'].includes(command.operation)||abandoned.length!==1)fail('DEPLOY_RECOVERY_REQUIRED');
    const recoveryDirectory=path.join(runtime,abandoned[0]);const prior=privateRead(path.join(recoveryDirectory,'state.json'));
+   const guard=readGuardTransitionEvidence({journalDirectory:recoveryDirectory});
+   if(guard) {
+    if(command.operation!=='rollback'||prior.stateIncomplete||prior.workerDetached)fail('DEPLOY_RECOVERY_REQUIRED','guard_recovery_unverified');
+    if(guard.direction==='forward') {
+     if(prior.operation!=='activate'||!['published-recorded','destination-bound'].includes(guard.status)||JSON.stringify(prior.previous)!==JSON.stringify(guard.origin))fail('DEPLOY_RECOVERY_REQUIRED','guard_recovery_unverified');
+     const atOrigin=JSON.stringify(previous)===JSON.stringify(guard.origin);
+     const atDestination=guard.destination_activation_id===previous?.activationId&&previous.releaseId===guard.candidate_release_id&&previous.predecessorActivationId===guard.origin.activationId;
+     if(!atOrigin&&!atDestination)fail('DEPLOY_RECOVERY_REQUIRED','guard_recovery_unverified');
+     validateRelease({repositoryRoot,releaseId:guard.candidate_release_id});
+    } else {
+     if(prior.operation!=='rollback'||![guard.source_activation_id,guard.destination_activation_id].includes(previous?.activationId))fail('DEPLOY_RECOVERY_REQUIRED','guard_recovery_unverified');
+    }
+    guardRecovery={directory:recoveryDirectory,state:prior,evidence:guard};
+   }
+   if(!guardRecovery) {
    // An interrupted refresh never moved the pointer or wiring; only a retried
    // refresh supersedes it, and only while current is still its origin.
    if(command.operation==='refresh-bootstrap'&&(prior.operation!=='refresh-bootstrap'||JSON.stringify(prior.previous)!==JSON.stringify(previous)))fail('DEPLOY_RECOVERY_REQUIRED');
@@ -565,13 +615,23 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    }
    }
   }
+  }
   const wiringFile=path.join(runtime,'wiring.json');
   const wiringPreviouslyInstalled = exists(wiringFile) && privateRead(wiringFile).installed === true;
   let managed = wiringPreviouslyInstalled;
   if(command.adoptFrom&&managed)fail('DEPLOY_ARGUMENTS_INVALID','adopt_requires_first_activation');
+  if(command.guardObserve&&!managed)fail('DEPLOY_ARGUMENTS_INVALID','guard_requires_managed_activation');
+  const guardPolicy=managed?readGuardHostPolicy({home}):'absent';
+  const enableGuard=command.operation==='activate'&&command.guardObserve&&guardPolicy==='absent';
+  let resultGuardMode=guardPolicy==='observe'?'observe':undefined;
+  const rollbackGuard=command.operation==='rollback'&&!guardRecovery&&previous
+   ?findGuardTransitionEvidence({runtimeRoot:runtime,activationId:previous.activationId}):null;
+  if(rollbackGuard&&rollbackGuard.evidence.origin.activationId!==previous.predecessorActivationId)fail('DEPLOY_RECOVERY_REQUIRED','guard_rollback_coordinates');
+  let guardForward;
+
   if(recovery&&!managed)fail('DEPLOY_RECOVERY_REQUIRED');
   if(command.operation==='activate')validateRelease({repositoryRoot,releaseId:command.releaseId});
-  if(command.operation==='rollback'&&!previous?.predecessorActivationId)fail('DEPLOY_PREDECESSOR_INVALID');
+  if(command.operation==='rollback'&&!previous?.predecessorActivationId&&!guardRecovery)fail('DEPLOY_PREDECESSOR_INVALID');
   // A missing bootstrap (interrupted replacement) is reinstalled; an invalid one refuses.
   // A retried refresh restores the set that was live before the first attempt,
   // never whatever the interrupted attempt left behind.
@@ -588,8 +648,11 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   }
   // First managed activation: refuse foreign wiring destinations before any mutation.
   if(command.operation==='activate'&&!managed)await planWiring({repositoryRoot,home,environment,releaseId:command.releaseId,planTimeoutMs,adoptFrom:command.adoptFrom});
-  directory=createPrivateDirectory(runtime,`.deploy.${randomBytes(16).toString('hex')}`);
-  state={version:1,status:'pending',operation:command.operation,phase:'before_mutation',previous,variables:{}};
+  // An explicit retry continues the same strict reverse intent. Creating another
+  // pending journal would turn a second interruption into ambiguous recovery.
+  const resumeGuardReverse=guardRecovery?.evidence.direction==='reverse';
+  directory=resumeGuardReverse?guardRecovery.directory:createPrivateDirectory(runtime,`.deploy.${randomBytes(16).toString('hex')}`);
+  state=resumeGuardReverse?guardRecovery.state:{version:1,status:'pending',operation:command.operation,phase:'before_mutation',previous,variables:{}};
   if(command.operation==='refresh-bootstrap') {
    state.bootstrap={prior:originalBootstrap,from:originalBootstrap?.sourceReleaseId??null,to:null,previousDirectory:null};
    // The inherited obligation keeps this journal pending even when the retry is
@@ -599,8 +662,8 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
   }
   checkpoint(directory,state);
   if(recovery&&command.operation==='refresh-bootstrap'){recovery.state.status='complete';recovery.state.recovery='superseded_by_refresh';checkpoint(recovery.directory,recovery.state);recovery=undefined;}
-  const run=async (phase,candidateReleaseId)=>{state.phase=phase;checkpoint(directory,state);await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom:command.adoptFrom});};
-  const pointerIntent=destination=>{state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);};
+  const run=async (phase,candidateReleaseId,guardTransition)=>{state.phase=phase;checkpoint(directory,state);return await phaseRunner({repositoryRoot,home,environment,phase,managed,deployLease:writer,admissionLease:admission,directory,state,phaseTimeoutMs,candidateReleaseId,adoptFrom:command.adoptFrom,guardTransition});};
+  const pointerIntent=destination=>{if(guardForward)guardForward=recordGuardDestination({journalDirectory:directory,destinationActivationId:destination.activationId});state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);};
   // Validation runs with admission released, so one sample can still see a probe
   // holding its shared lease or an unrelated process starting or exiting. Only
   // those two refusals are sampled again, and never a sample that counted a
@@ -618,10 +681,19 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    }
   };
   let current=previous;
-  if(managed&&command.operation!=='uninstall') {
+  if(managed&&command.operation!=='uninstall'&&!guardRecovery) {
    await run('verify');
    if(command.operation!=='refresh-bootstrap')requireCompatibleWiringTopology({repositoryRoot,home,previous,command});
   }
+  if(command.operation==='activate'&&managed&&(enableGuard||guardPolicy==='observe')) {
+   await planWiring({repositoryRoot,home,environment,releaseId:command.releaseId,planTimeoutMs,guardPolicy});
+  }
+  if(enableGuard) {
+   guardForward=captureGuardTransitionEvidence({home,repositoryRoot,candidateReleaseId:command.releaseId,origin:previous});
+   writeGuardTransitionEvidence({journalDirectory:directory,evidence:guardForward});
+  }
+  if(rollbackGuard)prepareGuardRollbackEvidence({forwardJournalDirectory:rollbackGuard.journalDirectory,rollbackJournalDirectory:directory,sourceActivationId:previous.activationId,destinationActivationId:rollbackGuard.evidence.origin.activationId});
+  if(guardRecovery?.evidence.direction==='forward')prepareIncompleteGuardRollbackEvidence({forwardJournalDirectory:guardRecovery.directory,rollbackJournalDirectory:directory,sourceActivationId:previous.activationId});
   if(!managed||command.operation==='uninstall')privateWrite(path.join(directory,'before.json'),wiringPreimages({repositoryRoot,home,releaseId:command.releaseId??previous?.releaseId,adoptFrom:command.adoptFrom}),{exclusive:true});
   if(!managed&&command.operation==='activate')privateWrite(path.join(directory,'listings.json'),wiringListings(home),{exclusive:true});
   if(command.operation==='uninstall') {
@@ -673,6 +745,37 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
     if(restored){state.status='complete';state.phase='wire_rolled_back';checkpoint(directory,state);fail('DEPLOY_WIRING_FAILED','first_activation_rolled_back');}
     state.phase='wire_rollback_failed';checkpoint(directory,state);fail('DEPLOY_RECOVERY_REQUIRED','wire_rollback_failed');
    };
+   let guardRollbackDestination;
+   if(rollbackGuard||guardRecovery) {
+    const evidence=readGuardTransitionEvidence({journalDirectory:directory});
+    guardRollbackDestination=evidence.destination_activation_id;
+    if(guardRecovery?.evidence.direction==='forward') {
+     const forward=guardRecovery.evidence;
+     const transactionPaths=[forward.policy_context?.directory,guardRecovery.state.variables?.HOOKS_TRANSACTION_DIR,guardRecovery.state.variables?.CLAUDE_HOOKS_TRANSACTION_DIR].filter(Boolean);
+     const remaining=transactionPaths.filter(exists);
+     if(remaining.length) {
+      if(remaining.length!==transactionPaths.length||!forward.policy_context)fail('DEPLOY_RECOVERY_REQUIRED','guard_context_unverified');
+      state.variables={...guardRecovery.state.variables};checkpoint(directory,state);
+      await run('rollback',forward.candidate_release_id,{action:'rollback',context:forward.policy_context});
+     }
+    }
+    restoreGuardRollbackEvidence({home,journalDirectory:directory});
+    resultGuardMode=undefined;
+   }
+   const guardPreimagesMatch=()=>guardForward?.entries.every(entry=>withEntry(home,entry.path,(_parent,view)=>
+    matchesPreimage(view,entry.preimage)&&(view.type!=='file'||view.info.uid===process.getuid()&&(view.info.mode&0o7022)===0)));
+   const undoGuardWiring=async()=>{
+    let restored=false;
+    if(!state.stateIncomplete&&!state.workerDetached) {
+     try {
+      if(guardForward.policy_context)await run('rollback',command.releaseId,{action:'rollback',context:guardForward.policy_context});
+      await run('verify',command.releaseId);await run('verify');
+      restored=guardPreimagesMatch();
+     } catch {restored=false;}
+    }
+    if(restored){state.status='complete';state.phase='wire_rolled_back';checkpoint(directory,state);fail('DEPLOY_WIRING_FAILED','guard_activation_rolled_back');}
+    fail('DEPLOY_RECOVERY_REQUIRED','guard_wire_unverified');
+   };
    let firstWired=false;
    if(command.operation==='activate') {
     if(!managed) {
@@ -684,12 +787,24 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
      firstWired=true;
     } else validateBootstrap({repositoryRoot});
    }
+   if(enableGuard) {
+    try {
+     const wire=await run('wire',command.releaseId,{action:'begin'});
+     guardForward=recordGuardPolicyContext({journalDirectory:directory,context:wire?.guardPolicyContext});
+     guardForward=recordGuardPublishedSnapshots({home,journalDirectory:directory});
+    } catch {await undoGuardWiring();}
+   }
    try {
     if(firstWired){state.phase='wired';checkpoint(directory,state);}
     if(command.operation==='activate')current=publishActivation({repositoryRoot,releaseId:command.releaseId,expectedCurrent:previous,onPointerIntent:pointerIntent});
-    else {validateBootstrap({repositoryRoot});current=rollbackActivation({repositoryRoot,expectedCurrent:previous,onPointerIntent:pointerIntent});}
+    else {validateBootstrap({repositoryRoot});if(guardRollbackDestination===previous?.activationId){current=previous;pointerIntent({activationId:previous.activationId,releaseId:previous.releaseId,predecessorActivationId:previous.predecessorActivationId});}else current=rollbackActivation({repositoryRoot,expectedCurrent:previous,onPointerIntent:pointerIntent});if(guardRollbackDestination&&current.activationId!==guardRollbackDestination)fail('DEPLOY_CURRENT_CHANGED');}
     state.current=current;checkpoint(directory,state);
    } catch(error) {
+    if(guardForward) {
+     let pointer;try{pointer=readActivation({repositoryRoot});}catch{}
+     if(pointer&&JSON.stringify(pointer)===JSON.stringify(previous))await undoGuardWiring();
+     fail('DEPLOY_RECOVERY_REQUIRED','guard_publication_uncertain');
+    }
     if(!firstWired)throw error;
     // Publication after a completed first wire failed. Only a pointer proven
     // still at the origin makes the wired HOME safe to undo; otherwise the new
@@ -699,6 +814,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
     state.phase='publication_uncertain';try{checkpoint(directory,state);}catch{}
     fail('DEPLOY_RECOVERY_REQUIRED','publication_uncertain');
    }
+   if(guardRollbackDestination)await run('verify');
    if (!managed) {
     managed = true;
     await run('wire');
@@ -730,18 +846,24 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
     fail('DEPLOY_VALIDATION_FAILED', reason);
    }
    if(JSON.stringify(readActivation({repositoryRoot}))!==JSON.stringify(current))fail('DEPLOY_CURRENT_CHANGED');
-   await run('finalize');
+   await run('finalize',undefined,guardForward?{action:'continue',context:guardForward.policy_context}:undefined);
+   if(guardForward){guardForward=markGuardTransitionFinalized({home,journalDirectory:directory});resultGuardMode='observe';}
    if (!exists(wiringFile) || privateRead(wiringFile).installed !== true) {
     privateWrite(wiringFile, {version:1, installed:true});
    }
   }
+  if(guardRecovery&&!resumeGuardReverse){guardRecovery.state.status='complete';guardRecovery.state.recovery='guard_predecessor_rollback';checkpoint(guardRecovery.directory,guardRecovery.state);}
   if(recovery){recovery.state.status='complete';recovery.state.recovery='validated_predecessor_rollback';checkpoint(recovery.directory,recovery.state);}
   state.status='complete';state.phase='complete';checkpoint(directory,state);
-  if(command.operation==='refresh-bootstrap')return {code:'DEPLOY_BOOTSTRAP_REFRESHED',releaseId:current.releaseId,bootstrap:{from:state.bootstrap.from,to:state.bootstrap.to,previousDirectory:state.bootstrap.previousDirectory},inventory:{before,after}};
+  let retentionWarning;
+  try {recordDeploymentRetention({repositoryRoot,journalDirectory:directory,previousDirectory:command.operation==='refresh-bootstrap'?state.bootstrap.previousDirectory:null});}
+  catch {retentionWarning='retention_receipt_unavailable';}
+  const retention=retentionWarning?{warnings:[retentionWarning]}:{};
+  if(command.operation==='refresh-bootstrap')return {...retention,code:'DEPLOY_BOOTSTRAP_REFRESHED',releaseId:current.releaseId,bootstrap:{from:state.bootstrap.from,to:state.bootstrap.to,previousDirectory:state.bootstrap.previousDirectory},inventory:{before,after}};
   // Uninstall reports adapters whose removed entry carried non-default env (names only),
   // or null when the selected release's library predates that report.
   const envDropped=command.operation==='uninstall'?{envDropped:state.variables.ENV_DROPPED_REPORTED==='1'?[...new Set((state.variables.ENV_DROPPED??'').split(' '))].filter(name=>ENV_ADAPTERS.includes(name)).sort():null}:{};
-  return {...envDropped,code:command.operation==='uninstall'?'DEPLOY_UNINSTALLED':command.operation==='rollback'?'DEPLOY_ROLLED_BACK':'DEPLOY_ACTIVATED',previousReleaseId:previous?.releaseId??null,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,inventory:{before,after},unprotected:state.variables.INSTALL_UNPROTECTED==='1'};
+  return {...retention,...envDropped,...(resultGuardMode?{runtime_mode:resultGuardMode,enforced:false}:{}),code:command.operation==='uninstall'?'DEPLOY_UNINSTALLED':command.operation==='rollback'?'DEPLOY_ROLLED_BACK':'DEPLOY_ACTIVATED',previousReleaseId:previous?.releaseId??null,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,inventory:{before,after},unprotected:state.variables.INSTALL_UNPROTECTED==='1'};
  } catch(error) {if(state&&!state.mutationStarted){try{state.status='complete';state.phase='refused';checkpoint(directory,state);}catch{}}if(error instanceof DeploymentError)throw error;fail('DEPLOY_FAILED');}
  finally {admission?.close();writer?.close();}
 }

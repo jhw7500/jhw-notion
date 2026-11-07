@@ -448,6 +448,29 @@ export class GuardRequestStore {
     }
   }
 
+  /** Explicit startup preparation; inspection never calls this mutation. */
+  async ensureInitialized(): Promise<{ created: boolean }> {
+    let result: { created: boolean } | undefined;
+    try {
+      await this.#runStateMutation(async (directory) => {
+        const loaded = await readState(directory, this.#sensitiveData);
+        if (loaded.initialized) {
+          result = { created: false };
+          return;
+        }
+        await writeState(directory, loaded.state, this.#sensitiveData, this.#stateHooks);
+        result = { created: true };
+      });
+    } catch (cause) {
+      if (result === undefined) {
+        if (isLockError(cause)) throw cause;
+        throw unavailable();
+      }
+    }
+    if (result === undefined) throw unavailable();
+    return result;
+  }
+
   async createOrReusePending(operationInput: CanonicalOperation): Promise<GuardPendingResult> {
     const operation = validateOperation(operationInput, this.#sensitiveData);
     return this.runMutation<GuardPendingResult>((state, now) => {
