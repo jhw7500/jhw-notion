@@ -19,6 +19,7 @@ const canonicalPr = join(repoRoot, "skills", "claude", "pr.md");
 const shipAlias = join(repoRoot, "skills", "claude", "ship.md");
 const agentsPath = join(repoRoot, "skills", "COMMANDS.md");
 const readmePath = join(repoRoot, "README.md");
+const codexUsageLimitPolicyPath = join(repoRoot, "docs", "pr-codex-usage-limit-policy.md");
 const codexPrSkill = join(repoRoot, "skills", "codex", "jhw-pr", "SKILL.md");
 const codexPrReference = join(repoRoot, "skills", "codex", "jhw-pr", "references", "pr.md");
 const codexShipSkill = join(repoRoot, "skills", "codex", "jhw-ship", "SKILL.md");
@@ -1153,6 +1154,7 @@ async function main() {
   const aliasText = await readFile(shipAlias, "utf8");
   const agentsText = await readFile(agentsPath, "utf8");
   const readmeText = await readFile(readmePath, "utf8");
+  const codexUsageLimitPolicyText = await readFile(codexUsageLimitPolicyPath, "utf8");
   const repositoryGeminiConfig = await readFile(join(repoRoot, ".gemini", "config.yaml"), "utf8");
   assert.match(prText, /^# \/jhw:pr — PR 생성/m);
   assert.match(prText, /<!-- jhw-pr:review-request reviewer=\$\{reviewer\} head=\$\{head\} base=\$\{ROUND_BASE_OID\} -->/);
@@ -1171,6 +1173,14 @@ async function main() {
   assert.doesNotMatch(prText, /vars\.REVIEW_MAX_ROUNDS[\s\S]{0,80}미설정 시 2/);
   assert.doesNotMatch(prText, /최초 PR 라운드는 기존 자동 트리거/);
   assert.match(prText, /jhw_pr_request_app_review codex "\$head"/);
+  assert.match(prText, /docs\/pr-codex-usage-limit-policy\.md/,
+    "the canonical PR skill must link the Codex usage-limit policy");
+  assert.match(codexUsageLimitPolicyText, /요청 댓글과 응답 사이의 귀속 정보를 제공하지 않는다/);
+  assert.match(codexUsageLimitPolicyText, /현재 HEAD에 귀속할 수 없는/);
+  assert.match(codexUsageLimitPolicyText, /FAILED/);
+  assert.match(codexUsageLimitPolicyText, /자동 제외[^\n]*지원하지 않는다/);
+  assert.match(codexUsageLimitPolicyText, /TIMEOUT/);
+  assert.match(codexUsageLimitPolicyText, /Gemini[^\n]*OpenCode[^\n]*제외/);
   assert.match(
     prText,
     /jhw_pr_capture_workflow_run_floors "\$ROUND_HEAD" "\$\{JHW_PR_AVAILABLE_WORKFLOWS:-\}"/,
@@ -1388,6 +1398,145 @@ async function main() {
       );
       assert.equal(observed.stdout.trim(), expected, name);
     }
+
+    for (const priority of ["P0", "P1"]) {
+      const quotaWithPriority = await runResult(
+        baseState({
+          prHead: currentHead,
+          issueComments: [
+            { id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody },
+            {
+              id: 9003,
+              actor: "chatgpt-codex-connector[bot]",
+              createdAt: "2026-08-29T00:02:00Z",
+              body: `You have reached your Codex usage limits for code reviews.\n${priority}: merge must remain blocked.`,
+            },
+          ],
+        }),
+        [
+          "ROUND_PLANNED_REVIEWERS=codex; ROUND_EXPECTED_REVIEWERS=codex; ROUND_UNAVAILABLE_REVIEWERS=''",
+          "export ROUND_PLANNED_REVIEWERS ROUND_EXPECTED_REVIEWERS ROUND_UNAVAILABLE_REVIEWERS",
+          "ship_codex_trigger",
+          "ship_codex_signal_status",
+          "printf 'status=%s\\nreason=%s\\nexpected=%s\\nunavailable=%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\" \"$ROUND_EXPECTED_REVIEWERS\" \"$ROUND_UNAVAILABLE_REVIEWERS\"",
+          `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request "codex=$SHIP_CODEX_REVIEW_STATUS"`,
+        ].join("\n"),
+      );
+      assert.equal(quotaWithPriority.stdout,
+        "status=FAILED\nreason=reviewer_response_failed\nexpected=codex\nunavailable=\n",
+        `quota plus ${priority} must remain FAILED without changing the round reviewer sets`);
+      assert.notEqual(quotaWithPriority.code, 0);
+      assert.equal(quotaWithPriority.state.prMerged, false,
+        `quota plus ${priority} must not open the merge gate`);
+    }
+
+    const quotaAfterRequestScopedCurrentHeadFinding = await runResult(
+      baseState({
+        prHead: currentHead,
+        issueComments: [
+          { id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody },
+          {
+            id: 9003,
+            actor: "chatgpt-codex-connector[bot]",
+            createdAt: "2026-08-29T00:02:01Z",
+            body: "You have reached your Codex usage limits for code reviews.",
+          },
+        ],
+        reviews: [{
+          id: 5200,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:02:00Z",
+          body: "P1: merge safety is not preserved.",
+        }],
+      }),
+      [
+        "ROUND_PLANNED_REVIEWERS=codex; ROUND_EXPECTED_REVIEWERS=codex; ROUND_UNAVAILABLE_REVIEWERS=''",
+        "export ROUND_PLANNED_REVIEWERS ROUND_EXPECTED_REVIEWERS ROUND_UNAVAILABLE_REVIEWERS",
+        "ship_codex_trigger",
+        "ship_codex_signal_status",
+        "printf 'status=%s\\nreason=%s\\nexpected=%s\\nunavailable=%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\" \"$ROUND_EXPECTED_REVIEWERS\" \"$ROUND_UNAVAILABLE_REVIEWERS\"",
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request "codex=$SHIP_CODEX_REVIEW_STATUS"`,
+      ].join("\n"),
+    );
+    assert.equal(quotaAfterRequestScopedCurrentHeadFinding.stdout,
+      "status=FEEDBACK\nreason=\nexpected=codex\nunavailable=\n",
+      "an after-request current-head P1 must remain FEEDBACK despite a later quota response");
+    assert.notEqual(quotaAfterRequestScopedCurrentHeadFinding.code, 0);
+    assert.equal(quotaAfterRequestScopedCurrentHeadFinding.state.prMerged, false,
+      "an after-request current-head P1 plus quota must not open the merge gate");
+
+    const quotaWithPreRequestCurrentHeadFinding = await runResult(
+      baseState({
+        prHead: currentHead,
+        issueComments: [
+          { id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody },
+          {
+            id: 9003,
+            actor: "chatgpt-codex-connector[bot]",
+            createdAt: "2026-08-29T00:02:01Z",
+            body: "You have reached your Codex usage limits for code reviews.",
+          },
+        ],
+        reviews: [{
+          id: 5200,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:00:30Z",
+          body: "P1: merge safety is not preserved.",
+        }],
+      }),
+      [
+        "ROUND_PLANNED_REVIEWERS=codex; ROUND_EXPECTED_REVIEWERS=codex; ROUND_UNAVAILABLE_REVIEWERS=''",
+        "export ROUND_PLANNED_REVIEWERS ROUND_EXPECTED_REVIEWERS ROUND_UNAVAILABLE_REVIEWERS",
+        "ship_codex_trigger",
+        "ship_codex_signal_status",
+        "printf 'status=%s\\nreason=%s\\nexpected=%s\\nunavailable=%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\" \"$ROUND_EXPECTED_REVIEWERS\" \"$ROUND_UNAVAILABLE_REVIEWERS\"",
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request "codex=$SHIP_CODEX_REVIEW_STATUS"`,
+      ].join("\n"),
+    );
+    assert.equal(quotaWithPreRequestCurrentHeadFinding.stdout,
+      "status=FAILED\nreason=reviewer_response_failed\nexpected=codex\nunavailable=\n",
+      "a pre-request current-head P1 must not hide a later quota failure or change the round reviewer sets");
+    assert.notEqual(quotaWithPreRequestCurrentHeadFinding.code, 0);
+    assert.equal(quotaWithPreRequestCurrentHeadFinding.state.prMerged, false,
+      "quota after a pre-request current-head P1 must not open the merge gate");
+
+    const delayedQuotaAfterCurrentHeadClean = await runResult(
+      baseState({
+        prHead: currentHead,
+        issueComments: [
+          { id: 9002, actor: "jhw7500", createdAt: requestCreatedAt, body: requestBody },
+          {
+            id: 9004,
+            actor: "chatgpt-codex-connector[bot]",
+            createdAt: "2026-08-29T00:04:00Z",
+            body: "You've reached your usage limit.",
+          },
+        ],
+        reviews: [{
+          id: 5201,
+          actor: "chatgpt-codex-connector[bot]",
+          commitId: currentHead,
+          submittedAt: "2026-08-29T00:03:00Z",
+          body: "No P1 findings.",
+        }],
+      }),
+      [
+        "ROUND_PLANNED_REVIEWERS=codex; ROUND_EXPECTED_REVIEWERS=codex; ROUND_UNAVAILABLE_REVIEWERS=''",
+        "export ROUND_PLANNED_REVIEWERS ROUND_EXPECTED_REVIEWERS ROUND_UNAVAILABLE_REVIEWERS",
+        "ship_codex_trigger",
+        "ship_codex_signal_status",
+        "printf 'status=%s\\nreason=%s\\nexpected=%s\\nunavailable=%s\\n' \"$SHIP_CODEX_REVIEW_STATUS\" \"$SHIP_CODEX_REVIEW_REASON\" \"$ROUND_EXPECTED_REVIEWERS\" \"$ROUND_UNAVAILABLE_REVIEWERS\"",
+        `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request "codex=$SHIP_CODEX_REVIEW_STATUS"`,
+      ].join("\n"),
+    );
+    assert.equal(delayedQuotaAfterCurrentHeadClean.stdout,
+      "status=FAILED\nreason=reviewer_response_failed\nexpected=codex\nunavailable=\n",
+      "a delayed quota response must supersede an earlier clean current-head review");
+    assert.notEqual(delayedQuotaAfterCurrentHeadClean.code, 0);
+    assert.equal(delayedQuotaAfterCurrentHeadClean.state.prMerged, false,
+      "a delayed quota response must keep the merge gate closed");
 
     const missingBaseCoordinate = await runResult(baseState(), "ship_codex_trigger", { ROUND_BASE_OID: "" });
     assert.notEqual(missingBaseCoordinate.code, 0,
@@ -6068,6 +6217,19 @@ async function main() {
     assert.equal(allowlist.stdout,
       allowlistCases.map(([reviewer, reason, allowed]) => `${reviewer}:${reason}=${allowed ? "allowed" : "blocked"}\n`).join(""),
       "catch-all, authentication, budget, author-inducible and output-validation reasons must never be allowlisted");
+    const codexQuotaExclusion = await runResult(
+      baseState({ prHead: currentHead }),
+      [
+        "ROUND_PLANNED_REVIEWERS=codex; ROUND_EXPECTED_REVIEWERS=''",
+        "ROUND_UNAVAILABLE_REVIEWERS=$'codex\\tquota_exhausted\\t9901\\t1'",
+        "export ROUND_PLANNED_REVIEWERS ROUND_EXPECTED_REVIEWERS ROUND_UNAVAILABLE_REVIEWERS",
+        `jhw_pr_validate_round_exclusions ${currentHead}`,
+      ].join("\n"),
+    );
+    assert.match(codexQuotaExclusion.stderr, /exclusion is not allowlisted: codex/);
+    assert.notEqual(codexQuotaExclusion.code, 0);
+    assert.equal(codexQuotaExclusion.state.prMerged, false,
+      "Codex quota cannot become an expected/excluded merge exception");
     for (const status of ["PENDING", "TIMEOUT", "TRIGGER_FAILED", "FAILED"]) {
       const notReady = await runResult(
         baseState({ prHead: currentHead }),
@@ -6075,6 +6237,16 @@ async function main() {
       );
       assert.match(notReady.stderr, new RegExp(`PR reviewer is not ready: gemini=${status}`));
       assert.equal(notReady.state.prMerged, false, `${status} must never be excluded from the merge gate`);
+      const codexNotReady = await runResult(
+        baseState({ prHead: currentHead }),
+        [
+          roundPlan("codex"),
+          `jhw_pr_merge_reviewed_head 42 ${currentHead} ${currentBaseOid} merge request codex=${status}`,
+        ].join("\n"),
+      );
+      assert.match(codexNotReady.stderr, new RegExp(`PR reviewer is not ready: codex=${status}`));
+      assert.equal(codexNotReady.state.prMerged, false,
+        `Codex ${status} must retain its ordinary merge-blocking meaning`);
     }
 
     const exclusionMarker = "<!-- jhw-pr:review-exclusion ";
