@@ -704,6 +704,63 @@ describe("historical cleanup proof", () => {
     await expect(stat(f.manifest.artifacts[0]!.file)).resolves.toBeDefined();
   });
 
+  it.each(["branch SHA", "symbolic HEAD", "fetch URL", "push URL"] as const)(
+    "preserves the worktree and backup when the remote %s changes at the final callback fence",
+    async (changed) => {
+      const f = await proofFixture();
+      const remote = (await git(f.source, "remote", "get-url", "origin")).trim();
+      await git(f.source, "remote", "set-url", "origin", "https://github.com/jhw7500/proof.git");
+      const delegate = new ProcessRunner();
+      let removeAttempts = 0;
+      const runner = {
+        run: async (...args: Parameters<ProcessRunner["run"]>) => {
+          const [command, commandArgs, options] = args;
+          if (commandArgs.includes("worktree") && commandArgs.includes("remove")) removeAttempts += 1;
+          // Keep production origin validation; only route network transport to the real local bare repository.
+          const transportArgs = commandArgs.includes("ls-remote")
+            ? commandArgs.map((arg) => arg === "origin" ? remote : arg)
+            : commandArgs;
+          return delegate.run(command, transportArgs, options);
+        },
+        runRaw: delegate.runRaw.bind(delegate),
+      };
+      const manager = new WorktreeManager(configFor(f.fixture.registryDir), runner);
+      const backups = [f.proofPath, f.manifest.bundle.file, f.manifest.artifacts[0]!.file];
+      const originalBytes = await Promise.all(backups.map((path) => readFile(path)));
+      let validations = 0;
+
+      await expect(manager.cleanupReleased(f.history, {
+        proofPath: f.proofPath,
+        registryHead: f.manifest.registry_head,
+        historySha256: f.manifest.history_sha256,
+        repositorySlug: f.manifest.repository_slug,
+        revalidate: async () => {
+          validations += 1;
+          if (changed === "branch SHA") {
+            await git(remote, "update-ref", "refs/heads/main", `${f.manifest.source_head}^`);
+          } else if (changed === "symbolic HEAD") {
+            await git(remote, "symbolic-ref", "HEAD", "refs/heads/other");
+          } else {
+            await git(f.source, "remote", "set-url", ...(changed === "push URL" ? ["--push"] : []),
+              "origin", "https://github.com/other/untrusted.git");
+          }
+        },
+      })).rejects.toMatchObject({
+        code: "WORKTREE_EQUIVALENCE_UNSAFE",
+        details: { reason: "integration_untrusted" },
+      });
+
+      expect(validations).toBe(1);
+      expect(removeAttempts).toBe(0);
+      await expect(stat(f.worktree)).resolves.toBeDefined();
+      expect((await git(f.source, "rev-parse", "HEAD")).trim()).toBe(f.manifest.source_head);
+      expect(await git(f.source, "show-ref", "--verify", `refs/heads/${f.history.branch}`)).toContain(f.manifest.worktree_head);
+      const state = JSON.parse(await readFile(join(f.fixture.root, "state", "worktrees.json"), "utf8"));
+      expect(state.worktrees[f.history.worktree_ref].lifecycle).toBe("pending-remove-equivalent");
+      expect(await Promise.all(backups.map((path) => readFile(path)))).toEqual(originalBytes);
+    },
+  );
+
   it("does not authorize active removal by validating a swapped public bundle instead of manifest-bound bytes", async () => {
     const f = await proofFixture();
     const validBundle = await readFile(f.manifest.bundle.file);

@@ -105,6 +105,7 @@ export interface VerifiedHistoricalCleanupProofScope {
   verified: VerifiedHistoricalCleanupProof;
   sourceArtifacts: ReadonlyArray<{ path: string; descriptor: number }>;
   assertArtifactsUnchanged(): Promise<void>;
+  assertSourceTrusted(): Promise<void>;
 }
 
 interface RetainedParent {
@@ -553,13 +554,14 @@ export async function withVerifiedHistoricalCleanupProof<T>(
     if (sourceBranch !== manifest.source_ref || sourceHead !== manifest.source_head || worktreeHead !== manifest.worktree_head || history.head_sha !== worktreeHead) {
       throw unsafe("snapshot_changed");
     }
-    await (input.sourceTrust ?? productionSourceTrust).assertTrustedSource({
+    const assertSourceTrusted = () => (input.sourceTrust ?? productionSourceTrust).assertTrustedSource({
       runner: input.runner,
       sourcePath: sourceRoot,
       repositorySlug: input.repositorySlug,
       sourceRef: manifest.source_ref,
       sourceHead: manifest.source_head,
     });
+    await assertSourceTrusted();
 
     const nonIntegrated = (await git(input.runner, worktreeRoot, ["rev-list", "--reverse", "--topo-order", `${sourceHead}..${worktreeHead}`]))
       .split("\n").filter(Boolean);
@@ -598,6 +600,7 @@ export async function withVerifiedHistoricalCleanupProof<T>(
     return await use({
       verified,
       sourceArtifacts: sources.map((source) => ({ path: source.path, descriptor: source.handle.fd })),
+      assertSourceTrusted,
       assertArtifactsUnchanged: async () => {
         assertDeclaredInventory(await ignoredArtifactInventory(input), manifest, "snapshot_changed");
         for (const snapshot of retained) await assertRetainedFileUnchanged(snapshot);

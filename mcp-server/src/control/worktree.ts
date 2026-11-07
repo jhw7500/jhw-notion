@@ -656,7 +656,7 @@ export class WorktreeManager {
       managedRoots: [this.config.stateDir, this.config.worktreeRoot],
       runner: this.runner,
       ...(this.proofSourceTrust ? { sourceTrust: this.proofSourceTrust } : {}),
-    }, async ({ verified, assertArtifactsUnchanged }) => {
+    }, async ({ verified, assertArtifactsUnchanged, assertSourceTrusted }) => {
       if (mapping.lifecycle === "active") {
         mapping.lifecycle = "pending-remove-equivalent";
         mapping.cleanup_intent = this.cleanupIntent(options, mappingSha256, verified);
@@ -688,6 +688,7 @@ export class WorktreeManager {
         throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Git state changed at final removal fence", { reason: "snapshot_changed" });
       }
       await assertArtifactsUnchanged();
+      await assertSourceTrusted();
       await this.git(["-C", last.repository_path, "worktree", "remove", last.path]);
       last.lifecycle = "removed";
       delete last.cleanup_intent;

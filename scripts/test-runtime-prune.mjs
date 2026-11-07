@@ -162,14 +162,15 @@ test('underspecified complete activate state blocks the whole batch',()=>{
 });
 
 test('apply makes all recovery copies durable before destination-then-source capture sync',()=>{
- const f=fixture(test);for(let sequence=1;sequence<=34;sequence++)journal(f,sequence,{age:60+sequence});const events=[];const real={mkdir:fs.mkdirSync,rename:fs.renameSync,rmdir:fs.rmdirSync,fsync:fs.fsyncSync};
+ const f=fixture(test);for(let sequence=1;sequence<=34;sequence++)journal(f,sequence,{age:60+sequence});const events=[];let markerSnapshot;const real={mkdir:fs.mkdirSync,rename:fs.renameSync,rmdir:fs.rmdirSync,fsync:fs.fsyncSync};
  fs.mkdirSync=function(name,...args){const result=real.mkdir.call(this,name,...args);if(path.basename(String(name))==='.prune.v1')events.push('mkdir:prune');return result;};
  fs.renameSync=function(from,to,...args){const result=real.rename.call(this,from,to,...args);if(path.basename(String(to)).startsWith('capture.'))events.push('rename:capture');return result;};
  fs.rmdirSync=function(name,...args){const result=real.rmdir.call(this,name,...args);events.push(path.basename(String(name))==='.prune.v1'?'rmdir:prune':'rmdir:capture');return result;};
- fs.fsyncSync=function(fd,...args){let target='';try{target=fs.readlinkSync(`/proc/self/fd/${fd}`);}catch{}const result=real.fsync.call(this,fd,...args);if(target===f.runtime)events.push('fsync:runtime');else if(target.endsWith('/.prune.v1'))events.push('fsync:evidence');else if(target.endsWith('/recovery.00000001'))events.push('fsync:recovery.00000001');return result;};
- try{prune.applyRuntimePrune({repositoryRoot:f.root,now:NOW});}finally{Object.assign(fs,{mkdirSync:real.mkdir,renameSync:real.rename,rmdirSync:real.rmdir,fsyncSync:real.fsync});}
+ fs.fsyncSync=function(fd,...args){let target='';try{target=fs.readlinkSync(`/proc/self/fd/${fd}`);}catch{}const result=real.fsync.call(this,fd,...args);if(target===f.runtime)events.push('fsync:runtime');else if(target.endsWith('/.prune.v1'))events.push('fsync:evidence');else if(target.includes('/.prune.v1/.write.'))events.push('fsync:state-temp');else if(target.endsWith('/recovery.00000001'))events.push('fsync:recovery.00000001');return result;};
+ try{prune.applyRuntimePrune({repositoryRoot:f.root,now:NOW,faultInjector:(point,context)=>{if(point==='after_originals_durable'){markerSnapshot={state:JSON.parse(fs.readFileSync(path.join(f.runtime,'.prune.v1/state.json'),'utf8')),recoveries:[0,1].map(index=>fs.existsSync(path.join(f.runtime,'.prune.v1',`recovery.${index.toString().padStart(8,'0')}`))),originals:[1,2].map(sequence=>fs.existsSync(path.join(f.runtime,`.deploy.${sequence.toString(16).padStart(32,'0')}`)))};events.push('point:originals_durable');}if(point==='before_recovery_cleanup'&&context.index===0)events.push('point:cleanup_start');}});}finally{Object.assign(fs,{mkdirSync:real.mkdir,renameSync:real.rename,rmdirSync:real.rmdir,fsyncSync:real.fsync});}
  const after=(needle,start)=>events.indexOf(needle,start+1);const mkdir=events.indexOf('mkdir:prune');const rename=events.indexOf('rename:capture');const captureRmdir=events.indexOf('rmdir:capture');const finalRmdir=events.lastIndexOf('rmdir:prune');
  assert.ok(after('fsync:runtime',mkdir)>mkdir,events);assert.ok(events.indexOf('fsync:recovery.00000001')<rename,events);const destinationSync=after('fsync:evidence',rename);assert.ok(destinationSync>rename,events);assert.ok(after('fsync:runtime',destinationSync)>destinationSync,events);assert.ok(after('fsync:evidence',captureRmdir)>captureRmdir,events);assert.ok(after('fsync:runtime',finalRmdir)>finalRmdir,events);
+ const marker=events.indexOf('point:originals_durable');const cleanup=events.indexOf('point:cleanup_start');const markerFileSync=events.lastIndexOf('fsync:state-temp',marker);const markerParentSync=events.lastIndexOf('fsync:evidence',marker);assert.ok(markerFileSync>=0&&markerFileSync<marker,events);assert.ok(markerParentSync>markerFileSync&&markerParentSync<marker,events);assert.ok(marker<cleanup,events);assert.deepEqual(markerSnapshot,{state:{version:1,status:'pending',phase:'originals_durable',recovered:2,removed:{journals:2,previous:0}},recoveries:[true,true],originals:[false,false]});
 });
 
 test('process-exit boundaries preserve an original or a verified recovery payload until durable deletion',()=>{
@@ -180,6 +181,7 @@ test('process-exit boundaries preserve an original or a verified recovery payloa
   ['after_recovery_durable',f=>fs.existsSync(path.join(f.runtime,'.deploy.00000000000000000000000000000001'))&&Boolean(recoveryPayload(f.runtime))],
   ['after_destination_sync',f=>!fs.existsSync(path.join(f.runtime,'.deploy.00000000000000000000000000000001'))&&Boolean(recoveryPayload(f.runtime))],
   ['after_original_unlink',f=>Boolean(recoveryPayload(f.runtime))],
+  ['after_originals_durable',f=>JSON.parse(fs.readFileSync(path.join(f.runtime,'.prune.v1/state.json'),'utf8')).phase==='originals_durable'&&Boolean(recoveryPayload(f.runtime))],
   ['before_recovery_cleanup',f=>!fs.existsSync(path.join(f.runtime,'.deploy.00000000000000000000000000000001'))&&Boolean(recoveryPayload(f.runtime))],
   ['after_recovery_cleanup_sync',f=>!fs.existsSync(path.join(f.runtime,'.prune.v1/recovery.00000000'))&&fs.existsSync(path.join(f.runtime,'.prune.v1/state.json'))],
   ['before_final_evidence_removal',f=>fs.existsSync(path.join(f.runtime,'.prune.v1/intent.json'))&&fs.existsSync(path.join(f.runtime,'.prune.v1/state.json'))],
@@ -190,6 +192,15 @@ test('process-exit boundaries preserve an original or a verified recovery payloa
   const source=`import {applyRuntimePrune} from ${JSON.stringify(module)};applyRuntimePrune({repositoryRoot:${JSON.stringify(f.root)},now:${NOW},faultInjector:point=>{if(point===${JSON.stringify(point)})process.exit(77);}});`;
   const child=spawnSync(process.execPath,['--input-type=module','--eval',source],{encoding:'utf8'});assert.equal(child.status,77,`${point}: ${child.stderr}`);assert.equal(check(f),true,point);
  }
+});
+
+test('multi-candidate interruption retains every recovery until the whole batch originals are durable',()=>{
+ const module=pathToFileURL(path.join(path.dirname(new URL(import.meta.url).pathname),'runtime-prune.mjs')).href;const f=fixture(test);for(let sequence=1;sequence<=34;sequence++)journal(f,sequence,{age:60+sequence});
+ const source=`import {applyRuntimePrune} from ${JSON.stringify(module)};applyRuntimePrune({repositoryRoot:${JSON.stringify(f.root)},now:${NOW},faultInjector:(point,context)=>{if(point==='after_destination_sync'&&context.index===1)process.exit(77);}});`;
+ const child=spawnSync(process.execPath,['--input-type=module','--eval',source],{encoding:'utf8'});assert.equal(child.status,77,child.stderr);
+ for(let index=0;index<2;index++){const {inventory}=recoveryPayload(f.runtime,index);assert.equal(inventory.name,`.deploy.${(index+1).toString(16).padStart(32,'0')}`);assert.ok(inventory.files.every(record=>record.identity&&record.recoveryIdentity&&typeof record.sha256==='string'&&record.sha256.length===64));}
+ assert.equal(fs.existsSync(path.join(f.runtime,'.deploy.00000000000000000000000000000001')),false);assert.equal(fs.existsSync(path.join(f.runtime,'.deploy.00000000000000000000000000000002')),false);
+ const state=JSON.parse(fs.readFileSync(path.join(f.runtime,'.prune.v1/state.json'),'utf8'));assert.notEqual(state.phase,'originals_durable');
 });
 
 test('final runtime parent fsync failure reports removed evidence without fencing a later explicit empty apply',()=>{
