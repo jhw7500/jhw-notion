@@ -83,7 +83,7 @@ Issue URL이 authority coordinate다. 서버가 verified repository token으로 
 
 ### Temporary Task
 
-`--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다.
+`--done`과 `--scope`는 각각 1개 이상이며 반복 가능하다. 모든 flag 값은 `--`로 시작하면 안 된다 — launcher가 option으로 보고 field 이름 없이 `INVALID_CLI_ARGUMENT`로 거부하며 `--done=<값>` 형태도 받지 않는다.
 
 위 authorization gate를 통과한 뒤에만 launcher로 다음 temporary registration fields를 사용한다. Project/Repository association을 caller가 고르거나 명시하지 않는다. scalar는 `JHW_TEMP_ALIAS`, `JHW_TEMP_GOAL`, `JHW_ORIGIN_ADAPTER`, `JHW_SESSION_VALUE`로 전달한다. repeatable 값은 leading-zero 없는 양의 10진수 `JHW_DONE_COUNT`·`JHW_SCOPE_COUNT`와 연속된 `JHW_DONE_1..N`·`JHW_SCOPE_1..N` process environment로 전달한다. 각 값은 비어 있지 않은 정확히 한 argv argument여야 하며 누락·gap·잘못된 count에서는 launcher를 호출하지 않는다. shell source, eval, delimiter join, bracket notation을 사용하지 않는다.
 
@@ -154,6 +154,8 @@ child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또�
 같은 오류에 `error.retained_claim`도 있으면 위 start보다 먼저 해당 exact Claim generation에 아래 recovery 절차를 적용한다. active/released 상태와 안전한 cleanup 여부를 확인한 뒤에만 저장된 child를 재개한다. Task/Claim 파일을 Registry에서 직접 삭제하지 않는다.
 
 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED` 또는 `TASK_SESSION_BUSY`이면 검증된 `error.conflicting_claim`에서 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 좌표만 보여주고 멈춘다. session ID, repository path, token, raw message와 그 밖의 필드는 보고하거나 출력하지 않는다. `TASK_SESSION_BUSY`에서 이 좌표는 같은 exact session을 이미 점유한 active Task/Claim이며, `error.retained_task`가 함께 있으면 그것은 등록됐지만 시작되지 못한 새 child이므로 서로 혼동하지 않는다. 자동 status/finish/takeover하지 않으며, 사용자가 명시적으로 Task 전환을 요청한 경우에만 아래 전환 절차에 conflicting Task/Claim 좌표를 사용한다.
+
+start 성공 직후 첫 편집 전에 새 Task branch HEAD를 fetch한 `origin/<default>`와 비교해 ahead/behind를 보고한다. remote default branch에 없는 commit이 들어 있으면 편집하지 말고 멈추며, branch에 고유 commit이 없을 때만 사용자 승인 후 remote base로 옮긴다.
 
 ## 기존 Task 재개
 
@@ -306,7 +308,7 @@ test "$finish_rc" -eq 0 || exit "$finish_rc"
 
 `--status`는 `completed|handoff|abandoned`다. Handoff source revision은 Claim acquisition 때 frozen된다. `--source-task-revision`을 새로 만들거나 `unknown`을 보내지 않는다; independently retained 값을 보낼 경우 frozen 값과 exact match해야 한다.
 
-Handoff는 Registry copy/history를 durable하게 만든 뒤 release하고 worktree를 유지한다. completed/abandoned의 local cleanup 실패는 이미 성공한 release를 되돌리지 않는다.
+Handoff는 Registry copy/history를 durable하게 만든 뒤 release하고 worktree를 유지한다. completed/abandoned의 local cleanup 실패는 이미 성공한 release를 되돌리지 않는다. completed/abandoned의 cleanup이 성공하면 worktree는 ignored 파일(`.review/`의 Tribunal 증거 등)과 함께 삭제된다. 보존할 증거가 있으면 `task finish` 전에 durable 위치로 복사하고 digest를 확인한다.
 
 Formal Task의 `--status completed`는 같은 Claim에 기록된 completion evidence를 요구하고 해당 Claim generation만 archive/release하며 GitHub Issue를 닫지 않는다. live Issue-closed enforcement와 tracker mutation은 별도 tracker workflow 책임이다. Issue가 open 또는 reopened이면 같은 Task ID를 검증해 새 Claim으로 재개할 수 있다.
 

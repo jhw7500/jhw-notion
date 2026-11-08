@@ -27,6 +27,10 @@ Claude Code, Gemini CLI, OpenCode는 이 파일을 공유하고 Codex는 생성�
    검증을 수행한 `Validation`에는 실제 최상위 Markdown 목록 항목을 쓴다.
 5. 커밋 전 메시지와 staged diff를 다시 읽는다. 저장소에 고정된 `v1` validator가 있다면
    완성한 메시지에 `--kind commit --expected-version v1` 검증을 실행한다. 실패하면 수정한다.
+   저장소에 commitlint 설정(`commitlint.config.*`, `.commitlintrc*`)이나
+   Commitlint workflow가 있으면 그 한도로도 메시지의 모든 줄을
+   검사한다(`config-conventional`의 `body-max-line-length`는 100자). 줄을 나눴다면
+   `v1` 검증을 다시 실행한다.
 
 ## 언어
 
