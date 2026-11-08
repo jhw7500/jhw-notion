@@ -64,6 +64,8 @@ Task는 repository 자체가 아니라 하나의 명시적 작업 단위다. rep
 
 dependency 형식은 정확히 `blocked_by|observes|integrates:tsk-...`이며 반복 가능하다. dependency를 grant처럼 해석하거나 parent의 grant를 child에 상속하지 않는다.
 
+새 Task branch는 `--repo-path` checkout의 HEAD에서 만들어지므로, start 성공 직후 첫 편집 전에 그 HEAD가 의도한 기준에서 분기했는지 확인한다. Formal·Temporary Task는 fetch한 `origin/<default>`와 비교해 ahead/behind를 보고한다. remote default branch에 없는 commit이 들어 있으면 편집하지 말고 멈추며, branch에 고유 commit이 없을 때만 사용자 승인 후 remote base로 옮긴다. child Task(`task child-start`, 등록된 child의 `task start --task`)는 `--repo-path`로 준 checkout(보통 parent Task worktree)의 HEAD와 비교한다. parent branch의 아직 게시되지 않은 commit만으로는 멈추지 않고, 그 checkout에도 없는 commit이 들어 있을 때만 멈춘다.
+
 ### Formal GitHub Issue
 
 Issue URL이 authority coordinate다. 서버가 verified repository token으로 current node ID, canonical URL, revision, `<owner>/<repo>#<number>` alias를 도출한다. 위 authorization gate 뒤에 **한 번만** 다음 formal start를 실행한다.
@@ -154,8 +156,6 @@ child 등록은 Claim/start보다 먼저 commit된다. 등록 뒤 admission 또�
 같은 오류에 `error.retained_claim`도 있으면 위 start보다 먼저 해당 exact Claim generation에 아래 recovery 절차를 적용한다. active/released 상태와 안전한 cleanup 여부를 확인한 뒤에만 저장된 child를 재개한다. Task/Claim 파일을 Registry에서 직접 삭제하지 않는다.
 
 성공 결과의 immutable `task_id`, 새 `claim_id`, branch, `worktree_ref`만 이후 명령에 사용한다. `TASK_ALREADY_CLAIMED` 또는 `TASK_SESSION_BUSY`이면 검증된 `error.conflicting_claim`에서 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 좌표만 보여주고 멈춘다. session ID, repository path, token, raw message와 그 밖의 필드는 보고하거나 출력하지 않는다. `TASK_SESSION_BUSY`에서 이 좌표는 같은 exact session을 이미 점유한 active Task/Claim이며, `error.retained_task`가 함께 있으면 그것은 등록됐지만 시작되지 못한 새 child이므로 서로 혼동하지 않는다. 자동 status/finish/takeover하지 않으며, 사용자가 명시적으로 Task 전환을 요청한 경우에만 아래 전환 절차에 conflicting Task/Claim 좌표를 사용한다.
-
-start 성공 직후 첫 편집 전에 새 Task branch HEAD를 fetch한 `origin/<default>`와 비교해 ahead/behind를 보고한다. remote default branch에 없는 commit이 들어 있으면 편집하지 말고 멈추며, branch에 고유 commit이 없을 때만 사용자 승인 후 remote base로 옮긴다.
 
 ## 기존 Task 재개
 
