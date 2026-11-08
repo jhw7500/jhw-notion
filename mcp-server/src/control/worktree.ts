@@ -670,6 +670,8 @@ export class WorktreeManager {
 
       const frozen = JSON.stringify(mapping);
       await options.revalidate();
+      // Finish remote checks before the final local removal fence.
+      await assertSourceTrusted();
       const lastState = await this.loadState();
       const selected = lastState.worktrees[history.worktree_ref];
       if (!selected || JSON.stringify(selected) !== frozen) {
@@ -688,7 +690,6 @@ export class WorktreeManager {
         throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Git state changed at final removal fence", { reason: "snapshot_changed" });
       }
       await assertArtifactsUnchanged();
-      await assertSourceTrusted();
       await this.git(["-C", last.repository_path, "worktree", "remove", last.path]);
       last.lifecycle = "removed";
       delete last.cleanup_intent;

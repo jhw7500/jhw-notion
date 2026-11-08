@@ -1,6 +1,7 @@
 # #220 cleanup artifact verification amendment
 
 상태: 사용자 `진행`으로 권장 설계 승인. 로컬 구현·검증을 재개한다.
+2라운드 뒤 사용자 `진행`으로 원격 확인과 최종 로컬 검사를 분리하는 아래 보완도 승인했다.
 
 ## 확인한 문제
 
@@ -25,10 +26,12 @@ v1, 정확한 역사적 patch 대응 정책은 유지한다.
   전체에 유지한다. cleanup은 source artifact를 다시 열어 새 snapshot을 만들지 않는다.
 - manifest·bundle·artifact backup의 검증된 읽기 핸들과 부모 관계도 같은 소유 범위에 둔다.
   마지막 확인에서 실제 경로가 같은 검증 객체를 가리키는지, 외부 backup이 여전히 같은 bytes와
-  안전한 객체인지 확인한다. scratch 복원이나 큰 hash 검증은 마지막 Registry fence 전에 한다.
-- 비싼 검증 후 Registry/history/successor, mapping CAS/uniqueness, source ref/HEAD,
-  worktree HEAD/status/ignored inventory를 재확인한다. 이어 retained FD와 실제 경로의
-  identity/time/mode/link를 빠르게 재확인하고 plain `git worktree remove`를 호출한다.
+  안전한 객체인지 확인한다. scratch 복원과 최초 hash 검증은 마지막 Registry fence 전에 한다.
+- 비싼 검증 후 Registry/history/successor callback과 원격 origin identity·기본 ref·SHA 확인을
+  끝낸다. 그 다음 mapping CAS/uniqueness, source ref/HEAD, worktree HEAD/status를 재확인한다.
+  ignored inventory와 retained FD·실제 경로의 bytes/identity/time/mode/link 검사를 마지막으로
+  실행하고 plain `git worktree remove`를 호출한다. 마지막 파일 검사 뒤에는 원격 조회나 외부
+  callback을 추가하지 않는다.
 - callback 성공·실패 모두 finally에서 FD와 scratch를 닫는다. FD나 callback을 persisted
   intent에 직렬화하지 않는다. 같은 proof 재개는 새 bounded 검증 scope를 처음부터 만든다.
 - ignored 원본을 미리 unlink하지 않는다. task branch·외부 backup 보존, 기존 ancestor 경로,
@@ -36,6 +39,33 @@ v1, 정확한 역사적 patch 대응 정책은 유지한다.
 
 이는 검증된 객체의 수명을 결속한다. 비협조적 same-UID writer를 전체 syscall 동안 원자
 봉쇄한다고 주장하지 않는다. 새로운 의존성·Registry 권한 전환·실제 worktree 삭제는 없다.
+
+## 2라운드 보완: 원격 확인 뒤 최종 로컬 검사
+
+`A-R2-001`은 마지막 파일 검사 뒤 원격 조회가 실행되는 새 대기 구간을 지적했다. 이 사이에
+ignored 파일이 교체되면 보존한 FD는 이전 백업 객체를 증명하지만 Git은 새 파일을 삭제할 수
+있다. 원격 재검사를 마지막 파일 검사 뒤에 추가한 순서를 다음 두 단계로 고정한다.
+
+```text
+remote checks / callbacks
+          |
+          v
+local generation / refs / status
+          |
+          v
+inventory / retained FD / paths
+          |
+          v
+git worktree remove
+```
+
+원격 확인은 그 시점의 통합 허용 조건이다. 원격과 로컬 파일을 분산 원자적으로 고정한다는
+보장을 만들지 않는다. 원격 확인 중 변경된 로컬 상태는 그 뒤의 최종 검사에서 거부한다.
+기존 원격 SHA·기본 ref·fetch·push URL drift 검사는 유지한다.
+
+실제 임시 Git 작업본에서 두 번째 source-trust 확인 중 artifact bytes, byte-identical 새 inode,
+새 ignored 경로, source HEAD, worktree HEAD/status, mapping을 변경하는 회귀를 둔다. 각 경우
+Git 제거 호출과 removed tombstone이 생기지 않고 작업본·branch·외부 backup이 남아야 한다.
 
 ## 승인 후 필수 반례
 

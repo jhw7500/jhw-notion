@@ -761,6 +761,74 @@ describe("historical cleanup proof", () => {
     },
   );
 
+  it.each([
+    "artifact bytes", "artifact inode", "ignored inventory", "source HEAD",
+    "worktree HEAD", "worktree status", "mapping",
+  ] as const)("rejects %s changed during the final source-trust check", async (changed) => {
+    const f = await proofFixture();
+    const artifactPath = join(f.worktree, f.manifest.artifacts[0]!.path);
+    const statePath = join(f.fixture.root, "state", "worktrees.json");
+    const delegate = new ProcessRunner();
+    let removeAttempts = 0;
+    const runner = {
+      run: async (...args: Parameters<ProcessRunner["run"]>) => {
+        if (args[1].includes("worktree") && args[1].includes("remove")) removeAttempts += 1;
+        return delegate.run(...args);
+      },
+      runRaw: delegate.runRaw.bind(delegate),
+    };
+    let trustChecks = 0;
+    const delayedTrust = {
+      assertTrustedSource: async () => {
+        trustChecks += 1;
+        if (trustChecks !== 2) return;
+        if (changed === "artifact bytes" || changed === "artifact inode") {
+          await unlink(artifactPath);
+          await writeFile(artifactPath, changed === "artifact bytes" ? "new unbacked bytes\n" : "private evidence\n", { mode: 0o600 });
+        } else if (changed === "ignored inventory") {
+          await writeFile(join(f.worktree, ".review", "new-note.txt"), "new unbacked evidence\n", { mode: 0o600 });
+        } else if (changed === "source HEAD" || changed === "worktree HEAD") {
+          await git(changed === "source HEAD" ? f.source : f.worktree, "commit", "--allow-empty", "-m", "concurrent change");
+        } else if (changed === "worktree status") {
+          await writeFile(join(f.worktree, "tracked.txt"), "concurrent unsaved change\n", "utf8");
+        } else {
+          const state = JSON.parse(await readFile(statePath, "utf8"));
+          state.worktrees[f.history.worktree_ref].session_id = "changed-during-source-trust";
+          await writeFile(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+        }
+      },
+    };
+    const manager = new WorktreeManager(configFor(f.fixture.registryDir), runner, {}, delayedTrust);
+    const backups = [f.proofPath, f.manifest.bundle.file, f.manifest.artifacts[0]!.file];
+    const originalBackups = await Promise.all(backups.map((path) => readFile(path)));
+
+    await expect(manager.cleanupReleased(f.history, {
+      proofPath: f.proofPath,
+      registryHead: f.manifest.registry_head,
+      historySha256: f.manifest.history_sha256,
+      repositorySlug: f.manifest.repository_slug,
+      revalidate: async () => undefined,
+    })).rejects.toMatchObject({
+      code: "WORKTREE_EQUIVALENCE_UNSAFE",
+      details: { reason: "snapshot_changed" },
+    });
+
+    expect(trustChecks).toBe(2);
+    expect(removeAttempts).toBe(0);
+    await expect(stat(f.worktree)).resolves.toBeDefined();
+    const head = (await git(f.worktree, "rev-parse", "HEAD")).trim();
+    expect(await git(f.source, "show-ref", "--verify", `refs/heads/${f.history.branch}`)).toContain(head);
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    expect(state.worktrees[f.history.worktree_ref].lifecycle).toBe("pending-remove-equivalent");
+    expect(await Promise.all(backups.map((path) => readFile(path)))).toEqual(originalBackups);
+    if (changed === "artifact bytes") expect(await readFile(artifactPath, "utf8")).toBe("new unbacked bytes\n");
+    if (changed === "ignored inventory") {
+      expect(await readFile(join(f.worktree, ".review", "new-note.txt"), "utf8")).toBe("new unbacked evidence\n");
+    }
+    if (changed === "worktree status") expect(await readFile(join(f.worktree, "tracked.txt"), "utf8")).toBe("concurrent unsaved change\n");
+    if (changed === "mapping") expect(state.worktrees[f.history.worktree_ref].session_id).toBe("changed-during-source-trust");
+  });
+
   it("does not authorize active removal by validating a swapped public bundle instead of manifest-bound bytes", async () => {
     const f = await proofFixture();
     const validBundle = await readFile(f.manifest.bundle.file);
