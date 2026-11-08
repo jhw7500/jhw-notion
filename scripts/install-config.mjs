@@ -973,10 +973,20 @@ function checkGuardPolicy() {
   return exactGuardPolicyState(logicalConfigFile) === transition.current ? CHANGED : FOREIGN;
 }
 
-function checkGuardPolicyTarget() {
+async function checkGuardPolicyTarget() {
   const transition = guardPolicyTransition();
   if (!transition) return FOREIGN;
   assertTrustedGuardPolicyLocation({ requireTarget: true });
+  // Validate the next environmentless hook's whole private source before any
+  // policy/hook transaction. The candidate editor owns these compiled modules;
+  // repositoryRoot may still hold an older checkout or retained installation.
+  const [{ withPrivateControlDirectory, parsePrivateControlCoordinates }, { loadControlConfig }] = await Promise.all([
+    import(new URL("../mcp-server/dist/control/private-control-config.js", import.meta.url)),
+    import(new URL("../mcp-server/dist/control/config.js", import.meta.url)),
+  ]);
+  const coordinates = withPrivateControlDirectory(process.env.HOME, reader =>
+    parsePrivateControlCoordinates(reader.read("control.env", 16 * 1024)));
+  loadControlConfig(coordinates);
   return exactGuardPolicyState(logicalConfigFile) === transition.current ? CHANGED : FOREIGN;
 }
 
@@ -2000,7 +2010,7 @@ try {
   if (operation === "check-codex") { inspectCodexRegistration(); process.exit(CHANGED); }
   if (operation === "check-codex-hooks" || operation === "check-claude-hooks") checkCodexHooks();
   if (operation === "check-guard-policy") process.exit(checkGuardPolicy());
-  if (operation === "check-guard-policy-target") process.exit(checkGuardPolicyTarget());
+  if (operation === "check-guard-policy-target") process.exit(await checkGuardPolicyTarget());
   if (operation === "register-stdio") registerStdio();
   if (operation === "unregister-stdio") unregisterStdio();
   if (operation === "register-opencode") registerOpenCode();

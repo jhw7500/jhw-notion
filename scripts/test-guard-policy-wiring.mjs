@@ -67,7 +67,7 @@ if (process.argv[2] === "rollback-guard-policy-transaction") {
   return { directory, log, racePolicy, preload };
 }
 
-function runWiring(f, script, wrapper) {
+function runWiring(f, script, wrapper, environment = {}) {
   return spawnSync("/bin/bash", ["-c", `
 set -euo pipefail
 SCRIPT_DIR="$1"
@@ -79,6 +79,7 @@ trap - EXIT
 `, "guard-policy-test", repositoryRoot], {
     env: {
       ...process.env,
+      ...environment,
       HOME: f.home,
       ...(wrapper ? {
         PATH: `${wrapper.directory}:${process.env.PATH}`,
@@ -87,6 +88,69 @@ trap - EXIT
       } : {}),
     },
     encoding: "utf8",
+  });
+}
+
+function provisionCoordinates(f) {
+  const coordinates = {
+    JHW_REGISTRY_DIR: path.join(f.home, "registry"), JHW_REGISTRY_REMOTE: "origin", JHW_REGISTRY_BRANCH: "main",
+    JHW_WORKTREE_ROOT: path.join(f.home, "worktrees"), JHW_CONTROL_STATE_DIR: path.join(f.home, "state"),
+    JHW_BUILD_HOST: "fixture-host", JHW_GITHUB_OWNER: "fixture-owner", JHW_PROJECT_NUMBER: "1",
+    JHW_REGISTRY_REPOSITORY: "fixture-owner/registry", JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_fixture",
+    JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+  };
+  const file = path.join(path.dirname(f.policy), "control.env");
+  fs.writeFileSync(file, Object.entries(coordinates).map(([key, value]) => `${key}=${value}\n`).join(""), { mode: 0o600 });
+  return { coordinates, file };
+}
+
+function fileObservation(file) {
+  let info;
+  try { info = fs.lstatSync(file, { bigint: true }); }
+  catch (cause) { if (cause.code === "ENOENT") return { type: "absent" }; throw cause; }
+  return {
+    identity: [info.dev, info.ino, info.uid, info.gid, info.mode, info.nlink, info.size, info.ctimeNs, info.mtimeNs],
+    bytes: info.isFile() ? fs.readFileSync(file) : info.isSymbolicLink() ? fs.readlinkSync(file) : null,
+  };
+}
+
+const invalidPrivateCoordinates = {
+  missing: file => fs.unlinkSync(file),
+  permissions: file => fs.chmodSync(file, 0o644),
+  "special-bits": file => fs.chmodSync(file, 0o4600),
+  symlink: file => { fs.renameSync(file, `${file}.target`); fs.symlinkSync(`${file}.target`, file); },
+  hardlink: file => fs.linkSync(file, `${file}.alias`),
+  partial: file => fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(/^JHW_REGISTRY_BRANCH=.*\n/m, "")),
+  duplicate: file => fs.appendFileSync(file, "JHW_PROJECT_NUMBER=1\n"),
+  "shell-expression": file => fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(/^JHW_BUILD_HOST=.*$/m, "JHW_BUILD_HOST=$(id)")),
+  "invalid-number": file => fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("JHW_PROJECT_NUMBER=1", "JHW_PROJECT_NUMBER=zero")),
+  "relative-path": file => fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(/^JHW_REGISTRY_DIR=.*$/m, "JHW_REGISTRY_DIR=relative")),
+  "invalid-utf8": file => fs.appendFileSync(file, Buffer.from([0xff])),
+  oversized: file => fs.appendFileSync(file, "#".repeat(16 * 1024)),
+};
+for (const current of ["absent", "observe"]) for (const [label, invalidate] of Object.entries(invalidPrivateCoordinates)) {
+  test(`observe transition rejects ${label} private coordinates from ${current} despite inherited coordinates without mutation`, t => {
+    const f = fixture();
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const { coordinates, file } = provisionCoordinates(f);
+    const claude = path.join(f.home, ".claude/settings.json");
+    const codex = path.join(f.home, ".codex/hooks.json");
+    for (const target of [claude, codex]) {
+      fs.mkdirSync(path.dirname(target), { mode: 0o700 });
+      fs.writeFileSync(target, '{"hooks":{},"foreign":"preserve"}\n', { mode: 0o600 });
+    }
+    if (current === "observe") fs.writeFileSync(f.policy, canonicalPolicy, { mode: 0o600 });
+    invalidate(file);
+    const files = [f.policy, claude, codex, file];
+    const before = files.map(fileObservation);
+    const wrapper = nodeWrapper(f);
+    const result = runWiring(f, `begin_guard_observe_transition ${current}`, wrapper, coordinates);
+    assert.notEqual(result.status, 0, `${label} coordinates must not be supplied by the inherited environment`);
+    assert.deepEqual(files.map(fileObservation), before);
+    const operations = fs.readFileSync(wrapper.log, "utf8").trim().split("\n");
+    assert.equal(operations.some(name => name.startsWith("register-")), false);
+    for (const directory of [path.dirname(f.policy), path.dirname(claude), path.dirname(codex)])
+      assert.deepEqual(fs.readdirSync(directory).filter(name => name.includes("jhw-txn")), []);
   });
 }
 
@@ -172,6 +236,7 @@ test("policy operations reject unsupported transitions and symlinked private par
 
 test("wiring coordinator activates both full hook groups before policy and finalizes all evidence", () => {
   const f = fixture();
+  provisionCoordinates(f);
   fs.mkdirSync(path.join(f.home, ".claude"), { mode: 0o700 });
   fs.mkdirSync(path.join(f.home, ".codex"), { mode: 0o700 });
   const wrapper = nodeWrapper(f);
@@ -195,6 +260,7 @@ finalize_wiring
 
 test("policy publication race rolls both hook configs back without overwriting the raced policy", () => {
   const f = fixture();
+  provisionCoordinates(f);
   fs.mkdirSync(path.join(f.home, ".claude"), { mode: 0o700 });
   fs.mkdirSync(path.join(f.home, ".codex"), { mode: 0o700 });
   const claude = path.join(f.home, ".claude/settings.json");
@@ -286,6 +352,7 @@ is_unprovisioned_control_diagnostic '{"error":{"code":"INVALID_CONFIG"}}' 78
 
 test("observe transition plans both full hook targets before any transaction mutation", () => {
   const f = fixture();
+  provisionCoordinates(f);
   fs.mkdirSync(path.join(f.home, ".claude"), { mode: 0o700 });
   fs.mkdirSync(path.join(f.home, ".codex"), { mode: 0o700 });
   const malformed = path.join(f.home, ".claude/settings.json");
@@ -355,6 +422,7 @@ function assertFullHooks(file) {
 
 test("same-bytes new-inode policy rollback failure preserves full hooks and all three recovery objects", () => {
   const f = fixture();
+  provisionCoordinates(f);
   fs.mkdirSync(path.join(f.home, ".claude"), { mode: 0o700 });
   fs.mkdirSync(path.join(f.home, ".codex"), { mode: 0o700 });
   const result = runWiring(f, `
@@ -378,6 +446,7 @@ trap - EXIT
 
 test("policy rollback fsync failure preserves the coordinated live target and all recovery evidence", () => {
   const f = fixture();
+  provisionCoordinates(f);
   fs.mkdirSync(path.join(f.home, ".claude"), { mode: 0o700 });
   fs.mkdirSync(path.join(f.home, ".codex"), { mode: 0o700 });
   const wrapper = nodeWrapper(f, { failPolicyRollbackFsync: true });
@@ -401,6 +470,7 @@ trap - EXIT
 
 test("successful coordinated rollback restores all three originals before finalizing evidence", () => {
   const f = fixture();
+  provisionCoordinates(f);
   fs.mkdirSync(path.join(f.home, ".claude"), { mode: 0o700 });
   fs.mkdirSync(path.join(f.home, ".codex"), { mode: 0o700 });
   const result = runWiring(f, `

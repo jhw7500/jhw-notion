@@ -241,13 +241,21 @@ function replayCandidate({repositoryRoot, candidateReleaseId, entries, currentPo
       fs.mkdirSync(transaction, {mode: 0o700});
       const operation = isPolicy ? 'register-guard-policy-transaction' : `register-${adapter}-hooks-transaction`;
       const evidence = isPolicy ? `${currentPolicy}:observe` : 'all';
-      const result = spawnSync(process.execPath, [editor, operation, config, process.execPath,
-        repositoryRoot, transaction, evidence], {
+      const runEditor = (selectedOperation, selectedEvidence) => spawnSync(process.execPath, [editor, selectedOperation, config, process.execPath,
+        repositoryRoot, transaction, selectedEvidence], {
         cwd: scratch,
         env: {HOME: home, PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`},
         encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024,
       });
+      const result = runEditor(operation, evidence);
       if (![0, 3].includes(result.status) || result.signal !== null) fail('guard_candidate_replay_failed');
+      if (result.status === 3) {
+        // Match the live installer's unchanged-hook path: detach captured-live
+        // before requiring a settled single-link snapshot of the live file.
+        const finalize = isPolicy ? 'finalize-guard-policy-transaction' : `finalize-${adapter}-hooks-transaction`;
+        const settled = runEditor(finalize, 'unchanged-restored');
+        if (settled.status !== 0 || settled.signal !== null) fail('guard_candidate_replay_failed');
+      }
       predicted.push({path: entry.path, snapshot: snapshotFile(home, entry.path)});
     }
     return predicted;

@@ -127,6 +127,53 @@ test('captures fixed preimages and candidate-predicted snapshots before any HOME
   }), before);
 });
 
+function fullHooksFixture(t) {
+  const f = fixture(t);
+  materializePredicted(f, captureGuardTransitionEvidence({
+    home: f.home, repositoryRoot: f.repositoryRoot, candidateReleaseId: releaseId, origin,
+  }));
+  fs.unlinkSync(livePath(f, GUARD_TRANSITION_PATHS[0]));
+  return f;
+}
+
+function observeLiveFiles(f) {
+  return GUARD_TRANSITION_PATHS.map(relative => {
+    const file = livePath(f, relative);
+    if (!fs.existsSync(file)) return null;
+    const info = fs.lstatSync(file, {bigint: true});
+    return {bytes: fs.readFileSync(file), identity: [info.dev, info.ino, info.uid, info.gid,
+      info.mode, info.nlink, info.size, info.ctimeNs, info.mtimeNs]};
+  });
+}
+
+test('candidate replay settles unchanged full hooks before snapshot without mutating HOME', t => {
+  const f = fullHooksFixture(t);
+  const before = observeLiveFiles(f);
+  const evidence = captureGuardTransitionEvidence({
+    home: f.home, repositoryRoot: f.repositoryRoot, candidateReleaseId: releaseId, origin,
+  });
+  assert.equal(evidence.current_policy, 'absent');
+  for (const entry of evidence.entries) assert.equal(entry.predicted.type, 'file');
+  for (const entry of evidence.entries.slice(1)) assert.deepEqual(entry.predicted, entry.preimage);
+  assert.deepEqual(observeLiveFiles(f), before);
+});
+
+for (const adapter of ['claude', 'codex']) {
+  test(`candidate replay refuses an unchanged ${adapter} finalize failure without mutating HOME`, t => {
+    const f = fullHooksFixture(t);
+    const editor = path.join(f.repositoryRoot, '.jhw-runtime/releases', releaseId, 'scripts/install-config.mjs');
+    const bytes = fs.readFileSync(editor, 'utf8');
+    const marker = 'const logicalConfigFile = configFile;';
+    assert.ok(bytes.includes(marker));
+    write(editor, bytes.replace(marker, `${marker}\nif (operation === "finalize-${adapter}-hooks-transaction") process.exit(93);`), 0o644);
+    const before = observeLiveFiles(f);
+    assert.throws(() => captureGuardTransitionEvidence({
+      home: f.home, repositoryRoot: f.repositoryRoot, candidateReleaseId: releaseId, origin,
+    }), {code: 'DEPLOY_RECOVERY_REQUIRED', reason: 'guard_candidate_replay_failed'});
+    assert.deepEqual(observeLiveFiles(f), before);
+  });
+}
+
 test('persists and finalizes an exact transition, then finds it by destination activation only', t => {
   const {f} = finalizedForward(t);
   const before = path.join(f.journalDirectory, 'before.json');

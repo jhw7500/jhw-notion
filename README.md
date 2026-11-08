@@ -181,6 +181,11 @@ host observe 전환은 `$HOME/.config/jhw-control/guard-policy.json`의 canonica
 명시 policy 아래의 data-only 11개 좌표를 Guard hook과 `guard status|preflight`가 사용한다.
 일반 CLI와 credential launcher는 env-only다. policy가 없으면 기존 env 기반 모드를 유지한다.
 
+`--guard-observe` 전환 계획은 정책과 hook을 바꾸기 전에 선택한 HOME의 `control.env`를
+같은 안전 리더와 전체 좌표 값 검사로 검증한다. 파일이 없거나 불완전·불안전·잘못된 값이면
+전환을 거부하고 기존 세 파일을 보존한다. 설치 프로세스에 상속된 좌표로 이 검사를 대신하거나
+private 파일을 자동 생성·수정하지 않는다.
+
 관찰 모드의 일반 Task/Claim 위반은 별도 필수 audit stream에 남기며, 전용 프로세스 잠금 안에서
 같은 FD의 전체 형식·owner·mode·link를 검증하고 append·fsync·재검증한 뒤에만 허용한다.
 기록 실패·손상·잠금 실패는 `GUARD_UNAVAILABLE`로 차단하고 자동 수리하지 않는다. 기록 성공 뒤

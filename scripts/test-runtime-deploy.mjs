@@ -1126,18 +1126,41 @@ test('guard observe activation refuses a first installation before wiring', asyn
  assert.equal(readActivation({repositoryRoot:f.root}),null);
  assert.deepEqual(fs.readdirSync(path.join(f.root,'.jhw-runtime')).filter(n=>n.startsWith('.deploy.')),[]);
 });
-function guardObserveControlBuild(f) {
+function guardCoordinates(home) {
+ return {
+  JHW_REGISTRY_DIR:path.join(home,'registry'),JHW_REGISTRY_REMOTE:'origin',JHW_REGISTRY_BRANCH:'main',
+  JHW_WORKTREE_ROOT:path.join(home,'worktrees'),JHW_CONTROL_STATE_DIR:path.join(home,'state'),
+  JHW_BUILD_HOST:'fixture-host',JHW_GITHUB_OWNER:'fixture-owner',JHW_PROJECT_NUMBER:'1',
+  JHW_REGISTRY_REPOSITORY:'fixture-owner/registry',JHW_PREFLIGHT_PROJECT_ITEM_ID:'PVTI_fixture',
+  JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER:'1',
+ };
+}
+function guardObserveControlBuild(f,{productionHook=false,runtimeMode='observe'}={}) {
  return async options=>{
   await f.build(options);
+  // Use the real safe reader and value validator in the candidate, independent
+  // of the checkout path passed to the wiring worker.
+  for(const name of ['private-control-config','config','errors'])write(options.stagingRoot,
+   `mcp-server/dist/control/${name}.js`,fs.readFileSync(path.join(source,`../mcp-server/dist/control/${name}.js`)));
+  if(productionHook) {
+   const mcpRoot=path.join(source,'../mcp-server');
+   const version=JSON.parse(fs.readFileSync(path.join(mcpRoot,'package.json'))).version;
+   const bundled=spawnSync(path.join(mcpRoot,'node_modules/.bin/rolldown'),[
+    'dist/control/hook-adapter.js','--file',path.join(options.stagingRoot,'mcp-server/dist/runtime/hook.cjs'),
+    '--format','cjs','--platform','node','--no-codeSplitting','--logLevel','silent',
+    '--transform.define',`__JHW_BUNDLED_CONTROL_TOOL_VERSION__:${JSON.stringify(version)}`,
+   ],{cwd:mcpRoot,encoding:'utf8'});
+   assert.equal(bundled.status,0,bundled.stderr);fs.chmodSync(path.join(options.stagingRoot,'mcp-server/dist/runtime/hook.cjs'),0o755);
+  }
   const counts={PENDING:0,APPROVED:0,CONSUMED:0,COMPLETED:0,FAILED:0,EXPIRED:0,total:0};
   const coverage={prompt_origin:'ok',pre_tool_block:'ok',post_tool_correlation:'ok',execution_recheck:'pending',enforced:false};
   const unsupported={prompt_origin:'unsupported',pre_tool_block:'unsupported',post_tool_correlation:'unsupported',execution_recheck:'pending',enforced:false};
-  const diagnostic={command:'guard preflight',result:{status:'NO-GO',code:'GUARD_UNAVAILABLE',diagnostics:{protocol_version:1,runtime_mode:'observe',request_state:{safety:'not_initialized',counts},digest_key:{safety:'not_initialized'},registry_claims:{availability:'unavailable'},adapter_coverage:{claude:coverage,codex:coverage,gemini:unsupported,opencode:unsupported}}}};
+  const diagnostic={command:'guard preflight',result:{status:'NO-GO',code:'GUARD_UNAVAILABLE',diagnostics:{protocol_version:1,runtime_mode:runtimeMode,request_state:{safety:'not_initialized',counts},digest_key:{safety:'not_initialized'},registry_claims:{availability:'unavailable'},adapter_coverage:{claude:coverage,codex:coverage,gemini:unsupported,opencode:unsupported}}}};
   const control=`#!/usr/bin/env node\nconsole.error(${JSON.stringify(JSON.stringify(diagnostic))});process.exitCode=78;`;
   for(const file of ['mcp-server/dist/control/cli.js','mcp-server/dist/runtime/control.cjs'])write(options.stagingRoot,file,control,0o755);
  };
 }
-async function guardTransitionFixture(t) {
+async function guardTransitionFixture(t,{provisioned=false,...buildOptions}={}) {
  const f=fixture(t);host(f);
  for(const directory of ['.claude','.codex','.config/jhw-control'])fs.mkdirSync(path.join(f.home,directory),{recursive:true,mode:0o700});
  // Freeze the actual pre-feature retained helpers, not the new helper with a label.
@@ -1147,13 +1170,63 @@ async function guardTransitionFixture(t) {
  }
  const original={'.claude/settings.json':'{"hooks":{},"fixture":"claude foreign"}\n','.codex/hooks.json':'{"hooks":{},"fixture":"codex foreign"}\n'};
  for(const [file,bytes] of Object.entries(original))write(f.home,file,bytes,0o600);
- const old=await f.run(['--prepare']);await f.run(['--activate',old.releaseId]);
+ const coordinates=guardCoordinates(f.home);
+ const old=provisioned?await deploy.runDeployment({...f.options,build:guardObserveControlBuild(f,{runtimeMode:'enforce'}),argv:['--prepare']}):await f.run(['--prepare']);
+ await deploy.runDeployment({...f.options,environment:provisioned?{...process.env,...coordinates}:process.env,argv:['--activate',old.releaseId]});
  const baseline=Object.fromEntries(Object.keys(original).map(file=>[file,fs.readFileSync(path.join(f.home,file))]));
+ if(buildOptions.productionHook) {
+  fs.mkdirSync(coordinates.JHW_REGISTRY_DIR,{mode:0o700});
+  const environment={HOME:f.home,PATH:'/usr/bin:/bin',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
+  for(const args of [['init','-q','--initial-branch=main'],['config','user.name','Guard fixture'],
+   ['config','user.email','guard@example.invalid'],['commit','--allow-empty','-qm','fixture']]) {
+   const result=spawnSync('/usr/bin/git',args,{cwd:coordinates.JHW_REGISTRY_DIR,env:environment,encoding:'utf8'});
+   assert.equal(result.status,0,result.stderr);
+  }
+ }
+ const controlEnv=write(f.home,'.config/jhw-control/control.env',Object.entries(coordinates).map(([key,value])=>`${key}=${value}\n`).join(''),0o600);
  for(const name of ['install-wiring.sh','install-config.mjs'])write(f.root,`scripts/${name}`,fs.readFileSync(path.join(source,name)));
  write(f.root,'skills/claude/task.md','new guard transition fixture');
- const candidate=await deploy.runDeployment({...f.options,build:guardObserveControlBuild(f),argv:['--prepare']});
- return {f,old,candidate,baseline,original,policy:path.join(f.home,'.config/jhw-control/guard-policy.json')};
+ const candidate=await deploy.runDeployment({...f.options,build:guardObserveControlBuild(f,buildOptions),argv:['--prepare']});
+ return {f,old,candidate,baseline,original,coordinates,controlEnv,policy:path.join(f.home,'.config/jhw-control/guard-policy.json')};
 }
+function invokeFreshGuardHooks(f,coordinates) {
+ const environment={...process.env,HOME:f.home,PATH:[path.dirname(process.execPath),'/usr/bin','/bin'].join(':')};
+ for(const key of [...Object.keys(coordinates),'JHW_GUARD_MODE','JHW_GUARD_ALLOW_OBSERVE','NODE_OPTIONS','NODE_PATH'])delete environment[key];
+ return ['claude','codex'].map(adapter=>{
+  const file=path.join(f.home,adapter==='claude'?'.claude/settings.json':'.codex/hooks.json');
+  const command=JSON.parse(fs.readFileSync(file)).hooks.PreToolUse[0].hooks[0].command;
+  const payload={session_id:'fresh-install-session',cwd:f.root,hook_event_name:'PreToolUse',
+   tool_name:'Read',tool_input:{file_path:'skills/claude/task.md'},tool_use_id:'fixture-read',
+   ...(adapter==='codex'?{model:'fixture-model',permission_mode:'default',transcript_path:null,turn_id:'fixture-turn'}:{})};
+  const result=spawnSync('/bin/bash',['-c',command],{env:environment,input:JSON.stringify(payload),encoding:'utf8',timeout:15000});
+  assert.equal(result.status,0,result.stderr);return {adapter,output:JSON.parse(result.stdout)};
+ });
+}
+test('guard observe refuses missing private coordinates despite inherited coordinates before managed activation mutates wiring',async t=>{
+ const {f,candidate,coordinates,controlEnv,policy}=await guardTransitionFixture(t,{productionHook:true,provisioned:true});
+ fs.unlinkSync(controlEnv);
+ const before=homeShape(f.home),pointer=readActivation({repositoryRoot:f.root});const phases=[];
+ let failure;
+ try {await deploy.runDeployment({...f.options,environment:{...process.env,...coordinates},
+  argv:['--activate',candidate.releaseId,'--guard-observe'],phaseRunner:async options=>{phases.push(options.phase);return deploy.wiringPhase(options);}});}
+ catch(cause){failure=cause;}
+ if(!failure)for(const {adapter,output} of invokeFreshGuardHooks(f,coordinates))
+  t.diagnostic(`${adapter} fresh hook after incorrectly accepted activation: ${JSON.stringify(output)}`);
+ assert.equal(failure?.code,'DEPLOY_WIRING_CONFLICT','missing private coordinates must refuse activation');
+ assert.deepEqual(phases,['verify']);assert.deepEqual(homeShape(f.home),before);
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),pointer);assert.equal(fs.existsSync(policy),false);
+ assert.equal(fs.existsSync(controlEnv),false,'inherited coordinates never provision the private file');
+});
+test('guard observe activation supplies both generated hooks in fresh processes without explicit coordinates',async t=>{
+ const {f,candidate,coordinates,controlEnv}=await guardTransitionFixture(t,{productionHook:true,provisioned:true});
+ const identity=()=>{const info=fs.statSync(controlEnv,{bigint:true});return [info.dev,info.ino,info.uid,info.gid,info.mode,info.nlink,info.size,info.ctimeNs,info.mtimeNs];};
+ const before=fs.readFileSync(controlEnv),originalIdentity=identity();
+ const result=await deploy.runDeployment({...f.options,environment:{...process.env,...coordinates},argv:['--activate',candidate.releaseId,'--guard-observe']});
+ assert.equal(result.code,'DEPLOY_ACTIVATED');
+ for(const {output} of invokeFreshGuardHooks(f,coordinates))assert.deepEqual(output,{hookSpecificOutput:{hookEventName:'PreToolUse'}});
+ assert.deepEqual(fs.readFileSync(controlEnv),before);assert.deepEqual(identity(),originalIdentity);
+ assert.equal(fs.existsSync(path.join(f.home,'state/guard-digest.key')),true,'real hook composition selected the private state directory');
+});
 test('guard observe managed activation preserves evidence and restores old retained wiring on rollback', async t => {
  const {f,old,candidate,baseline,original,policy}=await guardTransitionFixture(t);
  const phases=[];
