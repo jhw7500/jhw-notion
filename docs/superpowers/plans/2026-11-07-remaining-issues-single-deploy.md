@@ -105,10 +105,10 @@ worktree 정리는 정확한 역사적 통합과 외부 백업을 결속하며 G
 `task recover --action status --resolve-from-checkout true --repo-path ... --issue-url ...`를 유지하고,
 `--cleanup-proof`는 action cleanup에서만 허용한다.
 
-- [x] Step1: inactive released projection, invalid action/flag 조합, proof path redaction, status 성공/실패 journal 무변경, 실제 host 경유 projection 테스트를 작성한다.
+- [x] Step1: inactive released projection, invalid action/flag 조합, proof path redaction, status 성공/실패 journal 무변경, 실제 host 검증 함수 경유 projection 테스트를 작성한다. 이 최초 검사는 launcher 전체 실행이 아닌 `runCli`의 fake service 결과와 설치 host의 입력·출력 검증 함수 간 계약이다.
 - [x] Step2: targeted CLI 실패를 확인한 뒤 읽기 전용 resolver 분기를 선택하고 released만 strict schema로 출력한다. status journal append를 생략하며 다른 명령 감사는 유지한다.
 - [x] Step3: cleanup_proof를 core에 전달하고 safe result만 투영한다. mutation lock과 active successor 차단은 유지한다.
-- [x] Step4: CLI/e2e/실제 launcher 계약 검증을 끝내고 문서를 업데이트한다. host production 변경이 꼭 필요하면 원인과 최소 범위를 기록하고 해당 저장소 지침을 먼저 적용한다.
+- [x] Step4: CLI/e2e와 host 검증 함수 계약 검증을 끝내고 문서를 업데이트한다. 후속 A 검증에서 실제 host `run_program`에 private fixture home/env/tools와 대체 provider/control runner를 넣어 released status·실패 discovery·cleanup 3개 전체 분기를 확인했다. control 응답은 `.env` 없는 복사본에서 실제 built `runCli`를 fake service로 실행해 얻었다. 실제 credential store·운영 Registry·운영 launcher 설치 완료를 증명하는 검사는 아니다. host production 변경은 하지 않았다.
 - [ ] Step5: 부모가 커밋한다. canonical task 변경 뒤 최종 sync는 Task5 뒤 수행한다.
 
 ### Task 5: Guard private opt-in 관찰 모드와 managed 배선 전환

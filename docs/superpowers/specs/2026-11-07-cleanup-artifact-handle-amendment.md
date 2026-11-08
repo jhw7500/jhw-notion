@@ -2,6 +2,9 @@
 
 상태: 사용자 `진행`으로 권장 설계 승인. 로컬 구현·검증을 재개한다.
 2라운드 뒤 사용자 `진행`으로 원격 확인과 최종 로컬 검사를 분리하는 아래 보완도 승인했다.
+이후 사용자 `A`로 정상 cleanup과 checkout 부재 복구의 공통 검증 범위 및 상태 게시 직전
+검사 설계를 승인했다. 이번 범위는 로컬 수정·검증·커밋이며 새 Tribunal·push·PR·머지·배포와
+실제 redmine/Registry 정리는 별도 승인 대상이다.
 
 ## 확인한 문제
 
@@ -62,6 +65,50 @@ git worktree remove
 원격 확인은 그 시점의 통합 허용 조건이다. 원격과 로컬 파일을 분산 원자적으로 고정한다는
 보장을 만들지 않는다. 원격 확인 중 변경된 로컬 상태는 그 뒤의 최종 검사에서 거부한다.
 기존 원격 SHA·기본 ref·fetch·push URL drift 검사는 유지한다.
+
+## A 보완: checkout 부재 복구와 상태 게시까지 같은 소유 범위 유지
+
+`A-R1-001`은 checkout이 이미 제거된 `pending-remove-equivalent` 재개에서 backup-only 검증이
+핸들을 닫은 뒤 외부 callback과 tombstone 저장을 실행하는 누락을 확인했다. 정상 경로에서만
+핸들을 보존하는 것으로는 부족하므로 두 경로가 아래 공통 검증 소유자를 사용한다.
+
+- manifest·bundle·artifact backup은 최초 검증한 파일 FD와 root부터 열린 부모 디렉터리
+  chain을 callback 반환까지 유지한다. 각 하위 객체는 retained parent FD 기준으로 no-follow
+  open한다. 성공·callback 실패·부분 획득 실패 모두 finally에서 열린 자원을 닫는다.
+- 같은 경로 prefix의 directory FD는 공통 scope의 pool이 한 번만 열고 닫으며 경로별 chain과
+  missing-component 관측은 따로 유지한다. 파일 FD는 각 파일 소유자가 닫는다. manifest를 읽은 뒤
+  현재 `/proc` FD 사용량·soft limit과 앞으로 유지할 backup/source leaf·고유 parent·임시 I/O 여유를
+  비교해 부족하면 intent/Git 제거 전에 `scope_unsupported`로 중단한다. schema의 4096개는 입력
+  상한이며 모든 OS FD 한도에서 실행을 보장하지 않는다. 이 관측은 FD 예약이 아니므로 이후
+  `EMFILE`·`ENFILE`도 계속 안전하게 중단하며 프로세스 한도를 자동 변경하지 않는다.
+- source·worktree·common Git directory·managed roots의 경로와 디렉터리 identity도 보존한다.
+  backup은 이 금지 root 밖이어야 하며 lexical 경로와 열린 디렉터리 identity를 함께 검사한다.
+  처음부터 없는 root는 가장 가까운 현존 ancestor와 남은 경로의 부재를 검사한다. 이번 정상
+  제거로 사라진 worktree leaf만 retained FD의 link count가 0이면 허용하고 부모 교체는 거부한다.
+- checkout 부재 재개도 proof digest·외부 backup·branch head·Git registration 부재를 다시
+  검증한다. 외부 callback과 `beforeSave`, temp state write/fsync/close 뒤에 최종 guard를 실행한다.
+  guard는 동일한 retained state directory에서 정확한 pending state 전체를 읽어 비교하고,
+  backup을 다시 검사한 뒤 state를 한 번 더 비교한다. 그 다음에만 temp state를 rename한다.
+- guard 실패는 이번 temp state만 지운다. durable pending intent와 다른 writer의 최신 state를
+  덮어쓰지 않으며 task branch·외부 backup을 보존한다. Git 제거가 이미 끝난 경우에는 checkout이
+  없고 pending intent가 남을 수 있으므로 같은 proof 명시 재개 절차를 따른다.
+- 최종 backup/boundary 검증의 I/O 오류는 `snapshot_changed`로 반환한다. 외부 callback 자체의
+  오류는 이 정규화 범위 밖에 두고 원래 오류를 보존한다.
+- `A-R1-002`의 권한 검사는 `07777` 전체를 비교한다. manifest·bundle은 정확히 `0600`,
+  private backup parent는 정확히 `0700`이다. artifact source와 backup은 manifest에 선언된
+  일반 권한(`0000`–`0777`)을 서로 일치시키며 `0644`·`0755`도 유지한다. setuid·setgid·sticky는
+  모든 파일과 private parent에서 거부한다. 모든 artifact를 `0600`으로 바꾸는 정책은 아니다.
+
+최종 guard와 rename 사이에 외부 callback이나 Git 조회를 두지 않는다. 여러 파일과 state를
+비협조적 same-UID writer로부터 하나의 원자 연산으로 고정하는 보장은 없으며, rename 이후
+오류의 기존 결과 불확실성도 그대로 남는다. 새 CLI 플래그·manifest schema·오류 reason·의존성은
+추가하지 않는다.
+
+회귀는 실제 임시 Git 저장소에서 backup 교체·부모/ancestor 교체·금지 root 교체·특수 mode bit,
+checkout 부재 callback 및 `beforeSave`/temp fsync 뒤 교체·더 최신 state의 보존·열린 FD 수명과
+모든 종료 경로의 close를 확인한다. source/backup bytes가 같은 새 inode도 교체로 판정한다.
+배포 전 CLI/host/MCP fixture 검증과 배포 후 실제 새 세션의 Guard 확인·승인된 redmine 정리는
+서로 다른 증거다. 격리 fixture 통과를 실제 운영 확인 완료로 보고하지 않는다.
 
 실제 임시 Git 작업본에서 두 번째 source-trust 확인 중 artifact bytes, byte-identical 새 inode,
 새 ignored 경로, source HEAD, worktree HEAD/status, mapping을 변경하는 회귀를 둔다. 각 경우

@@ -1,12 +1,12 @@
 import { fstatSync } from "node:fs";
-import { chmod, link, mkdir, readFile, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, link, mkdir, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile, type FileHandle } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ProcessRunner } from "../process.js";
 import type { ClaimHistory } from "../schemas.js";
-import { verifyHistoricalCleanupProof, withVerifiedHistoricalCleanupProof } from "../worktree-cleanup-proof.js";
+import { historicalCleanupProofSha256, verifyHistoricalCleanupBackupOnly, verifyHistoricalCleanupProof, withVerifiedHistoricalCleanupBackupOnly, withVerifiedHistoricalCleanupProof } from "../worktree-cleanup-proof.js";
 import { WorktreeManager, worktreePlan } from "../worktree.js";
 import { configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
 
@@ -15,7 +15,38 @@ const TASK_ID = "tsk-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab";
 const sourceTrust = { assertTrustedSource: async () => undefined };
 
-afterEach(async () => Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup())));
+const filesystemBoundary = vi.hoisted(() => ({
+  beforeOpen: undefined as undefined | ((path: string, flags: string | number | undefined) => Promise<void>),
+  afterOpen: undefined as undefined | ((path: string, handle: FileHandle) => Promise<void>),
+  softDescriptorLimit: undefined as number | undefined,
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readFile: async (...args: Parameters<typeof actual.readFile>) => {
+      if (String(args[0]) === "/proc/self/limits" && filesystemBoundary.softDescriptorLimit !== undefined) {
+        return Buffer.from(`Max open files            ${filesystemBoundary.softDescriptorLimit}                 1048576              files\n`);
+      }
+      return actual.readFile(...args);
+    },
+    open: async (...args: Parameters<typeof actual.open>) => {
+      await filesystemBoundary.beforeOpen?.(String(args[0]), args[1]);
+      const handle = await actual.open(...args);
+      await filesystemBoundary.afterOpen?.(String(args[0]), handle);
+      return handle;
+    },
+  };
+});
+
+afterEach(async () => {
+  filesystemBoundary.beforeOpen = undefined;
+  filesystemBoundary.afterOpen = undefined;
+  filesystemBoundary.softDescriptorLimit = undefined;
+  vi.restoreAllMocks();
+  await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
+});
 
 async function proofFixture() {
   const fixture = await makeRegistryFixture();
@@ -199,7 +230,381 @@ function bundleSwapRestoreRunner(publicBundlePath: string, validBundle: Buffer) 
   return { runner, consumedBundlePaths };
 }
 
+function cleanupOptions(f: Awaited<ReturnType<typeof proofFixture>>) {
+  return {
+    proofPath: f.proofPath,
+    registryHead: f.manifest.registry_head,
+    historySha256: f.manifest.history_sha256,
+    repositorySlug: f.manifest.repository_slug,
+    revalidate: async () => undefined,
+  };
+}
+
+async function leaveRemovedCheckoutPending(f: Awaited<ReturnType<typeof proofFixture>>) {
+  let saves = 0;
+  const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {
+    beforeSave: () => {
+      if (++saves === 2) throw new Error("injected pending completion");
+    },
+  }, sourceTrust);
+  await expect(manager.cleanupReleased(f.history, cleanupOptions(f))).rejects.toThrow("injected pending completion");
+  await expect(stat(f.worktree)).rejects.toMatchObject({ code: "ENOENT" });
+}
+
+async function expectPendingCleanup(f: Awaited<ReturnType<typeof proofFixture>>) {
+  const state = JSON.parse(await readFile(join(f.fixture.root, "state", "worktrees.json"), "utf8"));
+  expect(state.worktrees[f.history.worktree_ref].lifecycle).toBe("pending-remove-equivalent");
+  expect(state.worktrees[f.history.worktree_ref].cleanup_intent.proof_sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect((await git(f.source, "rev-parse", `refs/heads/${f.history.branch}`)).trim()).toBe(f.manifest.worktree_head);
+}
+
+async function replaceBackupFile(path: string) {
+  const bytes = await readFile(path);
+  await rename(path, `${path}.previous`);
+  await writeFile(path, bytes, { mode: 0o600 });
+  await chmod(path, 0o600);
+}
+
 describe("historical cleanup proof", () => {
+  it.each([
+    ["manifest", 0o4600], ["manifest", 0o2600], ["manifest", 0o1600],
+    ["bundle", 0o4600], ["bundle", 0o2600], ["bundle", 0o1600],
+    ["backup", 0o4600], ["backup", 0o2600], ["backup", 0o1600],
+    ["source", 0o4600], ["source", 0o2600], ["source", 0o1600],
+    ["parent", 0o4700], ["parent", 0o2700], ["parent", 0o1700],
+  ] as const)("rejects special permission bits on %s (%i)", async (target, mode) => {
+    const f = await proofFixture();
+    const path = target === "manifest" ? f.proofPath : target === "bundle" ? f.manifest.bundle.file
+      : target === "backup" ? f.manifest.artifacts[0]!.file
+        : target === "source" ? join(f.worktree, f.manifest.artifacts[0]!.path) : f.backup;
+    await chmod(path, mode);
+    expect((await stat(path)).mode & 0o7777).toBe(mode);
+
+    await expect(verifyHistoricalCleanupProof({
+      proofPath: f.proofPath, history: f.history, registryHead: f.manifest.registry_head,
+      historySha256: f.manifest.history_sha256, mappingSha256: f.manifest.mapping_sha256,
+      sourcePath: f.source, worktreePath: f.worktree, commonGitDir: f.commonGitDir,
+      repositorySlug: f.manifest.repository_slug, managedRoots: [join(f.fixture.root, "state")],
+      runner: new ProcessRunner(), sourceTrust,
+    })).rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE", details: { reason: "backup_invalid" } });
+  });
+
+  it.each(["manifest", "parent"] as const)("rejects special permission bits in the standalone %s reader", async (target) => {
+    const f = await proofFixture();
+    await chmod(target === "manifest" ? f.proofPath : f.backup, target === "manifest" ? 0o4600 : 0o2700);
+    await expect(historicalCleanupProofSha256(f.proofPath)).rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+  });
+
+  it.each([0o644, 0o755])("preserves the declared ordinary artifact mode %i", async (mode) => {
+    const f = await proofFixture();
+    const entry = f.manifest.artifacts[0]!;
+    await chmod(join(f.worktree, entry.path), mode);
+    await chmod(entry.file, mode);
+    entry.mode = `0${mode.toString(8)}`;
+    const { createHash } = await import("node:crypto");
+    f.manifest.inventory_sha256 = createHash("sha256")
+      .update(JSON.stringify(f.manifest.artifacts.map(({ file: _file, ...artifact }) => artifact))).digest("hex");
+    await writeFile(f.proofPath, `${JSON.stringify(f.manifest)}\n`, { mode: 0o600 });
+    await expect(verifyHistoricalCleanupProof({
+      proofPath: f.proofPath, history: f.history, registryHead: f.manifest.registry_head,
+      historySha256: f.manifest.history_sha256, mappingSha256: f.manifest.mapping_sha256,
+      sourcePath: f.source, worktreePath: f.worktree, commonGitDir: f.commonGitDir,
+      repositorySlug: f.manifest.repository_slug, managedRoots: [join(f.fixture.root, "state")],
+      runner: new ProcessRunner(), sourceTrust,
+    })).resolves.toMatchObject({ inventorySha256: f.manifest.inventory_sha256 });
+  });
+
+  it.each(["manifest", "bundle", "artifact", "parent", "missing"] as const)(
+    "keeps recovery pending when its verified %s changes during the callback", async (target) => {
+      const f = await proofFixture();
+      await leaveRemovedCheckoutPending(f);
+      const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {}, sourceTrust);
+      await expect(manager.cleanupReleased(f.history, {
+        ...cleanupOptions(f),
+        revalidate: async () => {
+          if (target === "parent") {
+            const files = await Promise.all([f.proofPath, f.manifest.bundle.file, f.manifest.artifacts[0]!.file]
+              .map(async (path) => ({ name: path.slice(f.backup.length + 1), bytes: await readFile(path) })));
+            await rename(f.backup, `${f.backup}.previous`);
+            await mkdir(f.backup, { mode: 0o700 });
+            for (const file of files) await writeFile(join(f.backup, file.name), file.bytes, { mode: 0o600 });
+          } else if (target === "missing") {
+            await unlink(f.manifest.artifacts[0]!.file);
+          } else {
+            await replaceBackupFile(target === "manifest" ? f.proofPath : target === "bundle"
+              ? f.manifest.bundle.file : f.manifest.artifacts[0]!.file);
+          }
+        },
+      })).rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+      await expectPendingCleanup(f);
+    },
+  );
+
+  it.each([false, true])("checks backups after the state preparation hook (recovery=%s)", async (recovery) => {
+    const f = await proofFixture();
+    if (recovery) await leaveRemovedCheckoutPending(f);
+    let saves = 0;
+    const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {
+      beforeSave: async () => {
+        if (++saves === (recovery ? 1 : 2)) await replaceBackupFile(f.manifest.artifacts[0]!.file);
+      },
+    }, sourceTrust);
+    await expect(manager.cleanupReleased(f.history, cleanupOptions(f)))
+      .rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+    await expectPendingCleanup(f);
+  });
+
+  it.each([false, true])("preserves a newer mapping during state preparation (recovery=%s)", async (recovery) => {
+    const f = await proofFixture();
+    if (recovery) await leaveRemovedCheckoutPending(f);
+    let saves = 0;
+    const statePath = join(f.fixture.root, "state", "worktrees.json");
+    const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {
+      beforeSave: async () => {
+        if (++saves !== (recovery ? 1 : 2)) return;
+        const state = JSON.parse(await readFile(statePath, "utf8"));
+        state.worktrees[f.history.worktree_ref].session_id = "newer-session";
+        await writeFile(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+      },
+    }, sourceTrust);
+    await expect(manager.cleanupReleased(f.history, cleanupOptions(f)))
+      .rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+    await expectPendingCleanup(f);
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    expect(state.worktrees[f.history.worktree_ref].session_id).toBe("newer-session");
+  });
+
+  it("rejects an artifact backup inside a managed root during backup-only verification", async () => {
+    const f = await proofFixture();
+    const file = join(f.fixture.root, "state", "artifact-note.txt");
+    await writeFile(file, await readFile(f.manifest.artifacts[0]!.file), { mode: 0o600 });
+    f.manifest.artifacts[0]!.file = file;
+    await writeFile(f.proofPath, `${JSON.stringify(f.manifest)}\n`, { mode: 0o600 });
+    await expect(verifyHistoricalCleanupBackupOnly({
+      proofPath: f.proofPath, sourcePath: f.source, worktreePath: f.worktree,
+      commonGitDir: f.commonGitDir, managedRoots: [join(f.fixture.root, "state")], runner: new ProcessRunner(),
+    })).rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE", details: { reason: "backup_invalid" } });
+  });
+
+  it.each([false, true])("rechecks backups after syncing the temporary state file (recovery=%s)", async (recovery) => {
+    const f = await proofFixture();
+    if (recovery) await leaveRemovedCheckoutPending(f);
+    let saves = 0;
+    let changed = false;
+    const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {
+      beforeSave: () => {
+        if (++saves !== (recovery ? 1 : 2)) return;
+        filesystemBoundary.afterOpen = async (path, handle) => {
+          if (!basename(path).startsWith(".worktrees.") || !path.endsWith(".tmp")) return;
+          const sync = handle.sync.bind(handle);
+          vi.spyOn(handle, "sync").mockImplementationOnce(async () => {
+            await sync();
+            await replaceBackupFile(f.manifest.artifacts[0]!.file);
+            changed = true;
+          });
+        };
+      },
+    }, sourceTrust);
+
+    await expect(manager.cleanupReleased(f.history, cleanupOptions(f)))
+      .rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+    expect(changed).toBe(true);
+    await expectPendingCleanup(f);
+  });
+
+  it.each([false, true])("preserves a newer mapping while checking backup identities (recovery=%s)", async (recovery) => {
+    const f = await proofFixture();
+    if (recovery) await leaveRemovedCheckoutPending(f);
+    const statePath = join(f.fixture.root, "state", "worktrees.json");
+    let saves = 0;
+    let changed = false;
+    const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {
+      beforeSave: () => {
+        if (++saves !== (recovery ? 1 : 2)) return;
+        filesystemBoundary.beforeOpen = async (path) => {
+          if (changed || basename(path) !== basename(f.manifest.artifacts[0]!.file)) return;
+          changed = true;
+          const state = JSON.parse(await readFile(statePath, "utf8"));
+          state.worktrees[f.history.worktree_ref].session_id = "newest-session";
+          await writeFile(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+        };
+      },
+    }, sourceTrust);
+    await expect(manager.cleanupReleased(f.history, cleanupOptions(f)))
+      .rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+    expect(changed).toBe(true);
+    await expectPendingCleanup(f);
+    const state = JSON.parse(await readFile(statePath, "utf8"));
+    expect(state.worktrees[f.history.worktree_ref].session_id).toBe("newest-session");
+  });
+
+  it.each(["branch", "checkout", "registration"] as const)("rechecks %s metadata immediately before recovery publication", async (target) => {
+    const f = await proofFixture();
+    await leaveRemovedCheckoutPending(f);
+    const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {
+      beforeSave: async () => {
+        if (target === "branch") {
+          await git(f.source, "update-ref", `refs/heads/${f.history.branch}`, f.manifest.source_head);
+        } else {
+          await git(f.source, "worktree", "add", "--detach", f.worktree, f.manifest.source_head);
+          if (target === "registration") await rm(f.worktree, { recursive: true, force: true });
+        }
+      },
+    }, sourceTrust);
+    await expect(manager.cleanupReleased(f.history, cleanupOptions(f)))
+      .rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+    const state = JSON.parse(await readFile(join(f.fixture.root, "state", "worktrees.json"), "utf8"));
+    expect(state.worktrees[f.history.worktree_ref].lifecycle).toBe("pending-remove-equivalent");
+    const head = (await git(f.source, "rev-parse", `refs/heads/${f.history.branch}`)).trim();
+    expect(head).toBe(target === "branch" ? f.manifest.source_head : f.manifest.worktree_head);
+  });
+
+  it("retains all verified backup files throughout absent-checkout completion and closes them afterwards", async () => {
+    const f = await proofFixture();
+    await leaveRemovedCheckoutPending(f);
+    const files = new Set([f.proofPath, f.manifest.bundle.file, f.manifest.artifacts[0]!.file]);
+    const opened: FileHandle[] = [];
+    filesystemBoundary.afterOpen = async (_path, handle) => {
+      const path = await realpath(`/proc/self/fd/${handle.fd}`);
+      if (!files.has(path)) return;
+      opened.push(handle);
+    };
+    const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {}, sourceTrust);
+    await expect(manager.cleanupReleased(f.history, {
+      ...cleanupOptions(f),
+      revalidate: async () => {
+        const retained = opened.filter((handle) => handle.fd >= 0);
+        expect(retained).toHaveLength(3);
+        for (const handle of retained) expect(fstatSync(handle.fd).isFile()).toBe(true);
+      },
+    })).resolves.toMatchObject({ recovered: true, removed: true });
+    expect(opened.length).toBeGreaterThanOrEqual(3);
+    for (const handle of opened) expect(handle.fd).toBe(-1);
+  });
+
+  it("rejects an ancestor relationship change while acquiring the artifact backup parent", async () => {
+    const f = await proofFixture();
+    const container = join(f.fixture.root, "external");
+    const parent = join(container, "backup");
+    const managed = join(f.fixture.root, "state", "nested");
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    await mkdir(join(managed, "backup"), { recursive: true, mode: 0o700 });
+    const entry = f.manifest.artifacts[0]!;
+    const name = "artifact-note.txt";
+    for (const directory of [parent, join(managed, "backup")]) {
+      await writeFile(join(directory, name), await readFile(entry.file), { mode: 0o600 });
+    }
+    entry.file = join(parent, name);
+    await writeFile(f.proofPath, `${JSON.stringify(f.manifest)}\n`, { mode: 0o600 });
+    let changed = false;
+    filesystemBoundary.beforeOpen = async (path) => {
+      if (changed || basename(path) !== "backup" || await realpath(dirname(path)) !== container) return;
+      changed = true;
+      await rename(container, `${container}.previous`);
+      await symlink(managed, container, "dir");
+    };
+    await expect(verifyHistoricalCleanupProof({
+      proofPath: f.proofPath, history: f.history, registryHead: f.manifest.registry_head,
+      historySha256: f.manifest.history_sha256, mappingSha256: f.manifest.mapping_sha256,
+      sourcePath: f.source, worktreePath: f.worktree, commonGitDir: f.commonGitDir,
+      repositorySlug: f.manifest.repository_slug, managedRoots: [join(f.fixture.root, "state")],
+      runner: new ProcessRunner(), sourceTrust,
+    })).rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+    expect(changed).toBe(true);
+  });
+
+  it("rejects a changed forbidden-root identity during the verified scope", async () => {
+    const f = await proofFixture();
+    const managed = join(f.fixture.root, "state");
+    await expect(withVerifiedHistoricalCleanupProof({
+      proofPath: f.proofPath, history: f.history, registryHead: f.manifest.registry_head,
+      historySha256: f.manifest.history_sha256, mappingSha256: f.manifest.mapping_sha256,
+      sourcePath: f.source, worktreePath: f.worktree, commonGitDir: f.commonGitDir,
+      repositorySlug: f.manifest.repository_slug, managedRoots: [managed],
+      runner: new ProcessRunner(), sourceTrust,
+    }, async (scope) => {
+      await rename(managed, `${managed}.previous`);
+      await mkdir(managed, { mode: 0o700 });
+      await scope.assertArtifactsUnchanged();
+    })).rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE" });
+  });
+
+  it.each(["success", "callback failure", "invalid backup"] as const)("closes acquired file and parent descriptors on %s", async (outcome) => {
+    const f = await proofFixture();
+    if (outcome === "invalid backup") {
+      await writeFile(f.manifest.artifacts[0]!.file, "invalid backup bytes\n", { mode: 0o600 });
+    }
+    const opened: FileHandle[] = [];
+    filesystemBoundary.afterOpen = async (_path, handle) => { opened.push(handle); };
+    const operation = withVerifiedHistoricalCleanupProof({
+      proofPath: f.proofPath, history: f.history, registryHead: f.manifest.registry_head,
+      historySha256: f.manifest.history_sha256, mappingSha256: f.manifest.mapping_sha256,
+      sourcePath: f.source, worktreePath: f.worktree, commonGitDir: f.commonGitDir,
+      repositorySlug: f.manifest.repository_slug, managedRoots: [join(f.fixture.root, "state")],
+      runner: new ProcessRunner(), sourceTrust,
+    }, async () => {
+      if (outcome === "callback failure") throw new Error("injected callback failure");
+    });
+    if (outcome === "success") await expect(operation).resolves.toBeUndefined();
+    else await expect(operation).rejects.toThrow();
+    expect(opened.length).toBeGreaterThan(0);
+    for (const handle of opened) expect(handle.fd).toBe(-1);
+  });
+
+  it("shares retained directory identities and closes each acquired descriptor exactly once", async () => {
+    const f = await proofFixture();
+    const opened: Array<{ handle: FileHandle; close: ReturnType<typeof vi.spyOn> }> = [];
+    filesystemBoundary.afterOpen = async (_path, handle) => { opened.push({ handle, close: vi.spyOn(handle, "close") }); };
+    await withVerifiedHistoricalCleanupProof({
+      proofPath: f.proofPath, history: f.history, registryHead: f.manifest.registry_head,
+      historySha256: f.manifest.history_sha256, mappingSha256: f.manifest.mapping_sha256,
+      sourcePath: f.source, worktreePath: f.worktree, commonGitDir: f.commonGitDir,
+      repositorySlug: f.manifest.repository_slug, managedRoots: [join(f.fixture.root, "state")],
+      runner: new ProcessRunner(), sourceTrust,
+    }, async () => {
+      const directories = opened.filter(({ handle }) => handle.fd >= 0 && fstatSync(handle.fd).isDirectory());
+      const identities = directories.map(({ handle }) => { const info = fstatSync(handle.fd); return `${info.dev}:${info.ino}`; });
+      expect(identities.length).toBeGreaterThan(0);
+      expect(new Set(identities).size).toBe(identities.length);
+    });
+    for (const { handle, close } of opened) { expect(handle.fd).toBe(-1); expect(close).toHaveBeenCalledTimes(1); }
+  });
+
+  it.each(["normal", "recovery"] as const)("rejects an insufficient descriptor budget before the %s mutation callback", async (route) => {
+    const f = await proofFixture();
+    if (route === "recovery") await leaveRemovedCheckoutPending(f);
+    const statePath = join(f.fixture.root, "state", "worktrees.json");
+    const before = await readFile(statePath);
+    filesystemBoundary.softDescriptorLimit = 1;
+    let callbacks = 0;
+    const manager = new WorktreeManager(configFor(f.fixture.registryDir), new ProcessRunner(), {}, sourceTrust);
+    await expect(manager.cleanupReleased(f.history, {
+      ...cleanupOptions(f), revalidate: async () => { callbacks += 1; },
+    })).rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE", details: { reason: "scope_unsupported" } });
+    expect(callbacks).toBe(0);
+    expect(await readFile(statePath)).toEqual(before);
+    if (route === "normal") await expect(stat(f.worktree)).resolves.toBeDefined();
+    expect(await git(f.source, "show-ref", "--verify", `refs/heads/${f.history.branch}`)).toContain(f.manifest.worktree_head);
+  });
+
+  it("normalizes a retained boundary I/O failure without rewriting callback failures", async () => {
+    const f = await proofFixture();
+    const managed = join(f.fixture.root, "state");
+    let boundary: FileHandle | undefined;
+    filesystemBoundary.afterOpen = async (_path, handle) => {
+      if (await realpath(`/proc/self/fd/${handle.fd}`) === managed) boundary = handle;
+    };
+    const input = { proofPath: f.proofPath, sourcePath: f.source, worktreePath: f.worktree,
+      commonGitDir: f.commonGitDir, managedRoots: [managed], runner: new ProcessRunner() };
+    await expect(withVerifiedHistoricalCleanupBackupOnly(input, async (scope) => {
+      expect(boundary).toBeDefined();
+      vi.spyOn(boundary!, "stat").mockRejectedValueOnce(Object.assign(new Error("injected I/O error"), { code: "EIO" }));
+      await scope.assertBackupsUnchanged();
+    })).rejects.toMatchObject({ code: "WORKTREE_EQUIVALENCE_UNSAFE", details: { reason: "snapshot_changed" } });
+    const callbackError = new Error("callback identity must survive");
+    await expect(withVerifiedHistoricalCleanupBackupOnly(input, async () => { throw callbackError; })).rejects.toBe(callbackError);
+  });
+
   it("accepts a complete exact commit tuple, full bundle, and every ignored artifact", async () => {
     const f = await proofFixture();
 

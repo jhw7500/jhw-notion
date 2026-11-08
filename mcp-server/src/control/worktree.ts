@@ -15,8 +15,7 @@ import { ControlError } from "./errors.js";
 import { githubSlugFromCheckout } from "./github-source.js";
 import { ProcessRunner, type ProcessResult, type ProcessRunOptions } from "./process.js";
 import {
-  historicalCleanupProofSha256,
-  verifyHistoricalCleanupBackupOnly,
+  withVerifiedHistoricalCleanupBackupOnly,
   withVerifiedHistoricalCleanupProof,
   type SourceTrustPort,
   type VerifiedHistoricalCleanupProof,
@@ -589,39 +588,32 @@ export class WorktreeManager {
     if (mapping.lifecycle === "pending-remove-equivalent" && !await this.mappedWorktreeExists(mapping.path, root)) {
       const intent = mapping.cleanup_intent;
       if (!intent || intent.proof_path !== options.proofPath || intent.registry_head !== options.registryHead ||
-        intent.history_sha256 !== options.historySha256 || intent.repository_slug.toLowerCase() !== options.repositorySlug.toLowerCase() ||
-        await historicalCleanupProofSha256(options.proofPath) !== intent.proof_sha256) {
+        intent.history_sha256 !== options.historySha256 || intent.repository_slug.toLowerCase() !== options.repositorySlug.toLowerCase()) {
         throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup retry proof changed", { reason: "snapshot_changed" });
       }
-      const registered = (await this.git(["-C", mapping.repository_path, "worktree", "list", "--porcelain", "-z"])).stdout
-        .split("\0").some((entry) => entry === `worktree ${mapping.path}`);
-      const branchHead = (await this.git(["-C", mapping.repository_path, "show-ref", "--verify", "--hash", `refs/heads/${mapping.branch}`])).stdout.trim();
-      if (registered || branchHead !== intent.worktree_head) {
-        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Absent checkout metadata is not a completed Git removal", { reason: "snapshot_changed" });
-      }
-      const backup = await verifyHistoricalCleanupBackupOnly({
+      await this.assertEquivalentRemovalMetadata(mapping, root, intent.worktree_head);
+      return withVerifiedHistoricalCleanupBackupOnly({
         proofPath: options.proofPath,
         sourcePath: mapping.repository_path,
         worktreePath: mapping.path,
         commonGitDir: mapping.repository_identity,
         managedRoots: [this.config.stateDir, this.config.worktreeRoot],
         runner: this.runner,
+      }, async (backup) => {
+        if (backup.proofSha256 !== intent.proof_sha256 || backup.manifest.inventory_sha256 !== intent.inventory_sha256) {
+          throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Recovery backup changed after Git removal", { reason: "backup_invalid" });
+        }
+        await options.revalidate();
+        await this.completeEquivalentRemoval(state, mapping!, history, root, backup.assertBackupsUnchanged);
+        return {
+          removed: true,
+          recovered: true,
+          lifecycle: "removed" as const,
+          cleanup_policy: "historical-exact-patch-v1" as const,
+          branch_preserved: true as const,
+          proof_sha256: intent.proof_sha256,
+        };
       });
-      if (backup.proofSha256 !== intent.proof_sha256 || backup.manifest.inventory_sha256 !== intent.inventory_sha256) {
-        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Recovery backup changed after Git removal", { reason: "backup_invalid" });
-      }
-      await options.revalidate();
-      mapping.lifecycle = "removed";
-      delete mapping.cleanup_intent;
-      await this.saveState(state);
-      return {
-        removed: true,
-        recovered: true,
-        lifecycle: "removed",
-        cleanup_policy: "historical-exact-patch-v1",
-        branch_preserved: true,
-        proof_sha256: intent.proof_sha256,
-      };
     }
 
     const repository = await this.repositoryForMappedWorktree(mapping);
@@ -656,7 +648,7 @@ export class WorktreeManager {
       managedRoots: [this.config.stateDir, this.config.worktreeRoot],
       runner: this.runner,
       ...(this.proofSourceTrust ? { sourceTrust: this.proofSourceTrust } : {}),
-    }, async ({ verified, assertArtifactsUnchanged, assertSourceTrusted }) => {
+    }, async ({ verified, assertArtifactsUnchanged, assertBackupsUnchanged, assertSourceTrusted }) => {
       if (mapping.lifecycle === "active") {
         mapping.lifecycle = "pending-remove-equivalent";
         mapping.cleanup_intent = this.cleanupIntent(options, mappingSha256, verified);
@@ -691,9 +683,7 @@ export class WorktreeManager {
       }
       await assertArtifactsUnchanged();
       await this.git(["-C", last.repository_path, "worktree", "remove", last.path]);
-      last.lifecycle = "removed";
-      delete last.cleanup_intent;
-      await this.saveState(lastState);
+      await this.completeEquivalentRemoval(lastState, last, history, root, assertBackupsUnchanged);
       return {
         removed: true,
         recovered,
@@ -702,6 +692,52 @@ export class WorktreeManager {
         branch_preserved: true as const,
         proof_sha256: verified.proofSha256,
       };
+    });
+  }
+
+  private async assertEquivalentRemovalMetadata(mapping: WorktreeMapping, root: string, expectedHead: string): Promise<void> {
+    const unsafe = () => new ControlError("WORKTREE_EQUIVALENCE_UNSAFE",
+      "Absent checkout metadata is not a completed Git removal", { reason: "snapshot_changed" });
+    if (await this.mappedWorktreeExists(mapping.path, root)) throw unsafe();
+    const [registered, branchHead] = await Promise.all([
+      this.git(["-C", mapping.repository_path, "worktree", "list", "--porcelain", "-z"])
+        .then((result) => result.stdout.split("\0").some((entry) => entry === `worktree ${mapping.path}`)),
+      this.git(["-C", mapping.repository_path, "show-ref", "--verify", "--hash", `refs/heads/${mapping.branch}`])
+        .then((result) => result.stdout.trim()),
+    ]).catch(() => { throw unsafe(); });
+    if (registered || branchHead !== expectedHead) throw unsafe();
+  }
+
+  private async completeEquivalentRemoval(
+    state: WorktreeState,
+    mapping: WorktreeMapping,
+    history: ClaimHistory & { task_alias: string },
+    root: string,
+    assertBackupsUnchanged: () => Promise<void>,
+  ): Promise<void> {
+    const expectedState = JSON.stringify(state);
+    const pending = { ...mapping };
+    const intent = pending.cleanup_intent;
+    if (pending.lifecycle !== "pending-remove-equivalent" || !intent) {
+      throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup completion intent is missing", { reason: "snapshot_changed" });
+    }
+    mapping.lifecycle = "removed";
+    delete mapping.cleanup_intent;
+    await this.saveState(state, async (directory) => {
+      // Finish Git subprocesses before the final local publication fence.
+      await this.assertEquivalentRemovalMetadata(pending, root, intent.worktree_head);
+      const durable = await this.readState(directory);
+      const selected = durable.worktrees[history.worktree_ref];
+      if (!selected || JSON.stringify(durable) !== expectedState) {
+        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup state changed before publication", { reason: "snapshot_changed" });
+      }
+      this.assertCoordinates(selected, history, pending.repository_identity, root);
+      await this.assertUniqueCleanupMapping(durable, selected, root, history.worktree_ref);
+      await assertBackupsUnchanged();
+      // Backup hashing can yield; do not overwrite a newer state observed afterwards.
+      if (JSON.stringify(await this.readState(directory)) !== expectedState) {
+        throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Equivalent cleanup state changed during backup validation", { reason: "snapshot_changed" });
+      }
     });
   }
 
@@ -1817,7 +1853,7 @@ export class WorktreeManager {
     }
   }
 
-  private async saveState(state: WorktreeState): Promise<void> {
+  private async saveState(state: WorktreeState, beforePublish?: (directory: SecureStateDirectory) => Promise<void>): Promise<void> {
     await this.stateHooks.beforeSave?.();
     const serialized = `${JSON.stringify(state, null, 2)}\n`;
     await this.withStateDirectory(async (directory) => {
@@ -1830,6 +1866,7 @@ export class WorktreeManager {
         await handle.sync();
         await handle.close();
         handle = undefined;
+        if (beforePublish) await beforePublish(directory);
         await directory.renameWithin(temporary, WORKTREE_STATE_FILE);
         await this.stateHooks.afterPublish?.(join(directory.path, WORKTREE_STATE_FILE));
         await this.verifyPublishedState(directory, serialized);

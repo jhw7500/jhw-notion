@@ -433,9 +433,16 @@ journal append 없이 latest released generation도 조회한다. `released.avai
 ancestor가 아닌 작업본은 명시적인 `--action cleanup --cleanup-proof <absolute-private-manifest.json>`
 경로에서만 역사적 통합을 검증한다. 전체 linear suffix(최대 32)의 ordered/distinct ancestor 대응과
 raw path·old/new blob·mode·type tuple이 exact여야 하며, 이후 source 변경·revert는 허용한다.
-manifest·full bundle·ignored artifact 백업을 검증한 FD는 최종 확인까지 유지한다. branch와 외부
-backup은 보존하며 active successor·snapshot drift·불완전 backup은 거부한다. 실제 정리는 별도 승인 후
+manifest·full bundle·ignored artifact 백업의 검증 FD와 부모 관계는 정상 제거와 checkout 부재
+재개 모두 tombstone 게시까지 유지한다. backup은 source·worktree·common Git directory·managed
+roots 밖이어야 한다. manifest·bundle은 `0600`, private backup parent는 `0700`이며 artifact는
+선언된 일반 mode를 보존하고 setuid·setgid·sticky를 거부한다. 상태 temp write/fsync/close 뒤에도
+backup과 정확한 pending state를 재확인해 drift가 있으면 게시를 중단한다. branch와 외부 backup은
+보존하며 active successor·snapshot drift·불완전 backup은 거부한다. 실제 정리는 별도 승인 후
 `jhw-control-host`로 실행한다. [Task 절차](skills/claude/task.md)의 exact generation 절차를 따른다.
+같은 부모 FD는 공유하며 manifest의 4096개 입력 상한과 별개로 현재 FD 한도에 필요한 파일·부모·
+임시 I/O 여유가 들어가는지 intent/Git 제거 전에 확인한다. 부족하면 `scope_unsupported`로
+중단하며 OS 한도를 자동 변경하지 않는다. 검사는 동시 FD 사용에 대한 원자적 예약이 아니다.
 
 Claim은 release됐지만 host mapping만 남고 checkout은 사라진 경우에도 파일을 직접 지우거나 Registry를 손편집하지 않는다. status/error가 반환한 exact 세 좌표를 사용하고, takeover와 별개의 실행 직전 사용자 승인을 받은 뒤에만 다음 복구를 실행한다.
 

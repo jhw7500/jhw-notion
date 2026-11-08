@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, type FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, parse, relative, resolve, sep } from "node:path";
 
 import { z } from "zod";
 
@@ -105,13 +105,39 @@ export interface VerifiedHistoricalCleanupProofScope {
   verified: VerifiedHistoricalCleanupProof;
   sourceArtifacts: ReadonlyArray<{ path: string; descriptor: number }>;
   assertArtifactsUnchanged(): Promise<void>;
+  assertBackupsUnchanged(): Promise<void>;
   assertSourceTrusted(): Promise<void>;
+}
+
+export type HistoricalCleanupBackupInput = Pick<HistoricalCleanupProofInput,
+  "proofPath" | "sourcePath" | "worktreePath" | "commonGitDir" | "managedRoots" | "runner">;
+
+export interface VerifiedHistoricalCleanupBackupScope {
+  proofSha256: string;
+  manifest: HistoricalCleanupManifest;
+  assertBackupsUnchanged(): Promise<void>;
+}
+
+interface RetainedDirectory {
+  name: string;
+  handle: FileHandle;
+  info: BigIntStats;
+  parent?: FileHandle;
+}
+
+type DirectoryPool = Map<string, RetainedDirectory>;
+
+interface DirectoryChain {
+  path: string;
+  directories: RetainedDirectory[];
+  missing: string[];
 }
 
 interface RetainedParent {
   path: string;
   handle: FileHandle;
   info: BigIntStats;
+  chain: DirectoryChain;
 }
 
 interface RetainedFile {
@@ -123,37 +149,23 @@ interface RetainedFile {
 }
 
 export async function historicalCleanupProofSha256(proofPath: string): Promise<string> {
-  await assertPrivateParent(proofPath);
-  const proof = await secureRegularFile(proofPath, 0o600);
-  if (proof.bytes.length > MAX_MANIFEST_BYTES) throw unsafe("backup_invalid");
-  return sha256(proof.bytes);
+  const directories: DirectoryPool = new Map();
+  let proof: RetainedFile | undefined;
+  try {
+    const opened = await openRetainedFile(proofPath, 0o600, true, directories);
+    proof = opened.retained;
+    if (opened.bytes.length > MAX_MANIFEST_BYTES) throw unsafe("backup_invalid");
+    return proof.digest;
+  } finally {
+    if (proof) await closeRetainedFiles([proof]);
+    await closeDirectoryPool(directories);
+  }
 }
 
-export async function verifyHistoricalCleanupBackupOnly(input: {
-  proofPath: string;
-  sourcePath: string;
-  worktreePath: string;
-  commonGitDir: string;
-  managedRoots: readonly string[];
-  runner: CleanupProofRunner;
-}): Promise<{ proofSha256: string; manifest: HistoricalCleanupManifest }> {
-  await assertPrivateParent(input.proofPath);
-  const proof = await secureRegularFile(input.proofPath, 0o600);
-  if (proof.bytes.length > MAX_MANIFEST_BYTES) throw unsafe("backup_invalid");
-  let manifest: HistoricalCleanupManifest;
-  try { manifest = ManifestSchema.parse(JSON.parse(proof.bytes.toString("utf8"))); } catch { throw unsafe("backup_invalid"); }
-  await verifyBundle(input.runner, manifest, input.sourcePath, input.worktreePath, input.commonGitDir, input.managedRoots);
-  let total = 0;
-  for (const artifact of manifest.artifacts) {
-    total += artifact.bytes;
-    if (total > MAX_ARTIFACT_BYTES) throw unsafe("backup_invalid");
-    await assertPrivateParent(artifact.file);
-    const backup = await secureRegularFile(await realpath(artifact.file), Number.parseInt(artifact.mode, 8));
-    if (backup.bytes.length !== artifact.bytes || sha256(backup.bytes) !== artifact.sha256) throw unsafe("backup_invalid");
-  }
-  const inventory = manifest.artifacts.map(({ file: _file, ...entry }) => entry);
-  if (sha256(JSON.stringify(inventory)) !== manifest.inventory_sha256) throw unsafe("backup_invalid");
-  return { proofSha256: sha256(proof.bytes), manifest };
+export async function verifyHistoricalCleanupBackupOnly(
+  input: HistoricalCleanupBackupInput,
+): Promise<{ proofSha256: string; manifest: HistoricalCleanupManifest }> {
+  return withVerifiedHistoricalCleanupBackupOnly(input, async ({ proofSha256, manifest }) => ({ proofSha256, manifest }));
 }
 
 function unsafe(reason: "scope_unsupported" | "patch_mismatch" | "integration_untrusted" | "backup_invalid" | "snapshot_changed"): ControlError {
@@ -169,27 +181,88 @@ function within(root: string, target: string): boolean {
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
 }
 
-async function secureRegularFile(path: string, mode?: number): Promise<{ bytes: Buffer; ino: bigint }> {
-  if (!isAbsolute(path)) throw unsafe("backup_invalid");
-  let handle;
+function currentUid(info: BigIntStats): bigint {
+  return typeof process.getuid === "function" ? BigInt(process.getuid()) : info.uid;
+}
+
+function sameDirectoryIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return right.isDirectory() && right.nlink > 0n && left.dev === right.dev && left.ino === right.ino &&
+    left.uid === right.uid && left.mode === right.mode;
+}
+
+async function closeDirectoryPool(pool: DirectoryPool): Promise<void> {
+  for (const directory of [...pool.values()].reverse()) await directory.handle.close().catch(() => undefined);
+  pool.clear();
+}
+
+async function openDirectoryChain(path: string, pool: DirectoryPool, allowMissing = false): Promise<DirectoryChain> {
+  if (!isAbsolute(path) || path.length > 4096) throw unsafe("backup_invalid");
+  const target = resolve(path);
+  const root = parse(target).root;
+  const components = relative(root, target).split(sep).filter(Boolean);
+  const chain: DirectoryChain = { path: target, directories: [], missing: [] };
+  let pending: FileHandle | undefined;
+  let prefix = root;
   try {
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const info = await handle.stat({ bigint: true });
-    const uid = typeof process.getuid === "function" ? BigInt(process.getuid()) : info.uid;
-    if (!info.isFile() || info.nlink !== 1n || info.uid !== uid || (mode !== undefined && (info.mode & 0o777n) !== BigInt(mode))) {
-      throw unsafe("backup_invalid");
+    for (let index = -1; index < components.length; index += 1) {
+      const parent = chain.directories.at(-1)?.handle;
+      const name = index < 0 ? root : components[index]!;
+      if (index >= 0) prefix = join(prefix, name);
+      const shared = pool.get(prefix);
+      if (shared) {
+        chain.directories.push(shared);
+        continue;
+      }
+      try {
+        pending = await open(parent ? `/proc/self/fd/${parent.fd}/${name}` : root,
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+      } catch (cause) {
+        if (allowMissing && index >= 0 && (cause as NodeJS.ErrnoException).code === "ENOENT") {
+          chain.missing = components.slice(index);
+          return chain;
+        }
+        throw cause;
+      }
+      const info = await pending.stat({ bigint: true });
+      if (!info.isDirectory() || info.nlink < 1n) throw unsafe("backup_invalid");
+      const directory = { name, handle: pending, info, ...(parent ? { parent } : {}) };
+      chain.directories.push(directory);
+      pool.set(prefix, directory);
+      pending = undefined;
     }
-    return { bytes: await handle.readFile(), ino: info.ino };
+    return chain;
   } catch (cause) {
+    await pending?.close().catch(() => undefined);
     if (cause instanceof ControlError) throw cause;
     throw unsafe("backup_invalid");
-  } finally {
-    await handle?.close().catch(() => undefined);
   }
 }
 
-function currentUid(info: BigIntStats): bigint {
-  return typeof process.getuid === "function" ? BigInt(process.getuid()) : info.uid;
+async function assertDirectoryChainUnchanged(chain: DirectoryChain, allowRemovedLeaf = false): Promise<void> {
+  for (const [index, directory] of chain.directories.entries()) {
+    const path = directory.parent ? `/proc/self/fd/${directory.parent.fd}/${directory.name}` : directory.name;
+    const info = await directory.handle.stat({ bigint: true });
+    let current: BigIntStats;
+    try {
+      current = await lstat(path, { bigint: true });
+    } catch (cause) {
+      if (allowRemovedLeaf && chain.missing.length === 0 && index === chain.directories.length - 1 &&
+        (cause as NodeJS.ErrnoException).code === "ENOENT" && info.nlink === 0n) return;
+      throw unsafe("snapshot_changed");
+    }
+    if (!sameDirectoryIdentity(directory.info, info) || !sameDirectoryIdentity(directory.info, current)) {
+      throw unsafe("snapshot_changed");
+    }
+  }
+  if (chain.missing.length > 0) {
+    const parent = chain.directories.at(-1)!;
+    const absent = await lstat(`/proc/self/fd/${parent.handle.fd}/${chain.missing[0]}`)
+      .then(() => false, (cause: NodeJS.ErrnoException) => {
+        if (cause.code === "ENOENT") return true;
+        throw cause;
+      });
+    if (!absent) throw unsafe("snapshot_changed");
+  }
 }
 
 function sameFileObservation(left: BigIntStats, right: BigIntStats): boolean {
@@ -209,36 +282,39 @@ async function readRetained(handle: FileHandle, size: bigint): Promise<Buffer> {
   return bytes;
 }
 
-async function openRetainedFile(path: string, mode: number, privateParent: boolean): Promise<{ retained: RetainedFile; bytes: Buffer }> {
-  if (!isAbsolute(path) || await realpath(path).catch(() => "") !== resolve(path)) throw unsafe("backup_invalid");
+async function openRetainedFile(path: string, mode: number, privateParent: boolean, pool: DirectoryPool): Promise<{ retained: RetainedFile; bytes: Buffer }> {
+  if (!isAbsolute(path)) throw unsafe("backup_invalid");
+  path = resolve(path);
   const parentPath = dirname(path);
-  let parent: FileHandle | undefined;
+  let chain: DirectoryChain | undefined;
   let handle: FileHandle | undefined;
   try {
-    parent = await open(parentPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+    chain = await openDirectoryChain(parentPath, pool);
+    const parent = chain.directories.at(-1)!.handle;
     const parentInfo = await parent.stat({ bigint: true });
     if (!parentInfo.isDirectory() || parentInfo.uid !== currentUid(parentInfo) || parentInfo.nlink < 1n ||
-      (privateParent && (parentInfo.mode & 0o777n) !== 0o700n)) throw unsafe("backup_invalid");
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      (privateParent && (parentInfo.mode & 0o7777n) !== 0o700n)) throw unsafe("backup_invalid");
+    handle = await open(`/proc/self/fd/${parent.fd}/${basename(path)}`,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const before = await handle.stat({ bigint: true });
     if (!before.isFile() || before.nlink !== 1n || before.uid !== currentUid(before) ||
-      (before.mode & 0o777n) !== BigInt(mode)) throw unsafe("backup_invalid");
+      (before.mode & 0o7777n) !== BigInt(mode)) throw unsafe("backup_invalid");
     const bytes = await readRetained(handle, before.size);
     const after = await handle.stat({ bigint: true });
     if (!sameFileObservation(before, after)) throw unsafe("backup_invalid");
+    await assertDirectoryChainUnchanged(chain);
     return {
       retained: {
         path,
         handle,
         info: before,
         digest: sha256(bytes),
-        parent: { path: parentPath, handle: parent, info: parentInfo },
+        parent: { path: parentPath, handle: parent, info: parentInfo, chain },
       },
       bytes,
     };
   } catch (cause) {
     await handle?.close().catch(() => undefined);
-    await parent?.close().catch(() => undefined);
     if (cause instanceof ControlError) throw cause;
     throw unsafe("backup_invalid");
   }
@@ -246,27 +322,22 @@ async function openRetainedFile(path: string, mode: number, privateParent: boole
 
 async function assertRetainedFileUnchanged(snapshot: RetainedFile): Promise<void> {
   try {
+    await assertDirectoryChainUnchanged(snapshot.parent.chain);
     const parentInfo = await snapshot.parent.handle.stat({ bigint: true });
     if (!sameFileObservation(snapshot.parent.info, parentInfo)) throw unsafe("snapshot_changed");
-    const currentParent = await open(snapshot.parent.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
-    try {
-      const currentParentInfo = await currentParent.stat({ bigint: true });
-      if (!sameFileObservation(parentInfo, currentParentInfo)) throw unsafe("snapshot_changed");
-    } finally {
-      await currentParent.close().catch(() => undefined);
-    }
-
     const info = await snapshot.handle.stat({ bigint: true });
     if (!sameFileObservation(snapshot.info, info)) throw unsafe("snapshot_changed");
     const bytes = await readRetained(snapshot.handle, info.size);
     if (sha256(bytes) !== snapshot.digest) throw unsafe("snapshot_changed");
-    const current = await open(snapshot.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const current = await open(`/proc/self/fd/${snapshot.parent.handle.fd}/${basename(snapshot.path)}`,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
       const currentInfo = await current.stat({ bigint: true });
       if (!sameFileObservation(info, currentInfo)) throw unsafe("snapshot_changed");
     } finally {
       await current.close().catch(() => undefined);
     }
+    await assertDirectoryChainUnchanged(snapshot.parent.chain);
   } catch (cause) {
     if (cause instanceof ControlError) throw cause;
     throw unsafe("snapshot_changed");
@@ -274,20 +345,7 @@ async function assertRetainedFileUnchanged(snapshot: RetainedFile): Promise<void
 }
 
 async function closeRetainedFiles(files: readonly RetainedFile[]): Promise<void> {
-  await Promise.all(files.flatMap((file) => [
-    file.handle.close().catch(() => undefined),
-    file.parent.handle.close().catch(() => undefined),
-  ]));
-}
-
-async function assertPrivateParent(path: string): Promise<void> {
-  if (!isAbsolute(path) || await realpath(path).catch(() => "") !== resolve(path)) throw unsafe("backup_invalid");
-  const parent = dirname(path);
-  const info = await lstat(parent).catch(() => undefined);
-  const uid = typeof process.getuid === "function" ? process.getuid() : info?.uid;
-  if (!info?.isDirectory() || info.isSymbolicLink() || info.nlink < 1 || info.uid !== uid || (info.mode & 0o777) !== 0o700) {
-    throw unsafe("backup_invalid");
-  }
+  for (const file of files) await file.handle.close().catch(() => undefined);
 }
 
 async function git(runner: CleanupProofRunner, cwd: string, args: string[]): Promise<string> {
@@ -377,6 +435,7 @@ async function verifyMaterializedBundle(
   const bundlePath = join(inputDirectory, "verified.bundle");
   let writer: FileHandle | undefined;
   let snapshot: RetainedFile | undefined;
+  const directories: DirectoryPool = new Map();
   try {
     writer = await open(
       bundlePath,
@@ -391,7 +450,7 @@ async function verifyMaterializedBundle(
       offset += result.bytesWritten;
     }
     await writer.sync();
-    const materialized = await openRetainedFile(bundlePath, 0o600, true);
+    const materialized = await openRetainedFile(bundlePath, 0o600, true, directories);
     snapshot = materialized.retained;
     if (!materialized.bytes.equals(bytes) || snapshot.digest !== manifest.bundle.sha256) throw unsafe("backup_invalid");
     await writer.close();
@@ -419,46 +478,135 @@ async function verifyMaterializedBundle(
   } finally {
     await writer?.close().catch(() => undefined);
     if (snapshot) await closeRetainedFiles([snapshot]);
+    await closeDirectoryPool(directories);
     await rm(scratch, { recursive: true, force: true });
   }
 }
 
-async function verifyBundle(
-  runner: CleanupProofRunner,
-  manifest: HistoricalCleanupManifest,
-  sourcePath: string,
-  worktreePath: string,
-  commonGitDir: string,
-  managedRoots: readonly string[],
-): Promise<void> {
-  await assertPrivateParent(manifest.bundle.file);
-  const bundlePath = await realpath(manifest.bundle.file).catch(() => "");
-  const forbidden = [sourcePath, worktreePath, commonGitDir, ...managedRoots];
-  if (!bundlePath || forbidden.some((root) => within(resolve(root), bundlePath))) throw unsafe("backup_invalid");
-  const bundle = await secureRegularFile(bundlePath, 0o600);
-  if (bundle.bytes.length !== manifest.bundle.bytes || sha256(bundle.bytes) !== manifest.bundle.sha256) throw unsafe("backup_invalid");
-  await verifyMaterializedBundle(runner, manifest, sourcePath, bundle.bytes);
+interface BackupBoundary {
+  chain: DirectoryChain;
+  allowRemovedLeaf: boolean;
 }
 
-async function verifyBundleRetained(
-  runner: CleanupProofRunner,
+interface RetainedBackupScope extends VerifiedHistoricalCleanupBackupScope {
+  artifactBackups: ReadonlyArray<{ retained: RetainedFile; bytes: Buffer }>;
+  directories: DirectoryPool;
+}
+
+async function assertDescriptorBudget(
+  input: HistoricalCleanupBackupInput,
   manifest: HistoricalCleanupManifest,
-  sourcePath: string,
-  worktreePath: string,
-  commonGitDir: string,
-  managedRoots: readonly string[],
-  retained: RetainedFile[],
+  pool: DirectoryPool,
+  retainSourceArtifacts: boolean,
 ): Promise<void> {
-  await assertPrivateParent(manifest.bundle.file);
-  const bundlePath = await realpath(manifest.bundle.file).catch(() => "");
-  const forbidden = [sourcePath, worktreePath, commonGitDir, ...managedRoots];
-  if (!bundlePath || forbidden.some((root) => within(resolve(root), bundlePath))) throw unsafe("backup_invalid");
-  const bundle = await openRetainedFile(bundlePath, 0o600, true);
-  retained.push(bundle.retained);
-  if (bundle.bytes.length !== manifest.bundle.bytes || bundle.retained.digest !== manifest.bundle.sha256) {
-    throw unsafe("backup_invalid");
+  // An early capacity observation, not a reservation against concurrent opens.
+  const files = [manifest.bundle.file, ...manifest.artifacts.map((artifact) => artifact.file),
+    ...(retainSourceArtifacts ? manifest.artifacts.map((artifact) => join(input.worktreePath, artifact.path)) : [])];
+  const missingDirectories = new Set<string>();
+  for (const file of files) {
+    if (!isAbsolute(file)) throw unsafe("backup_invalid");
+    for (let parent = dirname(resolve(file)); !pool.has(parent); parent = dirname(parent)) {
+      missingDirectories.add(parent);
+      if (dirname(parent) === parent) break;
+    }
   }
-  await verifyMaterializedBundle(runner, manifest, sourcePath, bundle.bytes);
+  try {
+    const limits = (await readFile("/proc/self/limits")).toString("utf8");
+    const maximum = /^Max open files\s+(\d+|unlimited)\s+/m.exec(limits)?.[1];
+    if (!maximum) throw unsafe("scope_unsupported");
+    const opened = await readdir("/proc/self/fd");
+    // Retain all leaf descriptors and unique parents, leaving room for Git, scratch and state I/O.
+    if (maximum !== "unlimited" && BigInt(opened.length + missingDirectories.size + files.length + 64) > BigInt(maximum)) {
+      throw unsafe("scope_unsupported");
+    }
+  } catch (cause) {
+    if (cause instanceof ControlError) throw cause;
+    throw unsafe("scope_unsupported");
+  }
+}
+
+async function assertExternalBackup(file: RetainedFile, boundaries: readonly BackupBoundary[]): Promise<void> {
+  const actual = await realpath(`/proc/self/fd/${file.handle.fd}`).catch(() => "");
+  if (actual !== file.path) throw unsafe("snapshot_changed");
+  for (const boundary of boundaries) {
+    if (within(boundary.chain.path, actual)) throw unsafe("backup_invalid");
+    if (boundary.chain.missing.length > 0) continue;
+    const root = boundary.chain.directories.at(-1)!;
+    const rootInfo = await root.handle.stat({ bigint: true });
+    if (rootInfo.nlink === 0n && boundary.allowRemovedLeaf) continue;
+    const rootPath = await realpath(`/proc/self/fd/${root.handle.fd}`).catch(() => "");
+    if (!rootPath || within(rootPath, actual) || file.parent.chain.directories.some((directory) =>
+      directory.info.dev === rootInfo.dev && directory.info.ino === rootInfo.ino)) throw unsafe("backup_invalid");
+  }
+}
+
+async function withHistoricalCleanupBackups<T, Context>(
+  input: HistoricalCleanupBackupInput,
+  prepare: (manifest: HistoricalCleanupManifest) => Promise<Context>,
+  use: (scope: RetainedBackupScope, context: Context) => Promise<T>,
+  retainSourceArtifacts = false,
+): Promise<T> {
+  const retained: RetainedFile[] = [];
+  const boundaries: BackupBoundary[] = [];
+  const directories: DirectoryPool = new Map();
+  try {
+    const roots = [...new Set([input.sourcePath, input.worktreePath, input.commonGitDir, ...input.managedRoots].map((root) => resolve(root)))];
+    for (const root of roots) {
+      boundaries.push({ chain: await openDirectoryChain(root, directories, true), allowRemovedLeaf: root === resolve(input.worktreePath) });
+    }
+    const proof = await openRetainedFile(input.proofPath, 0o600, true, directories);
+    retained.push(proof.retained);
+    if (proof.bytes.length > MAX_MANIFEST_BYTES) throw unsafe("backup_invalid");
+    let manifest: HistoricalCleanupManifest;
+    try { manifest = ManifestSchema.parse(JSON.parse(proof.bytes.toString("utf8"))); } catch { throw unsafe("backup_invalid"); }
+    await assertExternalBackup(proof.retained, boundaries);
+    const context = await prepare(manifest);
+    await assertDescriptorBudget(input, manifest, directories, retainSourceArtifacts);
+
+    const bundle = await openRetainedFile(manifest.bundle.file, 0o600, true, directories);
+    retained.push(bundle.retained);
+    await assertExternalBackup(bundle.retained, boundaries);
+    if (bundle.bytes.length !== manifest.bundle.bytes || bundle.retained.digest !== manifest.bundle.sha256) throw unsafe("backup_invalid");
+    await verifyMaterializedBundle(input.runner, manifest, input.sourcePath, bundle.bytes);
+
+    const artifactBackups: Array<{ retained: RetainedFile; bytes: Buffer }> = [];
+    let total = 0;
+    for (const artifact of manifest.artifacts) {
+      total += artifact.bytes;
+      if (total > MAX_ARTIFACT_BYTES) throw unsafe("backup_invalid");
+      const backup = await openRetainedFile(artifact.file, Number.parseInt(artifact.mode, 8), true, directories);
+      retained.push(backup.retained);
+      artifactBackups.push(backup);
+      await assertExternalBackup(backup.retained, boundaries);
+      if (backup.bytes.length !== artifact.bytes || backup.retained.digest !== artifact.sha256) throw unsafe("backup_invalid");
+    }
+    const inventory = manifest.artifacts.map(({ file: _file, ...entry }) => entry);
+    if (sha256(JSON.stringify(inventory)) !== manifest.inventory_sha256) throw unsafe("backup_invalid");
+    const assertBackupsUnchanged = async () => {
+      try {
+        for (const boundary of boundaries) await assertDirectoryChainUnchanged(boundary.chain, boundary.allowRemovedLeaf);
+        for (const file of retained) {
+          await assertRetainedFileUnchanged(file);
+          await assertExternalBackup(file, boundaries);
+        }
+      } catch (cause) {
+        if (cause instanceof ControlError) throw cause;
+        throw unsafe("snapshot_changed");
+      }
+    };
+    await assertBackupsUnchanged();
+    return await use({ proofSha256: proof.retained.digest, manifest, artifactBackups, directories, assertBackupsUnchanged }, context);
+  } finally {
+    await closeRetainedFiles(retained);
+    await closeDirectoryPool(directories);
+  }
+}
+
+export async function withVerifiedHistoricalCleanupBackupOnly<T>(
+  input: HistoricalCleanupBackupInput,
+  use: (scope: VerifiedHistoricalCleanupBackupScope) => Promise<T>,
+): Promise<T> {
+  return withHistoricalCleanupBackups(input, async () => undefined, use);
 }
 
 async function ignoredArtifactInventory(input: HistoricalCleanupProofInput): Promise<Buffer[]> {
@@ -484,32 +632,21 @@ async function verifyArtifactsRetained(
   input: HistoricalCleanupProofInput,
   manifest: HistoricalCleanupManifest,
   retained: RetainedFile[],
+  backups: RetainedBackupScope["artifactBackups"],
+  directories: DirectoryPool,
 ): Promise<RetainedFile[]> {
   assertDeclaredInventory(await ignoredArtifactInventory(input), manifest);
   const sources: RetainedFile[] = [];
-  let total = 0;
-  for (const artifact of manifest.artifacts) {
-    total += artifact.bytes;
-    if (total > MAX_ARTIFACT_BYTES) throw unsafe("backup_invalid");
-    const mode = Number.parseInt(artifact.mode, 8);
-    const source = await openRetainedFile(join(input.worktreePath, artifact.path), mode, false);
+  for (const [index, artifact] of manifest.artifacts.entries()) {
+    const source = await openRetainedFile(join(input.worktreePath, artifact.path), Number.parseInt(artifact.mode, 8), false, directories);
     retained.push(source.retained);
     sources.push(source.retained);
-    await assertPrivateParent(artifact.file);
-    const backupPath = await realpath(artifact.file).catch(() => "");
-    if (!backupPath || [input.sourcePath, input.worktreePath, input.commonGitDir, ...input.managedRoots]
-      .some((root) => within(resolve(root), backupPath))) throw unsafe("backup_invalid");
-    const backup = await openRetainedFile(backupPath, mode, true);
-    retained.push(backup.retained);
+    const backup = backups[index]!;
     if (
       (source.retained.info.dev === backup.retained.info.dev && source.retained.info.ino === backup.retained.info.ino) ||
-      source.bytes.length !== artifact.bytes || backup.bytes.length !== artifact.bytes ||
-      source.retained.digest !== artifact.sha256 || backup.retained.digest !== artifact.sha256 ||
-      !source.bytes.equals(backup.bytes)
+      source.bytes.length !== artifact.bytes || source.retained.digest !== artifact.sha256 || !source.bytes.equals(backup.bytes)
     ) throw unsafe("backup_invalid");
   }
-  const inventory = manifest.artifacts.map(({ file: _file, ...entry }) => entry);
-  if (sha256(JSON.stringify(inventory)) !== manifest.inventory_sha256) throw unsafe("backup_invalid");
   return sources;
 }
 
@@ -517,18 +654,7 @@ export async function withVerifiedHistoricalCleanupProof<T>(
   input: HistoricalCleanupProofInput,
   use: (scope: VerifiedHistoricalCleanupProofScope) => Promise<T>,
 ): Promise<T> {
-  const retained: RetainedFile[] = [];
-  try {
-    await assertPrivateParent(input.proofPath);
-    const proof = await openRetainedFile(input.proofPath, 0o600, true);
-    retained.push(proof.retained);
-    if (proof.bytes.length > MAX_MANIFEST_BYTES) throw unsafe("backup_invalid");
-    let manifest: HistoricalCleanupManifest;
-    try {
-      manifest = ManifestSchema.parse(JSON.parse(proof.bytes.toString("utf8")));
-    } catch {
-      throw unsafe("backup_invalid");
-    }
+  return withHistoricalCleanupBackups(input, async (manifest) => {
     const history = input.history;
     if (
       manifest.task_id !== history.task_id || manifest.claim_id !== history.claim_id ||
@@ -586,29 +712,38 @@ export async function withVerifiedHistoricalCleanupProof<T>(
         throw unsafe("patch_mismatch");
       }
     }
-    await verifyBundleRetained(input.runner, manifest, sourceRoot, worktreeRoot, commonRoot, input.managedRoots, retained);
-    const sources = await verifyArtifactsRetained(input, manifest, retained);
-    const verified: VerifiedHistoricalCleanupProof = {
-      policy: manifest.policy,
-      proofSha256: sha256(proof.bytes),
-      inventorySha256: manifest.inventory_sha256,
-      sourceHead,
-      sourceRef: manifest.source_ref,
-      worktreeHead,
-      artifactPaths: manifest.artifacts.map((artifact) => artifact.path),
-    };
-    return await use({
-      verified,
-      sourceArtifacts: sources.map((source) => ({ path: source.path, descriptor: source.handle.fd })),
-      assertSourceTrusted,
-      assertArtifactsUnchanged: async () => {
+    return { sourceHead, worktreeHead, assertSourceTrusted };
+  }, async (backup, source) => {
+    const retained: RetainedFile[] = [];
+    try {
+      const manifest = backup.manifest;
+      const sources = await verifyArtifactsRetained(input, manifest, retained, backup.artifactBackups, backup.directories);
+      const verified: VerifiedHistoricalCleanupProof = {
+        policy: manifest.policy,
+        proofSha256: backup.proofSha256,
+        inventorySha256: manifest.inventory_sha256,
+        sourceHead: source.sourceHead,
+        sourceRef: manifest.source_ref,
+        worktreeHead: source.worktreeHead,
+        artifactPaths: manifest.artifacts.map((artifact) => artifact.path),
+      };
+      const assertArtifactsUnchanged = async () => {
         assertDeclaredInventory(await ignoredArtifactInventory(input), manifest, "snapshot_changed");
+        await backup.assertBackupsUnchanged();
         for (const snapshot of retained) await assertRetainedFileUnchanged(snapshot);
-      },
-    });
-  } finally {
-    await closeRetainedFiles(retained);
-  }
+      };
+      await assertArtifactsUnchanged();
+      return await use({
+        verified,
+        sourceArtifacts: sources.map((source) => ({ path: source.path, descriptor: source.handle.fd })),
+        assertSourceTrusted: source.assertSourceTrusted,
+        assertArtifactsUnchanged,
+        assertBackupsUnchanged: backup.assertBackupsUnchanged,
+      });
+    } finally {
+      await closeRetainedFiles(retained);
+    }
+  }, true);
 }
 
 export async function verifyHistoricalCleanupProof(input: HistoricalCleanupProofInput): Promise<VerifiedHistoricalCleanupProof> {
