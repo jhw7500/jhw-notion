@@ -96,10 +96,13 @@ node scripts/sync-codex-skills.mjs --check    # skills/codex 드리프트 검사
 
 ## 커밋과 PR
 
-- 커밋 메시지는 `/jhw:commit`(Change Evidence Contract v1)을 따른다. 제목은 commitlint 규칙
-  (`.github/commitlint.config.mjs`: type `feat|fix|chore|refactor|docs|test|build|ci|perf|style`,
-  header 100자 이하)과 계약의 결과 중심·72자 이하를 함께 지킨다. 관례는 영문 `type(scope): ` 접두어
-  뒤 한국어 결과이고, 필드 내용도 한국어로 쓴다(`skills/claude/commit.md` 「언어」).
+- 커밋 메시지는 `/jhw:commit`과 [Change Evidence Contract v1](https://github.com/jhw7500/automation/blob/0d97a63891ba4473a3a189eae643f8059b76eb56/docs/change-evidence-contract-v1.md)을
+  따른다. 제목은 결과 중심·72자 이하로 쓰고, 저장소 관례의 영문 type
+  `feat|fix|chore|refactor|docs|test|build|ci|perf|style`과 선택적 scope를 `type(scope): ` 접두어로
+  둔 뒤 결과와 필드 내용을 한국어로 쓴다(`skills/claude/commit.md` 「언어」).
+- `.github/workflows/commit-evidence-audit.yml`은 automation 커밋에 고정된 중앙 validator로 CEC v1의
+  필드·순서·제목 길이를 감사한다. 위 type 목록과 한국어 관례는 저장소 작성 규칙이며 중앙 감사가
+  강제하는 항목은 아니다.
 - 필드 제목 `### `는 앞에 공백 한 칸을 두고 `git commit --cleanup=verbatim --file <msg-file>`로 커밋한다.
 - PR은 `/jhw:pr`로 만든다. 본문은 `Contract version`·`Summary`·`Changes`·`Validation`·
   `Impact and risks`·`Related issue`이고 pinned validator가 push 전에 검증한다. 추가 `##` 제목은
