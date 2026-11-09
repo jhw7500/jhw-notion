@@ -35,8 +35,8 @@ const SUPPORTED_GUARD_TOOL_CASES = [
   { adapter: "codex", raw: "NotebookEdit", input: { notebook_path: "notes.ipynb", cell_id: "one", new_source: "bounded" }, tool: "file.modify", capability: "repo.modify" },
   { adapter: "codex", raw: "edit_file", input: { path: "src/file.ts", old_string: "a", new_string: "b" }, tool: "file.modify", capability: "repo.modify" },
   { adapter: "codex", raw: "mcp__filesystem__write_file", input: { path: "src/file.ts", content: "bounded" }, tool: "file.modify", capability: "repo.modify" },
-  { adapter: "codex", raw: "apply_patch", input: "*** Begin Patch\n*** Update File: src/file.ts\n*** End Patch", tool: "file.modify", capability: "repo.modify" },
-  { adapter: "codex", raw: "functions.apply_patch", input: { patch: "*** Begin Patch\n*** Update File: src/file.ts\n*** End Patch" }, tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "apply_patch", input: { command: "*** Begin Patch\n*** Update File: src/file.ts\n*** End Patch" }, tool: "file.modify", capability: "repo.modify" },
+  { adapter: "codex", raw: "functions.apply_patch", input: "*** Begin Patch\n*** Update File: src/file.ts\n*** End Patch", tool: "file.modify", capability: "repo.modify" },
   { adapter: "codex", raw: "Bash", input: { command: "git status --short" }, tool: "shell", capability: "shell.unclassified" },
   { adapter: "codex", raw: "exec_command", input: { command: "git status --short" }, tool: "shell", capability: "shell.unclassified" },
   { adapter: "codex", raw: "jhw_record", input: { db: "decisionLog", title: "bounded" }, tool: "notion.mutate", capability: "notion.mutate" },
@@ -152,8 +152,8 @@ describe("operation normalization", () => {
     ["Edit", { file_path: "private/file.ts", old_string: "old", new_string: "credential-value" }, "repo.modify", "file.modify", "medium"],
     ["Write", { file_path: "private/file.ts", content: "credential-value" }, "repo.modify", "file.modify", "medium"],
     ["NotebookEdit", { notebook_path: "private/file.ts" }, "repo.modify", "file.modify", "medium"],
-    ["apply_patch", "*** Begin Patch\n*** Update File: private/file.ts\n*** End Patch", "repo.modify", "file.modify", "medium"],
-    ["functions.apply_patch", { patch: "*** Begin Patch\n*** Update File: private/file.ts\n*** End Patch" }, "repo.modify", "file.modify", "medium"],
+    ["apply_patch", { command: "*** Begin Patch\n*** Update File: private/file.ts\n*** End Patch" }, "repo.modify", "file.modify", "medium"],
+    ["functions.apply_patch", "*** Begin Patch\n*** Update File: private/file.ts\n*** End Patch", "repo.modify", "file.modify", "medium"],
     ["mcp__filesystem__read_file", { path: "private/file.ts" }, "repo.inspect", "file.read", "low"],
     ["mcp__filesystem__write_file", { path: "private/file.ts", content: "credential-value" }, "repo.modify", "file.modify", "medium"],
     ["edit_file", { path: "private/file.ts", old_string: "old", new_string: "credential-value" }, "repo.modify", "file.modify", "medium"],
@@ -213,11 +213,29 @@ describe("operation normalization", () => {
     ["codex", "Edit", {}],
     ["codex", "Bash", { command: 7 }],
     ["codex", "jhw_record", { db: "unknown", title: "bounded" }],
+    ["codex", "apply_patch", "*** Add File: one.ts"],
+    ["codex", "apply_patch", { patch: "*** Add File: one.ts" }],
+    ["codex", "apply_patch", { command: "*** Add File: one.ts", explanation: "unsupported envelope" }],
+    ["codex", "functions.apply_patch", { patch: "*** Add File: one.ts" }],
+    ["codex", "functions.apply_patch", { command: "*** Add File: one.ts" }],
     ["codex", "apply_patch", { patch: 7 }],
+    ["codex", "apply_patch", { command: 7 }],
+    ["codex", "apply_patch", { patch: "*** Add File: one.ts", command: "*** Add File: other.ts" }],
+    ["codex", "functions.apply_patch", { patch: "*** Add File: one.ts", command: "*** Add File: one.ts" }],
     ["claude", "Edit", { path: "src/file.ts", old_string: "a", new_string: "b" }],
   ] as const)("fails closed for malformed recognized codec %s/%s", async (adapter, raw, input) => {
     await expect(normalizeOperation(event({ adapter, tool_name: raw, tool_input: input }), context, KEY))
       .rejects.toMatchObject({ code: "invalid_tool_input" } satisfies Partial<OperationNormalizationError>);
+  });
+
+  it("binds the complete Codex native patch command and its targets", async () => {
+    const patch = "*** Begin Patch\n*** Update File: src/file.ts\n-old\n+bounded\n*** End Patch";
+    const original = event({ tool_name: "apply_patch", tool_input: { command: patch } });
+    expect(resolveGuardTool("codex", "apply_patch", original.tool_input).mutation_targets).toEqual(["src/file.ts"]);
+    const normalized = await normalizeOperation(original, context, KEY);
+    expect(normalized).toMatchObject({ tool: "file.modify", requirements: [{ capability: "repo.modify", resource: context.repository }] });
+    const changed = await normalizeOperation(event({ tool_name: "apply_patch", tool_input: { command: patch.replace("bounded", "changed") } }), context, KEY);
+    expect(changed.digest).not.toBe(normalized.digest);
   });
 
   it("rejects replaying a genuine resolution against different raw input", async () => {

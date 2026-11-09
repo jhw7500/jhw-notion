@@ -14,6 +14,7 @@ const logicalConfigFile = configFile;
 // back up, lock, or open transactions; bootstrap is installed before wiring.
 const planning = operation.startsWith("check-");
 const hookAdapter = operation.includes("-claude-hooks") ? "claude" : "codex";
+const GUARD_POLICY_BYTES = Buffer.from('{"version":1,"mode":"observe"}\n', "utf8");
 
 const CHANGED = 0;
 const UNCHANGED = 3;
@@ -488,6 +489,58 @@ const CONTROL_HOOK_LINK_FINALIZABLE_STAGES = new Set([
 ]);
 let transactionParentAnchor;
 
+function guardPolicyTransition() {
+  const match = /^(absent|observe):(observe)$/.exec(transactionEvidence ?? "");
+  return match ? { current: match[1], target: match[2] } : undefined;
+}
+
+function assertTrustedGuardPolicyLocation({ allowMissing = false, requireTarget = false } = {}) {
+  if (!process.env.HOME || !path.isAbsolute(process.env.HOME)) throw new Error("missing guard policy HOME");
+  const home = path.resolve(process.env.HOME);
+  const expected = path.join(home, ".config", "jhw-control", "guard-policy.json");
+  if (path.resolve(logicalConfigFile) !== expected) throw new Error("invalid guard policy path");
+  if (allowMissing) {
+    try {
+      fs.lstatSync(logicalConfigFile);
+    } catch (cause) {
+      if (cause?.code === "ENOENT") return false;
+      throw cause;
+    }
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const root = path.parse(home).root;
+  const relative = path.relative(root, path.dirname(expected)).split(path.sep).filter(Boolean);
+  let current = root;
+  for (const part of relative) {
+    current = path.join(current, part);
+    let info;
+    try {
+      info = fs.lstatSync(current);
+    } catch (cause) {
+      if (allowMissing && cause?.code === "ENOENT") return false;
+      throw cause;
+    }
+    const stickyRootDirectory = info.uid === 0 && (info.mode & 0o1000) !== 0;
+    const privateNamespace = current === home || current.startsWith(`${home}${path.sep}`);
+    if (info.isSymbolicLink() || !info.isDirectory() || fs.realpathSync(current) !== current ||
+        (uid !== undefined && (privateNamespace ? info.uid !== uid : info.uid !== uid && info.uid !== 0)) ||
+        ((info.mode & 0o022) !== 0 && !stickyRootDirectory) ||
+        (requireTarget && current === path.dirname(expected) && (info.mode & 0o200) === 0)) {
+      throw new Error("unsafe guard policy parent");
+    }
+  }
+  return true;
+}
+
+function exactGuardPolicyState(file = configFile) {
+  const info = lstatMaybe(file);
+  if (!info) return "absent";
+  const uid = typeof process.getuid === "function" ? process.getuid() : info.uid;
+  if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || info.nlink !== 1 ||
+      (info.mode & 0o7777) !== 0o600) return "unsafe";
+  return fs.readFileSync(file).equals(GUARD_POLICY_BYTES) ? "observe" : "unsafe";
+}
+
 function anchorHookTransactionPaths() {
   const logicalParent = path.dirname(path.resolve(logicalConfigFile));
   const parentInfo = fs.lstatSync(logicalParent);
@@ -621,6 +674,9 @@ function readHookManifest(directory) {
       !manifest.artifacts.every((name) => typeof name === "string" && HOOK_TRANSACTION_KNOWN.has(name) && name !== "manifest.json") ||
       new Set(manifest.artifacts).size !== manifest.artifacts.length || !objectMap(manifest.identities)) {
     throw new Error("invalid hook manifest");
+  }
+  if (operation.includes("guard-policy") && manifest.operation !== "guard-policy") {
+    throw new Error("invalid Guard policy manifest operation");
   }
   return manifest;
 }
@@ -908,6 +964,64 @@ function registerCodexHooksTransaction() {
   }
 }
 
+function checkGuardPolicy() {
+  const transition = guardPolicyTransition();
+  if (!transition) return FOREIGN;
+  if (!assertTrustedGuardPolicyLocation({ allowMissing: true })) {
+    return transition.current === "absent" ? CHANGED : FOREIGN;
+  }
+  return exactGuardPolicyState(logicalConfigFile) === transition.current ? CHANGED : FOREIGN;
+}
+
+async function checkGuardPolicyTarget() {
+  const transition = guardPolicyTransition();
+  if (!transition) return FOREIGN;
+  assertTrustedGuardPolicyLocation({ requireTarget: true });
+  // Validate the next environmentless hook's whole private source before any
+  // policy/hook transaction. The candidate editor owns these compiled modules;
+  // repositoryRoot may still hold an older checkout or retained installation.
+  const [{ withPrivateControlDirectory, parsePrivateControlCoordinates }, { loadControlConfig }] = await Promise.all([
+    import(new URL("../mcp-server/dist/control/private-control-config.js", import.meta.url)),
+    import(new URL("../mcp-server/dist/control/config.js", import.meta.url)),
+  ]);
+  const coordinates = withPrivateControlDirectory(process.env.HOME, reader =>
+    parsePrivateControlCoordinates(reader.read("control.env", 16 * 1024)));
+  loadControlConfig(coordinates);
+  return exactGuardPolicyState(logicalConfigFile) === transition.current ? CHANGED : FOREIGN;
+}
+
+function registerGuardPolicyTransaction() {
+  const transition = guardPolicyTransition();
+  if (!transition) return FOREIGN;
+  assertTrustedGuardPolicyLocation();
+  let directory;
+  let manifest;
+  try {
+    directory = hookTransactionDirectory({ empty: true });
+    syncDirectory(path.dirname(configFile));
+    manifest = newHookManifest("guard-policy");
+    writeHookManifest(directory, manifest, { initial: true });
+    const capture = captureOriginal(directory, manifest);
+    if (capture.status !== CHANGED) return capture.status;
+    const capturedState = capture.current.exists
+      ? exactGuardPolicyState(transactionFile(directory, "captured-live"))
+      : "absent";
+    if (capturedState !== transition.current) {
+      return restoreCapturedOriginal(directory, manifest, "foreign-restored") === CHANGED ? FOREIGN : CAS_MISMATCH;
+    }
+    if (capturedState === transition.target) {
+      return restoreCapturedOriginal(directory, manifest, "unchanged-restored") === CHANGED ? UNCHANGED : CAS_MISMATCH;
+    }
+    writeTransactionArtifact(directory, manifest, "published", GUARD_POLICY_BYTES);
+    writeTransactionArtifact(directory, manifest, "published-ready", GUARD_POLICY_BYTES, 0o600);
+    manifest.published = hookIdentity(fs.lstatSync(transactionFile(directory, "published-ready")));
+    markHookTransaction(directory, manifest, "prepared");
+    return linkHookState(transactionFile(directory, "published-ready"), directory, manifest, "activated");
+  } catch {
+    return recoverCaptureOrActivationError(directory);
+  }
+}
+
 function unregisterCodexHooksTransaction() {
   let directory;
   let manifest;
@@ -1058,6 +1172,7 @@ function inspectCodexHooksTransaction() {
     candidate: manifest.candidate,
     deleteIntent: manifest.deleteIntent,
     activationTo: manifest.activationTo,
+    finalizeFrom: manifest.finalizeFrom,
   })}\n`);
   return CHANGED;
 }
@@ -1874,8 +1989,15 @@ try {
     "inspect-control-hook-link-transaction",
     "finalize-control-hook-link-transaction",
   ]);
+  const guardPolicyOperations = new Set([
+    "register-guard-policy-transaction",
+    "rollback-guard-policy-transaction",
+    "inspect-guard-policy-transaction",
+    "finalize-guard-policy-transaction",
+  ]);
   if (operation.endsWith("-codex-hooks-transaction") || operation.endsWith("-claude-hooks-transaction") ||
-      controlHookLinkOperations.has(operation)) {
+      controlHookLinkOperations.has(operation) || guardPolicyOperations.has(operation)) {
+    if (guardPolicyOperations.has(operation)) assertTrustedGuardPolicyLocation();
     anchorHookTransactionPaths();
   }
   if (["verify-stdio","verify-opencode","verify-codex","verify-claude-hooks","verify-codex-hooks"].includes(operation)) verifyManagedConfiguration();
@@ -1887,6 +2009,8 @@ try {
   if (operation === "check-opencode") { inspectOpenCodeRegistration(); process.exit(CHANGED); }
   if (operation === "check-codex") { inspectCodexRegistration(); process.exit(CHANGED); }
   if (operation === "check-codex-hooks" || operation === "check-claude-hooks") checkCodexHooks();
+  if (operation === "check-guard-policy") process.exit(checkGuardPolicy());
+  if (operation === "check-guard-policy-target") process.exit(await checkGuardPolicyTarget());
   if (operation === "register-stdio") registerStdio();
   if (operation === "unregister-stdio") unregisterStdio();
   if (operation === "register-opencode") registerOpenCode();
@@ -1903,6 +2027,10 @@ try {
   if (operation === "rollback-claude-hooks-transaction") process.exit(rollbackCodexHooksTransaction());
   if (operation === "inspect-claude-hooks-transaction") process.exit(inspectCodexHooksTransaction());
   if (operation === "finalize-claude-hooks-transaction") process.exit(finalizeCodexHooksTransaction());
+  if (operation === "register-guard-policy-transaction") process.exit(registerGuardPolicyTransaction());
+  if (operation === "rollback-guard-policy-transaction") process.exit(rollbackCodexHooksTransaction());
+  if (operation === "inspect-guard-policy-transaction") process.exit(inspectCodexHooksTransaction());
+  if (operation === "finalize-guard-policy-transaction") process.exit(finalizeCodexHooksTransaction());
   if (controlHookLinkOperations.has(operation)) {
     const status = operation === "remove-control-hook-link-transaction" ? removeControlHookLinkTransaction() :
       operation === "inspect-control-hook-link-transaction" ? inspectControlHookLinkTransaction() :

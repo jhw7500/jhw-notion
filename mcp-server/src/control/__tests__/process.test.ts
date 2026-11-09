@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,9 +7,84 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 
 import { loadControlConfig } from "../config.js";
-import { ProcessRunner } from "../process.js";
+import { createObserveJournalLock, MutationLock, ProcessRunner } from "../process.js";
 
 describe("control process boundary", () => {
+  it("uses a dedicated strict bounded observe-journal lock profile", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-observe-lock-"));
+    const stateDir = join(root, "state");
+    try {
+      await createObserveJournalLock(stateDir).runInStateDirectory(async () => undefined);
+      const info = await lstat(join(stateDir, "guard-observe-journal.lock"));
+      expect(info.isFile()).toBe(true);
+      expect(info.nlink).toBe(1);
+      expect(info.uid).toBe(process.getuid!());
+      expect(info.mode & 0o7777).toBe(0o600);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("tries every strict directory handle close and surfaces the first normal-path close failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-observe-close-"));
+    const stateDir = join(root, "state");
+    const closeFailure = new Error("injected strict directory close failure");
+    const closed: number[] = [];
+    const runtime = {
+      spawn: () => {
+        const child = Object.assign(new EventEmitter(), { kill: vi.fn(() => true) });
+        queueMicrotask(() => child.emit("close", 0));
+        return child;
+      },
+    };
+    try {
+      const lock = new MutationLock({ stateDir }, {}, runtime, {}, {
+        lockFileName: "guard-observe-journal.lock",
+        waitSeconds: 5,
+        strictExistingStateDirectory: true,
+        strictExistingLockFileMode: true,
+        strictCurrentUserPrivateState: true,
+        closeStrictDirectoryHandle: async (handle) => {
+          closed.push(handle.fd);
+          await handle.close();
+          if (closed.length === 1) throw closeFailure;
+        },
+      });
+
+      await expect(lock.runInStateDirectory(async () => "completed")).rejects.toBe(closeFailure);
+      expect(closed.length).toBeGreaterThan(1);
+      expect(new Set(closed).size).toBe(closed.length);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a primary setup failure while still attempting every strict directory close", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-observe-close-primary-"));
+    const stateDir = join(root, "state");
+    const closed: number[] = [];
+    try {
+      const lock = new MutationLock({ stateDir }, {}, { spawn: () => { throw new Error("spawn failed"); } }, {}, {
+        lockFileName: "guard-observe-journal.lock",
+        waitSeconds: 5,
+        strictExistingStateDirectory: true,
+        strictExistingLockFileMode: true,
+        strictCurrentUserPrivateState: true,
+        closeStrictDirectoryHandle: async (handle) => {
+          closed.push(handle.fd);
+          await handle.close();
+          if (closed.length === 1) throw new Error("secondary close failure");
+        },
+      });
+
+      await expect(lock.runInStateDirectory(async () => "must-not-run")).rejects.toMatchObject({
+        code: "LOCK_SPAWN_FAILED",
+      });
+      expect(closed.length).toBeGreaterThan(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it("never includes secret environment values in a failed command", async () => {
     const runner = new ProcessRunner({ GH_PROJECT_TOKEN: "secret-project-token" });
     const error = await runner

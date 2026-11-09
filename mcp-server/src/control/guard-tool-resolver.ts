@@ -65,10 +65,11 @@ const pathWriteInput = exactAuthorityCoordinates(
   { path: z.string().min(1), content: z.string() },
   ["path"],
 );
-const patchInput = z.union([
-  z.string().min(1),
-  exactAuthorityCoordinates({ patch: z.string().min(1) }, []),
-]);
+// Native Codex hook inputs normalize apply_patch to { command }; the current
+// namespaced FREEFORM tool surface supplies its raw string directly. These are
+// distinct exact identities, not interchangeable compatibility envelopes.
+const nativePatchInput = z.object({ command: z.string().min(1) }).strict();
+const freeformPatchInput = z.string().min(1);
 const shellInput = exactAuthorityCoordinates({ command: z.string().min(1) }, []);
 const notionInput = exactAuthorityCoordinates({ db: notionDatabaseId }, ["db"]);
 const notionNoteInput = exactAuthorityCoordinates({ title: z.string().min(1).optional() }, []);
@@ -105,8 +106,8 @@ const toolDefinitions = Object.freeze({
   [key("codex", "NotebookEdit")]: { family: "file_modify", codec: notebookEditInput, pathField: "notebook_path" },
   [key("codex", "edit_file")]: { family: "file_modify", codec: pathEditInput, pathField: "path" },
   [key("codex", "mcp__filesystem__write_file")]: { family: "file_modify", codec: pathWriteInput, pathField: "path" },
-  [key("codex", "apply_patch")]: { family: "file_modify", codec: patchInput, patch: true },
-  [key("codex", "functions.apply_patch")]: { family: "file_modify", codec: patchInput, patch: true },
+  [key("codex", "apply_patch")]: { family: "file_modify", codec: nativePatchInput, patch: true },
+  [key("codex", "functions.apply_patch")]: { family: "file_modify", codec: freeformPatchInput, patch: true },
   [key("codex", "Bash")]: { family: "shell", codec: shellInput },
   [key("codex", "exec_command")]: { family: "shell", codec: shellInput },
   [key("codex", "jhw_record")]: { family: "notion_mutation", codec: notionInput, notionDatabase: "input" },
@@ -138,7 +139,7 @@ function patchTargets(input: JsonValue): string[] | undefined {
   const patch = typeof input === "string"
     ? input
     : input !== null && typeof input === "object" && !Array.isArray(input)
-      ? input.patch
+      ? input.patch ?? input.command
       : undefined;
   if (typeof patch !== "string") return undefined;
   const targets: string[] = [];

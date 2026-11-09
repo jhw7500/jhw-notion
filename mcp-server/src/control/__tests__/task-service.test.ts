@@ -138,6 +138,10 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     }),
     assertStartReady: vi.fn().mockResolvedValue(undefined),
     cleanupReleased: vi.fn().mockResolvedValue({ removed: true, recovered: true, lifecycle: "removed" }),
+    releasedCleanupStatus: vi.fn().mockResolvedValue({
+      target: "matched",
+      snapshot_sha256: "f".repeat(64),
+    }),
     inspect: vi.fn().mockResolvedValue({
       path: worktreePath,
       repository_path: startInput.repository_path,
@@ -157,6 +161,7 @@ async function taskFixture(sensitiveData?: SensitiveDataPolicy) {
     claimsMappedToCheckout: vi.fn().mockResolvedValue(new Set<string>()),
   };
   const registry = {
+    assertReadyReadOnly: vi.fn().mockResolvedValue("e".repeat(40)),
     headRegularBlobObjectId: vi.fn().mockResolvedValue(activeClaim.source_task_revision),
     transact: vi.fn(async (_message: string, mutate: () => Promise<{ paths: readonly string[] }>) => {
       await mutate();
@@ -348,7 +353,7 @@ describe("TaskService", () => {
   });
 
   it("returns none when neither session nor worktree selects an active Claim", async () => {
-    const { tasks, claims, worktrees } = await taskFixture();
+    const { tasks, claims, worktrees, fixture } = await taskFixture();
     claims.listActiveClaims.mockResolvedValue([]);
     worktrees.claimsMappedToCheckout.mockResolvedValue(new Set());
 
@@ -511,7 +516,7 @@ describe("TaskService", () => {
   });
 
   it("rejects an incoherent completed release before reading or mutating authority", async () => {
-    const { tasks, claims, worktrees, registry } = await taskFixture();
+    const { tasks, claims, worktrees, registry, fixture } = await taskFixture();
 
     await expect(tasks.finish({
       task_id: TASK_ID,
@@ -907,7 +912,6 @@ describe("TaskService", () => {
       validation_summary: "tests: pass",
     };
     claims.getClaimHistory.mockResolvedValue(history);
-
     await expect(tasks.recover({
       task_id: activeClaim.task_id,
       claim_id: activeClaim.claim_id,
@@ -927,6 +931,47 @@ describe("TaskService", () => {
       action: { kind: "cleanup" },
     })).rejects.toMatchObject({ code: "WORKTREE_ACTIVE_SUCCESSOR" });
     expect(worktrees.cleanupReleased).toHaveBeenCalledTimes(1);
+  });
+
+  it("binds proof cleanup to Registry/history and rejects an active successor at the final fence", async () => {
+    const { tasks, claims, worktrees, registry, fixture } = await taskFixture();
+    const history = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:35:56.789Z",
+      status: "completed" as const,
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    };
+    claims.getClaimHistory.mockResolvedValue(history);
+    await mkdir(join(fixture.registryDir, "repositories"), { recursive: true });
+    await writeFile(join(fixture.registryDir, "repositories", `${history.repo_id}.yaml`), `${JSON.stringify({
+      id: history.repo_id,
+      github_node_id: "R_wlan",
+      slug: REPOSITORY_SLUG,
+    })}\n`, "utf8");
+    claims.getActive.mockResolvedValueOnce(undefined).mockResolvedValueOnce({
+      ...activeClaim,
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+    });
+    worktrees.cleanupReleased.mockImplementationOnce(async (_history, options) => {
+      await options?.revalidate?.();
+      return { removed: true, recovered: false, lifecycle: "removed" };
+    });
+
+    await expect(tasks.recover({
+      task_id: activeClaim.task_id,
+      claim_id: activeClaim.claim_id,
+      action: { kind: "cleanup", cleanup_proof: "/private/proof.json" },
+    })).rejects.toMatchObject({ code: "WORKTREE_ACTIVE_SUCCESSOR" });
+    expect(registry.assertReadyReadOnly).toHaveBeenCalledTimes(2);
+    expect(worktrees.cleanupReleased).toHaveBeenCalledWith(history, expect.objectContaining({
+      proofPath: "/private/proof.json",
+      registryHead: "e".repeat(40),
+      historySha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      repositorySlug: REPOSITORY_SLUG,
+      revalidate: expect.any(Function),
+    }));
   });
 
   it("repairs only an exact released mapping without invoking Claim mutation", async () => {
@@ -1199,12 +1244,134 @@ describe("TaskService", () => {
   });
 
   it("reports inactive recovery with no Handoff when Claim history is absent", async () => {
-    const { tasks } = await taskFixture();
+    const { tasks, registry } = await taskFixture();
 
     await expect(tasks.recoveryDiscovery(TASK_ID)).resolves.toEqual({
       state: "inactive",
       handoff: { available: false },
+      released: { available: false },
     });
+    expect(registry.assertReadyReadOnly).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects Registry movement during an inactive history-not-found discovery", async () => {
+    const { tasks, registry } = await taskFixture();
+    registry.assertReadyReadOnly.mockResolvedValueOnce("e".repeat(40)).mockResolvedValueOnce("f".repeat(40));
+
+    await expect(tasks.recoveryDiscovery(TASK_ID)).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
+  });
+
+  it("rejects Registry movement during an inactive Handoff discovery", async () => {
+    const { tasks, claims, registry, fixture } = await taskFixture();
+    const relativePath = `handoffs/${TASK_ID}/${CLAIM_ID}.md`;
+    const latest = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:40:00.000Z",
+      status: "handoff" as const,
+      handoff_path: relativePath,
+    };
+    await mkdir(join(fixture.registryDir, "handoffs", TASK_ID), { recursive: true });
+    await writeFile(join(fixture.registryDir, relativePath), buildHandoff({
+      task_id: TASK_ID,
+      source_task_revision: activeClaim.source_task_revision,
+      claim_id: CLAIM_ID,
+      generated_at: latest.released_at,
+      progress: "bounded progress",
+    }), "utf8");
+    claims.latestClaimHistory.mockResolvedValue(latest);
+    claims.getClaimHistory.mockResolvedValue(latest);
+    registry.assertReadyReadOnly.mockResolvedValueOnce("e".repeat(40)).mockResolvedValueOnce("f".repeat(40));
+
+    await expect(tasks.recoveryDiscovery(TASK_ID)).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
+  });
+
+  it("discovers the exact latest released generation without exposing private Claim fields", async () => {
+    const { tasks, claims, worktrees, fixture } = await taskFixture();
+    const latest = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:40:00.000Z",
+      status: "completed" as const,
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    };
+    claims.latestClaimHistory.mockResolvedValue(latest);
+    claims.getClaimHistory.mockResolvedValue(latest);
+    await mkdir(join(fixture.registryDir, "repositories"), { recursive: true });
+    await writeFile(join(fixture.registryDir, "repositories", `${latest.repo_id}.yaml`), `${JSON.stringify({
+      id: latest.repo_id, github_node_id: "R_wlan", slug: REPOSITORY_SLUG,
+    })}\n`, "utf8");
+
+    const result = await tasks.recoveryDiscovery(TASK_ID);
+
+    expect(result).toEqual({
+      state: "inactive",
+      handoff: { available: false },
+      released: {
+        available: true,
+        unique_latest: true,
+        claim_id: CLAIM_ID,
+        status: "completed",
+        released_at: latest.released_at,
+        host: activeClaim.host,
+        branch: activeClaim.branch,
+        worktree_ref: activeClaim.worktree_ref,
+        repository_slug: REPOSITORY_SLUG,
+        registry_head: "e".repeat(40),
+        history_sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        cleanup: { target: "matched", snapshot_sha256: "f".repeat(64) },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain(activeClaim.session_id);
+    expect(JSON.stringify(result)).not.toContain(activeClaim.project_id);
+    expect(JSON.stringify(result)).not.toContain(activeClaim.repo_id);
+    expect(claims.getClaimHistory).toHaveBeenCalledWith(TASK_ID, CLAIM_ID);
+    expect(worktrees.releasedCleanupStatus).toHaveBeenCalledWith(latest);
+  });
+
+  it("rejects a latest-history lookup that changes generation before cleanup discovery", async () => {
+    const { tasks, claims, worktrees } = await taskFixture();
+    claims.latestClaimHistory.mockResolvedValue({
+      ...activeClaim,
+      released_at: "2026-08-13T12:40:00.000Z",
+      status: "completed",
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    });
+    claims.getClaimHistory.mockResolvedValue({
+      ...activeClaim,
+      claim_id: "clm-0198aabb-ccdd-7eef-8abc-0123456789ac",
+      released_at: "2026-08-13T12:41:00.000Z",
+      status: "completed",
+      outcome: "other",
+      head_sha: "b".repeat(40),
+      validation_summary: "tests: pass",
+    });
+
+    await expect(tasks.recoveryDiscovery(TASK_ID)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(worktrees.releasedCleanupStatus).not.toHaveBeenCalled();
+  });
+
+  it("rejects Registry movement after released cleanup inspection and Repository resolution", async () => {
+    const { tasks, claims, registry, fixture } = await taskFixture();
+    const latest = {
+      ...activeClaim,
+      released_at: "2026-08-13T12:40:00.000Z",
+      status: "completed" as const,
+      outcome: "done",
+      head_sha: "a".repeat(40),
+      validation_summary: "tests: pass",
+    };
+    claims.latestClaimHistory.mockResolvedValue(latest);
+    claims.getClaimHistory.mockResolvedValue(latest);
+    await mkdir(join(fixture.registryDir, "repositories"), { recursive: true });
+    await writeFile(join(fixture.registryDir, "repositories", `${latest.repo_id}.yaml`), `${JSON.stringify({
+      id: latest.repo_id, github_node_id: "R_wlan", slug: REPOSITORY_SLUG,
+    })}\n`, "utf8");
+    registry.assertReadyReadOnly.mockResolvedValueOnce("e".repeat(40)).mockResolvedValueOnce("f".repeat(40));
+
+    await expect(tasks.recoveryDiscovery(TASK_ID)).rejects.toMatchObject({ code: "REGISTRY_MOVED_DURING_READ" });
   });
 
   it("uses only the exact latest Handoff generation as resume context", async () => {

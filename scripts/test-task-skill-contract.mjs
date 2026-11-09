@@ -99,6 +99,21 @@ const inactiveDiscoveryEnvelope = {
     task_id: targetTaskId,
     state: "inactive",
     handoff: { available: false },
+    released: { available: false },
+  },
+};
+const releasedDiscoveryEnvelope = {
+  command: "task recover",
+  result: {
+    kind: "resolved", task_id: targetTaskId, state: "inactive", handoff: { available: false },
+    released: {
+      available: true, unique_latest: true, repository_slug: "example/control", claim_id: startedClaimId,
+      status: "completed", released_at: "2026-08-26T00:00:00.000Z", host: "build-host",
+      branch: "task/0123456789ab-created", worktree_ref: worktreeRef,
+      registry_head: "a".repeat(40), history_sha256: "b".repeat(64),
+      cleanup: { target: "matched", snapshot_sha256: "c".repeat(64), source_ref: "refs/heads/main",
+        source_head: "d".repeat(40), worktree_head: "e".repeat(40) },
+    },
   },
 };
 const activeDiscoveryEnvelope = {
@@ -799,7 +814,7 @@ const hostOnlyLifecycleCounts = new Map([
   ["promote", 1],
   ["status", 1],
   ["handoff", 1],
-  ["recover", 6],
+  ["recover", 7],
   ["assert-owner", 1],
 ]);
 
@@ -842,6 +857,16 @@ async function assertRecoveryDiscoveryConsumerContract(label, markdown) {
   assert.equal(inactiveResult.task_id, targetTaskId);
   assert.deepEqual(inactiveResult.handoff, { available: false });
 
+  assert.deepEqual(inactiveResult.released, { available: false });
+  const released = await runRecoveryDiscovery(markdown, releasedDiscoveryEnvelope);
+  assert.equal(released.exitCode, 0);
+  assert.deepEqual(released.calls, [["preflight"], expectedRecoveryDiscoveryArgs(released.checkoutRoot)]);
+  assert.deepEqual(released.rawCalls, []);
+  assert.deepEqual(JSON.parse(released.stdout).result.released, releasedDiscoveryEnvelope.result.released,
+    `${label}: released discovery preserves the frozen cleanup coordinates`);
+  assert.equal(released.calls.some((call) => call.includes("cleanup") || call.includes("takeover")), false,
+    `${label}: discovery does not authorize cleanup or a successor Claim`);
+
   const resumed = await runWorkflow(markdown, { name: "resume" });
   assert.equal(resumed.exitCode, 0);
   assert.deepEqual(resumed.calls, [
@@ -882,6 +907,10 @@ async function assertRecoveryDiscoveryConsumerContract(label, markdown) {
 }
 
 function assertHostOnlyLifecycleContract(label, markdown) {
+  assert.match(markdown, /"\$HOME\/\.local\/bin\/jhw-control-host" task recover[^\n]*--expect[^\n]*\\\n\s+--action cleanup --cleanup-proof <absolute-private-manifest\.json>/,
+    `${label}: historical cleanup must use the exact host with an explicit private proof`);
+  assert.ok(markdown.includes("cleanup.target") && markdown.includes("matched") && markdown.includes("historical-exact-patch-v1"),
+    `${label}: discovery evidence and the opt-in cleanup policy remain distinct`);
   assert.doesNotMatch(markdown, /(^|[^-])jhw-control task(?:\s|$)/m,
     `${label}: raw Task lifecycle invocation must not remain`);
   for (const [subcommand, expectedCount] of hostOnlyLifecycleCounts) {

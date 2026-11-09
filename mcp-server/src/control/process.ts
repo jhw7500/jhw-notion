@@ -1,8 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, type ChildProcess } from "node:child_process";
-import { constants } from "node:fs";
-import { type FileHandle } from "node:fs/promises";
-import { resolve } from "node:path";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, open, stat, type FileHandle } from "node:fs/promises";
+import { parse, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Readable } from "node:stream";
 import { z } from "zod";
@@ -500,6 +500,158 @@ export class ProcessRunner {
 const lockOpenFlags = constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW;
 const strictLockCreateFlags = lockOpenFlags | constants.O_EXCL;
 const existingLockOpenFlags = constants.O_RDWR | constants.O_NOFOLLOW;
+const strictDirectoryOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+
+function sameStableDirectory(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.mode === right.mode;
+}
+
+function sameStableFile(left: BigIntStats, right: BigIntStats): boolean {
+  return sameStableDirectory(left, right)
+    && left.nlink === right.nlink
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function assertStrictPrivateFile(info: BigIntStats, currentUid: bigint): void {
+  if (
+    !info.isFile()
+    || info.uid !== currentUid
+    || info.nlink !== 1n
+    || (info.mode & 0o7777n) !== 0o600n
+  ) {
+    throw new ControlError("UNSAFE_STATE_PATH", "Host lock is not current-user private state");
+  }
+}
+
+interface StrictDirectoryRecord {
+  handle: FileHandle;
+  parent?: FileHandle;
+  name: string;
+  snapshot: BigIntStats;
+  leaf: boolean;
+}
+
+interface StrictDirectoryChain {
+  verify(): Promise<void>;
+  close(): Promise<void>;
+}
+
+function assertStrictDirectory(info: BigIntStats, currentUid: bigint, leaf: boolean): void {
+  const stickyRootAncestor = !leaf && info.uid === 0n && (info.mode & 0o1000n) !== 0n;
+  if (
+    !info.isDirectory()
+    || (leaf ? info.uid !== currentUid : info.uid !== currentUid && info.uid !== 0n)
+    || (leaf ? (info.mode & 0o7777n) !== 0o700n : (info.mode & 0o022n) !== 0n && !stickyRootAncestor)
+  ) {
+    throw new ControlError("UNSAFE_STATE_PATH", "Host lock directory chain is unsafe");
+  }
+}
+
+async function openStrictDirectoryChain(
+  stateDir: string,
+  retainedDirectory: SecureStateDirectory,
+  closeHandle: (handle: FileHandle) => Promise<void>,
+): Promise<StrictDirectoryChain> {
+  const currentUidNumber = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (currentUidNumber === undefined) {
+    throw new ControlError("UNSAFE_STATE_PATH", "Current UID is unavailable for host lock state");
+  }
+  const currentUid = BigInt(currentUidNumber);
+  const target = resolve(stateDir);
+  const root = parse(target).root;
+  const components = relative(root, target).split(sep).filter(Boolean);
+  const records: StrictDirectoryRecord[] = [];
+  try {
+    const rootHandle = await open(root, strictDirectoryOpenFlags);
+    const rootSnapshot = await rootHandle.stat({ bigint: true });
+    records.push({ handle: rootHandle, name: root, snapshot: rootSnapshot, leaf: components.length === 0 });
+    assertStrictDirectory(rootSnapshot, currentUid, components.length === 0);
+    for (const [index, component] of components.entries()) {
+      const parent = records.at(-1)!.handle;
+      const handle = await open(`/proc/self/fd/${parent.fd}/${component}`, strictDirectoryOpenFlags);
+      const snapshot = await handle.stat({ bigint: true });
+      const leaf = index === components.length - 1;
+      records.push({ handle, parent, name: component, snapshot, leaf });
+      assertStrictDirectory(snapshot, currentUid, leaf);
+    }
+    const retained = await stat(`/proc/self/fd/${retainedDirectory.fd}`, { bigint: true });
+    const selected = records.at(-1)!.snapshot;
+    if (!sameStableDirectory(selected, retained)) {
+      throw new ControlError("UNSAFE_STATE_PATH", "Canonical host lock directory identity changed");
+    }
+
+    return {
+      async verify() {
+        for (const record of records) {
+          const descriptorInfo = await record.handle.stat({ bigint: true });
+          assertStrictDirectory(descriptorInfo, currentUid, record.leaf);
+          if (!sameStableDirectory(record.snapshot, descriptorInfo)) {
+            throw new ControlError("UNSAFE_STATE_PATH", "Retained host lock directory metadata changed");
+          }
+          const currentPath = record.parent === undefined
+            ? root
+            : `/proc/self/fd/${record.parent.fd}/${record.name}`;
+          const pathInfo = await lstat(currentPath, { bigint: true });
+          assertStrictDirectory(pathInfo, currentUid, record.leaf);
+          if (!sameStableDirectory(record.snapshot, pathInfo)) {
+            throw new ControlError("UNSAFE_STATE_PATH", "Canonical host lock directory path changed");
+          }
+        }
+        const currentRetained = await stat(`/proc/self/fd/${retainedDirectory.fd}`, { bigint: true });
+        if (!sameStableDirectory(records.at(-1)!.snapshot, currentRetained)) {
+          throw new ControlError("UNSAFE_STATE_PATH", "Pinned host lock directory identity changed");
+        }
+      },
+      async close() {
+        let firstFailure: unknown;
+        for (const record of [...records].reverse()) {
+          try {
+            await closeHandle(record.handle);
+          } catch (cause) {
+            firstFailure ??= cause;
+          }
+        }
+        if (firstFailure !== undefined) throw firstFailure;
+      },
+    };
+  } catch (cause) {
+    for (const record of [...records].reverse()) await record.handle.close().catch(() => undefined);
+    throw cause;
+  }
+}
+
+async function verifyStrictLockFile(
+  directory: SecureStateDirectory,
+  lockFile: FileHandle,
+  initial: BigIntStats,
+  lockFileName: string,
+): Promise<void> {
+  const currentUidNumber = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (currentUidNumber === undefined) {
+    throw new ControlError("UNSAFE_STATE_PATH", "Current UID is unavailable for host lock state");
+  }
+  const pathFile = await directory.openFile(lockFileName, existingLockOpenFlags);
+  try {
+    const [retained, current] = await Promise.all([
+      lockFile.stat({ bigint: true }),
+      pathFile.stat({ bigint: true }),
+    ]);
+    const currentUid = BigInt(currentUidNumber);
+    assertStrictPrivateFile(retained, currentUid);
+    assertStrictPrivateFile(current, currentUid);
+    if (!sameStableFile(initial, retained) || !sameStableFile(retained, current)) {
+      throw new ControlError("UNSAFE_STATE_PATH", "Host lock metadata changed during protected operation");
+    }
+  } finally {
+    await pathFile.close();
+  }
+}
 
 const LockHolderRecordSchema = z.object({
   version: z.literal(1),
@@ -587,6 +739,10 @@ export interface MutationLockOptions {
   strictExistingStateDirectory?: boolean;
   /** Refuse, rather than chmod-repair, an already-existing non-0600 lock file. */
   strictExistingLockFileMode?: boolean;
+  /** Observe-audit profile: require current-UID ownership and exact private modes. */
+  strictCurrentUserPrivateState?: boolean;
+  /** Test seam for proving bounded strict-chain cleanup failures. */
+  closeStrictDirectoryHandle?: (handle: FileHandle) => Promise<void>;
 }
 
 function acquisitionFailure(status: number | null, contendedReason?: string): ControlError {
@@ -699,7 +855,7 @@ export class MutationLock implements MutationLockPort {
   readonly #options: MutationLockOptions;
 
   constructor(
-    config: ControlConfig,
+    config: Pick<ControlConfig, "stateDir">,
     environment: NodeJS.ProcessEnv = process.env,
     runtime: MutationLockRuntime = productionLockRuntime,
     secureDirectoryHooks: SecureStateDirectoryHooks = {},
@@ -739,6 +895,9 @@ export class MutationLock implements MutationLockPort {
   ): Promise<T> {
     let directory: SecureStateDirectory | undefined;
     let lockFile: FileHandle | undefined;
+    let strictDirectoryChain: StrictDirectoryChain | undefined;
+    let strictLockSnapshot: BigIntStats | undefined;
+    let primaryFailure: unknown;
     const registryLock = (this.#options.lockFileName ?? "registry.lock") === "registry.lock";
     try {
       try {
@@ -747,6 +906,14 @@ export class MutationLock implements MutationLockPort {
           this.#secureDirectoryHooks,
           { strictExistingMode: this.#options.strictExistingStateDirectory },
         );
+        if (this.#options.strictCurrentUserPrivateState) {
+          strictDirectoryChain = await openStrictDirectoryChain(
+            this.#stateDir,
+            directory,
+            this.#options.closeStrictDirectoryHandle ?? ((handle) => handle.close()),
+          );
+          await strictDirectoryChain.verify();
+        }
         const lockFileName = this.#options.lockFileName ?? "registry.lock";
         let lockCreated = false;
         if (this.#options.strictExistingLockFileMode) {
@@ -772,6 +939,13 @@ export class MutationLock implements MutationLockPort {
           }
         } else {
           await lockFile.chmod(0o600);
+        }
+        if (this.#options.strictCurrentUserPrivateState) {
+          const currentUid = typeof process.getuid === "function" ? BigInt(process.getuid()) : undefined;
+          if (currentUid === undefined) throw new ControlError("UNSAFE_STATE_PATH", "Current UID is unavailable");
+          strictLockSnapshot = await lockFile.stat({ bigint: true });
+          assertStrictPrivateFile(strictLockSnapshot, currentUid);
+          await strictDirectoryChain!.verify();
         }
       } catch (cause) {
         if (cause instanceof ControlError && cause.code === "UNSAFE_STATE_PATH") throw cause;
@@ -815,8 +989,26 @@ export class MutationLock implements MutationLockPort {
         }
         throw cause;
       }
+      if (this.#options.strictCurrentUserPrivateState) {
+        const lockFileName = this.#options.lockFileName ?? "registry.lock";
+        await verifyStrictLockFile(directory, lockFile, strictLockSnapshot!, lockFileName);
+        await strictDirectoryChain!.verify();
+      }
       if (registryLock) await writeLockHolderRecord(lockFile, context);
-      return await callback(directory);
+      const result = await callback(directory);
+      if (this.#options.strictCurrentUserPrivateState) {
+        await verifyStrictLockFile(
+          directory,
+          lockFile,
+          strictLockSnapshot!,
+          this.#options.lockFileName ?? "registry.lock",
+        );
+      }
+      await strictDirectoryChain?.verify();
+      return result;
+    } catch (cause) {
+      primaryFailure = cause;
+      throw cause;
     } finally {
       let closeFailure: { cause: unknown } | undefined;
       try {
@@ -829,7 +1021,12 @@ export class MutationLock implements MutationLockPort {
       } catch (cause) {
         closeFailure ??= { cause };
       }
-      if (closeFailure) throw closeFailure.cause;
+      try {
+        await strictDirectoryChain?.close();
+      } catch (cause) {
+        closeFailure ??= { cause };
+      }
+      if (closeFailure && primaryFailure === undefined) throw closeFailure.cause;
     }
   }
 }
@@ -837,18 +1034,40 @@ export class MutationLock implements MutationLockPort {
 const intrinsicMutationLockRun = MutationLock.prototype.run;
 const intrinsicMutationLockRunInStateDirectory = MutationLock.prototype.runInStateDirectory;
 
-export type ProductionMutationLockProfile = "registry" | "board";
+export type ProductionMutationLockProfile = "registry" | "board" | "observe-journal";
 
 function productionMutationOptions(profile: ProductionMutationLockProfile): Readonly<MutationLockOptions> {
   if (profile === "registry") return Object.freeze({
     waitSeconds: 30,
     contendedReason: "registry_state_lock",
   });
+  if (profile === "observe-journal") return Object.freeze({
+    lockFileName: "guard-observe-journal.lock",
+    waitSeconds: 5,
+    strictExistingStateDirectory: true,
+    strictExistingLockFileMode: true,
+    strictCurrentUserPrivateState: true,
+  });
   return Object.freeze({
     lockFileName: "boards.lock",
     waitSeconds: 5,
     contendedReason: "board_state_lock",
   });
+}
+
+/** Dedicated bounded lock for mandatory observe-audit publication. */
+export function createObserveJournalLock(
+  stateDir: string,
+  environment: NodeJS.ProcessEnv = process.env,
+  secureDirectoryHooks: SecureStateDirectoryHooks = {},
+): MutationLock {
+  return new MutationLock(
+    { stateDir },
+    environment,
+    productionLockRuntime,
+    secureDirectoryHooks,
+    productionMutationOptions("observe-journal"),
+  );
 }
 
 /** Mints the only MutationLock provenance accepted by production Guard composition. */

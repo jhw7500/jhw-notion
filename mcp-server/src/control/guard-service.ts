@@ -50,6 +50,8 @@ import {
   guardJournalHostCoordinateForTesting,
   isDirectGuardJournal,
   type GuardJournalEvent,
+  type GuardObservation,
+  type GuardObservedDecisionAppendResult,
 } from "./guard-journal.js";
 import {
   GuardRequestStore,
@@ -172,22 +174,32 @@ function captureGuardRequestStore(store: GuardRequestStore | undefined): GuardRe
 }
 
 interface GuardJournalAuthority {
-  append(event: GuardJournalEvent): Promise<void>;
+  append(event: GuardJournalEvent, observation?: GuardObservation): Promise<void>;
+  appendObservedDecision(
+    event: GuardJournalEvent,
+    observation: GuardObservation,
+  ): Promise<GuardObservedDecisionAppendResult>;
 }
 
 const guardJournalAppend = GuardJournal.prototype.append;
+const guardJournalAppendObservedDecision = GuardJournal.prototype.appendObservedDecision;
 
 function captureGuardJournal(journal: GuardJournal | undefined): GuardJournalAuthority | undefined {
   if (!journal) return undefined;
   if (
     !isDirectGuardJournal(journal) ||
     Object.getPrototypeOf(journal) !== GuardJournal.prototype ||
-    journal.append !== guardJournalAppend
+    journal.append !== guardJournalAppend ||
+    journal.appendObservedDecision !== guardJournalAppendObservedDecision
   ) {
     return undefined;
   }
   return {
-    append: (event) => guardJournalAppend.call(journal, event),
+    append: (event, observation) => observation === undefined
+      ? guardJournalAppend.call(journal, event)
+      : guardJournalAppend.call(journal, event, observation),
+    appendObservedDecision: (event, observation) =>
+      guardJournalAppendObservedDecision.call(journal, event, observation),
   };
 }
 
@@ -595,6 +607,7 @@ export class GuardService {
   private readonly requestStore: GuardRequestStoreAuthority | undefined;
   private readonly journalConfigured: boolean;
   private readonly decisionJournal: GuardJournalAuthority | undefined;
+  private readonly observedDenialCodes = new WeakMap<GuardDecision, GuardDenyCode>();
 
   constructor(private readonly options: GuardServiceOptions) {
     this.mode = GuardEvaluationModeSchema.safeParse(options.mode ?? "enforce").data;
@@ -1196,9 +1209,6 @@ export class GuardService {
     decision: GuardDecision,
     context: GuardDecisionJournalContext,
   ): Promise<GuardDecision> {
-    if (!this.decisionJournal) {
-      return this.journalConfigured ? this.withJournalWarning(decision) : decision;
-    }
     const operation = context.operation;
     const claim = context.claim;
     const event = context.event;
@@ -1234,11 +1244,31 @@ export class GuardService {
         ...(decision.reason ? { error_reason: decision.reason } : {}),
       } : {}),
     };
+    const observedCode = this.observedDenialCodes.get(decision);
+    const observation: GuardObservation | undefined = decision.decision === "ALLOW"
+      ? decision.observed_decision === "PERMIT_REQUIRED"
+        ? { observed_decision: "PERMIT_REQUIRED" }
+        : decision.observed_decision === "DENY" && observedCode !== undefined
+          ? { observed_decision: "DENY", decision_code: observedCode }
+          : undefined
+      : undefined;
+    const requiresObservation = decision.decision === "ALLOW" && decision.observed_decision !== undefined;
+    if (!this.decisionJournal || (requiresObservation && observation === undefined)) {
+      return requiresObservation
+        ? this.deny("GUARD_UNAVAILABLE", claim, operation)
+        : this.journalConfigured ? this.withJournalWarning(decision) : decision;
+    }
     try {
+      if (observation !== undefined) {
+        const result = await this.decisionJournal.appendObservedDecision(journalEvent, observation);
+        return result.legacy_journal_warning ? this.withJournalWarning(decision) : decision;
+      }
       await this.decisionJournal.append(journalEvent);
       return decision;
     } catch {
-      return this.withJournalWarning(decision);
+      return requiresObservation
+        ? this.deny("GUARD_UNAVAILABLE", claim, operation)
+        : this.withJournalWarning(decision);
     }
   }
 
@@ -1348,7 +1378,7 @@ export class GuardService {
   ): GuardDecision {
     const code = GuardDenyCodeSchema.parse(codeInput);
     if (this.mode === "observe" && !hardObserveCodes.has(code)) {
-      return GuardDecisionSchema.parse({
+      const observed = GuardDecisionSchema.parse({
         decision: "ALLOW",
         operation_id: operation?.operation_id ?? newOperationId(),
         summary: operation?.summary ?? summaryByCode[code],
@@ -1356,6 +1386,8 @@ export class GuardService {
         observed_decision: "DENY",
         ...(journalWarning ? { journal_warning: journalWarning } : {}),
       });
+      this.observedDenialCodes.set(observed, code);
+      return observed;
     }
     return GuardDecisionSchema.parse({
       decision: "DENY",

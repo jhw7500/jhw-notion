@@ -28,7 +28,7 @@ const SOURCE_INPUTS = [
   'mcp-server/src', 'mcp-server/scripts', 'skills',
   'scripts/sync-codex-skills.mjs', 'scripts/jhw-control-hook',
   'scripts/runtime-safety.mjs', 'scripts/runtime-store.mjs',
-  'scripts/runtime-entry.mjs', 'scripts/runtime-deploy.mjs', 'scripts/install-config.mjs', 'scripts/install-wiring.sh',
+  'scripts/runtime-entry.mjs', 'scripts/runtime-deploy.mjs', 'scripts/runtime-prune.mjs', 'scripts/runtime-guard.mjs', 'scripts/install-config.mjs', 'scripts/install-wiring.sh',
   'scripts/jhw-runtime-entry', 'scripts/jhw-runtime-control', 'scripts/jhw-runtime-hook',
 ];
 const EXCLUDED_SOURCE_NAMES = ['.git', '.ai', '.superpowers', 'node_modules', 'dist'];
@@ -482,6 +482,10 @@ function currentIn(runtime, repositoryRoot) {
   const manifest = activationIn(runtime, repositoryRoot, before.target.slice('activations/'.length));
   if (canonical(before) !== canonical(observation(runtime))) fail('DEPLOY_CURRENT_CHANGED');
   return { activationId: manifest.activationId, releaseId: manifest.releaseId, predecessorActivationId: manifest.predecessorActivationId, observation: before };
+}
+/** Strict frozen current-pointer shape shared with Guard transition evidence. */
+export function isActivationSnapshot(value) {
+  return value !== null && validCurrent(value);
 }
 export function readActivation({ repositoryRoot }) {
   return withStore(repositoryRoot, false, runtime => currentIn(runtime, repositoryRoot));

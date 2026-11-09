@@ -320,6 +320,12 @@ export const ERROR_REASONS = [
   "repair_checkout_unsafe",
   "repair_lifecycle_uncertain",
   "repair_state_changed",
+  // WORKTREE_EQUIVALENCE_UNSAFE — historical exact-patch proof axes.
+  "scope_unsupported",
+  "patch_mismatch",
+  "integration_untrusted",
+  "backup_invalid",
+  "snapshot_changed",
   // BOARD_BUSY — which holder class blocks, so the caller can tell "wait or
   // share" apart from "the blocker has already overstayed its lease".
   "exclusive_holder",

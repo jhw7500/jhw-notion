@@ -105,6 +105,13 @@ function fixture(overrides: {
         pinEvents.push("repository:end");
       }
     },
+    async withPinnedRepositoryByGitHubNodeReadOnly<T>(
+      githubNodeId: string,
+      use: (record: RepositoryRecord) => Promise<T>,
+    ): Promise<T> {
+      pinnedRepositoryLookup(githubNodeId);
+      return use(repositoryRecord);
+    },
     async withPinnedFormalTaskByGitHubNode<T>(
       githubNodeId: string,
       use: (task: FormalTask) => Promise<T>,
@@ -120,6 +127,13 @@ function fixture(overrides: {
       } finally {
         pinEvents.push("formal:end");
       }
+    },
+    async withPinnedFormalTaskByGitHubNodeReadOnly<T>(
+      githubNodeId: string,
+      use: (task: FormalTask) => Promise<T>,
+    ): Promise<T> {
+      pinnedFormalTaskLookup(githubNodeId);
+      return use(overrides.formalTask ?? formal);
     },
     getTask: vi.fn(async () => formal),
     getTaskSourceRevision: vi.fn(async () => formal.issue_revision),
@@ -140,7 +154,7 @@ function fixture(overrides: {
   const runner = {
     run: vi.fn(async (_command: string, args: string[]) => ({
       command: "git", args,
-      stdout: args[0] === "rev-parse"
+      stdout: args.includes("rev-parse")
         ? `${overrides.checkoutRoot ?? checkout}\n`
         : args.includes("--push")
           ? (overrides.pushRemote ?? overrides.remote ?? "git@github.com:jhw7500/wlan.git\n")
@@ -435,6 +449,29 @@ describe("GitHubSourceService", () => {
       "formal:end",
       "repository:end",
     ]);
+    expect(catalog.registerFormalTask).not.toHaveBeenCalled();
+    expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
+  });
+
+  it("uses only optional-lock-free Git and read-only Catalog pins for released discovery", async () => {
+    const { service, catalog, runner } = fixture();
+    const mutatingRepositoryPin = vi.spyOn(catalog, "withPinnedRepositoryByGitHubNode");
+    const mutatingTaskPin = vi.spyOn(catalog, "withPinnedFormalTaskByGitHubNode");
+    const readOnlyRepositoryPin = vi.spyOn(catalog, "withPinnedRepositoryByGitHubNodeReadOnly");
+    const readOnlyTaskPin = vi.spyOn(catalog, "withPinnedFormalTaskByGitHubNodeReadOnly");
+
+    await expect(service.withResolvedExistingFormalTaskReadOnly({
+      repository_path: checkout,
+      issue_url: "https://github.com/jhw7500/wlan/issues/7",
+    }, async ({ task }) => task.id)).resolves.toBe(formal.id);
+
+    expect(readOnlyRepositoryPin).toHaveBeenCalledTimes(1);
+    expect(readOnlyTaskPin).toHaveBeenCalledTimes(1);
+    expect(mutatingRepositoryPin).not.toHaveBeenCalled();
+    expect(mutatingTaskPin).not.toHaveBeenCalled();
+    expect(runner.run).toHaveBeenCalled();
+    for (const [, args] of runner.run.mock.calls) expect(args[0]).toBe("--no-optional-locks");
+    expect(catalog.registerRepository).not.toHaveBeenCalled();
     expect(catalog.registerFormalTask).not.toHaveBeenCalled();
     expect(catalog.registerTemporaryTask).not.toHaveBeenCalled();
   });

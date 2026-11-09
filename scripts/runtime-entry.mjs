@@ -52,6 +52,23 @@ class Directory {
   }
   close() { for (const record of this.records.reverse()) fs.closeSync(record.fd); this.records=[]; }
 }
+class AnchoredDirectory {
+  constructor(fd, verifyParent) {
+    this.fd=fd;this.verifyParent=verifyParent;this.stat=fs.fstatSync(fd,{bigint:true});
+    const mode=Number(this.stat.mode);if(!this.stat.isDirectory()||this.stat.uid!==BigInt(process.getuid())||mode&0o7022||mode&0o6000)fail();this.verify();
+  }
+  at(name){if(typeof name!=='string'||!name||name.includes('/')||['.','..'].includes(name))fail();return `/proc/self/fd/${this.fd}/${name}`;}
+  verify(){this.verifyParent();const current=fs.fstatSync(this.fd,{bigint:true});for(const key of ['dev','ino','uid','gid','mode'])if(this.stat[key]!==current[key])fail();}
+  close(){if(this.fd!==undefined){fs.closeSync(this.fd);this.fd=undefined;}}
+}
+function anchoredDirectory(runtimeHandle,parts) {
+  if(!runtimeHandle||!Number.isInteger(runtimeHandle.fd)||typeof runtimeHandle.verify!=='function')fail();runtimeHandle.verify();let fd;
+  try {
+    let parentFd=runtimeHandle.fd;
+    for(const part of parts){if(typeof part!=='string'||!part||part.includes('/')||['.','..'].includes(part))fail();const next=fs.openSync(`/proc/self/fd/${parentFd}/${part}`,C.O_RDONLY|C.O_DIRECTORY|C.O_NOFOLLOW);if(fd!==undefined)fs.closeSync(fd);fd=next;parentFd=fd;}
+    const result=new AnchoredDirectory(fd,()=>runtimeHandle.verify());fd=undefined;return result;
+  } finally {if(fd!==undefined)fs.closeSync(fd);}
+}
 function read(directory,name,requiredMode,maximum=1024*1024) {
   directory.verify();
   const location=directory.at(name);
@@ -119,9 +136,9 @@ function canonical(value) {
 }
 // Bind a small artifact subset to the immutable generation identity without
 // rehashing node_modules a second time inside the hook's existing deadline.
-function releaseManifest(repositoryRoot,releaseId) {
+function releaseManifest(repositoryRoot,releaseId,runtimeHandle=null) {
   if(typeof releaseId!=='string' || !RELEASE.test(releaseId)) fail();
-  const directory=new Directory(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId));
+  const directory=runtimeHandle?anchoredDirectory(runtimeHandle,['releases',releaseId]):new Directory(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId));
   try {
     if((fs.fstatSync(directory.fd).mode&0o7777)!==0o700) fail();
     const manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read(directory,'manifest.json',0o600,32*1024*1024)));
@@ -142,7 +159,7 @@ function releaseManifest(repositoryRoot,releaseId) {
   } finally { directory.close(); }
 }
 
-function readSet(directory,repositoryRoot) {
+function readSet(directory,repositoryRoot,runtimeHandle=null) {
   directory.verify();
   if ((Number(fs.fstatSync(directory.fd).mode)&0o7777)!==0o700) fail();
   const names=fs.readdirSync(`/proc/self/fd/${directory.fd}`).sort();
@@ -153,8 +170,8 @@ function readSet(directory,repositoryRoot) {
     const record=manifest.files[i]; const name=FILES[i];
     if(!exact(record,['name','mode','sha256']) || record.name!==name || record.mode!==modeFor(name) || typeof record.sha256!=='string' || !/^[a-f0-9]{64}$/.test(record.sha256) || hash(read(directory,name,record.mode))!==record.sha256) fail();
   }
-  const source=releaseManifest(repositoryRoot,manifest.sourceReleaseId);
-  const sourceDirectory=new Directory(path.join(repositoryRoot,'.jhw-runtime/releases',manifest.sourceReleaseId,'scripts'));
+  const source=releaseManifest(repositoryRoot,manifest.sourceReleaseId,runtimeHandle);
+  const sourceDirectory=runtimeHandle?anchoredDirectory(runtimeHandle,['releases',manifest.sourceReleaseId,'scripts']):new Directory(path.join(repositoryRoot,'.jhw-runtime/releases',manifest.sourceReleaseId,'scripts'));
   try {
     for(const record of manifest.files) {
       const original=source.entries.find(entry=>entry.path===`scripts/${record.name}`);
@@ -166,6 +183,13 @@ function readSet(directory,repositoryRoot) {
 export function validateBootstrap({repositoryRoot}) {
   let directory;
   try { directory=new Directory(path.join(repositoryRoot,'.jhw-runtime/bootstrap')); return readSet(directory,repositoryRoot); }
+  catch { fail(); }
+  finally { directory?.close(); }
+}
+export function validateRetainedBootstrap({repositoryRoot,name,runtimeHandle=null}) {
+  if(typeof name!=='string'||!/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(name))fail();
+  let directory;
+  try { directory=runtimeHandle?anchoredDirectory(runtimeHandle,[name]):new Directory(path.join(repositoryRoot,'.jhw-runtime',name)); return readSet(directory,repositoryRoot,runtimeHandle); }
   catch { fail(); }
   finally { directory?.close(); }
 }

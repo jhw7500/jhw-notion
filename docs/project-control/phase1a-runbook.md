@@ -375,6 +375,35 @@ jhw-control task recover --task <tsk-id> --expect <released-claim-id> --action c
 
 exact `pending-remove`는 이 cleanup이 재개하는 상태다. active successor, 다른 host/coordinates, dirty worktree, source checkout에 통합되지 않은 commit, `pending-create`, 또는 다른 generation의 ambiguous pending state면 stop하고 evidence를 보존한다. 자동 reset/rebase/force push, 경로 삭제, Claim 재생성으로 우회하지 않는다.
 
+inactive discovery가 `released.available: true`를 반환하면 exact latest released Claim과 `cleanup.target`을 먼저 확인한다. `registry_head`, `history_sha256`, `cleanup.snapshot_sha256`, `cleanup.source_ref`, `cleanup.source_head`, `cleanup.worktree_head`는 다음 proof의 frozen 입력이며 cleanup 허가가 아니다. timestamp 동률, generation/mapping 불일치, alias, active successor, detached source면 멈춘다.
+
+non-ancestor commit이 별도 integration commit으로 반영된 경우에는 `historical-exact-patch-v1` private manifest를 외부 `0700` directory의 `0600` regular file로 준비한다. manifest는 exact Task/Claim/Project/Repository/`repository_slug`/host/branch/worktree ref, 위 세 digest/HEAD, 전체 commit 1:1 대응, full bundle, ignored artifact 전수 inventory를 담는다. canonical `repository_slug`는 caller 입력이 아니라 pinned Repository record에서 얻고 source origin의 fetch/push URL과 remote default ref에 결속한다. full bundle은 scratch 복원과 object 연결성을 검증하고 artifact는 raw path bytes·bytes·SHA-256·mode·별개 inode를 전수 검증한다. patch-id만으로 만들거나 일부 commit을 생략하지 않는다.
+
+```bash
+"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <released-claim-id> --action cleanup \
+  --cleanup-proof <absolute-private-manifest.json>
+```
+
+이 정책은 통합 commit 뒤의 후속 변경과 revert를 허용하며 현재 파일 동일성을 주장하지 않는다. 삭제 intent는 `pending-remove-equivalent`로 durable하게 남고 같은 proof 명시 재실행만 재개한다. 삭제 직전 Registry HEAD, exact history, active successor 부재, mapping/source/worktree/inventory를 다시 확인한다. 성공 후 branch와 외부 bundle/artifact backup은 보존한다. 이전 parser는 새 lifecycle을 fail-closed하므로 rollback 도구에서는 복구가 끝날 때까지 관련 worktree 작업이 막힐 수 있다.
+
+정상 제거와 checkout이 이미 없는 intent 재개는 manifest·bundle·artifact backup의 검증 FD와
+부모 chain을 tombstone 게시까지 보존한다. backup은 source·worktree·common Git directory·managed
+roots 밖이어야 하며 경로와 열린 디렉터리 identity를 함께 검사한다. manifest·bundle은 정확히
+`0600`, private backup parent는 `0700`, artifact source/backup은 manifest의 일반 mode와 일치해야
+하며 모든 특수 mode bit는 거부한다. artifact `0644`·`0755`는 그대로 허용한다.
+부모 FD는 같은 scope에서 공유한다. manifest의 4096개는 schema 입력 상한이며 실제로는 backup과
+source의 모든 leaf·고유 parent·임시 I/O 여유를 현재 FD soft limit 안에 유지할 수 있어야 한다.
+부족하거나 `/proc`의 한도를 확인할 수 없으면 intent/Git 제거 전에 `scope_unsupported`로 멈춘다.
+운영자는 proof 형식·지원 범위와 실행 환경의 FD 한도를 함께 확인한다. 도구가 한도를 자동으로
+올리지는 않으며 이후 동시 FD 사용으로 생긴 자원 오류도 fail-closed한다.
+
+상태 저장의 callback·temp write/fsync/close가 끝난 뒤 branch·checkout/registration 부재,
+정확한 pending state 전체와 retained backup을 확인하고, backup 검사 뒤 state를 다시 비교한 다음
+rename한다. drift면 temp state만 버리고 pending intent 또는 다른 writer의 최신 state를 보존한다.
+이때 Git 제거가 이미 끝났다면 checkout은 없을 수 있으므로 branch와 외부 backup을 보존한 채
+같은 proof 명시 재개로 복구한다. 운영 redmine 정리와 배포 후 새 세션 Guard 확인은 별도 승인·
+실환경 검증 단계이며 격리 fixture 통과로 대체하지 않는다.
+
 worktree 제거는 commit 개수가 아니라 **통합 여부**로 판정한다. source checkout이 branch를 체크아웃한 상태에서 그 HEAD가 worktree의 HEAD에 도달 가능하면 허용하고, 도달 불가능하거나 checkout이 detached면 `WORKTREE_UNPUSHED`로 멈춘다. detached HEAD는 통합 지점이 아니므로 신뢰하지 않는다. 제거해도 **commit은 `refs/heads/task/...` branch ref에 그대로 남아** `git worktree add <path> <branch>`로 완전 복원된다. 다만 **gitignore된 로컬 파일은 worktree와 함께 삭제된다**(`dist/`·`node_modules/` 등) — 재생성 불가능한 로컬 산출물을 worktree 안에 두지 않는다. 따라서 병합 전에 `completed`로 끝내면 worktree가 남는다. **병합을 먼저 하고 나서 종료하거나, 이미 종료했다면 병합 뒤 위 cleanup을 released Claim ID로 실행한다.** 이 판정이 도입되기 전에 완료돼 남아 있는 worktree도 같은 방법으로 정리한다.
 
 ## 9. audit와 즉시 중단 조건

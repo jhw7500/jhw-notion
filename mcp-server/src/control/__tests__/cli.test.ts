@@ -268,6 +268,7 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     recoveryDiscovery: vi.fn().mockResolvedValue({
       state: "inactive",
       handoff: { available: false },
+      released: { available: false },
     }),
     recover: vi.fn().mockResolvedValue({
       kind: "status",
@@ -305,6 +306,10 @@ function makeCliDependencies(overrides: Overrides = {}): CliDependencies {
     registerTemporaryTask: vi.fn().mockResolvedValue(temporaryTask()),
     prepareExistingTask: vi.fn().mockResolvedValue({ task: formalTask(), alias: "example/control#1", source_task_revision: "2026-08-13T00:00:00Z" }),
     withResolvedExistingFormalTask: vi.fn(async (
+      _input: { repository_path: string; issue_url: string },
+      use: (resolved: { task: ReturnType<typeof formalTask>; alias: string }) => Promise<unknown>,
+    ) => use({ task: formalTask(), alias: "example/control#1" })),
+    withResolvedExistingFormalTaskReadOnly: vi.fn(async (
       _input: { repository_path: string; issue_url: string },
       use: (resolved: { task: ReturnType<typeof formalTask>; alias: string }) => Promise<unknown>,
     ) => use({ task: formalTask(), alias: "example/control#1" })),
@@ -1218,7 +1223,7 @@ describe("runCli", () => {
         },
       },
     });
-    expect(dependencies.source.withResolvedExistingFormalTask).toHaveBeenCalledWith({
+    expect(dependencies.source.withResolvedExistingFormalTaskReadOnly).toHaveBeenCalledWith({
       repository_path: "/private/source/control",
       issue_url: "https://github.com/example/control/issues/1",
     }, expect.any(Function));
@@ -1236,6 +1241,7 @@ describe("runCli", () => {
         recoveryDiscovery: vi.fn().mockResolvedValue({
           state: "inactive",
           handoff: { available: false },
+          released: { available: false },
         }),
       },
     });
@@ -1248,7 +1254,81 @@ describe("runCli", () => {
       task_id: TASK_ID,
       state: "inactive",
       handoff: { available: false },
+      released: { available: false },
     });
+  });
+
+  it("projects released-generation discovery through the read-only resolver without journaling", async () => {
+    const released = {
+      available: true as const,
+      unique_latest: true as const,
+      repository_slug: "example/control",
+      claim_id: CLAIM_ID,
+      status: "completed" as const,
+      released_at: "2026-08-13T00:01:00.000Z",
+      host: "build-host",
+      branch: activeClaim.branch,
+      worktree_ref: activeClaim.worktree_ref,
+      registry_head: "a".repeat(40),
+      history_sha256: "b".repeat(64),
+      cleanup: {
+        target: "matched" as const,
+        snapshot_sha256: "c".repeat(64),
+        source_ref: "refs/heads/main",
+        source_head: "d".repeat(40),
+        worktree_head: "e".repeat(40),
+      },
+    };
+    const journal = { append: vi.fn().mockRejectedValue(new Error("must not write")) };
+    const dependencies = makeCliDependencies({
+      journal,
+      taskService: { recoveryDiscovery: vi.fn().mockResolvedValue({
+        state: "inactive", handoff: { available: false }, released,
+      }) },
+    });
+    const result = await runCli(recoveryDiscoveryArgs(), dependencies);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).result).toEqual({
+      kind: "resolved", task_id: TASK_ID, state: "inactive", handoff: { available: false }, released,
+    });
+    expect(dependencies.source.withResolvedExistingFormalTaskReadOnly).toHaveBeenCalledOnce();
+    expect(dependencies.source.withResolvedExistingFormalTask).not.toHaveBeenCalled();
+    expect(journal.append).not.toHaveBeenCalled();
+    expect(dependencies.boardJournal.append).not.toHaveBeenCalled();
+    expect(dependencies.mutationLock.run).not.toHaveBeenCalled();
+  });
+
+  it.each(["source", "discovery"] as const)("keeps failed recovery discovery read-only at the %s boundary", async (boundary) => {
+    const journal = { append: vi.fn() };
+    const dependencies = makeCliDependencies({
+      journal,
+      ...(boundary === "source" ? { source: {
+        withResolvedExistingFormalTaskReadOnly: vi.fn().mockRejectedValue(new ControlError("REGISTRY_MOVED_DURING_READ", "private diagnostic")),
+      } } : { taskService: {
+        recoveryDiscovery: vi.fn().mockRejectedValue(new ControlError("REGISTRY_MOVED_DURING_READ", "private diagnostic")),
+      } }),
+    });
+    const result = await runCli(recoveryDiscoveryArgs(), dependencies);
+    expect(result.exitCode).not.toBe(0);
+    expect(JSON.parse(result.stderr).error.code).toBe("REGISTRY_MOVED_DURING_READ");
+    expect(journal.append).not.toHaveBeenCalled();
+    expect(dependencies.boardJournal.append).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { available: true, unique_latest: false },
+    { available: false, session_id: "private-session" },
+    { available: false, repository_path: "/private/backup" },
+  ])("rejects malformed released discovery metadata without leaking or journaling it", async (released) => {
+    const journal = { append: vi.fn() };
+    const dependencies = makeCliDependencies({ journal, taskService: {
+      recoveryDiscovery: vi.fn().mockResolvedValue({ state: "inactive", handoff: { available: false }, released }),
+    } });
+    const result = await runCli(recoveryDiscoveryArgs(), dependencies);
+    expect(result.exitCode).not.toBe(0);
+    expect(JSON.parse(result.stderr).error.code).toBe("INVALID_RECOVERY_RESULT");
+    expect(result.stdout + result.stderr).not.toContain("private");
+    expect(journal.append).not.toHaveBeenCalled();
   });
 
   it("bounds inactive discovery Handoff sections and excludes internal Handoff fields", async () => {
@@ -1265,6 +1345,7 @@ describe("runCli", () => {
         recoveryDiscovery: vi.fn().mockResolvedValue({
           state: "inactive",
           handoff: { available: true, handoff: handoffResult(sections) },
+          released: { available: false },
         }),
       },
     });
@@ -1312,7 +1393,7 @@ describe("runCli", () => {
     const result = await runCli([...argv], dependencies);
 
     expect(result.exitCode).toBe(2);
-    expect(dependencies.source.withResolvedExistingFormalTask).not.toHaveBeenCalled();
+    expect(dependencies.source.withResolvedExistingFormalTaskReadOnly).not.toHaveBeenCalled();
     expect(dependencies.taskService.recoveryDiscovery).not.toHaveBeenCalled();
   });
 
@@ -2960,6 +3041,55 @@ describe("runCli", () => {
     });
     expect(JSON.parse(result.stdout)).toMatchObject({ result: { kind: "cleanup", task_id: TASK_ID } });
     expect(mutationLock.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes a private cleanup proof only to the locked service and projects safe cleanup evidence", async () => {
+    const proofPath = "/private/cleanup evidence/proof.json";
+    const journal = { append: vi.fn() };
+    const dependencies = makeCliDependencies({ journal, taskService: {
+      recover: vi.fn().mockResolvedValue({
+        kind: "cleanup", history: { ...activeClaim, status: "completed", released_at: "2026-08-13T00:01:00.000Z" },
+        worktree: { removed: true, recovered: false, lifecycle: "removed", cleanup_policy: "historical-exact-patch-v1",
+          branch_preserved: true, proof_sha256: "a".repeat(64), private_path: proofPath },
+      }),
+    } });
+    const result = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID,
+      "--action", "cleanup", "--cleanup-proof", proofPath], dependencies);
+    expect(result.exitCode).toBe(0);
+    expect(dependencies.taskService.recover).toHaveBeenCalledWith({
+      task_id: TASK_ID, claim_id: CLAIM_ID, action: { kind: "cleanup", cleanup_proof: proofPath },
+    });
+    expect(JSON.parse(result.stdout).result).toEqual({
+      kind: "cleanup", task_id: TASK_ID, claim_id: CLAIM_ID, worktree_ref: activeClaim.worktree_ref,
+      removed: true, recovered: false, lifecycle: "removed", cleanup_policy: "historical-exact-patch-v1",
+      branch_preserved: true, proof_sha256: "a".repeat(64),
+    });
+    expect(dependencies.mutationLock.run).toHaveBeenCalledOnce();
+    expect(journal.append).toHaveBeenCalledOnce();
+    expect(result.stdout + result.stderr + JSON.stringify(journal.append.mock.calls)).not.toContain(proofPath);
+  });
+
+  it.each(["status", "takeover", "force-end", "repair-mapping"])("rejects cleanup proof for %s before a service call", async (action) => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID,
+      "--action", action, "--cleanup-proof", "/private/proof.json"], dependencies);
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.taskService.recover).not.toHaveBeenCalled();
+  });
+
+  it.each(["relative.json", "", "relative/../proof.json"])("rejects nonabsolute cleanup proof %j", async (path) => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli(["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID,
+      "--action", "cleanup", "--cleanup-proof", path], dependencies);
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.taskService.recover).not.toHaveBeenCalled();
+  });
+
+  it("rejects cleanup proof combined with checkout discovery", async () => {
+    const dependencies = makeCliDependencies();
+    const result = await runCli([...recoveryDiscoveryArgs(), "--cleanup-proof", "/private/proof.json"], dependencies);
+    expect(result.exitCode).toBe(2);
+    expect(dependencies.source.withResolvedExistingFormalTaskReadOnly).not.toHaveBeenCalled();
   });
 
   it("routes exact orphan mapping repair through the mutation lock and journals its bounded outcome", async () => {

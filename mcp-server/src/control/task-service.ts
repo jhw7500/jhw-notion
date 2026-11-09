@@ -34,6 +34,7 @@ import {
   type ConflictingClaimSummary,
   type ContractActiveClaim,
   type ErrorReason,
+  RepositoryRecordSchema,
   type TaskRecord,
   TaskRecordSchema,
   type TaskRole,
@@ -82,12 +83,28 @@ export interface WorktreeManagerPort {
   assertTakeoverEligible(previous: ActiveClaim): Promise<void>;
   rebindTakeover(previous: ClaimHistory, successor: ActiveClaim): Promise<{ changed: boolean }>;
   repairOrphanedMapping(input: WorktreeMappingRepairInput): Promise<WorktreeMappingRepairResult>;
-  cleanupReleased(history: ClaimHistory): Promise<WorktreeRemovalResult>;
+  cleanupReleased(history: ClaimHistory, options?: {
+    proofPath?: string;
+    registryHead?: string;
+    historySha256?: string;
+    repositorySlug?: string;
+    revalidate?: () => Promise<void>;
+  }): Promise<WorktreeRemovalResult>;
+  releasedCleanupStatus?(history: ClaimHistory): Promise<ReleasedCleanupStatus>;
   claimsMappedToCheckout(
     claims: readonly ActiveClaim[],
     repositoryPath: string,
     repositorySlug: string,
   ): Promise<ReadonlySet<string>>;
+}
+
+export interface ReleasedCleanupStatus {
+  target: "matched" | "removed" | "unmapped" | "blocked";
+  reason?: string;
+  snapshot_sha256: string;
+  source_ref?: string;
+  source_head?: string;
+  worktree_head?: string;
 }
 
 export interface RegistryGitPort {
@@ -97,6 +114,7 @@ export interface RegistryGitPort {
   listHeadDirectoryEntries(relativeDirectory: string, maximumEntries: number): Promise<RegistryDirectoryEntry[]>;
   readHeadRegularFile(relativePath: string): Promise<string>;
   headRegularBlobObjectId(relativePath: string): Promise<string>;
+  assertReadyReadOnly(): Promise<string>;
 }
 
 export interface TaskStartInput {
@@ -205,6 +223,22 @@ export type TaskRecoveryDiscovery =
   | {
       state: "inactive";
       handoff: TaskResumeContext;
+      released:
+        | { available: false }
+        | {
+            available: true;
+            unique_latest: true;
+            claim_id: string;
+            status: ClaimHistory["status"];
+            released_at: string;
+            host: string;
+            branch: string;
+            worktree_ref: string;
+            repository_slug: string;
+            registry_head: string;
+            history_sha256: string;
+            cleanup: ReleasedCleanupStatus;
+          };
     }
   | {
       state: "active";
@@ -221,7 +255,7 @@ export type TaskRecoveryDiscovery =
 export interface TaskRecoverInput {
   task_id: string;
   claim_id: string;
-  action: RecoveryAction | { kind: "cleanup" } | { kind: "repair-mapping"; worktree_ref: string };
+  action: RecoveryAction | { kind: "cleanup"; cleanup_proof?: string } | { kind: "repair-mapping"; worktree_ref: string };
 }
 
 export interface TaskCleanupRecoveryResult {
@@ -260,6 +294,26 @@ function worktreeCreateValidation(cause: unknown): string {
 }
 
 const maximumReusableClaimGenerations = 64;
+
+function releasedHistoryIdentity(history: ClaimHistory): string {
+  return JSON.stringify({
+    task_id: history.task_id,
+    task_alias: history.task_alias,
+    project_id: history.project_id,
+    repo_id: history.repo_id,
+    claim_id: history.claim_id,
+    host: history.host,
+    branch: history.branch,
+    worktree_ref: history.worktree_ref,
+    released_at: history.released_at,
+    status: history.status,
+    head_sha: history.head_sha,
+  });
+}
+
+function releasedHistorySha256(history: ClaimHistory): string {
+  return createHash("sha256").update(JSON.stringify(history), "utf8").digest("hex");
+}
 
 function reusableDisposition(history: ClaimHistory): Exclude<RetainedWorktreeGeneration["disposition"], "active"> | undefined {
   if (history.status === "handoff") return "handoff";
@@ -713,7 +767,66 @@ export class TaskService {
   async recoveryDiscovery(taskId: string): Promise<TaskRecoveryDiscovery> {
     const active = await this.claims.getActive(taskId);
     if (!active) {
-      return { state: "inactive", handoff: await this.resumeContext(taskId) };
+      const registryHead = await this.registry.assertReadyReadOnly();
+      let latest: ClaimHistory;
+      try {
+        latest = await this.claims.latestClaimHistory(taskId);
+      } catch (cause) {
+        if (cause instanceof ControlError && cause.code === "CLAIM_HISTORY_NOT_FOUND") {
+          if (await this.registry.assertReadyReadOnly() !== registryHead) {
+            throw new ControlError("REGISTRY_MOVED_DURING_READ", "Registry changed during empty recovery discovery");
+          }
+          return {
+            state: "inactive",
+            handoff: { available: false },
+            released: { available: false },
+          };
+        }
+        throw cause;
+      }
+      const exact = await this.claims.getClaimHistory(taskId, latest.claim_id);
+      if (releasedHistoryIdentity(latest) !== releasedHistoryIdentity(exact)) {
+        throw new ControlError("REGISTRY_CORRUPT", "Latest released Claim changed during recovery discovery");
+      }
+      const handoff = exact.status === "handoff" && exact.handoff_path
+        ? { available: true as const, handoff: await this.handoff(taskId, exact.claim_id) }
+        : { available: false as const };
+      if (handoff.available) {
+        if (await this.registry.assertReadyReadOnly() !== registryHead) {
+          throw new ControlError("REGISTRY_MOVED_DURING_READ", "Registry changed during Handoff recovery discovery");
+        }
+        return { state: "inactive", handoff, released: { available: false } };
+      }
+      if (!this.worktrees.releasedCleanupStatus) {
+        throw new ControlError("INVALID_RECOVERY_RESULT", "Worktree discovery port is unavailable");
+      }
+      const cleanup = await this.worktrees.releasedCleanupStatus(exact);
+      const repository = await this.records.readJson(
+        `repositories/${exact.repo_id}.yaml`,
+        RepositoryRecordSchema,
+        { field: "id", value: exact.repo_id },
+      );
+      if (await this.registry.assertReadyReadOnly() !== registryHead) {
+        throw new ControlError("REGISTRY_MOVED_DURING_READ", "Registry changed during released recovery discovery");
+      }
+      return {
+        state: "inactive",
+        handoff,
+        released: {
+          available: true,
+          unique_latest: true,
+          claim_id: exact.claim_id,
+          status: exact.status,
+          released_at: exact.released_at,
+          host: exact.host,
+          branch: exact.branch,
+          worktree_ref: exact.worktree_ref,
+          repository_slug: repository.slug,
+          registry_head: registryHead,
+          history_sha256: releasedHistorySha256(exact),
+          cleanup,
+        },
+      };
     }
     const status = await this.claims.recoverClaim(
       taskId,
@@ -965,7 +1078,52 @@ export class TaskService {
           { task_id: input.task_id, active_claim_id: active.claim_id },
         );
       }
-      return { kind: "cleanup", history, worktree: await this.worktrees.cleanupReleased(history) };
+      if (input.action.cleanup_proof !== undefined) {
+        const registryHead = await this.registry.assertReadyReadOnly();
+        const historySha256 = releasedHistorySha256(history);
+        const repository = await this.records.readJson(
+          `repositories/${history.repo_id}.yaml`,
+          RepositoryRecordSchema,
+          { field: "id", value: history.repo_id },
+        );
+        const revalidate = async (): Promise<void> => {
+          if (await this.registry.assertReadyReadOnly() !== registryHead) {
+            throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Registry changed before historical cleanup", {
+              reason: "snapshot_changed",
+            });
+          }
+          const successor = await this.claims.getActive(input.task_id);
+          if (successor) {
+            throw new ControlError(
+              "WORKTREE_ACTIVE_SUCCESSOR",
+              "Refusing archived cleanup while the Task has an active Claim generation",
+              { task_id: input.task_id, active_claim_id: successor.claim_id },
+            );
+          }
+          const current = await this.claims.getClaimHistory(input.task_id, input.claim_id);
+          if (releasedHistoryIdentity(current) !== releasedHistoryIdentity(history) || releasedHistorySha256(current) !== historySha256) {
+            throw new ControlError("WORKTREE_EQUIVALENCE_UNSAFE", "Released Claim changed before historical cleanup", {
+              reason: "snapshot_changed",
+            });
+          }
+        };
+        return {
+          kind: "cleanup",
+          history,
+          worktree: await this.worktrees.cleanupReleased(history, {
+            proofPath: input.action.cleanup_proof,
+            registryHead,
+            historySha256,
+            repositorySlug: repository.slug,
+            revalidate,
+          }),
+        };
+      }
+      return {
+        kind: "cleanup",
+        history,
+        worktree: await this.worktrees.cleanupReleased(history),
+      };
     }
     if (input.action.kind === "status") {
       const recovered = await this.claims.recoverClaim(input.task_id, input.claim_id, input.action);

@@ -15,7 +15,7 @@ function fixture(t) {
  const outer=fs.mkdtempSync(path.join(os.tmpdir(),'jhw-deploy-'));fs.chmodSync(outer,0o700);t.after(()=>{ if(t.passed===false) {for(const p of fs.readdirSync(outer,{recursive:true}).filter(p=>p.endsWith('.log'))) t.diagnostic(fs.readFileSync(path.join(outer,p),'utf8'));} fs.rmSync(outer,{recursive:true,force:true});});
  const root=path.join(outer,'repo'),home=path.join(outer,'home'),procRoot=path.join(outer,'proc');for(const p of [root,home,procRoot])fs.mkdirSync(p,{mode:0o700});
  for(const [p,b] of Object.entries({'.gitignore':'.jhw-runtime/\n','mcp-server/package.json':'{"type":"module"}','mcp-server/package-lock.json':'{"lockfileVersion":3}','mcp-server/tsconfig.json':'{}','mcp-server/src/index.ts':'export {};','scripts/sync-codex-skills.mjs':'','skills/claude/task.md':'fixture','skills/codex/jhw-task/SKILL.md':'fixture'}))write(root,p,b);
- for(const name of ['runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);
+ for(const name of ['runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);
  for(const args of [['init','-q'],['add','.'],['-c','user.name=Fixture','-c','user.email=f@example.invalid','commit','-qm','fixture']])assert.equal(spawnSync('git',args,{cwd:root}).status,0);
  let builds=0;
  const build=async ({stagingRoot})=>{builds++;const mcp="process.stdin.setEncoding('utf8');let b='';process.stdin.on('data',c=>{b+=c;let n;while((n=b.indexOf('\\n'))>=0){const q=JSON.parse(b.slice(0,n));b=b.slice(n+1);if(q.id)process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result:q.method==='tools/list'?{tools:[]}:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n');}});";const control="#!/usr/bin/env node\nconsole.log(JSON.stringify({error:{code:'INVALID_CONFIG'}}));process.exitCode=78;";const hook='#!/usr/bin/env node\nconsole.log("{}");';write(stagingRoot,'mcp-server/dist/index.js',mcp);write(stagingRoot,'mcp-server/dist/control/cli.js',control,0o755);write(stagingRoot,'mcp-server/dist/control/hook-adapter.js',hook,0o755);write(stagingRoot,'mcp-server/dist/runtime/mcp.cjs',mcp);write(stagingRoot,'mcp-server/dist/runtime/control.cjs',control,0o755);write(stagingRoot,'mcp-server/dist/runtime/hook.cjs',hook,0o755);fs.mkdirSync(path.join(stagingRoot,'mcp-server/node_modules'),{mode:0o755});};
@@ -25,7 +25,7 @@ function fixture(t) {
 function addConsumer(f,name='codex') {const p=path.join(f.procRoot,'100');fs.mkdirSync(p);write(p,'status',`Uid:\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\n`,0o600);write(p,'stat','100 (fixture) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0\n',0o600);write(p,'cmdline',`${name}\0`,0o600);fs.symlinkSync(f.root,path.join(p,'cwd'));}
 function host(f) {const contract={commands:['unlock','preflight','portfolio status','task start','task child-start','task contract','task completion-ready','task promote','task status','task handoff','task finish','task recover','task assert-owner','board status','board acquire','board with'],credential_policy:'secure-store-only',name:'jhw-control-host',version:5};write(f.home,'.local/bin/jhw-control-host',`#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(contract)}'\n`,0o755);}
 
-test('strict public arguments reject before any store or HOME write',async t=>{const f=fixture(t);for(const argv of [['--force'],['--status','extra'],['--activate'],['--activate','../bad'],['--prepare','--rollback'],['--uninstall','extra'],['--refresh-bootstrap','extra']])await assert.rejects(f.run(argv),{code:'DEPLOY_ARGUMENTS_INVALID'});assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime')),false);assert.deepEqual(fs.readdirSync(f.home),[]);});
+test('strict public arguments reject before any store or HOME write',async t=>{const f=fixture(t);for(const argv of [['--force'],['--status','extra'],['--activate'],['--activate','../bad'],['--prepare','--rollback'],['--uninstall','extra'],['--refresh-bootstrap','extra'],['--prune','--force'],['--prune','--apply','extra']])await assert.rejects(f.run(argv),{code:'DEPLOY_ARGUMENTS_INVALID'});assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime')),false);assert.deepEqual(fs.readdirSync(f.home),[]);});
 test('prepare permits active consumers and never invokes wiring or touches legacy builds',async t=>{const f=fixture(t);addConsumer(f);write(f.root,'mcp-server/dist/legacy','old');const r=await f.run(['--prepare']);assert.match(r.releaseId,/^r-/);assert.equal(f.builds(),1);assert.deepEqual(fs.readdirSync(f.home),[]);assert.equal(readActivation({repositoryRoot:f.root}),null);assert.equal(fs.readFileSync(path.join(f.root,'mcp-server/dist/legacy'),'utf8'),'old');});
 test('prepare refuses ignored files under source inputs before any build',async t=>{const f=fixture(t);const runtime=path.join(f.root,'.jhw-runtime');fs.appendFileSync(path.join(f.root,'.git/info/exclude'),'.omc/\n');write(f.root,'skills/claude/.omc/stale.md','stale');await assert.rejects(f.run(['--prepare']),{code:'DEPLOY_SOURCE_INVALID',reason:'ignored_source_files'});assert.equal(f.builds(),0);assert.deepEqual(fs.readdirSync(path.join(runtime,'releases')),[]);assert.deepEqual(fs.readdirSync(runtime).filter(name=>name.startsWith('.stage.')),[]);assert.equal(fs.readFileSync(path.join(f.root,'skills/claude/.omc/stale.md'),'utf8'),'stale');fs.rmSync(path.join(f.root,'skills/claude/.omc'),{recursive:true});const r=await f.run(['--prepare']);assert.equal(f.builds(),1);assert.equal(fs.existsSync(path.join(runtime,'releases',r.releaseId,'skills/claude/.omc')),false);});
 test('prepare refuses ignored files that appear under source inputs during the build',async t=>{const f=fixture(t);const runtime=path.join(f.root,'.jhw-runtime');fs.appendFileSync(path.join(f.root,'.git/info/exclude'),'.omc/\n');const build=async options=>{await f.build(options);write(f.root,'mcp-server/src/control/.omc/late.md','late');};await assert.rejects(deploy.runDeployment({...f.options,build,argv:['--prepare']}),{code:'DEPLOY_SOURCE_INVALID',reason:'ignored_source_files'});assert.equal(f.builds(),1);assert.deepEqual(fs.readdirSync(path.join(runtime,'releases')),[]);assert.deepEqual(fs.readdirSync(runtime).filter(name=>name.startsWith('.stage.')),[]);});
@@ -36,6 +36,29 @@ test('active and uncertain inventory refuse activation and uninstall before shar
 test('admission shared holder refuses activation preserving current and wiring',async t=>{const f=fixture(t);const r=await f.run(['--prepare']);const lock=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true,create:true});try{await assert.rejects(f.run(['--activate',r.releaseId]),{code:'DEPLOY_LOCK_CONTENDED'});}finally{lock.close();}assert.equal(readActivation({repositoryRoot:f.root}),null);assert.deepEqual(fs.readdirSync(f.home),[]);});
 test('first activation wires stable entries, next activation is pointer-only, rollback and reinstall retain releases',async t=>{const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});const r=await f.run(['--prepare']);const a=await f.run(['--activate',r.releaseId]);assert.equal(a.releaseId,r.releaseId);const config=path.join(f.home,'.claude.json');assert.deepEqual(JSON.parse(fs.readFileSync(config)).mcpServers['jhw-notion'].args,[path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']);assert.equal(fs.readlinkSync(path.join(f.home,'.local/bin/jhw-control-hook')),path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-hook'));assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home,'.config/opencode/opencode.json'))).mcp['jhw-notion'].command,['node',path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']);assert.match(fs.readFileSync(path.join(f.home,'.codex/config.toml'),'utf8'),/"mcp"/);const before=fs.statSync(config,{bigint:true});write(f.root,'mcp-server/src/index.ts','export const version=2;');const r2=await f.run(['--prepare']);await f.run(['--activate',r2.releaseId]);assert.equal(fs.statSync(config,{bigint:true}).ino,before.ino);assert.equal(fs.statSync(config,{bigint:true}).mtimeNs,before.mtimeNs);await f.run(['--rollback']);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,r.releaseId);await f.run(['--uninstall']);assert.equal(fs.existsSync(path.join(f.home,'.local/bin/jhw-control')),false);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/releases',r2.releaseId)),true);await f.run(['--activate',r.releaseId]);assert.equal(fs.existsSync(path.join(f.home,'.local/bin/jhw-control')),true);});
 test('first managed activation has no invented legacy predecessor',async t=>{const f=fixture(t);host(f);const r=await f.run(['--prepare']);await f.run(['--activate',r.releaseId]);await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_PREDECESSOR_INVALID'});});
+
+test('successful deployment writes an additive retention receipt without changing state schema',async t=>{
+ const f=fixture(t);host(f);const release=await f.run(['--prepare']);const result=await f.run(['--activate',release.releaseId]);assert.equal(result.warnings,undefined);
+ const runtime=path.join(f.root,'.jhw-runtime');const journal=fs.readdirSync(runtime).find(name=>/^\.deploy\.[a-f0-9]{32}$/.test(name));
+ const state=JSON.parse(fs.readFileSync(path.join(runtime,journal,'state.json')));assert.equal(state.status,'complete');assert.equal(state.phase,'complete');
+ const receipt=JSON.parse(fs.readFileSync(path.join(runtime,journal,'retention.json')));assert.equal(receipt.version,1);assert.equal(receipt.sequence,1);assert.equal(receipt.journal,journal);assert.equal(receipt.previous,null);
+ assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runtime,'.retention-sequence.v1.json'))),{version:1,sequence:1});
+});
+
+test('retention evidence failure is a bounded warning and does not reverse deployment success',async t=>{
+ const f=fixture(t);host(f);const first=await f.run(['--prepare']);await f.run(['--activate',first.releaseId]);
+ write(f.root,'mcp-server/src/index.ts','export const retentionWarning=1;');const second=await f.run(['--prepare']);write(f.root,'.jhw-runtime/.retention-sequence.v1.json','{"version":1,"sequence":"corrupt"}\n',0o600);
+ const result=await f.run(['--activate',second.releaseId]);assert.equal(result.code,'DEPLOY_ACTIVATED');assert.deepEqual(result.warnings,['retention_receipt_unavailable']);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,second.releaseId);
+});
+
+test('prune dry-run is lock-free while apply keeps inventory and both lease gates',async t=>{
+ const f=fixture(t);await f.run(['--prepare']);const runtime=path.join(f.root,'.jhw-runtime');const before=fs.readdirSync(runtime).sort();addConsumer(f);
+ const plan=await f.run(['--prune']);assert.equal(plan.code,'DEPLOY_PRUNE_PLAN');assert.equal(plan.dryRun,true);assert.deepEqual(fs.readdirSync(runtime).sort(),before);
+ await assert.rejects(f.run(['--prune','--apply']),{code:'DEPLOY_CONSUMERS_ACTIVE'});
+ fs.rmSync(path.join(f.procRoot,'100'),{recursive:true});const shared=acquireLease(path.join(runtime,'admission.lock'),{shared:true,create:true});
+ try{await assert.rejects(f.run(['--prune','--apply']),{code:'DEPLOY_LOCK_CONTENDED'});}finally{shared.close();}
+ const applied=await f.run(['--prune','--apply']);assert.equal(applied.code,'DEPLOY_PRUNED');assert.equal(applied.inventory.before.clear,true);assert.equal(applied.inventory.after.clear,true);
+});
 
 
 test('owned legacy MCP and exact launcher migrate; foreign hook launcher refuses and retains evidence',async t=>{
@@ -546,6 +569,7 @@ test('refresh-bootstrap installs changed helpers from current without moving the
  const link=path.join(f.home,'.local/bin/jhw-control');const wired=fs.lstatSync(link,{bigint:true});const target=fs.readlinkSync(link);const pointer=readActivation({repositoryRoot:f.root});
  const r=await f.run(['--refresh-bootstrap']);
  assert.equal(r.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(r.releaseId,b.releaseId);assert.equal(r.bootstrap.from,a.releaseId);assert.equal(r.bootstrap.to,b.releaseId);assert.match(r.bootstrap.previousDirectory,/^\.bootstrap\.previous\.[a-f0-9]{32}$/);
+ assert.equal(r.warnings,undefined);const runtime=path.join(f.root,'.jhw-runtime');const receipt=fs.readdirSync(runtime).filter(name=>/^\.deploy\.[a-f0-9]{32}$/.test(name)).map(name=>JSON.parse(fs.readFileSync(path.join(runtime,name,'retention.json')))).find(value=>value.previous?.name===r.bootstrap.previousDirectory);assert.equal(receipt.previous.name,r.bootstrap.previousDirectory);assert.match(receipt.previous.manifestSha256,/^[a-f0-9]{64}$/);
  assert.equal(JSON.parse(fs.readFileSync(path.join(bootstrap,'manifest.json'))).sourceReleaseId,b.releaseId);assert.match(fs.readFileSync(path.join(bootstrap,'jhw-runtime-control'),'utf8'),/changed selector/);
  assert.deepEqual(fs.readFileSync(path.join(f.root,'.jhw-runtime',r.bootstrap.previousDirectory,'manifest.json')),old);
  assert.deepEqual(readActivation({repositoryRoot:f.root}),pointer);const now=fs.lstatSync(link,{bigint:true});assert.equal(now.ino,wired.ino);assert.equal(now.mtimeNs,wired.mtimeNs);assert.equal(fs.readlinkSync(link),target);
@@ -1089,4 +1113,227 @@ test('a reacquisition sample that saw a consumer is refused without another samp
  const {f,b}=await secondReleaseFixture(t);
  await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',b.releaseId],phaseRunner:afterValidate(()=>{addConsumer(f);const entry=uncertainEntry(f);setTimeout(()=>{fs.rmSync(path.join(f.procRoot,'100'),{recursive:true,force:true});fs.rmSync(entry,{recursive:true,force:true});},50);})}),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'maintenance_reacquisition_failed'});
  assert.deepEqual(pendingJournal(f).reacquisition,{code:'DEPLOY_INVENTORY_UNCERTAIN',attempts:1,inventory:{clear:false,counts:{tui:1,app_server:0,legacy:0,managed:0},uncertain:1}});
+});
+
+
+// Guard opt-in is an explicit managed transition, independent of bootstrap refresh.
+test('guard observe activation refuses a first installation before wiring', async t => {
+ const f=fixture(t);host(f);
+ const release=await f.run(['--prepare']);const shape=homeShape(f.home);const phases=[];
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId,'--guard-observe'],phaseRunner:async ({phase})=>{phases.push(phase);}}),
+  {code:'DEPLOY_ARGUMENTS_INVALID',reason:'guard_requires_managed_activation'});
+ assert.deepEqual(phases,[]);assert.deepEqual(homeShape(f.home),shape);
+ assert.equal(readActivation({repositoryRoot:f.root}),null);
+ assert.deepEqual(fs.readdirSync(path.join(f.root,'.jhw-runtime')).filter(n=>n.startsWith('.deploy.')),[]);
+});
+function guardCoordinates(home) {
+ return {
+  JHW_REGISTRY_DIR:path.join(home,'registry'),JHW_REGISTRY_REMOTE:'origin',JHW_REGISTRY_BRANCH:'main',
+  JHW_WORKTREE_ROOT:path.join(home,'worktrees'),JHW_CONTROL_STATE_DIR:path.join(home,'state'),
+  JHW_BUILD_HOST:'fixture-host',JHW_GITHUB_OWNER:'fixture-owner',JHW_PROJECT_NUMBER:'1',
+  JHW_REGISTRY_REPOSITORY:'fixture-owner/registry',JHW_PREFLIGHT_PROJECT_ITEM_ID:'PVTI_fixture',
+  JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER:'1',
+ };
+}
+function guardObserveControlBuild(f,{productionHook=false,runtimeMode='observe'}={}) {
+ return async options=>{
+  await f.build(options);
+  // Use the real safe reader and value validator in the candidate, independent
+  // of the checkout path passed to the wiring worker.
+  for(const name of ['private-control-config','config','errors'])write(options.stagingRoot,
+   `mcp-server/dist/control/${name}.js`,fs.readFileSync(path.join(source,`../mcp-server/dist/control/${name}.js`)));
+  if(productionHook) {
+   const mcpRoot=path.join(source,'../mcp-server');
+   const version=JSON.parse(fs.readFileSync(path.join(mcpRoot,'package.json'))).version;
+   const bundled=spawnSync(path.join(mcpRoot,'node_modules/.bin/rolldown'),[
+    'dist/control/hook-adapter.js','--file',path.join(options.stagingRoot,'mcp-server/dist/runtime/hook.cjs'),
+    '--format','cjs','--platform','node','--no-codeSplitting','--logLevel','silent',
+    '--transform.define',`__JHW_BUNDLED_CONTROL_TOOL_VERSION__:${JSON.stringify(version)}`,
+   ],{cwd:mcpRoot,encoding:'utf8'});
+   assert.equal(bundled.status,0,bundled.stderr);fs.chmodSync(path.join(options.stagingRoot,'mcp-server/dist/runtime/hook.cjs'),0o755);
+  }
+  const counts={PENDING:0,APPROVED:0,CONSUMED:0,COMPLETED:0,FAILED:0,EXPIRED:0,total:0};
+  const coverage={prompt_origin:'ok',pre_tool_block:'ok',post_tool_correlation:'ok',execution_recheck:'pending',enforced:false};
+  const unsupported={prompt_origin:'unsupported',pre_tool_block:'unsupported',post_tool_correlation:'unsupported',execution_recheck:'pending',enforced:false};
+  const diagnostic={command:'guard preflight',result:{status:'NO-GO',code:'GUARD_UNAVAILABLE',diagnostics:{protocol_version:1,runtime_mode:runtimeMode,request_state:{safety:'not_initialized',counts},digest_key:{safety:'not_initialized'},registry_claims:{availability:'unavailable'},adapter_coverage:{claude:coverage,codex:coverage,gemini:unsupported,opencode:unsupported}}}};
+  const control=`#!/usr/bin/env node\nconsole.error(${JSON.stringify(JSON.stringify(diagnostic))});process.exitCode=78;`;
+  for(const file of ['mcp-server/dist/control/cli.js','mcp-server/dist/runtime/control.cjs'])write(options.stagingRoot,file,control,0o755);
+ };
+}
+async function guardTransitionFixture(t,{provisioned=false,...buildOptions}={}) {
+ const f=fixture(t);host(f);
+ for(const directory of ['.claude','.codex','.config/jhw-control'])fs.mkdirSync(path.join(f.home,directory),{recursive:true,mode:0o700});
+ // Freeze the actual pre-feature retained helpers, not the new helper with a label.
+ for(const name of ['install-wiring.sh','install-config.mjs']) {
+  const retained=spawnSync('git',['show',`50c9fe70c30ad7d9859bd2b9f31c84144d4dd140:scripts/${name}`],{cwd:path.dirname(source)});
+  assert.equal(retained.status,0);write(f.root,`scripts/${name}`,retained.stdout);
+ }
+ const original={'.claude/settings.json':'{"hooks":{},"fixture":"claude foreign"}\n','.codex/hooks.json':'{"hooks":{},"fixture":"codex foreign"}\n'};
+ for(const [file,bytes] of Object.entries(original))write(f.home,file,bytes,0o600);
+ const coordinates=guardCoordinates(f.home);
+ const old=provisioned?await deploy.runDeployment({...f.options,build:guardObserveControlBuild(f,{runtimeMode:'enforce'}),argv:['--prepare']}):await f.run(['--prepare']);
+ await deploy.runDeployment({...f.options,environment:provisioned?{...process.env,...coordinates}:process.env,argv:['--activate',old.releaseId]});
+ const baseline=Object.fromEntries(Object.keys(original).map(file=>[file,fs.readFileSync(path.join(f.home,file))]));
+ if(buildOptions.productionHook) {
+  fs.mkdirSync(coordinates.JHW_REGISTRY_DIR,{mode:0o700});
+  const environment={HOME:f.home,PATH:'/usr/bin:/bin',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
+  for(const args of [['init','-q','--initial-branch=main'],['config','user.name','Guard fixture'],
+   ['config','user.email','guard@example.invalid'],['commit','--allow-empty','-qm','fixture']]) {
+   const result=spawnSync('/usr/bin/git',args,{cwd:coordinates.JHW_REGISTRY_DIR,env:environment,encoding:'utf8'});
+   assert.equal(result.status,0,result.stderr);
+  }
+ }
+ const controlEnv=write(f.home,'.config/jhw-control/control.env',Object.entries(coordinates).map(([key,value])=>`${key}=${value}\n`).join(''),0o600);
+ for(const name of ['install-wiring.sh','install-config.mjs'])write(f.root,`scripts/${name}`,fs.readFileSync(path.join(source,name)));
+ write(f.root,'skills/claude/task.md','new guard transition fixture');
+ const candidate=await deploy.runDeployment({...f.options,build:guardObserveControlBuild(f,buildOptions),argv:['--prepare']});
+ return {f,old,candidate,baseline,original,coordinates,controlEnv,policy:path.join(f.home,'.config/jhw-control/guard-policy.json')};
+}
+function invokeFreshGuardHooks(f,coordinates) {
+ const environment={...process.env,HOME:f.home,PATH:[path.dirname(process.execPath),'/usr/bin','/bin'].join(':')};
+ for(const key of [...Object.keys(coordinates),'JHW_GUARD_MODE','JHW_GUARD_ALLOW_OBSERVE','NODE_OPTIONS','NODE_PATH'])delete environment[key];
+ return ['claude','codex'].map(adapter=>{
+  const file=path.join(f.home,adapter==='claude'?'.claude/settings.json':'.codex/hooks.json');
+  const command=JSON.parse(fs.readFileSync(file)).hooks.PreToolUse[0].hooks[0].command;
+  const payload={session_id:'fresh-install-session',cwd:f.root,hook_event_name:'PreToolUse',
+   tool_name:'Read',tool_input:{file_path:'skills/claude/task.md'},tool_use_id:'fixture-read',
+   ...(adapter==='codex'?{model:'fixture-model',permission_mode:'default',transcript_path:null,turn_id:'fixture-turn'}:{})};
+  const result=spawnSync('/bin/bash',['-c',command],{env:environment,input:JSON.stringify(payload),encoding:'utf8',timeout:15000});
+  assert.equal(result.status,0,result.stderr);return {adapter,output:JSON.parse(result.stdout)};
+ });
+}
+test('guard observe refuses missing private coordinates despite inherited coordinates before managed activation mutates wiring',async t=>{
+ const {f,candidate,coordinates,controlEnv,policy}=await guardTransitionFixture(t,{productionHook:true,provisioned:true});
+ fs.unlinkSync(controlEnv);
+ const before=homeShape(f.home),pointer=readActivation({repositoryRoot:f.root});const phases=[];
+ let failure;
+ try {await deploy.runDeployment({...f.options,environment:{...process.env,...coordinates},
+  argv:['--activate',candidate.releaseId,'--guard-observe'],phaseRunner:async options=>{phases.push(options.phase);return deploy.wiringPhase(options);}});}
+ catch(cause){failure=cause;}
+ if(!failure)for(const {adapter,output} of invokeFreshGuardHooks(f,coordinates))
+  t.diagnostic(`${adapter} fresh hook after incorrectly accepted activation: ${JSON.stringify(output)}`);
+ assert.equal(failure?.code,'DEPLOY_WIRING_CONFLICT','missing private coordinates must refuse activation');
+ assert.deepEqual(phases,['verify']);assert.deepEqual(homeShape(f.home),before);
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),pointer);assert.equal(fs.existsSync(policy),false);
+ assert.equal(fs.existsSync(controlEnv),false,'inherited coordinates never provision the private file');
+});
+test('guard observe activation supplies both generated hooks in fresh processes without explicit coordinates',async t=>{
+ const {f,candidate,coordinates,controlEnv}=await guardTransitionFixture(t,{productionHook:true,provisioned:true});
+ const identity=()=>{const info=fs.statSync(controlEnv,{bigint:true});return [info.dev,info.ino,info.uid,info.gid,info.mode,info.nlink,info.size,info.ctimeNs,info.mtimeNs];};
+ const before=fs.readFileSync(controlEnv),originalIdentity=identity();
+ const result=await deploy.runDeployment({...f.options,environment:{...process.env,...coordinates},argv:['--activate',candidate.releaseId,'--guard-observe']});
+ assert.equal(result.code,'DEPLOY_ACTIVATED');
+ for(const {output} of invokeFreshGuardHooks(f,coordinates))assert.deepEqual(output,{hookSpecificOutput:{hookEventName:'PreToolUse'}});
+ assert.deepEqual(fs.readFileSync(controlEnv),before);assert.deepEqual(identity(),originalIdentity);
+ assert.equal(fs.existsSync(path.join(f.home,'state/guard-digest.key')),true,'real hook composition selected the private state directory');
+});
+test('guard observe managed activation preserves evidence and restores old retained wiring on rollback', async t => {
+ const {f,old,candidate,baseline,original,policy}=await guardTransitionFixture(t);
+ const phases=[];
+ const result=await deploy.runDeployment({...f.options,argv:['--activate',candidate.releaseId,'--guard-observe'],phaseRunner:async options=>{phases.push(options.phase);return deploy.wiringPhase(options);}});
+ assert.equal(result.code,'DEPLOY_ACTIVATED');assert.equal(result.unprotected,false);
+ assert.equal(result.runtime_mode,'observe');assert.equal(result.enforced,false);
+ assert.equal(phases[0],'verify');assert.ok(phases.includes('wire'));
+ assert.deepEqual(JSON.parse(fs.readFileSync(policy)),{version:1,mode:'observe'});assert.equal(fs.statSync(policy).mode&0o7777,0o600);
+ for(const file of Object.keys(original))for(const event of ['UserPromptSubmit','PreToolUse','PostToolUse','SessionEnd'])
+  assert.ok(JSON.parse(fs.readFileSync(path.join(f.home,file))).hooks[event].some(group=>group.hooks.some(handler=>handler.command?.includes('jhw-control-hook'))));
+ const journals=fs.readdirSync(path.join(f.root,'.jhw-runtime')).filter(n=>n.startsWith('.deploy.')).map(name=>path.join(f.root,'.jhw-runtime',name));
+ const transitions=journals.filter(directory=>{try{return JSON.parse(fs.readFileSync(path.join(directory,'before.json'))).kind==='guard-observe-transition';}catch{return false;}});
+ assert.equal(transitions.length,1);assert.equal(JSON.parse(fs.readFileSync(path.join(transitions[0],'before.json'))).status,'finalized');
+ const rollback=await f.run(['--rollback']);assert.equal(rollback.releaseId,old.releaseId);
+ assert.equal(fs.existsSync(policy),false);
+ for(const [file,bytes] of Object.entries(baseline))assert.deepEqual(fs.readFileSync(path.join(f.home,file)),bytes);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(transitions[0],'before.json'))).status,'finalized','forward audit evidence is immutable during reverse restore');
+});
+
+test('guard observe explicit rollback resumes a reverse journal after ready sync interruption', async t => {
+ const {f,old,candidate,baseline,policy}=await guardTransitionFixture(t);
+ await f.run(['--activate',candidate.releaseId,'--guard-observe']);
+ const sync=fs.fsyncSync;let interrupted=false;
+ fs.fsyncSync=function(fd){
+  const target=fs.readlinkSync(`/proc/self/fd/${fd}`);
+  if(!interrupted&&path.basename(target).startsWith('.jhw-guard-ready.')){
+   interrupted=true;throw Error('bounded ready data sync interruption');
+  }
+  return sync.apply(this,arguments);
+ };
+ try{await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_FAILED'});}
+ finally{fs.fsyncSync=sync;}
+ assert.equal(interrupted,true);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);
+ const runtime=path.join(f.root,'.jhw-runtime');
+ const journals=fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')).sort();
+ const unlink=fs.unlinkSync;let interruptedAgain=false;
+ fs.unlinkSync=function(file){
+  const result=unlink.apply(this,arguments);
+  if(!interruptedAgain&&path.basename(String(file)).startsWith('.jhw-guard-restore.')){
+   interruptedAgain=true;throw Error('bounded capture cleanup interruption');
+  }
+  return result;
+ };
+ try{await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_FAILED'});}
+ finally{fs.unlinkSync=unlink;}
+ assert.equal(interruptedAgain,true);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);
+ assert.deepEqual(fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')).sort(),journals,
+  'repeated explicit retries keep one exact reverse intent instead of accumulating pending journals');
+ const resumed=await f.run(['--rollback']);
+ assert.equal(resumed.code,'DEPLOY_ROLLED_BACK');assert.equal(resumed.releaseId,old.releaseId);
+ assert.equal(fs.existsSync(policy),false);assert.equal((await f.run(['--status'])).recoveryPending,0);
+ for(const [file,bytes] of Object.entries(baseline))assert.deepEqual(fs.readFileSync(path.join(f.home,file)),bytes);
+});
+
+
+test('guard observe failed validation requires explicit rollback of policy and both hook configs', async t => {
+ const {f,old,candidate,baseline,policy}=await guardTransitionFixture(t);
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',candidate.releaseId,'--guard-observe'],phaseRunner:async options=>{
+  if(options.phase==='validate')throw new Error('bounded guard validation fault');
+  return deploy.wiringPhase(options);
+ }}),{code:'DEPLOY_VALIDATION_FAILED'});
+ assert.equal(readActivation({repositoryRoot:f.root}).releaseId,candidate.releaseId);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);assert.equal(fs.existsSync(policy),true);
+ const result=await f.run(['--rollback']);assert.equal(result.releaseId,old.releaseId);
+ assert.equal(fs.existsSync(policy),false);assert.equal((await f.run(['--status'])).recoveryPending,0);
+ for(const [file,bytes] of Object.entries(baseline))assert.deepEqual(fs.readFileSync(path.join(f.home,file)),bytes);
+});
+
+test('guard observe pointer-intent crash at origin cannot complete without restoring the files', async t => {
+ const {f,old,candidate,baseline,policy}=await guardTransitionFixture(t);
+ const modulePath=path.join(source,'runtime-deploy.mjs');
+ const childCode=`import fs from 'node:fs';import path from 'node:path';import {runDeployment} from ${JSON.stringify(pathToFileURL(modulePath).href)};
+ const options=${JSON.stringify({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate',candidate.releaseId,'--guard-observe']})};
+ const rename=fs.renameSync;fs.renameSync=function(from,to){if(path.basename(String(to))==='current'&&fs.realpathSync(path.dirname(String(to)))===options.repositoryRoot+'/.jhw-runtime')process.exit(86);return rename.apply(this,arguments);};
+ await runDeployment(options);process.exit(87);`;
+ const result=spawnSync(process.execPath,['--input-type=module','-'],{input:childCode,env:{HOME:f.home,PATH:[path.dirname(process.execPath),'/usr/bin','/bin'].join(':'),LANG:'C',LC_ALL:'C'},encoding:'utf8',timeout:30000});
+ assert.equal(result.status,86,result.stderr);
+ assert.equal(readActivation({repositoryRoot:f.root}).releaseId,old.releaseId);
+ assert.equal(fs.existsSync(policy),true,'wire is published while the pointer remains at origin');
+ assert.equal((await f.run(['--status'])).recoveryPending,1);
+ const rollback=await f.run(['--rollback']);assert.equal(rollback.releaseId,old.releaseId);
+ assert.equal(fs.existsSync(policy),false);assert.equal((await f.run(['--status'])).recoveryPending,0);
+ for(const [file,bytes] of Object.entries(baseline))assert.deepEqual(fs.readFileSync(path.join(f.home,file)),bytes);
+});
+
+test('guard observe survives normal activation refresh and an intermediate rollback', async t => {
+ const {f,old,candidate,baseline,policy}=await guardTransitionFixture(t);
+ await f.run(['--activate',candidate.releaseId,'--guard-observe']);
+ const observed=fs.readFileSync(policy);
+ write(f.root,'skills/claude/task.md','third policy-aware fixture');
+ const next=await deploy.runDeployment({...f.options,build:guardObserveControlBuild(f),argv:['--prepare']});
+ const activated=await f.run(['--activate',next.releaseId]);assert.equal(activated.runtime_mode,'observe');assert.equal(activated.enforced,false);
+ await f.run(['--refresh-bootstrap']);assert.deepEqual(fs.readFileSync(policy),observed);
+ const intermediate=await f.run(['--rollback']);assert.equal(intermediate.releaseId,candidate.releaseId);assert.deepEqual(fs.readFileSync(policy),observed);
+ const restored=await f.run(['--rollback']);assert.equal(restored.releaseId,old.releaseId);assert.equal(fs.existsSync(policy),false);
+ for(const [file,bytes] of Object.entries(baseline))assert.deepEqual(fs.readFileSync(path.join(f.home,file)),bytes);
+});
+
+test('guard observe rollback preserves a later foreign hook edit and keeps recovery pending', async t => {
+ const {f,candidate,policy}=await guardTransitionFixture(t);
+ await f.run(['--activate',candidate.releaseId,'--guard-observe']);
+ const file=path.join(f.home,'.claude/settings.json');const current=JSON.parse(fs.readFileSync(file));
+ current.foreign_after_transition='preserve this later edit';fs.writeFileSync(file,JSON.stringify(current)+'\n');
+ const edited=fs.readFileSync(file);const observed=fs.readFileSync(policy);const pointer=readActivation({repositoryRoot:f.root});
+ await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ assert.deepEqual(fs.readFileSync(file),edited);assert.deepEqual(fs.readFileSync(policy),observed);
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),pointer);assert.equal((await f.run(['--status'])).recoveryPending,1);
 });

@@ -28,6 +28,7 @@ import {
   type SensitiveDataPolicy,
 } from "./sensitive-data.js";
 import { ControlError } from "./errors.js";
+import { ObserveJournal } from "./observe-journal.js";
 import {
   createGuardHostCoordinateAuthority,
   type GuardHostCoordinateAuthority,
@@ -110,6 +111,34 @@ export const GuardJournalEventSchema = z.object({
 });
 export type GuardJournalEvent = z.infer<typeof GuardJournalEventSchema>;
 
+const GuardObservationSchema = z.discriminatedUnion("observed_decision", [
+  z.object({ observed_decision: z.literal("DENY"), decision_code: GuardDenyCodeSchema }).strict(),
+  z.object({ observed_decision: z.literal("PERMIT_REQUIRED") }).strict(),
+]);
+export type GuardObservation = z.infer<typeof GuardObservationSchema>;
+
+const GuardObservedDecisionRowSchema = z.unknown().transform(
+  (value, context): Record<string, unknown> => {
+    try {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("row");
+      const { mode, observed_decision, ...eventValue } = value as Record<string, unknown>;
+      if (mode !== "observe") throw new TypeError("mode");
+      const parsedEvent = GuardJournalEventSchema.parse(eventValue);
+      if (parsedEvent.event !== "decision") throw new TypeError("event");
+      const observation = observed_decision === "DENY"
+        ? GuardObservationSchema.parse({ observed_decision, decision_code: parsedEvent.decision_code })
+        : GuardObservationSchema.parse({ observed_decision });
+      if (observation.observed_decision === "PERMIT_REQUIRED" && parsedEvent.decision_code !== undefined) {
+        throw new TypeError("permit decision_code");
+      }
+      return { ...parsedEvent, mode, ...observation };
+    } catch {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid Guard observation row" });
+      return z.NEVER;
+    }
+  },
+);
+
 const GuardSessionEndExpectationSchema = z.object({
   origin_adapter: GuardAdapterSchema,
   task_id: TaskIdSchema,
@@ -139,52 +168,104 @@ export type GuardSessionEndEvidence =
   | { status: "absent" | "ambiguous" | "unverified" };
 
 export interface GuardJournalPort {
-  append(event: GuardJournalEvent): Promise<void>;
+  append(event: GuardJournalEvent, observation?: GuardObservation): Promise<void>;
+}
+
+export interface GuardObservedDecisionAppendResult {
+  legacy_journal_warning?: "GUARD_JOURNAL_UNAVAILABLE";
 }
 
 export class GuardJournal implements GuardJournalPort {
   readonly #stateDir: string;
   readonly #secureDirectoryHooks: SecureStateDirectoryHooks;
   readonly #sensitiveData: SensitiveDataPolicy;
+  readonly #observeJournal: ObserveJournal<Record<string, unknown>>;
 
   constructor(
     stateDir: string,
     secureDirectoryHooks: SecureStateDirectoryHooks = {},
     sensitiveData?: SensitiveDataPolicy,
+    environment: NodeJS.ProcessEnv = process.env,
   ) {
     this.#stateDir = resolve(stateDir);
     this.#secureDirectoryHooks = secureDirectoryHooks;
     this.#sensitiveData = sensitiveData ?? createSensitiveDataPolicy(process.env, [this.#stateDir]);
+    this.#observeJournal = new ObserveJournal(
+      this.#stateDir,
+      GuardObservedDecisionRowSchema,
+      this.#secureDirectoryHooks,
+      environment,
+    );
     if (new.target === GuardJournal) {
       directlyConstructedGuardJournals.set(this, createGuardHostCoordinateAuthority(this.#stateDir));
     }
   }
 
-  async append(event: GuardJournalEvent): Promise<void> {
+  async append(event: GuardJournalEvent, observation?: GuardObservation): Promise<void> {
+    if (observation !== undefined) {
+      await this.appendObservedDecision(event, observation);
+      return;
+    }
     try {
-      const parsed = GuardJournalEventSchema.parse(event);
-      this.#sensitiveData.assertSafe(parsed);
-      assertNoAbsoluteHostPaths(parsed);
-      await appendBoundedJournalLine(
-        this.#stateDir,
-        this.#secureDirectoryHooks,
-        this.#sensitiveData,
-        GUARD_JOURNAL_FILE,
-        parsed,
-        {
-          tooLarge: "Guard journal event exceeds the atomic append boundary",
-          incomplete: "Guard journal append was incomplete",
-          failed: "Unable to append the Guard journal",
-        },
-        {
-          maximumLineBytes: MAX_GUARD_JOURNAL_LINE_BYTES,
-          strictExistingStateDirectory: true,
-          strictExistingFileMode: true,
-        },
-      );
+      await this.#appendRow(GUARD_JOURNAL_FILE, this.#parseEvent(event));
     } catch {
       throw new ControlError("GUARD_JOURNAL_UNAVAILABLE", "Guard journal append is unavailable");
     }
+  }
+
+  async appendObservedDecision(
+    event: GuardJournalEvent,
+    observation: GuardObservation,
+  ): Promise<GuardObservedDecisionAppendResult> {
+    let parsed: GuardJournalEvent;
+    let observed: Record<string, unknown>;
+    try {
+      parsed = this.#parseEvent(event);
+      if (parsed.event !== "decision") throw new TypeError("Only decisions have observations");
+      observed = { ...parsed, mode: "observe", ...GuardObservationSchema.parse(observation) };
+      this.#sensitiveData.assertSafe(observed);
+      assertNoAbsoluteHostPaths(observed);
+      // An observed ALLOW is valid only after this required stream is durable.
+      await this.#observeJournal.append(observed);
+    } catch {
+      throw new ControlError("GUARD_JOURNAL_UNAVAILABLE", "Guard observation journal append is unavailable");
+    }
+
+    try {
+      // Retained releases still consume this strict legacy row, but its failure
+      // cannot erase the already-durable observation or turn it into a denial.
+      await this.#appendRow(GUARD_JOURNAL_FILE, parsed);
+      return {};
+    } catch {
+      return { legacy_journal_warning: "GUARD_JOURNAL_UNAVAILABLE" };
+    }
+  }
+
+  #parseEvent(event: GuardJournalEvent): GuardJournalEvent {
+    const parsed = GuardJournalEventSchema.parse(event);
+    this.#sensitiveData.assertSafe(parsed);
+    assertNoAbsoluteHostPaths(parsed);
+    return parsed;
+  }
+
+  #appendRow(file: string, row: Record<string, unknown>): Promise<void> {
+    return appendBoundedJournalLine(
+      this.#stateDir,
+      this.#secureDirectoryHooks,
+      this.#sensitiveData,
+      file,
+      row,
+      {
+        tooLarge: "Guard journal event exceeds the atomic append boundary",
+        incomplete: "Guard journal append was incomplete",
+        failed: "Unable to append the Guard journal",
+      },
+      {
+        maximumLineBytes: MAX_GUARD_JOURNAL_LINE_BYTES,
+        strictExistingStateDirectory: true,
+        strictExistingFileMode: true,
+      },
+    );
   }
 
   /**
@@ -320,6 +401,7 @@ export function createProductionGuardJournal(
     stateDirSnapshot,
     Object.freeze({}),
     createSensitiveDataPolicy(environmentSnapshot, [stateDirSnapshot]),
+    environmentSnapshot,
   );
   const coordinate = directlyConstructedGuardJournals.get(journal);
   if (!coordinate) throw new TypeError("Production GuardJournal construction failed");

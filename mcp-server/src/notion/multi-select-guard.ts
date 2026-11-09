@@ -4,7 +4,7 @@
 import type { Client } from "@notionhq/client";
 import type { DatabaseName } from "../config.js";
 import { normalizeMultiSelectValues } from "./field-vocab.js";
-import { appendMultiSelectOptions } from "./api.js";
+import { appendMultiSelectOptions, NotionError } from "./api.js";
 
 export interface MultiSelectGuardOptions {
   /** true면 미등록 값을 data source에 자동 등록 후 포함(--force-tag). 기본 false=현행 drop. */
@@ -46,8 +46,17 @@ export async function applyMultiSelectGuard(
       return [...kept, ...canonical];
     } catch (e) {
       // 자동등록 실패 → drop으로 폴백(저장은 진행). 가드의 안전 우선.
+      const message = e instanceof Error ? e.message : String(e);
+      const cause = e instanceof NotionError ? e._cause : undefined;
+      const optionLimit = e instanceof NotionError && e.status === 400
+        && typeof cause === "object" && cause !== null && "code" in cause
+        && cause.code === "validation_error"
+        && /multi_select\.options\.length should be ≤ `100`, instead was `\d+`/.test(message);
       opts.warnings?.push(
-        `[${db}.${field}] 자동등록 실패로 ${dropped.length}개 제외: ${dropped.join(", ")} (${e instanceof Error ? e.message : String(e)})`
+        `[${db}.${field}] 자동등록 실패로 ${dropped.length}개 제외: ${dropped.join(", ")} (${message})`
+        + (optionLimit
+          ? " 옵션 100개 상한 때문에 등록하지 못했습니다. Notion 화면에서 옵션을 추가한 뒤 --force-tag(allowNewTags: true)로 다시 저장하세요."
+          : "")
       );
       return kept;
     }
