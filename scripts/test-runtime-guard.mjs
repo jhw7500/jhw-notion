@@ -127,6 +127,63 @@ test('captures fixed preimages and candidate-predicted snapshots before any HOME
   }), before);
 });
 
+for (const installedAdapter of ['claude', 'codex']) {
+  const missingAdapter = installedAdapter === 'claude' ? 'codex' : 'claude';
+  const missingPath = missingAdapter === 'claude' ? GUARD_TRANSITION_PATHS[1] : GUARD_TRANSITION_PATHS[2];
+  test(`transitions only the installed ${installedAdapter} adapter and preserves a later ${missingAdapter} install on restore`, t => {
+    const f = fixture(t);
+    fs.rmSync(path.dirname(livePath(f, missingPath)), {recursive: true});
+    const evidence = captureGuardTransitionEvidence({
+      home: f.home, repositoryRoot: f.repositoryRoot, candidateReleaseId: releaseId, origin,
+    });
+    assert.deepEqual(evidence.entries.map(entry => entry.path), [
+      GUARD_TRANSITION_PATHS[0],
+      installedAdapter === 'claude' ? GUARD_TRANSITION_PATHS[1] : GUARD_TRANSITION_PATHS[2],
+    ]);
+    assert.equal(fs.existsSync(path.dirname(livePath(f, missingPath))), false);
+
+    writeGuardTransitionEvidence({journalDirectory: f.journalDirectory, evidence});
+    materializePredicted(f, evidence);
+    recordGuardPolicyContext({journalDirectory: f.journalDirectory, context: policyContext(f, evidence)});
+    recordGuardPublishedSnapshots({home: f.home, journalDirectory: f.journalDirectory});
+    recordGuardDestination({journalDirectory: f.journalDirectory, destinationActivationId: destination});
+    markGuardTransitionFinalized({home: f.home, journalDirectory: f.journalDirectory});
+
+    const lateConfig = '{"late":"adapter install"}\n';
+    write(livePath(f, missingPath), lateConfig);
+    const rollbackJournal = path.join(f.runtimeRoot, `.deploy.${'5'.repeat(32)}`);
+    fs.mkdirSync(rollbackJournal, {mode: 0o700});
+    prepareGuardRollbackEvidence({
+      forwardJournalDirectory: f.journalDirectory,
+      rollbackJournalDirectory: rollbackJournal,
+      sourceActivationId: destination,
+      destinationActivationId: origin.activationId,
+    });
+    assert.equal(restoreGuardRollbackEvidence({home: f.home, journalDirectory: rollbackJournal}).status, 'restored');
+    assert.equal(fs.readFileSync(livePath(f, missingPath), 'utf8'), lateConfig);
+  });
+}
+
+test('refuses an adapter scope change between capture and publication without modifying the new config', t => {
+  const f = fixture(t);
+  const codexPath = GUARD_TRANSITION_PATHS[2];
+  fs.rmSync(path.dirname(livePath(f, codexPath)), {recursive: true});
+  const evidence = captureGuardTransitionEvidence({
+    home: f.home, repositoryRoot: f.repositoryRoot, candidateReleaseId: releaseId, origin,
+  });
+  writeGuardTransitionEvidence({journalDirectory: f.journalDirectory, evidence});
+  materializePredicted(f, evidence);
+  recordGuardPolicyContext({journalDirectory: f.journalDirectory, context: policyContext(f, evidence)});
+
+  const lateConfig = '{"late":"before publication"}\n';
+  write(livePath(f, codexPath), lateConfig);
+  assert.throws(
+    () => recordGuardPublishedSnapshots({home: f.home, journalDirectory: f.journalDirectory}),
+    {code: 'DEPLOY_RECOVERY_REQUIRED', reason: 'guard_transition_scope_changed'},
+  );
+  assert.equal(fs.readFileSync(livePath(f, codexPath), 'utf8'), lateConfig);
+});
+
 function fullHooksFixture(t) {
   const f = fixture(t);
   materializePredicted(f, captureGuardTransitionEvidence({

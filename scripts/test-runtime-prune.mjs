@@ -107,7 +107,32 @@ test('sequence keeps newest previous and every unreferenced legacy previous',()=
  const first=retainedPrevious(f,journals[0],1);const latest=retainedPrevious(f,journals[1],2);const legacy=path.join(f.runtime,`.bootstrap.previous.${'f'.repeat(32)}`);fs.mkdirSync(legacy,{mode:0o700});
  const manifests=new Map([[first.name,first.manifest],[latest.name,latest.manifest]]);const result=prune.planRuntimePrune({repositoryRoot:f.root,now:NOW,validatePrevious:({name})=>manifests.get(name)});
  assert.deepEqual(result.candidates.previous,[first.name]);assert.equal(result.candidates.previous.includes(latest.name),false);assert.equal(result.candidates.previous.includes(path.basename(legacy)),false);
- const applied=prune.applyRuntimePrune({repositoryRoot:f.root,now:NOW,validatePrevious:({name})=>manifests.get(name)});assert.equal(applied.removed.previous,1);assert.equal(applied.removed.journals,2);assert.equal(fs.existsSync(first.directory),false);assert.equal(fs.existsSync(latest.directory),true);assert.equal(fs.existsSync(legacy),true);
+ const applied=prune.applyRuntimePrune({repositoryRoot:f.root,now:NOW,validatePrevious:({name})=>manifests.get(name)});assert.equal(applied.removed.previous,1);assert.equal(applied.removed.journals,1);assert.equal(fs.existsSync(first.directory),false);assert.equal(fs.existsSync(journals[1].directory),true);assert.equal(fs.existsSync(latest.directory),true);assert.equal(fs.existsSync(legacy),true);
+});
+
+test('latest previous retains its ordering journal until a successor makes the old pair collectible',()=>{
+ const f=fixture(test);const journals=[];for(let sequence=1;sequence<=34;sequence++)journals.push(journal(f,sequence,{age:60+sequence}));
+ const original=retainedPrevious(f,journals[0],1);const manifests=new Map([[original.name,original.manifest]]);
+ const firstPlan=prune.planRuntimePrune({repositoryRoot:f.root,now:NOW,validatePrevious:({name})=>manifests.get(name)});
+ assert.equal(firstPlan.candidates.journals.includes(journals[0].name),false);
+ assert.equal(firstPlan.candidates.previous.includes(original.name),false);
+ const firstApply=prune.applyRuntimePrune({repositoryRoot:f.root,now:NOW,validatePrevious:({name})=>manifests.get(name)});
+ assert.deepEqual(firstApply.removed,{journals:1,previous:0});
+ assert.equal(fs.existsSync(journals[0].directory),true);
+ assert.equal(fs.existsSync(original.directory),true);
+
+ const successorJournal=journal(f,35,{age:0});const successor=retainedPrevious(f,successorJournal,2);manifests.set(successor.name,successor.manifest);
+ const secondPlan=prune.planRuntimePrune({repositoryRoot:f.root,now:NOW,validatePrevious:({name})=>manifests.get(name)});
+ assert.equal(secondPlan.candidates.journals.includes(journals[0].name),true);
+ assert.equal(secondPlan.candidates.previous.includes(original.name),true);
+ assert.equal(secondPlan.candidates.journals.includes(successorJournal.name),false);
+ assert.equal(secondPlan.candidates.previous.includes(successor.name),false);
+ const secondApply=prune.applyRuntimePrune({repositoryRoot:f.root,now:NOW,validatePrevious:({name})=>manifests.get(name)});
+ assert.deepEqual(secondApply.removed,{journals:2,previous:1});
+ assert.equal(fs.existsSync(journals[0].directory),false);
+ assert.equal(fs.existsSync(original.directory),false);
+ assert.equal(fs.existsSync(successorJournal.directory),true);
+ assert.equal(fs.existsSync(successor.directory),true);
 });
 
 test('apply unlinks exact children without recursive removal',()=>{

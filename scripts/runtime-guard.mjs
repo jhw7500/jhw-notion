@@ -111,6 +111,23 @@ function sameSnapshot(left, right) {
   return validSnapshot(left) && validSnapshot(right) && JSON.stringify(left) === JSON.stringify(right);
 }
 
+function validTransitionEntryPaths(entries) {
+  if (!Array.isArray(entries) || entries.length < 1 || entries.length > GUARD_TRANSITION_PATHS.length) return false;
+  const paths = entries.map(entry => entry?.path);
+  return paths[0] === GUARD_TRANSITION_PATHS[0] && new Set(paths).size === paths.length &&
+    JSON.stringify(paths) === JSON.stringify(GUARD_TRANSITION_PATHS.filter(relative => paths.includes(relative)));
+}
+
+function transitionPaths(home) {
+  const paths = [GUARD_TRANSITION_PATHS[0]];
+  for (const relative of GUARD_TRANSITION_PATHS.slice(1)) {
+    try { fs.lstatSync(path.dirname(path.join(home, relative))); }
+    catch (cause) { if (cause?.code === 'ENOENT') continue; throw cause; }
+    paths.push(relative);
+  }
+  return paths;
+}
+
 function validActivation(value) {
   return isActivationSnapshot(value);
 }
@@ -277,7 +294,7 @@ export function captureGuardTransitionEvidence({home, repositoryRoot, candidateR
   const capturedHome = homeIdentity(home);
   const currentPolicy = readGuardHostPolicy({home});
   if (currentPolicy !== 'absent') fail('guard_transition_already_applied');
-  const entries = GUARD_TRANSITION_PATHS.map(relative => ({path: relative, preimage: snapshotFile(home, relative)}));
+  const entries = transitionPaths(home).map(relative => ({path: relative, preimage: snapshotFile(home, relative)}));
   const predicted = replayCandidate({repositoryRoot, candidateReleaseId, entries, currentPolicy});
   requireHomeIdentity(home, capturedHome);
   return {
@@ -295,11 +312,10 @@ function validForward(value) {
   if (value.version !== 1 || value.kind !== 'guard-observe-transition' || value.direction !== 'forward' ||
       !['captured', 'policy-context-recorded', 'published-recorded', 'destination-bound', 'finalized'].includes(value.status) ||
       !validActivation(value.origin) || !RELEASE.test(value.candidate_release_id) || value.current_policy !== 'absent' ||
-      !validHomeIdentity(value.home) ||
-      !Array.isArray(value.entries) || value.entries.length !== GUARD_TRANSITION_PATHS.length) return false;
-  if (!value.entries.every((entry, index) => exact(entry,
+      !validHomeIdentity(value.home) || !validTransitionEntryPaths(value.entries)) return false;
+  if (!value.entries.every(entry => exact(entry,
     ['path', 'preimage', 'predicted', ...(entry.published ? ['published'] : [])]) &&
-    entry.path === GUARD_TRANSITION_PATHS[index] && validSnapshot(entry.preimage) && validSnapshot(entry.predicted) &&
+    GUARD_TRANSITION_PATHS.includes(entry.path) && validSnapshot(entry.preimage) && validSnapshot(entry.predicted) &&
     (entry.published === undefined || validSnapshot(entry.published)))) return false;
   if (value.destination_activation_id !== undefined && !ACTIVATION.test(value.destination_activation_id)) return false;
   if (value.policy_context !== undefined && !validPolicyContext(value.policy_context)) return false;
@@ -358,6 +374,9 @@ export function recordGuardPublishedSnapshots({home, journalDirectory}) {
   requireHomeIdentity(home, evidence.home);
   if (evidence.status !== 'policy-context-recorded' || home !== contextHome(evidence.policy_context)) {
     fail('guard_evidence_order');
+  }
+  if (JSON.stringify(transitionPaths(home)) !== JSON.stringify(evidence.entries.map(entry => entry.path))) {
+    fail('guard_transition_scope_changed');
   }
   for (const entry of evidence.entries) {
     const published = snapshotFile(home, entry.path);
@@ -429,10 +448,10 @@ function validReverse(value) {
     ['finalized-transition', 'incomplete-config'].includes(value.scope) &&
     ['prepared', 'restoring', 'restored'].includes(value.status) && ACTIVATION.test(value.source_activation_id) &&
     ACTIVATION.test(value.destination_activation_id) && JOURNAL.test(value.forward_journal) &&
-    Array.isArray(value.entries) && value.entries.length === GUARD_TRANSITION_PATHS.length &&
-    value.entries.every((entry, index) => exact(entry, ['path', 'preimage', 'published', 'progress',
+    validTransitionEntryPaths(value.entries) &&
+    value.entries.every(entry => exact(entry, ['path', 'preimage', 'published', 'progress',
       ...(entry.capture ? ['capture'] : []), ...(entry.ready ? ['ready'] : [])]) &&
-      entry.path === GUARD_TRANSITION_PATHS[index] &&
+      GUARD_TRANSITION_PATHS.includes(entry.path) &&
       validSnapshot(entry.preimage) && validSnapshot(entry.published) &&
       ['pending', 'intent-durable', 'capture-durable', 'preimage-published', 'restored'].includes(entry.progress) &&
       (entry.capture === undefined || /^\.jhw-guard-restore\.[a-f0-9]{32}$/.test(entry.capture)) &&

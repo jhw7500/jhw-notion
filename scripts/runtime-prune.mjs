@@ -144,12 +144,13 @@ function buildPlan({repositoryRoot,now=Date.now(),validatePrevious=validateRetai
  }
  const newest=[...journals].sort((a,b)=>b.receipt.sequence-a.receipt.sequence);const recent=new Set(newest.slice(0,MIN_RECENT).map(item=>item.name));
  const boundary=newest[Math.min(MIN_RECENT,newest.length)-1]?.time;for(const item of newest)if(boundary!==undefined&&item.time===boundary)recent.add(item.name);
- const candidates=[];for(const item of journals){if(now-item.time<MIN_AGE_MS){skipped.retainedAge++;continue;}if(recent.has(item.name)){skipped.retainedRecent++;continue;}budget.candidates=(budget.candidates??0)+item.size;if(budget.candidates>CANDIDATE_TOTAL_LIMIT)fail('scan_limit');candidates.push(item);}
+ const referenced=new Map();for(const item of journals.filter(item=>item.receipt.previous)){if(referenced.has(item.receipt.previous.name))fail('unverified_journal');referenced.set(item.receipt.previous.name,item);}
+ const latestPreviousJournal=[...referenced.values()].sort((a,b)=>b.receipt.sequence-a.receipt.sequence)[0];const latestPrevious=latestPreviousJournal?.receipt.previous?.name;
+ const candidates=[];for(const item of journals){if(now-item.time<MIN_AGE_MS){skipped.retainedAge++;continue;}if(recent.has(item.name)){skipped.retainedRecent++;continue;}if(item===latestPreviousJournal)continue;budget.candidates=(budget.candidates??0)+item.size;if(budget.candidates>CANDIDATE_TOTAL_LIMIT)fail('scan_limit');candidates.push(item);}
  candidates.sort((a,b)=>a.receipt.sequence-b.receipt.sequence);
  // A previous set is eligible only when a valid receipt proves its ordering and
  // the referencing journal is itself being removed. Legacy/unreferenced sets stay.
- const previous=[];const referenced=new Map();for(const item of journals.filter(item=>item.receipt.previous)){if(referenced.has(item.receipt.previous.name))fail('unverified_journal');referenced.set(item.receipt.previous.name,item);}
- const latestPrevious=[...referenced.values()].sort((a,b)=>b.receipt.sequence-a.receipt.sequence)[0]?.receipt.previous?.name;
+ const previous=[];
  for(const name of names.filter(name=>PREVIOUS.test(name))) {
   const journal=referenced.get(name);if(!journal||name===latestPrevious||!candidates.includes(journal)||now-journal.time<MIN_AGE_MS){skipped.retainedPrevious++;continue;}
   let manifest;try{manifest=validatePrevious({repositoryRoot,name,runtimeHandle:{fd:runtime.fd,verify:()=>runtime.verify()}});}catch{fail('unverified_journal');}
