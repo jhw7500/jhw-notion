@@ -1,7 +1,7 @@
 import { link, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Catalog } from "../catalog.js";
 import type { SourceCatalogPort } from "../github-source.js";
@@ -1748,7 +1748,9 @@ describe("Catalog at Registry scale", () => {
       },
     };
     const config = configFor(fixture.registryDir);
-    const scaled = new Catalog(config, isolatedRegistryGit(config, counting));
+    const registry = isolatedRegistryGit(config, counting);
+    const scaled = new Catalog(config, registry);
+    const recordReads = vi.spyOn(scaled.records, "readOptionalJson");
 
     // What listing active Claims does: one full Task lookup per active Claim.
     const claimed = [taskId(1), taskId(1_150)];
@@ -1761,5 +1763,22 @@ describe("Catalog at Registry scale", () => {
     // Everything else is a fixed number of tree listings and HEAD lookups per
     // audit, independent of how many records the Registry holds.
     expect(calls.length).toBeLessThanOrEqual(distinctBlobs.size + 8 * claimed.length);
+
+    // Outside a view each lookup reads every Task and index record again.
+    const outsideView = recordReads.mock.calls.length;
+    expect(outsideView).toBeGreaterThanOrEqual(claimed.length * generated.size);
+
+    // One Guard decision reads inside one committed view, opened the way
+    // ClaimService.withCommittedView opens it. The audit runs once there, so
+    // twice as many active Claims add only their own records.
+    recordReads.mockClear();
+    const manyClaimed = [taskId(1), taskId(2), taskId(1_149), taskId(1_150)];
+    await registry.withCommittedTree(["tasks", "repositories", "claims/active"], () =>
+      scaled.withTaskAuditView(async () => {
+        for (const id of manyClaimed) await expect(scaled.getTask(id)).resolves.toMatchObject({ id });
+      }));
+    const insideView = recordReads.mock.calls.length;
+    expect(insideView).toBeGreaterThanOrEqual(generated.size);
+    expect(insideView).toBeLessThanOrEqual(outsideView / claimed.length + manyClaimed.length);
   }, 120_000);
 });

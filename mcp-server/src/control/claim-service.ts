@@ -302,7 +302,10 @@ export class ClaimService {
 
   /** Pins every Registry-backed Guard read to one immutable committed tree. */
   async withCommittedView<T>(read: () => Promise<T>): Promise<T> {
-    return this.registry.withCommittedTree(["tasks", "repositories", "claims/active"], read);
+    return this.registry.withCommittedTree(
+      ["tasks", "repositories", "claims/active"],
+      () => this.catalog.withTaskAuditView(read),
+    );
   }
 
   /** True only while a committed Guard view is held and HEAD has moved away. */

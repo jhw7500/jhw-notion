@@ -1,7 +1,7 @@
 import { appendFile, link, mkdir, readFile, rename, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Catalog } from "../catalog.js";
 import { ClaimService, type ClaimInspection } from "../claim-service.js";
@@ -792,6 +792,80 @@ describe("ClaimService", () => {
     }));
 
     await expect(claims.listActiveClaims()).resolves.toEqual([first, second]);
+  });
+
+  it("audits the Task catalog once per committed view however many Claims are active", async () => {
+    const { claims, catalog, task } = await claimsFixture();
+    const active = [await claims.claimTask(claimInput(task.id, { session_id: "codex-view-0" }))];
+    for (const n of [1, 2]) {
+      const other = await catalog.registerTemporaryTask({
+        project_id: task.project_id,
+        repo_id: task.repo_id,
+        alias: `wlan:tmp-20260813-view-${n}`,
+        goal: "hold another active Claim",
+        done_conditions: ["the view audits once"],
+        expected_scope: [`src/view-${n}.ts`],
+        ...emptyTaskContractIntent(),
+      });
+      active.push(await claims.claimTask(claimInput(other.id, {
+        task_alias: other.aliases[0],
+        session_id: `codex-view-${n}`,
+        branch: `task/wlan-view-${n}`,
+        worktree_ref: `wt-wlan-view-${n}`,
+      })));
+    }
+    const listings = vi.spyOn(catalog.records, "listDirectoryEntries");
+    const audits = () => listings.mock.calls.filter(([directory]) => directory === "tasks/by-source/github").length;
+
+    // One Guard decision: every active Claim's Task, then its own Task again.
+    await claims.withCommittedView(async () => {
+      const listed = await claims.listActiveClaims();
+      expect(listed).toHaveLength(active.length);
+      expect(listed).toEqual(expect.arrayContaining(active));
+      await expect(catalog.getTask(task.id)).resolves.toMatchObject({ id: task.id });
+    });
+    expect(audits()).toBe(1);
+
+    // The next decision audits again rather than trusting the last one.
+    await claims.withCommittedView(() => claims.listActiveClaims());
+    expect(audits()).toBe(2);
+
+    // Outside a view nothing is remembered: one audit per lookup, as before.
+    await claims.listActiveClaims();
+    expect(audits()).toBe(2 + active.length);
+  });
+
+  it("does not remember a failed Task audit and compares the checkout again in the next view", async () => {
+    const { fixture, claims, catalog, task } = await claimsFixture();
+    const other = await catalog.registerTemporaryTask({
+      project_id: task.project_id,
+      repo_id: task.repo_id,
+      alias: "wlan:tmp-20260813-view-sibling",
+      goal: "sit beside the Task being read",
+      done_conditions: ["its checkout is audited"],
+      expected_scope: ["src/sibling.ts"],
+      ...emptyTaskContractIntent(),
+    });
+    const siblingPath = join(fixture.registryDir, "tasks", `${other.id}.yaml`);
+    const committed = await readFile(siblingPath, "utf8");
+    const listings = vi.spyOn(catalog.records, "listDirectoryEntries");
+    const audits = () => listings.mock.calls.filter(([directory]) => directory === "tasks/by-source/github").length;
+
+    await claims.withCommittedView(async () => {
+      // A sibling whose checkout bytes disagree with HEAD fails the audit even
+      // though the Task asked for is intact.
+      await writeFile(siblingPath, `${committed} `, "utf8");
+      await expect(catalog.getTask(task.id)).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+      await writeFile(siblingPath, committed, "utf8");
+      await expect(catalog.getTask(task.id)).resolves.toMatchObject({ id: task.id });
+      await expect(catalog.getTask(task.id)).resolves.toMatchObject({ id: task.id });
+    });
+    // The failed audit, then the one that passed; the third lookup reused it.
+    expect(audits()).toBe(2);
+
+    await writeFile(siblingPath, `${committed} `, "utf8");
+    await expect(claims.withCommittedView(() => catalog.getTask(task.id)))
+      .rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
   });
 
   it("copies the active Work Contract digest into newly released history", async () => {

@@ -251,6 +251,11 @@ export class RegistryGit {
     return this.committedTree?.commit ?? "HEAD";
   }
 
+  /** The commit a held scope pins its reads to, or undefined outside one. */
+  committedTreeCommit(): string | undefined {
+    return this.committedTree?.commit;
+  }
+
   /**
    * Whether a scope is reading a commit HEAD has since left. A scope freezes
    * the committed side but not the checkout, so once HEAD moves the two stop

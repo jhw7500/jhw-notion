@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { join } from "node:path";
 
 import { z, type ZodType } from "zod";
@@ -259,6 +260,7 @@ export class Catalog {
   readonly records: RegistryRecordStore;
   private readonly sensitiveData: SensitiveDataPolicy;
   private readonly contractAuthority: ContractAuthorityPort;
+  private readonly taskAuditView = new AsyncLocalStorage<{ open: boolean; auditedCommit?: string }>();
 
   constructor(
     private readonly config: ControlConfig,
@@ -707,8 +709,28 @@ export class Catalog {
 
   async getTask(taskId: string): Promise<TaskRecord> {
     assertTaskId(taskId);
-    await this.auditTaskSourceIndexes();
+    await this.auditTaskSourceIndexesOncePerView();
     return this.taskAt(taskId);
+  }
+
+  /**
+   * Runs `read` as one view in which `getTask` does not repeat a Task catalog
+   * audit that already passed for the commit the reads are pinned to. What it
+   * remembers lives only for this call: the next view audits again, checkout
+   * comparison included, and a failed audit is never remembered. A view opened
+   * inside another joins it.
+   */
+  async withTaskAuditView<T>(read: () => Promise<T>): Promise<T> {
+    if (this.taskAuditView.getStore()?.open) return read();
+    const view: { open: boolean; auditedCommit?: string } = { open: true };
+    try {
+      return await this.taskAuditView.run(view, read);
+    } finally {
+      // Continuations left behind still see the store; closing it keeps them
+      // from skipping an audit once the view is over.
+      view.open = false;
+      view.auditedCommit = undefined;
+    }
   }
 
   async getTaskSourceRevision(taskId: string): Promise<string> {
@@ -1015,6 +1037,18 @@ export class Catalog {
     // Each task it walks is checked against its repository, so the scope covers
     // both subtrees rather than leaving half the reads asking per path.
     return this.registry.withCommittedTree(["tasks", "repositories"], () => this.auditTaskSourceIndexesWithin());
+  }
+
+  /** The full Task audit, skipped only when the open view already passed it for the pinned commit. */
+  private async auditTaskSourceIndexesOncePerView(): Promise<void> {
+    const view = this.taskAuditView.getStore();
+    if (!view?.open) return this.auditTaskSourceIndexes();
+    return this.registry.withCommittedTree(["tasks", "repositories"], async () => {
+      const commit = this.registry.committedTreeCommit();
+      if (commit !== undefined && view.open && view.auditedCommit === commit) return;
+      await this.auditTaskSourceIndexesWithin();
+      if (view.open) view.auditedCommit = commit;
+    });
   }
 
   private async auditTaskSourceIndexesWithin(): Promise<void> {
