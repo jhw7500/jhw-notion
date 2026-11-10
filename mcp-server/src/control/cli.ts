@@ -3992,4 +3992,9 @@ export function isCliEntrypointInvocation(invokedPath: string | undefined, modul
   }
 }
 
-if (isCliEntrypointInvocation(process.argv[1], fileURLToPath(import.meta.url))) void main();
+/** Defined only when this module is bundled into the hook entry, which shares its file name. */
+declare const __JHW_HOOK_BUNDLE__: boolean | undefined;
+
+if (typeof __JHW_HOOK_BUNDLE__ === "undefined" && isCliEntrypointInvocation(process.argv[1], fileURLToPath(import.meta.url))) {
+  void main();
+}
