@@ -1,14 +1,14 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { ControlError } from "../errors.js";
 import { MAX_HANDOFF_BYTES } from "../handoff.js";
-import { RegistryRecordStore } from "../codec.js";
-import { ProcessRunner } from "../process.js";
+import { MAX_REGISTRY_RECORD_BYTES, RegistryRecordStore } from "../codec.js";
+import { ProcessRunner, type RawProcessRunOptions } from "../process.js";
 import { RegistryGit, type ProcessRunnerLike, type RegistryMutationResult } from "../registry-git.js";
 import { createSensitiveDataPolicy } from "../sensitive-data.js";
 import { commitFile, configFor, git, makeRegistryFixture, type RegistryFixture } from "./helpers.js";
@@ -930,5 +930,332 @@ describe("RegistryGit", () => {
     await expect(registry.transact("unsafe", async () => mutation(["../outside.yaml"]))).rejects.toMatchObject({
       code: "INVALID_MUTATION_PATH",
     });
+  });
+});
+
+async function commitFiles(registryDir: string, files: ReadonlyMap<string, Buffer>): Promise<void> {
+  for (const [path, bytes] of files) {
+    await mkdir(dirname(join(registryDir, path)), { recursive: true });
+    await writeFile(join(registryDir, path), bytes);
+  }
+  await git(registryDir, "add", "--", ...files.keys());
+  await git(registryDir, "commit", "-m", "Records");
+}
+
+/**
+ * Records no other test commits, so none of their objects is remembered yet.
+ * Every third one carries bytes shaped like a batch header, a NUL and no final
+ * newline, which a reader trusting content over the declared size would misread.
+ */
+function uniqueRecords(directory: string, count: number): Map<string, Buffer> {
+  const files = new Map<string, Buffer>();
+  for (let index = 0; index < count; index += 1) {
+    const id = randomUUID();
+    files.set(`${directory}/r${index}.yaml`, index % 3 === 0
+      ? Buffer.concat([
+        Buffer.from(`${id}\n${"0".repeat(40)} blob 3\nabc\n`, "utf8"),
+        Buffer.from([0x00, 0x0a, 0xff]),
+        Buffer.from(id, "utf8"),
+      ])
+      : Buffer.from(`{"n":"${id}"}\n`, "utf8"));
+  }
+  return files;
+}
+
+type BatchAnswer = (
+  runner: ProcessRunner,
+  command: string,
+  args: string[],
+  options: RawProcessRunOptions | undefined,
+  maximumBytes: number,
+) => Promise<Buffer>;
+
+/** A real runner that records every call and can answer the batch some other way. */
+function recordingRunner(answerBatch?: BatchAnswer) {
+  const runner = new ProcessRunner();
+  const raw: { args: string[]; options?: RawProcessRunOptions; maximumBytes: number }[] = [];
+  const listings: string[][] = [];
+  const recording: ProcessRunnerLike = {
+    run: async (command, args, options) => {
+      if (args[0] === "ls-tree" && args[1] === "-r") listings.push(args);
+      return runner.run(command, args, options);
+    },
+    runRaw: async (command, args, options, maximumBytes) => {
+      raw.push({ args, options, maximumBytes });
+      return answerBatch && args[0] === "cat-file" && args[1] === "--batch"
+        ? answerBatch(runner, command, args, options, maximumBytes)
+        : runner.runRaw(command, args, options, maximumBytes);
+    },
+  };
+  return {
+    recording,
+    listings,
+    batches: () => raw.filter(({ args }) => args[0] === "cat-file" && args[1] === "--batch"),
+    singles: () => raw.filter(({ args }) => args[0] === "cat-file" && args[1] === "blob"),
+  };
+}
+
+interface BatchEntry {
+  header: string;
+  body?: Buffer;
+}
+
+function splitBatch(output: Buffer): BatchEntry[] {
+  const entries: BatchEntry[] = [];
+  for (let cursor = 0; cursor < output.length;) {
+    const newline = output.indexOf(0x0a, cursor);
+    const header = output.subarray(cursor, newline).toString("utf8");
+    const size = Number(header.split(" ")[2]);
+    entries.push({ header, body: output.subarray(newline + 1, newline + 1 + size) });
+    cursor = newline + 1 + size + 1;
+  }
+  return entries;
+}
+
+function joinBatch(entries: readonly BatchEntry[]): Buffer {
+  return Buffer.concat(entries.flatMap(({ header, body }) => body === undefined
+    ? [Buffer.from(`${header}\n`, "utf8")]
+    : [Buffer.from(`${header}\n`, "utf8"), body, Buffer.from("\n", "utf8")]));
+}
+
+function rewriteHeader(entry: BatchEntry, rewrite: (objectId: string, type: string, size: number) => string): void {
+  const [objectId, type, size] = entry.header.split(" ");
+  entry.header = rewrite(objectId as string, type as string, Number(size));
+}
+
+/** Fake committed objects, for byte budgets too large to commit for real. */
+function fakeCommittedObjects(directories: Readonly<Record<string, { count: number; size: number }>>) {
+  const commit = randomBytes(20).toString("hex");
+  const objects = new Map<string, Buffer>();
+  const rows = new Map<string, string>();
+  for (const [directory, { count, size }] of Object.entries(directories)) {
+    // Fake objects may share bytes; only their names have to differ.
+    const bytes = Buffer.alloc(size, directory);
+    for (let index = 0; index < count; index += 1) {
+      const objectId = randomBytes(20).toString("hex");
+      const path = `${directory}/r${index}.yaml`;
+      objects.set(objectId, bytes);
+      rows.set(path, `100644 blob ${objectId} ${size}\t${path}`);
+    }
+  }
+  const raw: string[][] = [];
+  const runner: ProcessRunnerLike = {
+    async run(_command, args) {
+      const path = args.at(-1) as string;
+      const stdout = args[0] === "rev-parse"
+        ? `${commit}\n`
+        : args[0] === "ls-tree" && args[1] === "-r"
+          ? [...rows].filter(([listed]) => listed.startsWith(`${path}/`)).map(([, row]) => `${row}\0`).join("")
+          : args[0] === "ls-tree" ? `${rows.get(path)}\0` : undefined;
+      if (stdout === undefined) throw new Error(`unexpected command: ${args.join(" ")}`);
+      return { command: "git", args, stdout, stderr: "", exitCode: 0 };
+    },
+    async runRaw(_command, args, options) {
+      raw.push(args);
+      if (args[0] === "cat-file" && args[1] === "--batch") {
+        return Buffer.concat((options?.input?.toString("utf8") ?? "").split("\n").filter(Boolean).flatMap((objectId) => {
+          const bytes = objects.get(objectId) as Buffer;
+          return [Buffer.from(`${objectId} blob ${bytes.length}\n`, "utf8"), bytes, Buffer.from("\n", "utf8")];
+        }));
+      }
+      if (args[0] === "cat-file" && args[1] === "blob") return objects.get(args[2] as string) as Buffer;
+      throw new Error(`unexpected raw command: ${args.join(" ")}`);
+    },
+  };
+  return {
+    runner,
+    paths: (directory: string) => [...rows.keys()].filter((path) => path.startsWith(`${directory}/`)),
+    counts: () => ({
+      batches: raw.filter((args) => args[1] === "--batch").length,
+      singles: raw.filter((args) => args[1] === "blob").length,
+    }),
+    forget: () => { raw.length = 0; },
+  };
+}
+
+describe("RegistryGit committed blob prefetch", () => {
+  it.each(["one after another", "all at once"] as const)(
+    "reads a scoped directory with one cat-file --batch when its records are read %s",
+    async (order) => {
+      const { registryDir } = await fixture();
+      const files = uniqueRecords("tasks", 24);
+      files.set("tasks/empty.yaml", Buffer.alloc(0));
+      await commitFiles(registryDir, files);
+      const { recording, batches, singles } = recordingRunner();
+      const registry = fixtureRegistryGit(configFor(registryDir), recording);
+      const paths = [...files.keys()];
+
+      const read = await registry.withCommittedTree(["tasks"], async () => {
+        if (order === "all at once") return Promise.all(paths.map((path) => registry.readHeadRegularBlob(path)));
+        const bytes: Buffer[] = [];
+        for (const path of paths) bytes.push(await registry.readHeadRegularBlob(path));
+        return bytes;
+      });
+
+      expect(read).toEqual(paths.map((path) => files.get(path)));
+      expect(batches()).toHaveLength(1);
+      expect(singles()).toHaveLength(0);
+    },
+  );
+
+  it.each<[string, (entries: BatchEntry[]) => Buffer]>([
+    ["another object ID", (entries) => {
+      rewriteHeader(entries[0] as BatchEntry, (objectId, type, size) =>
+        `${objectId.startsWith("0") ? "1" : "0"}${objectId.slice(1)} ${type} ${size}`);
+      return joinBatch(entries);
+    }],
+    ["another size", (entries) => {
+      rewriteHeader(entries[0] as BatchEntry, (objectId, type, size) => `${objectId} ${type} ${size + 1}`);
+      return joinBatch(entries);
+    }],
+    ["another type", (entries) => {
+      rewriteHeader(entries[0] as BatchEntry, (objectId, _type, size) => `${objectId} tree ${size}`);
+      return joinBatch(entries);
+    }],
+    ["a missing object", (entries) => {
+      const last = entries.at(-1) as BatchEntry;
+      entries[entries.length - 1] = { header: `${last.header.split(" ")[0]} missing` };
+      return joinBatch(entries);
+    }],
+    ["answers out of order", (entries) => joinBatch([entries[1] as BatchEntry, entries[0] as BatchEntry, ...entries.slice(2)])],
+    ["trailing bytes", (entries) => Buffer.concat([joinBatch(entries), Buffer.from("x", "utf8")])],
+    ["a truncated answer", (entries) => joinBatch(entries).subarray(0, -1)],
+    ["a lost separator", (entries) => {
+      const output = joinBatch(entries);
+      output[output.length - 1] = 0x20;
+      return output;
+    }],
+    ["nothing at all", () => Buffer.alloc(0)],
+  ])("reads one blob at a time, unchanged, when the batch answer has %s", async (_label, mangle) => {
+    const { registryDir } = await fixture();
+    const files = uniqueRecords("tasks", 6);
+    await commitFiles(registryDir, files);
+    const { recording, listings, batches, singles } = recordingRunner(async (runner, command, args, options, maximumBytes) =>
+      mangle(splitBatch(await runner.runRaw(command, args, options, maximumBytes))));
+    const registry = fixtureRegistryGit(configFor(registryDir), recording);
+    const paths = [...files.keys()];
+
+    const read = await registry.withCommittedTree(["tasks"], async () => {
+      const bytes: Buffer[] = [];
+      for (const path of paths) bytes.push(await registry.readHeadRegularBlob(path));
+      return bytes;
+    });
+
+    expect(read).toEqual(paths.map((path) => files.get(path)));
+    // Nothing from the rejected answer was remembered, so every record was
+    // asked for on its own; the batch was not retried, nor the listing redone.
+    expect(batches()).toHaveLength(1);
+    expect(singles()).toHaveLength(paths.length);
+    expect(listings).toHaveLength(1);
+  });
+
+  it.each<[string, BatchAnswer]>([
+    ["cannot start", (runner, _command, args, options, maximumBytes) =>
+      runner.runRaw("/nonexistent/jhw-batch-git", args, options, maximumBytes)],
+    ["exits nonzero", (runner, command, args, options, maximumBytes) =>
+      runner.runRaw(command, [...args, "--no-such-option"], options, maximumBytes)],
+    ["times out", (runner, _command, _args, options, maximumBytes) =>
+      runner.runRaw(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], { ...options, timeoutMs: 25 }, maximumBytes)],
+    ["outgrows its exact output bound", (runner, command, args, options, maximumBytes) =>
+      runner.runRaw(command, args, options, maximumBytes - 1)],
+    ["throws outside the runner contract", async () => {
+      throw new Error("injected batch failure");
+    }],
+  ])("reads one blob at a time, without calling the Registry corrupt, when the batch %s", async (_label, answer) => {
+    const { registryDir } = await fixture();
+    const files = uniqueRecords("tasks", 6);
+    await commitFiles(registryDir, files);
+    const { recording, listings, batches, singles } = recordingRunner(answer);
+    const registry = fixtureRegistryGit(configFor(registryDir), recording);
+    const paths = [...files.keys()];
+
+    const read = await registry.withCommittedTree(["tasks"], async () => {
+      const bytes: Buffer[] = [];
+      for (const path of paths) bytes.push(await registry.readHeadRegularBlob(path));
+      return bytes;
+    });
+
+    expect(read).toEqual(paths.map((path) => files.get(path)));
+    expect(batches()).toHaveLength(1);
+    expect(singles()).toHaveLength(paths.length);
+    expect(listings).toHaveLength(1);
+  });
+
+  it("leaves records over the Registry record limit out of the batch and still refuses them", async () => {
+    const { registryDir } = await fixture();
+    const files = uniqueRecords("tasks", 2);
+    // Over the Handoff limit but within the record limit: batched, yet still
+    // refused to a Handoff read by the size gate in front of the memo.
+    files.set("tasks/medium.yaml", Buffer.alloc(MAX_HANDOFF_BYTES + 8 * 1024, randomUUID()));
+    files.set("tasks/large.yaml", Buffer.alloc(MAX_REGISTRY_RECORD_BYTES + 1, randomUUID()));
+    await commitFiles(registryDir, files);
+    const objectIds = new Map<string, string>();
+    for (const path of files.keys()) objectIds.set(path, (await git(registryDir, "rev-parse", `HEAD:${path}`)).trim());
+    const { recording, batches, singles } = recordingRunner();
+    const registry = fixtureRegistryGit(configFor(registryDir), recording);
+
+    const outcome = await registry.withCommittedTree(["tasks"], async () => ({
+      small: await registry.readHeadRegularBlob("tasks/r0.yaml"),
+      medium: await registry.readHeadRegularBlob("tasks/medium.yaml"),
+      mediumAsHandoff: await registry.readHeadRegularFile("tasks/medium.yaml").catch((cause: unknown) => cause),
+      large: await registry.readHeadRegularBlob("tasks/large.yaml").catch((cause: unknown) => cause),
+    }));
+
+    expect(outcome.small).toEqual(files.get("tasks/r0.yaml"));
+    expect(outcome.medium).toEqual(files.get("tasks/medium.yaml"));
+    expect(outcome.mediumAsHandoff).toMatchObject({ code: "REGISTRY_CORRUPT" });
+    expect(outcome.large).toMatchObject({ code: "REGISTRY_CORRUPT" });
+    const batched = [...files.keys()].filter((path) => path !== "tasks/large.yaml");
+    expect(batches()).toHaveLength(1);
+    const [batch] = batches();
+    expect(batch?.options?.input?.toString("utf8").split("\n").filter(Boolean).sort())
+      .toEqual(batched.map((path) => objectIds.get(path)).sort());
+    // Bounded to exactly the answer it asked for.
+    expect(batch?.maximumBytes).toBe(batched.reduce((bytes, path) => {
+      const size = (files.get(path) as Buffer).length;
+      return bytes + Buffer.byteLength(`${objectIds.get(path)} blob ${size}\n`, "utf8") + size + 1;
+    }, 0));
+    expect(singles()).toHaveLength(0);
+  });
+
+  // The memo holds 32 MiB, so 279 such records fit in half of it and 280 do not.
+  it.each([[279, 1, 0], [280, 0, 1]])(
+    "batches a directory of %i 60,000-byte records only while it fits in half the memo",
+    async (count, batches, singles) => {
+      const fake = fakeCommittedObjects({ tasks: { count, size: 60_000 } });
+      const registry = fixtureRegistryGit(configFor("/fixture/registry"), fake.runner);
+
+      await registry.withCommittedTree(["tasks"], () => registry.readHeadRegularBlob(fake.paths("tasks")[0] as string));
+
+      expect(fake.counts()).toEqual({ batches, singles });
+    },
+  );
+
+  it("clears the memo once before a batch that would overflow it and keeps that whole batch", async () => {
+    // A fresh module starts with an empty memo, so the arithmetic is exact: two
+    // 16.2 MB directories fit within 32 MiB together, and a third batch does not.
+    vi.resetModules();
+    const fresh = await import("../registry-git.js");
+    const fake = fakeCommittedObjects({
+      tasks: { count: 270, size: 60_000 },
+      repositories: { count: 270, size: 60_000 },
+      "claims/active": { count: 30, size: 60_000 },
+    });
+    const registry = new fresh.RegistryGit(configFor("/fixture/registry"), fake.runner, undefined, async () => undefined);
+
+    await registry.withCommittedTree(["tasks", "repositories", "claims/active"], async () => {
+      await registry.readHeadRegularBlob(fake.paths("tasks")[0] as string);
+      await registry.readHeadRegularBlob(fake.paths("repositories")[0] as string);
+      // Still remembered: the second batch fit without a clear.
+      await registry.readHeadRegularBlob(fake.paths("tasks")[1] as string);
+      for (const path of fake.paths("claims/active")) await registry.readHeadRegularBlob(path);
+    });
+    // Every record of the last batch survived the clear that batch caused.
+    expect(fake.counts()).toEqual({ batches: 3, singles: 0 });
+
+    // And that clear did happen: what the first batch remembered is gone.
+    fake.forget();
+    await registry.readHeadRegularBlob(fake.paths("tasks")[2] as string);
+    expect(fake.counts()).toEqual({ batches: 0, singles: 1 });
   });
 });

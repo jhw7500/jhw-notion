@@ -1,13 +1,14 @@
+import { spawn, type SpawnOptions } from "node:child_process";
 import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
 import { loadControlConfig } from "../config.js";
-import { createObserveJournalLock, MutationLock, ProcessRunner } from "../process.js";
+import { createObserveJournalLock, MutationLock, ProcessRunner, type ProcessRunnerRuntime } from "../process.js";
 
 describe("control process boundary", () => {
   it("uses a dedicated strict bounded observe-journal lock profile", async () => {
@@ -476,5 +477,89 @@ describe("control process boundary", () => {
     expect(failure).toMatchObject({ code: "COMMAND_OUTPUT_TOO_LARGE" });
   });
 
+  it("feeds raw input to the child's stdin and closes it", async () => {
+    const input = Buffer.from([0x00, 0x0a, 0xff, 0x41, 0x0a]);
+    const bytes = await new ProcessRunner({}).runRaw(
+      process.execPath,
+      ["-e", "process.stdin.pipe(process.stdout)"],
+      { input },
+      64,
+    );
 
+    expect(bytes).toEqual(input);
+  });
+
+  // Far more input than a pipe holds, so the write is still pending when the
+  // child lets go of its stdin.
+  it.each([
+    ["closes stdin and keeps running", "exec 0<&-; sleep 0.2; printf done"],
+    ["exits at once", "printf done"],
+  ])("returns the answer of a raw child that %s without reading its input", async (_label, script) => {
+    const bytes = await new ProcessRunner({}).runRaw(
+      "bash",
+      ["-c", script],
+      { input: Buffer.alloc(8 * 1024 * 1024, 0x61) },
+      64,
+    );
+
+    expect(bytes.toString("utf8")).toBe("done");
+  });
+
+  it("opens stdin only for a raw command that is given input", async () => {
+    const stdio: unknown[] = [];
+    const runtime: ProcessRunnerRuntime = {
+      spawn: ((command: string, args: readonly string[], options: SpawnOptions) => {
+        stdio.push(options.stdio);
+        return spawn(command, args, options);
+      }) as typeof spawn,
+    };
+    const runner = new ProcessRunner({}, runtime);
+
+    // Without input stdin is not a pipe, so `cat` sees end of file at once.
+    expect((await runner.runRaw("bash", ["-c", "cat; printf end"], {}, 64)).toString("utf8")).toBe("end");
+    expect((await runner.runRaw("bash", ["-c", "cat"], { input: Buffer.from("in", "utf8") }, 64)).toString("utf8")).toBe("in");
+    expect(stdio).toEqual([["ignore", "pipe", "ignore"], ["pipe", "pipe", "ignore"]]);
+  });
+
+  it.each([
+    ["EPIPE", "resolves"],
+    ["ECONNRESET", "resolves"],
+    ["EIO", "rejects"],
+  ] as const)("leaves a %s stdin failure to the child's own answer only when the child let go of the pipe", async (code, outcome) => {
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(Object.assign(new Error("injected stdin failure"), { code }));
+      },
+    });
+    const child = Object.assign(new EventEmitter(), { pid: undefined, stdin, stdout: new PassThrough(), kill: vi.fn(() => true) });
+    const RuntimeProcessRunner = ProcessRunner as unknown as new (
+      environment: NodeJS.ProcessEnv,
+      runtime: { spawn(): typeof child },
+    ) => ProcessRunner;
+    const runner = new RuntimeProcessRunner({}, {
+      spawn: () => {
+        setImmediate(() => {
+          child.stdout.end();
+          child.emit("close", 0);
+        });
+        return child;
+      },
+    });
+
+    const pending = runner.runRaw("fake", [], { input: Buffer.from("x", "utf8") }, 64);
+
+    if (outcome === "resolves") await expect(pending).resolves.toEqual(Buffer.alloc(0));
+    else await expect(pending).rejects.toMatchObject({ code: "RAW_COMMAND_FAILED" });
+  });
+
+  it("fails a raw command that cannot start, with input pending, by stable metadata", async () => {
+    const error = await new ProcessRunner({}).runRaw(
+      "/nonexistent/jhw-raw-command",
+      [],
+      { input: Buffer.alloc(1024 * 1024, 0x61) },
+      64,
+    ).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ code: "RAW_COMMAND_FAILED" });
+  });
 });

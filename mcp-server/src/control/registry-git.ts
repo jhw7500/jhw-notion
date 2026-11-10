@@ -6,7 +6,7 @@ import type { ControlConfig } from "./config.js";
 import { MAX_REGISTRY_RECORD_BYTES, type RegistryDirectoryEntry } from "./codec.js";
 import { ControlError } from "./errors.js";
 import { MAX_HANDOFF_BYTES } from "./handoff.js";
-import type { ProcessResult, ProcessRunOptions } from "./process.js";
+import type { ProcessResult, ProcessRunOptions, RawProcessRunOptions } from "./process.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "./sensitive-data.js";
 import { githubSlugFromRemote } from "./github-source.js";
 
@@ -21,11 +21,11 @@ export type RegistryMutation = () => Promise<RegistryMutationResult>;
 
 export interface ProcessRunnerLike {
   run(command: string, args: string[], options?: ProcessRunOptions): Promise<ProcessResult>;
-  runRaw?(command: string, args: string[], options: ProcessRunOptions | undefined, maximumBytes: number): Promise<Buffer>;
+  runRaw?(command: string, args: string[], options: RawProcessRunOptions | undefined, maximumBytes: number): Promise<Buffer>;
 }
 
 interface RawProcessRunnerLike extends ProcessRunnerLike {
-  runRaw(command: string, args: string[], options: ProcessRunOptions | undefined, maximumBytes: number): Promise<Buffer>;
+  runRaw(command: string, args: string[], options: RawProcessRunOptions | undefined, maximumBytes: number): Promise<Buffer>;
 }
 
 const MAX_HEAD_DIRECTORY_ENTRIES = 10_000;
@@ -83,6 +83,30 @@ function parseHeadTreeRow(row: string): { path: string; objectId: string; size: 
   return { path: row.slice(tab + 1), objectId: objectId as string, size: BigInt(size as string) };
 }
 
+/**
+ * Splits `cat-file --batch` output into the requested blobs, in request order,
+ * or returns undefined unless every one is exactly `<oid> blob <size>\n`, that
+ * many bytes and `\n`, with nothing left over. A `missing` row, another type,
+ * another size or any trailing byte rejects the whole answer.
+ */
+function parseCatFileBatch(
+  output: Buffer,
+  requested: readonly { objectId: string; size: number }[],
+): Buffer[] | undefined {
+  const blobs: Buffer[] = [];
+  let cursor = 0;
+  for (const { objectId, size } of requested) {
+    const header = Buffer.from(`${objectId} blob ${size}\n`, "utf8");
+    if (!output.subarray(cursor, cursor + header.length).equals(header)) return undefined;
+    cursor += header.length;
+    if (cursor + size + 1 > output.length || output[cursor + size] !== 0x0a) return undefined;
+    // A copy, so a remembered blob does not keep the whole answer alive.
+    blobs.push(Buffer.from(output.subarray(cursor, cursor + size)));
+    cursor += size + 1;
+  }
+  return cursor === output.length ? blobs : undefined;
+}
+
 function isNonFastForwardPushFailure(error: ControlError): boolean {
   const stderr = typeof error.details.stderr === "string" ? error.details.stderr : "";
   return /(?:non-fast-forward|\(fetch first\)|Updates were rejected because the remote contains work)/i.test(stderr);
@@ -113,6 +137,8 @@ export class RegistryGit {
     commit?: string;
     directories: readonly string[];
     subtrees: Map<string, Promise<Map<string, HeadBlobEntry>>>;
+    /** One blob prefetch per scoped directory; each settles and never rejects. */
+    prefetches: Map<string, Promise<void>>;
     holders: number;
     ready: Promise<void>;
   };
@@ -200,6 +226,7 @@ export class RegistryGit {
       commit: undefined,
       directories: [...relativeDirectories],
       subtrees: new Map<string, Promise<Map<string, HeadBlobEntry>>>(),
+      prefetches: new Map<string, Promise<void>>(),
       holders: 1,
       ready: Promise.resolve(),
     };
@@ -340,6 +367,71 @@ export class RegistryGit {
   }
 
   /**
+   * Remembers the blobs of one scoped directory with a single `cat-file
+   * --batch`, the first time one of them is read and not yet remembered. It is
+   * only a shortcut: any failure is dropped with the memo untouched, the read
+   * that asked carries on one blob at a time exactly as before, and nothing
+   * here starts a listing or reaches the listing's own failure path.
+   */
+  private prefetchCommittedDirectory(
+    scope: NonNullable<RegistryGit["committedTree"]>,
+    directory: string,
+    runner: RawProcessRunnerLike,
+  ): Promise<void> {
+    const started = scope.prefetches.get(directory);
+    if (started) return started;
+    const pending = (async () => {
+      try {
+        const listing = scope.subtrees.get(directory);
+        if (!listing) return;
+        const requested: { objectId: string; size: number }[] = [];
+        const seen = new Set<string>();
+        let total = 0;
+        for (const { objectId, size } of (await listing).values()) {
+          if (size > BigInt(MAX_REGISTRY_RECORD_BYTES) || committedBlobs.has(objectId) || seen.has(objectId)) continue;
+          seen.add(objectId);
+          requested.push({ objectId, size: Number(size) });
+          total += Number(size);
+        }
+        if (requested.length === 0 || total > MAX_COMMITTED_BLOB_CACHE_BYTES / 2) return;
+        const output = await runner.runRaw(
+          "git",
+          ["cat-file", "--batch"],
+          {
+            cwd: this.config.registryDir,
+            input: Buffer.from(requested.map(({ objectId }) => `${objectId}\n`).join(""), "utf8"),
+          },
+          requested.reduce(
+            (bytes, { objectId, size }) => bytes + Buffer.byteLength(`${objectId} blob ${size}\n`, "utf8") + size + 1,
+            0,
+          ),
+        );
+        const blobs = parseCatFileBatch(output, requested);
+        if (!blobs) return;
+        // One synchronous pass with at most one clear before it, so the byte
+        // bound cannot drop part of this batch while it lands.
+        let incoming = 0;
+        requested.forEach(({ objectId }, index) => {
+          if (!committedBlobs.has(objectId)) incoming += (blobs[index] as Buffer).length;
+        });
+        if (committedBlobBytes + incoming > MAX_COMMITTED_BLOB_CACHE_BYTES) {
+          committedBlobs.clear();
+          committedBlobBytes = 0;
+        }
+        requested.forEach(({ objectId }, index) => {
+          if (committedBlobs.has(objectId)) return;
+          committedBlobs.set(objectId, blobs[index] as Buffer);
+          committedBlobBytes += (blobs[index] as Buffer).length;
+        });
+      } catch {
+        // The per-blob reads answer instead.
+      }
+    })();
+    scope.prefetches.set(directory, pending);
+    return pending;
+  }
+
+  /**
    * Reads the whole HEAD tree entry for a path: mode, type, object ID and size
    * together. `-l` is what makes the size part of the same answer, so nothing
    * has to ask a second process for it, and every gate a read passes through
@@ -396,6 +488,11 @@ export class RegistryGit {
         relativePath,
         object_id: objectId,
       });
+    }
+    const scope = this.committedTree;
+    const covering = scope && this.coveringDirectory(scope, relativePath);
+    if (scope && covering !== undefined && !committedBlobs.has(objectId)) {
+      await this.prefetchCommittedDirectory(scope, covering, rawRunner as RawProcessRunnerLike);
     }
     try {
       const remembered = committedBlobs.get(objectId);

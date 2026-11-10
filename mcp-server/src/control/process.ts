@@ -47,6 +47,11 @@ export interface ProcessRunOptions {
   signal?: AbortSignal;
 }
 
+/** `runRaw` alone can feed a child: bytes written to its stdin, which is then closed. */
+export interface RawProcessRunOptions extends ProcessRunOptions {
+  input?: Buffer;
+}
+
 export type GhCredential = "project" | "repo";
 
 /** Removes credentials before spawning ordinary host subprocesses. */
@@ -318,7 +323,7 @@ export class ProcessRunner {
   async runRaw(
     command: string,
     args: string[],
-    options: ProcessRunOptions = {},
+    options: RawProcessRunOptions = {},
     maximumBytes: number,
   ): Promise<Buffer> {
     if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
@@ -340,7 +345,7 @@ export class ProcessRunner {
         detached: process.platform !== "win32",
         // stderr is intentionally not captured: an arbitrary blob error must
         // never become an unredacted diagnostic payload.
-        stdio: ["ignore", "pipe", "ignore"],
+        stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
       });
     } catch {
       throw new ControlError("RAW_COMMAND_FAILED", "Unable to start raw command", {
@@ -348,6 +353,17 @@ export class ProcessRunner {
         args: safeArgs,
         exitCode: null,
       });
+    }
+
+    let inputFailed = false;
+    if (options.input !== undefined) {
+      // A child that exits without reading all of its input closes the pipe
+      // under the write. Its exit status and output answer for that; the write
+      // error must not become an unhandled stream error in a long-lived server.
+      child.stdin?.on("error", (cause: NodeJS.ErrnoException) => {
+        if (cause.code !== "EPIPE" && cause.code !== "ECONNRESET") inputFailed = true;
+      });
+      child.stdin?.end(options.input);
     }
 
     const output = new Promise<{ bytes: Buffer; tooLarge: boolean }>((resolve, reject) => {
@@ -402,6 +418,13 @@ export class ProcessRunner {
     }
     if (exit.exitCode !== 0) {
       throw new ControlError("RAW_COMMAND_FAILED", "Raw command failed", {
+        command: safeCommand,
+        args: safeArgs,
+        exitCode: exit.exitCode,
+      });
+    }
+    if (inputFailed) {
+      throw new ControlError("RAW_COMMAND_FAILED", "Unable to deliver raw command input", {
         command: safeCommand,
         args: safeArgs,
         exitCode: exit.exitCode,

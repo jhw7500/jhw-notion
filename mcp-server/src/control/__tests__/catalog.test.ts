@@ -1735,6 +1735,7 @@ describe("Catalog at Registry scale", () => {
     }
     expect(blobs.size).toBe(generated.size);
     const calls: string[][] = [];
+    const batched: string[] = [];
     const runner = new ProcessRunner();
     const counting: ProcessRunnerLike = {
       run: async (command, args, options) => {
@@ -1743,6 +1744,9 @@ describe("Catalog at Registry scale", () => {
       },
       runRaw: async (command, args, options, maximumBytes) => {
         calls.push(args);
+        if (args[0] === "cat-file" && args[1] === "--batch") {
+          batched.push(...(options?.input?.toString("utf8").split("\n").filter(Boolean) ?? []));
+        }
         const held = args[0] === "cat-file" && args[1] === "blob" ? blobs.get(args[2] as string) : undefined;
         return held ?? runner.runRaw(command, args, options, maximumBytes);
       },
@@ -1756,13 +1760,16 @@ describe("Catalog at Registry scale", () => {
     const claimed = [taskId(1), taskId(1_150)];
     for (const id of claimed) await expect(scaled.getTask(id)).resolves.toMatchObject({ id });
 
+    // One batch asks Git for each record at most once and no record is read one
+    // blob at a time. The audit reads every record, so with no single-blob read
+    // the batch plus blobs this process already remembered served all of them.
     const blobReads = calls.filter((args) => args[0] === "cat-file");
-    const distinctBlobs = new Set(blobReads.map((args) => args[2]));
-    expect(distinctBlobs.size).toBeGreaterThanOrEqual(generated.size);
-    expect(blobReads).toHaveLength(distinctBlobs.size);
+    expect(blobReads.filter((args) => args[1] === "blob")).toHaveLength(0);
+    expect(blobReads.filter((args) => args[1] === "--batch")).toHaveLength(1);
+    expect(batched).toHaveLength(new Set(batched).size);
     // Everything else is a fixed number of tree listings and HEAD lookups per
     // audit, independent of how many records the Registry holds.
-    expect(calls.length).toBeLessThanOrEqual(distinctBlobs.size + 8 * claimed.length);
+    expect(calls.length).toBeLessThanOrEqual(blobReads.length + 8 * claimed.length);
 
     // Outside a view each lookup reads every Task and index record again.
     const outsideView = recordReads.mock.calls.length;
