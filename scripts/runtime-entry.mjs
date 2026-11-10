@@ -285,6 +285,8 @@ export function managedHookRelationship({repositoryRoot,releaseRoot}) {
   } finally { scripts?.close(); runtime?.close(); }
 }
 function failure(selector,args,code) {
+  // jhw-control-host accepts a nonzero control exit only with this single JSON error line.
+  if(selector==='control') { process.stderr.write(JSON.stringify({error:{code}})+'\n'); return 75; }
   if(selector!=='hook') { process.stderr.write(code+'\n'); return 75; }
   const event=args[2]==='--event' && ['UserPromptSubmit','PostToolUse','SessionEnd'].includes(args[3]) ? args[3] : 'PreToolUse';
   let result;

@@ -63,6 +63,8 @@ async function fixture(t, body = "process.stdin.pipe(process.stdout); process.st
   } finally { lease.close(); deploy.close(); }
   return { root, release, activation, prepare, bootstrap:path.join(root,'.jhw-runtime/bootstrap'), lock:path.join(root,'.jhw-runtime/admission.lock') };
 }
+// The single stderr line jhw-control-host accepts with a nonzero control exit.
+const controlError = code => `${JSON.stringify({ error:{ code } })}\n`;
 function run(f, name = 'jhw-runtime-entry', args = ['mcp'], input = '', options = {}) {
   return spawnSync(path.join(f.bootstrap,name), args, {
     input, encoding:'utf8', timeout:12000,
@@ -182,7 +184,7 @@ test('control selector refuses an invalid sibling entry under both launch forms'
     fs.rmSync(sibling,{force:true}); arrange();
     for (const [file,args] of [[process.execPath,[selector]],[selector,[]]]) {
       const result = spawnSync(file,args,{encoding:'utf8',timeout:12000});
-      assert.equal(result.status,75,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,'DEPLOY_BOOTSTRAP_INVALID\n');
+      assert.equal(result.status,75,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,controlError('DEPLOY_BOOTSTRAP_INVALID'));
     }
   }
 });
@@ -195,8 +197,11 @@ test('exclusive admission denies before reading corrupt current or executing any
   const lock = acquireLease(f.lock);
   try {
     const result = run(f); assert.equal(result.status,75); assert.equal(result.stdout,''); assert.equal(result.stderr,'DEPLOY_MAINTENANCE\n');
+    // Break caught: a control entry failure that jhw-control-host can only report as CONTROL_OUTPUT_INVALID.
+    const control = run(f,'jhw-runtime-control',[]); assert.equal(control.status,75); assert.equal(control.stdout,''); assert.equal(control.stderr,controlError('DEPLOY_MAINTENANCE'));
   } finally { lock.close(); }
   const result = run(f); assert.equal(result.status,75); assert.equal(result.stdout,''); assert.match(result.stderr,/^DEPLOY_[A-Z_]+\n$/);
+  const control = run(f,'jhw-runtime-control',[]); assert.equal(control.status,75); assert.equal(control.stdout,''); assert.match(control.stderr,/^\{"error":\{"code":"DEPLOY_[A-Z_]+"\}\}\n$/);
 });
 
 // Break caught: closing the lease when spawn returns rather than when the child exits.
@@ -258,6 +263,7 @@ for (const variant of ['extra-key','missing-file','extra-file','unsafe-mode','sy
     if (variant === 'symlink') { fs.unlinkSync(file); fs.symlinkSync(path.join(f.root,'scripts/runtime-store.mjs'),file); }
     if (variant === 'hardlink') fs.linkSync(file,path.join(f.root,'alias'));
     const result=run(f); assert.equal(result.status,75); assert.equal(result.stdout,''); assert.equal(result.stderr,'DEPLOY_BOOTSTRAP_INVALID\n');
+    const control=run(f,'jhw-runtime-control',[]); assert.equal(control.status,75); assert.equal(control.stdout,''); assert.equal(control.stderr,controlError('DEPLOY_BOOTSTRAP_INVALID'));
   });
 }
 

@@ -17,6 +17,6 @@ if (entry) {
   process.argv = [process.argv[0], entry, 'control', ...process.argv.slice(2)];
   require(entry);
 } else {
-  process.stderr.write('DEPLOY_BOOTSTRAP_INVALID\n');
+  process.stderr.write(JSON.stringify({ error: { code: 'DEPLOY_BOOTSTRAP_INVALID' } }) + '\n');
   process.exitCode = 75;
 }

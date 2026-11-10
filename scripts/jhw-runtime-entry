@@ -10,6 +10,7 @@ const selector = process.argv[2];
 const args = process.argv.slice(3);
 function refuse() {
   const code='DEPLOY_BOOTSTRAP_INVALID';
+  if(selector==='control') { process.stderr.write(JSON.stringify({error:{code}})+'\n'); process.exitCode=75; return; }
   if(selector!=='hook') { process.stderr.write(code+'\n'); process.exitCode=75; return; }
   const event=args[2]==='--event' && ['UserPromptSubmit','PostToolUse','SessionEnd'].includes(args[3]) ? args[3] : 'PreToolUse';
   const value=event==='SessionEnd' ? {} : event==='PostToolUse' ? {systemMessage:code} : event==='UserPromptSubmit' ? {hookSpecificOutput:{hookEventName:event,additionalContext:code},systemMessage:code} : {hookSpecificOutput:{hookEventName:event,permissionDecision:'deny',permissionDecisionReason:code},systemMessage:code};
