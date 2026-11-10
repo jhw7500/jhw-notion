@@ -32,6 +32,18 @@ const MAX_HEAD_DIRECTORY_ENTRIES = 10_000;
 const MAX_HEAD_TREE_ROW_BYTES = 384;
 const gitObjectIdPattern = /^[0-9a-f]{40,64}$/;
 
+/**
+ * Committed blob bytes by object name, shared by every reader in the process.
+ * An object name is the hash of its content, so bytes read once for a name are
+ * the bytes of that name for as long as the process lives; an audit that walks
+ * every record on each lookup then asks Git once per distinct record instead
+ * of once per visit. Only successful reads are kept, and the whole map is
+ * dropped rather than allowed to grow past its byte bound.
+ */
+const MAX_COMMITTED_BLOB_CACHE_BYTES = 32 * 1024 * 1024;
+const committedBlobs = new Map<string, Buffer>();
+let committedBlobBytes = 0;
+
 export interface RegistryTransactionResult {
   commit: string;
   changed: boolean;
@@ -239,6 +251,11 @@ export class RegistryGit {
     return this.committedTree?.commit ?? "HEAD";
   }
 
+  /** The commit a held scope pins its reads to, or undefined outside one. */
+  committedTreeCommit(): string | undefined {
+    return this.committedTree?.commit;
+  }
+
   /**
    * Whether a scope is reading a commit HEAD has since left. A scope freezes
    * the committed side but not the checkout, so once HEAD moves the two stop
@@ -381,7 +398,8 @@ export class RegistryGit {
       });
     }
     try {
-      const bytes = await rawRunner.runRaw(
+      const remembered = committedBlobs.get(objectId);
+      const bytes = remembered ?? await rawRunner.runRaw(
         "git",
         ["cat-file", "blob", objectId],
         { cwd: this.config.registryDir },
@@ -391,7 +409,16 @@ export class RegistryGit {
         // Defend the contract even for alternate ProcessRunner implementations.
         throw new ControlError("RAW_OUTPUT_TOO_LARGE", "Raw blob exceeds the Handoff byte limit");
       }
-      return bytes;
+      if (remembered === undefined) {
+        if (committedBlobBytes + bytes.length > MAX_COMMITTED_BLOB_CACHE_BYTES) {
+          committedBlobs.clear();
+          committedBlobBytes = 0;
+        }
+        committedBlobs.set(objectId, bytes);
+        committedBlobBytes += bytes.length;
+      }
+      // A copy, so no caller can change what the next reader of this object sees.
+      return Buffer.from(bytes);
     } catch {
       // In particular, never attach a Buffer or raw subprocess output here.
       throw new ControlError("REGISTRY_CORRUPT", "Unable to read Registry HEAD blob", {

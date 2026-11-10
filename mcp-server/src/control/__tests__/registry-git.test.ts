@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -821,6 +822,53 @@ describe("RegistryGit", () => {
       { cwd: registryDir },
       MAX_HANDOFF_BYTES,
     );
+  });
+
+  it("asks Git once for a blob it has already read", async () => {
+    const { registryDir } = await fixture();
+    // Content no other test commits, so its object cannot already be held.
+    const content = `{"n":"${randomUUID()}"}\n`;
+    await commitFile(registryDir, "tasks/once.json", content);
+    const runner = new ProcessRunner();
+    const raw: string[][] = [];
+    const counting: ProcessRunnerLike = {
+      run: runner.run.bind(runner),
+      runRaw: async (command, args, options, maximumBytes) => {
+        raw.push(args);
+        return runner.runRaw(command, args, options, maximumBytes);
+      },
+    };
+    const registry = fixtureRegistryGit(configFor(registryDir), counting);
+
+    const first = await registry.readHeadRegularBlob("tasks/once.json");
+    first.fill(0);
+    const second = await registry.readHeadRegularBlob("tasks/once.json");
+    // Another instance in the same process shares what the first one read.
+    const third = await fixtureRegistryGit(configFor(registryDir), counting).readHeadRegularBlob("tasks/once.json");
+
+    expect(second.toString("utf8")).toBe(content);
+    expect(third.toString("utf8")).toBe(content);
+    expect(raw.filter((args) => args[0] === "cat-file")).toHaveLength(1);
+  });
+
+  it("does not remember a blob read that failed", async () => {
+    const { registryDir } = await fixture();
+    const objectId = "d".repeat(40);
+    const run = vi.fn(async (_command: string, args: string[]) => {
+      if (args[0] === "ls-tree") {
+        return { command: "git", args, stdout: `100644 blob ${objectId}       8\thandoffs/retry.md\0`, stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command: ${args.join(" ")}`);
+    });
+    const runRaw = vi.fn()
+      .mockRejectedValueOnce(new Error("transient"))
+      .mockResolvedValueOnce(Buffer.from("# Retry\n", "utf8"));
+    const registry = fixtureRegistryGit(configFor(registryDir), { run, runRaw });
+
+    await expect(registry.readHeadRegularBlob("handoffs/retry.md")).rejects.toMatchObject({ code: "REGISTRY_CORRUPT" });
+    await expect(registry.readHeadRegularFile("handoffs/retry.md")).resolves.toBe("# Retry\n");
+    await expect(registry.readHeadRegularFile("handoffs/retry.md")).resolves.toBe("# Retry\n");
+    expect(runRaw).toHaveBeenCalledTimes(2);
   });
 
   it("round-trips exact Unicode blob bytes", async () => {

@@ -370,14 +370,16 @@ async function defaultBuild({ stagingRoot }) {
   fs.mkdirSync(runtime, { recursive: true, mode: 0o755 });
   fs.chmodSync(runtime, 0o755);
   const bundler = path.join(mcpRoot, 'node_modules/.bin/rolldown');
-  for (const [input, output, executable] of [
-    ['dist/index.js', 'dist/runtime/mcp.cjs', false],
-    ['dist/control/cli.js', 'dist/runtime/control.cjs', true],
-    ['dist/control/hook-adapter.js', 'dist/runtime/hook.cjs', true],
+  for (const [input, output, executable, defines] of [
+    ['dist/index.js', 'dist/runtime/mcp.cjs', false, []],
+    ['dist/control/cli.js', 'dist/runtime/control.cjs', true, []],
+    // The hook bundle carries the CLI module under its own file name, so the
+    // CLI's entry check would pass there too; this define switches it off.
+    ['dist/control/hook-adapter.js', 'dist/runtime/hook.cjs', true, ['--transform.define', '__JHW_HOOK_BUNDLE__:true']],
   ]) {
     await run(bundler, [input, '--file', output, '--format', 'cjs', '--platform', 'node',
       '--no-codeSplitting', '--minify', '--legalComments', 'none', '--logLevel', 'silent',
-      '--transform.define', controlVersionDefine], mcpRoot, env);
+      '--transform.define', controlVersionDefine, ...defines], mcpRoot, env);
     fs.chmodSync(path.join(mcpRoot, output), executable ? 0o755 : 0o644);
   }
   await run(process.execPath, ['scripts/sync-codex-skills.mjs'], stagingRoot, env);

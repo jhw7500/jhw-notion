@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { acquireLease } from './runtime-safety.mjs';
 
 // A missing implementation is an explicit behavioral failure, not an import error.
@@ -370,11 +371,36 @@ test('default npm build and skill generation stay private with safe modes under 
   finally { process.umask(old); }
   assert.equal(fs.readFileSync(path.join(releasePath(root, release), 'skills/generated/done'), 'utf8'), 'generated');
   assert.equal(fs.existsSync(path.join(releasePath(root, release), '.build-home')), false);
+  const defines = {};
   for (const name of ['mcp.cjs', 'control.cjs', 'hook.cjs']) {
     const bundle=fs.readFileSync(path.join(releasePath(root, release), 'mcp-server/dist/runtime', name), 'utf8');
     assert.match(bundle,/--transform\.define __JHW_BUNDLED_CONTROL_TOOL_VERSION__:"1\.0\.0"/);
+    defines[name] = [...bundle.matchAll(/--transform\.define (\S+)/g)].flatMap(match => ['--transform.define', match[1]]);
+    assert.equal(defines[name].includes('__JHW_HOOK_BUNDLE__:true'), name === 'hook.cjs');
   }
   unchanged(root);
+
+  // The same defines on the real sources: the hook bundle answers the hook
+  // without also running the CLI it carries, and the control bundle still runs it.
+  const mcpServer = path.join(path.dirname(fileURLToPath(import.meta.url)), '../mcp-server');
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'jhw-store-entry-'));
+  fs.chmodSync(scratch, 0o700);
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const launch = (name, input, args) => {
+    const output = path.join(scratch, name);
+    const bundled = spawnSync(path.join(mcpServer, 'node_modules/.bin/rolldown'), [path.join(mcpServer, input), '--file', output,
+      '--format', 'cjs', '--platform', 'node', '--no-codeSplitting', '--minify', '--logLevel', 'silent', ...defines[name]],
+    { encoding: 'utf8', timeout: 30_000 });
+    assert.equal(bundled.status, 0, bundled.stderr);
+    return spawnSync(process.execPath, [output, ...args], { cwd: scratch, input: '{}', encoding: 'utf8', timeout: 30_000,
+      env: { PATH: process.env.PATH, HOME: scratch } });
+  };
+  const hook = launch('hook.cjs', 'src/control/hook-adapter.ts', ['--adapter', 'claude', '--event', 'PreToolUse']);
+  assert.equal(hook.status, 0);
+  assert.match(hook.stdout, /"hookEventName":"PreToolUse"/);
+  assert.equal(hook.stderr, '');
+  const control = launch('control.cjs', 'src/control/cli.ts', []);
+  assert.match(control.stderr, /"code":"INVALID_CONFIG"/);
 });
 
 
