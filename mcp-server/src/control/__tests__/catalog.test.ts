@@ -7,7 +7,7 @@ import { Catalog } from "../catalog.js";
 import type { SourceCatalogPort } from "../github-source.js";
 import { sourceIndexKey } from "../ids.js";
 import { ProcessRunner } from "../process.js";
-import { RegistryGit } from "../registry-git.js";
+import { RegistryGit, type ProcessRunnerLike } from "../registry-git.js";
 import type { FormalTask, RepositoryRecord } from "../schemas.js";
 import { createSensitiveDataPolicy, type SensitiveDataPolicy } from "../sensitive-data.js";
 import {
@@ -1677,4 +1677,89 @@ describe("Catalog Task contracts and one-level child topology", () => {
     await expect(catalog.getTask(formal.id)).resolves.toEqual(formal);
     await expect(catalog.getTask(temporary.id)).resolves.toEqual(temporary);
   });
+});
+
+describe("Catalog at Registry scale", () => {
+  it("asks Git for each distinct record once while listing active Claims", async () => {
+    const { catalog, fixture } = await catalogFixture();
+    await catalog.registerRepository(repositoryInput);
+    const formal = (await catalog.registerFormalTask(issueInput)).task;
+    const temporary = await catalog.registerTemporaryTask({
+      project_id: issueInput.project_id,
+      repo_id: issueInput.repo_id,
+      alias: "wlan:scale-seed",
+      goal: "seed a Registry at production scale",
+      done_conditions: ["audit stays bounded"],
+      expected_scope: ["src/control"],
+    });
+
+    // 950 formal Tasks with their source indexes and 200 temporary ones, on top
+    // of the two registered above: 1,152 Tasks and 951 indexes in one commit.
+    const generated = new Map<string, string>();
+    const taskId = (n: number) => `tsk-00000000-0000-7000-8000-${n.toString(16).padStart(12, "0")}`;
+    for (let n = 1; n <= 1_150; n += 1) {
+      const id = taskId(n);
+      if (n <= 950) {
+        const nodeId = `I_kwDOScale${n}`;
+        generated.set(`tasks/${id}.yaml`, `${JSON.stringify({
+          ...formal,
+          id,
+          issue_node_id: nodeId,
+          issue_url: `https://github.com/jhw7500/wlan/issues/${n + 1}`,
+          aliases: [`jhw7500/wlan#${n + 1}`],
+          // A contract names the one Task it belongs to; the clones go without.
+          work_contract: undefined,
+        }, null, 2)}\n`);
+        generated.set(`tasks/by-source/github/${sourceIndexKey(nodeId)}.yaml`, `${JSON.stringify({ task_id: id }, null, 2)}\n`);
+      } else {
+        generated.set(`tasks/${id}.yaml`, `${JSON.stringify({
+          ...temporary,
+          id,
+          aliases: [`wlan:scale-${n}`],
+          work_contract: undefined,
+        }, null, 2)}\n`);
+      }
+    }
+    for (const [path, content] of generated) await writeFile(join(fixture.registryDir, path), content, "utf8");
+    await git(fixture.registryDir, "add", "--", "tasks");
+    await git(fixture.registryDir, "commit", "-m", "Registry at scale");
+    await git(fixture.registryDir, "push", "origin", "main");
+
+    // Generated blobs are answered from their own bytes, looked up by the
+    // object name Git committed them under, so the test counts reads without
+    // paying for two thousand cat-file spawns. Anything else asks real Git.
+    const blobs = new Map<string, Buffer>();
+    for (const row of (await git(fixture.registryDir, "ls-tree", "-r", "-z", "HEAD", "--", "tasks")).split("\0")) {
+      const content = generated.get(row.slice(row.indexOf("\t") + 1));
+      if (content !== undefined) blobs.set(row.split(" ")[2] as string, Buffer.from(content, "utf8"));
+    }
+    expect(blobs.size).toBe(generated.size);
+    const calls: string[][] = [];
+    const runner = new ProcessRunner();
+    const counting: ProcessRunnerLike = {
+      run: async (command, args, options) => {
+        calls.push(args);
+        return runner.run(command, args, options);
+      },
+      runRaw: async (command, args, options, maximumBytes) => {
+        calls.push(args);
+        const held = args[0] === "cat-file" && args[1] === "blob" ? blobs.get(args[2] as string) : undefined;
+        return held ?? runner.runRaw(command, args, options, maximumBytes);
+      },
+    };
+    const config = configFor(fixture.registryDir);
+    const scaled = new Catalog(config, isolatedRegistryGit(config, counting));
+
+    // What listing active Claims does: one full Task lookup per active Claim.
+    const claimed = [taskId(1), taskId(1_150)];
+    for (const id of claimed) await expect(scaled.getTask(id)).resolves.toMatchObject({ id });
+
+    const blobReads = calls.filter((args) => args[0] === "cat-file");
+    const distinctBlobs = new Set(blobReads.map((args) => args[2]));
+    expect(distinctBlobs.size).toBeGreaterThanOrEqual(generated.size);
+    expect(blobReads).toHaveLength(distinctBlobs.size);
+    // Everything else is a fixed number of tree listings and HEAD lookups per
+    // audit, independent of how many records the Registry holds.
+    expect(calls.length).toBeLessThanOrEqual(distinctBlobs.size + 8 * claimed.length);
+  }, 120_000);
 });
