@@ -151,6 +151,20 @@ jhw-control board recover --action reset-state --confirm reset-state --session <
 빈 상태를 만든다. 파일 부재는 손상이 아니라 빈 상태다. 정상 상태에서 실행하면
 `INVALID_BOARD_INPUT`으로 거부된다.
 
+손상 파일에 배포 복구 guard가 남아 있으면(`recovery_guard_active`), 또는 파일을 해석할 수
+없어 guard가 없다는 것을 증명하지 못하면(`recovery_guard_state_unproven`) `reset-state`는
+아무것도 바꾸지 않고 `BOARD_RECOVERY_REQUIRED`로 멈춘다. 이때는 status·recovery-inspect·
+recovery `with`·recovery-clear도 같은 손상 파일을 읽지 못하므로, 도구로 풀 수 있는 경로가
+없다. 운영자가 다음 순서로 직접 복구한다.
+
+1. 이 host에서 board 명령을 쓰는 세션과 배포를 모두 멈춘다.
+2. guard가 걸렸을 수 있는 board를 정한다. 손상 파일에서 `recovery_guard`가 있는 board를
+   읽을 수 있으면 그 board들이고, 읽을 수 없으면 이 host에 등록했던 board 전부다.
+3. 대상 board마다 host-side 고정 verifier로 패키지 상태를 확인한다. 반쯤 바뀐 board는
+   복원한 뒤 다시 확인한다.
+4. 모든 대상이 확인된 뒤에만 board state 파일(`boards.yaml`)을 직접 타임스탬프 접미로 옮겨
+   보존하고, board를 다시 등록한다. 파일을 지우지 않는다.
+
 ## 배포 복구 guard
 
 ```bash
@@ -179,10 +193,19 @@ boolean은 clear 권위가 아니다. `recovery_proof_mismatch`,
 `recovery_requires_exclusive`, `recovery_holder_session_mismatch`,
 `recovery_holder_not_exclusive`, `recovery_holder_untracked`,
 `recovery_holder_not_live` 중 하나면 guard를 보존한 채 멈춘다. guard가 있는 정상 state는
-`reset-state`나 unregister로 지우지 않는다. guard 필드를 모르는 retained runtime은
-strict schema 오류로 fail-close하며, dirty guard가 남은 상태에서는 rollback release를
-활성화하지 않는다. 손상 state를 파싱해 모든 board entry에서 guard 부재를 증명할 수
-없으면 `recovery_guard_state_unproven`으로 reset을 거부한다.
+`reset-state`나 unregister로 지우지 않는다. 손상 state를 파싱해 모든 board entry에서
+guard 부재를 증명할 수 없으면 `recovery_guard_state_unproven`으로 reset을 거부한다.
+
+guard 필드를 모르는 이전 runtime은 guard가 있는 state를 strict schema 오류
+(`BOARD_STATE_CORRUPT`)로 읽어 일반 명령을 멈춘다. 그러나 그 runtime의 `reset-state`는
+guard를 알지 못하므로 guard와 모든 board 등록을 함께 지운다. 이 상태로 rollback하면 guard가
+막아야 할 일반 진입이 다시 열린다. 그래서 다음을 지킨다.
+
+- rollback release를 활성화하기 전에 `jhw-control board list`를 실행해 모든 board의
+  `recovery_guard_armed`가 `false`인지 확인한다. 하나라도 `true`면 rollback하지 않고,
+  guard를 아는 release에서 복구와 `recovery-clear`를 먼저 끝낸다.
+- 이전 runtime에서 `BOARD_STATE_CORRUPT`를 만나면 `reset-state`를 실행하지 않는다.
+  guard를 아는 release로 되돌아가 위 손상 복구 절차를 따른다.
 
 ## 결과 해석
 
