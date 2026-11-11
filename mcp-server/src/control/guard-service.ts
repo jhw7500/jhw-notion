@@ -361,6 +361,17 @@ const hardObserveCodes = new Set<GuardDenyCode>([
   "GUARD_SELF_APPROVAL_DENIED",
 ]);
 
+// Another Registry writer (a control command such as preflight or task finish,
+// or another Guard evaluation) can hold registry.lock longer than the bounded
+// Guard wait. That is a busy Registry, not missing authority: observe mode
+// records it and allows, enforce mode still denies (#241). Only the production
+// Registry lock's contention reason qualifies; admission, reentrancy, authority
+// and timeout failures stay plain GUARD_UNAVAILABLE.
+function registryWriterHoldsLock(cause: unknown): boolean {
+  return cause instanceof ControlError && cause.code === "LOCK_CONTENDED" &&
+    cause.details.reason === "registry_state_lock";
+}
+
 const runFile = promisify(execFile);
 const sensitiveReadComponent = /^(?:\.env(?:\..*)?|\.git|\.netrc|\.npmrc|\.pypirc|credentials?|secrets?|tokens?|id_rsa|id_ed25519)$/iu;
 
@@ -607,7 +618,7 @@ export class GuardService {
   private readonly requestStore: GuardRequestStoreAuthority | undefined;
   private readonly journalConfigured: boolean;
   private readonly decisionJournal: GuardJournalAuthority | undefined;
-  private readonly observedDenialCodes = new WeakMap<GuardDecision, GuardDenyCode>();
+  private readonly observedDenialCodes = new WeakMap<GuardDecision, { code: GuardDenyCode; reason?: ErrorReason }>();
 
   constructor(private readonly options: GuardServiceOptions) {
     this.mode = GuardEvaluationModeSchema.safeParse(options.mode ?? "enforce").data;
@@ -695,9 +706,28 @@ export class GuardService {
     try {
       const callbackDecision = await runWithinRegistryBarrier(evaluateWithinBarrier);
       return authoritativeDecision ?? callbackDecision;
-    } catch {
-      return authoritativeDecision ?? this.deny("GUARD_UNAVAILABLE");
+    } catch (cause) {
+      if (authoritativeDecision) return authoritativeDecision;
+      if (!registryWriterHoldsLock(cause)) return this.deny("GUARD_UNAVAILABLE");
+      return this.mode === "observe"
+        ? this.observeRegistryBusy()
+        : this.deny("GUARD_UNAVAILABLE", undefined, undefined, "hook", undefined, "registry_state_lock");
     }
+  }
+
+  // Observe mode only (#241): record the would-be denial with the existing code
+  // and reason, so a release rolled back to still reads the observation journal,
+  // and allow. No request state was touched: the barrier was never entered.
+  private observeRegistryBusy(): GuardDecision {
+    const observed = GuardDecisionSchema.parse({
+      decision: "ALLOW",
+      operation_id: newOperationId(),
+      summary: "Another Registry writer holds the Registry lock",
+      execution_boundary: "hook",
+      observed_decision: "DENY",
+    });
+    this.observedDenialCodes.set(observed, { code: "GUARD_UNAVAILABLE", reason: "registry_state_lock" });
+    return observed;
   }
 
   private async evaluatePinned(
@@ -1217,6 +1247,7 @@ export class GuardService {
       : decision.decision === "ALLOW"
         ? decision.consumed_request_id
         : undefined;
+    const observedDenial = decision.decision === "ALLOW" ? this.observedDenialCodes.get(decision) : undefined;
     const journalEvent: GuardJournalEvent = {
       protocol_version: 1,
       event: "decision",
@@ -1243,8 +1274,9 @@ export class GuardService {
         decision_code: decision.code,
         ...(decision.reason ? { error_reason: decision.reason } : {}),
       } : {}),
+      ...(observedDenial?.reason ? { error_reason: observedDenial.reason } : {}),
     };
-    const observedCode = this.observedDenialCodes.get(decision);
+    const observedCode = observedDenial?.code;
     const observation: GuardObservation | undefined = decision.decision === "ALLOW"
       ? decision.observed_decision === "PERMIT_REQUIRED"
         ? { observed_decision: "PERMIT_REQUIRED" }
@@ -1386,7 +1418,7 @@ export class GuardService {
         observed_decision: "DENY",
         ...(journalWarning ? { journal_warning: journalWarning } : {}),
       });
-      this.observedDenialCodes.set(observed, code);
+      this.observedDenialCodes.set(observed, { code });
       return observed;
     }
     return GuardDecisionSchema.parse({
