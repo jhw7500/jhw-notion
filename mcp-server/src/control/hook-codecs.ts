@@ -46,6 +46,22 @@ const documentedAgentMetadata = {
   agent_id: coordinate(255).optional(),
   agent_type: coordinate(255).optional(),
 };
+// Claude Code 2.1.322 builds every hook input from one common base, so these
+// optional fields can reach all four events (a recorded SessionEnd carries
+// prompt_id). None of them is copied into Guard authority coordinates.
+const claudeCommonMetadata = {
+  ...documentedAgentMetadata,
+  prompt_id: coordinate(255).optional(),
+  permission_mode: claudePermissionMode.optional(),
+  effort: claudeEffort,
+  scratchpad_dir: coordinate(4_096).optional(),
+};
+// Claude Code 2.1.322 names the serving MCP server on tool events for mcp__*
+// tools. Its source is documented as an open set.
+const claudeMcpServer = z.object({
+  name: coordinate(255),
+  source: coordinate(64),
+}).strict().optional();
 
 // Keep the two native schema sets distinct. Task 2 can refine one adapter from
 // recorded fixtures without silently widening the other adapter's parser.
@@ -53,48 +69,51 @@ const documentedAgentMetadata = {
 // metadata is accepted but never copied into Guard authority coordinates.
 const ClaudeUserPromptSubmitSchema = z.object({
   session_id: coordinate(255),
-  ...documentedAgentMetadata,
-  prompt_id: coordinate(255).optional(),
+  ...claudeCommonMetadata,
   transcript_path: transcriptPath.optional(),
   cwd,
-  permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("UserPromptSubmit"),
   prompt,
-}).strict();
+  source: z.enum(["user", "sdk", "system", "loop_wakeup", "schedule_wakeup", "poll_event"]).optional(),
+  session_title: z.string().max(4_096).refine((value) => Buffer.byteLength(value, "utf8") <= 4_096).optional(),
+}).strict().superRefine((native, context) => {
+  // When Claude marks a prompt's author as anything but the user, reject every
+  // prompt that guard-state treats as an unlock attempt. Claude Code 2.1.322
+  // sets source only on its poll-event path, so ordinary, scheduled and
+  // system-injected prompts arrive without it and keep today's handling (#239).
+  if (native.source !== undefined && native.source !== "user" && native.prompt.startsWith("/jhw:unlock")) {
+    context.addIssue({ code: "custom", path: ["source"], message: "Guard unlock requires a user-authored prompt" });
+  }
+});
 const ClaudePreToolUseSchema = z.object({
   session_id: coordinate(255),
-  ...documentedAgentMetadata,
-  prompt_id: coordinate(255).optional(),
+  ...claudeCommonMetadata,
   transcript_path: transcriptPath.optional(),
   cwd,
-  permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("PreToolUse"),
-  effort: claudeEffort,
   tool_name: coordinate(64),
   tool_input: toolInput,
   tool_use_id: coordinate(255),
+  mcp_server: claudeMcpServer,
 }).strict();
 const ClaudePostToolUseSchema = z.object({
   session_id: coordinate(255),
-  ...documentedAgentMetadata,
-  prompt_id: coordinate(255).optional(),
+  ...claudeCommonMetadata,
   transcript_path: transcriptPath.optional(),
   cwd,
-  permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("PostToolUse"),
-  effort: claudeEffort,
   tool_name: coordinate(64),
   tool_input: toolInput,
   tool_response: z.unknown().optional(),
   tool_use_id: coordinate(255),
   duration_ms: z.number().finite().nonnegative().optional(),
+  mcp_server: claudeMcpServer,
 }).strict();
 const ClaudeSessionEndSchema = z.object({
   session_id: coordinate(255),
-  ...documentedAgentMetadata,
+  ...claudeCommonMetadata,
   transcript_path: transcriptPath,
   cwd,
-  permission_mode: claudePermissionMode.optional(),
   hook_event_name: z.literal("SessionEnd"),
   reason: coordinate(64),
 }).strict();
