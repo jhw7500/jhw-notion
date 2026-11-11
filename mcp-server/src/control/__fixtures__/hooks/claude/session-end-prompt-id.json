@@ -1,0 +1,8 @@
+{
+  "session_id": "claude-contract-session-01",
+  "transcript_path": "/workspace/adapter-contract/transcript.jsonl",
+  "cwd": "/workspace/adapter-contract",
+  "prompt_id": "018f21e0-7b2c-7a00-8000-000000000011",
+  "hook_event_name": "SessionEnd",
+  "reason": "other"
+}

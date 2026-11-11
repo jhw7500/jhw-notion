@@ -60,7 +60,21 @@ const CLAIM_ID = "clm-018f21e0-7b2c-7a00-8000-000000000002";
 const KEY = Buffer.alloc(32, 0x71);
 const roots: string[] = [];
 
-type HookFixture = "user-prompt-submit" | "pre-tool-edit" | "post-tool-edit" | "session-end";
+type HookFixture =
+  | "user-prompt-submit"
+  | "pre-tool-edit"
+  | "post-tool-edit"
+  | "session-end"
+  | "pre-tool-mcp"
+  | "session-end-prompt-id";
+
+// The only keys decode may copy into each Guard event; native metadata never appears here.
+const GUARD_EVENT_KEYS: Readonly<Record<HookEventName, readonly string[]>> = {
+  UserPromptSubmit: ["adapter", "event", "prompt", "protocol_version", "session_id"],
+  PreToolUse: ["adapter", "cwd", "event", "protocol_version", "session_id", "tool_input", "tool_name", "tool_use_id"],
+  PostToolUse: ["adapter", "event", "ok", "protocol_version", "session_id", "tool_use_id"],
+  SessionEnd: ["adapter", "cwd", "event", "protocol_version", "session_id"],
+};
 
 function fixtureBytes(adapter: Adapter, fixture: HookFixture): Buffer {
   return readFileSync(join(fixtureRoot, adapter, `${fixture}.json`));
@@ -103,6 +117,11 @@ describe("recorded native hook contracts", () => {
       expect(codec(codecs, adapter).decode("SessionEnd", fixtureJson(adapter, "session-end")))
         .toMatchObject({ adapter, event: "session_end" });
     }
+    // Recorded from Claude Code 2.1.322: an MCP tool call and a SessionEnd after a prompt.
+    expect(codecs.claudeHookCodec.decode("PreToolUse", fixtureJson("claude", "pre-tool-mcp")))
+      .toMatchObject({ adapter: "claude", event: "pre_tool_use", tool_name: "mcp__repowire__whoami" });
+    expect(codecs.claudeHookCodec.decode("SessionEnd", fixtureJson("claude", "session-end-prompt-id")))
+      .toMatchObject({ adapter: "claude", event: "session_end" });
   });
 
   it("catches documented subagent metadata rejection without treating it as Guard authority", async () => {
@@ -132,6 +151,102 @@ describe("recorded native hook contracts", () => {
         { level: 3 },
         {},
       ]) expect(() => codecs.claudeHookCodec.decode(event, { ...native, effort })).toThrow();
+    }
+  });
+
+  it("catches Claude MCP server metadata rejection without treating it as Guard authority", async () => {
+    const codecs = await loadCodecs();
+    const recorded = fixtureJson("claude", "pre-tool-mcp");
+    for (const event of ["PreToolUse", "PostToolUse"] as const) {
+      // The 2.1.322 hook input builder adds the same mcp_server field to PostToolUse.
+      const native = event === "PreToolUse" ? recorded : {
+        ...fixtureJson("claude", "post-tool-edit"),
+        tool_name: recorded.tool_name,
+        tool_input: recorded.tool_input,
+        mcp_server: recorded.mcp_server,
+      };
+      const decoded = codecs.claudeHookCodec.decode(event, native);
+      expect(Object.keys(decoded).sort()).toEqual(GUARD_EVENT_KEYS[event]);
+      if (event === "PreToolUse") expect(decoded).toMatchObject({ tool_name: "mcp__repowire__whoami" });
+      expect(() => codecs.claudeHookCodec.decode(event, {
+        ...native,
+        mcp_server: { name: "repowire", source: "claudeai" },
+      })).not.toThrow();
+      for (const mcpServer of [
+        { name: "repowire" },
+        { name: "", source: "user" },
+        { name: "repowire", source: "user", unreviewed: true },
+        "repowire",
+      ]) expect(() => codecs.claudeHookCodec.decode(event, { ...native, mcp_server: mcpServer })).toThrow();
+      const codexFixture = event === "PreToolUse" ? "pre-tool-edit" : "post-tool-edit";
+      expect(() => codecs.codexHookCodec.decode(event, {
+        ...fixtureJson("codex", codexFixture),
+        mcp_server: recorded.mcp_server,
+      })).toThrow();
+    }
+  });
+
+  it("catches Claude common metadata rejection on every event", async () => {
+    const codecs = await loadCodecs();
+    const events: ReadonlyArray<readonly [HookEventName, HookFixture]> = [
+      ["UserPromptSubmit", "user-prompt-submit"],
+      ["PreToolUse", "pre-tool-edit"],
+      ["PostToolUse", "post-tool-edit"],
+      ["SessionEnd", "session-end"],
+    ];
+    const claudeOnly = {
+      prompt_id: "018f21e0-7b2c-7a00-8000-000000000011",
+      effort: { level: "high" },
+      scratchpad_dir: "/workspace/adapter-contract/.scratchpad",
+    };
+    for (const [event, fixture] of events) {
+      const native = { ...fixtureJson("claude", fixture), ...claudeOnly, permission_mode: "default" };
+      const decoded = codecs.claudeHookCodec.decode(event, native);
+      expect(Object.keys(decoded).sort(), event).toEqual(GUARD_EVENT_KEYS[event]);
+      expect(() => codecs.claudeHookCodec.decode(event, { ...native, scratchpad_dir: "" }), event).toThrow();
+      expect(() => codecs.claudeHookCodec.decode(event, { ...native, effort: { level: "turbo" } }), event).toThrow();
+      for (const [field, value] of Object.entries(claudeOnly)) {
+        expect(
+          () => codecs.codexHookCodec.decode(event, { ...fixtureJson("codex", fixture), [field]: value }),
+          `codex ${event}.${field}`,
+        ).toThrow();
+      }
+    }
+  });
+
+  it("catches Claude prompt source and title drift and rejects unlock prompts marked non-user", async () => {
+    const codecs = await loadCodecs();
+    // Claude Code 2.1.322 omits source on ordinary prompts, so a source-less
+    // unlock still decodes; origin-based unlock decisions belong to #239.
+    const unlock = fixtureJson("claude", "user-prompt-submit");
+    const ordinary = { ...unlock, prompt: "summarize the adapter contract" };
+    const sources = ["user", "sdk", "system", "loop_wakeup", "schedule_wakeup", "poll_event"];
+    for (const source of sources) {
+      const decoded = codecs.claudeHookCodec.decode("UserPromptSubmit", {
+        ...ordinary,
+        source,
+        session_title: "renamed adapter contract session",
+      });
+      expect(Object.keys(decoded).sort(), source).toEqual(GUARD_EVENT_KEYS.UserPromptSubmit);
+    }
+    expect(codecs.claudeHookCodec.decode("UserPromptSubmit", unlock)).toMatchObject({ prompt: unlock.prompt });
+    expect(codecs.claudeHookCodec.decode("UserPromptSubmit", { ...unlock, source: "user" }))
+      .toMatchObject({ prompt: unlock.prompt });
+    for (const source of sources.filter((value) => value !== "user")) {
+      expect(() => codecs.claudeHookCodec.decode("UserPromptSubmit", { ...unlock, source }), source).toThrow();
+      expect(
+        () => codecs.claudeHookCodec.decode("UserPromptSubmit", { ...unlock, prompt: "/jhw:unlock", source }),
+        `${source} prefix only`,
+      ).toThrow();
+    }
+    for (const drift of [{ source: "operator" }, { source: "" }, { session_title: 7 }]) {
+      expect(() => codecs.claudeHookCodec.decode("UserPromptSubmit", { ...ordinary, ...drift })).toThrow();
+    }
+    for (const field of [{ source: "user" }, { session_title: "renamed adapter contract session" }]) {
+      expect(() => codecs.codexHookCodec.decode("UserPromptSubmit", {
+        ...fixtureJson("codex", "user-prompt-submit"),
+        ...field,
+      })).toThrow();
     }
   });
 

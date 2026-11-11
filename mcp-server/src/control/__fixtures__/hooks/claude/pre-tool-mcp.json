@@ -1,0 +1,18 @@
+{
+  "session_id": "claude-contract-session-01",
+  "transcript_path": "/workspace/adapter-contract/transcript.jsonl",
+  "cwd": "/workspace/adapter-contract",
+  "prompt_id": "018f21e0-7b2c-7a00-8000-000000000011",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "xhigh"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "mcp__repowire__whoami",
+  "tool_input": {},
+  "tool_use_id": "toolu_contract_mcp_01",
+  "mcp_server": {
+    "name": "repowire",
+    "source": "user"
+  }
+}
