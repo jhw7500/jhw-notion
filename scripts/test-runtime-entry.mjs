@@ -423,8 +423,8 @@ test('managed child refuses before replacement target bytes can execute', async 
   const readyName='child-spawn-ready'; const resumeName='child-spawn-resume';
   const f=await fixture(t,"process.stdout.write('ORIGINAL');",undefined,{
     'runtime-entry.mjs':(bytes,root)=>bytes.replace(
-      '    return await new Promise((resolve,reject)=>{',
-      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    return await new Promise((resolve,reject)=>{`,
+      '    const childArgs=',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    const childArgs=`,
     ),
   });
   const p=start(f);
@@ -444,8 +444,8 @@ test('managed selector executes one pinned bundle after a non-entry dependency r
   const readyName='bundle-spawn-ready'; const resumeName='bundle-spawn-resume';
   const f=await fixture(t,"import './dependency.js';",undefined,{
     'runtime-entry.mjs':(bytes,root)=>bytes.replace(
-      '    return await new Promise((resolve,reject)=>{',
-      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    return await new Promise((resolve,reject)=>{`,
+      '    const childArgs=',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    const childArgs=`,
     ),
   },{
     bundleBody:"process.stdout.write('ORIGINAL');",
@@ -470,8 +470,8 @@ test('control authorization version stays pinned after package metadata replacem
   const bundle=bundledControlVersion(t,'1.0.0');
   const f=await fixture(t,undefined,undefined,{
     'runtime-entry.mjs':(bytes,root)=>bytes.replace(
-      '    return await new Promise((resolve,reject)=>{',
-      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    return await new Promise((resolve,reject)=>{`,
+      '    const childArgs=',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    const childArgs=`,
     ),
   },{bundleBody:bundle});
   const ready=path.join(f.root,readyName); const resume=path.join(f.root,resumeName);
@@ -550,8 +550,8 @@ test('managed credential replacement fails before descriptor execution', async t
   const bundle=bundledCredentialProbe(t);
   const f=await fixture(t,undefined,undefined,{
     'runtime-entry.mjs':(bytes,root)=>bytes.replace(
-      '    return await new Promise((resolve,reject)=>{',
-      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    return await new Promise((resolve,reject)=>{`,
+      '    const childArgs=',
+      `    fs.writeFileSync(${JSON.stringify(path.join(root,readyName))},'ready'); while(!fs.existsSync(${JSON.stringify(path.join(root,resumeName))})) await new Promise(resolve=>setTimeout(resolve,10));\n    const childArgs=`,
     ),
   },{bundleBody:bundle});
   const credential=write(f.root,'mcp-server/.env','NOTION_API_KEY=original-descriptor-key\n',0o600);

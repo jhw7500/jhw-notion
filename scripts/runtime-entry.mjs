@@ -391,7 +391,7 @@ const finish=(code,signal)=>{
   const output=!overflow && code===0 && signal===null ? validate(Buffer.concat(chunks,length)) : undefined;
   if(output) process.stdout.write(output); else fallback();
 };
-try { child=spawn(process.execPath,['-e',coreRunner,'--','/proc/self/fd/4',releaseRoot,'hook','none',...args],{stdio:['inherit','pipe','inherit',3,4]}); }
+try { child=spawn(process.execPath,['-e',coreRunner,'--','/proc/self/fd/4',releaseRoot,'hook','none',...args],{stdio:['inherit','pipe','inherit',3,4,'ignore',6]}); }
 catch { fallback(); process.exit(0); }
 child.stdout.on('data',chunk=>{ if(overflow) return; length+=chunk.length; if(length>12*1024) { overflow=true; chunks.length=0; child.kill('SIGTERM'); } else chunks.push(chunk); });
 child.stdout.on('error',()=>{ overflow=true; child.kill('SIGTERM'); });
@@ -399,12 +399,12 @@ child.once('error',()=>finish(null,null)); child.once('close',finish);
 timer=setTimeout(()=>{ child.kill('SIGTERM'); killTimer=setTimeout(()=>child.kill('SIGKILL'),200); },event==='SessionEnd' ? 2000 : 8000);
 `;
 
-function runPinnedHook({args,artifact,lease,releaseRoot}) {
+function runPinnedHook({args,artifact,lease,binding,releaseRoot}) {
   return new Promise(resolve=>{
     let child;
     try {
       artifact.verify();
-      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',releaseRoot,...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd],env:runtimeEnvironment()});
+      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',releaseRoot,...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd,'ignore',binding.fd],env:runtimeEnvironment()});
       fs.closeSync(artifact.fd); artifact.fd=undefined;
     } catch { if(artifact.fd!==undefined) { fs.closeSync(artifact.fd); artifact.fd=undefined; } resolve(failure('hook',args,'GUARD_UNAVAILABLE')); return; }
     child.once('error',()=>resolve(failure('hook',args,'GUARD_UNAVAILABLE')));
@@ -413,46 +413,70 @@ function runPinnedHook({args,artifact,lease,releaseRoot}) {
 }
 
 export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseId,safetySource,storeSource}) {
-  let lease; let credential; const artifacts=[];
+  let lease; let publication; let binding; let credential; const artifacts=[];
   try {
-    if(!['mcp','control','hook'].includes(selector)) fail('DEPLOY_SELECTOR_INVALID');
+    if(!['mcp','control','hook','session'].includes(selector)) fail('DEPLOY_SELECTOR_INVALID');
     if(!Array.isArray(args) || args.some(value=>typeof value!=='string' || value.includes('\0'))) fail('DEPLOY_SELECTOR_INVALID');
     if(selector==='hook' && (args.length!==4 || args[0]!=='--adapter' || !['claude','codex'].includes(args[1]) || args[2]!=='--event' || !['PreToolUse','PostToolUse','UserPromptSubmit','SessionEnd'].includes(args[3]))) return failure(selector,args,'GUARD_PROTOCOL_MISMATCH');
+    if(selector==='session' && (args.length<2 || args[0]!=='--' || !args[1])) fail('DEPLOY_SELECTOR_INVALID');
+    const token=process.env.JHW_RUNTIME_SESSION_BINDING;
+    // A nested wrapper cannot silently turn an existing client's later work into a new generation.
+    if(selector==='session' && token!==undefined) fail('DEPLOY_SESSION_INVALID');
     const validated=validateBootstrap({repositoryRoot});
     if(sourceReleaseId!==validated.sourceReleaseId || !Buffer.isBuffer(safetySource) || !Buffer.isBuffer(storeSource)) fail('DEPLOY_BOOTSTRAP_CHANGED');
     const byName=new Map(validated.files.map(record=>[record.name,record]));
     if(hash(safetySource)!==byName.get('runtime-safety.mjs')?.sha256 || hash(storeSource)!==byName.get('runtime-store.mjs')?.sha256) fail('DEPLOY_BOOTSTRAP_CHANGED');
-    const moduleUrl=bytes=>`data:text/javascript;base64,${Buffer.from(bytes).toString('base64')}`;
+    const moduleUrl=bytes=>'data:text/javascript;base64,'+Buffer.from(bytes).toString('base64');
     const safetyUrl=moduleUrl(safetySource);
     const safety=await import(safetyUrl);
-    try { lease=safety.acquireLease(path.join(repositoryRoot,'.jhw-runtime/admission.lock'),{shared:true}); }
-    catch(error) { if(error.code==='DEPLOY_LOCK_CONTENDED') fail('DEPLOY_MAINTENANCE'); throw error; }
-    // Admission now prevents a cooperating maintenance writer from replacing
-    // bootstrap. Revalidate before importing store or resolving current.
+    try {
+      // Keep the original lifetime lease: even orphan children still block ordinary maintenance.
+      lease=safety.acquireLease(path.join(repositoryRoot,'.jhw-runtime/admission.lock'),{shared:true});
+      publication=safety.acquireLease(path.join(repositoryRoot,'.jhw-runtime/publication.lock'),{shared:true,create:true});
+    } catch(error) { if(error.code==='DEPLOY_LOCK_CONTENDED') fail('DEPLOY_MAINTENANCE'); throw error; }
     if(canonical(validateBootstrap({repositoryRoot}))!==canonical(validated)) fail('DEPLOY_BOOTSTRAP_CHANGED');
     const storeText=new TextDecoder('utf-8',{fatal:true}).decode(storeSource);
     const safetySpecifier="'./runtime-safety.mjs'";
     if(storeText.split(safetySpecifier).length!==2) fail('DEPLOY_BOOTSTRAP_CHANGED');
     const store=await import(moduleUrl(Buffer.from(storeText.replace(safetySpecifier,JSON.stringify(safetyUrl)))));
-    const activation=store.readActivation({repositoryRoot});
-    if(!activation) fail('DEPLOY_NO_CURRENT');
-    const release=path.join(repositoryRoot,'.jhw-runtime/releases',activation.releaseId);
-    const target=path.join(release, selector==='mcp' ? 'mcp-server/dist/runtime/mcp.cjs' : selector==='control' ? 'mcp-server/dist/runtime/control.cjs' : 'mcp-server/dist/runtime/hook.cjs');
-    const relative=path.relative(release,target); artifacts.push(openArtifact(repositoryRoot,activation.releaseId,relative));
-    if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease,releaseRoot:release});
-    if(selector==='mcp') credential=openCredential(repositoryRoot,activation.releaseId);
-    const command=process.execPath; const childArgs=['-e',MODULE_RUNNER_SOURCE,'--',`/proc/self/fd/4`,release,selector,credential?'fd':'none',...args];
+    if(token===undefined) store.assertNoSessionAncestor({repositoryRoot});
+    const selected=token!==undefined
+      ? store.resolveSessionBinding({repositoryRoot,token})
+      : store.readActivation({repositoryRoot});
+    if(!selected) fail('DEPLOY_NO_CURRENT');
+    binding=store.createSessionBinding({repositoryRoot,releaseId:selected.releaseId,kind:selector==='session'?'session':'invocation',parentBinding:token??null});
+    const release=path.join(repositoryRoot,'.jhw-runtime/releases',selected.releaseId);
+    if(selector==='session') {
+      const environment=runtimeEnvironment();
+      environment.JHW_RUNTIME_SESSION_BINDING=binding.token;
+      publication.close(); publication=undefined;
+      return await new Promise((resolve,reject)=>{
+        const child=spawn(args[1],args.slice(2),{stdio:['inherit','inherit','inherit',lease.fd,'ignore','ignore',binding.fd],env:environment});
+        child.once('error',()=>reject(Object.assign(new Error('DEPLOY_START_FAILED'),{code:'DEPLOY_START_FAILED'})));
+        child.once('exit',(code,signal)=>resolve(code??(128+(osConstants.signals[signal]??1))));
+      });
+    }
+    const target=path.join(release,selector==='mcp'?'mcp-server/dist/runtime/mcp.cjs':selector==='control'?'mcp-server/dist/runtime/control.cjs':'mcp-server/dist/runtime/hook.cjs');
+    artifacts.push(openArtifact(repositoryRoot,selected.releaseId,path.relative(release,target)));
+    if(selector==='mcp') credential=openCredential(repositoryRoot,selected.releaseId);
+    publication.close(); publication=undefined;
+    if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease,binding,releaseRoot:release});
+    const childArgs=['-e',MODULE_RUNNER_SOURCE,'--','/proc/self/fd/4',release,selector,credential?'fd':'none',...args];
     return await new Promise((resolve,reject)=>{
-      // fd 3 is inherited through Node, Bash, timeout, and core. Closing the
-      // supervisor's fd never unlocks the child's open-file description.
       for(const artifact of artifacts) artifact.verify();
       credential?.verify();
-      const child=spawn(command,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd),credential?.fd??'ignore'],env:runtimeEnvironment()});
+      // Credential remains fd 5; session lifetime proof has a separate inherited fd 6.
+      const child=spawn(process.execPath,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd),credential?.fd??'ignore',binding.fd],env:runtimeEnvironment()});
       for(const artifact of artifacts.splice(0)) fs.closeSync(artifact.fd);
       if(credential){fs.closeSync(credential.fd);credential.fd=undefined;}
       child.once('error',()=>reject(Object.assign(new Error('DEPLOY_START_FAILED'),{code:'DEPLOY_START_FAILED'})));
-      child.once('exit',(code,signal)=>resolve(code ?? (128+(osConstants.signals[signal] ?? 1))));
+      child.once('exit',(code,signal)=>resolve(code??(128+(osConstants.signals[signal]??1))));
     });
-  } catch(error) { return failure(selector,args,typeof error.code==='string' && /^DEPLOY_[A-Z_]{1,56}$/.test(error.code) ? error.code : 'DEPLOY_START_FAILED'); }
-  finally { for(const artifact of artifacts) if(artifact.fd!==undefined) fs.closeSync(artifact.fd); if(credential?.fd!==undefined) fs.closeSync(credential.fd); lease?.close(); }
+  } catch(error) {
+    return failure(selector,args,typeof error.code==='string' && /^DEPLOY_[A-Z_]{1,56}$/.test(error.code)?error.code:'DEPLOY_START_FAILED');
+  } finally {
+    for(const artifact of artifacts) if(artifact.fd!==undefined) fs.closeSync(artifact.fd);
+    if(credential?.fd!==undefined) fs.closeSync(credential.fd);
+    publication?.close(); binding?.close(); lease?.close();
+  }
 }

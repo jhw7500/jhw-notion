@@ -386,9 +386,11 @@ async function defaultBuild({ stagingRoot }) {
   fs.rmSync(home, { recursive: true });
 }
 
-/** Preparation alone owns deploy.lock. Publish/rollback MUST be called by the
- * driver holding deploy.lock + exclusive admission.lock and both quiescence checks.
- * build({stagingRoot}) is a module integration seam, never a public CLI option. */
+/** Preparation alone owns deploy.lock. Ordinary publish/rollback requires the
+ * driver to hold deploy.lock + exclusive admission.lock and both quiescence checks.
+ * Compatible activation instead requires deploy.lock + exclusive publication.lock
+ * and the bound-session inventory/compatibility gate; maintenance still requires
+ * exclusive admission. build({stagingRoot}) is a module seam, never a CLI option. */
 export async function prepareRelease({ repositoryRoot, build = defaultBuild }) {
   let root; let runtime; let releases; let stage; let lease; let stageName;
   try {
@@ -448,7 +450,7 @@ function observation(runtime) {
     return { target, dev: String(stat.dev), ino: String(stat.ino), ctimeNs: String(stat.ctimeNs) };
   } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
-function validCurrent(value) {
+export function validCurrent(value) {
   if (value === null) return true;
   return exact(value, ['activationId', 'releaseId', 'predecessorActivationId', 'observation']) &&
     ACTIVATION.test(value.activationId) && RELEASE.test(value.releaseId) &&
@@ -556,5 +558,588 @@ export function rollbackActivation({ repositoryRoot, expectedCurrent, onPointerI
     if (predecessor.releaseId !== manifest.priorCurrent.releaseId ||
         predecessor.predecessorActivationId !== manifest.priorCurrent.predecessorActivationId) fail('DEPLOY_PREDECESSOR_INVALID');
     return switchPointer(runtime, repositoryRoot, current.predecessorActivationId, expectedCurrent, onPointerIntent);
+  });
+}
+
+
+// A binding chooses immutable runtime bytes; it never grants Project Control or
+// board authority. Callers serialize selection/registration with publication.lock
+// and keep the ordinary admission lease over the complete process lifetime.
+const SESSION_ID = /^s-[a-f0-9]{32}$/;
+const SESSION_PRIVATE = /^(?:\.creating\.s-[a-f0-9]{32}|\.retired\.s-[a-f0-9]{32}\.[a-f0-9]{32})$/;
+const SESSION_TOKEN = /^(s-[a-f0-9]{32}):([a-f0-9]{64})$/;
+const SESSION_LIMIT = 1024;
+const SESSION_MANIFEST_LIMIT = 16 * 1024;
+const PROCESS_RECORD_LIMIT = 128 * 1024;
+const DECIMAL = /^\d{1,32}$/;
+const BOOT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+const sessionFail = () => fail('DEPLOY_SESSION_INVALID');
+// Readers hold a shared namespace lease only while taking the directory snapshot;
+// registration and retirement hold the exclusive lease over atomic publication.
+// A bounded wait handles ordinary simultaneous arrivals without weakening pin checks.
+const SESSION_INDEX_WAIT_NS = 500_000_000n;
+const SESSION_INDEX_SLEEP = new Int32Array(new SharedArrayBuffer(4));
+const sessionIndexWriters = new Set();
+function sessionIndexLease(repositoryRoot, shared) {
+  // Synchronous re-entrant reads inside the same JS stack cannot wait for their
+  // own exclusive lease. Their caller already holds the verified namespace.
+  // Separate processes and worker isolates still acquire the kernel lease.
+  if (shared && sessionIndexWriters.has(repositoryRoot)) return { close() {} };
+  const file = path.join(repositoryRoot, '.jhw-runtime/session-index.lock');
+  const deadline = process.hrtime.bigint() + SESSION_INDEX_WAIT_NS;
+  for (;;) {
+    try {
+      const lease = acquireLease(file, { shared, create: true });
+      if (!shared) sessionIndexWriters.add(repositoryRoot);
+      let closed = false;
+      return { close() {
+        if (closed) return;
+        closed = true;
+        try { lease.close(); }
+        finally { if (!shared) sessionIndexWriters.delete(repositoryRoot); }
+      } };
+    } catch (error) {
+      if (error.code !== 'DEPLOY_LOCK_CONTENDED' || process.hrtime.bigint() >= deadline) sessionFail();
+      Atomics.wait(SESSION_INDEX_SLEEP, 0, 0, 5);
+    }
+  }
+}
+function sessionBoundary(callback) {
+  try { return callback(); }
+  catch { sessionFail(); }
+}
+function sessionRootName(repositoryRoot) {
+  if (typeof repositoryRoot !== 'string' || !path.isAbsolute(repositoryRoot) ||
+      repositoryRoot !== path.resolve(repositoryRoot) || repositoryRoot.includes('\0')) sessionFail();
+  return repositoryRoot;
+}
+function processRecord(directoryFd, name, limit = PROCESS_RECORD_LIMIT, allowedUid = process.getuid()) {
+  const fd = fs.openSync('/proc/self/fd/' + directoryFd + '/' + name, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+  try {
+    const before = fs.fstatSync(fd, { bigint: true });
+    if (!before.isFile() || (before.uid !== BigInt(allowedUid) && before.uid !== 0n)) sessionFail();
+    const bytes = Buffer.alloc(limit + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = fs.readSync(fd, bytes, length, bytes.length - length, null);
+      if (!count) break;
+      length += count;
+    }
+    if (length > limit || !same(before, fs.fstatSync(fd, { bigint: true }))) sessionFail();
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, length));
+  } finally { fs.closeSync(fd); }
+}
+function sessionBootId() {
+  const directory = fs.openSync('/proc/sys/kernel/random', C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+  try {
+    const value = processRecord(directory, 'boot_id', 64).trim();
+    if (!BOOT_ID.test(value)) sessionFail();
+    return value;
+  } finally { fs.closeSync(directory); }
+}
+function sessionProcess(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1 || pid > 0x7fffffff) sessionFail();
+  const name = '/proc/' + pid;
+  const directory = fs.openSync(name, C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+  try {
+    const before = fs.fstatSync(directory, { bigint: true });
+    if (before.uid !== BigInt(process.getuid())) sessionFail();
+    const observe = () => {
+      const stat = processRecord(directory, 'stat');
+      const end = stat.lastIndexOf(')');
+      if (!stat.startsWith(pid + ' (') || end < 0) sessionFail();
+      const fields = stat.slice(end + 1).trim().split(/\s+/);
+      if (fields.length < 20 || !/^\d+$/.test(fields[1]) || !DECIMAL.test(fields[19]) ||
+          ['Z', 'X', 'x'].includes(fields[0])) sessionFail();
+      const parentPid = Number(fields[1]);
+      if (!Number.isSafeInteger(parentPid) || parentPid < 0 || parentPid > 0x7fffffff) sessionFail();
+      const status = processRecord(directory, 'status');
+      const uid = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/m.exec(status);
+      if (!uid || uid.slice(1).some(value => Number(value) !== process.getuid())) sessionFail();
+      const command = processRecord(directory, 'cmdline');
+      if (!command || !command.endsWith('\0')) sessionFail();
+      const executable = fs.statSync('/proc/self/fd/' + directory + '/exe', { bigint: true });
+      if (!executable.isFile()) sessionFail();
+      return { pid, parentPid, uid: process.getuid(), startTime: fields[19],
+        commandDigest: digest(command), exeDev: String(executable.dev), exeIno: String(executable.ino) };
+    };
+    const first = observe();
+    const second = observe();
+    if (canonical(first) !== canonical(second) || !objectSame(before, fs.fstatSync(directory, { bigint: true })) ||
+        !objectSame(before, fs.lstatSync(name, { bigint: true }))) sessionFail();
+    return first;
+  } finally { fs.closeSync(directory); }
+}
+function ownerMatches(record) {
+  if (record.owner.bootId !== sessionBootId()) sessionFail();
+  const observed = sessionProcess(record.owner.pid);
+  for (const key of ['uid', 'pid', 'startTime', 'commandDigest', 'exeDev', 'exeIno']) {
+    if (observed[key] !== record.owner[key]) sessionFail();
+  }
+  const held = fs.statSync('/proc/' + record.owner.pid + '/fd/' + record.lease.fd, { bigint: true });
+  if (!held.isFile() || held.uid !== BigInt(process.getuid()) || held.nlink !== 1n ||
+      (Number(held.mode) & 0o7777) !== 0o600 ||
+      String(held.dev) !== record.lease.dev || String(held.ino) !== record.lease.ino) sessionFail();
+  return observed;
+}
+function requireSessionDescendant(pid, record) {
+  const chain = [];
+  let current = pid;
+  for (let depth = 0; depth < 256; depth++) {
+    if (chain.some(item => item.pid === current)) sessionFail();
+    const observed = sessionProcess(current);
+    chain.push(observed);
+    if (current === record.owner.pid) {
+      ownerMatches(record);
+      for (const prior of chain.reverse()) {
+        if (canonical(prior) !== canonical(sessionProcess(prior.pid))) sessionFail();
+      }
+      return;
+    }
+    if (!observed.parentPid || observed.parentPid === current) sessionFail();
+    current = observed.parentPid;
+  }
+  sessionFail();
+}
+function sessionNames(directory, reserved = 0) {
+  const list = [];
+  let count = reserved;
+  const stream = fs.opendirSync('/proc/self/fd/' + directory.fd);
+  try {
+    let item;
+    while ((item = stream.readSync()) !== null) {
+      if (++count > SESSION_LIMIT) sessionFail();
+      if (SESSION_ID.test(item.name)) list.push(item.name);
+      else {
+        // Interrupted construction/retirement stays outside the public namespace.
+        // Count every entry and validate even ignored names as private real dirs.
+        if (!SESSION_PRIVATE.test(item.name)) sessionFail();
+        const ignored = directory.child(item.name, false, true);
+        ignored.close();
+      }
+    }
+  } finally { stream.closeSync(); }
+  directory.verify();
+  return list.sort();
+}
+function unusedSessionName(directory, name) {
+  directory.verify();
+  try { fs.lstatSync(directory.at(name)); }
+  catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  sessionFail();
+}
+function sessionDirectory(runtime, create = false) {
+  try { return runtime.child('sessions', create, true); }
+  catch (error) { if (!create && error.code === 'ENOENT') return null; throw error; }
+}
+function leaseIsHeld(file) {
+  let probe;
+  try { probe = acquireLease(file); return false; }
+  catch (error) { if (error.code === 'DEPLOY_LOCK_CONTENDED') return true; throw error; }
+  finally { probe?.close(); }
+}
+function sessionRecord(runtime, root, repositoryRoot, id, token = null) {
+  let sessions; let directory;
+  try {
+    if (!SESSION_ID.test(id)) sessionFail();
+    sessions = sessionDirectory(runtime);
+    if (!sessions) sessionFail();
+    directory = sessions.child(id, false, true);
+    if (canonical(names(directory)) !== canonical(['lease', 'manifest.json'])) sessionFail();
+    const { bytes, mode } = readBytes(directory, 'manifest.json', SESSION_MANIFEST_LIMIT);
+    if (mode !== 0o600) sessionFail();
+    const record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    const actualToken = id + ':' + digest(bytes);
+    const file = fs.lstatSync(directory.at('manifest.json'), { bigint: true });
+    const lease = fs.lstatSync(directory.at('lease'), { bigint: true });
+    const integer = value => Number.isSafeInteger(value) && value >= 0;
+    if (token !== null && token !== actualToken ||
+        !exact(record, ['version', 'id', 'kind', 'releaseId', 'compatibilityDigest', 'parentBinding',
+          'repository', 'owner', 'manifest', 'lease', 'createdAt']) ||
+        record.version !== 1 || record.id !== id || !['session', 'invocation'].includes(record.kind) ||
+        !RELEASE.test(record.releaseId) || !DIGEST.test(record.compatibilityDigest) ||
+        !(record.parentBinding === null || typeof record.parentBinding === 'string' && SESSION_TOKEN.test(record.parentBinding)) ||
+        record.kind === 'session' && record.parentBinding !== null || !timestamp(record.createdAt) ||
+        !exact(record.repository, ['path', 'dev', 'ino']) || record.repository.path !== repositoryRoot ||
+        record.repository.dev !== String(root.stat.dev) || record.repository.ino !== String(root.stat.ino) ||
+        !exact(record.owner, ['uid', 'pid', 'startTime', 'bootId', 'commandDigest', 'exeDev', 'exeIno']) ||
+        record.owner.uid !== process.getuid() || !integer(record.owner.pid) || record.owner.pid < 1 ||
+        !DECIMAL.test(record.owner.startTime) || !BOOT_ID.test(record.owner.bootId) ||
+        !DIGEST.test(record.owner.commandDigest) || !DECIMAL.test(record.owner.exeDev) || !DECIMAL.test(record.owner.exeIno) ||
+        !exact(record.manifest, ['dev', 'ino']) || record.manifest.dev !== String(file.dev) || record.manifest.ino !== String(file.ino) ||
+        !exact(record.lease, ['dev', 'ino', 'fd']) || !integer(record.lease.fd) || record.lease.fd > 1048576 ||
+        !lease.isFile() || lease.uid !== BigInt(process.getuid()) || lease.nlink !== 1n || (Number(lease.mode) & 0o7777) !== 0o600 ||
+        record.lease.dev !== String(lease.dev) || record.lease.ino !== String(lease.ino) ||
+        bytes.toString('utf8') !== canonical(record) + '\n') sessionFail();
+    directory.verify();
+    return { record, token: actualToken, leaseFile: path.join(repositoryRoot, '.jhw-runtime/sessions', id, 'lease') };
+  } finally { directory?.close(); sessions?.close(); }
+}
+
+// Retire only exact inode-bound records after an independent exclusive flock
+// proves every inherited holder has closed. This is used by normal close() and
+// by a separate bounded maintenance reaper; never by the entry hot path.
+function retireUnusedSessionRecord({ repositoryRoot, id, token = null, expectedRecord = null, indexHeld = false }) {
+  let index;
+  try {
+    if (!indexHeld) index = sessionIndexLease(repositoryRoot, false);
+    return withStore(repositoryRoot, false, (runtime, root) => {
+      if (!runtime) sessionFail();
+      const data = sessionRecord(runtime, root, repositoryRoot, id, token);
+      if (expectedRecord && canonical(data.record) !== canonical(expectedRecord)) sessionFail();
+      let exclusive; let sessions; let directory;
+      try {
+        try { exclusive = acquireLease(data.leaseFile); }
+        catch (error) { if (error.code === 'DEPLOY_LOCK_CONTENDED') return false; throw error; }
+        const exclusiveIdentity = fs.fstatSync(exclusive.fd, { bigint: true });
+        if (String(exclusiveIdentity.dev) !== data.record.lease.dev ||
+            String(exclusiveIdentity.ino) !== data.record.lease.ino) sessionFail();
+        sessions = sessionDirectory(runtime);
+        directory = sessions.child(id, false, true);
+        const verified = sessionRecord(runtime, root, repositoryRoot, id, data.token);
+        if (canonical(data.record) !== canonical(verified.record)) sessionFail();
+        directory.verify();
+        const retired = '.retired.' + id + '.' + randomBytes(16).toString('hex');
+        unusedSessionName(sessions, retired);
+        const retiringIdentity = directory.stat;
+        fs.renameSync(sessions.at(id), sessions.at(retired));
+        fs.fsyncSync(sessions.fd);
+        directory.close(); directory = undefined;
+        directory = sessions.child(retired, false, true);
+        if (!objectSame(retiringIdentity, directory.stat)) sessionFail();
+        const retiredManifest = fs.lstatSync(directory.at('manifest.json'), { bigint: true });
+        if (String(retiredManifest.dev) !== data.record.manifest.dev ||
+            String(retiredManifest.ino) !== data.record.manifest.ino ||
+            !same(exclusiveIdentity, fs.lstatSync(directory.at('lease'), { bigint: true }))) sessionFail();
+        const retiredBytes = readBytes(directory, 'manifest.json', SESSION_MANIFEST_LIMIT);
+        if (retiredBytes.mode !== 0o600 || id + ':' + digest(retiredBytes.bytes) !== data.token) sessionFail();
+        fs.unlinkSync(directory.at('manifest.json'));
+        fs.unlinkSync(directory.at('lease'));
+        fs.fsyncSync(directory.fd);
+        sessions.verify();
+        fs.rmdirSync(sessions.at(retired));
+        fs.fsyncSync(sessions.fd);
+        return true;
+      } finally { directory?.close(); sessions?.close(); exclusive?.close(); }
+    });
+  } finally { index?.close(); }
+}
+
+// This maintenance API is deliberately not used during runManaged entry: it
+// may scan historical records and must be invoked only with an owner-approved
+// maintenance window. Preview is the default and removes nothing.
+export function reapCompletedSessionBindings({ repositoryRoot, dryRun = true, limit = 128, after = null }) {
+  return sessionBoundary(() => {
+    sessionRootName(repositoryRoot);
+    if (typeof dryRun !== 'boolean' || !Number.isInteger(limit) || limit < 1 || limit > SESSION_LIMIT ||
+        !(after === null || typeof after === 'string' && SESSION_ID.test(after))) sessionFail();
+    let index;
+    try {
+      const lockPath = path.join(repositoryRoot, '.jhw-runtime/session-index.lock');
+      if (!dryRun) index = sessionIndexLease(repositoryRoot, false);
+      else if (fs.existsSync(lockPath)) index = acquireLease(lockPath, { shared: true });
+      return withStore(repositoryRoot, false, (runtime, root) => {
+        if (!runtime) return { scanned:0, candidates:0, removed:0, busy:0, rootsSkipped:0, nextAfter:null };
+        const sessions = sessionDirectory(runtime);
+        if (!sessions) return { scanned:0, candidates:0, removed:0, busy:0, rootsSkipped:0, nextAfter:null };
+        try {
+          const namesBefore = sessionNames(sessions);
+          const ids = namesBefore.filter(id => after === null || id > after);
+          const selected = ids.slice(0, limit);
+          let candidates = 0; let removed = 0; let busy = 0; let rootsSkipped = 0;
+          for (const id of selected) {
+            const data = sessionRecord(runtime, root, repositoryRoot, id);
+            if (data.record.kind !== 'invocation') { rootsSkipped++; continue; }
+            if (dryRun) {
+              if (leaseIsHeld(data.leaseFile)) busy++;
+              else candidates++;
+            } else {
+              if (retireUnusedSessionRecord({repositoryRoot, id, token:data.token,
+                  expectedRecord:data.record, indexHeld:true})) { removed++; candidates++; }
+              else busy++;
+            }
+          }
+          if (dryRun && canonical(namesBefore) !== canonical(sessionNames(sessions))) sessionFail();
+          return { scanned:selected.length, candidates, removed, busy, rootsSkipped,
+            nextAfter:ids.length > selected.length ? selected.at(-1) : null };
+        } finally { sessions.close(); }
+      });
+    } finally { index?.close(); }
+  });
+}
+
+// Everything is protected except the explicitly bounded MCP tool/entry surface.
+// This includes actual dependency bytes, not only their package-lock declaration.
+function compatibleMcpEntry(name) {
+  return name === 'mcp-server/src/tools' || name.startsWith('mcp-server/src/tools/') ||
+    /^mcp-server\/src\/(?:index|server)\.ts$/.test(name) ||
+    name === 'mcp-server/dist/tools' || name.startsWith('mcp-server/dist/tools/') ||
+    /^mcp-server\/dist\/(?:index|server)\.(?:js(?:\.map)?|d\.ts(?:\.map)?)$/.test(name) ||
+    name === 'mcp-server/dist/runtime/mcp.cjs';
+}
+function releaseCompatibilityIn(runtime, repositoryRoot, releaseId) {
+  const validated = validateReleaseIn(runtime, repositoryRoot, releaseId);
+  let releases; let release;
+  try {
+    releases = runtime.child('releases', false, true);
+    release = releases.child(releaseId, false, true);
+    const manifest = readJson(release);
+    if (canonical(summary(manifest)) !== canonical(validated) || contentDigest(manifest) !== validated.contentDigest) fail('DEPLOY_RELEASE_INVALID');
+    const result = digest(canonical({ version: 1, entries: manifest.entries.filter(entry => !compatibleMcpEntry(entry.path)) }));
+    release.verify();
+    if (canonical(manifest) !== canonical(readJson(release))) fail('DEPLOY_RELEASE_INVALID');
+    return result;
+  } finally { release?.close(); releases?.close(); }
+}
+export function releaseCompatibility({ repositoryRoot, releaseId }) {
+  return withStore(repositoryRoot, false, runtime => {
+    if (!runtime) fail('DEPLOY_RELEASE_INVALID');
+    return releaseCompatibilityIn(runtime, repositoryRoot, releaseId);
+  });
+}
+function verifyLiveSession(runtime, repositoryRoot, data) {
+  if (!leaseIsHeld(data.leaseFile)) sessionFail();
+  ownerMatches(data.record);
+  if (releaseCompatibilityIn(runtime, repositoryRoot, data.record.releaseId) !== data.record.compatibilityDigest) sessionFail();
+  if (!leaseIsHeld(data.leaseFile)) sessionFail();
+  ownerMatches(data.record);
+}
+export function resolveSessionBinding({ repositoryRoot, token, pid = process.pid }) {
+  return sessionBoundary(() => {
+    sessionRootName(repositoryRoot);
+    if (typeof token !== 'string' || !SESSION_TOKEN.test(token)) sessionFail();
+    return withStore(repositoryRoot, false, (runtime, root) => {
+      if (!runtime) sessionFail();
+      const index = sessionIndexLease(repositoryRoot, true);
+      let data;
+      try { data = sessionRecord(runtime, root, repositoryRoot, token.slice(0, 34), token); }
+      finally { index.close(); }
+      if (data.record.kind !== 'session') sessionFail();
+      verifyLiveSession(runtime, repositoryRoot, data);
+      requireSessionDescendant(pid, data.record);
+      return { ...data.record, token: data.token, live: true };
+    });
+  });
+}
+export function inspectSessionBindings({ repositoryRoot }) {
+  return sessionBoundary(() => {
+    sessionRootName(repositoryRoot);
+    return withStore(repositoryRoot, false, (runtime, root) => {
+      if (!runtime) return [];
+      const sessions = sessionDirectory(runtime);
+      if (!sessions) return [];
+      try {
+        let snapshot;
+        const index = sessionIndexLease(repositoryRoot, true);
+        try {
+          const before = sessionNames(sessions);
+          snapshot = before.map(id => sessionRecord(runtime, root, repositoryRoot, id));
+          if (canonical(before) !== canonical(sessionNames(sessions))) sessionFail();
+        } finally { index.close(); }
+        const result = [];
+        for (const data of snapshot) {
+          if (!leaseIsHeld(data.leaseFile)) continue;
+          verifyLiveSession(runtime, repositoryRoot, data);
+          if (data.record.parentBinding !== null) {
+            const parent = resolveSessionBinding({ repositoryRoot, token: data.record.parentBinding, pid: data.record.owner.pid });
+            if (parent.releaseId !== data.record.releaseId) sessionFail();
+          }
+          result.push({ ...data.record, token: data.token, live: true });
+        }
+        return result;
+      } finally { sessions.close(); }
+    });
+  });
+}
+export function createSessionBinding({ repositoryRoot, releaseId, kind = 'session', parentBinding = null }) {
+  return sessionBoundary(() => {
+    sessionRootName(repositoryRoot);
+    if (!['session', 'invocation'].includes(kind) || kind === 'session' && parentBinding !== null ||
+        !(parentBinding === null || typeof parentBinding === 'string' && SESSION_TOKEN.test(parentBinding))) sessionFail();
+    if (parentBinding !== null) {
+      const parent = resolveSessionBinding({ repositoryRoot, token: parentBinding });
+      if (parent.releaseId !== releaseId) sessionFail();
+    }
+    return withStore(repositoryRoot, false, (runtime, root) => {
+      if (!runtime) sessionFail();
+      const compatibilityDigest = releaseCompatibilityIn(runtime, repositoryRoot, releaseId);
+      const observed = sessionProcess(process.pid);
+      const owner = { uid: observed.uid, pid: observed.pid, startTime: observed.startTime, bootId: sessionBootId(),
+        commandDigest: observed.commandDigest, exeDev: observed.exeDev, exeIno: observed.exeIno };
+      let sessions; let directory; let lease; let manifestFd; let index; let published = false;
+      const id = 's-' + randomBytes(16).toString('hex');
+      const staging = '.creating.' + id;
+      const leaseFile = path.join(repositoryRoot, '.jhw-runtime/sessions', staging, 'lease');
+      try {
+        sessions = sessionDirectory(runtime, true);
+        index = sessionIndexLease(repositoryRoot, false);
+        sessionNames(sessions, 1);
+        fs.mkdirSync(sessions.at(staging), { mode: 0o700 });
+        directory = sessions.child(staging, false, true);
+        writeBytes(directory, 'lease', '', 0o600);
+        lease = acquireLease(leaseFile, { shared: true });
+        manifestFd = fs.openSync(directory.at('manifest.json'), C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600);
+        fs.fchmodSync(manifestFd, 0o600);
+        const manifestIdentity = fs.fstatSync(manifestFd, { bigint: true });
+        const leaseIdentity = fs.fstatSync(lease.fd, { bigint: true });
+        const record = { version: 1, id, kind, releaseId, compatibilityDigest, parentBinding,
+          repository: { path: repositoryRoot, dev: String(root.stat.dev), ino: String(root.stat.ino) }, owner,
+          manifest: { dev: String(manifestIdentity.dev), ino: String(manifestIdentity.ino) },
+          lease: { dev: String(leaseIdentity.dev), ino: String(leaseIdentity.ino), fd: lease.fd }, createdAt: new Date().toISOString() };
+        const bytes = canonical(record) + '\n';
+        fs.writeFileSync(manifestFd, bytes);
+        fs.fsyncSync(manifestFd);
+        fs.closeSync(manifestFd); manifestFd = undefined;
+        fs.fsyncSync(directory.fd);
+        directory.verify(); ownerMatches(record);
+        unusedSessionName(sessions, id);
+        const directoryIdentity = directory.stat;
+        // No public s-ID exists until its complete, inode-bound record is durable.
+        fs.renameSync(sessions.at(staging), sessions.at(id));
+        published = true;
+        fs.fsyncSync(sessions.fd); fs.fsyncSync(runtime.fd);
+        directory.close(); directory = undefined;
+        directory = sessions.child(id, false, true);
+        if (!objectSame(directoryIdentity, directory.stat)) sessionFail();
+        const token = id + ':' + digest(bytes);
+        sessionRecord(runtime, root, repositoryRoot, id, token);
+        ownerMatches(record);
+        const held = lease; lease = undefined;
+        let closed = false;
+        const close = () => {
+          if (closed) return;
+          closed = true;
+          held.close();
+          // A descendant may outlive its owner and retain this lease. If so,
+          // leave a complete record for the separate verified reaper.
+          try { retireUnusedSessionRecord({ repositoryRoot, id, token, expectedRecord:record }); }
+          catch { /* Keep untrusted records as evidence; never guess cleanup. */ }
+        };
+        return { id, token, record, fd: held.fd, close };
+      } finally {
+        if (manifestFd !== undefined) fs.closeSync(manifestFd);
+        lease?.close();
+        if (!published && directory) {
+          try {
+            directory.verify();
+            for (const name of names(directory)) {
+              if (!['manifest.json', 'lease'].includes(name)) sessionFail();
+              fs.unlinkSync(directory.at(name));
+            }
+            fs.fsyncSync(directory.fd);
+            sessions.verify(); fs.rmdirSync(sessions.at(staging)); fs.fsyncSync(sessions.fd);
+          } catch { /* Interrupted private construction is never a public record. */ }
+        }
+        directory?.close(); index?.close(); sessions?.close();
+      }
+    });
+  });
+}
+
+
+// Missing pins must not turn a descendant of a pinned wrapper into an unbound
+// caller. Ancestor traversal reads only PID relationship metadata, including for
+// foreign-UID ancestors; it never reads their command line or environment.
+function sessionAncestorProcess(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1 || pid > 0x7fffffff) sessionFail();
+  const name = '/proc/' + pid;
+  const directory = fs.openSync(name, C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+  try {
+    const before = fs.fstatSync(directory, { bigint: true });
+    const observe = () => {
+      const stat = processRecord(directory, 'stat', PROCESS_RECORD_LIMIT, before.uid);
+      const end = stat.lastIndexOf(')');
+      if (!stat.startsWith(pid + ' (') || end < 0) sessionFail();
+      const fields = stat.slice(end + 1).trim().split(/\s+/);
+      if (fields.length < 20 || !/^\d+$/.test(fields[1]) || !DECIMAL.test(fields[19]) ||
+          ['Z', 'X', 'x'].includes(fields[0])) sessionFail();
+      const parentPid = Number(fields[1]);
+      if (!Number.isSafeInteger(parentPid) || parentPid < 0 || parentPid > 0x7fffffff) sessionFail();
+      return { pid, parentPid, uid: Number(before.uid), startTime: fields[19], dev: String(before.dev), ino: String(before.ino) };
+    };
+    const first = observe();
+    if (canonical(first) !== canonical(observe()) ||
+        !objectSame(before, fs.fstatSync(directory, { bigint: true })) ||
+        !objectSame(before, fs.lstatSync(name, { bigint: true }))) sessionFail();
+    return first;
+  } finally { fs.closeSync(directory); }
+}
+// The missing-pin check is an ancestry check, not a global inventory audit.
+// Enumerating every historical invocation and probing its lease made each new
+// hook slower as completed invocation records accumulated. Session owners and
+// descendants retain their lease descriptor; inspect those actual ancestors
+// instead. The separate deployment inventory remains exhaustive/fail-closed.
+// A non-dumpable current-user ancestor, such as the per-user sshd of an SSH
+// login, hides its descriptor table: opendir fails with EACCES and the kernel
+// owns /proc/<pid>/fd as root. Such a process cannot be a working session
+// owner, because bound descendants verify the owner through its exe and fd
+// entries (sessionProcess, ownerMatches), which it hides as well. Only that
+// kernel-marked case is skipped; every other failure stays fail-closed.
+function ancestorHasSessionLease(repositoryRoot, ancestor) {
+  if (ancestor.uid !== process.getuid()) return false;
+  const base = path.join(repositoryRoot, '.jhw-runtime/sessions') + path.sep;
+  const fdPath = '/proc/' + ancestor.pid + '/fd';
+  let descriptors;
+  try { descriptors = fs.opendirSync(fdPath); }
+  catch (error) {
+    let owner = null;
+    try { if (error?.code === 'EACCES') owner = fs.statSync(fdPath, { bigint: true }).uid; } catch { owner = null; }
+    if (owner !== 0n) sessionFail();
+    return false;
+  }
+  try {
+    let item; let scanned = 0;
+    while ((item = descriptors.readSync()) !== null) {
+      if (++scanned > 65536 || !/^(?:0|[1-9][0-9]*)$/.test(item.name)) sessionFail();
+      const descriptorPath = fdPath + '/' + item.name;
+      let target;
+      try { target = fs.readlinkSync(descriptorPath); }
+      catch (error) { if (error.code === 'ENOENT') continue; sessionFail(); }
+      if (!target.startsWith(base)) continue;
+      const parts = target.slice(base.length).split(path.sep);
+      // An ancestor holding a private/retired/unknown session lease is
+      // uncertainty, never evidence that the pin may be discarded.
+      if (parts.length !== 2 || !SESSION_ID.test(parts[0]) || parts[1] !== 'lease') sessionFail();
+      const data = withStore(repositoryRoot, false, (runtime, root) => {
+        if (!runtime) sessionFail();
+        return sessionRecord(runtime, root, repositoryRoot, parts[0]);
+      });
+      const held = fs.statSync(descriptorPath, { bigint: true });
+      if (String(held.dev) !== data.record.lease.dev ||
+          String(held.ino) !== data.record.lease.ino) sessionFail();
+      if (data.record.kind === 'session' || data.record.parentBinding !== null) return true;
+    }
+    return false;
+  } finally { descriptors.closeSync(); }
+}
+export function assertNoSessionAncestor({ repositoryRoot, pid = process.pid }) {
+  return sessionBoundary(() => {
+    sessionRootName(repositoryRoot);
+    if (!Number.isSafeInteger(pid) || pid < 1 || pid > 0x7fffffff) sessionFail();
+    // Check trusted store identity once, without scanning unrelated invocations.
+    withStore(repositoryRoot, false, runtime => {
+      if (!runtime) return;
+      const sessions = sessionDirectory(runtime);
+      sessions?.close();
+    });
+    const bootId = sessionBootId();
+    const chain = [];
+    let current = pid;
+    let reachedInit = false;
+    for (let depth = 0; depth < 256; depth++) {
+      if (chain.some(item => item.pid === current)) sessionFail();
+      const observed = sessionAncestorProcess(current);
+      chain.push(observed);
+      if (ancestorHasSessionLease(repositoryRoot, observed)) sessionFail();
+      if (current === 1) { reachedInit = true; break; }
+      if (!observed.parentPid || observed.parentPid === current) sessionFail();
+      current = observed.parentPid;
+    }
+    if (!reachedInit) sessionFail();
+    for (const before of chain.reverse()) {
+      if (canonical(before) !== canonical(sessionAncestorProcess(before.pid)) ||
+          ancestorHasSessionLease(repositoryRoot, before)) sessionFail();
+    }
+    if (bootId !== sessionBootId()) sessionFail();
   });
 }

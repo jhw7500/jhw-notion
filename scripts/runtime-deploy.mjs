@@ -3,8 +3,8 @@ import path from 'node:path';
 import {createHash, randomBytes} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, requireQuiescence} from './runtime-safety.mjs';
-import {prepareRelease, validateRelease, readActivation, publishActivation, rollbackActivation} from './runtime-store.mjs';
+import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, inspectSessionConsumers, requireQuiescence} from './runtime-safety.mjs';
+import {prepareRelease, validateRelease, readActivation, validCurrent, publishActivation, rollbackActivation, createSessionBinding, resolveSessionBinding, inspectSessionBindings, releaseCompatibility} from './runtime-store.mjs';
 import {installBootstrap, validateBootstrap} from './runtime-entry.mjs';
 import {DEPLOY_VARIABLE_KEYS,applyRuntimePrune,planRuntimePrune,recordDeploymentRetention} from './runtime-prune.mjs';
 import {readGuardHostPolicy,captureGuardTransitionEvidence,writeGuardTransitionEvidence,readGuardTransitionEvidence,recordGuardPolicyContext,recordGuardPublishedSnapshots,recordGuardDestination,markGuardTransitionFinalized,findGuardTransitionEvidence,prepareGuardRollbackEvidence,prepareIncompleteGuardRollbackEvidence,restoreGuardRollbackEvidence} from './runtime-guard.mjs';
@@ -22,6 +22,7 @@ function parse(argv) {
  if(argv.length===1&&['--prepare','--status','--rollback','--uninstall','--refresh-bootstrap','--help','-h'].includes(argv[0]))return {operation:argv[0].replace(/^--?/,'')};
  if(argv.length===1&&argv[0]==='--prune')return {operation:'prune',apply:false};
  if(argv.length===2&&argv[0]==='--prune'&&argv[1]==='--apply')return {operation:'prune',apply:true};
+ if(argv.length===2&&argv[0]==='--activate-compatible'&&RELEASE.test(argv[1]))return {operation:'activate-compatible',releaseId:argv[1]};
  if(argv.length===2&&argv[0]==='--activate'&&RELEASE.test(argv[1]))return {operation:'activate',releaseId:argv[1]};
  if(argv.length===3&&argv[0]==='--activate'&&RELEASE.test(argv[1])&&argv[2]==='--guard-observe')return {operation:'activate',releaseId:argv[1],guardObserve:true};
  if(argv.length===4&&argv[0]==='--activate'&&RELEASE.test(argv[1])&&argv[2]==='--adopt-from'&&argv[3]!=='')return {operation:'activate',releaseId:argv[1],adoptFrom:argv[3]};
@@ -510,7 +511,7 @@ async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,l
  for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV'])delete env[key];
  adoptEnvironment(env);
  const child=spawn(process.execPath,[path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp'],{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd]});
- let input='';let bytes=0;let stderrBytes=0;let stage=0;let failure=false;let logging=true;
+ let input='';let bytes=0;let stderrBytes=0;let stage=0;let failure=false;let logging=true;let initialization;let advertisedTools;let nextCursor;
  child.stdin.on('error',()=>{failure=true;});
  const send=value=>child.stdin.write(JSON.stringify(value)+'\n');
  send({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'jhw-deployment-validation',version:'1'}}});
@@ -520,8 +521,8 @@ async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,l
   while((newline=input.indexOf('\n'))>=0){const line=input.slice(0,newline);input=input.slice(newline+1);try{
    const response=JSON.parse(line);
    if(response.jsonrpc!=='2.0'||response.error)throw new Error();
-   if(stage===0&&response.id===1&&typeof response.result?.protocolVersion==='string'&&response.result?.serverInfo&&response.result?.capabilities){stage=1;send({jsonrpc:'2.0',method:'notifications/initialized'});send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}});}
-   else if(stage===1&&response.id===2&&Array.isArray(response.result?.tools)){stage=2;child.stdin.end();}
+   if(stage===0&&response.id===1&&typeof response.result?.protocolVersion==='string'&&response.result?.serverInfo&&response.result?.capabilities){initialization=response.result;stage=1;send({jsonrpc:'2.0',method:'notifications/initialized'});send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}});}
+   else if(stage===1&&response.id===2&&Array.isArray(response.result?.tools)){advertisedTools=response.result.tools;nextCursor=response.result.nextCursor;stage=2;child.stdin.end();}
    else throw new Error();
   }catch{failure=true;child.stdin.end();}}
  });
@@ -532,6 +533,206 @@ async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,l
  const result=await Promise.race([new Promise(resolve=>{child.once('error',()=>resolve(null));child.once('close',(code,signal)=>resolve(signal?null:code));}),new Promise(resolve=>{timer=setTimeout(()=>{failure=true;child.stdin.end();child.unref();child.stdout.unref();child.stderr.unref();resolve(null);},12000);})]);
  logging=false;clearTimeout(timer);
  if(result!==0||failure||stage!==2||input.trim())fail('DEPLOY_VALIDATION_FAILED');
+ return {protocolVersion:initialization.protocolVersion,capabilities:initialization.capabilities,tools:advertisedTools,nextCursor};
+}
+
+
+function compatibleInventory({repositoryRoot,procRoot,fingerprint}) {
+  const sessions=inspectSessionBindings({repositoryRoot});
+  if(sessions.some(item=>item.compatibilityDigest!==fingerprint))
+    fail('DEPLOY_COMPATIBILITY_MISMATCH','live_session_contract');
+  if(sessions.some(item=>item.kind==='invocation'&&item.parentBinding===null))
+    fail('DEPLOY_CONSUMERS_ACTIVE','unbound_invocation');
+  const inventory=inspectSessionConsumers({repositoryRoot,procRoot,excludePids:[process.pid]},observation=>{
+    // Direct legacy execution and proxy connections lack the managed session contract.
+    if(observation.category==='legacy'||(observation.category==='app_server'&&observation.args.includes('proxy'))) return false;
+    const selectedToken=observation.token??sessions.find(item=>
+      item.kind==='session'&&item.owner.pid===observation.pid&&item.owner.startTime===observation.startTime)?.token;
+    if(selectedToken===undefined) return false;
+    const record=resolveSessionBinding({repositoryRoot,token:selectedToken,pid:observation.pid});
+    return record.compatibilityDigest===fingerprint;
+  });
+  if(inventory.uncertain) throw Object.assign(new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN'),{inventory});
+  if(!inventory.clear) throw Object.assign(new DeploymentError('DEPLOY_CONSUMERS_ACTIVE'),{inventory});
+  return inventory;
+}
+function requireBootstrapGeneration({repositoryRoot,releaseId}) {
+  const bootstrap=validateBootstrap({repositoryRoot});
+  const manifest=privateRead(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'manifest.json'),{limit:32*1024*1024});
+  for(const helper of bootstrap.files) {
+    const entry=manifest.entries.find(item=>item.path==='scripts/'+helper.name);
+    if(entry?.type!=='file'||entry.sha256!==helper.sha256||entry.mode!==helper.mode)
+      fail('DEPLOY_COMPATIBILITY_MISMATCH','bootstrap_refresh_required');
+  }
+}
+// Validate the typed Tool surface without importing mutable SDK files at runtime.
+function validMcpTool(tool) {
+  const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
+  const string=value=>typeof value==='string';
+  const boolean=value=>typeof value==='boolean';
+  const strings=value=>Array.isArray(value)&&value.every(string);
+  const optional=(value,key,check)=>!Object.hasOwn(value,key)||check(value[key]);
+  const schema=value=>object(value)&&value.type==='object'&&
+    optional(value,'properties',properties=>object(properties)&&Object.values(properties).every(object))&&
+    optional(value,'required',strings);
+  const icon=value=>object(value)&&string(value.src)&&
+    optional(value,'mimeType',string)&&optional(value,'sizes',strings)&&
+    optional(value,'theme',theme=>['light','dark'].includes(theme));
+  const annotations=value=>object(value)&&optional(value,'title',string)&&
+    ['readOnlyHint','destructiveHint','idempotentHint','openWorldHint'].every(key=>optional(value,key,boolean));
+  const execution=value=>object(value)&&
+    optional(value,'taskSupport',support=>['required','optional','forbidden'].includes(support));
+  return object(tool)&&string(tool.name)&&tool.name.length>0&&tool.name.length<=256&&
+    optional(tool,'title',string)&&optional(tool,'description',string)&&
+    optional(tool,'icons',icons=>Array.isArray(icons)&&icons.every(icon))&&
+    schema(tool.inputSchema)&&optional(tool,'outputSchema',schema)&&
+    optional(tool,'annotations',annotations)&&optional(tool,'execution',execution)&&
+    optional(tool,'_meta',object);
+}
+function mcpContract(value) {
+  if(value.nextCursor!==undefined) fail('DEPLOY_VALIDATION_FAILED','incomplete_tools_list');
+  const normalize=value=>Array.isArray(value)?value.map(normalize):value!==null&&typeof value==='object'
+    ?Object.fromEntries(Object.keys(value).sort().map(key=>[key,normalize(value[key])])):value;
+  const tools=new Map();
+  for(const tool of value.tools) {
+    if(!validMcpTool(tool)||tools.has(tool.name)) fail('DEPLOY_VALIDATION_FAILED');
+    const contract=Object.fromEntries(Object.entries(tool).filter(([key])=>!['name','title','description','icons'].includes(key)));
+    tools.set(tool.name,JSON.stringify(normalize(contract)));
+  }
+  return {protocol:value.protocolVersion,capabilities:JSON.stringify(normalize(value.capabilities)),tools};
+}
+
+function reconcileCompatibleJournal({repositoryRoot,runtime}) {
+  const abandoned=pending(runtime);
+  if(!abandoned.length) return null;
+  if(abandoned.length!==1) fail('DEPLOY_RECOVERY_REQUIRED');
+  const directory=path.join(runtime,abandoned[0]);
+  const state=privateRead(path.join(directory,'state.json'));
+  const allowed=['version','status','operation','compatible','candidateReleaseId','compatibilityDigest','phase','previous','variables','mutationStarted','destination','stateIncomplete','workerDetached'];
+  if(!state||Object.keys(state).some(key=>!allowed.includes(key))||state.version!==1||state.status!=='pending'||
+    state.operation!=='activate'||state.compatible!==true||!RELEASE.test(state.candidateReleaseId??'')||
+    !/^[a-f0-9]{64}$/.test(state.compatibilityDigest??'')||!state.previous||state.stateIncomplete||state.workerDetached||
+    !state.variables||typeof state.variables!=='object'||Array.isArray(state.variables)||
+    Object.entries(state.variables).some(([key,value])=>!KEYS.includes(key)||typeof value!=='string')||
+    !['before_mutation','candidate_validate','pointer_intent'].includes(state.phase))
+    fail('DEPLOY_RECOVERY_REQUIRED');
+  if(!validCurrent(state.previous)) fail('DEPLOY_RECOVERY_REQUIRED');
+  const publication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
+  try {
+    const current=readActivation({repositoryRoot});
+    const atOrigin=JSON.stringify(current)===JSON.stringify(state.previous);
+    let atDestination=false;
+    if(state.phase==='pointer_intent') {
+      const destination=state.destination;
+      if(state.mutationStarted!==true||!destination||Object.keys(destination).sort().join(',')!=='activationId,predecessorActivationId,releaseId'||
+        !/^a-[a-f0-9]{32}$/.test(destination.activationId)||destination.releaseId!==state.candidateReleaseId||
+        destination.predecessorActivationId!==state.previous.activationId) fail('DEPLOY_RECOVERY_REQUIRED');
+      atDestination=current?.activationId===destination.activationId&&current.releaseId===destination.releaseId&&
+        current.predecessorActivationId===destination.predecessorActivationId;
+      if(atDestination) {
+        const manifest=privateRead(path.join(runtime,'activations',current.activationId,'manifest.json'));
+        const origin=manifest.priorCurrent;
+        if(!origin||['activationId','releaseId','predecessorActivationId'].some(key=>origin[key]!==state.previous[key])||
+          ['target','dev','ino','ctimeNs'].some(key=>origin.observation[key]!==state.previous.observation?.[key])) fail('DEPLOY_RECOVERY_REQUIRED');
+      }
+    } else if(state.destination!==undefined||
+      (state.mutationStarted!==undefined&&state.mutationStarted!==true)||
+      (state.phase==='before_mutation'&&state.mutationStarted)) fail('DEPLOY_RECOVERY_REQUIRED');
+    if(!atOrigin&&!atDestination) fail('DEPLOY_RECOVERY_REQUIRED');
+    for(const releaseId of [state.previous.releaseId,state.candidateReleaseId]) {
+      if(releaseCompatibility({repositoryRoot,releaseId})!==state.compatibilityDigest) fail('DEPLOY_RECOVERY_REQUIRED');
+      requireBootstrapGeneration({repositoryRoot,releaseId});
+    }
+    state.status='complete';
+    state.phase=atDestination?'interrupted_after_publish':'interrupted_before_publish';
+    checkpoint(directory,state);
+    return {transaction:abandoned[0],outcome:state.phase};
+  } finally {publication.close();}
+}
+function createCompatibleJournal(runtime,state) {
+  const parent=pinnedDirectory(runtime);
+  const suffix=randomBytes(16).toString('hex');
+  try {
+    const staging=createPrivateDirectory(runtime,'.candidate.'+suffix);
+    checkpoint(staging,state);
+    parent.verify();
+    fs.renameSync(parent.at('.candidate.'+suffix),parent.at('.deploy.'+suffix));
+    fs.fsyncSync(parent.fd);parent.verify();
+    return path.join(runtime,'.deploy.'+suffix);
+  } finally {parent.close();}
+}
+
+async function runCompatibleDeployment({repositoryRoot,home,procRoot,environment,releaseId,phaseRunner,phaseTimeoutMs}) {
+  const runtime=path.join(repositoryRoot,'.jhw-runtime');
+  // This is a distinct, proved-coexistence operation. Ordinary maintenance keeps
+  // its original global inventory and exclusive admission semantics unchanged.
+  let writer; let publication; let probe; let directory; let state; let logFd;
+  try {
+    writer=acquireLease(path.join(runtime,'deploy.lock'));
+    const previous=readActivation({repositoryRoot});
+    if(!previous||!exists(path.join(runtime,'wiring.json'))||privateRead(path.join(runtime,'wiring.json')).installed!==true)
+      fail('DEPLOY_COMPATIBILITY_MISMATCH','managed_activation_required');
+    const recovery=reconcileCompatibleJournal({repositoryRoot,runtime});
+    validateRelease({repositoryRoot,releaseId});
+    requireMatchingInstaller(repositoryRoot,previous.releaseId);
+    requireBootstrapGeneration({repositoryRoot,releaseId:previous.releaseId});
+    const fingerprint=releaseCompatibility({repositoryRoot,releaseId:previous.releaseId});
+    if(releaseCompatibility({repositoryRoot,releaseId})!==fingerprint)
+      fail('DEPLOY_COMPATIBILITY_MISMATCH','shared_artifacts_changed');
+    requireBootstrapGeneration({repositoryRoot,releaseId});
+    const before=compatibleInventory({repositoryRoot,procRoot,fingerprint});
+    state={version:1,status:'pending',operation:'activate',compatible:true,candidateReleaseId:releaseId,compatibilityDigest:fingerprint,phase:'before_mutation',previous,variables:{}};
+    directory=createCompatibleJournal(runtime,state);
+    await phaseRunner({repositoryRoot,home,environment,phase:'verify',managed:true,deployLease:writer,directory,state,phaseTimeoutMs});
+    const logDirectory=pinnedDirectory(directory);
+    try {
+      logFd=fs.openSync(logDirectory.at('candidate-probe.log'),fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
+      fs.fchmodSync(logFd,0o600); logDirectory.verify();
+    } finally {logDirectory.close();}
+    const inspectCandidate=async selected=>{
+      publication=acquireLease(path.join(runtime,'publication.lock'),{shared:true,create:true});
+      try {probe=createSessionBinding({repositoryRoot,releaseId:selected});}
+      finally {publication.close();publication=undefined;}
+      try {
+        return mcpContract(await mcpProbe({repositoryRoot,home,environment:{...environment,JHW_RUNTIME_SESSION_BINDING:probe.token},deployLease:writer,directory,logFd}));
+      } finally {probe.close();probe=undefined;}
+    };
+    state.phase='candidate_validate';checkpoint(directory,state);
+    const currentContract=await inspectCandidate(previous.releaseId);
+    const candidateContract=await inspectCandidate(releaseId);
+    if(currentContract.protocol!==candidateContract.protocol||currentContract.capabilities!==candidateContract.capabilities||
+      [...currentContract.tools].some(([name,contract])=>candidateContract.tools.get(name)!==contract))
+      fail('DEPLOY_COMPATIBILITY_MISMATCH','mcp_contract_changed');
+    // Only selection/registration and the atomic default switch use publication.
+    // Existing processes retain their admission and per-binding lifetime leases.
+    publication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
+    if(JSON.stringify(readActivation({repositoryRoot}))!==JSON.stringify(previous)) fail('DEPLOY_CURRENT_CHANGED');
+    const after=compatibleInventory({repositoryRoot,procRoot,fingerprint});
+    if(releaseCompatibility({repositoryRoot,releaseId})!==fingerprint) fail('DEPLOY_COMPATIBILITY_MISMATCH');
+    requireBootstrapGeneration({repositoryRoot,releaseId});
+    state.mutationStarted=true;checkpoint(directory,state);
+    const current=publishActivation({repositoryRoot,releaseId,expectedCurrent:previous,onPointerIntent:destination=>{
+      state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);
+    }});
+    state.current=current;state.status='complete';state.phase='complete';checkpoint(directory,state);
+    return {code:'DEPLOY_COMPATIBLE_ACTIVATED',releaseId:current.releaseId,previousReleaseId:previous.releaseId,
+      predecessorAvailable:true,inventory:{before,after},existingSessionsPreserved:true,recovery};
+  } catch(error) {
+    // A failed pre-publication probe never moves the default. Retain its audit
+    // record but do not strand an otherwise unchanged installation as pending.
+    if(state&&!state.mutationStarted) {
+      try {
+        if(JSON.stringify(readActivation({repositoryRoot}))===JSON.stringify(state.previous)) {
+          state.status='complete';state.phase='candidate_rejected';checkpoint(directory,state);
+        }
+      } catch { /* Preserve uncertain evidence for the existing recovery path. */ }
+    }
+    throw error;
+  } finally {
+    probe?.close();
+    if(logFd!==undefined){fs.fsyncSync(logFd);fs.closeSync(logFd);}
+    publication?.close();writer?.close();
+  }
 }
 
 /** Module-only fixtures may supply private procRoot/build/phaseRunner. Public
@@ -539,7 +740,7 @@ async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,l
 export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000,planTimeoutMs=45000}={}) {
  const command=parse(argv);
  if([phaseTimeoutMs,planTimeoutMs].some(value=>!Number.isInteger(value)||value<1||value>45000))fail('DEPLOY_ARGUMENTS_INVALID');
- if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--activate RELEASE_ID --guard-observe','--rollback','--uninstall','--refresh-bootstrap','--prune','--prune --apply']};
+ if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate-compatible RELEASE_ID','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--activate RELEASE_ID --guard-observe','--rollback','--uninstall','--refresh-bootstrap','--prune','--prune --apply']};
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
  const runtime=path.join(repositoryRoot,'.jhw-runtime');
@@ -553,6 +754,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    return {...applyRuntimePrune({repositoryRoot}),inventory:{before,after}};
   } finally {pruneAdmission?.close();pruneWriter?.close();}
  }
+ if(command.operation==='activate-compatible')return runCompatibleDeployment({repositoryRoot,home,procRoot,environment,releaseId:command.releaseId,phaseRunner,phaseTimeoutMs});
  if(command.operation==='status') {
   const inventory=inspectConsumers(inventoryOptions);const current=exists(runtime)?readActivation({repositoryRoot}):null;
   return {code:'DEPLOY_STATUS',advisory:true,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,recoveryPending:pending(runtime).length,inventory};
