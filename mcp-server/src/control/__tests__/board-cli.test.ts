@@ -1,12 +1,22 @@
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { requiresMutationLock, runCli, type CliDependencies } from "../cli.js";
+import { requiresMutationLock, runBoardWith, runCli, type CliDependencies } from "../cli.js";
 import { ControlError } from "../errors.js";
 
 const HOLDER = `hld-0189a7f0-1234-7abc-8def-0123456789ab`;
 const RESERVATION = `rsv-0189a7f0-1234-7abc-8def-0123456789ab`;
+const TRANSACTION = "0189a7f0-1234-7abc-8def-0123456789ab";
+const GENERATION = "0189a7f0-1234-7abc-8def-0123456789ac";
+const MANIFEST = "a".repeat(64);
+const TOKEN = "A".repeat(43);
+
+const temporaryRoots: string[] = [];
+afterEach(async () => {
+  await Promise.all(temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
 
 function largeBoardSummaries(count = 20): Array<Record<string, unknown>> {
   return Array.from({ length: count }, (_, index) => ({
@@ -49,6 +59,18 @@ function makeDependencies(overrides: BoardOverrides = {}) {
     reserve: vi.fn().mockResolvedValue({ board_id: "wlan-01", reservation_id: RESERVATION, from: "2026-08-22T12:00:00.000Z", to: "2026-08-22T13:00:00.000Z", mode: "exclusive" }),
     unreserve: vi.fn().mockResolvedValue({ board_id: "wlan-01", reservation_id: RESERVATION, cross_session: false }),
     adoptHolder: vi.fn(),
+    armRecoveryGuard: vi.fn().mockImplementation(async (input) => ({
+      guard: {
+        transaction_id: input.transaction_id,
+        manifest_sha256: input.manifest_sha256,
+        generation: input.recovery_proof.generation,
+        armed_at: "2026-08-22T10:00:00.000Z",
+        holder_id: input.holder_id,
+        holder_session: input.session,
+      },
+    })),
+    inspectRecoveryGuard: vi.fn().mockResolvedValue(null),
+    clearRecoveryGuard: vi.fn().mockResolvedValue({ board_id: "pim", transaction_id: TRANSACTION, cleared: true }),
     recoverResetState: vi.fn().mockResolvedValue({ reset: true, preserved: "boards.yaml.corrupt-x" }),
     ...overrides.boardService,
   };
@@ -250,5 +272,132 @@ describe("board CLI wiring", () => {
     expect(boardService.recoverResetState).not.toHaveBeenCalled();
     const accepted = await runCli(["board", "recover", "--action", "reset-state", "--confirm", "reset-state", "--session", "s"], dependencies);
     expect(accepted.exitCode).toBe(0);
+  });
+
+  it("writes a private durable proof before arming and never emits its raw token", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-recovery-cli-"));
+    temporaryRoots.push(root);
+    const proofFile = join(root, "recovery-proof.json");
+    const { dependencies, boardService } = makeDependencies();
+    const result = await runCli([
+      "board", "recovery-arm", "pim", "--holder", HOLDER, "--session", "sess-a",
+      "--transaction", TRANSACTION, "--manifest-sha256", MANIFEST, "--proof-file", proofFile,
+    ], dependencies);
+
+    expect(result.exitCode).toBe(0);
+    const proof = JSON.parse(await readFile(proofFile, "utf8")) as Record<string, string>;
+    expect(proof).toMatchObject({ board_id: "pim", transaction_id: TRANSACTION, manifest_sha256: MANIFEST });
+    expect(proof.generation).toMatch(/^[0-9a-f-]{36}$/);
+    expect(proof.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect((await stat(proofFile)).mode & 0o777).toBe(0o600);
+    expect(boardService.armRecoveryGuard).toHaveBeenCalledWith(expect.objectContaining({ recovery_proof: proof }));
+    expect(`${result.stdout}${result.stderr}`).not.toContain(proof.token);
+  });
+
+  it("does not arm when exclusive proof creation fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-recovery-cli-"));
+    temporaryRoots.push(root);
+    const proofFile = join(root, "recovery-proof.json");
+    await writeFile(proofFile, "occupied", { mode: 0o600 });
+    const { dependencies, boardService } = makeDependencies();
+    const result = await runCli([
+      "board", "recovery-arm", "pim", "--holder", HOLDER, "--session", "sess-a",
+      "--transaction", TRANSACTION, "--manifest-sha256", MANIFEST, "--proof-file", proofFile,
+    ], dependencies);
+    expect(result.exitCode).toBe(1);
+    expect(boardService.armRecoveryGuard).not.toHaveBeenCalled();
+  });
+
+  it("leaves the durable private proof available when arming fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-recovery-cli-"));
+    temporaryRoots.push(root);
+    const proofFile = join(root, "recovery-proof.json");
+    const { dependencies } = makeDependencies({
+      boardService: { armRecoveryGuard: vi.fn().mockRejectedValue(new Error("injected arm failure")) },
+    });
+    const result = await runCli([
+      "board", "recovery-arm", "pim", "--holder", HOLDER, "--session", "sess-a",
+      "--transaction", TRANSACTION, "--manifest-sha256", MANIFEST, "--proof-file", proofFile,
+    ], dependencies);
+    expect(result.exitCode).toBe(1);
+    const proof = JSON.parse(await readFile(proofFile, "utf8")) as Record<string, string>;
+    expect(proof).toMatchObject({ board_id: "pim", transaction_id: TRANSACTION, manifest_sha256: MANIFEST });
+    expect((await stat(proofFile)).mode & 0o777).toBe(0o600);
+  });
+
+  it("inspects without proof and clears from a strict bounded proof file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-recovery-cli-"));
+    temporaryRoots.push(root);
+    const proofFile = join(root, "recovery-proof.json");
+    const proof = {
+      board_id: "pim", transaction_id: TRANSACTION, manifest_sha256: MANIFEST,
+      generation: GENERATION, token: TOKEN,
+    };
+    await writeFile(proofFile, `${JSON.stringify(proof)}\n`, { mode: 0o600 });
+    const { dependencies, boardService } = makeDependencies();
+
+    expect((await runCli(["board", "recovery-inspect", "pim"], dependencies)).exitCode).toBe(0);
+    const cleared = await runCli([
+      "board", "recovery-clear", "pim", "--holder", HOLDER, "--session", "sess-recovery",
+      "--recovery-proof-file", proofFile,
+    ], dependencies);
+    expect(cleared.exitCode).toBe(0);
+    expect(boardService.clearRecoveryGuard).toHaveBeenCalledWith({
+      board_id: "pim", holder_id: HOLDER, session: "sess-recovery", recovery_proof: proof,
+    });
+    expect(`${cleared.stdout}${cleared.stderr}`).not.toContain(TOKEN);
+  });
+
+  it("rejects an oversized or non-strict recovery proof before clear", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-recovery-cli-"));
+    temporaryRoots.push(root);
+    const proofFile = join(root, "recovery-proof.json");
+    const { dependencies, boardService } = makeDependencies();
+    await writeFile(proofFile, JSON.stringify({
+      board_id: "pim", transaction_id: TRANSACTION, manifest_sha256: MANIFEST,
+      generation: GENERATION, token: TOKEN, verdict: true,
+    }), { mode: 0o600 });
+    const extraField = await runCli([
+      "board", "recovery-clear", "pim", "--holder", HOLDER, "--session", "sess-recovery",
+      "--recovery-proof-file", proofFile,
+    ], dependencies);
+    expect(extraField.exitCode).toBe(4);
+    expect(boardService.clearRecoveryGuard).not.toHaveBeenCalled();
+
+    await writeFile(proofFile, "x".repeat(2049), { mode: 0o600 });
+    const oversized = await runCli([
+      "board", "recovery-clear", "pim", "--holder", HOLDER, "--session", "sess-recovery",
+      "--recovery-proof-file", proofFile,
+    ], dependencies);
+    expect(oversized.exitCode).toBe(4);
+    expect(boardService.clearRecoveryGuard).not.toHaveBeenCalled();
+  });
+
+  it("passes a recovery proof through both board-with acquisition paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-recovery-cli-"));
+    temporaryRoots.push(root);
+    const proofFile = join(root, "recovery-proof.json");
+    const proof = {
+      board_id: "pim", transaction_id: TRANSACTION, manifest_sha256: MANIFEST,
+      generation: GENERATION, token: TOKEN,
+    };
+    await writeFile(proofFile, `${JSON.stringify(proof)}\n`, { mode: 0o600 });
+    const acquired = makeDependencies();
+    expect(await runBoardWith([
+      "board", "with", "pim", "--mode", "exclusive", "--for", "30m", "--session", "sess-recovery",
+      "--purpose", "recover", "--recovery-proof-file", proofFile, "--", "/bin/true",
+    ], acquired.dependencies)).toBe(0);
+    expect(acquired.boardService.acquire).toHaveBeenCalledWith(expect.objectContaining({ recovery_proof: proof }));
+
+    const adopted = makeDependencies({
+      boardService: {
+        adoptHolder: vi.fn().mockResolvedValue({ board_id: "pim", holder_id: HOLDER, liveness_tracked: true, cross_session: false }),
+      },
+    });
+    expect(await runBoardWith([
+      "board", "with", "pim", "--use-holder", HOLDER, "--session", "sess-recovery",
+      "--recovery-proof-file", proofFile, "--", "/bin/true",
+    ], adopted.dependencies)).toBe(0);
+    expect(adopted.boardService.adoptHolder).toHaveBeenCalledWith(expect.objectContaining({ recovery_proof: proof }));
   });
 });

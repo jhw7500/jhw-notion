@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 import { BoardJournal, type BoardJournalEvent, type BoardJournalPort } from "./board-journal.js";
 import type { ControlConfig } from "./config.js";
@@ -9,12 +10,15 @@ import { openSecureStateDirectory, type SecureStateDirectory, type SecureStateDi
 import type { MutationLockPort } from "./process.js";
 import {
   BoardStateSchema,
+  BoardRecoveryProofSchema,
   OffsetDateTimeSchema,
   type BoardConflictSummary,
   type BoardHolder,
   type BoardInterface,
   type BoardMode,
   type BoardRecord,
+  type BoardRecoveryGuard,
+  type BoardRecoveryProof,
   type BoardReservation,
   type BoardState,
 } from "./schemas.js";
@@ -174,6 +178,39 @@ class BoardStateStore {
     }
   }
 
+  async recoveryGuardEvidence(): Promise<"present" | "absent" | "unproven"> {
+    const directory = await openSecureStateDirectory(this.stateDir, this.secureDirectoryHooks);
+    try {
+      let file;
+      try {
+        file = await directory.openFile(BOARD_STATE_FILE, constants.O_RDONLY | constants.O_NOFOLLOW);
+      } catch {
+        return "unproven";
+      }
+      try {
+        const info = await file.stat();
+        if (!info.isFile() || info.nlink !== 1) return "unproven";
+        const raw = JSON.parse((await file.readFile()).toString("utf8")) as unknown;
+        if (typeof raw !== "object" || raw === null || Array.isArray(raw) || !("boards" in raw)) {
+          return "unproven";
+        }
+        const boards = (raw as { boards?: unknown }).boards;
+        if (typeof boards !== "object" || boards === null || Array.isArray(boards)) return "unproven";
+        for (const board of Object.values(boards)) {
+          if (typeof board !== "object" || board === null || Array.isArray(board)) return "unproven";
+          if (Object.prototype.hasOwnProperty.call(board, "recovery_guard")) return "present";
+        }
+        return "absent";
+      } catch {
+        return "unproven";
+      } finally {
+        await file.close();
+      }
+    } finally {
+      await directory.close();
+    }
+  }
+
   /** Preserves the corrupt file aside and publishes an empty state in its place. */
   async resetCorrupt(suffix: string): Promise<string> {
     const preserved = `${BOARD_STATE_FILE}.corrupt-${suffix}`;
@@ -208,7 +245,10 @@ export interface BoardAcquireInput extends BoardWindowInput {
   accept_shortened?: boolean;
   long_lease?: boolean;
   cross_session?: boolean;
+  recovery_proof?: BoardRecoveryProof;
 }
+
+export type BoardRecoveryGuardSummary = Omit<BoardRecoveryGuard, "token_sha256">;
 
 export interface BoardHolderSummary {
   board_id: string;
@@ -339,6 +379,7 @@ export class BoardService {
     }
     return this.mutate(async (state) => {
       const board = this.requireBoard(state, input.board_id);
+      this.assertGuardAbsent(input.board_id, board);
       if (input.description !== undefined) board.description = input.description;
       if (input.interfaces !== undefined) board.interfaces = input.interfaces;
       return { board_id: input.board_id };
@@ -349,6 +390,7 @@ export class BoardService {
     this.assertBoardId(input.board_id);
     return this.mutate(async (state, context) => {
       const board = this.requireBoard(state, input.board_id);
+      this.assertGuardAbsent(input.board_id, board);
       await this.sweepBoard(state, input.board_id, board, context);
       if (board.holders.length > 0 || board.reservations.length > 0) {
         throw new ControlError("BOARD_NOT_EMPTY", "Board still has holders or reservations", {
@@ -357,6 +399,104 @@ export class BoardService {
       }
       delete state.boards[input.board_id];
       return { board_id: input.board_id, removed: true };
+    });
+  }
+
+  async armRecoveryGuard(input: {
+    board_id: string;
+    holder_id: string;
+    session: string;
+    transaction_id: string;
+    manifest_sha256: string;
+    recovery_proof: BoardRecoveryProof;
+  }): Promise<{ guard: BoardRecoveryGuardSummary }> {
+    this.assertBoardId(input.board_id);
+    this.assertSession(input.session);
+    if (!HOLDER_ID.test(input.holder_id)) throw invalidInput("Invalid holder coordinate");
+    const proof = this.parseRecoveryProof(input.recovery_proof);
+    if (
+      proof.board_id !== input.board_id ||
+      proof.transaction_id !== input.transaction_id ||
+      proof.manifest_sha256 !== input.manifest_sha256
+    ) {
+      throw new ControlError("RECOVERY_PROOF_MISMATCH", "Recovery proof coordinates do not match the arm request", {
+        reason: "recovery_proof_mismatch",
+        board_id: input.board_id,
+      });
+    }
+    return this.mutate(async (state, context) => {
+      const board = this.requireBoard(state, input.board_id);
+      if (board.recovery_guard !== undefined) {
+        throw new ControlError("BOARD_RECOVERY_REQUIRED", "Board already has an armed recovery guard", {
+          reason: "recovery_guard_active",
+          board_id: input.board_id,
+        });
+      }
+      await this.sweepBoard(state, input.board_id, board, context);
+      const holder = this.requireHolder(board, input.board_id, input.holder_id);
+      if (holder.session !== input.session) {
+        throw new ControlError("HOLDER_MISMATCH", "Recovery guard holder session does not match", {
+          reason: "recovery_holder_session_mismatch",
+          conflicting_board: holderConflict(input.board_id, holder),
+        });
+      }
+      if (holder.mode !== "exclusive") {
+        throw new ControlError("HOLDER_MISMATCH", "Recovery guard requires an exclusive holder", {
+          reason: "recovery_holder_not_exclusive",
+          conflicting_board: holderConflict(input.board_id, holder),
+        });
+      }
+      await this.assertRecoveryHolderLive(input.board_id, holder);
+      const guard: BoardRecoveryGuard = {
+        transaction_id: proof.transaction_id,
+        manifest_sha256: proof.manifest_sha256,
+        generation: proof.generation,
+        token_sha256: this.hashRecoveryToken(proof.token),
+        armed_at: this.now().toISOString(),
+        holder_id: holder.holder_id,
+        holder_session: holder.session,
+      };
+      board.recovery_guard = guard;
+      return { guard: this.guardSummary(guard) };
+    });
+  }
+
+  async inspectRecoveryGuard(boardId: string): Promise<BoardRecoveryGuardSummary | null> {
+    this.assertBoardId(boardId);
+    const board = this.requireBoard(await this.store.read(), boardId);
+    return board.recovery_guard === undefined ? null : this.guardSummary(board.recovery_guard);
+  }
+
+  async clearRecoveryGuard(input: {
+    board_id: string;
+    holder_id: string;
+    session: string;
+    recovery_proof: BoardRecoveryProof;
+  }): Promise<{ board_id: string; transaction_id: string; cleared: true }> {
+    this.assertBoardId(input.board_id);
+    this.assertSession(input.session);
+    if (!HOLDER_ID.test(input.holder_id)) throw invalidInput("Invalid holder coordinate");
+    const proof = this.parseRecoveryProof(input.recovery_proof);
+    return this.mutate(async (state, context) => {
+      const board = this.requireBoard(state, input.board_id);
+      await this.sweepBoard(state, input.board_id, board, context);
+      const guard = this.requireMatchingRecoveryGuard(input.board_id, board, proof);
+      const holder = this.requireHolder(board, input.board_id, input.holder_id);
+      if (holder.session !== input.session) {
+        throw new ControlError("HOLDER_MISMATCH", "Recovery clear holder session does not match", {
+          reason: "recovery_holder_session_mismatch",
+          conflicting_board: holderConflict(input.board_id, holder),
+        });
+      }
+      if (holder.mode !== "exclusive") {
+        throw new ControlError("HOLDER_MISMATCH", "Recovery clear requires an exclusive holder", {
+          reason: "recovery_holder_not_exclusive",
+          conflicting_board: holderConflict(input.board_id, holder),
+        });
+      }
+      await this.assertRecoveryHolderLive(input.board_id, holder);
+      delete board.recovery_guard;
+      return { board_id: input.board_id, transaction_id: guard.transaction_id, cleared: true as const };
     });
   }
 
@@ -371,6 +511,7 @@ export class BoardService {
       const nowMs = this.now().getTime();
       const board = this.requireBoard(state, input.board_id);
       await this.sweepBoard(state, input.board_id, board, context);
+      this.assertRecoveryAccess(input.board_id, board, input.mode, input.recovery_proof);
 
       let untilMs = this.resolveWindow(input, nowMs);
 
@@ -610,6 +751,7 @@ export class BoardService {
       const nowMs = this.now().getTime();
       const board = this.requireBoard(state, input.board_id);
       await this.sweepBoard(state, input.board_id, board, context);
+      this.assertGuardAbsent(input.board_id, board);
       const holder = this.requireHolder(board, input.board_id, input.holder_id);
       this.assertOperable({
         recordedSession: holder.session,
@@ -769,6 +911,7 @@ export class BoardService {
     session: string;
     liveness: LivenessTrio;
     cross_session?: boolean;
+    recovery_proof?: BoardRecoveryProof;
   }): Promise<{ board_id: string; holder_id: string; liveness_tracked: boolean; cross_session: boolean }> {
     this.assertBoardId(input.board_id);
     this.assertSession(input.session);
@@ -778,6 +921,7 @@ export class BoardService {
       const board = this.requireBoard(state, input.board_id);
       await this.sweepBoard(state, input.board_id, board, context);
       const holder = this.requireHolder(board, input.board_id, input.holder_id);
+      this.assertRecoveryAccess(input.board_id, board, holder.mode, input.recovery_proof);
       // The sweep above already reaped every provably dead pid, so any pid
       // still recorded here belongs to a process we must not displace.
       if (holder.pid !== null) {
@@ -813,6 +957,17 @@ export class BoardService {
         await this.store.read();
       } catch (cause) {
         if (cause instanceof ControlError && cause.code === "BOARD_STATE_CORRUPT") {
+          const recoveryGuardEvidence = await this.store.recoveryGuardEvidence();
+          if (recoveryGuardEvidence === "present") {
+            throw new ControlError("BOARD_RECOVERY_REQUIRED", "Recovery guard state cannot be reset", {
+              reason: "recovery_guard_active",
+            });
+          }
+          if (recoveryGuardEvidence !== "absent") {
+            throw new ControlError("BOARD_RECOVERY_REQUIRED", "Recovery guard absence cannot be proven", {
+              reason: "recovery_guard_state_unproven",
+            });
+          }
           const suffix = this.now().toISOString().replace(/[:.]/g, "-");
           const preserved = await this.store.resetCorrupt(suffix);
           await this.safeJournal({ event: "state_reset" });
@@ -848,6 +1003,7 @@ export class BoardService {
             holder_count: board.holders.length,
             reservation_count: board.reservations.length,
             expired_holder_count: board.holders.filter((holder) => epoch(holder.granted_until) <= nowMs).length,
+            recovery_guard_armed: board.recovery_guard !== undefined,
           };
         }),
       };
@@ -886,6 +1042,7 @@ export class BoardService {
         board_id: boardId,
         ...(board.description ? { description: display(board.description) } : {}),
         interfaces: board.interfaces,
+        recovery_guard: board.recovery_guard === undefined ? null : this.guardSummary(board.recovery_guard),
         holders,
         reservations,
         truncated: board.reservations.length > RESERVATION_DISPLAY_LIMIT,
@@ -904,6 +1061,7 @@ export class BoardService {
           interfaces: board.interfaces,
           holder_count: board.holders.length,
           reservation_count: board.reservations.length,
+          recovery_guard_armed: board.recovery_guard !== undefined,
         };
       }),
     };
@@ -973,6 +1131,100 @@ export class BoardService {
     }
     // EPERM and unreadable evidence stay alive: reclaim requires proof of death.
     return "alive";
+  }
+
+  private parseRecoveryProof(value: unknown): BoardRecoveryProof {
+    const parsed = BoardRecoveryProofSchema.safeParse(value);
+    if (!parsed.success) throw invalidInput("Invalid recovery proof");
+    return parsed.data;
+  }
+
+  private hashRecoveryToken(token: string): string {
+    return createHash("sha256").update(token, "utf8").digest("hex");
+  }
+
+  private guardSummary(guard: BoardRecoveryGuard): BoardRecoveryGuardSummary {
+    const { token_sha256: _tokenHash, ...summary } = guard;
+    return summary;
+  }
+
+  private assertGuardAbsent(boardId: string, board: BoardRecord): void {
+    if (board.recovery_guard === undefined) return;
+    throw new ControlError("BOARD_RECOVERY_REQUIRED", "Board has an armed recovery guard", {
+      reason: "recovery_guard_active",
+      board_id: boardId,
+    });
+  }
+
+  private requireMatchingRecoveryGuard(
+    boardId: string,
+    board: BoardRecord,
+    proofValue: unknown,
+  ): BoardRecoveryGuard {
+    const proof = this.parseRecoveryProof(proofValue);
+    const guard = board.recovery_guard;
+    const tokenHash = this.hashRecoveryToken(proof.token);
+    const tokenMatches = guard !== undefined && timingSafeEqual(
+      Buffer.from(guard.token_sha256, "hex"),
+      Buffer.from(tokenHash, "hex"),
+    );
+    if (
+      guard === undefined ||
+      proof.board_id !== boardId ||
+      proof.transaction_id !== guard.transaction_id ||
+      proof.manifest_sha256 !== guard.manifest_sha256 ||
+      proof.generation !== guard.generation ||
+      !tokenMatches
+    ) {
+      throw new ControlError("RECOVERY_PROOF_MISMATCH", "Recovery proof does not match the armed guard", {
+        reason: "recovery_proof_mismatch",
+        board_id: boardId,
+      });
+    }
+    return guard;
+  }
+
+  private assertRecoveryAccess(
+    boardId: string,
+    board: BoardRecord,
+    mode: BoardMode,
+    proof: BoardRecoveryProof | undefined,
+  ): void {
+    if (board.recovery_guard === undefined) {
+      if (proof !== undefined) this.requireMatchingRecoveryGuard(boardId, board, proof);
+      return;
+    }
+    if (proof === undefined) this.assertGuardAbsent(boardId, board);
+    if (mode !== "exclusive") {
+      throw new ControlError("BOARD_RECOVERY_REQUIRED", "Recovery requires an exclusive holder", {
+        reason: "recovery_requires_exclusive",
+        board_id: boardId,
+      });
+    }
+    this.requireMatchingRecoveryGuard(boardId, board, proof);
+  }
+
+  private async assertRecoveryHolderLive(boardId: string, holder: BoardHolder): Promise<void> {
+    if (holder.pid === null || holder.pid_start_time === null || holder.boot_id === null) {
+      throw new ControlError("HOLDER_MISMATCH", "Recovery guard requires tracked liveness", {
+        reason: "recovery_holder_untracked",
+        conflicting_board: holderConflict(boardId, holder),
+      });
+    }
+    const [bootId, inspection] = await Promise.all([
+      this.probe.currentBootId(),
+      this.probe.inspect(holder.pid),
+    ]);
+    if (
+      bootId !== holder.boot_id ||
+      inspection.state !== "alive" ||
+      inspection.startTime !== holder.pid_start_time
+    ) {
+      throw new ControlError("HOLDER_MISMATCH", "Recovery holder lacks exact live process evidence", {
+        reason: "recovery_holder_not_live",
+        conflicting_board: holderConflict(boardId, holder),
+      });
+    }
   }
 
   private removeHolder(board: BoardRecord, holderId: string): void {

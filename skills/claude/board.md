@@ -1,6 +1,6 @@
 ---
 description: Use when the user explicitly requests target-board occupancy, sharing, reservation, waiting, release, or board registry maintenance
-argument-hint: "(register | update | unregister | list | status | acquire | release | extend | share | reserve | unreserve | wait | with | recover) <board-id>"
+argument-hint: "(register | update | unregister | list | status | acquire | release | extend | share | reserve | unreserve | wait | with | recover | recovery-arm | recovery-inspect | recovery-clear) <board-id>"
 ---
 
 # /jhw:board — 타겟보드 점유·공유·예약
@@ -150,6 +150,39 @@ jhw-control board recover --action reset-state --confirm reset-state --session <
 `BOARD_STATE_CORRUPT`일 때만 사용한다. 손상 파일을 타임스탬프 접미로 보존 이동한 뒤
 빈 상태를 만든다. 파일 부재는 손상이 아니라 빈 상태다. 정상 상태에서 실행하면
 `INVALID_BOARD_INPUT`으로 거부된다.
+
+## 배포 복구 guard
+
+```bash
+jhw-control board recovery-arm <board-id> --holder <hld-id> --session <session-id> \
+  --transaction <uuid> --manifest-sha256 <sha256> --proof-file <absolute-private-path>
+jhw-control board recovery-inspect <board-id>
+jhw-control board recovery-clear <board-id> --holder <hld-id> --session <session-id> \
+  --recovery-proof-file <absolute-private-path>
+"$HOME/.local/bin/jhw-control-host" board with <board-id> --mode exclusive \
+  (--for <d> | --until <t>) --session <session-id> --purpose <text> \
+  --recovery-proof-file <absolute-private-path> -- <recovery-command...>
+```
+
+고정 패키지 배포의 첫 원격 쓰기 전에 live pid가 정확히 검증된 exclusive holder로
+guard를 arm한다. proof file은 새 0600 owner-only regular file로 먼저 fsync되고 raw
+token은 status·stdout·journal에 나오지 않는다. guard는 원래 holder의 release·만료·
+pid 사망과 독립적으로 남는다. 이 상태에서는 일반 acquire/wait/with/share/adopt,
+board identity update, unregister가 `BOARD_RECOVERY_REQUIRED` +
+`recovery_guard_active`로 멈춘다. matching proof를 제공한 exclusive recovery `with`만
+기존 holder·예약 충돌 규칙을 그대로 통과해야 진입한다.
+
+`recovery-clear`는 proof의 board/transaction/manifest/generation/token과 현재 live
+exclusive holder/session을 모두 다시 확인한다. host-side 고정 verifier가 복원 파일과
+패키지 상태를 독립적으로 검증한 뒤에만 호출하며, 자식 프로그램의 verdict JSON이나
+boolean은 clear 권위가 아니다. `recovery_proof_mismatch`,
+`recovery_requires_exclusive`, `recovery_holder_session_mismatch`,
+`recovery_holder_not_exclusive`, `recovery_holder_untracked`,
+`recovery_holder_not_live` 중 하나면 guard를 보존한 채 멈춘다. guard가 있는 정상 state는
+`reset-state`나 unregister로 지우지 않는다. guard 필드를 모르는 retained runtime은
+strict schema 오류로 fail-close하며, dirty guard가 남은 상태에서는 rollback release를
+활성화하지 않는다. 손상 state를 파싱해 모든 board entry에서 guard 부재를 증명할 수
+없으면 `recovery_guard_state_unproven`으로 reset을 거부한다.
 
 ## 결과 해석
 
