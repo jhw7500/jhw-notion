@@ -491,7 +491,7 @@ jhw-control guard preflight
 
 호스트가 별도로 opt-in한 `$HOME/.config/jhw-control/guard-policy.json`의 exact `{version:1,mode:"observe"}`도 Guard 전용 관찰 모드를 선택한다. policy는 current-user-owned 단일 링크 regular `0600`이고 안전한 no-follow 부모 경로여야 한다. Guard 이벤트와 `guard status`/`guard preflight`에만 적용하며, 일반 CLI·credential launcher의 env-only 계약은 유지한다. 좌표 env가 하나라도 있으면 전체 env만 검증하며 private `control.env`와 섞지 않는다. 좌표 env가 전혀 없을 때만 명시 policy 아래의 안전한 data-only 11개 좌표를 사용한다. 명시 enforce와 policy observe가 충돌하거나 일부 env·unsafe policy이면 fail-closed다.
 
-관찰 모드는 일반 Task/Claim 규칙 위반을 별도 versioned observe journal에 기록하고 permit을 발급하지 않는다. protocol mismatch·Guard unavailable·self-approval 같은 안전 오류는 계속 차단한다. 첫 유효 hook composition만 기존 store를 보존하며 missing request store와 digest key를 준비하고, 읽기 전용 진단은 상태 파일을 만들지 않는다. `runtime_mode: observe`, `enforced: false`는 배선 및 관찰을 뜻하며 강제 보호 완료가 아니다.
+관찰 모드는 일반 Task/Claim 규칙 위반을 별도 versioned observe journal에 기록하고 permit을 발급하지 않는다. protocol mismatch·Guard unavailable·self-approval 같은 안전 오류는 계속 차단한다. 다만 다른 Registry writer가 `registry.lock`을 쥐고 있어 PreToolUse 평가가 기다리다 끝난 `GUARD_UNAVAILABLE` + `registry_state_lock`은 관찰 기록에 남기고 허용한다. 첫 유효 hook composition만 기존 store를 보존하며 missing request store와 digest key를 준비하고, 읽기 전용 진단은 상태 파일을 만들지 않는다. `runtime_mode: observe`, `enforced: false`는 배선 및 관찰을 뜻하며 강제 보호 완료가 아니다.
 
 ## 결과 해석
 
@@ -508,6 +508,7 @@ jhw-control guard preflight
 - `WORKTREE_EQUIVALENCE_UNSAFE` + `backup_invalid`: manifest/full bundle/ignored artifact의 owner·mode·hash·bytes·inode·inventory·복원 검증이 실패했다. worktree와 branch를 유지하고 backup을 다시 만든다.
 - `WORKTREE_EQUIVALENCE_UNSAFE` + `snapshot_changed`: Registry/history/mapping/ref/HEAD/worktree/inventory가 frozen proof 또는 최종 fence에서 바뀌었다. 기존 proof를 재사용하지 않고 새 discovery부터 다시 시작한다.
 - `LOCK_CONTENDED` + `registry_state_lock`이면 같은 호스트의 Registry writer가 최대 30초 대기 뒤에도 실행 중인 것이다. optional `lock_holder`의 `command`, `acquired_at`, `elapsed_ms`, `pid_state`만 보고하며 `registry.lock`을 삭제하거나 holder를 자동 종료하지 않는다.
+- Guard hook 판정의 `GUARD_UNAVAILABLE` + `registry_state_lock`이면 다른 Registry writer(control 명령이나 다른 Guard 평가)가 `registry.lock`을 Guard 대기 5초보다 오래 쥔 것이다. enforce 모드는 거부하고 observe 모드는 관찰 기록에 남긴 뒤 허용한다. `registry.lock`을 삭제하거나 holder를 종료하거나 Guard 상태를 reset하지 말고, writer가 끝난 뒤 원래 동작을 다시 실행한다.
 - Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
 - exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.

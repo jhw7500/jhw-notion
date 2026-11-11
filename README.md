@@ -188,8 +188,10 @@ private 파일을 자동 생성·수정하지 않는다.
 
 관찰 모드의 일반 Task/Claim 위반은 별도 필수 audit stream에 남기며, 전용 프로세스 잠금 안에서
 같은 FD의 전체 형식·owner·mode·link를 검증하고 append·fsync·재검증한 뒤에만 허용한다.
-기록 실패·손상·잠금 실패는 `GUARD_UNAVAILABLE`로 차단하고 자동 수리하지 않는다. 기록 성공 뒤
-optional legacy journal만 실패하면 warning을 반환한다. protocol·unavailable·self-approval도
+기록 실패·손상·잠금 실패는 `GUARD_UNAVAILABLE`로 차단하고 자동 수리하지 않는다. 다만 control 명령 같은
+다른 Registry writer가 `registry.lock`을 쥐고 있어 PreToolUse 평가가 기다리다 끝나면, 관찰 모드는
+`GUARD_UNAVAILABLE`과 reason `registry_state_lock`을 기록한 뒤 허용한다. 기록 성공 뒤
+optional legacy journal만 실패하면 warning을 반환한다. protocol·unavailable(위 `registry_state_lock` 경합 제외)·self-approval도
 차단한다. 진단은 request/key를 초기화하지 않으며 첫 유효 hook만 missing store를 준비한다.
 `unprotected: false`, `runtime_mode: observe`, `enforced: false`는 배선·관찰 상태이며 강제 보호 완료가 아니다.
 

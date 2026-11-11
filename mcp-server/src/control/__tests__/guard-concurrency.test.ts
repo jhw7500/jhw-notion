@@ -14,7 +14,7 @@ import {
 } from "../guard-service.js";
 import { GuardRequestStore } from "../guard-state.js";
 import { GuardJournal, type GuardJournalEvent, type GuardJournalPort } from "../guard-journal.js";
-import { MutationLock, type MutationLockRuntime } from "../process.js";
+import { MutationLock, type MutationLockOptions, type MutationLockRuntime } from "../process.js";
 import {
   ContractActiveClaimSchema,
   type ContractActiveClaim,
@@ -144,6 +144,8 @@ async function fixture(options: {
   afterGuardStateFileSync?: () => Promise<void>;
   afterDecisionJournalSync?: () => Promise<void>;
   registryLockRuntime?: MutationLockRuntime;
+  registryLockOptions?: MutationLockOptions;
+  serviceOverrides?: Partial<GuardServiceOptions>;
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "jhw-guard-concurrency-"));
   roots.push(root);
@@ -153,7 +155,13 @@ async function fixture(options: {
   await writeFile(join(cwd, "file.ts"), "a\n", "utf8");
   const stateDir = join(root, "state");
   const config = configFor(stateDir);
-  const registryMutationLock = new MutationLock(config, {}, options.registryLockRuntime);
+  const registryMutationLock = new MutationLock(
+    config,
+    {},
+    options.registryLockRuntime,
+    {},
+    options.registryLockOptions,
+  );
   const journal = new MemoryJournal();
   const requestStore = new GuardRequestStore(config, {
     journal,
@@ -201,6 +209,7 @@ async function fixture(options: {
     registry_view: registryView,
     guard_request_store: requestStore,
     guard_journal: decisionJournal,
+    ...options.serviceOverrides,
   } as Omit<GuardServiceOptions, "registry_mutation_barrier"> & { guard_journal: GuardJournal };
   const composition = createGuardServiceComposition(registryMutationLock, serviceOptions);
   return {
@@ -627,6 +636,50 @@ describe("GuardService concurrency and Registry composition", () => {
     await expect(fixtureValue.composition.service.evaluatePreTool(
       preTool(fixtureValue.cwd, "call-after-callback-failure"),
     )).resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+  });
+
+  it("lets observe mode record and allow a Registry writer holding registry.lock, while enforce denies", async () => {
+    // Status 75 is the flock helper's contention exit: another Registry writer
+    // holds registry.lock past the bounded Guard wait (#241).
+    const heldByWriter = { spawn: () => completedLockAcquisition(75) };
+    const registryLockOptions: MutationLockOptions = { contendedReason: "registry_state_lock" };
+    const observeOverrides = { mode: "observe" as const, inspect_guard_state: async () => true };
+
+    const enforce = await fixture({ registryLockRuntime: heldByWriter, registryLockOptions });
+    await expect(enforce.composition.service.evaluatePreTool(preTool(enforce.cwd, "call-busy-enforce")))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE", reason: "registry_state_lock" });
+
+    const observe = await fixture({
+      registryLockRuntime: heldByWriter,
+      registryLockOptions,
+      serviceOverrides: observeOverrides,
+    });
+    await expect(observe.composition.service.evaluatePreTool(preTool(observe.cwd, "call-busy-observe")))
+      .resolves.toMatchObject({ decision: "ALLOW", observed_decision: "DENY" });
+    // Only vocabulary an older release already knows, so a rollback still reads the journal.
+    expect(JSON.parse(await readFile(join(observe.stateDir, "guard-observe-journal.v1.jsonl"), "utf8")))
+      .toMatchObject({
+        mode: "observe",
+        observed_decision: "DENY",
+        decision_code: "GUARD_UNAVAILABLE",
+        error_reason: "registry_state_lock",
+      });
+
+    // Contention without the Registry writer's reason, or with another lock's
+    // reason, is not proof of a busy Registry: observe keeps the hard deny.
+    for (const [label, options] of [
+      ["unlabeled", undefined],
+      ["board", { contendedReason: "board_state_lock" } satisfies MutationLockOptions],
+    ] as const) {
+      const other = await fixture({
+        registryLockRuntime: heldByWriter,
+        ...(options ? { registryLockOptions: options } : {}),
+        serviceOverrides: observeOverrides,
+      });
+      const decision = await other.composition.service.evaluatePreTool(preTool(other.cwd, `call-busy-${label}`));
+      expect(decision, label).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+      expect(decision, label).not.toHaveProperty("reason");
+    }
   });
 
   it("appends the decision journal only after releasing the Registry writer lock", async () => {

@@ -595,6 +595,12 @@ guard-digest.key
 | `GUARD_PROMPT_ORIGIN_UNSUPPORTED` | native prompt origin 미지원 | 불가 |
 | `GUARD_UNAVAILABLE` | Guard/Registry/state 검증 실패 | 불가 |
 
+PreToolUse 평가에서 다른 Registry writer(control 명령 또는 다른 Guard 평가)가 `registry.lock`을
+Guard 대기 시간보다 오래 쥐면 `GUARD_UNAVAILABLE`에 `details.reason: "registry_state_lock"`을 붙인다.
+enforce는 그대로 거부하고, observe는 Guard 상태가 손상된 것이 아니므로 같은 code·reason을 관찰
+기록에 남기고 허용한다(#241). 새 code를 두지 않은 것은 롤백한 이전 release가 관찰 기록을 손상으로
+보고 모든 판정을 차단하지 않게 하기 위해서다.
+
 같은 code 안에서 운영자 조치가 갈리면 `details.reason`의 literal 식별자를 쓴다.
 신규 reason은 `schemas.ts`의 `ERROR_REASONS` 등록, Guard 스킬 문서의 해석, journal
 `error_reason` 기록을 한 변경으로 제공한다. 사용자 조치나 승인 명령을 free-text
