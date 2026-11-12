@@ -635,17 +635,17 @@ function values(flags: ParsedFlags, flag: string): string[] {
   return result === undefined ? [] : Array.isArray(result) ? result : [result];
 }
 
-/** Rejects content flags while treating the checkout path only as a protected term. */
+/** Operational path arguments: protected terms for the other flags, never content themselves. */
+const OPERATIONAL_PATH_FLAGS = ["--repo-path", "--cleanup-proof", "--proof-file", "--recovery-proof-file"];
+
+/** Rejects content flags while treating operational paths only as protected terms. */
 function assertSafeFlags(flags: ParsedFlags, dependencies: CliDependencies): void {
-  const checkout = value(flags, "--repo-path");
-  const proof = value(flags, "--cleanup-proof");
-  const policy = createSensitiveDataPolicy(dependencies.env, [
-    dependencies.stateDir,
-    ...(checkout && isAbsolute(checkout) ? [checkout] : []),
-    ...(proof && isAbsolute(proof) ? [proof] : []),
-  ]);
+  const paths = OPERATIONAL_PATH_FLAGS
+    .map((name) => value(flags, name))
+    .filter((path): path is string => typeof path === "string" && isAbsolute(path));
+  const policy = createSensitiveDataPolicy(dependencies.env, [dependencies.stateDir, ...paths]);
   policy.assertSafe(Object.fromEntries([...flags].filter(([name]) =>
-    name !== "--repo-path" && name !== "--cleanup-proof")));
+    !OPERATIONAL_PATH_FLAGS.includes(name))));
 }
 
 function required(flags: ParsedFlags, flag: string): string {

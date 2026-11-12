@@ -159,9 +159,12 @@ recovery `with`·recovery-clear도 같은 손상 파일을 읽지 못하므로, 
 
 1. 이 host에서 board 명령을 쓰는 세션과 배포를 모두 멈춘다.
 2. guard가 걸렸을 수 있는 board를 정한다. 손상 파일에서 `recovery_guard`가 있는 board를
-   읽을 수 있으면 그 board들이고, 읽을 수 없으면 이 host에 등록했던 board 전부다.
+   읽을 수 있으면 그 board들이다. 읽을 수 없으면 이 host에 등록했던 board 전부에서,
+   `recovery-arm`을 쓰는 고정 패키지 배포를 한 번도 하지 않았다고 확인한 board만 뺀다.
+   그런 board에는 guard가 걸릴 수 없다. 확인할 수 없는 board는 대상으로 둔다. 대상이
+   없으면 3단계를 건너뛴다.
 3. 대상 board마다 host-side 고정 verifier로 패키지 상태를 확인한다. 반쯤 바뀐 board는
-   복원한 뒤 다시 확인한다.
+   복원한 뒤 다시 확인한다. verifier로 확인할 수 없는 대상이 남으면 4단계로 가지 않는다.
 4. 모든 대상이 확인된 뒤에만 board state 파일(`boards.yaml`)을 직접 타임스탬프 접미로 옮겨
    보존하고, board를 다시 등록한다. 파일을 지우지 않는다.
 
@@ -180,7 +183,10 @@ jhw-control board recovery-clear <board-id> --holder <hld-id> --session <session
 
 고정 패키지 배포의 첫 원격 쓰기 전에 live pid가 정확히 검증된 exclusive holder로
 guard를 arm한다. proof file은 새 0600 owner-only regular file로 먼저 fsync되고 raw
-token은 status·stdout·journal에 나오지 않는다. guard는 원래 holder의 release·만료·
+token은 status·stdout·journal에 나오지 않는다. proof는 guard를 정상 경로로 풀 유일한
+수단이므로 재부팅·로그아웃 뒤에도 남는 owner-only(0700) 디렉터리에 둔다. control state
+디렉터리 아래 private 하위 디렉터리도 쓸 수 있다. `/tmp`나 `$XDG_RUNTIME_DIR` 같은
+tmpfs에는 두지 않는다. guard는 원래 holder의 release·만료·
 pid 사망과 독립적으로 남는다. 이 상태에서는 일반 acquire/wait/with/share/adopt,
 board identity update, unregister가 `BOARD_RECOVERY_REQUIRED` +
 `recovery_guard_active`로 멈춘다. matching proof를 제공한 exclusive recovery `with`만
@@ -195,6 +201,17 @@ boolean은 clear 권위가 아니다. `recovery_proof_mismatch`,
 `recovery_holder_not_live` 중 하나면 guard를 보존한 채 멈춘다. guard가 있는 정상 state는
 `reset-state`나 unregister로 지우지 않는다. 손상 state를 파싱해 모든 board entry에서
 guard 부재를 증명할 수 없으면 `recovery_guard_state_unproven`으로 reset을 거부한다.
+
+proof를 잃으면 그 guard는 도구로 풀 수 없다. clear가 proof의 token을 요구하기 때문이다.
+이때 운영자가 다음 순서로 직접 푼다.
+
+1. 이 host에서 board 명령을 쓰는 세션과 배포를 모두 멈춘다.
+2. 그 board를 host-side 고정 verifier로 확인한다. 반쯤 바뀌었으면 복원한 뒤 다시 확인한다.
+3. board state 파일(`boards.yaml`)을 타임스탬프 접미 사본으로 먼저 보존한다.
+4. 같은 디렉터리의 임시 파일에 그 board의 `recovery_guard` 필드만 뺀 내용을 쓰고, rename으로
+   원본을 바꾼다. 다른 board의 등록·holder·예약은 그대로 두고, 파일은 owner-only 0600의
+   단일 링크 일반 파일로 둔다.
+5. `jhw-control board list`로 그 board의 `recovery_guard_armed`가 `false`인지 확인한다.
 
 guard 필드를 모르는 이전 runtime은 guard가 있는 state를 strict schema 오류
 (`BOARD_STATE_CORRUPT`)로 읽어 일반 명령을 멈춘다. 그러나 그 runtime의 `reset-state`는

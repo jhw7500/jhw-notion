@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -346,6 +346,35 @@ describe("board CLI wiring", () => {
       board_id: "pim", holder_id: HOLDER, session: "sess-recovery", recovery_proof: proof,
     });
     expect(`${cleared.stdout}${cleared.stderr}`).not.toContain(TOKEN);
+  });
+
+  it("accepts proof files kept under the durable control state directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jhw-recovery-state-"));
+    temporaryRoots.push(root);
+    await mkdir(join(root, "recovery"), { mode: 0o700 });
+    const proofFile = join(root, "recovery", "pim.json");
+    const { dependencies, boardService } = makeDependencies();
+    Object.assign(dependencies, { stateDir: root });
+
+    const armed = await runCli([
+      "board", "recovery-arm", "pim", "--holder", HOLDER, "--session", "sess-a",
+      "--transaction", TRANSACTION, "--manifest-sha256", MANIFEST, "--proof-file", proofFile,
+    ], dependencies);
+    expect(armed.stderr).not.toContain("SENSITIVE_DATA_REJECTED");
+    expect(armed.exitCode).toBe(0);
+    const cleared = await runCli([
+      "board", "recovery-clear", "pim", "--holder", HOLDER, "--session", "sess-recovery",
+      "--recovery-proof-file", proofFile,
+    ], dependencies);
+    expect(cleared.stderr).not.toContain("SENSITIVE_DATA_REJECTED");
+    expect(cleared.exitCode).toBe(0);
+    expect(boardService.clearRecoveryGuard).toHaveBeenCalledWith(expect.objectContaining({ board_id: "pim" }));
+    // The state path stays a protected term for content flags.
+    const leaked = await runCli([
+      "board", "recovery-clear", "pim", "--holder", HOLDER, "--session", root,
+      "--recovery-proof-file", proofFile,
+    ], dependencies);
+    expect(leaked.exitCode).not.toBe(0);
   });
 
   it("rejects an oversized or non-strict recovery proof before clear", async () => {

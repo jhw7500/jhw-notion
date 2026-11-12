@@ -508,6 +508,10 @@ jhw-control guard preflight
 - `WORKTREE_EQUIVALENCE_UNSAFE` + `backup_invalid`: manifest/full bundle/ignored artifact의 owner·mode·hash·bytes·inode·inventory·복원 검증이 실패했다. worktree와 branch를 유지하고 backup을 다시 만든다.
 - `WORKTREE_EQUIVALENCE_UNSAFE` + `snapshot_changed`: Registry/history/mapping/ref/HEAD/worktree/inventory가 frozen proof 또는 최종 fence에서 바뀌었다. 기존 proof를 재사용하지 않고 새 discovery부터 다시 시작한다.
 - `LOCK_CONTENDED` + `registry_state_lock`이면 같은 호스트의 Registry writer가 최대 30초 대기 뒤에도 실행 중인 것이다. optional `lock_holder`의 `command`, `acquired_at`, `elapsed_ms`, `pid_state`만 보고하며 `registry.lock`을 삭제하거나 holder를 자동 종료하지 않는다.
+- board 명령이 배포 복구 guard 때문에 멈추면 guard는 그대로 보존된다. guard를 지우거나 board state를 reset하지 말고 `skills/claude/board.md`의 배포 복구 guard·손상 복구 절차를 따른다.
+  - `BOARD_RECOVERY_REQUIRED` + `recovery_guard_active`: guard가 걸린 board라 일반 진입·update·unregister·reset이 멈췄다. + `recovery_guard_state_unproven`: 손상 state에서 guard 부재를 증명하지 못해 reset이 멈췄다. + `recovery_requires_exclusive`: proof를 낸 recovery 진입(`with`·acquire)이 exclusive 모드가 아니다.
+  - `RECOVERY_PROOF_MISMATCH` + `recovery_proof_mismatch`: proof가 guard의 board·transaction·manifest·generation·token과 다르다.
+  - `HOLDER_MISMATCH` + `recovery_holder_session_mismatch`, `recovery_holder_not_exclusive`, `recovery_holder_untracked`, `recovery_holder_not_live`: arm·clear를 부른 holder가 같은 session의 live exclusive holder가 아니다.
 - Guard hook 판정의 `GUARD_UNAVAILABLE` + `registry_state_lock`이면 다른 Registry writer(control 명령이나 다른 Guard 평가)가 `registry.lock`을 Guard 대기 5초보다 오래 쥔 것이다. enforce 모드는 거부하고 observe 모드는 관찰 기록에 남긴 뒤 허용한다. `registry.lock`을 삭제하거나 holder를 종료하거나 Guard 상태를 reset하지 말고, writer가 끝난 뒤 원래 동작을 다시 실행한다.
 - Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
