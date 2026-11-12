@@ -6,9 +6,10 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import * as store from './runtime-store.mjs';
 import { acquireLease } from './runtime-safety.mjs';
+import { installBootstrap } from './runtime-entry.mjs';
 
 const moduleUrl = pathToFileURL(new URL('./runtime-store.mjs', import.meta.url).pathname).href;
 function api() {
@@ -686,4 +687,290 @@ test('bounded reaper paginates finished invocations without touching a live root
     assert.deepEqual(fs.readdirSync(path.join(f.root,'.jhw-runtime/sessions')),[root.id]);
     assert.equal(resolve(f,root.token).releaseId,f.release.releaseId);
   } finally {root.close();}
+});
+
+// Real managed entries need an installed bootstrap, as in test-runtime-coexist.mjs.
+const entryHelpers = ['runtime-entry.mjs', 'runtime-safety.mjs', 'runtime-store.mjs', 'runtime-deploy.mjs', 'install-wiring.sh',
+  'install-config.mjs', 'jhw-runtime-entry', 'jhw-runtime-control', 'jhw-runtime-hook', 'jhw-control-hook'];
+async function entryFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jhw-session-entry-test-'));
+  fs.chmodSync(root, 0o700);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const [name, text] of Object.entries({
+    '.gitignore': '.jhw-runtime/\n', 'mcp-server/package.json': '{"type":"module"}',
+    'mcp-server/package-lock.json': '{"lockfileVersion":3}', 'mcp-server/tsconfig.json': '{}',
+    'mcp-server/src/index.ts': 'export const generation = 1;', 'mcp-server/scripts/clean-dist.mjs': '',
+    'scripts/sync-codex-skills.mjs': '', 'skills/claude/task.md': 'fixture task',
+  })) write(root, name, text);
+  for (const name of entryHelpers) {
+    write(root, 'scripts/' + name, fs.readFileSync(new URL('./' + name, import.meta.url)), name.startsWith('jhw-') ? 0o755 : 0o644);
+  }
+  git(root, 'init', '-q');
+  git(root, 'add', '.');
+  git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture');
+  const control = "process.stdout.write('ready\\n');if(process.argv.includes('--hold'))process.stdin.resume();";
+  const hook = "process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:process.argv.at(-1)}})+'\\n');";
+  const build = async ({ stagingRoot }) => {
+    for (const [name, body, mode] of [
+      ['mcp-server/dist/index.js', 'module.exports = {};', 0o644], ['mcp-server/dist/runtime/mcp.cjs', 'module.exports = {};', 0o644],
+      ['mcp-server/dist/control/cli.js', control, 0o755], ['mcp-server/dist/runtime/control.cjs', control, 0o755],
+      ['mcp-server/dist/control/hook-adapter.js', hook, 0o755], ['mcp-server/dist/runtime/hook.cjs', hook, 0o755],
+    ]) write(stagingRoot, name, body, mode);
+    fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { mode: 0o755 });
+  };
+  const release = await store.prepareRelease({ repositoryRoot: root, build });
+  const deploy = acquireLease(path.join(root, '.jhw-runtime/deploy.lock'));
+  const admission = acquireLease(path.join(root, '.jhw-runtime/admission.lock'), { create: true });
+  try {
+    await installBootstrap({ repositoryRoot: root, releaseId: release.releaseId });
+    store.publishActivation({ repositoryRoot: root, releaseId: release.releaseId, expectedCurrent: null });
+  } finally { admission.close(); deploy.close(); }
+  write(root, '.jhw-runtime/wiring.json', '{"version":1,"installed":true}\n', 0o600);
+  return { root, release, entry: path.join(root, '.jhw-runtime/bootstrap/jhw-runtime-entry') };
+}
+function runEntry(f, args, options = {}) {
+  return spawnSync(process.execPath, [f.entry, ...args], { encoding: 'utf8', timeout: 20000, ...options });
+}
+function listSessions(f) {
+  try { return fs.readdirSync(path.join(f.root, '.jhw-runtime/sessions')).sort(); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+}
+function leaseFree(f, id) {
+  try { acquireLease(sessionPath(f, id, 'lease')).close(); return true; }
+  catch (error) { if (error.code === 'DEPLOY_LOCK_CONTENDED') return false; throw error; }
+}
+async function until(check, label, limit = 10000) {
+  const deadline = Date.now() + limit;
+  while (!check()) {
+    if (Date.now() > deadline) assert.fail('timed out: ' + label);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+// Valid completed invocation records whose owner already exited, as a killed
+// entry leaves them. Each manifest binds its own and its lease file's inode.
+function writeCompletedRecords(f, count) {
+  const probe = spawnSync(process.execPath, ['-e', "process.stdout.write(require('node:fs').readFileSync('/proc/self/stat','latin1'))"], { encoding: 'latin1' });
+  assert.equal(probe.status, 0, probe.stderr);
+  const fields = probe.stdout.slice(probe.stdout.lastIndexOf(')') + 1).trim().split(/\s+/);
+  const executable = fs.statSync(process.execPath, { bigint: true });
+  const repository = fs.statSync(f.root, { bigint: true });
+  const owner = { uid: process.getuid(), pid: probe.pid, startTime: fields[19],
+    bootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
+    commandDigest: createHash('sha256').update('exited entry').digest('hex'),
+    exeDev: String(executable.dev), exeIno: String(executable.ino) };
+  const compatibilityDigest = store.releaseCompatibility({ repositoryRoot: f.root, releaseId: f.release.releaseId });
+  fs.mkdirSync(path.join(f.root, '.jhw-runtime/sessions'), { recursive: true, mode: 0o700 });
+  const ids = [];
+  for (let index = 0; index < count; index++) {
+    const id = 's-' + randomBytes(16).toString('hex');
+    fs.mkdirSync(sessionPath(f, id, ''), { mode: 0o700 });
+    const leaseFd = fs.openSync(sessionPath(f, id, 'lease'), 'wx', 0o600);
+    const lease = fs.fstatSync(leaseFd, { bigint: true });
+    fs.closeSync(leaseFd);
+    const fd = fs.openSync(sessionPath(f, id, 'manifest.json'), 'wx', 0o600);
+    try {
+      const manifest = fs.fstatSync(fd, { bigint: true });
+      fs.writeFileSync(fd, canonical({ version: 1, id, kind: 'invocation', releaseId: f.release.releaseId, compatibilityDigest,
+        parentBinding: null, repository: { path: f.root, dev: String(repository.dev), ino: String(repository.ino) }, owner,
+        manifest: { dev: String(manifest.dev), ino: String(manifest.ino) },
+        lease: { dev: String(lease.dev), ino: String(lease.ino), fd: 6 }, createdAt: new Date().toISOString() }) + '\n');
+    } finally { fs.closeSync(fd); }
+    ids.push(id);
+  }
+  return ids;
+}
+
+test('records of signal-terminated entries and session wrappers are reclaimed by a later entry', async t => {
+  const f = await entryFixture(t);
+  const held = spawn(process.execPath, [f.entry, 'control', '--hold'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const wrapper = spawn(process.execPath, [f.entry, 'session', '--', process.execPath, '-e', "process.stdout.write('ready\\n');process.stdin.resume()"],
+    { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exits = [once(held, 'exit'), once(wrapper, 'exit')];
+  let output = ''; let stderr = '';
+  for (const child of [held, wrapper]) {
+    child.stdout.on('data', part => { output += part; });
+    child.stderr.on('data', part => { stderr += part; });
+  }
+  let ids;
+  try {
+    await until(() => output === 'ready\nready\n' || held.exitCode !== null || wrapper.exitCode !== null, 'entries ready ' + stderr);
+    ids = listSessions(f);
+    assert.deepEqual(ids.map(id => JSON.parse(fs.readFileSync(sessionPath(f, id, 'manifest.json'), 'utf8')).kind).sort(), ['invocation', 'session']);
+    held.kill('SIGTERM'); wrapper.kill('SIGTERM');
+    assert.deepEqual((await Promise.all(exits)).map(([, signal]) => signal), ['SIGTERM', 'SIGTERM']);
+  } finally { held.kill('SIGKILL'); wrapper.kill('SIGKILL'); held.stdin.end(); wrapper.stdin.end(); }
+  // Descendants exit on stdin EOF; no close() ran, so both records stay behind.
+  await until(() => ids.every(id => leaseFree(f, id)), 'descendants released leases');
+  assert.deepEqual(listSessions(f), ids);
+  const next = runEntry(f, ['control']);
+  assert.equal(next.status, 0, next.stderr);
+  assert.equal(next.stdout, 'ready\n');
+  assert.deepEqual(listSessions(f), []);
+});
+
+test('an entry drains more than SESSION_LIMIT completed records so control and PreToolUse still run', async t => {
+  const f = await entryFixture(t);
+  writeCompletedRecords(f, 1);
+  // Positive control: the helper's records pass full sessionRecord validation.
+  assert.equal(store.reapCompletedSessionBindings({ repositoryRoot: f.root, dryRun: true }).candidates, 1);
+  writeCompletedRecords(f, 1099);
+  assert.equal(listSessions(f).length, 1100);
+  const control = runEntry(f, ['control']);
+  assert.equal(control.status, 0, control.stderr);
+  assert.equal(control.stdout, 'ready\n');
+  const afterControl = listSessions(f).length;
+  const hook = runEntry(f, ['hook', '--adapter', 'claude', '--event', 'PreToolUse'], { input: '{}' });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.doesNotMatch(hook.stdout, /DEPLOY_SESSION_INVALID|deny/);
+  assert.deepEqual(JSON.parse(hook.stdout), { hookSpecificOutput: { hookEventName: 'PreToolUse' } });
+  const remaining = listSessions(f).length;
+  assert.ok(remaining < 1024, 'entries left ' + remaining + ' records (after control: ' + afterControl + ')');
+  // Reclaim keeps making progress after a drain reaches its floor; it never stalls there.
+  assert.ok(remaining < afterControl, 'the second entry reclaimed nothing at ' + afterControl);
+});
+
+test('entry reclaim removes abandoned private leftovers of the expected shape and keeps other evidence', async t => {
+  const f = await fixture(t);
+  const sessions = path.join(f.root, '.jhw-runtime/sessions');
+  fs.mkdirSync(sessions, { mode: 0o700 });
+  const hex = () => randomBytes(16).toString('hex');
+  const leftover = (name, files) => {
+    fs.mkdirSync(path.join(sessions, name), { mode: 0o700 });
+    for (const [file, mode] of files) write(path.join(sessions, name), file, '', mode);
+    return name;
+  };
+  leftover('.creating.s-' + hex(), []);
+  leftover('.retired.s-' + hex() + '.' + hex(), [['lease', 0o600]]);
+  leftover('.creating.s-' + hex(), [['lease', 0o600], ['manifest.json', 0o600]]);
+  const kept = [
+    leftover('.retired.s-' + hex() + '.' + hex(), [['lease', 0o600], ['manifest.json', 0o600], ['extra', 0o600]]),
+    leftover('.creating.s-' + hex(), [['lease', 0o644]]),
+  ].sort();
+  // Each entry reclaims at most two; three entries cover any listing order.
+  for (let entry = 0; entry < 3; entry++) {
+    const binding = create(f);
+    try { assert.equal(resolve(f, binding.token).releaseId, f.release.releaseId); }
+    finally { binding.close(); }
+  }
+  assert.deepEqual(listSessions(f), kept);
+  assert.deepEqual(fs.readdirSync(path.join(sessions, kept[0])).sort(), kept[0].startsWith('.retired.') ? ['extra', 'lease', 'manifest.json'] : ['lease']);
+});
+
+test('kept evidence leftovers do not starve reclaim of completed public records', async t => {
+  const f = await fixture(t);
+  const sessions = path.join(f.root, '.jhw-runtime/sessions');
+  fs.mkdirSync(sessions, { mode: 0o700 });
+  const hex = () => randomBytes(16).toString('hex');
+  // Five leftovers whose shape is kept as evidence fill more than one batch.
+  for (let i = 0; i < 5; i++) {
+    const name = '.retired.s-' + hex() + '.' + hex();
+    fs.mkdirSync(path.join(sessions, name), { mode: 0o700 });
+    write(path.join(sessions, name), 'extra', '', 0o600);
+  }
+  // A finished process leaves one completed public record behind.
+  const script = "const s=await import(process.argv[1]);s.createSessionBinding({repositoryRoot:process.argv[2],releaseId:process.argv[3],kind:'invocation'});";
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script, moduleUrl, f.root, f.release.releaseId], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(child.status, 0, child.stderr);
+  const [completed] = listSessions(f).filter(name => name.startsWith('s-'));
+  assert.ok(completed);
+  // Each entry tries four consecutive candidates from a random start over six, so
+  // twelve entries all missing the record has probability (1/3)^12.
+  for (let entry = 0; entry < 12 && listSessions(f).includes(completed); entry++) {
+    const binding = create(f);
+    try { assert.equal(resolve(f, binding.token).releaseId, f.release.releaseId); }
+    finally { binding.close(); }
+  }
+  assert.equal(listSessions(f).includes(completed), false, 'completed record starved behind kept evidence');
+  assert.equal(listSessions(f).filter(name => name.startsWith('.retired.')).length, 5);
+});
+
+test('entry reclaim keeps a completed record whose manifest was tampered', async t => {
+  const f = await fixture(t);
+  const script = "const s=await import(process.argv[1]);for(let i=0;i<2;i++)s.createSessionBinding({repositoryRoot:process.argv[2],releaseId:process.argv[3],kind:'invocation'});";
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script, moduleUrl, f.root, f.release.releaseId], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(child.status, 0, child.stderr);
+  const [tampered, valid] = listSessions(f);
+  assert.ok(tampered && valid);
+  fs.chmodSync(sessionPath(f, tampered, 'manifest.json'), 0o644);
+  const binding = create(f);
+  try { assert.equal(resolve(f, binding.token).releaseId, f.release.releaseId); }
+  finally { binding.close(); }
+  // The valid sibling shows reclaim ran in this entry; the tampered one is evidence.
+  assert.deepEqual(listSessions(f), [tampered]);
+  assert.equal(fs.statSync(sessionPath(f, tampered, 'manifest.json')).mode & 0o777, 0o644);
+});
+
+test('entry reclaim keeps live session roots and invocations, including ones whose owner exited', async t => {
+  const f = await fixture(t);
+  const sessionRoot = create(f);
+  const invocation = create(f, { kind: 'invocation' });
+  // The owner exits at once; a descendant keeps both inherited leases until a stop
+  // file appears (Node destroys a child's stdin pipe when that child exits).
+  const stop = path.join(f.root, 'stop');
+  const holder = "const fs=require('node:fs');const t=setInterval(()=>{if(fs.existsSync(process.argv[1]))clearInterval(t);},20);";
+  const script = "const s=await import(process.argv[1]);const {spawn}=await import('node:child_process');const [root,releaseId,holder,stop]=process.argv.slice(2);const a=s.createSessionBinding({repositoryRoot:root,releaseId});const b=s.createSessionBinding({repositoryRoot:root,releaseId,kind:'invocation'});spawn(process.execPath,['-e',holder,stop],{stdio:['ignore','ignore','ignore',a.fd,b.fd]});process.exit(0);";
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, moduleUrl, f.root, f.release.releaseId, holder, stop], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = once(child, 'exit');
+  let stderr = '';
+  child.stderr.on('data', part => { stderr += part; });
+  let orphans;
+  try {
+    const [code] = await exited;
+    assert.equal(code, 0, stderr);
+    const live = [sessionRoot.id, invocation.id].sort();
+    orphans = listSessions(f).filter(id => !live.includes(id));
+    assert.equal(orphans.length, 2);
+    assert.ok(orphans.every(id => !leaseFree(f, id)), 'descendant must hold both orphan leases');
+    for (let entry = 0; entry < 3; entry++) create(f).close();
+    assert.deepEqual(listSessions(f), [...live, ...orphans].sort());
+    assert.ok(orphans.every(id => !leaseFree(f, id)), 'descendant must still hold both orphan leases');
+  } finally { fs.writeFileSync(stop, ''); }
+  try {
+    // Positive control: once the last holder exits, the same orphans are reclaimed.
+    await until(() => orphans.every(id => leaseFree(f, id)), 'descendant released leases');
+    create(f).close();
+    assert.deepEqual(listSessions(f), [sessionRoot.id, invocation.id].sort());
+  } finally { invocation.close(); sessionRoot.close(); }
+});
+
+test('inventory treats a record retired after its snapshot as not live', async t => {
+  const f = await fixture(t);
+  // Deterministic seam: retire a held record right before its post-snapshot lease probe.
+  const binding = create(f, { kind: 'invocation' });
+  const original = fs.openSync;
+  let armed = true; let retiredBeforeProbe = false;
+  try {
+    fs.openSync = function(name, ...args) {
+      if (armed && path.basename(String(name)) === 'lease') {
+        armed = false;
+        binding.close();
+        retiredBeforeProbe = !fs.existsSync(sessionPath(f, binding.id, ''));
+      }
+      return original.call(this, name, ...args);
+    };
+    assert.deepEqual(inspect(f), []);
+  } finally { fs.openSync = original; binding.close(); }
+  assert.equal(retiredBeforeProbe, true, 'the record must vanish between snapshot and probe');
+  // Concurrent churn: a child creates and closes invocations while inventory repeats.
+  const stop = path.join(f.root, 'stop');
+  const script = "const fs=await import('node:fs');const s=await import(process.argv[1]);const [root,releaseId,stop]=process.argv.slice(2);let count=0;process.stdout.write('ready\\n');while(!fs.existsSync(stop)){s.createSessionBinding({repositoryRoot:root,releaseId,kind:'invocation'}).close();count++;}process.stdout.write(count+'\\n');";
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, moduleUrl, f.root, f.release.releaseId, stop], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const done = once(child, 'exit');
+  let output = ''; let stderr = '';
+  child.stdout.on('data', part => { output += part; });
+  child.stderr.on('data', part => { stderr += part; });
+  const errors = []; let inspections = 0;
+  try {
+    await until(() => output === 'ready\n' || child.exitCode !== null, 'creator ready ' + stderr);
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline && child.exitCode === null && inspections < 300) {
+      try { inspect(f); } catch (error) { errors.push(error.code ?? error.message); }
+      inspections++;
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  } finally { fs.writeFileSync(stop, ''); }
+  const [code] = await done;
+  assert.equal(code, 0, stderr);
+  assert.deepEqual(errors, []);
+  assert.ok(Number(output.split('\n')[1]) > 0 && inspections > 0, 'churn and inventory both ran: ' + JSON.stringify({ output, inspections }));
 });

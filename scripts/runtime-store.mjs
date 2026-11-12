@@ -722,6 +722,23 @@ function sessionNames(directory, reserved = 0) {
   directory.verify();
   return list.sort();
 }
+// Entry reclaim must still list a namespace that sessionNames() refuses as full.
+// Unknown names are only counted here; they are never opened or removed.
+const SESSION_SCAN_LIMIT = 65536;
+function sessionInventory(directory) {
+  const ids = []; const leftovers = []; let total = 0;
+  const stream = fs.opendirSync('/proc/self/fd/' + directory.fd);
+  try {
+    let item;
+    while ((item = stream.readSync()) !== null) {
+      if (++total > SESSION_SCAN_LIMIT) sessionFail();
+      if (SESSION_ID.test(item.name)) ids.push(item.name);
+      else if (SESSION_PRIVATE.test(item.name)) leftovers.push(item.name);
+    }
+  } finally { stream.closeSync(); }
+  directory.verify();
+  return { ids, leftovers, total };
+}
 function unusedSessionName(directory, name) {
   directory.verify();
   try { fs.lstatSync(directory.at(name)); }
@@ -777,8 +794,9 @@ function sessionRecord(runtime, root, repositoryRoot, id, token = null) {
 }
 
 // Retire only exact inode-bound records after an independent exclusive flock
-// proves every inherited holder has closed. This is used by normal close() and
-// by a separate bounded maintenance reaper; never by the entry hot path.
+// proves every inherited holder has closed. This is used by normal close(), by
+// bounded entry reclaim (each retirement under its own short index lease), and
+// by the explicit maintenance reaper.
 function retireUnusedSessionRecord({ repositoryRoot, id, token = null, expectedRecord = null, indexHeld = false }) {
   let index;
   try {
@@ -825,9 +843,86 @@ function retireUnusedSessionRecord({ repositoryRoot, id, token = null, expectedR
   } finally { index?.close(); }
 }
 
-// This maintenance API is deliberately not used during runManaged entry: it
-// may scan historical records and must be invoked only with an owner-approved
-// maintenance window. Preview is the default and removes nothing.
+// A wrapper or entry killed by a signal never runs close(). Entries therefore
+// reclaim in bounded batches before taking their own exclusive index lease: public
+// records only after the exclusive flock in retireUnusedSessionRecord proves no
+// holder (session and invocation alike), and private leftovers only when proven
+// abandoned under the exclusive index lease with the expected file shape.
+// Near the limit an entry drains toward SESSION_RECLAIM_FLOOR within a deadline.
+// Uncertain candidates are skipped and kept as evidence; this never fails an entry.
+const SESSION_RECLAIM_FLOOR = SESSION_LIMIT - 64;
+const SESSION_RECLAIM_DEADLINE_NS = 1_500_000_000n;
+function reclaimCompletedSessions({ repositoryRoot, runtime, root, sessions }) {
+  try {
+    const deadline = process.hrtime.bigint() + SESSION_RECLAIM_DEADLINE_NS;
+    const inventory = sessionInventory(sessions);
+    let total = inventory.total;
+    // At exactly the floor a drain would stop at once; use normal batches there.
+    const drain = total > SESSION_RECLAIM_FLOOR;
+    // Live records and kept evidence are skipped, so one random start over every
+    // candidate keeps neither from starving the rest of each bounded batch.
+    const pool = [...inventory.leftovers, ...inventory.ids];
+    const start = pool.length ? randomBytes(4).readUInt32LE(0) % pool.length : 0;
+    const candidates = [...pool.slice(start), ...pool.slice(0, start)];
+    const bootId = inventory.ids.length ? sessionBootId() : null;
+    let attempts = 0; let reclaimed = 0;
+    for (const name of candidates) {
+      if (drain ? total <= SESSION_RECLAIM_FLOOR || process.hrtime.bigint() >= deadline : reclaimed >= 2 || attempts >= 4) break;
+      attempts++;
+      try {
+        let removed = false;
+        if (SESSION_PRIVATE.test(name)) {
+          const index = sessionIndexLease(repositoryRoot, false);
+          let directory;
+          try {
+            directory = sessions.child(name, false, true);
+            const entries = names(directory);
+            let expected = true;
+            for (const entry of entries) {
+              if (!['manifest.json', 'lease'].includes(entry)) { expected = false; break; }
+              const stat = fs.lstatSync(directory.at(entry), { bigint: true });
+              if (!stat.isFile() || stat.uid !== BigInt(process.getuid()) || stat.nlink !== 1n ||
+                  (Number(stat.mode) & 0o7777) !== 0o600) { expected = false; break; }
+            }
+            if (expected) {
+              directory.verify();
+              for (const entry of entries) fs.unlinkSync(directory.at(entry));
+              fs.fsyncSync(directory.fd);
+              directory.verify();
+              fs.rmdirSync(sessions.at(name));
+              fs.fsyncSync(sessions.fd);
+              removed = true;
+            }
+          } finally { directory?.close(); index.close(); }
+        } else {
+          const data = sessionRecord(runtime, root, repositoryRoot, name);
+          const { owner } = data.record;
+          let mayLive = false;
+          // Cheap prefilter without flock: a same-boot owner whose start time
+          // (field 22, as in sessionProcess) still matches may hold the lease.
+          if (owner.bootId === bootId) {
+            let stat = null;
+            try { stat = fs.readFileSync('/proc/' + owner.pid + '/stat', 'latin1'); }
+            catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error; }
+            if (stat !== null) {
+              const end = stat.lastIndexOf(')');
+              const fields = stat.slice(end + 1).trim().split(/\s+/);
+              mayLive = !stat.startsWith(owner.pid + ' (') || end < 0 || !DECIMAL.test(fields[19] ?? '') ||
+                fields[19] === owner.startTime;
+            }
+          }
+          if (!mayLive) removed = retireUnusedSessionRecord({ repositoryRoot, id: name, token: data.token, expectedRecord: data.record }) === true;
+        }
+        if (removed) { reclaimed++; total--; }
+      } catch { /* Skip an uncertain candidate; its evidence stays in place. */ }
+    }
+  } catch { /* Best effort only; the SESSION_LIMIT check at registration still decides. */ }
+}
+
+// This explicit maintenance API (preview by default, removes nothing then) is
+// unchanged: it pages through historical invocation records under one index
+// lease and is not called during runManaged entry, whose bounded reclaim above
+// handles signal-terminated leftovers. Use it in an owner-approved window.
 export function reapCompletedSessionBindings({ repositoryRoot, dryRun = true, limit = 128, after = null }) {
   return sessionBoundary(() => {
     sessionRootName(repositoryRoot);
@@ -938,7 +1033,22 @@ export function inspectSessionBindings({ repositoryRoot }) {
         } finally { index.close(); }
         const result = [];
         for (const data of snapshot) {
-          if (!leaseIsHeld(data.leaseFile)) continue;
+          let held;
+          try { held = leaseIsHeld(data.leaseFile); }
+          catch (error) {
+            // A record retired after the snapshot (close() or entry reclaim) is
+            // not live. Any other probe failure stays fail-closed.
+            let present = true;
+            const recheck = sessionIndexLease(repositoryRoot, true);
+            try {
+              sessions.verify();
+              try { fs.lstatSync(sessions.at(data.record.id)); }
+              catch (missing) { if (missing.code !== 'ENOENT') throw missing; present = false; }
+            } finally { recheck.close(); }
+            if (present) throw error;
+            continue;
+          }
+          if (!held) continue;
           verifyLiveSession(runtime, repositoryRoot, data);
           if (data.record.parentBinding !== null) {
             const parent = resolveSessionBinding({ repositoryRoot, token: data.record.parentBinding, pid: data.record.owner.pid });
@@ -972,6 +1082,7 @@ export function createSessionBinding({ repositoryRoot, releaseId, kind = 'sessio
       const leaseFile = path.join(repositoryRoot, '.jhw-runtime/sessions', staging, 'lease');
       try {
         sessions = sessionDirectory(runtime, true);
+        reclaimCompletedSessions({ repositoryRoot, runtime, root, sessions });
         index = sessionIndexLease(repositoryRoot, false);
         sessionNames(sessions, 1);
         fs.mkdirSync(sessions.at(staging), { mode: 0o700 });
@@ -1011,7 +1122,7 @@ export function createSessionBinding({ repositoryRoot, releaseId, kind = 'sessio
           closed = true;
           held.close();
           // A descendant may outlive its owner and retain this lease. If so,
-          // leave a complete record for the separate verified reaper.
+          // leave a complete record for later bounded reclaim or the reaper.
           try { retireUnusedSessionRecord({ repositoryRoot, id, token, expectedRecord:record }); }
           catch { /* Keep untrusted records as evidence; never guess cleanup. */ }
         };

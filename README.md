@@ -158,6 +158,9 @@ shared fingerprint와 bootstrap을 확인해 확실한 미게시/게시 상태�
   launcher 및 SSH처럼 환경을 재구성하는 경로는 별도 연동이 필요하며, 누락 시 거부된다.
 - 실제 클라이언트의 환경 상속과 서버 공유 방식은 별도로 확인해야 한다. 격리된 Node
   클라이언트의 공존 시험을 개별 Codex 채팅의 무중단 지원 증거로 해석하지 않는다.
+- 끝났거나 signal로 종료된 wrapper/entry의 binding 기록은 이후 entry가 작은 묶음으로
+  회수한다. 기록 수가 한도에 가까우면 한 번에 더 많이 회수하며, lease를 가진 프로세스가
+  남아 있거나 형식이 어긋난 기록은 증거로 남긴다.
 
 stable bootstrap helper가 바뀐 release는 먼저 일반 `--activate`로 활성화한 뒤, consumer가
 없는 같은 maintenance window에서 다음 명령으로 현재 release의 helper 세트를 다시 설치한다.
