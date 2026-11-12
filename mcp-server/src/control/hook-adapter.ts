@@ -167,8 +167,11 @@ async function resolveGuard(
  * The decision must be on stdout before the runner's 8,000 ms watchdog, which
  * starts after it spawns this process, so its clock starts slightly later than
  * the `performance.now()` clock used here. Deadline output plus the bounded
- * diagnostics write finish by about 7.0 s. The deadline stays above the
- * Registry lock wait (5 s) plus 1 s and below the watchdog minus 1 s.
+ * diagnostics write finish by about 7.0 s. After a decision that was slow or
+ * attempted a diagnostics append, the core requests exit itself once the
+ * bounded diagnostic is done, so a slow append cannot keep it alive into the
+ * kill. The deadline stays above the Registry lock wait (5 s) plus 1 s and
+ * below the watchdog minus 1 s.
  */
 export const HOOK_DECISION_DEADLINE_MS = 6_500;
 export const HOOK_LATENCY_WARNING_MS = HOOK_DECISION_DEADLINE_MS / 2;
@@ -176,6 +179,9 @@ export const HOOK_LATENCY_WARNING_MS = HOOK_DECISION_DEADLINE_MS / 2;
 // committed enforce decision into the runner's kill.
 const HOOK_DIAGNOSTICS_CUTOFF_MS = 7_000;
 const HOOK_DIAGNOSTICS_RACE_MS = 250;
+// Runs (keyed by their io seam) in which a diagnostics append was started; the
+// append may outlive its race, so such a run must end by an explicit exit.
+const diagnosticsAttempted = new WeakSet<HookDeadlineIo>();
 
 /** Known host mode and control state directory; absent when the policy could not be resolved. */
 export interface HookRunContext {
@@ -264,6 +270,7 @@ async function recordBoundedDiagnostic(
   io?: HookDeadlineIo,
 ): Promise<void> {
   if (!context || (io && io.now() > HOOK_DIAGNOSTICS_CUTOFF_MS)) return;
+  if (io) diagnosticsAttempted.add(io);
   let timer: NodeJS.Timeout | undefined;
   try {
     await Promise.race([
@@ -305,24 +312,30 @@ async function executeHookAdapter(
   let gate: DecisionGate | undefined;
   // A PreToolUse decision settles through here: it disarms the deadline, emits
   // once and, when it was slow, records the latency after stdout is written.
-  const finish = async (result: HookRunResult): Promise<HookRunResult> => {
+  let emitted = false;
+  const finish = async (result: HookRunResult, exitAfter = true): Promise<HookRunResult> => {
     if (!timed) return result;
     gate?.dispose();
     if (await deadline.emission.emit(result.stdout)) {
+      emitted = true;
       const elapsed = deadline.io.now();
-      if (elapsed > HOOK_LATENCY_WARNING_MS) {
+      const slow = elapsed > HOOK_LATENCY_WARNING_MS;
+      if (slow) {
         await recordBoundedDiagnostic(context, {
           adapter: selection.adapter, event: selection.event, kind: "latency", elapsed_ms: Math.round(elapsed),
         }, deadline.io);
       }
+      // An append may outlive its race; exit 0 now that the decision is written.
+      if (exitAfter && (slow || diagnosticsAttempted.has(deadline.io))) deadline.io.exit();
     }
     return result;
   };
   const failed = async (code: HookFailureCode, kind: GuardDiagnosticKind): Promise<HookRunResult> => {
     if (!observeAllowed) return finish(failureResult(selection.event, code));
     // The decision reaches stdout first; the diagnostic is bounded and skipped when late.
-    const result = await finish({ exitCode: 0, stdout: neutralAllow(), stderr: "" });
+    const result = await finish({ exitCode: 0, stdout: neutralAllow(), stderr: "" }, false);
     await recordBoundedDiagnostic(context, { adapter: selection.adapter, event: selection.event, kind, code }, deadline?.io);
+    if (emitted) deadline?.io.exit();
     return result;
   };
   let event: GuardCommonEvent;

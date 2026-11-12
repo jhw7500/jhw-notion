@@ -17,8 +17,21 @@ import { renderStaticHookFailure } from "../hook-codecs.js";
 import { newOperationId } from "../ids.js";
 import type { GuardDecision } from "../schemas.js";
 
+const slowAppend = vi.hoisted(() => ({ delayMs: 0 }));
+vi.mock("../guard-diagnostics.js", async (importActual) => {
+  const actual = await importActual<typeof import("../guard-diagnostics.js")>();
+  return {
+    ...actual,
+    appendGuardHookDiagnostic: async (...args: Parameters<typeof actual.appendGuardHookDiagnostic>) => {
+      if (slowAppend.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, slowAppend.delayMs));
+      return actual.appendGuardHookDiagnostic(...args);
+    },
+  };
+});
+
 const roots: string[] = [];
 afterEach(async () => {
+  slowAppend.delayMs = 0;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -232,6 +245,28 @@ describe("PreToolUse decision deadline", () => {
       expect(result.stdout).toBe(NEUTRAL);
       expect(f.io.write).toHaveBeenCalledExactlyOnceWith(NEUTRAL);
       expect(await rows(ctx)).toEqual([]);
+    });
+  });
+
+  describe("exit after a committed decision with a slow diagnostics append", () => {
+    const failures = [
+      ["a slow decision", payload("PreToolUse"), async (f: ReturnType<typeof fakeIo>) => { f.clock.t = 3_300; return allow(); }],
+      ["an observe self-failure", payload("PreToolUse"), async (): Promise<GuardDecision> => { throw new Error("boom"); }],
+    ] as const;
+
+    it.each(failures)("requests exit 0 within the bound after the stdout write of %s", async (_label, raw, evaluate) => {
+      const ctx = await context("observe");
+      const f = fakeIo();
+      const order: string[] = [];
+      f.io.write.mockImplementation(async () => { order.push("write"); });
+      f.io.exit.mockImplementation(() => { order.push("exit"); });
+      slowAppend.delayMs = 2_000;
+      const started = Date.now();
+      const result = await runHookAdapterWithDeadline(argv, raw, port(() => evaluate(f)), f.io, ctx);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(result.exitCode).toBe(0);
+      expect(order).toEqual(["write", "exit"]);
+      expect(f.io.exit).toHaveBeenCalledOnce();
     });
   });
 

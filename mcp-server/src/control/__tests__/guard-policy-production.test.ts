@@ -12,9 +12,22 @@ import { resolveGuardEnvironment } from "../guard-policy.js";
 import { GuardRequestStore } from "../guard-state.js";
 import { runProductionHookAdapter } from "../hook-adapter.js";
 
+const slowAppend = vi.hoisted(() => ({ delayMs: 0 }));
+vi.mock("../guard-diagnostics.js", async (importActual) => {
+  const actual = await importActual<typeof import("../guard-diagnostics.js")>();
+  return {
+    ...actual,
+    appendGuardHookDiagnostic: async (...args: Parameters<typeof actual.appendGuardHookDiagnostic>) => {
+      if (slowAppend.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, slowAppend.delayMs));
+      return actual.appendGuardHookDiagnostic(...args);
+    },
+  };
+});
+
 const execFile = promisify(execFileCallback);
 const roots: string[] = [];
 afterEach(async () => {
+  slowAppend.delayMs = 0;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -304,6 +317,34 @@ process.stdout.write("{}\n");
     );
     expect(io.write).toHaveBeenCalledExactlyOnceWith('{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n');
     await expect(readFile(join(f.stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("requests exit after a fast observe decision whose service-side diagnostics append is slow", async () => {
+    const f = await fixture();
+    await mkdir(f.stateDir, { mode: 0o700 });
+    const observePath = join(f.stateDir, "guard-observe-journal.v1.jsonl");
+    await writeFile(observePath, "unsafe\n", { mode: 0o600 });
+    await chmod(observePath, 0o644);
+    const order: string[] = [];
+    const io = {
+      now: () => 100,
+      setTimer: () => ({ clear: () => undefined }),
+      write: vi.fn(async (_stdout: string) => { order.push("write"); }),
+      exit: vi.fn(() => { order.push("exit"); }),
+    };
+    slowAppend.delayMs = 2_000;
+    const started = Date.now();
+    const result = await runProductionHookAdapter(
+      ["--adapter", "codex", "--event", "PreToolUse"],
+      payload(f, "codex", "PreToolUse", { tool_name: "Bash", tool_input: { command: "printf bounded" }, tool_use_id: "fixture-write" }),
+      f.environment,
+      io,
+    );
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result.exitCode).toBe(0);
+    expect(io.write).toHaveBeenCalledExactlyOnceWith('{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n');
+    expect(order).toEqual(["write", "exit"]);
+    expect(io.exit).toHaveBeenCalledOnce();
   });
 
   it("keeps read-only guard preflight separate from startup initialization", async () => {
