@@ -1833,17 +1833,21 @@ describe("GuardService", () => {
     it.each([
       ["apply_patch", (body: string) => ({ command: body })],
       ["functions.apply_patch", (body: string) => body],
-    ] as const)("keeps 17 KiB Codex %s targets and their path safety", async (toolName, input) => {
-      const body = patch(17 * KIB);
-      expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(17 * KIB);
+    ] as const)("keeps 17, 65 and 512 KiB Codex %s targets and their path safety", async (toolName, input) => {
+      // Patch text is file content, not a command line, so the shell self-approval
+      // scan bound (64 KiB) must not refuse a large patch.
+      for (const kib of [17, 65, 512]) {
+        const body = patch(kib * KIB);
+        expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(kib * KIB);
 
-      await expect(fixture.service().evaluatePreTool(preTool(fixture.root, toolName, input(body))))
-        .resolves.toMatchObject({ decision: "ALLOW", execution_boundary: "hook" });
-      await expect(fixture.service().evaluatePreTool(preTool(
-        fixture.root,
-        toolName,
-        input(patch(17 * KIB, ["src/file.ts", "../outside.ts"])),
-      ))).resolves.toMatchObject({ decision: "DENY", code: "GUARD_WORKTREE_MISMATCH" });
+        await expect(fixture.service().evaluatePreTool(preTool(fixture.root, toolName, input(body))))
+          .resolves.toMatchObject({ decision: "ALLOW", execution_boundary: "hook" });
+        await expect(fixture.service().evaluatePreTool(preTool(
+          fixture.root,
+          toolName,
+          input(patch(kib * KIB, ["src/file.ts", "../outside.ts"])),
+        ))).resolves.toMatchObject({ decision: "DENY", code: "GUARD_WORKTREE_MISMATCH" });
+      }
     });
 
     it("routes a 17 KiB native Codex apply_patch through the hook adapter", async () => {
