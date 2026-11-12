@@ -338,6 +338,8 @@ export interface GuardServiceOptions {
   mode?: GuardEvaluationMode;
   /** Strict read-only inspection seam. It must never create, clean, or lock state. */
   inspect_guard_state?: () => Promise<boolean>;
+  /** PreToolUse decision deadline: the permit boundary asks it before any state is committed. */
+  decision_gate?: { tryCommit(): boolean };
   /** Best-effort, never-throwing sink for diagnostics that no release reads. */
   record_diagnostic?: (row: Pick<GuardDiagnosticRow, "kind" | "code"> & { adapter: GuardAdapter }) => Promise<void>;
 }
@@ -722,7 +724,7 @@ export class GuardService {
             } catch {
               return false;
             }
-            return true;
+            return this.options.decision_gate?.tryCommit() ?? true;
           },
           complete: (committedDecision) => {
             if (authoritativeDecision) {
@@ -1265,6 +1267,12 @@ export class GuardService {
       : decision.decision === "ALLOW"
         ? decision.consumed_request_id
         : undefined;
+    // An enforce ALLOW that never reached the permit boundary (all grants present,
+    // claim-free read) settles the deadline here: after it expired, the deadline
+    // deny was emitted, so no ALLOW is journaled.
+    if (decision.decision === "ALLOW" && this.mode === "enforce" && this.options.decision_gate?.tryCommit() === false) {
+      return decision;
+    }
     const observedDenial = decision.decision === "ALLOW" ? this.observedDenialCodes.get(decision) : undefined;
     const journalEvent: GuardJournalEvent = {
       protocol_version: 1,

@@ -329,6 +329,15 @@ test('a hook core that throws keeps GUARD_UNAVAILABLE in exactly one line', asyn
   }
 });
 
+// Preservation (mixed version): a newer core's GUARD_DEADLINE_EXCEEDED deny line passes the unchanged runner verbatim.
+test('the hook runner passes a core GUARD_DEADLINE_EXCEEDED deny line through verbatim', async t => {
+  const line=JSON.stringify(hookFailure('PreToolUse','GUARD_DEADLINE_EXCEEDED'))+'\n';
+  const f=await fixture(t,undefined,`process.stdout.write(${JSON.stringify(line)});`);
+  const result=run(f,'jhw-runtime-hook',['--adapter','claude','--event','PreToolUse'],'{}');
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(result.stdout,line);
+});
+
 // Break caught: a control core that dies while loading or running leaving no single-line error for jhw-control-host.
 test('a control bundle that throws exits 1 with exactly one JSON error line', async t => {
   const external=await fixture(t,undefined,undefined,{},{

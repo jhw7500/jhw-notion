@@ -231,25 +231,6 @@ process.stdout.write("{}\n");
     expect(diagnostics).toContainEqual(expect.objectContaining({ kind: "unrecorded_allow", code: "GUARD_UNAVAILABLE" }));
   });
 
-  it("writes the observe allow of a provider failure to stdout before its diagnostics row", async () => {
-    const f = await fixture();
-    await invoke(f, "codex", "PreToolUse");
-    await chmod(join(f.stateDir, "guard-digest.key"), 0o644);
-    const diagnosticsPath = join(f.stateDir, "guard-hook-diagnostics.v1.jsonl");
-    let diagnosticsAtWrite: string | undefined;
-    const write = vi.fn(async (_stdout: string) => {
-      diagnosticsAtWrite = await readFile(diagnosticsPath, "utf8").catch(() => "");
-    });
-
-    const result = await runProductionHookAdapter(
-      ["--adapter", "codex", "--event", "PreToolUse"], payload(f, "codex", "PreToolUse"), f.environment, write,
-    );
-    expect(result.stdout).toBe('{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n');
-    expect(write).toHaveBeenCalledExactlyOnceWith(result.stdout);
-    expect(diagnosticsAtWrite).toBe("");
-    expect(await readFile(diagnosticsPath, "utf8")).toContain('"kind":"unrecorded_allow"');
-  });
-
   it("allows a native event that fails to decode in observe, without initializing Guard state", async () => {
     const f = await fixture();
     expect(await invoke(f, "codex", "PreToolUse", { unexpected: "invalid" }))
@@ -279,6 +260,50 @@ process.stdout.write("{}\n");
     );
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout)).toHaveProperty("systemMessage", "GUARD_PROTOCOL_MISMATCH");
+  });
+
+  it("does not cut digest key creation when the deadline has already passed", async () => {
+    const f = await fixture();
+    const io = {
+      now: () => 7_000,
+      setTimer: () => ({ clear: () => undefined }),
+      write: vi.fn(async (_stdout: string) => undefined),
+      exit: vi.fn(),
+    };
+    await runProductionHookAdapter(
+      ["--adapter", "codex", "--event", "PreToolUse"], payload(f, "codex", "PreToolUse"), f.environment, io,
+    );
+    // The gate arms only after the key exists, so the late clock fires at arm, never mid-creation.
+    expect((await stat(join(f.stateDir, "guard-digest.key"))).size).toBe(32);
+    expect(io.write).toHaveBeenCalledExactlyOnceWith('{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n');
+    await vi.waitFor(() => expect(io.exit).toHaveBeenCalledOnce());
+    const rows = (await readFile(join(f.stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(rows).toEqual([expect.objectContaining({ kind: "deadline", mode: "observe" })]);
+  });
+
+  it("skips the service-side unrecorded_allow row once more than 7,000 ms have passed", async () => {
+    const f = await fixture();
+    await mkdir(f.stateDir, { mode: 0o700 });
+    const observePath = join(f.stateDir, "guard-observe-journal.v1.jsonl");
+    await writeFile(observePath, "unsafe\n", { mode: 0o600 });
+    await chmod(observePath, 0o644);
+    // The gate arms on the first reading; every later reading is past the diagnostics cutoff.
+    const readings = vi.fn().mockReturnValueOnce(100).mockReturnValue(7_100);
+    const io = {
+      now: readings,
+      setTimer: () => ({ clear: () => undefined }),
+      write: vi.fn(async (_stdout: string) => undefined),
+      exit: vi.fn(),
+    };
+    await runProductionHookAdapter(
+      ["--adapter", "codex", "--event", "PreToolUse"],
+      payload(f, "codex", "PreToolUse", { tool_name: "Bash", tool_input: { command: "printf bounded" }, tool_use_id: "fixture-write" }),
+      f.environment,
+      io,
+    );
+    expect(io.write).toHaveBeenCalledExactlyOnceWith('{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n');
+    await expect(readFile(join(f.stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("keeps read-only guard preflight separate from startup initialization", async () => {

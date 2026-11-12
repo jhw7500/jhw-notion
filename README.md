@@ -228,7 +228,8 @@ deployment journal은 자동 삭제하지 않는다. stage와 private evidence�
 | `DEPLOY_VALIDATION_FAILED` / `rollback_recovery_required` | rollback 자체의 검증 실패다. 추가 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. maintenance와 pointer·pending evidence를 유지하고 operator 수동 검토로 넘긴다. |
 | `DEPLOY_RECOVERY_REQUIRED` | `--status`와 retained private evidence를 읽고 maintenance를 유지한 채 operator review로 넘긴다. 자동 restore, journal 삭제, `installed:true` 강제 설정은 하지 않는다. |
 | `DEPLOY_PREDECESSOR_INVALID` | rollback 대상이 없거나 유효하지 않다. 임의 release를 predecessor로 대체하지 않는다. |
-| `GUARD_HOOK_TIMEOUT` | Guard hook runner의 watchdog(SessionEnd 2초, 그 밖 8초)이 core를 종료시켜 PreToolUse·UserPromptSubmit·PostToolUse가 event 형태의 deny 또는 알림으로 끝났다(SessionEnd는 `{}`). 저장되는 값이 아니라 runner stdout에만 나온다. core가 느려진 원인(예: Registry 경합)을 확인하고 자동 재시도나 hook 제거는 하지 않는다. core가 죽거나 출력이 규격 밖인 경우는 `GUARD_UNAVAILABLE`로 그대로다. |
+| `GUARD_HOOK_TIMEOUT` | Guard hook runner의 watchdog(SessionEnd 2초, 그 밖 8초)이 core를 종료시켜 PreToolUse·UserPromptSubmit·PostToolUse가 event 형태의 deny 또는 알림으로 끝났다(SessionEnd는 `{}`). 저장되는 값이 아니라 runner stdout에만 나온다. core가 느려진 원인(예: Registry 경합)을 확인하고 자동 재시도나 hook 제거는 하지 않는다. enforce에서는 core가 permit을 이미 소비한 뒤 runner가 core를 종료시켰을 수 있으므로 같은 호출을 재시도하기 전에 Guard request 상태를 확인한다. core가 죽거나 출력이 규격 밖인 경우는 `GUARD_UNAVAILABLE`로 그대로다. observe 모드에서도 이 경우는 차단이며, 동기 작업이 이벤트 루프를 막지 않는 한 core의 `GUARD_DEADLINE_EXCEEDED`가 먼저 답한다. |
+| `GUARD_DEADLINE_EXCEEDED` | Guard core의 PreToolUse 결정이 프로세스 시작 후 6,500 ms 안에 끝나지 않았고 permit commit 경계를 아직 넘지 않아 enforce 모드가 이 코드로 deny했다. runner watchdog(8초)은 core를 띄운 직후부터 재므로 core 시계보다 조금 늦게 시작해 최소 1.5초의 여유가 있고, deadline 출력과 진단 기록은 약 7.0초 안에 끝난다. 관찰 모드는 같은 경우를 허용하고 진단 파일에 `deadline` 행만 남긴다. 저장되는 값이 아니라 hook stdout에만 나오며 `GuardDenyCode`·`ErrorReason`에는 없다. 느려진 원인(Registry·git·잠금 대기)을 확인하고 자동 재시도는 하지 않는다. |
 | `DEPLOY_CHILD_SIGNALED` | `jhw-control-host`가 출력을 캡처하는 managed control child가 signal로 끝났다. 종료코드 75와 이 코드 한 줄이 stderr에 나오며 저장되지 않는다. child가 이미 stderr에 썼다면 launcher는 두 줄 이상을 보게 되어 이전과 같이 `CONTROL_OUTPUT_INVALID`로 보고한다. `board with`와 managed MCP selector는 기존대로 128+signal을 반환하고 아무것도 쓰지 않는다. |
 
 Guard 결과는 deployment 성공과 별도다. activation 결과의 `unprotected: true`는 Project
@@ -275,12 +276,14 @@ command를 포함하면 `GUARD_UNAVAILABLE` 대신 `GUARD_PROTOCOL_MISMATCH`로 
 한 줄씩 남는다. 이 파일은 어떤 release도 읽지 않으므로 이전 release로 되돌려도 열리지 않고 판정에 쓰이지 않는다.
 state 디렉터리가 아직 없으면 만들지 않고, 잠금 없이 한 줄(1 KiB 이하, mode 0600)을 append하며 실패는 무시한다.
 행은 `v`, `at`, `adapter`, `event`, `mode`, `kind`와 선택적 `code`·`elapsed_ms`만 담고 session id와 경로는 없다.
-진단 파일이 크기 상한(1 MiB)에 닿으면 이후 observe의 Guard 자신의 실패 허용은 진단 행을
+진단 파일이 크기 상한(`latency`는 512 KiB, 그 밖은 1 MiB)에 닿으면 이후 observe의 Guard 자신의 실패 허용은 진단 행을
 남기지 않는다. 그 시점부터 이 파일에는 관찰이 더 기록되지 않는다.
 
 | `kind` | 의미 |
 |---|---|
 | `unrecorded_allow` | Guard 실패(`code`)를 허용했고 관찰 audit row는 남기지 못했다. 관찰 기록이 상한·손상·잠금으로 막혔다는 신호다. |
+| `deadline` | PreToolUse 결정이 6,500 ms deadline을 넘겼다. 관찰 모드는 허용했고 enforce는 `GUARD_DEADLINE_EXCEEDED`로 거부했다(`mode`로 구분). `elapsed_ms`를 함께 남긴다. |
+| `latency` | PreToolUse 결정이 3,250 ms를 넘겨 끝났다(`elapsed_ms`). 가장 자주 쌓이므로 파일이 512 KiB에 닿으면 이 종류가 먼저 멈추고, 그 밖의 종류는 1 MiB까지 쓴다. 결정 출력 뒤 7,000 ms가 지났으면 어떤 행도 쓰지 않는다. |
 | `decode_failure` | hook 입력이 decode되지 않았지만 self-approval 사전 검사가 clear라 허용했다. 관찰 모드에서 hook 입력 형식이 바뀌어도 차단 없이 지나가므로 이 건수로 확인한다. |
 
 건수 확인(`JHW_CONTROL_STATE_DIR`를 쓰면 그 디렉터리):

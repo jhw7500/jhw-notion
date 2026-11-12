@@ -1666,6 +1666,64 @@ describe("GuardService", () => {
     expect((await readFile(observePath, "utf8")).split("\n").length - 1).toBe(8 * 1024);
   });
 
+  it("asks the decision gate at the permit boundary and commits nothing once it refuses", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const expired = { tryCommit: vi.fn(() => false) };
+    const open = { tryCommit: vi.fn(() => true) };
+
+    await expect(fixture.service({ decision_gate: expired }).evaluatePreTool(preTool(fixture.cwd)))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(expired.tryCommit).toHaveBeenCalledOnce();
+    expect(fixture.permitCalls).toBe(0);
+
+    await expect(fixture.service({ decision_gate: open }).evaluatePreTool(preTool(fixture.cwd)))
+      .resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+    expect(open.tryCommit).toHaveBeenCalledOnce();
+    expect(fixture.permitCalls).toBe(1);
+  });
+
+  it("never asks the decision gate on a path that commits nothing", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const gate = { tryCommit: vi.fn(() => false) };
+
+    await expect(fixture.service({ ...{ mode: "observe" as const, inspect_guard_state: async () => true }, decision_gate: gate })
+      .evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({ decision: "ALLOW" });
+    expect(gate.tryCommit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an all-grants-present call", "Edit", undefined, true],
+    ["a Claim-free read", "Read", { file_path: "src/file.ts" }, false],
+  ] as const)("settles the decision gate before journaling an enforce ALLOW of %s", async (_label, toolName, input, hasClaim) => {
+    if (!hasClaim) {
+      fixture.currentClaim = undefined;
+      fixture.activeClaims = [];
+    }
+    const journalPath = (directory: string) => join(fixture.root, directory, "guard-journal.jsonl");
+    const journaled = async (directory: string): Promise<GuardJournalEvent[]> =>
+      (await readFile(journalPath(directory), "utf8").catch(() => "")).trim().split("\n").filter(Boolean)
+        .map((line) => JSON.parse(line) as GuardJournalEvent);
+
+    const open = { tryCommit: vi.fn(() => true) };
+    await expect(fixture.service({ decision_gate: open, guard_journal: new GuardJournal(join(fixture.root, "gate-open")) })
+      .evaluatePreTool(preTool(fixture.cwd, toolName, input))).resolves.toMatchObject({ decision: "ALLOW" });
+    expect(open.tryCommit).toHaveBeenCalled();
+    expect(await journaled("gate-open")).toHaveLength(1);
+
+    // The deadline already emitted GUARD_DEADLINE_EXCEEDED: no ALLOW may reach the journal.
+    const expired = { tryCommit: vi.fn(() => false) };
+    await fixture.service({ decision_gate: expired, guard_journal: new GuardJournal(join(fixture.root, "gate-expired")) })
+      .evaluatePreTool(preTool(fixture.cwd, toolName, input));
+    expect(expired.tryCommit).toHaveBeenCalled();
+    expect(await journaled("gate-expired")).toEqual([]);
+  });
+
   it("allows after durable observation when only the optional legacy row fails", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);

@@ -491,7 +491,7 @@ jhw-control guard preflight
 
 호스트가 별도로 opt-in한 `$HOME/.config/jhw-control/guard-policy.json`의 exact `{version:1,mode:"observe"}`도 Guard 전용 관찰 모드를 선택한다. policy는 current-user-owned 단일 링크 regular `0600`이고 안전한 no-follow 부모 경로여야 한다. Guard 이벤트와 `guard status`/`guard preflight`에만 적용하며, 일반 CLI·credential launcher의 env-only 계약은 유지한다. 좌표 env가 하나라도 있으면 전체 env만 검증하며 private `control.env`와 섞지 않는다. 좌표 env가 전혀 없을 때만 명시 policy 아래의 안전한 data-only 11개 좌표를 사용한다. 명시 enforce와 policy observe가 충돌하거나 일부 env·unsafe policy이면 fail-closed다.
 
-관찰 모드는 일반 Task/Claim 규칙 위반을 별도 versioned observe journal에 기록하고 permit을 발급하지 않는다. self-approval, 검사할 수 없는 실행 command, 읽을 수 없는 `tool_input`은 계속 차단한다. PreToolUse에서 Guard 자신의 실패(`GUARD_UNAVAILABLE`·`GUARD_PROTOCOL_MISMATCH`, 관찰 기록 쓰기 실패, 다른 Registry writer의 `registry.lock` 경합 `registry_state_lock`)는 self-approval 사전 검사가 clear일 때 관찰 기록에 남기고 허용하며, 기록 자체를 쓸 수 없으면 진단 파일 `guard-hook-diagnostics.v1.jsonl`에 `unrecorded_allow`만 남긴다. core 밖의 실패(runner timeout, core crash)는 계속 차단한다. 첫 유효 hook composition만 기존 store를 보존하며 missing request store와 digest key를 준비하고, 읽기 전용 진단은 상태 파일을 만들지 않는다. `runtime_mode: observe`, `enforced: false`는 배선 및 관찰을 뜻하며 강제 보호 완료가 아니다.
+관찰 모드는 일반 Task/Claim 규칙 위반을 별도 versioned observe journal에 기록하고 permit을 발급하지 않는다. self-approval, 검사할 수 없는 실행 command, 읽을 수 없는 `tool_input`은 계속 차단한다. PreToolUse에서 Guard 자신의 실패(`GUARD_UNAVAILABLE`·`GUARD_PROTOCOL_MISMATCH`, 관찰 기록 쓰기 실패, 다른 Registry writer의 `registry.lock` 경합 `registry_state_lock`)는 self-approval 사전 검사가 clear일 때 관찰 기록에 남기고 허용하며, 기록 자체를 쓸 수 없으면 진단 파일 `guard-hook-diagnostics.v1.jsonl`에 `unrecorded_allow`만 남긴다. PreToolUse 결정이 6,500 ms 안에 끝나지 않으면(permit commit 전) enforce는 `GUARD_DEADLINE_EXCEEDED`로 거부하고 observe는 허용하며 `deadline` 행을 남긴다. core 밖의 실패(runner timeout, core crash)는 계속 차단한다. 첫 유효 hook composition만 기존 store를 보존하며 missing request store와 digest key를 준비하고, 읽기 전용 진단은 상태 파일을 만들지 않는다. `runtime_mode: observe`, `enforced: false`는 배선 및 관찰을 뜻하며 강제 보호 완료가 아니다.
 
 ## 결과 해석
 
@@ -513,6 +513,7 @@ jhw-control guard preflight
   - `RECOVERY_PROOF_MISMATCH` + `recovery_proof_mismatch`: proof가 guard의 board·transaction·manifest·generation·token과 다르다.
   - `HOLDER_MISMATCH` + `recovery_holder_session_mismatch`, `recovery_holder_not_exclusive`, `recovery_holder_untracked`, `recovery_holder_not_live`: arm·clear를 부른 holder가 같은 session의 live exclusive holder가 아니다.
 - Guard hook 판정의 `GUARD_UNAVAILABLE` + `registry_state_lock`이면 다른 Registry writer(control 명령이나 다른 Guard 평가)가 `registry.lock`을 Guard 대기 5초보다 오래 쥔 것이다. enforce 모드는 거부하고 observe 모드는 관찰 기록에 남긴 뒤 허용한다. `registry.lock`을 삭제하거나 holder를 종료하거나 Guard 상태를 reset하지 말고, writer가 끝난 뒤 원래 동작을 다시 실행한다.
+- Guard hook 판정의 `GUARD_DEADLINE_EXCEEDED`는 core의 PreToolUse 결정이 6,500 ms 안에 끝나지 않아 enforce가 거부한 것이다(observe는 허용하고 진단 파일에 `deadline` 행을 남긴다). 저장되는 값이 아니라 hook stdout에만 나온다. 느려진 원인(Registry·git·잠금 대기)을 확인하고 Guard 상태를 reset하지 말며, 원인이 풀린 뒤 원래 동작을 다시 실행한다.
 - Guard request 전이에서 `LOCK_CONTENDED` + `guard_state_lock`이면 별도 `guard-requests.lock`을 다른 승인·소모·완료 전이가 사용 중인 것이다. Guard state를 reset·삭제하거나 Registry lock 문제로 해석하지 말고, 진행 중인 전이가 끝난 뒤 원래 동작을 다시 평가한다.
 - exit `0` + `journal_warning.code=JOURNAL_WRITE_FAILED`: lifecycle은 이미 성공했다. 재시도하지 말고 measurement gap만 보고한다.
 - exit `4`: Claim conflict/mismatch/not found. 자동 takeover 금지.
