@@ -314,7 +314,18 @@ function processObservation(procFd, pid, options) {
     // Zombies and PF_KTHREAD tasks cannot start a consumer; all other empty
     // cmdlines are uncertain, including an exec transition through empty argv.
     if (!argv.length && firstStat.state !== 'Z' && !(firstStat.flags & 0x00200000n)) uncertain();
-    const consumer = argv.length ? classify(entryIdentity(argv), options.repositoryRoot, readCwd) : null;
+    const identity = argv.length ? entryIdentity(argv) : null;
+    const consumer = argv.length ? classify(identity, options.repositoryRoot, readCwd) : null;
+    let environment; let bound = false;
+    if (consumer && options.verifySessionConsumer) {
+      environment = readRecord(fd, 'environ', MAX_ARGV_BYTES, options.uid);
+      if (environment.length && environment.at(-1) !== 0) uncertain();
+      const variables = new TextDecoder('utf-8', {fatal:true}).decode(environment).split('\0');
+      const matches = variables.filter(value => value.startsWith('JHW_RUNTIME_SESSION_BINDING='));
+      if (matches.length > 1) uncertain();
+      const token = matches.length ? matches[0].slice('JHW_RUNTIME_SESSION_BINDING='.length) : undefined;
+      bound = options.verifySessionConsumer({pid:Number(pid),startTime:firstStat.start,category:consumer,entry:identity?.entry,args:identity?.args??[],token}) === true;
+    }
     const lastArgv = readRecord(fd, 'cmdline', options.maxArgvBytes, options.uid);
     const lastStat = parseStat(readRecord(fd, 'stat', RECORD_BYTES, options.uid), pid);
     const lastUids = readUids(readRecord(fd, 'status', RECORD_BYTES, options.uid));
@@ -323,7 +334,8 @@ function processObservation(procFd, pid, options) {
         (!argv.length && (firstStat.state !== lastStat.state || firstStat.flags !== lastStat.flags)) ||
         (cwd !== undefined && cwd !== fs.readlinkSync(`/proc/self/fd/${fd}/cwd`)) ||
         !sameObject(before, fs.fstatSync(fd)) || !sameObject(before, fs.lstatSync(anchored))) uncertain();
-    return consumer;
+    if (environment && !environment.equals(readRecord(fd, 'environ', MAX_ARGV_BYTES, options.uid))) uncertain();
+    return options.verifySessionConsumer && consumer ? {category:consumer,bound} : consumer;
   } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
@@ -340,8 +352,9 @@ function processNames(procFd, maxEntries) {
   return names.sort();
 }
 
-export function inspectConsumers({ repositoryRoot, procRoot = '/proc', uid = process.getuid(), excludePids = [], maxEntries = MAX_ENTRIES, maxArgvBytes = MAX_ARGV_BYTES } = {}) {
+function scanConsumers({ repositoryRoot, procRoot = '/proc', uid = process.getuid(), excludePids = [], maxEntries = MAX_ENTRIES, maxArgvBytes = MAX_ARGV_BYTES } = {}, verifySessionConsumer) {
   const result = { clear: false, counts: { tui: 0, app_server: 0, legacy: 0, managed: 0 }, uncertain: 0 };
+  if (verifySessionConsumer) result.bound = {tui:0,app_server:0,legacy:0,managed:0};
   let fd;
   try {
     if (!Number.isSafeInteger(uid) || uid < 0 || !Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > MAX_ENTRIES ||
@@ -356,8 +369,9 @@ export function inspectConsumers({ repositoryRoot, procRoot = '/proc', uid = pro
     for (const pid of names) {
       if (excluded.has(pid)) continue;
       try {
-        const consumer = processObservation(fd, pid, { repositoryRoot: repository, uid, maxArgvBytes });
-        if (consumer) result.counts[consumer]++;
+        const consumer = processObservation(fd, pid, { repositoryRoot: repository, uid, maxArgvBytes, verifySessionConsumer });
+        if (consumer && verifySessionConsumer) (consumer.bound ? result.bound : result.counts)[consumer.category]++;
+        else if (consumer) result.counts[consumer]++;
       } catch { result.uncertain++; }
     }
     const afterNames = processNames(fd, maxEntries);
@@ -366,6 +380,17 @@ export function inspectConsumers({ repositoryRoot, procRoot = '/proc', uid = pro
   } catch { result.uncertain++; }
   finally { if (fd !== undefined) fs.closeSync(fd); }
   return result;
+}
+
+export function inspectConsumers(options = {}) {
+  return scanConsumers(options);
+}
+
+// Module-only proof callback. The public deployment command always supplies its
+// canonical binding verifier; there is no argv/env exclusion or acceptance knob.
+export function inspectSessionConsumers(options, verifySessionConsumer) {
+  if (typeof verifySessionConsumer !== 'function') uncertain();
+  return scanConsumers(options, verifySessionConsumer);
 }
 
 export function requireQuiescence(options) {

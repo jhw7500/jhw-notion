@@ -49,6 +49,7 @@ control/hook link 또는 지원 TUI 설정 파일이 하나라도 있으면 buil
 |---|---|
 | `./install.sh --prepare` | private stage에서 `npm ci`와 build를 수행하고 immutable release를 검증·보존한다. live pointer와 HOME은 그대로다. source 입력(`skills`, `mcp-server/src`, `mcp-server/scripts` 등) 아래에 git이 무시하는 파일이 있으면 `DEPLOY_SOURCE_INVALID` / `ignored_source_files`로 거부한다. 검사는 복사·build 전에 하고 build 뒤에 다시 한다(`.git`·`.ai`·`.superpowers`·`node_modules`·`dist` 아래는 release에서 빠지므로 대상이 아니다). 추적되지 않았지만 무시되지 않은 파일은 release에 복사되고 `dirty: true`로 보고된다. git은 빈 무시 디렉터리를 나열하지 않으므로, 비어 있거나 내용이 모두 제외 이름(`node_modules` 등) 아래에 있는 무시 디렉터리는 거부되지 않고 `dirty`에도 반영되지 않은 채 빈 디렉터리로 release에 복사된다. 인자 없는 첫 설치도 같은 staged build를 거치므로 같은 검사를 받는다. |
 | `./install.sh --status` | 선택된 release, predecessor 유무, pending recovery 수와 `tui`·`app_server`·`legacy`·`managed` 집계만 반환하는 advisory 조회다. |
+| `./install.sh --activate-compatible RELEASE_ID` | 검증된 session binding을 유지하며, 공용 파일과 MCP 계약이 호환되는 후보로 default만 전환한다. 기존 unbound consumer와 불확실성은 거부한다. |
 | `./install.sh --activate RELEASE_ID` | 두 번의 consumer inventory와 exclusive admission을 통과한 정확한 retained release만 활성화한다. |
 | `./install.sh --activate RELEASE_ID --guard-observe` | 기존 managed 설치를 명시적 host 관찰 모드로 전환한다. 현재 배선을 먼저 검증하고 Claude·Codex 네 이벤트를 배선한 뒤 private policy를 마지막에 게시한다. 첫 설치와 `--adopt-from` 조합은 거부한다. 이미 관찰 모드면 일반 activate와 같다. |
 | `./install.sh --activate RELEASE_ID --adopt-from LEGACY_CHECKOUT` | 첫 managed activation 전용. 같은 저장소의 다른 checkout(정규 절대경로, 같은 git common dir)이 남긴 legacy 설치를 넘겨받는다. 그 checkout을 정확히 가리키는 legacy 링크와 `node <LEGACY_CHECKOUT>/mcp-server/dist/index.js` MCP 항목만 adopt하며 env 키는 보존하고, 이 release에 없는 이름의 legacy Codex 링크는 제거한다(실패 시 preimage로 복원). 두 checkout 모두 consumer가 없어야 한다. 보존된 기본값 외 env는 이후 `--uninstall`에서 항목과 함께 사라지므로 재설치 뒤 다시 입력해야 한다. |
@@ -60,7 +61,8 @@ control/hook link 또는 지원 TUI 설정 파일이 하나라도 있으면 buil
 
 첫 활성화는 legacy entry를 stable bootstrap으로 옮긴다. 성공 뒤 MCP/control/hook은
 `.jhw-runtime/bootstrap/jhw-runtime-{entry,control,hook}`를 거쳐 admission lease를 잡고,
-실행할 release는 `.jhw-runtime/current` 아래에서 선택한다. 스킬은
+실행할 release는 유효한 session binding이 있으면 그 retained release로, 없으면
+`.jhw-runtime/current` 아래에서 선택한다. 스킬은
 `.jhw-runtime/current/skills`를 가리킨다. 준비 단계는 세 selector마다 npm 실행 코드를
 단일 CJS bundle로 만들며, bootstrap은 manifest로 검증한 bundle inode를 descriptor로 고정해
 실행하고 그 뒤 built-in이 아닌 module load를 거부한다. 따라서 검사 뒤 release의 다른 JS나
@@ -93,9 +95,72 @@ ownership proof와 기존 no-clobber transaction으로 생성한다.
 검토한다. `--rollback`은 legacy checkout이나 과거 wiring을 복원하지 않으며 이 경우
 `DEPLOY_PREDECESSOR_INVALID`로 거부된다. 자동 복원 command는 없다.
 
-이후 compatible release 활성화는 `current` pointer만 바꾸고 TUI 설정을 다시 쓰지 않는다.
+이후 일반 retained release 활성화는 `current` pointer만 바꾸고 TUI 설정을 다시 쓰지 않는다.
 일반 activation/rollback은 bootstrap도 다시 설치하지 않으며, bootstrap은 처음 helper를
 가져온 release(`sourceReleaseId`)를 계속 고정한다.
+
+
+### 세션을 유지하는 호환 MCP 업데이트
+
+pin-aware bootstrap을 설치한 뒤에는 wrapper가 시작한 클라이언트 프로세스와 그 후손을
+하나의 retained release에 고정할 수 있다. 예를 들어 관리 checkout에서 다음처럼 시작한다.
+
+~~~bash
+node .jhw-runtime/bootstrap/jhw-runtime-entry session -- codex
+~~~
+
+wrapper는 release·프로세스 identity·상속 lease에 연결된 private binding을 만들고,
+MCP/control/네 종류의 hook이 그 binding을 다시 검증하도록 전달한다. 이후 default가
+바뀌어도 같은 wrapper의 새 명령과 MCP 재연결은 원래 release를 사용한다.
+환경에서 binding이 사라지거나 변조되면 원래 세션의 후속 호출을 거부하며 current로
+대체하지 않는다. binding은 버전 선택 정보이고 기존 control 승인이나 board lease를
+대체하지 않는다.
+
+후보는 평소처럼 준비하고, 아래 별도 명령으로 호환성을 확인한 뒤 default를 바꾼다.
+
+~~~bash
+./install.sh --prepare
+./install.sh --activate-compatible RELEASE_ID
+~~~
+
+이 경로는 기존 MCP tool/entry 영역의 변경만 허용한다. bootstrap helper, 공용 wiring,
+skills, control/hook 코드와 상태 계약, package/lockfile, 실제 dependency bytes와 그 외
+공용 파일의 집합·내용·모드가 같아야 한다. current와 후보의 MCP를 각각 초기화하고
+tools/list를 확인해 protocol·capabilities 및 기존 tool의 input/output schema·annotations·
+execution·_meta와 기타 동작 필드가 같은지도 검사한다. title·description·icons는 표시
+metadata로 보고 계약 비교에서 제외한다. MCP 형식 검증을 통과한 새 tool 추가는 허용한다.
+구현의 의미적 호환성까지 이 검사로 증명하지는 않으므로 후보 자체의 제품 시험은 계속 필요하다.
+
+공존 전환은 candidate 검증이 끝난 뒤 짧은 publication lock 아래에서 current를 게시한다.
+실행 중인 세션은 기존 admission lease와 binding lease를 유지하므로 일반 --activate,
+--rollback, --refresh-bootstrap, --uninstall의 maintenance gate도 계속 적용된다.
+기존 release를 default로 되돌릴 때도 --activate-compatible에 그 release ID를 지정할 수
+있지만 현재 tool 계약을 제거하는 변경은 거부된다. 기존 세션의 release는 바뀌지 않는다.
+
+후보 초기화 실패나 비호환 변경은 default를 그대로 둔다. 호환 전환 도중 프로세스가
+중단되면 다음 --activate-compatible가 기록된 origin/destination, 실제 current,
+shared fingerprint와 bootstrap을 확인해 확실한 미게시/게시 상태만 감사 이력으로
+완료 처리하고 요청을 다시 검증한다. 알 수 없는 pending 기록이나 pointer 변경,
+살아 있는 고아 lease 등은 계속 거부한다. 기록을 삭제하거나 강제 전환하는 옵션은 없다.
+
+적용 범위와 제한:
+
+- 최초 pin-aware bootstrap 도입은 기존 --activate와 --refresh-bootstrap maintenance 절차가
+  필요하다. 이미 실행 중인 unbound 세션을 자동 편입하지 않는다.
+- 고정 단위는 wrapper로 시작한 프로세스다. 같은 app-server를 공유하는 여러 채팅은
+  같은 release를 사용하며, 새 버전을 사용하려면 독립 wrapper/서버를 시작해야 한다.
+- 기존 외부 서버에 접속하는 proxy, binding이 없는 consumer, PID/부모 관계나 lease가
+  불확실한 consumer는 호환 전환을 차단한다.
+- skills는 current/skills 링크를 유지한다. 공존하는 release의 skills bytes가 같다는
+  검증이 이를 뒷받침한다. skills·공용 상태·bootstrap·의존성을 바꾸는 업데이트에는
+  기존 maintenance 절차를 사용한다.
+- 현재 별도 설치된 jhw-control-host는 binding 환경을 전달하지 않는다. 해당 secure host
+  launcher 및 SSH처럼 환경을 재구성하는 경로는 별도 연동이 필요하며, 누락 시 거부된다.
+- 실제 클라이언트의 환경 상속과 서버 공유 방식은 별도로 확인해야 한다. 격리된 Node
+  클라이언트의 공존 시험을 개별 Codex 채팅의 무중단 지원 증거로 해석하지 않는다.
+- 끝났거나 signal로 종료된 wrapper/entry의 binding 기록은 이후 entry가 작은 묶음으로
+  회수한다. 기록 수가 한도에 가까우면 한 번에 더 많이 회수하며, lease를 가진 프로세스가
+  남아 있거나 형식이 어긋난 기록은 증거로 남긴다.
 
 stable bootstrap helper가 바뀐 release는 먼저 일반 `--activate`로 활성화한 뒤, consumer가
 없는 같은 maintenance window에서 다음 명령으로 현재 release의 helper 세트를 다시 설치한다.
