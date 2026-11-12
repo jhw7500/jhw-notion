@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 
-import { encodeCanonicalJson, type GuardAdapter, type JsonValue } from "./guard-protocol.js";
+import {
+  encodeCanonicalJson,
+  TOOL_INPUT_JSON_LIMITS,
+  type GuardAdapter,
+  type JsonValue,
+} from "./guard-protocol.js";
 
 const notionDatabaseId = z.enum(["decisionLog", "preferences", "projects", "references", "knowledgeBase"]);
 type NotionDatabaseId = z.infer<typeof notionDatabaseId>;
@@ -199,7 +204,7 @@ interface ResolutionBinding {
 const genuineResolutions = new WeakMap<object, ResolutionBinding>();
 
 function rawInputFingerprint(input: JsonValue): string {
-  return createHash("sha256").update(encodeCanonicalJson(input), "utf8").digest("hex");
+  return createHash("sha256").update(encodeCanonicalJson(input, TOOL_INPUT_JSON_LIMITS), "utf8").digest("hex");
 }
 
 function rawCommand(input: JsonValue): string | undefined {

@@ -33,6 +33,17 @@ export interface CanonicalJsonLimits {
   maximumObjectKeys?: number;
 }
 
+/**
+ * One explicit limit for a PreToolUse `tool_input` (#247): the hook stdin
+ * bound, applied to both a single string and the canonical total. Structural
+ * limits (depth, nodes, keys, arrays) keep the defaults.
+ */
+export const MAX_TOOL_INPUT_BYTES = 8 * 1024 * 1024;
+export const TOOL_INPUT_JSON_LIMITS: Readonly<CanonicalJsonLimits> = Object.freeze({
+  maximumBytes: MAX_TOOL_INPUT_BYTES,
+  maximumStringBytes: MAX_TOOL_INPUT_BYTES,
+});
+
 function jsonFailure(message: string): never {
   throw new TypeError(message);
 }
@@ -126,16 +137,16 @@ export function encodeCanonicalJson(value: unknown, limits: CanonicalJsonLimits 
   return encoded;
 }
 
-function isBoundedJson(value: unknown): value is JsonValue {
+function isBoundedToolInput(value: unknown): value is JsonValue {
   try {
-    encodeCanonicalJson(value);
+    encodeCanonicalJson(value, TOOL_INPUT_JSON_LIMITS);
     return true;
   } catch {
     return false;
   }
 }
 
-const boundedJsonValueSchema = z.custom<JsonValue>(isBoundedJson, "Expected bounded strict JSON data");
+const toolInputJsonValueSchema = z.custom<JsonValue>(isBoundedToolInput, "Expected bounded strict JSON data");
 const boundedUtf8 = (maximumBytes: number, allowEmpty = false) => z.string()
   .min(allowEmpty ? 0 : 1)
   .max(maximumBytes)
@@ -191,7 +202,7 @@ export const PreToolUseEventSchema = z.object({
   event: z.literal("pre_tool_use"),
   cwd: boundedCoordinate(4_096).refine(isAbsolute, "cwd must be absolute"),
   tool_name: GuardToolNameSchema,
-  tool_input: boundedJsonValueSchema,
+  tool_input: toolInputJsonValueSchema,
   tool_use_id: GuardToolUseIdSchema,
 }).strict();
 export type PreToolUseEventInput = z.input<typeof PreToolUseEventSchema>;

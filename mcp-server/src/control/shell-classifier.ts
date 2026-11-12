@@ -892,6 +892,11 @@ async function simpleKnownDetection(
 }
 
 /** Bounded, context-free detector shared by pre-Claim Guard policy and classification. */
+/** Whether detectGuardSelfApproval reads the whole command (it returns false above this bound). */
+export function selfApprovalScanCovers(input: string): boolean {
+  return typeof input === "string" && Buffer.byteLength(input, "utf8") <= MAX_COMMAND_BYTES;
+}
+
 export function detectGuardSelfApproval(input: string): boolean {
   if (typeof input !== "string" || input.length === 0 || Buffer.byteLength(input, "utf8") > MAX_COMMAND_BYTES) {
     return false;

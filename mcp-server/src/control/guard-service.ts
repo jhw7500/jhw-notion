@@ -85,6 +85,7 @@ import {
 import {
   classifyShell,
   detectGuardSelfApproval,
+  selfApprovalScanCovers,
   ShellClassificationError,
   type ExecutionBoundary,
   type ShellClassification,
@@ -656,8 +657,19 @@ export class GuardService {
     }
 
     const earlyCommand = resolvedTool.self_approval_command;
-    if (earlyCommand && detectGuardSelfApproval(earlyCommand)) {
-      return this.deny("GUARD_SELF_APPROVAL_DENIED");
+    if (earlyCommand) {
+      // The self-approval scan reads at most the shell command bound and simple
+      // argv tokens. A command it cannot read is refused in every mode, as it was
+      // before larger tool inputs were accepted, so padding never hides an approval.
+      if (!selfApprovalScanCovers(earlyCommand)) return this.deny("GUARD_PROTOCOL_MISMATCH");
+      let selfApproval: boolean;
+      try {
+        selfApproval = detectGuardSelfApproval(earlyCommand);
+      } catch (cause) {
+        if (cause instanceof ShellClassificationError) return this.deny("GUARD_PROTOCOL_MISMATCH");
+        throw cause;
+      }
+      if (selfApproval) return this.deny("GUARD_SELF_APPROVAL_DENIED");
     }
 
     const claimFree = await claimFreeReadSummary(event, resolvedTool);
