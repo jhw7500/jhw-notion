@@ -944,6 +944,41 @@ test('entry reclaim keeps live session roots and invocations, including ones who
   } finally { invocation.close(); sessionRoot.close(); }
 });
 
+test('inventory treats a record whose holder finishes during live verification as not live', async t => {
+  const f = await fixture(t);
+  // Deterministic seam: the first lease probe sees the holder; retire it right
+  // before verifyLiveSession probes the lease again.
+  const binding = create(f, { kind: 'invocation' });
+  const original = fs.openSync;
+  let opens = 0; let retiredDuringVerify = false;
+  try {
+    fs.openSync = function(name, ...args) {
+      if (path.basename(String(name)) === 'lease' && ++opens === 2) {
+        binding.close();
+        retiredDuringVerify = !fs.existsSync(sessionPath(f, binding.id, ''));
+      }
+      return original.call(this, name, ...args);
+    };
+    assert.deepEqual(inspect(f), []);
+  } finally { fs.openSync = original; binding.close(); }
+  assert.equal(retiredDuringVerify, true, 'the record must vanish between the first probe and live verification');
+});
+
+test('an unbound lineage may end at a process whose parent is outside the PID namespace', async t => {
+  const f = await fixture(t);
+  // A process entered into a PID namespace by setns (docker exec, nsenter) sees
+  // PPID 0 without being PID 1. On a host, kthreadd has the same shape.
+  let top = null;
+  for (const name of fs.readdirSync('/proc')) {
+    if (!/^[0-9]+$/.test(name) || name === '1') continue;
+    let stat;
+    try { stat = fs.readFileSync(`/proc/${name}/stat`, 'latin1'); } catch { continue; }
+    if (stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[1] === '0') { top = Number(name); break; }
+  }
+  if (top === null) { t.skip('no process with PPID 0 other than PID 1 is visible'); return; }
+  assert.doesNotThrow(() => store.assertNoSessionAncestor({ repositoryRoot: f.root, pid: top }));
+});
+
 test('inventory treats a record retired after its snapshot as not live', async t => {
   const f = await fixture(t);
   // Deterministic seam: retire a held record right before its post-snapshot lease probe.

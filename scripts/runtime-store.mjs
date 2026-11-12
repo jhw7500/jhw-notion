@@ -1036,27 +1036,29 @@ export function inspectSessionBindings({ repositoryRoot }) {
         } finally { index.close(); }
         const result = [];
         for (const data of snapshot) {
-          let held;
-          try { held = leaseIsHeld(data.leaseFile); }
-          catch (error) {
-            // A record retired after the snapshot (close() or entry reclaim) is
-            // not live. Any other probe failure stays fail-closed.
-            let present = true;
+          // A record whose holder finished after the snapshot is not live: it was
+          // retired (close() or entry reclaim) or its lease is no longer held.
+          // Re-check that under the shared index lease; anything else stays fail-closed.
+          const ended = () => {
             const recheck = sessionIndexLease(repositoryRoot, true);
             try {
               sessions.verify();
               try { fs.lstatSync(sessions.at(data.record.id)); }
-              catch (missing) { if (missing.code !== 'ENOENT') throw missing; present = false; }
+              catch (missing) { if (missing.code !== 'ENOENT') throw missing; return true; }
+              return !leaseIsHeld(data.leaseFile);
             } finally { recheck.close(); }
-            if (present) throw error;
-            continue;
-          }
+          };
+          let held;
+          try { held = leaseIsHeld(data.leaseFile); }
+          catch (error) { if (ended()) continue; throw error; }
           if (!held) continue;
-          verifyLiveSession(runtime, repositoryRoot, data);
-          if (data.record.parentBinding !== null) {
-            const parent = resolveSessionBinding({ repositoryRoot, token: data.record.parentBinding, pid: data.record.owner.pid });
-            if (parent.releaseId !== data.record.releaseId) sessionFail();
-          }
+          try {
+            verifyLiveSession(runtime, repositoryRoot, data);
+            if (data.record.parentBinding !== null) {
+              const parent = resolveSessionBinding({ repositoryRoot, token: data.record.parentBinding, pid: data.record.owner.pid });
+              if (parent.releaseId !== data.record.releaseId) sessionFail();
+            }
+          } catch (error) { if (ended()) continue; throw error; }
           result.push({ ...data.record, token: data.token, live: true });
         }
         return result;
@@ -1239,17 +1241,21 @@ export function assertNoSessionAncestor({ repositoryRoot, pid = process.pid }) {
     const bootId = sessionBootId();
     const chain = [];
     let current = pid;
-    let reachedInit = false;
+    let reachedTop = false;
     for (let depth = 0; depth < 256; depth++) {
       if (chain.some(item => item.pid === current)) sessionFail();
       const observed = sessionAncestorProcess(current);
       chain.push(observed);
       if (ancestorHasSessionLease(repositoryRoot, observed)) sessionFail();
-      if (current === 1) { reachedInit = true; break; }
-      if (!observed.parentPid || observed.parentPid === current) sessionFail();
+      // The visible lineage ends at PID 1 or at a process whose parent lies
+      // outside this PID namespace (PPID 0, e.g. entered by setns or docker exec).
+      // Every visible process up to there was still checked for a session lease;
+      // a lease inherited across the boundary stays visible on that process.
+      if (current === 1 || observed.parentPid === 0) { reachedTop = true; break; }
+      if (observed.parentPid === current) sessionFail();
       current = observed.parentPid;
     }
-    if (!reachedInit) sessionFail();
+    if (!reachedTop) sessionFail();
     for (const before of chain.reverse()) {
       if (canonical(before) !== canonical(sessionAncestorProcess(before.pid)) ||
           ancestorHasSessionLease(repositoryRoot, before)) sessionFail();
