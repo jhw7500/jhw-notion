@@ -748,7 +748,7 @@ async function until(check, label, limit = 10000) {
 }
 // Valid completed invocation records whose owner already exited, as a killed
 // entry leaves them. Each manifest binds its own and its lease file's inode.
-function writeCompletedRecords(f, count) {
+function writeCompletedRecords(f, count, exe = null) {
   const probe = spawnSync(process.execPath, ['-e', "process.stdout.write(require('node:fs').readFileSync('/proc/self/stat','latin1'))"], { encoding: 'latin1' });
   assert.equal(probe.status, 0, probe.stderr);
   const fields = probe.stdout.slice(probe.stdout.lastIndexOf(')') + 1).trim().split(/\s+/);
@@ -757,7 +757,7 @@ function writeCompletedRecords(f, count) {
   const owner = { uid: process.getuid(), pid: probe.pid, startTime: fields[19],
     bootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
     commandDigest: createHash('sha256').update('exited entry').digest('hex'),
-    exeDev: String(executable.dev), exeIno: String(executable.ino) };
+    exeDev: String(executable.dev), exeIno: String(executable.ino), ...exe };
   const compatibilityDigest = store.releaseCompatibility({ repositoryRoot: f.root, releaseId: f.release.releaseId });
   fs.mkdirSync(path.join(f.root, '.jhw-runtime/sessions'), { recursive: true, mode: 0o700 });
   const ids = [];
@@ -779,6 +779,17 @@ function writeCompletedRecords(f, count) {
   }
   return ids;
 }
+
+test('a record whose executable inode reads as a negative BigInt stays valid', async t => {
+  const f = await fixture(t);
+  // Some filesystems report inode numbers above 2^63, which BigInt stats show as negative.
+  const [id] = writeCompletedRecords(f, 1, { exeIno: '-9223372036854300301' });
+  const preview = store.reapCompletedSessionBindings({ repositoryRoot: f.root, dryRun: true });
+  assert.equal(preview.candidates, 1);
+  const removed = store.reapCompletedSessionBindings({ repositoryRoot: f.root, dryRun: false });
+  assert.equal(removed.removed, 1);
+  assert.equal(listSessions(f).includes(id), false);
+});
 
 test('records of signal-terminated entries and session wrappers are reclaimed by a later entry', async t => {
   const f = await entryFixture(t);

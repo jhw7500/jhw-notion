@@ -572,6 +572,9 @@ const SESSION_LIMIT = 1024;
 const SESSION_MANIFEST_LIMIT = 16 * 1024;
 const PROCESS_RECORD_LIMIT = 128 * 1024;
 const DECIMAL = /^\d{1,32}$/;
+// BigInt stats are signed 64-bit, so an inode or device number above 2^63 reads
+// as negative. Identity is compared as the same string, so only the sign is new.
+const SIGNED_DECIMAL = /^-?\d{1,32}$/;
 const BOOT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const sessionFail = () => fail('DEPLOY_SESSION_INVALID');
 // Readers hold a shared namespace lease only while taking the directory snapshot;
@@ -782,7 +785,7 @@ function sessionRecord(runtime, root, repositoryRoot, id, token = null) {
         !exact(record.owner, ['uid', 'pid', 'startTime', 'bootId', 'commandDigest', 'exeDev', 'exeIno']) ||
         record.owner.uid !== process.getuid() || !integer(record.owner.pid) || record.owner.pid < 1 ||
         !DECIMAL.test(record.owner.startTime) || !BOOT_ID.test(record.owner.bootId) ||
-        !DIGEST.test(record.owner.commandDigest) || !DECIMAL.test(record.owner.exeDev) || !DECIMAL.test(record.owner.exeIno) ||
+        !DIGEST.test(record.owner.commandDigest) || !SIGNED_DECIMAL.test(record.owner.exeDev) || !SIGNED_DECIMAL.test(record.owner.exeIno) ||
         !exact(record.manifest, ['dev', 'ino']) || record.manifest.dev !== String(file.dev) || record.manifest.ino !== String(file.ino) ||
         !exact(record.lease, ['dev', 'ino', 'fd']) || !integer(record.lease.fd) || record.lease.fd > 1048576 ||
         !lease.isFile() || lease.uid !== BigInt(process.getuid()) || lease.nlink !== 1n || (Number(lease.mode) & 0o7777) !== 0o600 ||
