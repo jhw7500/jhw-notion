@@ -8,7 +8,7 @@ import { Catalog } from "./catalog.js";
 import { ClaimService } from "./claim-service.js";
 import { createCliDependencies, isCliEntrypointInvocation } from "./cli.js";
 import { ControlContractAuthority } from "./contract-authority.js";
-import { encodeCanonicalJson, type GuardCommonEvent } from "./guard-protocol.js";
+import { encodeCanonicalJson, MAX_TOOL_INPUT_BYTES, type GuardCommonEvent } from "./guard-protocol.js";
 import {
   createGuardServiceComposition,
   GuardSideEventResultSchema,
@@ -37,7 +37,7 @@ import {
   type SessionEndEvidenceResult,
 } from "./session-end.js";
 
-export const MAX_HOOK_STDIN_BYTES = 128 * 1024;
+export const MAX_HOOK_STDIN_BYTES = MAX_TOOL_INPUT_BYTES;
 export const MAX_HOOK_OUTPUT_BYTES = 12 * 1024;
 
 const HookAdapterNameSchema = z.enum(["claude", "codex"]);

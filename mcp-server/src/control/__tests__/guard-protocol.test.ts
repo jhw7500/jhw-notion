@@ -4,6 +4,7 @@ import {
   CanonicalOperationSchema,
   GuardCommonEventSchema,
   GuardProtocolVersion,
+  MAX_TOOL_INPUT_BYTES,
   OperationRequirementSchema,
   type GuardCommonEventInput,
   type GuardCommonEventOutput,
@@ -91,15 +92,43 @@ describe("Guard common protocol", () => {
     }
   });
 
-  it("rejects tool input whose canonical serialized UTF-8 size exceeds 64 KiB", () => {
-    const overLimit = {
-      ...preTool,
-      tool_input: {
-        chunks: ["a".repeat(16_384), "b".repeat(16_384), "c".repeat(16_384), "d".repeat(16_384)],
-      },
-    };
+  it("accepts tool input strings above 16 KiB and totals above 64 KiB (#247)", () => {
+    // Break caught: the generic 16 KiB string / 64 KiB total default rejected large Write, Edit and apply_patch input.
+    for (const tool_input of [
+      { file_path: "src/file.ts", content: "x".repeat(17 * 1024) },
+      { file_path: "src/file.ts", content: "x".repeat(1024 * 1024) },
+      { chunks: ["a".repeat(16_384), "b".repeat(16_384), "c".repeat(16_384), "d".repeat(16_384)] },
+    ]) {
+      expect(GuardCommonEventSchema.safeParse({ ...preTool, tool_input }).success).toBe(true);
+    }
+  });
 
-    expect(GuardCommonEventSchema.safeParse(overLimit).success).toBe(false);
+  it("rejects tool input whose canonical serialized UTF-8 size exceeds the 8 MiB tool-input limit", () => {
+    expect(MAX_TOOL_INPUT_BYTES).toBe(8 * 1024 * 1024);
+    const envelope = Buffer.byteLength('{"content":""}', "utf8");
+    const exact = { content: "x".repeat(MAX_TOOL_INPUT_BYTES - envelope) };
+    const over = { content: "x".repeat(MAX_TOOL_INPUT_BYTES - envelope + 1) };
+    const half = MAX_TOOL_INPUT_BYTES / 2;
+
+    expect(GuardCommonEventSchema.safeParse({ ...preTool, tool_input: exact }).success).toBe(true);
+    expect(GuardCommonEventSchema.safeParse({ ...preTool, tool_input: over }).success).toBe(false);
+    expect(GuardCommonEventSchema.safeParse({
+      ...preTool,
+      tool_input: { chunks: ["a".repeat(half), "b".repeat(half)] },
+    }).success).toBe(false);
+  });
+
+  it("keeps the 64 KiB prompt bound separate from the tool-input limit", () => {
+    const prompt = (bytes: number) => ({
+      protocol_version: 1,
+      adapter: "claude",
+      event: "user_prompt_submit",
+      session_id: "claude-local-hardening",
+      prompt: "p".repeat(bytes),
+    });
+
+    expect(GuardCommonEventSchema.safeParse(prompt(64 * 1024)).success).toBe(true);
+    expect(GuardCommonEventSchema.safeParse(prompt(64 * 1024 + 1)).success).toBe(false);
   });
 
   it("rejects non-JSON values, cycles, non-finite numbers, accessors, and authority-bearing prototypes", () => {
@@ -144,7 +173,7 @@ describe("Guard common protocol", () => {
     const cases = [
       deep,
       Array.from({ length: 2_100 }, () => null),
-      { value: "x".repeat(20 * 1024) },
+      { value: "x".repeat(MAX_TOOL_INPUT_BYTES + 1) },
       { ["k".repeat(300)]: true },
       sparse,
       adorned,

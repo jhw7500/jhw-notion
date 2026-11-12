@@ -21,6 +21,7 @@ import type { ControlConfig } from "../config.js";
 import type { CanonicalOperation, OperationRequirement } from "../guard-protocol.js";
 import { GuardRequestStore, type GuardRequest } from "../guard-state.js";
 import { GuardJournal, type GuardJournalEvent, type GuardJournalPort } from "../guard-journal.js";
+import { runHookAdapter, type HookGuardPort } from "../hook-adapter.js";
 import type { SecureStateDirectoryHooks } from "../journal.js";
 import { MutationLock, type MutationLockRuntime } from "../process.js";
 import {
@@ -1721,6 +1722,232 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
+  describe("oversized tool input (#247)", () => {
+    // Break caught: a 16 KiB string / 64 KiB total tool_input bound turned large
+    // Write, Edit, apply_patch and Bash input into GUARD_PROTOCOL_MISMATCH or
+    // GUARD_UNAVAILABLE, which observe mode hard-denies for every session.
+    const KIB = 1024;
+    const sizes = [["17 KiB", 17 * KIB], ["1 MiB", 1024 * KIB]] as const;
+    const write = (bytes: number) => ({ file_path: "src/file.ts", content: "w".repeat(bytes) });
+    const edit = (bytes: number) => ({
+      file_path: "src/file.ts",
+      old_string: "o".repeat(bytes),
+      new_string: "n".repeat(bytes),
+    });
+    const patch = (bytes: number, targets: readonly string[] = ["src/file.ts"]) => [
+      "*** Begin Patch",
+      ...targets.map((target) => `*** Update File: ${target}`),
+      "@@",
+      ...Array.from({ length: Math.ceil(bytes / 64) }, (_, index) => `+${String(index).padStart(63, "p")}`),
+      "*** End Patch",
+    ].join("\n");
+    const words = (count: number, bytes: number) =>
+      Array.from({ length: count }, (_, index) => `${index}`.padEnd(bytes, "q")).join(" ");
+    const heredoc = (body: string) => `cat > src/generated.txt <<'EOF'\n${body}\nEOF`;
+
+    function useClaudeClaim(): void {
+      fixture.currentClaim = ContractActiveClaimSchema.parse({
+        ...activeClaim(fixture.currentContract),
+        origin_adapter: "claude",
+      });
+      fixture.activeClaims = [fixture.currentClaim];
+    }
+
+    function claudePreTool(toolName: string, toolInput: unknown, toolUseId = "call-large-claude"): unknown {
+      return { ...preTool(fixture.cwd, toolName, toolInput, toolUseId) as object, adapter: "claude" };
+    }
+
+    function observeService(directory = "observe-large"): GuardService {
+      return fixture.service({
+        mode: "observe",
+        inspect_guard_state: async () => true,
+        guard_journal: new GuardJournal(join(fixture.root, directory)),
+      });
+    }
+
+    function hookPort(service: GuardService): HookGuardPort {
+      return {
+        submitUserPrompt: (event) => service.submitUserPrompt(event),
+        evaluatePreTool: (event) => service.evaluatePreTool(event),
+        completePostTool: (event) => service.completePostTool(event),
+        recordSessionEnd: async () => {
+          throw new Error("SessionEnd is not part of this test");
+        },
+      };
+    }
+
+    const neutral = `${JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse" } })}\n`;
+
+    it.each(sizes)("gives a Claude Write of %s the same decision as a short Write", async (_label, bytes) => {
+      useClaudeClaim();
+      const short = await fixture.service().evaluatePreTool(claudePreTool("Write", write(1)));
+      const large = await fixture.service().evaluatePreTool(claudePreTool("Write", write(bytes)));
+
+      expect(short).toMatchObject({ decision: "PERMIT_REQUIRED" });
+      expect(large).toMatchObject({ decision: short.decision, summary: short.summary });
+      await expect(observeService().evaluatePreTool(claudePreTool("Write", write(bytes)))).resolves.toMatchObject({
+        decision: "ALLOW",
+        observed_decision: "PERMIT_REQUIRED",
+      });
+    });
+
+    it.each(sizes)("routes a Claude Write of %s through the hook adapter to a normal observe decision", async (_label, bytes) => {
+      useClaudeClaim();
+      const raw = JSON.stringify({
+        session_id: SESSION_ID,
+        cwd: fixture.cwd,
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: write(bytes),
+        tool_use_id: "call-large-hook",
+      });
+
+      const result = await runHookAdapter(
+        ["--adapter", "claude", "--event", "PreToolUse"],
+        raw,
+        hookPort(observeService()),
+      );
+
+      expect(result).toEqual({ exitCode: 0, stdout: neutral, stderr: "" });
+    });
+
+    it("allows a Claude Edit with 17 KiB strings directly and through the hook adapter", async () => {
+      useClaudeClaim();
+      await expect(fixture.service().evaluatePreTool(claudePreTool("Edit", edit(17 * KIB)))).resolves.toMatchObject({
+        decision: "ALLOW",
+        execution_boundary: "hook",
+      });
+      const raw = JSON.stringify({
+        session_id: SESSION_ID,
+        cwd: fixture.cwd,
+        hook_event_name: "PreToolUse",
+        tool_name: "Edit",
+        tool_input: edit(17 * KIB),
+        tool_use_id: "call-large-edit-hook",
+      });
+
+      await expect(runHookAdapter(["--adapter", "claude", "--event", "PreToolUse"], raw, hookPort(fixture.service())))
+        .resolves.toEqual({ exitCode: 0, stdout: neutral, stderr: "" });
+    });
+
+    it.each([
+      ["apply_patch", (body: string) => ({ command: body })],
+      ["functions.apply_patch", (body: string) => body],
+    ] as const)("keeps 17, 65 and 512 KiB Codex %s targets and their path safety", async (toolName, input) => {
+      // Patch text is file content, not a command line, so the shell self-approval
+      // scan bound (64 KiB) must not refuse a large patch.
+      for (const kib of [17, 65, 512]) {
+        const body = patch(kib * KIB);
+        expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(kib * KIB);
+
+        await expect(fixture.service().evaluatePreTool(preTool(fixture.root, toolName, input(body))))
+          .resolves.toMatchObject({ decision: "ALLOW", execution_boundary: "hook" });
+        await expect(fixture.service().evaluatePreTool(preTool(
+          fixture.root,
+          toolName,
+          input(patch(kib * KIB, ["src/file.ts", "../outside.ts"])),
+        ))).resolves.toMatchObject({ decision: "DENY", code: "GUARD_WORKTREE_MISMATCH" });
+      }
+    });
+
+    it("routes a 17 KiB native Codex apply_patch through the hook adapter", async () => {
+      const raw = JSON.stringify({
+        cwd: fixture.root,
+        hook_event_name: "PreToolUse",
+        model: "gpt-5-codex",
+        permission_mode: "default",
+        session_id: SESSION_ID,
+        tool_input: { command: patch(17 * KIB) },
+        tool_name: "apply_patch",
+        tool_use_id: "call-large-patch-hook",
+        transcript_path: null,
+        turn_id: "codex-turn-large",
+      });
+
+      await expect(runHookAdapter(["--adapter", "codex", "--event", "PreToolUse"], raw, hookPort(fixture.service())))
+        .resolves.toEqual({ exitCode: 0, stdout: neutral, stderr: "" });
+    });
+
+    it.each([
+      ["heredoc", heredoc("line\n".repeat(17 * KIB / 5)), heredoc("line")],
+      ["simple argv", `printf %s ${words(3, 6 * KIB)}`, "printf %s a b c"],
+    ] as const)("classifies a ~17 KiB %s Bash command like its short form", async (_label, large, short) => {
+      expect(Buffer.byteLength(large, "utf8")).toBeGreaterThan(16 * KIB);
+      expect(Buffer.byteLength(large, "utf8")).toBeLessThan(64 * KIB);
+
+      const shortDecision = await fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command: short }));
+      const largeDecision = await fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command: large }));
+
+      expect(shortDecision).toMatchObject({ decision: "PERMIT_REQUIRED" });
+      expect(largeDecision).toMatchObject({ decision: shortDecision.decision, summary: shortDecision.summary });
+    });
+
+    it.each([
+      ["compound", `echo ${words(3, 6 * KIB)} && git push origin HEAD`, "echo hi && git push origin HEAD"],
+      ["simple argv", `git push origin ${words(3, 6 * KIB)}`, "git push origin HEAD"],
+    ] as const)("keeps a %s git push padded past 16 KiB non-approvable in enforce mode", async (_label, large, short) => {
+      expect(Buffer.byteLength(large, "utf8")).toBeGreaterThan(16 * KIB);
+
+      const shortDecision = await fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command: short }));
+      const largeDecision = await fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command: large }));
+
+      expect(shortDecision).toMatchObject({ decision: "DENY", code: "GUARD_WRAPPER_REQUIRED" });
+      expect(largeDecision).toEqual(shortDecision);
+      expect(fixture.permitCalls).toBe(0);
+    });
+
+    it("refuses a Bash command over 64 KiB in every mode because self-approval cannot be scanned", async () => {
+      const command = heredoc("line\n".repeat(70 * KIB / 5));
+      expect(Buffer.byteLength(command, "utf8")).toBeGreaterThan(64 * KIB);
+
+      await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command })))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+      await expect(observeService("observe-over-64").evaluatePreTool(preTool(fixture.cwd, "Bash", { command })))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+      expect(fixture.permitCalls).toBe(0);
+    });
+
+    it("never lets padding past 64 KiB hide a self-approval command, even in observe mode", async () => {
+      const command = `jhw-control guard approve req-padded # ${"x".repeat(70 * KIB)}`;
+      expect(Buffer.byteLength(command, "utf8")).toBeGreaterThan(64 * KIB);
+
+      await expect(observeService("observe-padded-approval").evaluatePreTool(preTool(fixture.cwd, "Bash", { command })))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+      await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command })))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+      expect(fixture.permitCalls).toBe(0);
+    });
+
+    it("refuses a command with an argv token the self-approval scan cannot parse as a protocol mismatch", async () => {
+      const command = `python3 -c '${"pass;".repeat(9 * KIB / 5)}'`;
+
+      await expect(observeService("observe-long-token").evaluatePreTool(preTool(fixture.cwd, "Bash", { command })))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+      expect(fixture.permitCalls).toBe(0);
+    });
+
+    it("binds the same 1 MiB input to the same operation digest on every evaluation", async () => {
+      useClaudeClaim();
+      const operations: CanonicalOperation[] = [];
+      const service = fixture.service({
+        permit_decisions: {
+          decideMissingGrant: async (operation, missing) => {
+            operations.push(operation);
+            return fixture.permit!.decideMissingGrant(operation, missing);
+          },
+        },
+      });
+
+      await service.evaluatePreTool(claudePreTool("Write", write(1024 * KIB), "call-large-first"));
+      await service.evaluatePreTool(claudePreTool("Write", write(1024 * KIB), "call-large-second"));
+
+      expect(operations).toHaveLength(2);
+      expect(operations[0]?.digest).toMatch(/^[0-9a-f]{64}$/u);
+      expect(operations[1]?.digest).toBe(operations[0]?.digest);
+      expect(operations[1]?.operation_id).not.toBe(operations[0]?.operation_id);
+    });
+  });
+
   describe("integrated one-time permit lifecycle", () => {
     function missingRepositoryModify(): void {
       fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
@@ -1762,6 +1989,22 @@ describe("GuardService", () => {
       });
       return { requestId: decision.request_id, service };
     }
+
+    it("consumes the approved permit on the exact retry of a 1 MiB Edit (#247)", async () => {
+      missingRepositoryModify();
+      const input = {
+        file_path: "src/file.ts",
+        old_string: "o".repeat(1024 * 1024),
+        new_string: "n".repeat(1024 * 1024),
+      };
+      const { requestId, service } = await requestAndApprove(preTool(fixture.cwd, "Edit", input, "call-large-request"));
+
+      await expect(service.evaluatePreTool(preTool(fixture.cwd, "Edit", input, "call-large-retry")))
+        .resolves.toMatchObject({ decision: "ALLOW", execution_boundary: "hook", consumed_request_id: requestId });
+      expect(await storedRequests()).toEqual([
+        expect.objectContaining({ request_id: requestId, state: "CONSUMED", correlation_id: "call-large-retry" }),
+      ]);
+    });
 
     it("creates one exact PENDING request and reuses it without consuming quota", async () => {
       missingRepositoryModify();

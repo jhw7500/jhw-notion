@@ -244,14 +244,75 @@ describe("strict hook adapter executable core", () => {
     ]) expect(() => parseBoundedHookStdin(raw)).toThrow();
   });
 
-  it("rejects stdin above the exact 128 KiB UTF-8 boundary", async () => {
+  it("rejects stdin above the exact 8 MiB UTF-8 boundary", async () => {
     // Break caught: character-count or post-parse limiting lets oversized multibyte stdin consume memory.
     const { parseBoundedHookStdin } = await loadAdapter();
-    const exact = `{"value":"${"a".repeat(128 * 1024 - 12)}"}`;
-    expect(Buffer.byteLength(exact, "utf8")).toBe(128 * 1024);
-    expect(parseBoundedHookStdin(exact)).toEqual({ value: "a".repeat(128 * 1024 - 12) });
+    const limit = 8 * 1024 * 1024;
+    const exact = `{"value":"${"a".repeat(limit - 12)}"}`;
+    expect(Buffer.byteLength(exact, "utf8")).toBe(limit);
+    expect(parseBoundedHookStdin(exact)).toEqual({ value: "a".repeat(limit - 12) });
     expect(() => parseBoundedHookStdin(`${exact} `)).toThrow();
-    expect(() => parseBoundedHookStdin(`{"value":"${"한".repeat(44_000)}"}`)).toThrow();
+    const multibyte = `{"value":"${"한".repeat(2_900_000)}"}`;
+    expect(multibyte.length).toBeLessThan(limit);
+    expect(Buffer.byteLength(multibyte, "utf8")).toBeGreaterThan(limit);
+    expect(() => parseBoundedHookStdin(multibyte)).toThrow();
+  });
+
+  it.each([
+    ["Write 17 KiB", "Write", { file_path: "/srv/worktrees/native-17/big.txt", content: "w".repeat(17 * 1024) }],
+    ["Write 1 MiB", "Write", { file_path: "/srv/worktrees/native-17/big.txt", content: "w".repeat(1024 * 1024) }],
+    ["Edit 17 KiB", "Edit", {
+      file_path: "/srv/worktrees/native-17/big.txt",
+      old_string: "o".repeat(17 * 1024),
+      new_string: "n".repeat(17 * 1024),
+    }],
+  ] as const)("decodes a Claude %s tool input and renders the Guard decision (#247)", async (_label, toolName, toolInput) => {
+    // Break caught: a 16 KiB string / 64 KiB total / 128 KiB stdin bound hard-denies large Claude tool input.
+    const { runHookAdapter } = await loadAdapter();
+    const guard = new ObservableGuard(undefined, {
+      decision: "ALLOW",
+      operation_id: "op-018f21e0-7b2c-7a00-8000-000000000004",
+      summary: "repo.modify repository:repo-guard",
+      execution_boundary: "hook",
+    });
+    const raw = JSON.stringify({
+      ...JSON.parse(preToolPayload()) as Record<string, unknown>,
+      tool_name: toolName,
+      tool_input: toolInput,
+    });
+
+    const result = await runHookAdapter(["--adapter", "claude", "--event", "PreToolUse"], raw, guard);
+
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: `${JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse" } })}\n`,
+      stderr: "",
+    });
+    expect(guard.calls).toHaveLength(1);
+    expect(guard.calls[0]).toMatchObject({
+      method: "evaluatePreTool",
+      event: { adapter: "claude", event: "pre_tool_use", tool_name: toolName, tool_input: toolInput },
+    });
+  });
+
+  it("keeps hook stdin above 8 MiB a protocol mismatch before any Guard call", async () => {
+    const { runHookAdapter } = await loadAdapter();
+    const guard = new ObservableGuard();
+    const raw = JSON.stringify({
+      ...JSON.parse(preToolPayload()) as Record<string, unknown>,
+      tool_name: "Write",
+      tool_input: { file_path: "/srv/worktrees/native-17/big.txt", content: "w".repeat(8 * 1024 * 1024) },
+    });
+    expect(Buffer.byteLength(raw, "utf8")).toBeGreaterThan(8 * 1024 * 1024);
+
+    const result = await runHookAdapter(["--adapter", "claude", "--event", "PreToolUse"], raw, guard);
+
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: `${JSON.stringify(exactFailure("PreToolUse", "GUARD_PROTOCOL_MISMATCH"))}\n`,
+      stderr: "",
+    });
+    expect(guard.calls).toEqual([]);
   });
 
   it.each([

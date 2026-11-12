@@ -13,9 +13,14 @@ import {
   stableCanonicalJson,
   type NormalizeOperationContext,
 } from "../operation-normalizer.js";
-import { guardToolIdentityInventoryForTesting, resolveGuardTool } from "../guard-tool-resolver.js";
+import {
+  guardToolIdentityInventoryForTesting,
+  isResolvedGuardToolFor,
+  resolveGuardTool,
+} from "../guard-tool-resolver.js";
 import {
   CanonicalOperationSchema,
+  MAX_TOOL_INPUT_BYTES,
   type CanonicalOperation,
   type JsonValue,
   type PreToolUseEvent,
@@ -354,6 +359,44 @@ describe("operation normalization", () => {
     expect(first.digest).toBe(second.digest);
   });
 
+  it("resolves and fingerprints tool input above the 16 KiB default string bound (#247)", () => {
+    // Break caught: the raw-input fingerprint used the generic bound, so large input threw GUARD_UNAVAILABLE.
+    const input = { file_path: "src/file.ts", content: "x".repeat(17 * 1024) };
+    const resolved = resolveGuardTool("codex", "Write", input);
+
+    expect(resolved.mutation_targets).toEqual(["src/file.ts"]);
+    expect(isResolvedGuardToolFor(resolved, "codex", "Write", input)).toBe(true);
+    expect(isResolvedGuardToolFor(resolved, "codex", "Write", { ...input, content: `${input.content}y` })).toBe(false);
+  });
+
+  it("digests a maximal tool input at the exact 8 MiB canonical limit the same way twice (#247)", async () => {
+    const envelope = Buffer.byteLength(JSON.stringify({ content: "", file_path: "src/file.ts" }), "utf8");
+    const input = { file_path: "src/file.ts", content: "x".repeat(MAX_TOOL_INPUT_BYTES - envelope) };
+    expect(Buffer.byteLength(JSON.stringify({ content: input.content, file_path: input.file_path }), "utf8"))
+      .toBe(MAX_TOOL_INPUT_BYTES);
+
+    const first = await normalizeOperation(event({ tool_name: "Write", tool_input: input, tool_use_id: "call-max" }), context, KEY);
+    const second = await normalizeOperation(event({ tool_name: "Write", tool_input: input, tool_use_id: "call-max-retry" }), context, KEY);
+
+    expect(first).toMatchObject({ tool: "file.modify", requirements: [{ capability: "repo.modify", resource: context.repository }] });
+    expect(second.digest).toBe(first.digest);
+  });
+
+  it("digests a Bash command under 64 KiB whose raw command and argv exceed the old 128 KiB material bound (#247)", async () => {
+    // Break caught: shell digest material carries the command twice, so a 64 KiB command overflowed 128 KiB.
+    const tokens = Array.from({ length: 255 }, (_, index) => `${index}`.padEnd(255, "a"));
+    const command = `printf ${tokens.join(" ")}`;
+    expect(Buffer.byteLength(command, "utf8")).toBeLessThanOrEqual(64 * 1024);
+    expect(Buffer.byteLength(JSON.stringify({ argv: ["printf", ...tokens], raw_command: command }), "utf8"))
+      .toBeGreaterThan(128 * 1024);
+
+    const first = await normalizeOperation(event({ tool_input: { command }, tool_use_id: "call-wide" }), context, KEY);
+    const second = await normalizeOperation(event({ tool_input: { command }, tool_use_id: "call-wide-retry" }), context, KEY);
+
+    expect(first).toMatchObject({ tool: "shell", requirements: [{ capability: "shell.unclassified", resource: context.repository }] });
+    expect(second.digest).toBe(first.digest);
+  });
+
   it("changes the digest for adapter, Task, Claim, session, worktree, cwd, argument, and key changes", async () => {
     const base = await normalizeOperation(event(), context, KEY);
     const cases: Array<Promise<{ digest: string }>> = [
@@ -590,6 +633,11 @@ describe("stable canonical JSON", () => {
     expect(stableCanonicalJson({ z: 1, a: { y: 2, x: 3 }, argv: ["second", "first"] })).toBe(
       '{"a":{"x":3,"y":2},"argv":["second","first"],"z":1}',
     );
+  });
+
+  it("bounds digest material strings at the 8 MiB tool-input limit", () => {
+    expect(() => stableCanonicalJson({ value: "x".repeat(MAX_TOOL_INPUT_BYTES) })).not.toThrow();
+    expect(() => stableCanonicalJson({ value: "x".repeat(MAX_TOOL_INPUT_BYTES + 1) })).toThrow();
   });
 
   it("rejects cycles, unsupported values, non-finite numbers, sparse arrays, and custom prototypes", () => {

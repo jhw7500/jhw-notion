@@ -9,6 +9,7 @@ import {
   ClaimIdSchema,
   GuardSessionSchema,
   GuardWorktreeRefSchema,
+  MAX_TOOL_INPUT_BYTES,
   OperationRequirementSchema,
   PreToolUseEventSchema,
   encodeCanonicalJson,
@@ -35,7 +36,9 @@ import { ResourceRefSchema, TaskIdSchema } from "./work-contract.js";
 
 const PRIVATE_PATH_BYTES = 4_096;
 const DIGEST_KEY_BYTES = 32;
-const MAX_DIGEST_MATERIAL_BYTES = 128 * 1024;
+// Shell material carries the command twice (raw_command and argv), so a
+// maximal tool input needs twice its bound plus the fixed envelope (#247).
+const MAX_DIGEST_MATERIAL_BYTES = 2 * MAX_TOOL_INPUT_BYTES + 64 * 1024;
 
 const privateAbsolutePath = z.string().min(1).max(PRIVATE_PATH_BYTES)
   .refine((value) => Buffer.byteLength(value, "utf8") <= PRIVATE_PATH_BYTES)
@@ -135,7 +138,7 @@ function assertDigestKey(digestKey: Uint8Array): void {
 export function stableCanonicalJson(value: unknown): string {
   return encodeCanonicalJson(value, {
     maximumBytes: MAX_DIGEST_MATERIAL_BYTES,
-    maximumStringBytes: 64 * 1024,
+    maximumStringBytes: MAX_TOOL_INPUT_BYTES,
     maximumNodes: 4_096,
     maximumArrayLength: 2_048,
     maximumObjectKeys: 512,
