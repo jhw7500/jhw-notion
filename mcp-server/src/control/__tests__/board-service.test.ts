@@ -31,6 +31,7 @@ type ProbeTable = Record<number, PidInspection>;
 
 interface Fixture {
   service: BoardService;
+  restart: () => BoardService;
   events: BoardJournalEvent[];
   probeTable: ProbeTable;
   setBootId: (value: string | undefined) => void;
@@ -58,21 +59,49 @@ function makeFixture(): Fixture {
     currentBootId: async () => bootId,
     inspect: async (pid) => probeTable[pid] ?? { state: "unknown" },
   };
-  const service = new BoardService(
-    configFor(stateDir),
-    { run: async (callback) => callback() },
-    probe,
-    () => new Date(nowMs),
-    { append: async (event) => { events.push(event); } },
-  );
+  const restart = () => new BoardService(
+      configFor(stateDir),
+      { run: async (callback) => callback() },
+      probe,
+      () => new Date(nowMs),
+      { append: async (event) => { events.push(event); } },
+    );
+  const service = restart();
   return {
     service,
+    restart,
     events,
     probeTable,
     setBootId: (value) => { bootId = value; },
     setNow: (minutes) => { nowMs = BASE + minutes * 60_000; },
     stateDir,
   };
+}
+
+const TRANSACTION_ID = "0189a7f0-1234-7abc-8def-0123456789ab";
+const MANIFEST_SHA256 = "a".repeat(64);
+const GENERATION = "0189a7f0-1234-7abc-8def-0123456789ac";
+const RECOVERY_TOKEN = "A".repeat(43);
+const TRACKED = { pid: 4242, pid_start_time: "100", boot_id: "boot-1" };
+
+const recoveryProof = () => ({
+  board_id: "pim",
+  transaction_id: TRANSACTION_ID,
+  manifest_sha256: MANIFEST_SHA256,
+  generation: GENERATION,
+  token: RECOVERY_TOKEN,
+});
+
+async function trackedExclusive(fixture: Fixture, session = "sess-a") {
+  fixture.probeTable[TRACKED.pid] = { state: "alive", startTime: TRACKED.pid_start_time };
+  return fixture.service.acquire({
+    board_id: "pim",
+    mode: "exclusive",
+    session,
+    purpose: "deployment",
+    for_minutes: 60,
+    liveness: TRACKED,
+  });
 }
 
 async function registered(fixture: Fixture, boardId = "wlan-01"): Promise<void> {
@@ -547,7 +576,9 @@ describe("state durability", () => {
     await expect(fixture.service.recoverResetState({ session: "sess-a" }))
       .rejects.toMatchObject({ code: "INVALID_BOARD_INPUT" });
 
-    await writeFile(join(fixture.stateDir, "boards.yaml"), "{ not json", "utf8");
+    await writeFile(join(fixture.stateDir, "boards.yaml"), JSON.stringify({
+      version: 1, boards: {}, unexpected: true,
+    }), "utf8");
     await expect(fixture.service.list()).rejects.toMatchObject({ code: "BOARD_STATE_CORRUPT" });
     const reset = await fixture.service.recoverResetState({ session: "sess-a" });
     expect(reset.reset).toBe(true);
@@ -555,10 +586,217 @@ describe("state durability", () => {
     expect(fixture.events.some((event) => event.event === "state_reset")).toBe(true);
   });
 
+  it("denies reset when malformed JSON cannot prove recovery-guard absence", async () => {
+    const fixture = makeFixture();
+    await registered(fixture);
+    await writeFile(join(fixture.stateDir, "boards.yaml"), "{ not json", "utf8");
+
+    await expect(fixture.service.recoverResetState({ session: "sess-a" }))
+      .rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED", details: { reason: "recovery_guard_state_unproven" } });
+  });
+
   it("persists JSON-subset YAML the schema can round-trip", async () => {
     const fixture = makeFixture();
     await registered(fixture);
     const raw = JSON.parse(await readFile(join(fixture.stateDir, "boards.yaml"), "utf8")) as { version: number };
     expect(raw.version).toBe(1);
+  });
+});
+
+describe("deployment recovery guard", () => {
+  it("requires a live tracked exclusive holder and persists independently across restart and release", async () => {
+    const fixture = makeFixture();
+    await registered(fixture, "pim");
+    const holder = await trackedExclusive(fixture);
+
+    const armed = await fixture.service.armRecoveryGuard({
+      board_id: "pim",
+      holder_id: holder.holder.holder_id,
+      session: "sess-a",
+      transaction_id: TRANSACTION_ID,
+      manifest_sha256: MANIFEST_SHA256,
+      recovery_proof: recoveryProof(),
+    });
+    expect(armed.guard).toMatchObject({
+      transaction_id: TRANSACTION_ID,
+      manifest_sha256: MANIFEST_SHA256,
+      holder_id: holder.holder.holder_id,
+      holder_session: "sess-a",
+    });
+    const rawState = await readFile(join(fixture.stateDir, "boards.yaml"), "utf8");
+    expect(rawState).not.toContain(RECOVERY_TOKEN);
+    expect(rawState).toContain("token_sha256");
+
+    await fixture.service.release({ board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a" });
+    const restarted = fixture.restart();
+    expect(await restarted.inspectRecoveryGuard("pim")).toEqual(armed.guard);
+    expect(JSON.stringify(await restarted.status("pim"))).not.toContain("token_sha256");
+    await expect(restarted.acquire({
+      board_id: "pim", mode: "exclusive", session: "sess-b", purpose: "normal", for_minutes: 30,
+    })).rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED", details: { reason: "recovery_guard_active" } });
+  });
+
+  it("preserves the guard when expiry and process death reap its original holder", async () => {
+    const fixture = makeFixture();
+    await registered(fixture, "pim");
+    const holder = await trackedExclusive(fixture);
+    const armed = await fixture.service.armRecoveryGuard({
+      board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a",
+      transaction_id: TRANSACTION_ID, manifest_sha256: MANIFEST_SHA256,
+      recovery_proof: recoveryProof(),
+    });
+
+    fixture.setNow(90);
+    fixture.probeTable[TRACKED.pid] = { state: "dead" };
+    const recovery = await fixture.service.acquire({
+      board_id: "pim", mode: "exclusive", session: "sess-recovery", purpose: "recover", for_minutes: 30,
+      recovery_proof: recoveryProof(),
+    });
+    expect(recovery.holder.session).toBe("sess-recovery");
+    expect(await fixture.service.inspectRecoveryGuard("pim")).toEqual(armed.guard);
+  });
+
+  it("blocks normal wait without retrying and blocks identity-bypass mutations", async () => {
+    const fixture = makeFixture();
+    await registered(fixture, "pim");
+    const holder = await trackedExclusive(fixture);
+    await fixture.service.armRecoveryGuard({
+      board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a",
+      transaction_id: TRANSACTION_ID, manifest_sha256: MANIFEST_SHA256,
+      recovery_proof: recoveryProof(),
+    });
+    await expect(fixture.service.share({
+      board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a",
+    })).rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED" });
+    await expect(fixture.service.adoptHolder({
+      board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a", liveness: TRACKED,
+    })).rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED" });
+    await fixture.service.release({ board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a" });
+
+    let sleeps = 0;
+    await expect(fixture.service.wait(
+      { board_id: "pim", mode: "exclusive", session: "sess-b", purpose: "normal", for_minutes: 30 },
+      { poll_ms: 1, timeout_ms: 10 },
+      async () => { sleeps += 1; },
+    )).rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED" });
+    expect(sleeps).toBe(0);
+    await expect(fixture.service.update({ board_id: "pim", description: "renamed", session: "sess-b" }))
+      .rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED" });
+    await expect(fixture.service.unregister({ board_id: "pim", session: "sess-b" }))
+      .rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED" });
+  });
+
+  it("rejects invalid recovery proof and preserves ordinary exclusive collisions", async () => {
+    const fixture = makeFixture();
+    await registered(fixture, "pim");
+    const holder = await trackedExclusive(fixture);
+    const armed = await fixture.service.armRecoveryGuard({
+      board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a",
+      transaction_id: TRANSACTION_ID, manifest_sha256: MANIFEST_SHA256,
+      recovery_proof: recoveryProof(),
+    });
+
+    await expect(fixture.service.acquire({
+      board_id: "pim", mode: "exclusive", session: "sess-recovery", purpose: "recover", for_minutes: 30,
+      recovery_proof: { ...recoveryProof(), token: "x".repeat(43) },
+    })).rejects.toMatchObject({ code: "RECOVERY_PROOF_MISMATCH", details: { reason: "recovery_proof_mismatch" } });
+    await expect(fixture.service.acquire({
+      board_id: "pim", mode: "exclusive", session: "sess-recovery", purpose: "recover", for_minutes: 30,
+      recovery_proof: recoveryProof(),
+    })).rejects.toMatchObject({ code: "BOARD_BUSY", details: { reason: "exclusive_holder" } });
+  });
+
+  it("clears only with matching proof and the matching live exclusive recovery holder", async () => {
+    const fixture = makeFixture();
+    await registered(fixture, "pim");
+    const original = await trackedExclusive(fixture);
+    const armed = await fixture.service.armRecoveryGuard({
+      board_id: "pim", holder_id: original.holder.holder_id, session: "sess-a",
+      transaction_id: TRANSACTION_ID, manifest_sha256: MANIFEST_SHA256,
+      recovery_proof: recoveryProof(),
+    });
+    await fixture.service.release({ board_id: "pim", holder_id: original.holder.holder_id, session: "sess-a" });
+
+    fixture.probeTable[777] = { state: "alive", startTime: "7" };
+    const recovery = await fixture.service.acquire({
+      board_id: "pim", mode: "exclusive", session: "sess-recovery", purpose: "recover", for_minutes: 30,
+      liveness: { pid: 777, pid_start_time: "7", boot_id: "boot-1" },
+      recovery_proof: recoveryProof(),
+    });
+    await expect(fixture.service.clearRecoveryGuard({
+      board_id: "pim", holder_id: recovery.holder.holder_id, session: "other",
+      recovery_proof: recoveryProof(),
+    })).rejects.toMatchObject({ code: "HOLDER_MISMATCH" });
+    await expect(fixture.service.clearRecoveryGuard({
+      board_id: "pim", holder_id: "hld-0189a7f0-1234-7abc-8def-0123456789ad", session: "sess-recovery",
+      recovery_proof: recoveryProof(),
+    })).rejects.toMatchObject({ code: "HOLDER_NOT_FOUND" });
+    await expect(fixture.service.clearRecoveryGuard({
+      board_id: "pim", holder_id: recovery.holder.holder_id, session: "sess-recovery",
+      recovery_proof: { ...recoveryProof(), generation: "0189a7f0-1234-7abc-8def-0123456789ad" },
+    })).rejects.toMatchObject({ code: "RECOVERY_PROOF_MISMATCH" });
+
+    await expect(fixture.service.clearRecoveryGuard({
+      board_id: "pim", holder_id: recovery.holder.holder_id, session: "sess-recovery",
+      recovery_proof: recoveryProof(),
+    })).resolves.toEqual({ board_id: "pim", transaction_id: TRANSACTION_ID, cleared: true });
+    expect(await fixture.service.inspectRecoveryGuard("pim")).toBeNull();
+  });
+
+  it("refuses arming from shared, untracked, or another session's holder", async () => {
+    const fixture = makeFixture();
+    await registered(fixture, "pim");
+    const shared = await fixture.service.acquire({
+      board_id: "pim", mode: "shared", session: "sess-a", purpose: "observe", for_minutes: 30,
+    });
+    const arm = (session = "sess-a") => fixture.service.armRecoveryGuard({
+      board_id: "pim", holder_id: shared.holder.holder_id, session,
+      transaction_id: TRANSACTION_ID, manifest_sha256: MANIFEST_SHA256,
+      recovery_proof: recoveryProof(),
+    });
+    await expect(arm()).rejects.toMatchObject({ code: "HOLDER_MISMATCH", details: { reason: "recovery_holder_not_exclusive" } });
+    await fixture.service.share({
+      board_id: "pim", holder_id: shared.holder.holder_id, exclusive: true, session: "sess-a",
+    });
+    await expect(arm()).rejects.toMatchObject({ code: "HOLDER_MISMATCH", details: { reason: "recovery_holder_untracked" } });
+    await expect(arm("sess-b")).rejects.toMatchObject({ code: "HOLDER_MISMATCH" });
+  });
+
+  it("never resets a corrupt state that still contains a recovery guard marker", async () => {
+    const fixture = makeFixture();
+    await registered(fixture, "pim");
+    const holder = await trackedExclusive(fixture);
+    await fixture.service.armRecoveryGuard({
+      board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a",
+      transaction_id: TRANSACTION_ID, manifest_sha256: MANIFEST_SHA256,
+      recovery_proof: recoveryProof(),
+    });
+    const stateFile = join(fixture.stateDir, "boards.yaml");
+    const state = JSON.parse(await readFile(stateFile, "utf8")) as {
+      boards: { pim: { recovery_guard: Record<string, unknown> } };
+    };
+    state.boards.pim.recovery_guard.unknown_old_runtime_field = true;
+    await writeFile(stateFile, JSON.stringify(state), "utf8");
+
+    await expect(fixture.service.recoverResetState({ session: "sess-a" }))
+      .rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED", details: { reason: "recovery_guard_active" } });
+  });
+
+  it("never resets a truncated armed state whose guard can no longer be parsed", async () => {
+    const fixture = makeFixture();
+    await registered(fixture, "pim");
+    const holder = await trackedExclusive(fixture);
+    await fixture.service.armRecoveryGuard({
+      board_id: "pim", holder_id: holder.holder.holder_id, session: "sess-a",
+      transaction_id: TRANSACTION_ID, manifest_sha256: MANIFEST_SHA256,
+      recovery_proof: recoveryProof(),
+    });
+    const stateFile = join(fixture.stateDir, "boards.yaml");
+    const armedState = await readFile(stateFile, "utf8");
+    await writeFile(stateFile, armedState.slice(0, -2), "utf8");
+
+    await expect(fixture.service.recoverResetState({ session: "sess-a" }))
+      .rejects.toMatchObject({ code: "BOARD_RECOVERY_REQUIRED", details: { reason: "recovery_guard_state_unproven" } });
+    await expect(fixture.service.list()).rejects.toMatchObject({ code: "BOARD_STATE_CORRUPT" });
   });
 });

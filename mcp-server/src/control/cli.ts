@@ -16,7 +16,7 @@ import {
 } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, parse, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Writable } from "node:stream";
 import { TextDecoder } from "node:util";
 import { Client } from "@notionhq/client";
@@ -81,6 +81,7 @@ import {
   AuthorityRecordSchema,
   ActiveClaimSchema,
   BoardConflictSummarySchema,
+  BoardRecoveryProofSchema,
   BoundedPortfolioPayloadSchema,
   COMMAND_FAILURE_STDERR_HEAD_BYTES,
   CommandFailureDetailSchema,
@@ -99,6 +100,7 @@ import {
   type ActiveClaim,
   type BoardConflictSummary,
   type BoardMode,
+  type BoardRecoveryProof,
   type BoundedPortfolioPayload,
   type CommandFailureDetail,
   type ConflictingClaimSummary,
@@ -290,11 +292,17 @@ const commandNames = [
   "board unreserve",
   "board wait",
   "board recover",
+  "board recovery-arm",
+  "board recovery-inspect",
+  "board recovery-clear",
 ] as const;
 
 const BOARD_ID = /^[a-z0-9][a-z0-9-]{1,62}$/;
 const HOLDER_ID = /^hld-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RESERVATION_ID = /^rsv-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const RECOVERY_TRANSACTION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const RECOVERY_PROOF_MAX_BYTES = 2 * 1024;
 const osSignals: Partial<Record<string, number>> = osConstants.signals;
 
 type CommandName = (typeof commandNames)[number] | "help" | "invalid";
@@ -392,7 +400,8 @@ export interface CliDependencies {
   boardService: Pick<
     BoardService,
     "register" | "update" | "unregister" | "list" | "status" | "acquire" | "wait" |
-    "release" | "extend" | "share" | "reserve" | "unreserve" | "adoptHolder" | "recoverResetState"
+    "release" | "extend" | "share" | "reserve" | "unreserve" | "adoptHolder" | "recoverResetState" |
+    "armRecoveryGuard" | "inspectRecoveryGuard" | "clearRecoveryGuard"
   >;
   boardJournal: BoardJournalPort;
   livenessProbe: LivenessProbe;
@@ -626,17 +635,17 @@ function values(flags: ParsedFlags, flag: string): string[] {
   return result === undefined ? [] : Array.isArray(result) ? result : [result];
 }
 
-/** Rejects content flags while treating the checkout path only as a protected term. */
+/** Operational path arguments: protected terms for the other flags, never content themselves. */
+const OPERATIONAL_PATH_FLAGS = ["--repo-path", "--cleanup-proof", "--proof-file", "--recovery-proof-file"];
+
+/** Rejects content flags while treating operational paths only as protected terms. */
 function assertSafeFlags(flags: ParsedFlags, dependencies: CliDependencies): void {
-  const checkout = value(flags, "--repo-path");
-  const proof = value(flags, "--cleanup-proof");
-  const policy = createSensitiveDataPolicy(dependencies.env, [
-    dependencies.stateDir,
-    ...(checkout && isAbsolute(checkout) ? [checkout] : []),
-    ...(proof && isAbsolute(proof) ? [proof] : []),
-  ]);
+  const paths = OPERATIONAL_PATH_FLAGS
+    .map((name) => value(flags, name))
+    .filter((path): path is string => typeof path === "string" && isAbsolute(path));
+  const policy = createSensitiveDataPolicy(dependencies.env, [dependencies.stateDir, ...paths]);
   policy.assertSafe(Object.fromEntries([...flags].filter(([name]) =>
-    name !== "--repo-path" && name !== "--cleanup-proof")));
+    !OPERATIONAL_PATH_FLAGS.includes(name))));
 }
 
 function required(flags: ParsedFlags, flag: string): string {
@@ -2442,6 +2451,7 @@ function exitCode(cause: unknown, command?: CommandName): CliResult["exitCode"] 
     // tell "the board is busy" apart from a crash.
     "BOARD_NOT_FOUND", "BOARD_ALREADY_REGISTERED", "BOARD_NOT_EMPTY", "BOARD_BUSY", "BOARD_RESERVED",
     "RESERVATION_CONFLICT", "HOLDER_NOT_FOUND", "RESERVATION_NOT_FOUND", "HOLDER_AMBIGUOUS", "HOLDER_MISMATCH",
+    "BOARD_RECOVERY_REQUIRED", "RECOVERY_PROOF_MISMATCH",
     // A full board or reservation table is a transient occupancy refusal with
     // a reason axis, not a crash.
     "BOARD_LIMIT_EXCEEDED",
@@ -2709,6 +2719,62 @@ function boardMode(flags: ParsedFlags): BoardMode {
   return raw;
 }
 
+function assertRecoveryProofFileStat(info: BigIntStats): void {
+  const currentUid = typeof process.getuid === "function" ? BigInt(process.getuid()) : info.uid;
+  if (!info.isFile() || info.nlink !== 1n || info.uid !== currentUid || (info.mode & 0o777n) !== 0o600n) {
+    throw new ControlError("UNSAFE_STATE_PATH", "Recovery proof must be a private owner-only single-link regular file");
+  }
+}
+
+async function writeRecoveryProof(path: string, proof: BoardRecoveryProof): Promise<void> {
+  if (!isAbsolute(path)) usage("Recovery proof path must be absolute");
+  const file = await open(
+    path,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    assertRecoveryProofFileStat(await file.stat({ bigint: true }));
+    await file.writeFile(`${JSON.stringify(proof)}\n`, "utf8");
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  const parent = await open(dirname(path), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+  try {
+    await parent.sync();
+  } finally {
+    await parent.close();
+  }
+}
+
+async function readRecoveryProof(path: string, boardId: string): Promise<BoardRecoveryProof> {
+  if (!isAbsolute(path)) usage("Recovery proof path must be absolute");
+  const file = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const info = await file.stat({ bigint: true });
+    assertRecoveryProofFileStat(info);
+    if (info.size > BigInt(RECOVERY_PROOF_MAX_BYTES)) throw invalidRecoveryProof();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((await file.readFile()).toString("utf8"));
+    } catch {
+      throw invalidRecoveryProof();
+    }
+    const parsed = BoardRecoveryProofSchema.safeParse(raw);
+    if (!parsed.success || parsed.data.board_id !== boardId) throw invalidRecoveryProof();
+    return parsed.data;
+  } finally {
+    await file.close();
+  }
+}
+
+function invalidRecoveryProof(): ControlError {
+  return new ControlError("RECOVERY_PROOF_MISMATCH", "Recovery proof file is invalid", {
+    reason: "recovery_proof_mismatch",
+  });
+}
+
 async function boardWindowAndLiveness(
   flags: ParsedFlags,
   dependencies: CliDependencies,
@@ -2769,6 +2835,55 @@ async function executeBoard(
 
   const boardId = requireBoardPositional(argv);
   const rest = argv.slice(3);
+
+  if (command === "board recovery-inspect") {
+    const flags = parseFlags(rest, new Set());
+    assertSafeFlags(flags, dependencies);
+    return { flags, result: resultJson(command, await board.inspectRecoveryGuard(boardId)) };
+  }
+
+  if (command === "board recovery-arm") {
+    const flags = parseFlags(rest, new Set([
+      "--holder", "--session", "--transaction", "--manifest-sha256", "--proof-file",
+    ]));
+    assertSafeFlags(flags, dependencies);
+    const holderId = assertPattern(required(flags, "--holder"), HOLDER_ID);
+    const session = required(flags, "--session");
+    const transactionId = assertPattern(required(flags, "--transaction"), RECOVERY_TRANSACTION_ID);
+    const manifestSha256 = assertPattern(required(flags, "--manifest-sha256"), SHA256_HEX);
+    const proof: BoardRecoveryProof = {
+      board_id: boardId,
+      transaction_id: transactionId,
+      manifest_sha256: manifestSha256,
+      generation: randomUUID(),
+      token: randomBytes(32).toString("base64url"),
+    };
+    await writeRecoveryProof(required(flags, "--proof-file"), proof);
+    const armed = await board.armRecoveryGuard({
+      board_id: boardId,
+      holder_id: holderId,
+      session,
+      transaction_id: transactionId,
+      manifest_sha256: manifestSha256,
+      recovery_proof: proof,
+    });
+    return { flags, result: resultJson(command, armed) };
+  }
+
+  if (command === "board recovery-clear") {
+    const flags = parseFlags(rest, new Set(["--holder", "--session", "--recovery-proof-file"]));
+    assertSafeFlags(flags, dependencies);
+    const recoveryProof = await readRecoveryProof(required(flags, "--recovery-proof-file"), boardId);
+    return {
+      flags,
+      result: resultJson(command, await board.clearRecoveryGuard({
+        board_id: boardId,
+        holder_id: assertPattern(required(flags, "--holder"), HOLDER_ID),
+        session: required(flags, "--session"),
+        recovery_proof: recoveryProof,
+      })),
+    };
+  }
 
   if (command === "board register" || command === "board update") {
     const flags = parseFlags(rest, new Set(["--description", "--interface", "--session"]), new Set(["--interface"]));
@@ -3816,6 +3931,7 @@ export async function runBoardWith(argv: string[], dependencies: CliDependencies
   const flags = parseFlags(head.slice(3), new Set([
     "--mode", "--for", "--until", "--session", "--purpose",
     "--consume", "--long-lease", "--cross-session", "--use-holder", "--json-fd",
+    "--recovery-proof-file",
   ]));
   assertSafeFlags(flags, dependencies);
   const session = required(flags, "--session");
@@ -3830,6 +3946,10 @@ export async function runBoardWith(argv: string[], dependencies: CliDependencies
   }
   const rawJsonFd = value(flags, "--json-fd");
   if (rawJsonFd !== undefined && !/^[1-9]\d{0,2}$/.test(rawJsonFd)) usage("Invalid json fd");
+  const recoveryProofFile = value(flags, "--recovery-proof-file");
+  const recoveryProof = recoveryProofFile === undefined
+    ? undefined
+    : await readRecoveryProof(recoveryProofFile, boardId);
   const trio = await captureLivenessTrio(dependencies.livenessProbe, process.pid);
 
   let holderId: string;
@@ -3841,6 +3961,7 @@ export async function runBoardWith(argv: string[], dependencies: CliDependencies
       session,
       liveness: trio,
       ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+      ...(recoveryProof ? { recovery_proof: recoveryProof } : {}),
     });
     holderId = adopted.holder_id;
     coordinates = adopted;
@@ -3865,6 +3986,7 @@ export async function runBoardWith(argv: string[], dependencies: CliDependencies
       ...(consume !== undefined ? { consume } : {}),
       ...(boardBoolean(flags, "--long-lease") ? { long_lease: true } : {}),
       ...(boardBoolean(flags, "--cross-session") ? { cross_session: true } : {}),
+      ...(recoveryProof ? { recovery_proof: recoveryProof } : {}),
     });
     holderId = acquired.holder.holder_id;
     coordinates = acquired;

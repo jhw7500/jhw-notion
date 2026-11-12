@@ -1,6 +1,6 @@
 ---
 description: Use when the user explicitly requests target-board occupancy, sharing, reservation, waiting, release, or board registry maintenance
-argument-hint: "(register | update | unregister | list | status | acquire | release | extend | share | reserve | unreserve | wait | with | recover) <board-id>"
+argument-hint: "(register | update | unregister | list | status | acquire | release | extend | share | reserve | unreserve | wait | with | recover | recovery-arm | recovery-inspect | recovery-clear) <board-id>"
 ---
 
 # /jhw:board — 타겟보드 점유·공유·예약
@@ -150,6 +150,79 @@ jhw-control board recover --action reset-state --confirm reset-state --session <
 `BOARD_STATE_CORRUPT`일 때만 사용한다. 손상 파일을 타임스탬프 접미로 보존 이동한 뒤
 빈 상태를 만든다. 파일 부재는 손상이 아니라 빈 상태다. 정상 상태에서 실행하면
 `INVALID_BOARD_INPUT`으로 거부된다.
+
+손상 파일에 배포 복구 guard가 남아 있으면(`recovery_guard_active`), 또는 파일을 해석할 수
+없어 guard가 없다는 것을 증명하지 못하면(`recovery_guard_state_unproven`) `reset-state`는
+아무것도 바꾸지 않고 `BOARD_RECOVERY_REQUIRED`로 멈춘다. 이때는 status·recovery-inspect·
+recovery `with`·recovery-clear도 같은 손상 파일을 읽지 못하므로, 도구로 풀 수 있는 경로가
+없다. 운영자가 다음 순서로 직접 복구한다.
+
+1. 이 host에서 board 명령을 쓰는 세션과 배포를 모두 멈춘다.
+2. guard가 걸렸을 수 있는 board를 정한다. 손상 파일에서 `recovery_guard`가 있는 board를
+   읽을 수 있으면 그 board들이다. 읽을 수 없으면 이 host에 등록했던 board 전부에서,
+   `recovery-arm`을 쓰는 고정 패키지 배포를 한 번도 하지 않았다고 확인한 board만 뺀다.
+   그런 board에는 guard가 걸릴 수 없다. 확인할 수 없는 board는 대상으로 둔다. 대상이
+   없으면 3단계를 건너뛴다.
+3. 대상 board마다 host-side 고정 verifier로 패키지 상태를 확인한다. 반쯤 바뀐 board는
+   복원한 뒤 다시 확인한다. verifier로 확인할 수 없는 대상이 남으면 4단계로 가지 않는다.
+4. 모든 대상이 확인된 뒤에만 board state 파일(`boards.yaml`)을 직접 타임스탬프 접미로 옮겨
+   보존하고, board를 다시 등록한다. 파일을 지우지 않는다.
+
+## 배포 복구 guard
+
+```bash
+jhw-control board recovery-arm <board-id> --holder <hld-id> --session <session-id> \
+  --transaction <uuid> --manifest-sha256 <sha256> --proof-file <absolute-private-path>
+jhw-control board recovery-inspect <board-id>
+jhw-control board recovery-clear <board-id> --holder <hld-id> --session <session-id> \
+  --recovery-proof-file <absolute-private-path>
+"$HOME/.local/bin/jhw-control-host" board with <board-id> --mode exclusive \
+  (--for <d> | --until <t>) --session <session-id> --purpose <text> \
+  --recovery-proof-file <absolute-private-path> -- <recovery-command...>
+```
+
+고정 패키지 배포의 첫 원격 쓰기 전에 live pid가 정확히 검증된 exclusive holder로
+guard를 arm한다. proof file은 새 0600 owner-only regular file로 먼저 fsync되고 raw
+token은 status·stdout·journal에 나오지 않는다. proof는 guard를 정상 경로로 풀 유일한
+수단이므로 재부팅·로그아웃 뒤에도 남는 owner-only(0700) 디렉터리에 둔다. control state
+디렉터리 아래 private 하위 디렉터리도 쓸 수 있다. `/tmp`나 `$XDG_RUNTIME_DIR` 같은
+tmpfs에는 두지 않는다. guard는 원래 holder의 release·만료·
+pid 사망과 독립적으로 남는다. 이 상태에서는 일반 acquire/wait/with/share/adopt,
+board identity update, unregister가 `BOARD_RECOVERY_REQUIRED` +
+`recovery_guard_active`로 멈춘다. matching proof를 제공한 exclusive recovery `with`만
+기존 holder·예약 충돌 규칙을 그대로 통과해야 진입한다.
+
+`recovery-clear`는 proof의 board/transaction/manifest/generation/token과 현재 live
+exclusive holder/session을 모두 다시 확인한다. host-side 고정 verifier가 복원 파일과
+패키지 상태를 독립적으로 검증한 뒤에만 호출하며, 자식 프로그램의 verdict JSON이나
+boolean은 clear 권위가 아니다. `recovery_proof_mismatch`,
+`recovery_requires_exclusive`, `recovery_holder_session_mismatch`,
+`recovery_holder_not_exclusive`, `recovery_holder_untracked`,
+`recovery_holder_not_live` 중 하나면 guard를 보존한 채 멈춘다. guard가 있는 정상 state는
+`reset-state`나 unregister로 지우지 않는다. 손상 state를 파싱해 모든 board entry에서
+guard 부재를 증명할 수 없으면 `recovery_guard_state_unproven`으로 reset을 거부한다.
+
+proof를 잃으면 그 guard는 도구로 풀 수 없다. clear가 proof의 token을 요구하기 때문이다.
+이때 운영자가 다음 순서로 직접 푼다.
+
+1. 이 host에서 board 명령을 쓰는 세션과 배포를 모두 멈춘다.
+2. 그 board를 host-side 고정 verifier로 확인한다. 반쯤 바뀌었으면 복원한 뒤 다시 확인한다.
+3. board state 파일(`boards.yaml`)을 타임스탬프 접미 사본으로 먼저 보존한다.
+4. 같은 디렉터리의 임시 파일에 그 board의 `recovery_guard` 필드만 뺀 내용을 쓰고, rename으로
+   원본을 바꾼다. 다른 board의 등록·holder·예약은 그대로 두고, 파일은 owner-only 0600의
+   단일 링크 일반 파일로 둔다.
+5. `jhw-control board list`로 그 board의 `recovery_guard_armed`가 `false`인지 확인한다.
+
+guard 필드를 모르는 이전 runtime은 guard가 있는 state를 strict schema 오류
+(`BOARD_STATE_CORRUPT`)로 읽어 일반 명령을 멈춘다. 그러나 그 runtime의 `reset-state`는
+guard를 알지 못하므로 guard와 모든 board 등록을 함께 지운다. 이 상태로 rollback하면 guard가
+막아야 할 일반 진입이 다시 열린다. 그래서 다음을 지킨다.
+
+- rollback release를 활성화하기 전에 `jhw-control board list`를 실행해 모든 board의
+  `recovery_guard_armed`가 `false`인지 확인한다. 하나라도 `true`면 rollback하지 않고,
+  guard를 아는 release에서 복구와 `recovery-clear`를 먼저 끝낸다.
+- 이전 runtime에서 `BOARD_STATE_CORRUPT`를 만나면 `reset-state`를 실행하지 않는다.
+  guard를 아는 release로 되돌아가 위 손상 복구 절차를 따른다.
 
 ## 결과 해석
 

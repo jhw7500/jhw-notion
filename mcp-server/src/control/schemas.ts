@@ -350,6 +350,14 @@ export const ERROR_REASONS = [
   // did not.
   "cross_session_flag_required",
   "live_pid_recorded",
+  "recovery_guard_active",
+  "recovery_guard_state_unproven",
+  "recovery_requires_exclusive",
+  "recovery_proof_mismatch",
+  "recovery_holder_session_mismatch",
+  "recovery_holder_not_exclusive",
+  "recovery_holder_untracked",
+  "recovery_holder_not_live",
   // LOCK_CONTENDED — boards.lock, distinguished from registry.lock contention.
   "board_state_lock",
   // LOCK_CONTENDED — the host-global Registry writer lock.
@@ -589,6 +597,29 @@ export const BoardHolderSchema = z
   });
 export type BoardHolder = z.infer<typeof BoardHolderSchema>;
 
+const RecoveryUuidSchema = z.string().regex(
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+);
+export const BoardRecoveryProofSchema = z.object({
+  board_id: BoardIdSchema,
+  transaction_id: RecoveryUuidSchema,
+  manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  generation: RecoveryUuidSchema,
+  token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict();
+export type BoardRecoveryProof = z.infer<typeof BoardRecoveryProofSchema>;
+
+export const BoardRecoveryGuardSchema = z.object({
+  transaction_id: RecoveryUuidSchema,
+  manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  generation: RecoveryUuidSchema,
+  token_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  armed_at: OffsetDateTimeSchema,
+  holder_id: canonicalId("hld"),
+  holder_session: ClaimCoordinateSchema,
+}).strict();
+export type BoardRecoveryGuard = z.infer<typeof BoardRecoveryGuardSchema>;
+
 export const BoardReservationSchema = z
   .object({
     reservation_id: canonicalId("rsv"),
@@ -608,6 +639,7 @@ export const BoardRecordSchema = z
     description: boundedCoordinate(255).optional(),
     interfaces: z.array(BoardInterfaceSchema).max(8),
     registered_at: OffsetDateTimeSchema,
+    recovery_guard: BoardRecoveryGuardSchema.optional(),
     holders: z.array(BoardHolderSchema).max(16)
       .refine((holders) => new Set(holders.map((holder) => holder.holder_id)).size === holders.length, "Duplicate holder"),
     reservations: z.array(BoardReservationSchema).max(32)
