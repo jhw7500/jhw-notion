@@ -356,6 +356,14 @@ Module._load=function(request,parent,isMain){
   return load.apply(this,arguments);
 };
 process.argv=[process.execPath,entry,...args];
+if(selector==='control') {
+  let wrote=false; const write=process.stderr.write;
+  process.stderr.write=function(){ wrote=true; return write.apply(this,arguments); };
+  process.on('uncaughtException',error=>{
+    if(!wrote) { try { fs.writeSync(2,JSON.stringify({error:{code:typeof error?.code==='string' && /^DEPLOY_[A-Z_]{1,56}$/.test(error.code)?error.code:'DEPLOY_START_FAILED'}})+'\n'); } catch {} }
+    process.exit(1);
+  });
+}
 require(entry);
 `;
 
@@ -364,8 +372,8 @@ const {spawn}=require('node:child_process');
 const releaseRoot=process.argv[1]; const args=process.argv.slice(2); const event=args[3];
 const coreRunner=${JSON.stringify(MODULE_RUNNER_SOURCE)};
 const exact=(value,keys)=>value!==null && typeof value==='object' && !Array.isArray(value) && Object.keys(value).sort().join(',')===[...keys].sort().join(',');
-const fallback=()=>{
-  const code='GUARD_UNAVAILABLE'; let value;
+const fallback=code=>{
+  let value;
   if(event==='SessionEnd') value={};
   else if(event==='PostToolUse') value={systemMessage:code};
   else if(event==='UserPromptSubmit') value={hookSpecificOutput:{hookEventName:event,additionalContext:code},systemMessage:code};
@@ -385,18 +393,18 @@ const validate=bytes=>{
   if(!valid) return;
   const output=Buffer.from(JSON.stringify(value)+'\n'); return output.length<=12*1024 ? output : undefined;
 };
-let child; let timer; let killTimer; let settled=false; let overflow=false; let length=0; const chunks=[];
+let child; let timer; let killTimer; let settled=false; let timedOut=false; let overflow=false; let length=0; const chunks=[];
 const finish=(code,signal)=>{
   if(settled) return; settled=true; clearTimeout(timer); clearTimeout(killTimer);
   const output=!overflow && code===0 && signal===null ? validate(Buffer.concat(chunks,length)) : undefined;
-  if(output) process.stdout.write(output); else fallback();
+  if(output) process.stdout.write(output); else fallback(timedOut ? 'GUARD_HOOK_TIMEOUT' : 'GUARD_UNAVAILABLE');
 };
 try { child=spawn(process.execPath,['-e',coreRunner,'--','/proc/self/fd/4',releaseRoot,'hook','none',...args],{stdio:['inherit','pipe','inherit',3,4,'ignore',6]}); }
-catch { fallback(); process.exit(0); }
+catch { fallback('GUARD_UNAVAILABLE'); process.exit(0); }
 child.stdout.on('data',chunk=>{ if(overflow) return; length+=chunk.length; if(length>12*1024) { overflow=true; chunks.length=0; child.kill('SIGTERM'); } else chunks.push(chunk); });
 child.stdout.on('error',()=>{ overflow=true; child.kill('SIGTERM'); });
 child.once('error',()=>finish(null,null)); child.once('close',finish);
-timer=setTimeout(()=>{ child.kill('SIGTERM'); killTimer=setTimeout(()=>child.kill('SIGKILL'),200); },event==='SessionEnd' ? 2000 : 8000);
+timer=setTimeout(()=>{ timedOut=true; child.kill('SIGTERM'); killTimer=setTimeout(()=>child.kill('SIGKILL'),200); },event==='SessionEnd' ? 2000 : 8000);
 `;
 
 function runPinnedHook({args,artifact,lease,binding,releaseRoot}) {
@@ -440,11 +448,9 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
     if(storeText.split(safetySpecifier).length!==2) fail('DEPLOY_BOOTSTRAP_CHANGED');
     const store=await import(moduleUrl(Buffer.from(storeText.replace(safetySpecifier,JSON.stringify(safetyUrl)))));
     if(token===undefined) store.assertNoSessionAncestor({repositoryRoot});
-    const selected=token!==undefined
-      ? store.resolveSessionBinding({repositoryRoot,token})
-      : store.readActivation({repositoryRoot});
-    if(!selected) fail('DEPLOY_NO_CURRENT');
-    binding=store.createSessionBinding({repositoryRoot,releaseId:selected.releaseId,kind:selector==='session'?'session':'invocation',parentBinding:token??null});
+    const bound=store.bindEntryRelease({repositoryRoot,token,kind:selector==='session'?'session':'invocation'});
+    binding=bound.binding;
+    const selected={releaseId:bound.releaseId};
     const release=path.join(repositoryRoot,'.jhw-runtime/releases',selected.releaseId);
     if(selector==='session') {
       const environment=runtimeEnvironment();
@@ -470,13 +476,21 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
       for(const artifact of artifacts.splice(0)) fs.closeSync(artifact.fd);
       if(credential){fs.closeSync(credential.fd);credential.fd=undefined;}
       child.once('error',()=>reject(Object.assign(new Error('DEPLOY_START_FAILED'),{code:'DEPLOY_START_FAILED'})));
-      child.once('exit',(code,signal)=>resolve(code??(128+(osConstants.signals[signal]??1))));
+      child.once('exit',(code,signal)=>{
+        if(code!==null) { resolve(code); return; }
+        // jhw-control-host captures control output and accepts only rc 75 with one JSON line for a signalled child; `board with` streams (inherited stdio, signal status propagated) and mcp keep 128+n.
+        if(selector!=='control' || (args[0]==='board' && args[1]==='with')) { resolve(128+(osConstants.signals[signal]??1)); return; }
+        process.stderr.write(JSON.stringify({error:{code:'DEPLOY_CHILD_SIGNALED'}})+'\n');
+        resolve(75);
+      });
     });
   } catch(error) {
     return failure(selector,args,typeof error.code==='string' && /^DEPLOY_[A-Z_]{1,56}$/.test(error.code)?error.code:'DEPLOY_START_FAILED');
   } finally {
-    for(const artifact of artifacts) if(artifact.fd!==undefined) fs.closeSync(artifact.fd);
-    if(credential?.fd!==undefined) fs.closeSync(credential.fd);
-    publication?.close(); binding?.close(); lease?.close();
+    // A failure line may already be written: no cleanup step may throw into a second emission.
+    const quiet=close=>{ try { close(); } catch {} };
+    for(const artifact of artifacts) if(artifact.fd!==undefined) quiet(()=>fs.closeSync(artifact.fd));
+    if(credential?.fd!==undefined) quiet(()=>fs.closeSync(credential.fd));
+    quiet(()=>publication?.close()); quiet(()=>binding?.close()); quiet(()=>lease?.close());
   }
 }

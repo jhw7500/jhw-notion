@@ -278,6 +278,42 @@ for (const flag of ['-W', '-X', '--unknown-option', '-Bunknown']) {
   });
 }
 
+test('bun --no-install never consumes the script and keeps unrelated services quiescent', t => {
+  const options = procFixture(t);
+  addProcess(options, 100, ['bun', '--no-install', '/opt/claude-mem/scripts/worker-service.cjs', '--daemon']);
+  assert.deepEqual(inspectConsumers(options), clearInventory);
+  assert.deepEqual(requireQuiescence(options), clearInventory);
+});
+
+test('bun --no-install preserves legacy and managed consumer identities', t => {
+  const options = procFixture(t);
+  addProcess(options, 100, ['bun', '--no-install', './scripts/jhw-control-hook']);
+  addProcess(options, 101, ['bun', '--no-install', `${options.repositoryRoot}/.jhw-runtime/bootstrap/jhw-runtime-control`]);
+  assert.deepEqual(inspectConsumers(options), {
+    clear: false, counts: { tui: 0, app_server: 0, legacy: 1, managed: 1 }, uncertain: 0,
+  });
+  assert.throws(() => requireQuiescence(options), { code: 'DEPLOY_CONSUMERS_ACTIVE' });
+});
+
+test('bun accepts exactly --no-install; other options stay uncertain', t => {
+  for (const flags of [['--no-installx'], ['--no-install=1'], ['--preload', 'x'], ['--hot'], ['-i'], ['--no-install', '--smol']]) {
+    const options = procFixture(t);
+    addProcess(options, 100, ['bun', ...flags, `${options.repositoryRoot}/scripts/jhw-control-hook`]);
+    assert.deepEqual(inspectConsumers(options), {
+      clear: false, counts: { tui: 0, app_server: 0, legacy: 0, managed: 0 }, uncertain: 1,
+    }, flags.join(' '));
+    assert.throws(() => requireQuiescence(options), { code: 'DEPLOY_INVENTORY_UNCERTAIN' }, flags.join(' '));
+  }
+});
+
+test('bun --no-install preserves eval and script-argument boundaries', t => {
+  const options = procFixture(t);
+  const consumer = `${options.repositoryRoot}/scripts/jhw-control-hook`;
+  addProcess(options, 100, ['bun', '--no-install', '-e', 'console.log(1)', consumer]);
+  addProcess(options, 101, ['bun', '--no-install', '--', '/opt/other.js', consumer]);
+  assert.deepEqual(inspectConsumers(options), clearInventory);
+});
+
 test('inventory matches only exact legacy and known managed runtime entry paths', t => {
   const options = procFixture(t);
   const root = options.repositoryRoot;

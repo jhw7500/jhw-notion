@@ -51,7 +51,7 @@ async function fixture(t, body = "process.stdin.pipe(process.stdout); process.st
     write(stagingRoot, 'mcp-server/dist/runtime/control.cjs', '#!/usr/bin/env node\n'+bundleBody, 0o755);
     write(stagingRoot, 'mcp-server/dist/runtime/hook.cjs', '#!/usr/bin/env node\n'+hookBundleBody, 0o755);
     runtimeOptions.extraBuild?.(stagingRoot,root);
-    fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { mode: 0o755 });
+    fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { recursive: true, mode: 0o755 });
   }});
   const release = await prepare();
   const deploy = acquireLease(path.join(root,'.jhw-runtime/deploy.lock'));
@@ -307,15 +307,97 @@ test('every hook event escalates an ignored SIGTERM to SIGKILL', async t => {
   const f=await fixture(t,undefined,hookBody,{
     'runtime-entry.mjs':bytes=>bytes.replace("event==='SessionEnd' ? 2000 : 8000","event==='SessionEnd' ? 100 : 100"),
   });
-  for (const event of ['PreToolUse','UserPromptSubmit','PostToolUse']) {
+  for (const event of ['PreToolUse','UserPromptSubmit','PostToolUse','SessionEnd']) {
     const result=spawnSync(path.join(f.bootstrap,'jhw-runtime-hook'),['--adapter','claude','--event',event],{
       input:'{}',encoding:'utf8',timeout:900,
     });
     assert.equal(result.error,undefined,String(result.error));
     assert.equal(result.status,0,result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout),hookFailure(event,'GUARD_UNAVAILABLE'));
+    assert.deepEqual(JSON.parse(result.stdout),hookFailure(event,'GUARD_HOOK_TIMEOUT'));
     const lease=acquireLease(f.lock); lease.close();
   }
+});
+
+// Preservation: a core that dies is not a watchdog timeout, and the runner still emits exactly one line.
+test('a hook core that throws keeps GUARD_UNAVAILABLE in exactly one line', async t => {
+  const f=await fixture(t,undefined,"throw new Error('boom');");
+  for (const event of ['PreToolUse','UserPromptSubmit','PostToolUse','SessionEnd']) {
+    const result=run(f,'jhw-runtime-hook',['--adapter','claude','--event',event],'{}');
+    assert.equal(result.status,0,result.stderr);
+    assert.equal(result.stdout.split('\n').filter(Boolean).length,1);
+    assert.deepEqual(JSON.parse(result.stdout),hookFailure(event,'GUARD_UNAVAILABLE'));
+  }
+});
+
+// Break caught: a control core that dies while loading or running leaving no single-line error for jhw-control-host.
+test('a control bundle that throws exits 1 with exactly one JSON error line', async t => {
+  const external=await fixture(t,undefined,undefined,{},{
+    bundleBody:"require('../external.cjs');",
+    extraBuild:(stagingRoot,root)=>write(stagingRoot,'mcp-server/dist/external.cjs',`require('node:fs').writeFileSync(${JSON.stringify(path.join(root,'external-module-executed'))},'bad');`),
+  });
+  const forbidden=run(external,'jhw-runtime-control',[]);
+  assert.equal(forbidden.status,1,forbidden.stderr); assert.equal(forbidden.stdout,'');
+  assert.equal(forbidden.stderr,controlError('DEPLOY_EXTERNAL_MODULE_FORBIDDEN'));
+  assert.equal(fs.existsSync(path.join(external.root,'external-module-executed')),false);
+  const boom=await fixture(t,undefined,undefined,{},{bundleBody:"throw new Error('boom');"});
+  const thrown=run(boom,'jhw-runtime-control',[]);
+  assert.equal(thrown.status,1,thrown.stderr); assert.equal(thrown.stdout,''); assert.equal(thrown.stderr,controlError('DEPLOY_START_FAILED'));
+  const late=await fixture(t,undefined,undefined,{},{bundleBody:"setTimeout(()=>{ throw new Error('late'); },20);"});
+  const lateResult=run(late,'jhw-runtime-control',[]);
+  assert.equal(lateResult.status,1,lateResult.stderr); assert.equal(lateResult.stderr,controlError('DEPLOY_START_FAILED'));
+});
+
+// Break caught: a control core's own error line followed by the default uncaught-error stack trace.
+test('a throwing control bundle that already wrote its error line adds nothing', async t => {
+  const own=JSON.stringify({error:{code:'OWN_FAILURE'}});
+  const f=await fixture(t,undefined,undefined,{},{bundleBody:`process.stderr.write(${JSON.stringify(own+'\n')}); throw new Error('boom');`});
+  const result=run(f,'jhw-runtime-control',[]);
+  assert.equal(result.status,1,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,own+'\n');
+});
+
+// Break caught: a signalled captured-output control child returning 128+n, which jhw-control-host rejects as CONTROL_OUTPUT_INVALID.
+test('a control child ended by a signal returns 75 with one DEPLOY_CHILD_SIGNALED line', async t => {
+  const f=await fixture(t,undefined,undefined,{},{bundleBody:"process.kill(process.pid,'SIGUSR2');"});
+  const result=run(f,'jhw-runtime-control',[]);
+  assert.equal(result.status,75,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,controlError('DEPLOY_CHILD_SIGNALED'));
+  const listed=run(f,'jhw-runtime-control',['board','list']);
+  assert.equal(listed.status,75,listed.stderr); assert.equal(listed.stderr,controlError('DEPLOY_CHILD_SIGNALED'));
+  // A child that already wrote its own line leaves the launcher two lines (CONTROL_OUTPUT_INVALID), as base does for any signalled child.
+  const own=controlError('OWN_FAILURE');
+  const written=await fixture(t,undefined,undefined,{},{bundleBody:`require('node:fs').writeSync(2,${JSON.stringify(own)}); process.kill(process.pid,'SIGUSR2');`});
+  const kept=run(written,'jhw-runtime-control',[]);
+  assert.equal(kept.status,75,kept.stderr); assert.equal(kept.stdout,''); assert.equal(kept.stderr,own+controlError('DEPLOY_CHILD_SIGNALED'));
+});
+
+// Preservation: `board with` runs with the launcher's inherited stdio and propagates the signal status, so it writes nothing and keeps 128+n.
+test('a signalled board with child keeps 128+signal and writes nothing', async t => {
+  const f=await fixture(t,undefined,undefined,{},{bundleBody:"process.kill(process.pid,'SIGUSR2');"});
+  const result=run(f,'jhw-runtime-control',['board','with','target']);
+  assert.equal(result.status,140,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,'');
+});
+
+// Preservation: an ordinary control exit code and its stderr pass through untouched.
+test('a control child exit code and stderr pass through unchanged', async t => {
+  const f=await fixture(t,undefined,undefined,{},{bundleBody:"process.stderr.write('child-stderr\\n'); process.exitCode=4;"});
+  const result=run(f,'jhw-runtime-control',[]);
+  assert.equal(result.status,4,result.stderr); assert.equal(result.stderr,'child-stderr\n');
+});
+
+// A drifted patch target must fail the test instead of silently leaving the fixture unpatched.
+function patched(bytes,target,replacement) { assert.ok(bytes.includes(target),'patch target missing: '+target); return bytes.replace(target,replacement); }
+
+// Break caught: a cleanup close throwing after failure() wrote its line, so the outer refusal writes a second one.
+test('a throwing binding close after a failure line adds no second emission', async t => {
+  const helperEdits={
+    'runtime-store.mjs':bytes=>patched(bytes,'return { id, token, record, fd: held.fd, close };',"return { id, token, record, fd: held.fd, close: () => { close(); throw new Error('close boom'); } };"),
+    'runtime-entry.mjs':bytes=>patched(bytes,"    if(selector==='hook') return await runPinnedHook(","    fail('DEPLOY_TEST_FORCED');\n    if(selector==='hook') return await runPinnedHook("),
+  };
+  const f=await fixture(t,undefined,undefined,helperEdits);
+  const hook=run(f,'jhw-runtime-hook',['--adapter','claude','--event','PreToolUse'],'{}');
+  assert.equal(hook.status,0,hook.stderr); assert.equal(hook.stdout.split('\n').filter(Boolean).length,1);
+  assert.deepEqual(JSON.parse(hook.stdout),hookFailure('PreToolUse','DEPLOY_TEST_FORCED'));
+  const control=run(f,'jhw-runtime-control',[]);
+  assert.equal(control.status,75,control.stderr); assert.equal(control.stdout,''); assert.equal(control.stderr,controlError('DEPLOY_TEST_FORCED'));
 });
 
 // Break caught: caching current at bootstrap installation instead of reading after admission.
@@ -357,6 +439,83 @@ test('incomplete release helper set refuses installation and preserves the prior
   await assert.rejects(entry.installBootstrap({repositoryRoot:f.root,releaseId:next.releaseId}));
   assert.deepEqual(fs.readFileSync(path.join(f.bootstrap,'manifest.json')),prior);
   const result=run(f,'jhw-runtime-control',[],'still works'); assert.equal(result.status,23,result.stderr); assert.equal(result.stdout,'still works');
+});
+
+// Preload for the entry process: counts opens of the release's walk sentinel (one per full release walk) and
+// can swap the sentinel bytes on the second read of the `current` pointer (the post-validation observation).
+const walkProbe = `import fs from 'node:fs';
+const query = new URL(import.meta.url).searchParams;
+const out = query.get('count'); const swap = query.get('swap');
+let opens = 0; let links = 0;
+const open = fs.openSync; const link = fs.readlinkSync;
+fs.openSync = function (name, ...rest) { if (typeof name === 'string' && name.endsWith('/walk-sentinel.js')) opens++; return open.call(this, name, ...rest); };
+fs.readlinkSync = function (name, ...rest) {
+  const value = link.call(this, name, ...rest);
+  if (swap && typeof name === 'string' && name.endsWith('/current') && ++links === 2) { fs.writeFileSync(swap + '.replacement', 'tampered'); fs.chmodSync(swap + '.replacement', 0o644); fs.renameSync(swap + '.replacement', swap); }
+  return value;
+};
+process.on('exit', () => fs.writeFileSync(out, String(opens)));
+`;
+const sentinelBuild = { extraBuild: stagingRoot => write(stagingRoot, 'mcp-server/node_modules/walk-sentinel/walk-sentinel.js', '// sentinel') };
+function probedEntry(f, args, { input = '', swap } = {}) {
+  const directory = fs.mkdtempSync(path.join(f.root, 'walk-probe-'));
+  const counter = path.join(directory, 'counter.mjs'); const count = path.join(directory, 'count');
+  fs.writeFileSync(counter, walkProbe);
+  const preload = `${pathToFileURL(counter).href}?count=${encodeURIComponent(count)}${swap ? `&swap=${encodeURIComponent(swap)}` : ''}`;
+  const result = spawnSync(process.execPath, ['--import', preload, path.join(f.bootstrap, 'jhw-runtime-entry'), ...args], { input, encoding: 'utf8', timeout: 20000 });
+  return { result, walks: fs.existsSync(count) ? Number(fs.readFileSync(count, 'utf8')) : undefined };
+}
+
+// Break caught: an unbound entry validating the whole release more than once before it runs.
+test('unbound hook and control entries walk the release exactly once', async t => {
+  const f = await fixture(t, undefined, undefined, {}, sentinelBuild);
+  const hook = probedEntry(f, ['hook', '--adapter', 'claude', '--event', 'SessionEnd'], { input: '{}' });
+  assert.equal(hook.result.status, 0, hook.result.stderr); assert.equal(hook.walks, 1);
+  const control = probedEntry(f, ['control']);
+  assert.equal(control.result.status, 23, control.result.stderr); assert.equal(control.walks, 1);
+});
+
+// Preservation: the last full walk runs after the final pointer observation, so release files that are not the
+// pinned bundle (node_modules) cannot change between selection and binding. Not about the executed bundle bytes.
+test('release files replaced after selection refuse before the core executes', async t => {
+  const f = await fixture(t, undefined, undefined, {}, sentinelBuild);
+  const sentinel = path.join(f.root, '.jhw-runtime/releases', f.release.releaseId, 'mcp-server/node_modules/walk-sentinel/walk-sentinel.js');
+  const control = probedEntry(f, ['control'], { swap: sentinel });
+  assert.equal(control.result.status, 75, control.result.stderr);
+  assert.equal(control.result.stdout, ''); assert.equal(control.result.stderr, controlError('DEPLOY_RELEASE_INVALID'));
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'tampered');
+});
+
+// Preservation: a release already corrupt or untrusted before entry reports the walk's own code on the unbound entries
+// (the walk now runs inside the session boundary, which would otherwise relabel it DEPLOY_SESSION_INVALID).
+test('a release corrupt or untrusted before an unbound entry reports the walk code', async t => {
+  const cases = [['file bytes differ from the manifest', file => fs.appendFileSync(file, '// tampered'), 'DEPLOY_RELEASE_INVALID'],
+    ['group-writable release file', file => fs.chmodSync(file, 0o666), 'DEPLOY_UNTRUSTED_PATH']];
+  for (const [label, tamper, code] of cases) {
+    const f = await fixture(t);
+    tamper(path.join(f.root, '.jhw-runtime/releases', f.release.releaseId, 'mcp-server/dist/index.js'));
+    const hook = run(f, 'jhw-runtime-hook', ['--adapter', 'claude', '--event', 'PreToolUse'], '{}');
+    assert.equal(hook.status, 0, label + hook.stderr); assert.equal(hook.stdout.split('\n').filter(Boolean).length, 1, label);
+    assert.deepEqual(JSON.parse(hook.stdout), hookFailure('PreToolUse', code), label);
+    const control = run(f, 'jhw-runtime-control', []);
+    assert.equal(control.status, 75, label + control.stderr); assert.equal(control.stdout, '', label); assert.equal(control.stderr, controlError(code), label);
+  }
+});
+
+// Measurement only (not asserted): JHW_MEASURE_ENTRY=1 node --test --test-name-pattern='entry timing' scripts/test-runtime-entry.mjs
+test('entry timing with a large node_modules tree', { skip: !process.env.JHW_MEASURE_ENTRY }, async t => {
+  const f = await fixture(t, undefined, undefined, {}, { extraBuild: stagingRoot => {
+    for (let n = 0; n < 4000; n++) write(stagingRoot, `mcp-server/node_modules/dep-${n % 200}/file-${n}.js`, `// ${n}`);
+  } });
+  const samples = [];
+  for (let n = 0; n < 7; n++) {
+    const started = process.hrtime.bigint();
+    const result = run(f, 'jhw-runtime-hook', ['--adapter', 'claude', '--event', 'SessionEnd'], '{}');
+    samples.push(Number(process.hrtime.bigint() - started) / 1e6);
+    assert.equal(result.status, 0, result.stderr);
+  }
+  samples.sort((a, b) => a - b);
+  console.log(`entry timing ms min=${samples[0].toFixed(0)} median=${samples[3].toFixed(0)} max=${samples[6].toFixed(0)}`);
 });
 
 // Break caught: collapsing valid child signal exits into a different status.
