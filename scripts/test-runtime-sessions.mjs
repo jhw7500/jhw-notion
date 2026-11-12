@@ -692,7 +692,7 @@ test('bounded reaper paginates finished invocations without touching a live root
 // Real managed entries need an installed bootstrap, as in test-runtime-coexist.mjs.
 const entryHelpers = ['runtime-entry.mjs', 'runtime-safety.mjs', 'runtime-store.mjs', 'runtime-deploy.mjs', 'install-wiring.sh',
   'install-config.mjs', 'jhw-runtime-entry', 'jhw-runtime-control', 'jhw-runtime-hook', 'jhw-control-hook'];
-async function entryFixture(t) {
+async function entryFixture(t, sentinel = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jhw-session-entry-test-'));
   fs.chmodSync(root, 0o700);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -716,7 +716,8 @@ async function entryFixture(t) {
       ['mcp-server/dist/control/cli.js', control, 0o755], ['mcp-server/dist/runtime/control.cjs', control, 0o755],
       ['mcp-server/dist/control/hook-adapter.js', hook, 0o755], ['mcp-server/dist/runtime/hook.cjs', hook, 0o755],
     ]) write(stagingRoot, name, body, mode);
-    fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { mode: 0o755 });
+    if (sentinel) write(stagingRoot, 'mcp-server/node_modules/walk-sentinel/walk-sentinel.js', '// sentinel');
+    fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { recursive: true, mode: 0o755 });
   };
   const release = await store.prepareRelease({ repositoryRoot: root, build });
   const deploy = acquireLease(path.join(root, '.jhw-runtime/deploy.lock'));
@@ -817,6 +818,42 @@ test('records of signal-terminated entries and session wrappers are reclaimed by
   assert.equal(next.status, 0, next.stderr);
   assert.equal(next.stdout, 'ready\n');
   assert.deepEqual(listSessions(f), []);
+});
+
+// Break caught: a pinned entry validating the whole release more than once (resolve, parent re-resolve, compatibility).
+test('a hook entry under a session wrapper walks the release exactly once', async t => {
+  const f = await entryFixture(t, true);
+  const directory = fs.mkdtempSync(path.join(f.root, 'walk-probe-'));
+  const counter = path.join(directory, 'counter.mjs'); const count = path.join(directory, 'count');
+  fs.writeFileSync(counter, "import fs from 'node:fs'; const out = new URL(import.meta.url).searchParams.get('count'); let opens = 0; const open = fs.openSync;\n" +
+    "fs.openSync = function (name, ...rest) { if (typeof name === 'string' && name.endsWith('/walk-sentinel.js')) opens++; return open.call(this, name, ...rest); };\n" +
+    "process.on('exit', () => fs.writeFileSync(out, String(opens)));\n");
+  const preload = pathToFileURL(counter).href + '?count=' + encodeURIComponent(count);
+  const result = runEntry(f, ['session', '--', process.execPath, '--import', preload, f.entry, 'hook', '--adapter', 'claude', '--event', 'PreToolUse'], { input: '{}' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { hookSpecificOutput: { hookEventName: 'PreToolUse' } });
+  assert.equal(Number(fs.readFileSync(count, 'utf8')), 1);
+});
+
+// Preservation: under a session wrapper, a release corrupt or untrusted before the entry reports DEPLOY_SESSION_INVALID.
+test('a release corrupt or untrusted before a pinned entry reports DEPLOY_SESSION_INVALID', async t => {
+  for (const [label, tamper] of [['file bytes differ from the manifest', file => `fs.appendFileSync(${JSON.stringify(file)}, '// tampered')`],
+    ['group-writable release file', file => `fs.chmodSync(${JSON.stringify(file)}, 0o666)`]]) {
+    for (const args of [['hook', '--adapter', 'claude', '--event', 'PreToolUse'], ['control']]) {
+      const f = await entryFixture(t);
+      const file = path.join(f.root, '.jhw-runtime/releases', f.release.releaseId, 'mcp-server/dist/index.js');
+      const script = `const fs = require('node:fs'); ${tamper(file)}; const r = require('node:child_process').spawnSync(process.execPath, [${JSON.stringify(f.entry)}, ...${JSON.stringify(args)}], { encoding: 'utf8', input: '{}' }); process.stdout.write(JSON.stringify([r.status, r.stdout, r.stderr]));`;
+      const wrapped = runEntry(f, ['session', '--', process.execPath, '-e', script]);
+      assert.equal(wrapped.status, 0, label + wrapped.stderr);
+      const [status, stdout, stderr] = JSON.parse(wrapped.stdout);
+      if (args[0] === 'hook') {
+        assert.equal(status, 0, label); assert.equal(stderr, '', label);
+        assert.deepEqual(JSON.parse(stdout), { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'DEPLOY_SESSION_INVALID' }, systemMessage: 'DEPLOY_SESSION_INVALID' }, label);
+      } else {
+        assert.equal(status, 75, label); assert.equal(stdout, '', label); assert.equal(stderr, JSON.stringify({ error: { code: 'DEPLOY_SESSION_INVALID' } }) + '\n', label);
+      }
+    }
+  }
 });
 
 test('an entry drains more than SESSION_LIMIT completed records so control and PreToolUse still run', async t => {

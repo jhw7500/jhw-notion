@@ -410,3 +410,32 @@ test('preparation retains the source-only wiring library as a bound input', asyn
   const result = await prepare(root);
   assert.equal(fs.readFileSync(path.join(releasePath(root, result), 'scripts/install-wiring.sh'), 'utf8'), '# source-only fixture\n');
 });
+
+// Break caught: entry selection re-walking the release, or a binding record that differs from createSessionBinding.
+test('bindEntryRelease selects the current release and writes the same record shape as createSessionBinding', async t => {
+  assert.equal(typeof store.bindEntryRelease, 'function', 'bindEntryRelease must exist');
+  const root = fixture(t);
+  const release = await prepare(root);
+  assert.throws(() => store.bindEntryRelease({ repositoryRoot: root }), code('DEPLOY_NO_CURRENT'));
+  const activation = store.publishActivation({ repositoryRoot: root, releaseId: release.releaseId, expectedCurrent: store.readActivation({ repositoryRoot: root }) });
+  const reference = store.createSessionBinding({ repositoryRoot: root, releaseId: release.releaseId, kind: 'invocation' });
+  const session = store.createSessionBinding({ repositoryRoot: root, releaseId: release.releaseId, kind: 'session' });
+  let unbound; let pinned;
+  try {
+    unbound = store.bindEntryRelease({ repositoryRoot: root, kind: 'invocation' });
+    assert.equal(unbound.releaseId, activation.releaseId);
+    assert.deepEqual(Object.keys(unbound.binding.record), Object.keys(reference.record));
+    assert.equal(unbound.binding.record.compatibilityDigest, store.releaseCompatibility({ repositoryRoot: root, releaseId: release.releaseId }));
+    assert.equal(unbound.binding.record.kind, 'invocation');
+    assert.equal(unbound.binding.record.parentBinding, null);
+    pinned = store.bindEntryRelease({ repositoryRoot: root, token: session.token, kind: 'invocation' });
+    assert.equal(pinned.releaseId, release.releaseId);
+    assert.equal(pinned.binding.record.parentBinding, session.token);
+    assert.equal(pinned.binding.record.compatibilityDigest, reference.record.compatibilityDigest);
+    assert.match(pinned.binding.token, /^s-[a-f0-9]{32}:[a-f0-9]{64}$/);
+    for (const token of ['', '../foreign:' + 'a'.repeat(64), 's-' + '0'.repeat(32) + ':' + '0'.repeat(64)]) {
+      assert.throws(() => store.bindEntryRelease({ repositoryRoot: root, token, kind: 'invocation' }), code('DEPLOY_SESSION_INVALID'));
+    }
+  } finally { pinned?.binding.close(); unbound?.binding.close(); session.close(); reference.close(); }
+  assert.throws(() => store.bindEntryRelease({ repositoryRoot: root, token: session.token, kind: 'invocation' }), code('DEPLOY_SESSION_INVALID'));
+});

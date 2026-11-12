@@ -440,11 +440,9 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
     if(storeText.split(safetySpecifier).length!==2) fail('DEPLOY_BOOTSTRAP_CHANGED');
     const store=await import(moduleUrl(Buffer.from(storeText.replace(safetySpecifier,JSON.stringify(safetyUrl)))));
     if(token===undefined) store.assertNoSessionAncestor({repositoryRoot});
-    const selected=token!==undefined
-      ? store.resolveSessionBinding({repositoryRoot,token})
-      : store.readActivation({repositoryRoot});
-    if(!selected) fail('DEPLOY_NO_CURRENT');
-    binding=store.createSessionBinding({repositoryRoot,releaseId:selected.releaseId,kind:selector==='session'?'session':'invocation',parentBinding:token??null});
+    const bound=store.bindEntryRelease({repositoryRoot,token,kind:selector==='session'?'session':'invocation'});
+    binding=bound.binding;
+    const selected={releaseId:bound.releaseId};
     const release=path.join(repositoryRoot,'.jhw-runtime/releases',selected.releaseId);
     if(selector==='session') {
       const environment=runtimeEnvironment();

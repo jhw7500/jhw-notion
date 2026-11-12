@@ -51,7 +51,7 @@ async function fixture(t, body = "process.stdin.pipe(process.stdout); process.st
     write(stagingRoot, 'mcp-server/dist/runtime/control.cjs', '#!/usr/bin/env node\n'+bundleBody, 0o755);
     write(stagingRoot, 'mcp-server/dist/runtime/hook.cjs', '#!/usr/bin/env node\n'+hookBundleBody, 0o755);
     runtimeOptions.extraBuild?.(stagingRoot,root);
-    fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { mode: 0o755 });
+    fs.mkdirSync(path.join(stagingRoot, 'mcp-server/node_modules'), { recursive: true, mode: 0o755 });
   }});
   const release = await prepare();
   const deploy = acquireLease(path.join(root,'.jhw-runtime/deploy.lock'));
@@ -357,6 +357,83 @@ test('incomplete release helper set refuses installation and preserves the prior
   await assert.rejects(entry.installBootstrap({repositoryRoot:f.root,releaseId:next.releaseId}));
   assert.deepEqual(fs.readFileSync(path.join(f.bootstrap,'manifest.json')),prior);
   const result=run(f,'jhw-runtime-control',[],'still works'); assert.equal(result.status,23,result.stderr); assert.equal(result.stdout,'still works');
+});
+
+// Preload for the entry process: counts opens of the release's walk sentinel (one per full release walk) and
+// can swap the sentinel bytes on the second read of the `current` pointer (the post-validation observation).
+const walkProbe = `import fs from 'node:fs';
+const query = new URL(import.meta.url).searchParams;
+const out = query.get('count'); const swap = query.get('swap');
+let opens = 0; let links = 0;
+const open = fs.openSync; const link = fs.readlinkSync;
+fs.openSync = function (name, ...rest) { if (typeof name === 'string' && name.endsWith('/walk-sentinel.js')) opens++; return open.call(this, name, ...rest); };
+fs.readlinkSync = function (name, ...rest) {
+  const value = link.call(this, name, ...rest);
+  if (swap && typeof name === 'string' && name.endsWith('/current') && ++links === 2) { fs.writeFileSync(swap + '.replacement', 'tampered'); fs.chmodSync(swap + '.replacement', 0o644); fs.renameSync(swap + '.replacement', swap); }
+  return value;
+};
+process.on('exit', () => fs.writeFileSync(out, String(opens)));
+`;
+const sentinelBuild = { extraBuild: stagingRoot => write(stagingRoot, 'mcp-server/node_modules/walk-sentinel/walk-sentinel.js', '// sentinel') };
+function probedEntry(f, args, { input = '', swap } = {}) {
+  const directory = fs.mkdtempSync(path.join(f.root, 'walk-probe-'));
+  const counter = path.join(directory, 'counter.mjs'); const count = path.join(directory, 'count');
+  fs.writeFileSync(counter, walkProbe);
+  const preload = `${pathToFileURL(counter).href}?count=${encodeURIComponent(count)}${swap ? `&swap=${encodeURIComponent(swap)}` : ''}`;
+  const result = spawnSync(process.execPath, ['--import', preload, path.join(f.bootstrap, 'jhw-runtime-entry'), ...args], { input, encoding: 'utf8', timeout: 20000 });
+  return { result, walks: fs.existsSync(count) ? Number(fs.readFileSync(count, 'utf8')) : undefined };
+}
+
+// Break caught: an unbound entry validating the whole release more than once before it runs.
+test('unbound hook and control entries walk the release exactly once', async t => {
+  const f = await fixture(t, undefined, undefined, {}, sentinelBuild);
+  const hook = probedEntry(f, ['hook', '--adapter', 'claude', '--event', 'SessionEnd'], { input: '{}' });
+  assert.equal(hook.result.status, 0, hook.result.stderr); assert.equal(hook.walks, 1);
+  const control = probedEntry(f, ['control']);
+  assert.equal(control.result.status, 23, control.result.stderr); assert.equal(control.walks, 1);
+});
+
+// Preservation: the last full walk runs after the final pointer observation, so release files that are not the
+// pinned bundle (node_modules) cannot change between selection and binding. Not about the executed bundle bytes.
+test('release files replaced after selection refuse before the core executes', async t => {
+  const f = await fixture(t, undefined, undefined, {}, sentinelBuild);
+  const sentinel = path.join(f.root, '.jhw-runtime/releases', f.release.releaseId, 'mcp-server/node_modules/walk-sentinel/walk-sentinel.js');
+  const control = probedEntry(f, ['control'], { swap: sentinel });
+  assert.equal(control.result.status, 75, control.result.stderr);
+  assert.equal(control.result.stdout, ''); assert.equal(control.result.stderr, controlError('DEPLOY_RELEASE_INVALID'));
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'tampered');
+});
+
+// Preservation: a release already corrupt or untrusted before entry reports the walk's own code on the unbound entries
+// (the walk now runs inside the session boundary, which would otherwise relabel it DEPLOY_SESSION_INVALID).
+test('a release corrupt or untrusted before an unbound entry reports the walk code', async t => {
+  const cases = [['file bytes differ from the manifest', file => fs.appendFileSync(file, '// tampered'), 'DEPLOY_RELEASE_INVALID'],
+    ['group-writable release file', file => fs.chmodSync(file, 0o666), 'DEPLOY_UNTRUSTED_PATH']];
+  for (const [label, tamper, code] of cases) {
+    const f = await fixture(t);
+    tamper(path.join(f.root, '.jhw-runtime/releases', f.release.releaseId, 'mcp-server/dist/index.js'));
+    const hook = run(f, 'jhw-runtime-hook', ['--adapter', 'claude', '--event', 'PreToolUse'], '{}');
+    assert.equal(hook.status, 0, label + hook.stderr); assert.equal(hook.stdout.split('\n').filter(Boolean).length, 1, label);
+    assert.deepEqual(JSON.parse(hook.stdout), hookFailure('PreToolUse', code), label);
+    const control = run(f, 'jhw-runtime-control', []);
+    assert.equal(control.status, 75, label + control.stderr); assert.equal(control.stdout, '', label); assert.equal(control.stderr, controlError(code), label);
+  }
+});
+
+// Measurement only (not asserted): JHW_MEASURE_ENTRY=1 node --test --test-name-pattern='entry timing' scripts/test-runtime-entry.mjs
+test('entry timing with a large node_modules tree', { skip: !process.env.JHW_MEASURE_ENTRY }, async t => {
+  const f = await fixture(t, undefined, undefined, {}, { extraBuild: stagingRoot => {
+    for (let n = 0; n < 4000; n++) write(stagingRoot, `mcp-server/node_modules/dep-${n % 200}/file-${n}.js`, `// ${n}`);
+  } });
+  const samples = [];
+  for (let n = 0; n < 7; n++) {
+    const started = process.hrtime.bigint();
+    const result = run(f, 'jhw-runtime-hook', ['--adapter', 'claude', '--event', 'SessionEnd'], '{}');
+    samples.push(Number(process.hrtime.bigint() - started) / 1e6);
+    assert.equal(result.status, 0, result.stderr);
+  }
+  samples.sort((a, b) => a - b);
+  console.log(`entry timing ms min=${samples[0].toFixed(0)} median=${samples[3].toFixed(0)} max=${samples[6].toFixed(0)}`);
 });
 
 // Break caught: collapsing valid child signal exits into a different status.

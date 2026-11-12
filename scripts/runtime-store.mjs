@@ -293,7 +293,7 @@ function summary(manifest) {
   const { releaseId, sourceRevision, sourceDigest, contentDigest, dirty } = manifest;
   return { releaseId, sourceRevision, sourceDigest, contentDigest, dirty };
 }
-function validateReleaseIn(runtime, repositoryRoot, releaseId) {
+function validateReleaseIn(runtime, repositoryRoot, releaseId, walkTree = true) {
   let releases; let release;
   try {
     if (typeof releaseId !== 'string' || !RELEASE.test(releaseId)) fail('DEPLOY_RELEASE_INVALID');
@@ -304,9 +304,11 @@ function validateReleaseIn(runtime, repositoryRoot, releaseId) {
         manifest.version !== 1 || manifest.releaseId !== releaseId || manifest.sourceRevision !== RELEASE.exec(releaseId)[1] ||
         typeof manifest.sourceDigest !== 'string' || !DIGEST.test(manifest.sourceDigest) || typeof manifest.dirty !== 'boolean' || !timestamp(manifest.createdAt) ||
         !validEntries(manifest.entries) || contentDigest(manifest) !== manifest.contentDigest || RELEASE.exec(releaseId)[2] !== manifest.contentDigest) fail('DEPLOY_RELEASE_INVALID');
-    const entries = walk(release, { repositoryRoot });
-    if (canonical(entries) !== canonical(manifest.entries)) fail('DEPLOY_RELEASE_INVALID');
-    requiredArtifacts(entries);
+    if (walkTree) {
+      const entries = walk(release, { repositoryRoot });
+      if (canonical(entries) !== canonical(manifest.entries)) fail('DEPLOY_RELEASE_INVALID');
+    }
+    requiredArtifacts(manifest.entries);
     credentialSource(repositoryRoot);
     // Re-read the manifest after hashing the entire tree to detect concurrent edits.
     if (canonical(manifest) !== canonical(readJson(release))) fail('DEPLOY_RELEASE_INVALID');
@@ -458,7 +460,7 @@ export function validCurrent(value) {
     exact(value.observation, ['target', 'dev', 'ino', 'ctimeNs']) && value.observation.target === `activations/${value.activationId}` &&
     ['dev', 'ino', 'ctimeNs'].every(key => typeof value.observation[key] === 'string' && /^\d{1,32}$/.test(value.observation[key]));
 }
-function activationIn(runtime, repositoryRoot, activationId) {
+function activationIn(runtime, repositoryRoot, activationId, walkTree = true) {
   let activations; let activation;
   try {
     if (!ACTIVATION.test(activationId)) fail('DEPLOY_ACTIVATION_INVALID');
@@ -473,17 +475,17 @@ function activationIn(runtime, repositoryRoot, activationId) {
     for (const name of ['mcp-server', 'scripts', 'skills']) {
       if (readLink(activation, name).target !== `../../releases/${manifest.releaseId}/${name}`) fail('DEPLOY_ACTIVATION_INVALID');
     }
-    validateReleaseIn(runtime, repositoryRoot, manifest.releaseId);
+    validateReleaseIn(runtime, repositoryRoot, manifest.releaseId, walkTree);
     if (canonical(readJson(activation)) !== canonical(manifest)) fail('DEPLOY_ACTIVATION_INVALID');
     return manifest;
   } catch (error) { boundary(error, 'DEPLOY_ACTIVATION_INVALID'); }
   finally { activation?.close(); activations?.close(); }
 }
-function currentIn(runtime, repositoryRoot) {
+function currentIn(runtime, repositoryRoot, walkTree = true) {
   if (!runtime) return null;
   const before = observation(runtime);
   if (!before) return null;
-  const manifest = activationIn(runtime, repositoryRoot, before.target.slice('activations/'.length));
+  const manifest = activationIn(runtime, repositoryRoot, before.target.slice('activations/'.length), walkTree);
   if (canonical(before) !== canonical(observation(runtime))) fail('DEPLOY_CURRENT_CHANGED');
   return { activationId: manifest.activationId, releaseId: manifest.releaseId, predecessorActivationId: manifest.predecessorActivationId, observation: before };
 }
@@ -975,8 +977,8 @@ function compatibleMcpEntry(name) {
     /^mcp-server\/dist\/(?:index|server)\.(?:js(?:\.map)?|d\.ts(?:\.map)?)$/.test(name) ||
     name === 'mcp-server/dist/runtime/mcp.cjs';
 }
-function releaseCompatibilityIn(runtime, repositoryRoot, releaseId) {
-  const validated = validateReleaseIn(runtime, repositoryRoot, releaseId);
+function releaseCompatibilityIn(runtime, repositoryRoot, releaseId, walkTree = true) {
+  const validated = validateReleaseIn(runtime, repositoryRoot, releaseId, walkTree);
   let releases; let release;
   try {
     releases = runtime.child('releases', false, true);
@@ -995,14 +997,17 @@ export function releaseCompatibility({ repositoryRoot, releaseId }) {
     return releaseCompatibilityIn(runtime, repositoryRoot, releaseId);
   });
 }
-function verifyLiveSession(runtime, repositoryRoot, data) {
+function verifyLiveSession(runtime, repositoryRoot, data, walkTree = true) {
   if (!leaseIsHeld(data.leaseFile)) sessionFail();
   ownerMatches(data.record);
-  if (releaseCompatibilityIn(runtime, repositoryRoot, data.record.releaseId) !== data.record.compatibilityDigest) sessionFail();
+  if (releaseCompatibilityIn(runtime, repositoryRoot, data.record.releaseId, walkTree) !== data.record.compatibilityDigest) sessionFail();
   if (!leaseIsHeld(data.leaseFile)) sessionFail();
   ownerMatches(data.record);
 }
 export function resolveSessionBinding({ repositoryRoot, token, pid = process.pid }) {
+  return resolveSessionBindingWith({ repositoryRoot, token, pid }, true);
+}
+function resolveSessionBindingWith({ repositoryRoot, token, pid }, walkTree) {
   return sessionBoundary(() => {
     sessionRootName(repositoryRoot);
     if (typeof token !== 'string' || !SESSION_TOKEN.test(token)) sessionFail();
@@ -1013,7 +1018,7 @@ export function resolveSessionBinding({ repositoryRoot, token, pid = process.pid
       try { data = sessionRecord(runtime, root, repositoryRoot, token.slice(0, 34), token); }
       finally { index.close(); }
       if (data.record.kind !== 'session') sessionFail();
-      verifyLiveSession(runtime, repositoryRoot, data);
+      verifyLiveSession(runtime, repositoryRoot, data, walkTree);
       requireSessionDescendant(pid, data.record);
       return { ...data.record, token: data.token, live: true };
     });
@@ -1067,17 +1072,38 @@ export function inspectSessionBindings({ repositoryRoot }) {
   });
 }
 export function createSessionBinding({ repositoryRoot, releaseId, kind = 'session', parentBinding = null }) {
+  return createSessionBindingWith({ repositoryRoot, releaseId, kind, parentBinding }, true);
+}
+/** Entry selection reads manifests only; the one full release walk is the compatibility digest inside binding creation. */
+export function bindEntryRelease({ repositoryRoot, token, kind = 'invocation' }) {
+  let releaseId;
+  if (token !== undefined) releaseId = resolveSessionBindingWith({ repositoryRoot, token, pid: process.pid }, false).releaseId;
+  else {
+    const selected = withStore(repositoryRoot, false, runtime => currentIn(runtime, repositoryRoot, false));
+    if (!selected) fail('DEPLOY_NO_CURRENT');
+    releaseId = selected.releaseId;
+  }
+  // Unbound entries report the walk's own code, as the separate selection walk did; sessionBoundary would relabel it.
+  const walked = {};
+  let binding;
+  try { binding = createSessionBindingWith({ repositoryRoot, releaseId, kind, parentBinding: token ?? null }, false, token === undefined ? walked : null); }
+  catch (error) { throw walked.error ?? error; }
+  return { releaseId, binding };
+}
+function createSessionBindingWith({ repositoryRoot, releaseId, kind, parentBinding }, walkParent, walked = null) {
   return sessionBoundary(() => {
     sessionRootName(repositoryRoot);
     if (!['session', 'invocation'].includes(kind) || kind === 'session' && parentBinding !== null ||
         !(parentBinding === null || typeof parentBinding === 'string' && SESSION_TOKEN.test(parentBinding))) sessionFail();
     if (parentBinding !== null) {
-      const parent = resolveSessionBinding({ repositoryRoot, token: parentBinding });
+      const parent = resolveSessionBindingWith({ repositoryRoot, token: parentBinding, pid: process.pid }, walkParent);
       if (parent.releaseId !== releaseId) sessionFail();
     }
     return withStore(repositoryRoot, false, (runtime, root) => {
       if (!runtime) sessionFail();
-      const compatibilityDigest = releaseCompatibilityIn(runtime, repositoryRoot, releaseId);
+      let compatibilityDigest;
+      try { compatibilityDigest = releaseCompatibilityIn(runtime, repositoryRoot, releaseId); }
+      catch (error) { if (walked && error instanceof DeploymentError) walked.error = error; throw error; }
       const observed = sessionProcess(process.pid);
       const owner = { uid: observed.uid, pid: observed.pid, startTime: observed.startTime, bootId: sessionBootId(),
         commandDigest: observed.commandDigest, exeDev: observed.exeDev, exeIno: observed.exeIno };
