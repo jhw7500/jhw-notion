@@ -9,13 +9,16 @@ import { ClaimService } from "./claim-service.js";
 import { createCliDependencies, isCliEntrypointInvocation } from "./cli.js";
 import { ControlContractAuthority } from "./contract-authority.js";
 import { encodeCanonicalJson, MAX_TOOL_INPUT_BYTES, type GuardCommonEvent } from "./guard-protocol.js";
+import { loadControlConfig } from "./config.js";
 import {
   createGuardServiceComposition,
   GuardSideEventResultSchema,
+  screenSelfApproval,
   type GuardSideEventResult,
 } from "./guard-service.js";
+import { appendGuardHookDiagnostic, type GuardDiagnosticKind, type GuardDiagnosticRow } from "./guard-diagnostics.js";
 import { createProductionGuardJournal } from "./guard-journal.js";
-import { resolveGuardEnvironment } from "./guard-policy.js";
+import { resolveGuardEnvironment, type GuardEnvironmentResolution } from "./guard-policy.js";
 import {
   GuardDigestKey,
   GuardRequestStore,
@@ -159,10 +162,49 @@ async function resolveGuard(
   return typeof provider === "function" ? provider(event) : provider;
 }
 
+/** Present only when the host policy resolved to observe. */
+interface ObserveContext {
+  stateDir: string;
+}
+
+const HOOK_DIAGNOSTICS_RACE_MS = 250;
+
+/** One stdout emission per process: the first outcome wins, every later one is dropped. */
+class SingleEmission {
+  private done = false;
+
+  constructor(private readonly write: (stdout: string) => Promise<void>) {}
+
+  async emit(stdout: string): Promise<boolean> {
+    if (this.done) return false;
+    this.done = true;
+    await this.write(stdout);
+    return true;
+  }
+}
+
+async function recordBoundedDiagnostic(
+  observe: ObserveContext | undefined,
+  row: Omit<GuardDiagnosticRow, "mode">,
+): Promise<void> {
+  if (!observe) return;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      appendGuardHookDiagnostic(observe.stateDir, { ...row, mode: "observe" }),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, HOOK_DIAGNOSTICS_RACE_MS); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function executeHookAdapter(
   argv: readonly string[],
   raw: string | Uint8Array,
   provider: HookGuardPort | ((event: HookEventName) => Promise<HookGuardPort>),
+  observe?: ObserveContext,
+  emission?: SingleEmission,
 ): Promise<HookRunResult> {
   let selection: ReturnType<typeof parseHookCliArguments>;
   try {
@@ -171,11 +213,38 @@ async function executeHookAdapter(
     return failureResult(fallbackEvent(argv), "GUARD_PROTOCOL_MISMATCH");
   }
   const codec = codecFor(selection.adapter);
+  let stdin: Record<string, unknown> | undefined;
+  try {
+    stdin = parseBoundedHookStdin(raw);
+  } catch {
+    stdin = undefined;
+  }
+  // In observe a Guard self-failure on PreToolUse is a recorded allow, but only
+  // when the self-approval screen of the raw input is clear: unreadable,
+  // unscannable and self-approving input stays denied.
+  const observeAllowed = observe !== undefined && selection.event === "PreToolUse" && stdin !== undefined &&
+    screenSelfApproval(selection.adapter, stdin.tool_name, stdin.tool_input) === "clear";
+  const failed = async (
+    code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH",
+    kind: GuardDiagnosticKind,
+  ): Promise<HookRunResult> => {
+    if (!observeAllowed) return failureResult(selection.event, code);
+    const result: HookRunResult = {
+      exitCode: 0,
+      stdout: serializeNative(selection.event, { hookSpecificOutput: { hookEventName: "PreToolUse" } }),
+      stderr: "",
+    };
+    // The decision reaches stdout first; the diagnostic is bounded.
+    await emission?.emit(result.stdout);
+    await recordBoundedDiagnostic(observe, { adapter: selection.adapter, event: selection.event, kind, code });
+    return result;
+  };
   let event: GuardCommonEvent;
   try {
-    event = codec.decode(selection.event, parseBoundedHookStdin(raw));
+    if (stdin === undefined) throw new TypeError("Invalid hook stdin");
+    event = codec.decode(selection.event, stdin);
   } catch {
-    return failureResult(selection.event, "GUARD_PROTOCOL_MISMATCH");
+    return failed("GUARD_PROTOCOL_MISMATCH", "decode_failure");
   }
 
   let rawResult: unknown;
@@ -191,7 +260,7 @@ async function executeHookAdapter(
       rawResult = await guard.recordSessionEnd(event);
     }
   } catch {
-    return failureResult(selection.event, "GUARD_UNAVAILABLE");
+    return failed("GUARD_UNAVAILABLE", "unrecorded_allow");
   }
 
   try {
@@ -204,7 +273,7 @@ async function executeHookAdapter(
           : codec.renderSessionEnd(rawResult);
     return { exitCode: 0, stdout: serializeNative(selection.event, rendered), stderr: "" };
   } catch {
-    return failureResult(selection.event, "GUARD_PROTOCOL_MISMATCH");
+    return failed("GUARD_PROTOCOL_MISMATCH", "unrecorded_allow");
   }
 }
 
@@ -216,9 +285,11 @@ export async function runHookAdapter(
   return executeHookAdapter(argv, raw, guard);
 }
 
-async function createProductionHookGuard(environment: NodeJS.ProcessEnv): Promise<HookGuardPort> {
-  const resolution = resolveGuardEnvironment(environment);
-  environment = resolution.environment;
+async function createProductionHookGuard(
+  resolution: GuardEnvironmentResolution,
+  observe: ObserveContext | undefined,
+): Promise<HookGuardPort> {
+  const environment = resolution.environment;
   const dependencies = createCliDependencies(environment);
   const catalog = dependencies.catalog as unknown as Catalog;
   const claims = dependencies.guardClaims as unknown as ClaimService;
@@ -248,6 +319,7 @@ async function createProductionHookGuard(environment: NodeJS.ProcessEnv): Promis
     guard_request_store: requestStore,
     guard_journal: guardJournal,
     mode: dependencies.guardMode,
+    record_diagnostic: (row) => recordBoundedDiagnostic(observe, { ...row, event: "PreToolUse" }),
     inspect_guard_state: async () => {
       const [key, requests] = await Promise.all([digestKey.inspect(), requestStore.inspect()]);
       return key.status === "ready" && requests.status === "ready";
@@ -281,10 +353,30 @@ export async function runProductionHookAdapter(
   argv: readonly string[],
   raw: string | Uint8Array,
   environment: NodeJS.ProcessEnv = process.env,
+  write?: (stdout: string) => Promise<void>,
 ): Promise<HookRunResult> {
-  return executeHookAdapter(argv, raw, async (event) => event === "SessionEnd"
-    ? sessionEndOnlyGuard(environment)
-    : createProductionHookGuard(environment));
+  // Resolved once and shared with the provider. SessionEnd never needs it.
+  let resolution: GuardEnvironmentResolution | undefined;
+  let resolutionError: unknown;
+  let observe: ObserveContext | undefined;
+  if (fallbackEvent(argv) !== "SessionEnd") {
+    try {
+      resolution = resolveGuardEnvironment(environment);
+      if (resolution.mode === "observe") observe = { stateDir: loadControlConfig(resolution.environment).stateDir };
+    } catch (cause) {
+      // Mode unknown: every failure stays denied.
+      resolutionError = cause;
+    }
+  }
+  const emission = write ? new SingleEmission(write) : undefined;
+  const result = await executeHookAdapter(argv, raw, async (event) => {
+    if (event === "SessionEnd") return sessionEndOnlyGuard(environment);
+    if (!resolution) throw resolutionError;
+    return createProductionHookGuard(resolution, observe);
+  }, observe, emission);
+  // A result that was not already emitted, such as a denial, goes out here; the latch drops a second emission.
+  await emission?.emit(result.stdout);
+  return result;
 }
 
 async function writeResult(stream: Writable, content: string): Promise<void> {
@@ -310,8 +402,7 @@ async function main(): Promise<void> {
     process.exitCode = 0;
     return;
   }
-  const result = await runProductionHookAdapter(argv, raw, process.env);
-  await writeResult(process.stdout, result.stdout);
+  const result = await runProductionHookAdapter(argv, raw, process.env, (stdout) => writeResult(process.stdout, stdout));
   process.exitCode = result.exitCode;
 }
 

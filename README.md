@@ -255,12 +255,40 @@ host observe 전환은 `$HOME/.config/jhw-control/guard-policy.json`의 canonica
 private 파일을 자동 생성·수정하지 않는다.
 
 관찰 모드의 일반 Task/Claim 위반은 별도 필수 audit stream에 남기며, 전용 프로세스 잠금 안에서
-같은 FD의 전체 형식·owner·mode·link를 검증하고 append·fsync·재검증한 뒤에만 허용한다.
-기록 실패·손상·잠금 실패는 `GUARD_UNAVAILABLE`로 차단하고 자동 수리하지 않는다. 다만 control 명령 같은
-다른 Registry writer가 `registry.lock`을 쥐고 있어 PreToolUse 평가가 기다리다 끝나면, 관찰 모드는
-`GUARD_UNAVAILABLE`과 reason `registry_state_lock`을 기록한 뒤 허용한다. 기록 성공 뒤
-optional legacy journal만 실패하면 warning을 반환한다. protocol·unavailable(위 `registry_state_lock` 경합 제외)·self-approval도
-차단한다. 진단은 request/key를 초기화하지 않으며 첫 유효 hook만 missing store를 준비한다.
+같은 FD의 전체 형식·owner·mode·link를 검증하고 append·fsync·재검증한 뒤 허용한다. 관찰 모드의
+PreToolUse는 Guard 자신의 실패(`GUARD_UNAVAILABLE`, `GUARD_PROTOCOL_MISMATCH`, 관찰 기록의 잠금·쓰기·손상·
+8,192행 상한 실패)를 host policy가 observe로 확인되고 self-approval 사전 검사가 clear일 때 기록하고 허용한다.
+다른 Registry writer의 `registry.lock` 경합은 `GUARD_UNAVAILABLE`과 reason `registry_state_lock`으로 기록한다.
+관찰 기록 자체를 쓸 수 없으면 audit row 없이 허용하고 아래 진단 파일에 `unrecorded_allow`만 남기며 자동 수리하지
+않는다. self-approval, 64 KiB를 넘어 검사할 수 없는 실행 command, 읽을 수 없는 `tool_input`은 계속 차단한다.
+core 밖의 실패(runner timeout, core crash, shell fallback)는 정책과 사전 검사를 알 수 없으므로 차단한다.
+enforce는 다음 세 경우만 거부 코드가 바뀌고 나머지는 그대로다. 형식이 잘못된 입력이나 해석할 수 없는 mode가
+self-approval command를 포함하면 `GUARD_UNAVAILABLE` 대신 `GUARD_SELF_APPROVAL_DENIED`로, 검사할 수 없는 실행
+command를 포함하면 `GUARD_UNAVAILABLE` 대신 `GUARD_PROTOCOL_MISMATCH`로 거부한다. self-approval 검사기가
+`ShellClassificationError`가 아닌 예외를 던지면 예외가 전파돼 `GUARD_UNAVAILABLE`로 끝나던 것을
+`GUARD_PROTOCOL_MISMATCH`로 거부한다. 기록 성공 뒤 optional legacy journal만 실패하면 warning을 반환한다.
+진단은 request/key를 초기화하지 않으며 첫 유효 hook만 missing store를 준비한다.
+모든 도구가 막혀 세션을 이어 갈 수 없을 때의 사용자 터미널 절차는
+`docs/project-control/guard-break-glass.md`를 따른다.
+
+관찰 모드에서 허용으로 바뀐 Guard 자신의 실패는 control state 디렉터리의 `guard-hook-diagnostics.v1.jsonl`에
+한 줄씩 남는다. 이 파일은 어떤 release도 읽지 않으므로 이전 release로 되돌려도 열리지 않고 판정에 쓰이지 않는다.
+state 디렉터리가 아직 없으면 만들지 않고, 잠금 없이 한 줄(1 KiB 이하, mode 0600)을 append하며 실패는 무시한다.
+행은 `v`, `at`, `adapter`, `event`, `mode`, `kind`와 선택적 `code`·`elapsed_ms`만 담고 session id와 경로는 없다.
+진단 파일이 크기 상한(1 MiB)에 닿으면 이후 observe의 Guard 자신의 실패 허용은 진단 행을
+남기지 않는다. 그 시점부터 이 파일에는 관찰이 더 기록되지 않는다.
+
+| `kind` | 의미 |
+|---|---|
+| `unrecorded_allow` | Guard 실패(`code`)를 허용했고 관찰 audit row는 남기지 못했다. 관찰 기록이 상한·손상·잠금으로 막혔다는 신호다. |
+| `decode_failure` | hook 입력이 decode되지 않았지만 self-approval 사전 검사가 clear라 허용했다. 관찰 모드에서 hook 입력 형식이 바뀌어도 차단 없이 지나가므로 이 건수로 확인한다. |
+
+건수 확인(`JHW_CONTROL_STATE_DIR`를 쓰면 그 디렉터리):
+
+```sh
+grep -o '"kind":"[a-z_]*"' "$HOME/.local/state/jhw-control/guard-hook-diagnostics.v1.jsonl" | sort | uniq -c
+```
+
 `unprotected: false`, `runtime_mode: observe`, `enforced: false`는 배선·관찰 상태이며 강제 보호 완료가 아니다.
 
 전환 전후 세 파일의 bytes·mode와 frozen activation은 private `.deploy.*/before.json`에 보존된다.

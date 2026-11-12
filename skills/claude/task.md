@@ -491,7 +491,7 @@ jhw-control guard preflight
 
 호스트가 별도로 opt-in한 `$HOME/.config/jhw-control/guard-policy.json`의 exact `{version:1,mode:"observe"}`도 Guard 전용 관찰 모드를 선택한다. policy는 current-user-owned 단일 링크 regular `0600`이고 안전한 no-follow 부모 경로여야 한다. Guard 이벤트와 `guard status`/`guard preflight`에만 적용하며, 일반 CLI·credential launcher의 env-only 계약은 유지한다. 좌표 env가 하나라도 있으면 전체 env만 검증하며 private `control.env`와 섞지 않는다. 좌표 env가 전혀 없을 때만 명시 policy 아래의 안전한 data-only 11개 좌표를 사용한다. 명시 enforce와 policy observe가 충돌하거나 일부 env·unsafe policy이면 fail-closed다.
 
-관찰 모드는 일반 Task/Claim 규칙 위반을 별도 versioned observe journal에 기록하고 permit을 발급하지 않는다. protocol mismatch·Guard unavailable·self-approval 같은 안전 오류는 계속 차단한다. 다만 다른 Registry writer가 `registry.lock`을 쥐고 있어 PreToolUse 평가가 기다리다 끝난 `GUARD_UNAVAILABLE` + `registry_state_lock`은 관찰 기록에 남기고 허용한다. 첫 유효 hook composition만 기존 store를 보존하며 missing request store와 digest key를 준비하고, 읽기 전용 진단은 상태 파일을 만들지 않는다. `runtime_mode: observe`, `enforced: false`는 배선 및 관찰을 뜻하며 강제 보호 완료가 아니다.
+관찰 모드는 일반 Task/Claim 규칙 위반을 별도 versioned observe journal에 기록하고 permit을 발급하지 않는다. self-approval, 검사할 수 없는 실행 command, 읽을 수 없는 `tool_input`은 계속 차단한다. PreToolUse에서 Guard 자신의 실패(`GUARD_UNAVAILABLE`·`GUARD_PROTOCOL_MISMATCH`, 관찰 기록 쓰기 실패, 다른 Registry writer의 `registry.lock` 경합 `registry_state_lock`)는 self-approval 사전 검사가 clear일 때 관찰 기록에 남기고 허용하며, 기록 자체를 쓸 수 없으면 진단 파일 `guard-hook-diagnostics.v1.jsonl`에 `unrecorded_allow`만 남긴다. core 밖의 실패(runner timeout, core crash)는 계속 차단한다. 첫 유효 hook composition만 기존 store를 보존하며 missing request store와 digest key를 준비하고, 읽기 전용 진단은 상태 파일을 만들지 않는다. `runtime_mode: observe`, `enforced: false`는 배선 및 관찰을 뜻하며 강제 보호 완료가 아니다.
 
 ## 결과 해석
 

@@ -445,7 +445,8 @@ activation의 전환 증거 하나로만 원래 세 파일을 복원하고 retai
 
 필수 observe audit는 전용 bounded cross-process flock 아래 단일 no-follow FD로 전체 UTF-8/framing/
 schema를 읽고 append·fsync·post-validation한다. poisoned tail·UID/mode/link/path drift·lock/write/sync
-실패는 ALLOW 대신 GUARD_UNAVAILABLE이며 자동 repair는 없다. optional legacy journal과 SessionEnd의
+실패는 audit row 없이 허용하고 읽는 release가 없는 진단 파일에 `unrecorded_allow`만 남기며 자동 repair는
+없다(enforce와 self-approval·검사 불가 입력의 차단은 그대로다). optional legacy journal과 SessionEnd의
 별도 advisory 성격은 유지한다. 이 audit는 Claim/permit/Registry authority를 만들지 않는다.
 
 배포 기록 prune은 모든 후보의 검증된 durable recovery copy를 먼저 만들고 원본을 변경한다.

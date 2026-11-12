@@ -80,7 +80,7 @@ const notionInput = exactAuthorityCoordinates({ db: notionDatabaseId }, ["db"]);
 const notionNoteInput = exactAuthorityCoordinates({ title: z.string().min(1).optional() }, []);
 const trackerInput = exactAuthorityCoordinates({ issue_node_id: z.string().min(1) }, ["issue_node_id"]);
 
-type GuardToolFamily = "file_read" | "file_modify" | "shell" | "notion_mutation" | "tracker_mutation" | "unclassified";
+export type GuardToolFamily = "file_read" | "file_modify" | "shell" | "notion_mutation" | "tracker_mutation" | "unclassified";
 
 interface ToolDefinition {
   family: Exclude<GuardToolFamily, "unclassified">;
@@ -138,6 +138,11 @@ export function guardToolIdentityInventoryForTesting(): readonly Readonly<{
       rawToolName: encoded.slice(separator + 1),
     });
   }));
+}
+
+/** Table lookup only: it cannot throw, and an unknown tool is `unclassified`. */
+export function guardToolFamily(adapter: GuardAdapter, rawToolName: string): GuardToolFamily {
+  return (toolDefinitions[key(adapter, rawToolName)] as ToolDefinition | undefined)?.family ?? "unclassified";
 }
 
 function patchTargets(input: JsonValue): string[] | undefined {

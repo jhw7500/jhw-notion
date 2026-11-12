@@ -33,9 +33,11 @@ import {
   type NormalizeOperationContext,
 } from "./operation-normalizer.js";
 import {
+  guardToolFamily,
   resolveGuardTool,
   type ResolvedGuardTool,
 } from "./guard-tool-resolver.js";
+import type { GuardDiagnosticRow } from "./guard-diagnostics.js";
 import {
   createGuardMutationLockAuthority,
   createGuardMutationLockAuthorityForTesting,
@@ -336,6 +338,8 @@ export interface GuardServiceOptions {
   mode?: GuardEvaluationMode;
   /** Strict read-only inspection seam. It must never create, clean, or lock state. */
   inspect_guard_state?: () => Promise<boolean>;
+  /** Best-effort, never-throwing sink for diagnostics that no release reads. */
+  record_diagnostic?: (row: Pick<GuardDiagnosticRow, "kind" | "code"> & { adapter: GuardAdapter }) => Promise<void>;
 }
 
 const summaryByCode: Record<GuardDenyCode, string> = {
@@ -356,11 +360,40 @@ const summaryByCode: Record<GuardDenyCode, string> = {
   GUARD_STATE_LIMIT: "Guard request state limit was reached",
 };
 
-const hardObserveCodes = new Set<GuardDenyCode>([
-  "GUARD_PROTOCOL_MISMATCH",
-  "GUARD_UNAVAILABLE",
-  "GUARD_SELF_APPROVAL_DENIED",
-]);
+const hardObserveCodes = new Set<GuardDenyCode>(["GUARD_SELF_APPROVAL_DENIED"]);
+
+export type SelfApprovalScreen = "clear" | "self_approval" | "unscannable" | "invalid_command" | "unreadable";
+
+/**
+ * Pure early screen shared by the service and the hook adapter. `unreadable`
+ * means the input cannot be screened at all. A runnable command that is too
+ * large to scan, or any detector failure, is `unscannable`; a classified
+ * shell tool whose `command` is not a string is `invalid_command`. Neither is
+ * ever `clear`. Any other tool family keeps its pre-screen behaviour for a
+ * non-string `command`.
+ */
+export function screenSelfApproval(adapter: GuardAdapter, toolName: unknown, toolInput: unknown): SelfApprovalScreen {
+  if (typeof toolName !== "string" || typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) {
+    return "unreadable";
+  }
+  const family = guardToolFamily(adapter, toolName);
+  const runnable = family !== "file_modify";
+  const command = (toolInput as Record<string, unknown>).command;
+  if (command === undefined) return "clear";
+  if (typeof command !== "string") return family === "shell" ? "invalid_command" : "clear";
+  if (command === "") return "clear";
+  // The self-approval scan reads at most the shell command bound and simple
+  // argv tokens. A command that may run (shell or unclassified tools) and that
+  // the scan cannot read is refused in every mode, as it was before larger tool
+  // inputs were accepted, so padding never hides an approval. A file-modifying
+  // tool's `command` is patch text that is never run, so its size is not refused.
+  if (runnable && !selfApprovalScanCovers(command)) return "unscannable";
+  try {
+    return detectGuardSelfApproval(command) ? "self_approval" : "clear";
+  } catch (cause) {
+    return cause instanceof ShellClassificationError && !runnable ? "clear" : "unscannable";
+  }
+}
 
 // Another Registry writer (a control command such as preflight or task finish,
 // or another Guard evaluation) can hold registry.lock longer than the bounded
@@ -641,10 +674,16 @@ export class GuardService {
   ): Promise<GuardDecision> {
     const eventResult = this.safeCommonEvent(eventInput);
     if (!eventResult.success || eventResult.data.event !== "pre_tool_use") {
-      return this.deny("GUARD_PROTOCOL_MISMATCH");
+      return this.hardDeny("GUARD_PROTOCOL_MISMATCH");
     }
     const event = eventResult.data;
     journalContext.event = event;
+    // Before every self-failure path, so observe never converts these two.
+    const screen = screenSelfApproval(event.adapter, event.tool_name, event.tool_input);
+    if (screen === "self_approval") return this.hardDeny("GUARD_SELF_APPROVAL_DENIED");
+    if (screen === "unscannable") return this.hardDeny("GUARD_PROTOCOL_MISMATCH");
+    // The shell identity codec requires a string command and enforce denies it as GUARD_UNAVAILABLE; observe must not convert it.
+    if (screen === "invalid_command") return this.hardDeny("GUARD_UNAVAILABLE");
     let resolvedTool: ResolvedGuardTool;
     try {
       resolvedTool = resolveGuardTool(event.adapter, event.tool_name, event.tool_input);
@@ -654,25 +693,6 @@ export class GuardService {
     if (!this.mode) return this.deny("GUARD_UNAVAILABLE");
     if (this.mode === "observe" && !await this.observeStateAvailable()) {
       return this.deny("GUARD_UNAVAILABLE");
-    }
-
-    const earlyCommand = resolvedTool.self_approval_command;
-    if (earlyCommand) {
-      // The self-approval scan reads at most the shell command bound and simple
-      // argv tokens. A command that may run (shell or unclassified tools) and that
-      // the scan cannot read is refused in every mode, as it was before larger tool
-      // inputs were accepted, so padding never hides an approval. A file-modifying
-      // tool's `command` is patch text that is never run, so its size is not refused.
-      const runnable = resolvedTool.family !== "file_modify";
-      if (runnable && !selfApprovalScanCovers(earlyCommand)) return this.deny("GUARD_PROTOCOL_MISMATCH");
-      let selfApproval = false;
-      try {
-        selfApproval = detectGuardSelfApproval(earlyCommand);
-      } catch (cause) {
-        if (!(cause instanceof ShellClassificationError)) throw cause;
-        if (runnable) return this.deny("GUARD_PROTOCOL_MISMATCH");
-      }
-      if (selfApproval) return this.deny("GUARD_SELF_APPROVAL_DENIED");
     }
 
     const claimFree = await claimFreeReadSummary(event, resolvedTool);
@@ -724,25 +744,8 @@ export class GuardService {
     } catch (cause) {
       if (authoritativeDecision) return authoritativeDecision;
       if (!registryWriterHoldsLock(cause)) return this.deny("GUARD_UNAVAILABLE");
-      return this.mode === "observe"
-        ? this.observeRegistryBusy()
-        : this.deny("GUARD_UNAVAILABLE", undefined, undefined, "hook", undefined, "registry_state_lock");
+      return this.deny("GUARD_UNAVAILABLE", undefined, undefined, "hook", undefined, "registry_state_lock");
     }
-  }
-
-  // Observe mode only (#241): record the would-be denial with the existing code
-  // and reason, so a release rolled back to still reads the observation journal,
-  // and allow. No request state was touched: the barrier was never entered.
-  private observeRegistryBusy(): GuardDecision {
-    const observed = GuardDecisionSchema.parse({
-      decision: "ALLOW",
-      operation_id: newOperationId(),
-      summary: "Another Registry writer holds the Registry lock",
-      execution_boundary: "hook",
-      observed_decision: "DENY",
-    });
-    this.observedDenialCodes.set(observed, { code: "GUARD_UNAVAILABLE", reason: "registry_state_lock" });
-    return observed;
   }
 
   private async evaluatePinned(
@@ -1301,9 +1304,8 @@ export class GuardService {
       : undefined;
     const requiresObservation = decision.decision === "ALLOW" && decision.observed_decision !== undefined;
     if (!this.decisionJournal || (requiresObservation && observation === undefined)) {
-      return requiresObservation
-        ? this.deny("GUARD_UNAVAILABLE", claim, operation)
-        : this.journalConfigured ? this.withJournalWarning(decision) : decision;
+      if (requiresObservation) return this.unrecordedAllow(decision, event?.adapter, observedCode);
+      return this.journalConfigured ? this.withJournalWarning(decision) : decision;
     }
     try {
       if (observation !== undefined) {
@@ -1313,10 +1315,23 @@ export class GuardService {
       await this.decisionJournal.append(journalEvent);
       return decision;
     } catch {
-      return requiresObservation
-        ? this.deny("GUARD_UNAVAILABLE", claim, operation)
-        : this.withJournalWarning(decision);
+      return requiresObservation ? this.unrecordedAllow(decision, event?.adapter, observedCode) : this.withJournalWarning(decision);
     }
+  }
+
+  // Observe only: an observation that cannot be made durable still allows, and
+  // the loss is reported to the diagnostics file instead of denying every call.
+  private async unrecordedAllow(
+    decision: GuardDecision,
+    adapter: GuardAdapter | undefined,
+    code: GuardDenyCode | undefined,
+  ): Promise<GuardDecision> {
+    try {
+      if (adapter) await this.options.record_diagnostic?.({ kind: "unrecorded_allow", adapter, ...(code ? { code } : {}) });
+    } catch {
+      // Diagnostics never change a decision.
+    }
+    return decision;
   }
 
   private withJournalWarning(decision: GuardDecision): GuardDecision {
@@ -1433,9 +1448,18 @@ export class GuardService {
         observed_decision: "DENY",
         ...(journalWarning ? { journal_warning: journalWarning } : {}),
       });
-      this.observedDenialCodes.set(observed, { code });
+      this.observedDenialCodes.set(observed, { code, ...(reason ? { reason } : {}) });
       return observed;
     }
+    return this.hardDeny(code, claim, journalWarning, reason);
+  }
+
+  private hardDeny(
+    code: GuardDenyCode,
+    claim?: ActiveClaim,
+    journalWarning?: "GUARD_JOURNAL_UNAVAILABLE",
+    reason?: ErrorReason,
+  ): GuardDecision {
     return GuardDecisionSchema.parse({
       decision: "DENY",
       code,
