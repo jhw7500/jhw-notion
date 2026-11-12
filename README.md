@@ -76,7 +76,8 @@ parser로 descriptor를 읽고 전후 identity를 대조한 뒤 `NOTION_API_KEY`
 반영하고 fd를 닫는다. 다른 well-formed key는 실행하거나 전달하지 않으며 Node startup injection
 변수도 selector child environment에서 제거하므로 credential data가 bundle보다 먼저 코드로
 평가되지 않는다. hook runner는 모든 이벤트에서
-timeout 뒤 `SIGTERM`, 200 ms 뒤 `SIGKILL` 순으로 종료를 보장한다. 설치기는 다음 wiring을
+timeout 뒤 `SIGTERM`, 200 ms 뒤 `SIGKILL` 순으로 종료를 보장하고, watchdog timeout은 event 형태의
+`GUARD_HOOK_TIMEOUT`(SessionEnd는 `{}`)으로, 그 밖의 runner 실패는 `GUARD_UNAVAILABLE`로 한 줄만 낸다. 설치기는 다음 wiring을
 ownership proof와 기존 no-clobber transaction으로 생성한다.
 
 1. `~/.local/bin/jhw-control`과 `~/.local/bin/jhw-control-hook`
@@ -227,6 +228,8 @@ deployment journal은 자동 삭제하지 않는다. stage와 private evidence�
 | `DEPLOY_VALIDATION_FAILED` / `rollback_recovery_required` | rollback 자체의 검증 실패다. 추가 `--rollback`은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. maintenance와 pointer·pending evidence를 유지하고 operator 수동 검토로 넘긴다. |
 | `DEPLOY_RECOVERY_REQUIRED` | `--status`와 retained private evidence를 읽고 maintenance를 유지한 채 operator review로 넘긴다. 자동 restore, journal 삭제, `installed:true` 강제 설정은 하지 않는다. |
 | `DEPLOY_PREDECESSOR_INVALID` | rollback 대상이 없거나 유효하지 않다. 임의 release를 predecessor로 대체하지 않는다. |
+| `GUARD_HOOK_TIMEOUT` | Guard hook runner의 watchdog(SessionEnd 2초, 그 밖 8초)이 core를 종료시켜 PreToolUse·UserPromptSubmit·PostToolUse가 event 형태의 deny 또는 알림으로 끝났다(SessionEnd는 `{}`). 저장되는 값이 아니라 runner stdout에만 나온다. core가 느려진 원인(예: Registry 경합)을 확인하고 자동 재시도나 hook 제거는 하지 않는다. core가 죽거나 출력이 규격 밖인 경우는 `GUARD_UNAVAILABLE`로 그대로다. |
+| `DEPLOY_CHILD_SIGNALED` | `jhw-control-host`가 출력을 캡처하는 managed control child가 signal로 끝났다. 종료코드 75와 이 코드 한 줄이 stderr에 나오며 저장되지 않는다. child가 이미 stderr에 썼다면 launcher는 두 줄 이상을 보게 되어 이전과 같이 `CONTROL_OUTPUT_INVALID`로 보고한다. `board with`와 managed MCP selector는 기존대로 128+signal을 반환하고 아무것도 쓰지 않는다. |
 
 Guard 결과는 deployment 성공과 별도다. activation 결과의 `unprotected: true`는 Project
 Control 좌표가 전혀 없어 exact `INVALID_CONFIG` 경로로 Guard group을 활성화하지 않았다는

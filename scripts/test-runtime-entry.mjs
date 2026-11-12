@@ -307,15 +307,97 @@ test('every hook event escalates an ignored SIGTERM to SIGKILL', async t => {
   const f=await fixture(t,undefined,hookBody,{
     'runtime-entry.mjs':bytes=>bytes.replace("event==='SessionEnd' ? 2000 : 8000","event==='SessionEnd' ? 100 : 100"),
   });
-  for (const event of ['PreToolUse','UserPromptSubmit','PostToolUse']) {
+  for (const event of ['PreToolUse','UserPromptSubmit','PostToolUse','SessionEnd']) {
     const result=spawnSync(path.join(f.bootstrap,'jhw-runtime-hook'),['--adapter','claude','--event',event],{
       input:'{}',encoding:'utf8',timeout:900,
     });
     assert.equal(result.error,undefined,String(result.error));
     assert.equal(result.status,0,result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout),hookFailure(event,'GUARD_UNAVAILABLE'));
+    assert.deepEqual(JSON.parse(result.stdout),hookFailure(event,'GUARD_HOOK_TIMEOUT'));
     const lease=acquireLease(f.lock); lease.close();
   }
+});
+
+// Preservation: a core that dies is not a watchdog timeout, and the runner still emits exactly one line.
+test('a hook core that throws keeps GUARD_UNAVAILABLE in exactly one line', async t => {
+  const f=await fixture(t,undefined,"throw new Error('boom');");
+  for (const event of ['PreToolUse','UserPromptSubmit','PostToolUse','SessionEnd']) {
+    const result=run(f,'jhw-runtime-hook',['--adapter','claude','--event',event],'{}');
+    assert.equal(result.status,0,result.stderr);
+    assert.equal(result.stdout.split('\n').filter(Boolean).length,1);
+    assert.deepEqual(JSON.parse(result.stdout),hookFailure(event,'GUARD_UNAVAILABLE'));
+  }
+});
+
+// Break caught: a control core that dies while loading or running leaving no single-line error for jhw-control-host.
+test('a control bundle that throws exits 1 with exactly one JSON error line', async t => {
+  const external=await fixture(t,undefined,undefined,{},{
+    bundleBody:"require('../external.cjs');",
+    extraBuild:(stagingRoot,root)=>write(stagingRoot,'mcp-server/dist/external.cjs',`require('node:fs').writeFileSync(${JSON.stringify(path.join(root,'external-module-executed'))},'bad');`),
+  });
+  const forbidden=run(external,'jhw-runtime-control',[]);
+  assert.equal(forbidden.status,1,forbidden.stderr); assert.equal(forbidden.stdout,'');
+  assert.equal(forbidden.stderr,controlError('DEPLOY_EXTERNAL_MODULE_FORBIDDEN'));
+  assert.equal(fs.existsSync(path.join(external.root,'external-module-executed')),false);
+  const boom=await fixture(t,undefined,undefined,{},{bundleBody:"throw new Error('boom');"});
+  const thrown=run(boom,'jhw-runtime-control',[]);
+  assert.equal(thrown.status,1,thrown.stderr); assert.equal(thrown.stdout,''); assert.equal(thrown.stderr,controlError('DEPLOY_START_FAILED'));
+  const late=await fixture(t,undefined,undefined,{},{bundleBody:"setTimeout(()=>{ throw new Error('late'); },20);"});
+  const lateResult=run(late,'jhw-runtime-control',[]);
+  assert.equal(lateResult.status,1,lateResult.stderr); assert.equal(lateResult.stderr,controlError('DEPLOY_START_FAILED'));
+});
+
+// Break caught: a control core's own error line followed by the default uncaught-error stack trace.
+test('a throwing control bundle that already wrote its error line adds nothing', async t => {
+  const own=JSON.stringify({error:{code:'OWN_FAILURE'}});
+  const f=await fixture(t,undefined,undefined,{},{bundleBody:`process.stderr.write(${JSON.stringify(own+'\n')}); throw new Error('boom');`});
+  const result=run(f,'jhw-runtime-control',[]);
+  assert.equal(result.status,1,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,own+'\n');
+});
+
+// Break caught: a signalled captured-output control child returning 128+n, which jhw-control-host rejects as CONTROL_OUTPUT_INVALID.
+test('a control child ended by a signal returns 75 with one DEPLOY_CHILD_SIGNALED line', async t => {
+  const f=await fixture(t,undefined,undefined,{},{bundleBody:"process.kill(process.pid,'SIGUSR2');"});
+  const result=run(f,'jhw-runtime-control',[]);
+  assert.equal(result.status,75,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,controlError('DEPLOY_CHILD_SIGNALED'));
+  const listed=run(f,'jhw-runtime-control',['board','list']);
+  assert.equal(listed.status,75,listed.stderr); assert.equal(listed.stderr,controlError('DEPLOY_CHILD_SIGNALED'));
+  // A child that already wrote its own line leaves the launcher two lines (CONTROL_OUTPUT_INVALID), as base does for any signalled child.
+  const own=controlError('OWN_FAILURE');
+  const written=await fixture(t,undefined,undefined,{},{bundleBody:`require('node:fs').writeSync(2,${JSON.stringify(own)}); process.kill(process.pid,'SIGUSR2');`});
+  const kept=run(written,'jhw-runtime-control',[]);
+  assert.equal(kept.status,75,kept.stderr); assert.equal(kept.stdout,''); assert.equal(kept.stderr,own+controlError('DEPLOY_CHILD_SIGNALED'));
+});
+
+// Preservation: `board with` runs with the launcher's inherited stdio and propagates the signal status, so it writes nothing and keeps 128+n.
+test('a signalled board with child keeps 128+signal and writes nothing', async t => {
+  const f=await fixture(t,undefined,undefined,{},{bundleBody:"process.kill(process.pid,'SIGUSR2');"});
+  const result=run(f,'jhw-runtime-control',['board','with','target']);
+  assert.equal(result.status,140,result.stderr); assert.equal(result.stdout,''); assert.equal(result.stderr,'');
+});
+
+// Preservation: an ordinary control exit code and its stderr pass through untouched.
+test('a control child exit code and stderr pass through unchanged', async t => {
+  const f=await fixture(t,undefined,undefined,{},{bundleBody:"process.stderr.write('child-stderr\\n'); process.exitCode=4;"});
+  const result=run(f,'jhw-runtime-control',[]);
+  assert.equal(result.status,4,result.stderr); assert.equal(result.stderr,'child-stderr\n');
+});
+
+// A drifted patch target must fail the test instead of silently leaving the fixture unpatched.
+function patched(bytes,target,replacement) { assert.ok(bytes.includes(target),'patch target missing: '+target); return bytes.replace(target,replacement); }
+
+// Break caught: a cleanup close throwing after failure() wrote its line, so the outer refusal writes a second one.
+test('a throwing binding close after a failure line adds no second emission', async t => {
+  const helperEdits={
+    'runtime-store.mjs':bytes=>patched(bytes,'return { id, token, record, fd: held.fd, close };',"return { id, token, record, fd: held.fd, close: () => { close(); throw new Error('close boom'); } };"),
+    'runtime-entry.mjs':bytes=>patched(bytes,"    if(selector==='hook') return await runPinnedHook(","    fail('DEPLOY_TEST_FORCED');\n    if(selector==='hook') return await runPinnedHook("),
+  };
+  const f=await fixture(t,undefined,undefined,helperEdits);
+  const hook=run(f,'jhw-runtime-hook',['--adapter','claude','--event','PreToolUse'],'{}');
+  assert.equal(hook.status,0,hook.stderr); assert.equal(hook.stdout.split('\n').filter(Boolean).length,1);
+  assert.deepEqual(JSON.parse(hook.stdout),hookFailure('PreToolUse','DEPLOY_TEST_FORCED'));
+  const control=run(f,'jhw-runtime-control',[]);
+  assert.equal(control.status,75,control.stderr); assert.equal(control.stdout,''); assert.equal(control.stderr,controlError('DEPLOY_TEST_FORCED'));
 });
 
 // Break caught: caching current at bootstrap installation instead of reading after admission.
