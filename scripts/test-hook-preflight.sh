@@ -183,8 +183,11 @@ if (inlineGroups?.length !== 2 || inlineOwned?.type !== "command" || inlineOwned
     inlineOwned?.command !== expectedOwned) process.exit(64);
 if (blocker?.type !== "command" || blocker?.timeout !== 12 || blocker?.command !== expectedBlocker) process.exit(64);
 const native = JSON.stringify({
-  hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "GUARD_UNAVAILABLE" },
-  systemMessage: "GUARD_UNAVAILABLE",
+  hookSpecificOutput: {
+    hookEventName: "UserPromptSubmit",
+    additionalContext: "NO_STATE_CHANGE\nPrompt did not change Guard authority",
+  },
+  systemMessage: "NO_STATE_CHANGE\nPrompt did not change Guard authority",
 });
 for (const value of [
   {
@@ -408,8 +411,10 @@ if (JSON.stringify(Object.keys(coverage).sort()) !== JSON.stringify(["claude", "
 }
 const axes = ["enforced", "execution_recheck", "post_tool_correlation", "pre_tool_block", "prompt_origin"];
 for (const [adapter, value] of Object.entries(coverage)) {
-  if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(axes)) {
-    fail(`${adapter} does not expose the exact five coverage axes`);
+  // Claude additionally names the hook inputs its probes do not interpret (#238).
+  const expectedKeys = adapter === "claude" ? [...axes, "unchecked_input_events"].sort() : axes;
+  if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(expectedKeys)) {
+    fail(`${adapter} does not expose the exact coverage keys`);
   }
 }
 const staticExpected = {
@@ -429,6 +434,7 @@ const expectedClaude = {
   post_tool_correlation: claudeAxes,
   execution_recheck: "pending",
   enforced: scenario === "claude-exact-trusted",
+  unchecked_input_events: ["PreToolUse", "PostToolUse", "SessionEnd"],
 };
 if (JSON.stringify(coverage.claude) !== JSON.stringify(expectedClaude)) {
   fail(`Claude installed/runtime coverage is not truthful: ${JSON.stringify(coverage.claude)}`);

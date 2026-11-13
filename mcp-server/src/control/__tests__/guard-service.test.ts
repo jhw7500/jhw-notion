@@ -2356,6 +2356,129 @@ describe("GuardService", () => {
       ]);
     });
 
+    describe("prompt origin (#239)", () => {
+      const NON_USER_SOURCES = ["sdk", "system", "loop_wakeup", "schedule_wakeup", "poll_event"] as const;
+
+      async function decisionRows(stateDir: string): Promise<GuardJournalEvent[]> {
+        const text = await readFile(join(stateDir, "guard-journal.jsonl"), "utf8").catch(() => "");
+        return text.split("\n").filter(Boolean).map((line) => JSON.parse(line) as GuardJournalEvent)
+          .filter((row) => row.event === "decision");
+      }
+
+      it.each(NON_USER_SOURCES)("refuses a %s-sourced unlock in enforce, records one decision row and keeps the request pending", async (source) => {
+        missingRepositoryModify();
+        const stateDir = join(fixture.root, `origin-enforce-${source}`);
+        const service = integratedService({ guard_journal: new GuardJournal(stateDir) });
+        const decision = await service.evaluatePreTool(preTool(fixture.cwd));
+        if (decision.decision !== "PERMIT_REQUIRED") throw new Error("expected a permit request");
+        const before = (await decisionRows(stateDir)).length;
+
+        await expect(service.submitUserPrompt(promptEvent(decision.approval_command, { prompt_source: source })))
+          .resolves.toMatchObject({
+            status: "DENY",
+            event: "user_prompt_submit",
+            code: "GUARD_PROMPT_ORIGIN_UNSUPPORTED",
+          });
+
+        const rows = await decisionRows(stateDir);
+        expect(rows).toHaveLength(before + 1);
+        expect(rows.at(-1)).toMatchObject({
+          event: "decision",
+          evaluation_stage: "hook",
+          origin_adapter: "codex",
+          session_id: SESSION_ID,
+          decision_code: "GUARD_PROMPT_ORIGIN_UNSUPPORTED",
+        });
+        expect(GuardJournalEventSchema.safeParse(rows.at(-1)).success).toBe(true);
+        expect(await storedRequests()).toEqual([
+          expect.objectContaining({ request_id: decision.request_id, state: "PENDING" }),
+        ]);
+      });
+
+      it.each(NON_USER_SOURCES)("refuses a %s-sourced unlock in observe and records one decision row", async (source) => {
+        const stateDir = join(fixture.root, `origin-observe-${source}`);
+        const service = fixture.service({
+          mode: "observe",
+          inspect_guard_state: async () => true,
+          guard_journal: new GuardJournal(stateDir),
+        });
+        await expect(service.submitUserPrompt(promptEvent(
+          "/jhw:unlock req-018f21e0-7b2c-7a00-8000-000000000099",
+          { prompt_source: source },
+        ))).resolves.toMatchObject({ status: "DENY", code: "GUARD_PROMPT_ORIGIN_UNSUPPORTED" });
+        expect(await decisionRows(stateDir)).toEqual([
+          expect.objectContaining({ decision_code: "GUARD_PROMPT_ORIGIN_UNSUPPORTED", session_id: SESSION_ID }),
+        ]);
+      });
+
+      it("refuses a non-user malformed unlock-prefixed prompt with the same code", async () => {
+        const stateDir = join(fixture.root, "origin-malformed");
+        const service = integratedService({ guard_journal: new GuardJournal(stateDir) });
+        await expect(service.submitUserPrompt(promptEvent("/jhw:unlock extra", { prompt_source: "sdk" })))
+          .resolves.toMatchObject({ status: "DENY", code: "GUARD_PROMPT_ORIGIN_UNSUPPORTED" });
+        expect(await decisionRows(stateDir)).toHaveLength(1);
+      });
+
+      it("reports a journal warning on the refusal when the append fails", async () => {
+        const journal = new GuardJournal(join(fixture.root, "origin-warning"), {
+          afterJournalSync: () => { throw new Error("decision journal unavailable"); },
+        });
+        const service = integratedService({ guard_journal: journal });
+        await expect(service.submitUserPrompt(promptEvent(
+          "/jhw:unlock req-018f21e0-7b2c-7a00-8000-000000000099",
+          { prompt_source: "sdk" },
+        ))).resolves.toMatchObject({
+          status: "DENY",
+          code: "GUARD_PROMPT_ORIGIN_UNSUPPORTED",
+          journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+        });
+      });
+
+      it.each([
+        ["user source", { prompt_source: "user" }],
+        ["absent source", {}],
+      ])("keeps today's handling for a %s (enforce approves, no origin row)", async (_label, overrides) => {
+        missingRepositoryModify();
+        const stateDir = join(fixture.root, `origin-user-${_label.replace(" ", "-")}`);
+        const service = integratedService({ guard_journal: new GuardJournal(stateDir) });
+        const decision = await service.evaluatePreTool(preTool(fixture.cwd));
+        if (decision.decision !== "PERMIT_REQUIRED") throw new Error("expected a permit request");
+
+        await expect(service.submitUserPrompt(promptEvent(decision.approval_command, overrides)))
+          .resolves.toMatchObject({ status: "APPROVED", request_id: decision.request_id });
+        expect((await decisionRows(stateDir)).map((row) => row.decision_code))
+          .not.toContain("GUARD_PROMPT_ORIGIN_UNSUPPORTED");
+      });
+
+      it.each([
+        ["user source", { prompt_source: "user" }],
+        ["absent source", {}],
+      ])("keeps today's observe handling for a %s", async (_label, overrides) => {
+        const service = fixture.service({ mode: "observe", inspect_guard_state: async () => true });
+        await expect(service.submitUserPrompt(promptEvent(
+          "/jhw:unlock req-018f21e0-7b2c-7a00-8000-000000000099",
+          overrides,
+        ))).resolves.toMatchObject({
+          status: "NO_STATE_CHANGE",
+          summary: "Observe mode does not approve permits",
+        });
+      });
+
+      it.each(NON_USER_SOURCES)("leaves a non-unlock %s prompt untouched", async (source) => {
+        const stateDir = join(fixture.root, `origin-ordinary-${source}`);
+        const service = integratedService({ guard_journal: new GuardJournal(stateDir) });
+        await expect(service.submitUserPrompt(promptEvent("summarize the repository", { prompt_source: source })))
+          .resolves.toMatchObject({ status: "NO_STATE_CHANGE", summary: "Prompt did not change Guard authority" });
+        expect(await decisionRows(stateDir)).toEqual([]);
+      });
+
+      it("still treats a source-less malformed unlock as no state change in enforce", async () => {
+        const service = integratedService();
+        await expect(service.submitUserPrompt(promptEvent("/jhw:unlock req-018f21e0-7b2c-7a00-8000-000000000099 extra")))
+          .resolves.toMatchObject({ status: "NO_STATE_CHANGE" });
+      });
+    });
+
     it("approves only the exact native prompt and atomically consumes the exact hook retry", async () => {
       missingRepositoryModify();
       const { requestId, service } = await requestAndApprove();

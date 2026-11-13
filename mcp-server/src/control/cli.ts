@@ -224,8 +224,15 @@ const GuardAdapterCoverageEntrySchema = z.object({
   execution_recheck: z.literal("pending"),
   enforced: z.boolean(),
 }).strict();
+// Claude's coverage entry also names the hook inputs the runtime probes do not interpret and,
+// when the owned UserPromptSubmit probe answered with a Guard failure, the bare code it carried.
+const claudeUncheckedInputEvents: ["PreToolUse", "PostToolUse", "SessionEnd"] = ["PreToolUse", "PostToolUse", "SessionEnd"];
+const GuardClaudeAdapterCoverageEntrySchema = GuardAdapterCoverageEntrySchema.extend({
+  probe_code: z.string().regex(/^GUARD_[A-Z0-9_]{1,56}$/).optional(),
+  unchecked_input_events: z.tuple([z.literal("PreToolUse"), z.literal("PostToolUse"), z.literal("SessionEnd")]),
+}).strict();
 const GuardAdapterCoverageSchema = z.object({
-  claude: GuardAdapterCoverageEntrySchema,
+  claude: GuardClaudeAdapterCoverageEntrySchema,
   codex: GuardAdapterCoverageEntrySchema,
   gemini: GuardAdapterCoverageEntrySchema,
   opencode: GuardAdapterCoverageEntrySchema,
@@ -1655,7 +1662,13 @@ function hasExactCodexHookProbe(raw: unknown): boolean {
   }
 }
 
-function hasExactClaudePromptProbe(raw: unknown): boolean {
+const claudeHealthyPromptCode = "NO_STATE_CHANGE";
+const guardFailureCodePattern = /^GUARD_[A-Z0-9_]{1,56}$/;
+
+// A healthy owned UserPromptSubmit response starts with NO_STATE_CHANGE; every Guard failure
+// output (static, runner, deadline, side deny) starts with a bare GUARD_* code instead.
+// `observeFailureCode` receives that code so preflight can name the cause.
+function hasExactClaudePromptProbe(raw: unknown, observeFailureCode?: (code: string) => void): boolean {
   const parsed = CodexHookProbeResultSchema.safeParse(raw);
   if (!parsed.success || parsed.data.exitCode !== 0 || parsed.data.signal !== null || parsed.data.stderr.byteLength !== 0) {
     return false;
@@ -1694,8 +1707,15 @@ function hasExactClaudePromptProbe(raw: unknown): boolean {
     if (!nativeLine || nativeLine.includes("\n") || nativeLine.includes("\r")) return false;
     try {
       const native = NativeHookOutputSchema.safeParse(JSON.parse(nativeLine));
-      return native.success && "hookSpecificOutput" in native.data &&
-        native.data.hookSpecificOutput.hookEventName === "UserPromptSubmit";
+      if (!native.success || !("hookSpecificOutput" in native.data) ||
+        native.data.hookSpecificOutput.hookEventName !== "UserPromptSubmit" ||
+        !("additionalContext" in native.data.hookSpecificOutput) || !("systemMessage" in native.data)) return false;
+      const firstLines = [native.data.hookSpecificOutput.additionalContext, native.data.systemMessage]
+        .map((text) => text.split("\n", 1)[0] as string);
+      if (firstLines.every((first) => first === claudeHealthyPromptCode)) return true;
+      const failureCode = firstLines.find((first) => guardFailureCodePattern.test(first));
+      if (failureCode) observeFailureCode?.(failureCode);
+      return false;
     } catch {
       return false;
     }
@@ -1745,12 +1765,14 @@ async function inspectAdapterCoverage(
   const claudeInstalled = claudeInstallation !== false && claudeInstallation !== undefined;
   let claudePromptTrusted = false;
   let claudeCommandTrusted = false;
+  let claudeProbeCode: string | undefined;
   if (claudeInstalled && dependencies.claudeHookRuntime) {
     try {
       const cwd = process.cwd();
       if (await claudeSettingsHierarchyAllowsHooks(cwd)) {
         claudePromptTrusted = hasExactClaudePromptProbe(
           await dependencies.claudeHookRuntime.probePrompt(dependencies.env.HOME as string),
+          (code) => { claudeProbeCode = code; },
         );
         if (claudePromptTrusted) {
           claudeCommandTrusted = hasExactCodexHookProbe(
@@ -1809,7 +1831,9 @@ async function inspectAdapterCoverage(
       post_tool_correlation: "ok",
       execution_recheck: "pending",
       enforced: dependencies.guardMode === "enforce" && claudePromptTrusted && claudeCommandTrusted,
-    } : { ...missing },
+      ...(claudeProbeCode !== undefined && !claudePromptTrusted ? { probe_code: claudeProbeCode } : {}),
+      unchecked_input_events: claudeUncheckedInputEvents,
+    } : { ...missing, unchecked_input_events: claudeUncheckedInputEvents },
     codex: installed ? {
       prompt_origin: "ok",
       pre_tool_block: "ok",

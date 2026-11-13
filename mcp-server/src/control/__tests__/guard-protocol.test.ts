@@ -1,11 +1,16 @@
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
   CanonicalOperationSchema,
+  GUARD_UNLOCK_PREFIX,
   GuardCommonEventSchema,
   GuardProtocolVersion,
   MAX_TOOL_INPUT_BYTES,
   OperationRequirementSchema,
+  parseGuardUnlockPrompt,
   type GuardCommonEventInput,
   type GuardCommonEventOutput,
 } from "../guard-protocol.js";
@@ -230,5 +235,51 @@ describe("canonical Guard protocol", () => {
     for (const field of ["tool_input", "command", "cwd", "prompt", "credential", "environment"]) {
       expect(CanonicalOperationSchema.safeParse({ ...canonical, [field]: "private" }).success).toBe(false);
     }
+  });
+
+  it("carries an optional known prompt source on user prompt events only", () => {
+    const prompt = {
+      protocol_version: 1,
+      adapter: "claude",
+      event: "user_prompt_submit",
+      session_id: "claude-local-hardening",
+      prompt: "hello",
+    };
+    expect(GuardCommonEventSchema.parse(prompt)).toEqual(prompt);
+    for (const source of ["user", "sdk", "system", "loop_wakeup", "schedule_wakeup", "poll_event"]) {
+      expect(GuardCommonEventSchema.parse({ ...prompt, prompt_source: source })).toMatchObject({ prompt_source: source });
+    }
+    expect(GuardCommonEventSchema.safeParse({ ...prompt, prompt_source: "operator" }).success).toBe(false);
+    expect(GuardCommonEventSchema.safeParse({ ...preTool, prompt_source: "user" }).success).toBe(false);
+  });
+});
+
+describe("Guard unlock prompt codec", () => {
+  const id = "req-018f21e0-7b2c-7a00-8000-000000000003";
+
+  it("classifies prompts as none, exact or malformed from one definition", () => {
+    expect(GUARD_UNLOCK_PREFIX).toBe("/jhw:unlock");
+    expect(parseGuardUnlockPrompt("ok")).toEqual({ kind: "none" });
+    expect(parseGuardUnlockPrompt(` ${GUARD_UNLOCK_PREFIX} ${id}`)).toEqual({ kind: "none" });
+    expect(parseGuardUnlockPrompt(`${GUARD_UNLOCK_PREFIX} ${id}`)).toEqual({ kind: "exact", request_id: id });
+    for (const raw of [
+      GUARD_UNLOCK_PREFIX,
+      `${GUARD_UNLOCK_PREFIX} ${id}\n`,
+      `${GUARD_UNLOCK_PREFIX} ${id} extra`,
+      `${GUARD_UNLOCK_PREFIX} ${id.toUpperCase()}`,
+      `${GUARD_UNLOCK_PREFIX}x ${id}`,
+    ]) {
+      expect(parseGuardUnlockPrompt(raw), raw).toEqual({ kind: "malformed" });
+    }
+  });
+
+  it("is the only place in control sources that spells the reserved prefix", () => {
+    const controlDir = dirname(dirname(fileURLToPath(import.meta.url)));
+    const offenders: string[] = [];
+    for (const name of readdirSync(controlDir)) {
+      if (!name.endsWith(".ts") || name === "guard-protocol.ts") continue;
+      if (readFileSync(join(controlDir, name), "utf8").includes("jhw:unlock")) offenders.push(name);
+    }
+    expect(offenders).toEqual([]);
   });
 });

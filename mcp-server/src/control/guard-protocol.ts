@@ -159,6 +159,9 @@ const boundedCoordinate = (maximumBytes: number) => z.string()
 
 export const GuardAdapterSchema = z.enum(["claude", "codex", "gemini", "opencode"]);
 export type GuardAdapter = z.infer<typeof GuardAdapterSchema>;
+export const GuardPromptSourceSchema = z.enum([
+  "user", "sdk", "system", "loop_wakeup", "schedule_wakeup", "poll_event",
+]);
 export const GuardSessionSchema = boundedCoordinate(255);
 export const GuardWorktreeRefSchema = z.string().regex(/^wt-[a-z0-9][a-z0-9-]{1,120}$/);
 export const GuardToolNameSchema = boundedCoordinate(64);
@@ -168,9 +171,6 @@ export const ClaimIdSchema = z.string().regex(
 );
 export const RequestIdSchema = z.string().regex(
   /^req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-);
-export const ExactGuardUnlockPromptSchema = z.string().regex(
-  /^\/jhw:unlock req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
 );
 export const OperationIdSchema = z.string().regex(
   /^op-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
@@ -184,11 +184,24 @@ export const GuardPromptContextSchema = z.object({
 }).strict();
 export type GuardPromptContext = z.infer<typeof GuardPromptContextSchema>;
 
-/** Returns a request coordinate only for byte-exact reserved prompt syntax. */
-export function exactGuardUnlockRequestId(rawPrompt: string): string | undefined {
-  const parsed = ExactGuardUnlockPromptSchema.safeParse(rawPrompt);
-  if (!parsed.success) return undefined;
-  return parsed.data.slice("/jhw:unlock ".length);
+export const GUARD_UNLOCK_PREFIX = "/jhw:unlock";
+const GUARD_UNLOCK_PROMPT_PATTERN = new RegExp(
+  `^${GUARD_UNLOCK_PREFIX} (req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$`,
+);
+
+export type GuardUnlockPrompt =
+  | { kind: "none" }
+  | { kind: "malformed" }
+  | { kind: "exact"; request_id: string };
+
+/**
+ * The single definition of the reserved unlock prompt syntax. `exact` is byte-exact;
+ * any other prompt that starts with the reserved prefix is `malformed`.
+ */
+export function parseGuardUnlockPrompt(rawPrompt: string): GuardUnlockPrompt {
+  if (!rawPrompt.startsWith(GUARD_UNLOCK_PREFIX)) return { kind: "none" };
+  const match = GUARD_UNLOCK_PROMPT_PATTERN.exec(rawPrompt);
+  return match ? { kind: "exact", request_id: match[1] as string } : { kind: "malformed" };
 }
 
 const commonEventBase = {
@@ -221,6 +234,8 @@ export const UserPromptSubmitEventSchema = z.object({
   ...commonEventBase,
   event: z.literal("user_prompt_submit"),
   prompt: boundedUtf8(MAX_GUARD_JSON_BYTES, true),
+  // Set only by the Claude codec when the native event carries `source`; absent means unknown.
+  prompt_source: GuardPromptSourceSchema.optional(),
 }).strict();
 export type UserPromptSubmitEventInput = z.input<typeof UserPromptSubmitEventSchema>;
 export type UserPromptSubmitEvent = z.output<typeof UserPromptSubmitEventSchema>;
