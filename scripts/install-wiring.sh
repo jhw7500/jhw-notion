@@ -1301,20 +1301,36 @@ validate_guard_preflight_diagnostic() {
       return exact(value, ["safety", "counts"]) &&
         oneOf(value.safety, ["ready", "not_initialized"]) && validCounts(value.counts);
     };
-    const validCoverageEntry = (value) => exact(value, [
+    const coverageKeys = [
       "prompt_origin", "pre_tool_block", "post_tool_correlation", "execution_recheck", "enforced",
-    ]) && oneOf(value.prompt_origin, ["ok", "missing", "unsupported"]) &&
-      oneOf(value.pre_tool_block, ["ok", "missing", "unsupported"]) &&
-      oneOf(value.post_tool_correlation, ["ok", "missing", "unsupported"]) &&
-      value.execution_recheck === "pending" && typeof value.enforced === "boolean";
-    const exactStaticCoverage = (value, state) => validCoverageEntry(value) &&
+    ];
+    // Only the Claude entry may carry these optional keys (#238); every other entry stays exact.
+    const claudeOptionalKeys = ["probe_code", "unchecked_input_events"];
+    const validClaudeOptionalKeys = (value) =>
+      (value.probe_code === undefined ||
+        typeof value.probe_code === "string" && /^GUARD_[A-Z0-9_]{1,56}$/.test(value.probe_code) &&
+        value.enforced === false) &&
+      (value.unchecked_input_events === undefined ||
+        JSON.stringify(value.unchecked_input_events) === JSON.stringify(["PreToolUse", "PostToolUse", "SessionEnd"]));
+    const validCoverageEntry = (value, optionalKeys) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const keys = Object.keys(value);
+      if (!coverageKeys.every((key) => keys.includes(key)) ||
+          !keys.every((key) => coverageKeys.includes(key) || optionalKeys.includes(key))) return false;
+      return oneOf(value.prompt_origin, ["ok", "missing", "unsupported"]) &&
+        oneOf(value.pre_tool_block, ["ok", "missing", "unsupported"]) &&
+        oneOf(value.post_tool_correlation, ["ok", "missing", "unsupported"]) &&
+        value.execution_recheck === "pending" && typeof value.enforced === "boolean" &&
+        (optionalKeys.length === 0 || validClaudeOptionalKeys(value));
+    };
+    const exactStaticCoverage = (value, state, optionalKeys = []) => validCoverageEntry(value, optionalKeys) &&
       value.prompt_origin === state && value.pre_tool_block === state &&
       value.post_tool_correlation === state && value.enforced === false;
-    const exactExpectedCoverage = (value, expected) => expected
-      ? validCoverageEntry(value) && value.prompt_origin === "ok" &&
+    const exactExpectedCoverage = (value, expected, optionalKeys = []) => expected
+      ? validCoverageEntry(value, optionalKeys) && value.prompt_origin === "ok" &&
         value.pre_tool_block === "ok" && value.post_tool_correlation === "ok" &&
         (diagnostics.runtime_mode === "enforce" || value.enforced === false)
-      : exactStaticCoverage(value, "missing");
+      : exactStaticCoverage(value, "missing", optionalKeys);
     const rc = Number(process.env.GUARD_PREFLIGHT_RC);
     const expectClaude = process.env.GUARD_EXPECT_CLAUDE;
     const expectCodex = process.env.GUARD_EXPECT_CODEX;
@@ -1335,7 +1351,7 @@ validate_guard_preflight_diagnostic() {
         !oneOf(diagnostics.registry_claims.availability, ["available", "unavailable"])) process.exit(1);
     const coverage = diagnostics.adapter_coverage;
     if (!exact(coverage, ["claude", "codex", "gemini", "opencode"]) ||
-        !exactExpectedCoverage(coverage.claude, expectClaude === "true") ||
+        !exactExpectedCoverage(coverage.claude, expectClaude === "true", claudeOptionalKeys) ||
         !exactExpectedCoverage(coverage.codex, expectCodex === "true") ||
         !exactStaticCoverage(coverage.gemini, "unsupported") ||
         !exactStaticCoverage(coverage.opencode, "unsupported")) process.exit(1);

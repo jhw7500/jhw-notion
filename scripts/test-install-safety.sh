@@ -1031,6 +1031,77 @@ EOF
   done
 }
 
+test_install_validates_claude_probe_scope_keys() {
+  local scenario home output
+  for scenario in \
+    accept-probe-code accept-scope-only \
+    reject-claude-extra-key reject-bad-probe-code reject-bad-scope \
+    reject-probe-code-enforced reject-codex-scope; do
+    home="$ROOT/guard-diagnostic-claude-keys-$scenario-home"
+    mkdir -p "$home/.claude"
+    output="$(node - "$scenario" <<'EOF'
+const scenario = process.argv[2];
+const coverage = (state, extra = {}) => ({
+  prompt_origin: state,
+  pre_tool_block: state,
+  post_tool_correlation: state,
+  execution_recheck: "pending",
+  enforced: false,
+  ...extra,
+});
+const scope = ["PreToolUse", "PostToolUse", "SessionEnd"];
+const claudeExtra = {
+  "accept-probe-code": { probe_code: "GUARD_PROTOCOL_MISMATCH", unchecked_input_events: scope },
+  "accept-scope-only": { unchecked_input_events: scope },
+  "reject-claude-extra-key": { unchecked_input_events: scope, private_marker: true },
+  "reject-bad-probe-code": { probe_code: "not_a_guard_code", unchecked_input_events: scope },
+  "reject-bad-scope": { unchecked_input_events: ["PreToolUse"] },
+  "reject-probe-code-enforced": { probe_code: "GUARD_UNAVAILABLE", unchecked_input_events: scope, enforced: true },
+  "reject-codex-scope": {},
+}[scenario];
+process.stdout.write(JSON.stringify({
+  command: "guard preflight",
+  result: {
+    status: "NO-GO",
+    code: "GUARD_UNAVAILABLE",
+    diagnostics: {
+      protocol_version: 1,
+      runtime_mode: "enforce",
+      request_state: {
+        safety: "not_initialized",
+        counts: { PENDING: 0, APPROVED: 0, CONSUMED: 0, COMPLETED: 0, FAILED: 0, EXPIRED: 0, total: 0 },
+      },
+      digest_key: { safety: "not_initialized" },
+      registry_claims: { availability: "available" },
+      adapter_coverage: {
+        claude: coverage("ok", claudeExtra),
+        codex: coverage("missing", scenario === "reject-codex-scope" ? { unchecked_input_events: scope } : {}),
+        gemini: coverage("unsupported"),
+        opencode: coverage("unsupported"),
+      },
+    },
+  },
+}));
+EOF
+)"
+    case "$scenario" in
+      accept-*)
+        JHW_TEST_DIAGNOSTIC_OUTPUT="$output" JHW_TEST_DIAGNOSTIC_EXIT=78 run_install "$home"
+        grep -qF '설치 완료!' "$home/install.log" || return 1
+        assert_exact_owned_hook_groups "$home/.claude/settings.json" "$home" claude
+        ;;
+      *)
+        if JHW_TEST_DIAGNOSTIC_OUTPUT="$output" JHW_TEST_DIAGNOSTIC_EXIT=78 run_install "$home"; then
+          echo "installer accepted a Claude probe key outside the allowed set: $scenario" >&2
+          return 1
+        fi
+        ! grep -qF '설치 완료!' "$home/install.log" || return 1
+        [ ! -e "$home/.local/bin/jhw-control-hook" ] && [ ! -L "$home/.local/bin/jhw-control-hook" ] || return 1
+        ;;
+    esac
+  done
+}
+
 test_symlinked_supported_tui_roots_fail_before_adapter_writes() {
   local adapter home target marker
   for adapter in claude codex; do
@@ -3683,6 +3754,7 @@ case "${JHW_INSTALL_TEST_ONLY:-all}" in
   malformed-diagnostic) test_install_rejects_malformed_diagnostic_and_rolls_back_hooks; exit ;;
   diagnostic-schema) test_install_requires_complete_guard_diagnostic_schema; exit ;;
   adapter-subsets) test_install_accepts_guard_diagnostic_for_detected_adapters; exit ;;
+  claude-probe-keys) test_install_validates_claude_probe_scope_keys; exit ;;
   symlinked-tui-root) test_symlinked_supported_tui_roots_fail_before_adapter_writes; exit ;;
   uninstall-symlinked-tui-root) test_uninstall_rejects_symlinked_supported_tui_roots_before_transactions; exit ;;
   rollback-hooks) test_preflight_failure_restores_exact_prior_hook_state; exit ;;
@@ -3774,6 +3846,7 @@ test_install_aborts_on_guard_diagnostic_execution_failure
 test_install_rejects_malformed_diagnostic_and_rolls_back_hooks
 test_install_requires_complete_guard_diagnostic_schema
 test_install_accepts_guard_diagnostic_for_detected_adapters
+test_install_validates_claude_probe_scope_keys
 test_symlinked_supported_tui_roots_fail_before_adapter_writes
 test_uninstall_rejects_symlinked_supported_tui_roots_before_transactions
 test_preflight_failure_restores_exact_prior_hook_state

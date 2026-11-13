@@ -674,13 +674,19 @@ async function task3ClaudeHome(): Promise<Awaited<ReturnType<typeof task3CodexHo
   return { ...fixture, settingsPath };
 }
 
-function task3SuccessfulClaudePromptProbe(): Task3CodexHookProbeResult {
+const task3ClaudeUncheckedInputEvents = ["PreToolUse", "PostToolUse", "SessionEnd"];
+const task3HealthyClaudePromptContext = "NO_STATE_CHANGE\nPrompt did not change Guard authority";
+
+function task3SuccessfulClaudePromptProbe(
+  additionalContext: string = task3HealthyClaudePromptContext,
+  systemMessage: string = additionalContext,
+): Task3CodexHookProbeResult {
   const native = JSON.stringify({
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
-      additionalContext: "GUARD_UNAVAILABLE",
+      additionalContext,
     },
-    systemMessage: "GUARD_UNAVAILABLE",
+    systemMessage,
   });
   const lines = [
     {
@@ -3331,7 +3337,11 @@ describe("runCli", () => {
     ].sort();
 
     expect(Object.keys(coverage).sort()).toEqual(["claude", "codex", "gemini", "opencode"]);
-    for (const adapter of Object.values(coverage)) expect(Object.keys(adapter).sort()).toEqual(exactAxes);
+    for (const [name, adapter] of Object.entries(coverage)) {
+      expect(Object.keys(adapter).sort()).toEqual(
+        name === "claude" ? [...exactAxes, "unchecked_input_events"].sort() : exactAxes,
+      );
+    }
     expect(coverage).toEqual({
       claude: {
         prompt_origin: "missing",
@@ -3339,6 +3349,7 @@ describe("runCli", () => {
         post_tool_correlation: "missing",
         execution_recheck: "pending",
         enforced: false,
+        unchecked_input_events: task3ClaudeUncheckedInputEvents,
       },
       codex: {
         prompt_origin: "ok",
@@ -3401,6 +3412,7 @@ describe("runCli", () => {
       post_tool_correlation: "ok",
       execution_recheck: "pending",
       enforced: true,
+      unchecked_input_events: task3ClaudeUncheckedInputEvents,
     });
   });
 
@@ -3421,6 +3433,7 @@ describe("runCli", () => {
       post_tool_correlation: "missing",
       execution_recheck: "pending",
       enforced: false,
+      unchecked_input_events: task3ClaudeUncheckedInputEvents,
     });
     expect(runtime.probePrompt).not.toHaveBeenCalled();
     expect(runtime.probeCommand).not.toHaveBeenCalled();
@@ -3463,10 +3476,89 @@ describe("runCli", () => {
       post_tool_correlation: "ok",
       execution_recheck: "pending",
       enforced: false,
+      unchecked_input_events: task3ClaudeUncheckedInputEvents,
     });
     expect(runtime.probePrompt).toHaveBeenCalledOnce();
     expect(runtime.probeCommand).not.toHaveBeenCalled();
     expect(`${result.stdout}${result.stderr}`).not.toContain("private-claude-probe-error");
+  });
+
+  async function claudePromptProbeCoverage(probe: Task3CodexHookProbeResult) {
+    const fixture = await task3ClaudeHome();
+    const runtime = {
+      probePrompt: vi.fn().mockResolvedValue(probe),
+      probeCommand: vi.fn().mockResolvedValue(task3SuccessfulProbe()),
+    };
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(fixture.home);
+    let result;
+    try { result = await runCli(["guard", "preflight"], makeCliDependencies({
+      env: { HOME: fixture.home },
+      codexRepositoryRoot: fixture.repositoryRoot,
+      claudeHookRuntime: runtime,
+    })); } finally { cwd.mockRestore(); }
+    return { runtime, result, claude: task3AdapterCoverage(result).claude };
+  }
+
+  it.each([
+    "GUARD_PROTOCOL_MISMATCH",
+    "GUARD_UNAVAILABLE",
+    "GUARD_HOOK_TIMEOUT",
+    "GUARD_PROMPT_ORIGIN_UNSUPPORTED",
+    "GUARD_DEADLINE_EXCEEDED",
+  ])("does not trust an owned Claude prompt response carrying %s and reports it as probe_code", async (code) => {
+    const { runtime, result, claude } = await claudePromptProbeCoverage(task3SuccessfulClaudePromptProbe(code));
+
+    expect(claude).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: false,
+      probe_code: code,
+      unchecked_input_events: task3ClaudeUncheckedInputEvents,
+    });
+    expect(result.exitCode).toBe(78);
+    expect(JSON.parse(result.stdout || result.stderr)).toMatchObject({ result: { status: "NO-GO" } });
+    expect(runtime.probeCommand).not.toHaveBeenCalled();
+  });
+
+  it("does not trust a response whose systemMessage alone carries the failure code", async () => {
+    const { claude } = await claudePromptProbeCoverage(
+      task3SuccessfulClaudePromptProbe(task3HealthyClaudePromptContext, "GUARD_PROTOCOL_MISMATCH"),
+    );
+    expect(claude).toMatchObject({ enforced: false, probe_code: "GUARD_PROTOCOL_MISMATCH" });
+  });
+
+  it("reports only the first line of a multi-line failure output as the code", async () => {
+    const { claude } = await claudePromptProbeCoverage(
+      task3SuccessfulClaudePromptProbe("GUARD_UNAVAILABLE\nPrivate detail line"),
+    );
+    expect(claude).toMatchObject({ enforced: false, probe_code: "GUARD_UNAVAILABLE" });
+    expect(JSON.stringify(claude)).not.toContain("Private detail line");
+  });
+
+  it.each(["hello", "guard_unavailable", "GUARD_", "APPROVED\nrequest"])(
+    "keeps Claude unenforced without a probe_code when the first line %j is not a Guard failure code",
+    async (context) => {
+      const { claude } = await claudePromptProbeCoverage(task3SuccessfulClaudePromptProbe(context));
+      expect(claude).toMatchObject({ enforced: false });
+      expect(claude).not.toHaveProperty("probe_code");
+    },
+  );
+
+  it("keeps a healthy owned Claude prompt response trusted without a probe_code", async () => {
+    const { runtime, claude } = await claudePromptProbeCoverage(task3SuccessfulClaudePromptProbe(
+      `${task3HealthyClaudePromptContext}\nTask: guard-task\nTask ID: tsk-x`,
+    ));
+    expect(claude).toEqual({
+      prompt_origin: "ok",
+      pre_tool_block: "ok",
+      post_tool_correlation: "ok",
+      execution_recheck: "pending",
+      enforced: true,
+      unchecked_input_events: task3ClaudeUncheckedInputEvents,
+    });
+    expect(runtime.probeCommand).toHaveBeenCalledOnce();
   });
 
   it("keeps exact Claude hooks unenforced when the direct PreTool probe fails", async () => {
@@ -3515,6 +3607,7 @@ describe("runCli", () => {
         post_tool_correlation: "ok",
         execution_recheck: "pending",
         enforced: false,
+        unchecked_input_events: task3ClaudeUncheckedInputEvents,
       });
       expect(runtime.probePrompt).not.toHaveBeenCalled();
       expect(runtime.probeCommand).not.toHaveBeenCalled();
@@ -3578,6 +3671,7 @@ describe("runCli", () => {
         post_tool_correlation: "missing",
         execution_recheck: "pending",
         enforced: false,
+        unchecked_input_events: task3ClaudeUncheckedInputEvents,
       });
       expect(runtime.probePrompt).not.toHaveBeenCalled();
       expect(runtime.probeCommand).not.toHaveBeenCalled();
@@ -3630,6 +3724,7 @@ describe("runCli", () => {
       post_tool_correlation: "missing",
       execution_recheck: "pending",
       enforced: false,
+      unchecked_input_events: task3ClaudeUncheckedInputEvents,
     });
     expect(runtime.probePrompt).not.toHaveBeenCalled();
     expect(runtime.probeCommand).not.toHaveBeenCalled();
@@ -3681,6 +3776,7 @@ describe("runCli", () => {
       post_tool_correlation: "missing",
       execution_recheck: "pending",
       enforced: false,
+      unchecked_input_events: task3ClaudeUncheckedInputEvents,
     });
     expect(runtime.probePrompt).not.toHaveBeenCalled();
     expect(runtime.probeCommand).not.toHaveBeenCalled();
