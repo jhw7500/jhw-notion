@@ -1,10 +1,10 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createCliDependencies, createCommandCliDependencies, runCli } from "../cli.js";
 import { loadControlConfig } from "../config.js";
@@ -12,9 +12,22 @@ import { resolveGuardEnvironment } from "../guard-policy.js";
 import { GuardRequestStore } from "../guard-state.js";
 import { runProductionHookAdapter } from "../hook-adapter.js";
 
+const slowAppend = vi.hoisted(() => ({ delayMs: 0 }));
+vi.mock("../guard-diagnostics.js", async (importActual) => {
+  const actual = await importActual<typeof import("../guard-diagnostics.js")>();
+  return {
+    ...actual,
+    appendGuardHookDiagnostic: async (...args: Parameters<typeof actual.appendGuardHookDiagnostic>) => {
+      if (slowAppend.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, slowAppend.delayMs));
+      return actual.appendGuardHookDiagnostic(...args);
+    },
+  };
+});
+
 const execFile = promisify(execFileCallback);
 const roots: string[] = [];
 afterEach(async () => {
+  slowAppend.delayMs = 0;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -175,7 +188,7 @@ process.stdout.write("{}\n");
     expect(await f.git(f.registry, "rev-parse", "HEAD")).toBe(f.head);
   });
 
-  it("blocks a soft violation when only the legacy journal is writable", async () => {
+  it("allows and reports a soft violation when only the legacy journal is writable", async () => {
     const f = await fixture();
     await mkdir(f.stateDir, { mode: 0o700 });
     const legacyPath = join(f.stateDir, "guard-journal.jsonl");
@@ -186,10 +199,16 @@ process.stdout.write("{}\n");
 
     expect(await invoke(f, "codex", "PreToolUse", {
       tool_name: "Bash", tool_input: { command: "printf bounded" }, tool_use_id: "fixture-write",
-    })).toHaveProperty("systemMessage", "GUARD_UNAVAILABLE");
+    })).toEqual({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
 
     expect(await readFile(legacyPath, "utf8")).toBe("");
     expect(await readFile(observePath, "utf8")).toBe("unsafe\n");
+    const diagnostics = (await readFile(join(f.stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(diagnostics).toEqual([expect.objectContaining({
+      v: 1, adapter: "codex", event: "PreToolUse", mode: "observe", kind: "unrecorded_allow", code: "GUARD_CLAIM_REQUIRED",
+    })]);
+    expect((await stat(join(f.stateDir, "guard-hook-diagnostics.v1.jsonl"))).mode & 0o777).toBe(0o600);
     const config = loadControlConfig(resolveGuardEnvironment(f.environment).environment);
     await expect(new GuardRequestStore(config).inspect()).resolves.toEqual({ status: "ready", requests: [] });
   });
@@ -203,22 +222,129 @@ process.stdout.write("{}\n");
     expect(await readdir(f.repository)).not.toContain("added.txt");
   });
 
-  it("keeps self-approval and corrupt Guard state blocked in observe mode", async () => {
+  it("keeps self-approval blocked and allows corrupt Guard state without repairing it in observe mode", async () => {
     const f = await fixture();
     expect(await invoke(f, "codex", "PreToolUse", {
       tool_name: "Bash", tool_input: { command: "jhw-control guard approve --request req-018f21e0-7b2c-7a00-8000-000000000003" },
     })).toHaveProperty("systemMessage", "GUARD_SELF_APPROVAL_DENIED");
     const requests = join(f.stateDir, "guard-requests.yaml");
     await writeFile(requests, "{ corrupt");
-    expect(await invoke(f, "codex", "PreToolUse")).toHaveProperty("systemMessage", "GUARD_UNAVAILABLE");
+    expect(await invoke(f, "codex", "PreToolUse")).toEqual({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
     expect(await readFile(requests, "utf8")).toBe("{ corrupt");
   });
 
-  it("does not initialize Guard state for a malformed native event", async () => {
+  it("allows a provider failure after observe resolved and reports it when the state directory exists", async () => {
+    const f = await fixture();
+    await invoke(f, "codex", "PreToolUse");
+    // A digest key with a loose mode makes the production composition throw before any decision.
+    await chmod(join(f.stateDir, "guard-digest.key"), 0o644);
+    expect(await invoke(f, "codex", "PreToolUse")).toEqual({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
+    const diagnostics = (await readFile(join(f.stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(diagnostics).toContainEqual(expect.objectContaining({ kind: "unrecorded_allow", code: "GUARD_UNAVAILABLE" }));
+  });
+
+  it("allows a native event that fails to decode in observe, without initializing Guard state", async () => {
     const f = await fixture();
     expect(await invoke(f, "codex", "PreToolUse", { unexpected: "invalid" }))
-      .toHaveProperty("systemMessage", "GUARD_PROTOCOL_MISMATCH");
+      .toEqual({ hookSpecificOutput: { hookEventName: "PreToolUse" } });
     expect(await readdir(f.home)).not.toContain("state");
+  });
+
+  it("keeps a self-approving native event that fails to decode denied in observe", async () => {
+    const f = await fixture();
+    expect(await invoke(f, "codex", "PreToolUse", {
+      unexpected: "invalid",
+      tool_name: "Bash", tool_input: { command: "jhw-control guard approve --request req-018f21e0-7b2c-7a00-8000-000000000003" },
+    })).toHaveProperty("systemMessage", "GUARD_PROTOCOL_MISMATCH");
+    expect(await readdir(f.home)).not.toContain("state");
+  });
+
+  it("keeps unreadable tool_input denied in observe", async () => {
+    const f = await fixture();
+    expect(await invoke(f, "codex", "PreToolUse", { tool_input: "not an object" }))
+      .toHaveProperty("systemMessage", "GUARD_PROTOCOL_MISMATCH");
+  });
+
+  it("keeps the preflight command probe input denied in observe", async () => {
+    const f = await fixture();
+    const result = await runProductionHookAdapter(
+      ["--adapter", "claude", "--event", "PreToolUse"], '{"hook_event_name":"PreToolUse"}\n', f.environment,
+    );
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toHaveProperty("systemMessage", "GUARD_PROTOCOL_MISMATCH");
+  });
+
+  it("does not cut digest key creation when the deadline has already passed", async () => {
+    const f = await fixture();
+    const io = {
+      now: () => 7_000,
+      setTimer: () => ({ clear: () => undefined }),
+      write: vi.fn(async (_stdout: string) => undefined),
+      exit: vi.fn(),
+    };
+    await runProductionHookAdapter(
+      ["--adapter", "codex", "--event", "PreToolUse"], payload(f, "codex", "PreToolUse"), f.environment, io,
+    );
+    // The gate arms only after the key exists, so the late clock fires at arm, never mid-creation.
+    expect((await stat(join(f.stateDir, "guard-digest.key"))).size).toBe(32);
+    expect(io.write).toHaveBeenCalledExactlyOnceWith('{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n');
+    await vi.waitFor(() => expect(io.exit).toHaveBeenCalledOnce());
+    const rows = (await readFile(join(f.stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(rows).toEqual([expect.objectContaining({ kind: "deadline", mode: "observe" })]);
+  });
+
+  it("skips the service-side unrecorded_allow row once more than 7,000 ms have passed", async () => {
+    const f = await fixture();
+    await mkdir(f.stateDir, { mode: 0o700 });
+    const observePath = join(f.stateDir, "guard-observe-journal.v1.jsonl");
+    await writeFile(observePath, "unsafe\n", { mode: 0o600 });
+    await chmod(observePath, 0o644);
+    // The gate arms on the first reading; every later reading is past the diagnostics cutoff.
+    const readings = vi.fn().mockReturnValueOnce(100).mockReturnValue(7_100);
+    const io = {
+      now: readings,
+      setTimer: () => ({ clear: () => undefined }),
+      write: vi.fn(async (_stdout: string) => undefined),
+      exit: vi.fn(),
+    };
+    await runProductionHookAdapter(
+      ["--adapter", "codex", "--event", "PreToolUse"],
+      payload(f, "codex", "PreToolUse", { tool_name: "Bash", tool_input: { command: "printf bounded" }, tool_use_id: "fixture-write" }),
+      f.environment,
+      io,
+    );
+    expect(io.write).toHaveBeenCalledExactlyOnceWith('{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n');
+    await expect(readFile(join(f.stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("requests exit after a fast observe decision whose service-side diagnostics append is slow", async () => {
+    const f = await fixture();
+    await mkdir(f.stateDir, { mode: 0o700 });
+    const observePath = join(f.stateDir, "guard-observe-journal.v1.jsonl");
+    await writeFile(observePath, "unsafe\n", { mode: 0o600 });
+    await chmod(observePath, 0o644);
+    const order: string[] = [];
+    const io = {
+      now: () => 100,
+      setTimer: () => ({ clear: () => undefined }),
+      write: vi.fn(async (_stdout: string) => { order.push("write"); }),
+      exit: vi.fn(() => { order.push("exit"); }),
+    };
+    slowAppend.delayMs = 2_000;
+    const started = Date.now();
+    const result = await runProductionHookAdapter(
+      ["--adapter", "codex", "--event", "PreToolUse"],
+      payload(f, "codex", "PreToolUse", { tool_name: "Bash", tool_input: { command: "printf bounded" }, tool_use_id: "fixture-write" }),
+      f.environment,
+      io,
+    );
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result.exitCode).toBe(0);
+    expect(io.write).toHaveBeenCalledExactlyOnceWith('{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n');
+    expect(order).toEqual(["write", "exit"]);
+    expect(io.exit).toHaveBeenCalledOnce();
   });
 
   it("keeps read-only guard preflight separate from startup initialization", async () => {

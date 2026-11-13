@@ -666,19 +666,30 @@ describe("GuardService concurrency and Registry composition", () => {
       });
 
     // Contention without the Registry writer's reason, or with another lock's
-    // reason, is not proof of a busy Registry: observe keeps the hard deny.
+    // reason, is an ordinary Guard self-failure: observe records plain
+    // GUARD_UNAVAILABLE (no reason) and allows; enforce keeps the deny.
     for (const [label, options] of [
       ["unlabeled", undefined],
       ["board", { contendedReason: "board_state_lock" } satisfies MutationLockOptions],
     ] as const) {
+      const enforceOther = await fixture({
+        registryLockRuntime: heldByWriter,
+        ...(options ? { registryLockOptions: options } : {}),
+      });
+      const denied = await enforceOther.composition.service.evaluatePreTool(preTool(enforceOther.cwd, `call-busy-${label}`));
+      expect(denied, label).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+      expect(denied, label).not.toHaveProperty("reason");
+
       const other = await fixture({
         registryLockRuntime: heldByWriter,
         ...(options ? { registryLockOptions: options } : {}),
         serviceOverrides: observeOverrides,
       });
       const decision = await other.composition.service.evaluatePreTool(preTool(other.cwd, `call-busy-${label}`));
-      expect(decision, label).toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
-      expect(decision, label).not.toHaveProperty("reason");
+      expect(decision, label).toMatchObject({ decision: "ALLOW", observed_decision: "DENY" });
+      const row = JSON.parse(await readFile(join(other.stateDir, "guard-observe-journal.v1.jsonl"), "utf8"));
+      expect(row, label).toMatchObject({ mode: "observe", observed_decision: "DENY", decision_code: "GUARD_UNAVAILABLE" });
+      expect(row, label).not.toHaveProperty("error_reason");
     }
   });
 

@@ -209,7 +209,7 @@ export interface HookCodec {
   renderSessionEnd(result: unknown): unknown;
   renderFailure(
     event: HookEventName,
-    code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH",
+    code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH" | "GUARD_DEADLINE_EXCEEDED",
   ): unknown;
 }
 
@@ -335,7 +335,7 @@ function renderSessionEnd(_result: unknown): unknown {
 
 export function renderStaticHookFailure(
   event: HookEventName,
-  code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH",
+  code: "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH" | "GUARD_DEADLINE_EXCEEDED",
 ): unknown {
   if (event === "PreToolUse") {
     return {

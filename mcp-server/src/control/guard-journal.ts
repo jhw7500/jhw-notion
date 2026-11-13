@@ -225,7 +225,8 @@ export class GuardJournal implements GuardJournalPort {
       observed = { ...parsed, mode: "observe", ...GuardObservationSchema.parse(observation) };
       this.#sensitiveData.assertSafe(observed);
       assertNoAbsoluteHostPaths(observed);
-      // An observed ALLOW is valid only after this required stream is durable.
+      // An observed ALLOW is recorded here first; if this stream cannot be made durable the
+      // caller still allows and reports the loss to the diagnostics file.
       await this.#observeJournal.append(observed);
     } catch {
       throw new ControlError("GUARD_JOURNAL_UNAVAILABLE", "Guard observation journal append is unavailable");

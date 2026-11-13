@@ -1,4 +1,4 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -212,5 +212,60 @@ describe("jhw-control installed entry", () => {
     expect(journal).not.toContain("entry-project-token");
     expect(journal).not.toContain("entry-repo-token");
     expect(JSON.parse(journal)).toMatchObject({ command: "project register", error_code: "REGISTRY_CORRUPT" });
+  });
+
+  it("exits promptly after a fast observe hook decision and writes no deadline row", async () => {
+    // Built here, in this file, because the tests above rebuild the shared dist.
+    await execFile("npm", ["run", "build"], { cwd: mcpRoot, encoding: "utf8" });
+    const home = await mkdtemp(join(tmpdir(), "jhw-hook-timer-"));
+    paths.push(home);
+    const environment = { HOME: home, PATH: "/usr/bin:/bin", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+    const registry = join(home, "registry");
+    const repository = join(home, "repository");
+    for (const directory of [registry, repository]) {
+      await mkdir(directory, { mode: 0o700 });
+      await execFile("/usr/bin/git", ["init", "--initial-branch=main"], { cwd: directory, env: environment });
+      await writeFile(join(directory, "README.md"), "fixture\n");
+      await execFile("/usr/bin/git", ["add", "README.md"], { cwd: directory, env: environment });
+      await execFile("/usr/bin/git", ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"], {
+        cwd: directory, env: environment,
+      });
+    }
+    const config = join(home, ".config", "jhw-control");
+    const stateDir = join(home, "state");
+    await mkdir(config, { recursive: true, mode: 0o700 });
+    await writeFile(join(config, "control.env"), Object.entries({
+      JHW_REGISTRY_DIR: registry, JHW_REGISTRY_REMOTE: "origin", JHW_REGISTRY_BRANCH: "main",
+      JHW_WORKTREE_ROOT: join(home, "worktrees"), JHW_CONTROL_STATE_DIR: stateDir, JHW_BUILD_HOST: "fixture-host",
+      JHW_GITHUB_OWNER: "fixture-owner", JHW_PROJECT_NUMBER: "1", JHW_REGISTRY_REPOSITORY: "fixture-owner/registry",
+      JHW_PREFLIGHT_PROJECT_ITEM_ID: "PVTI_fixture", JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER: "1",
+    }).map(([key, value]) => `${key}=${value}\n`).join(""), { mode: 0o600 });
+    await writeFile(join(config, "guard-policy.json"), '{"version":1,"mode":"observe"}\n', { mode: 0o600 });
+    const input = JSON.stringify({
+      session_id: "timer-session", cwd: repository, hook_event_name: "PreToolUse", model: "fixture-model",
+      permission_mode: "default", transcript_path: null, turn_id: "fixture-turn",
+      tool_name: "Read", tool_input: { file_path: "README.md" }, tool_use_id: "fixture-read",
+    });
+
+    const started = performance.now();
+    const outcome = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolveOutcome, reject) => {
+      const child = spawn(process.execPath, [join(mcpRoot, "dist", "control", "hook-adapter.js"), "--adapter", "codex", "--event", "PreToolUse"], {
+        env: environment, stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("error", reject);
+      child.on("close", (code) => resolveOutcome({ code, stdout, stderr }));
+      child.stdin.end(input);
+    });
+    const elapsed = performance.now() - started;
+
+    expect(outcome).toEqual({ code: 0, stdout: '{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n', stderr: "" });
+    // A deadline timer that stayed armed or ref'd would keep the process alive for 6.5 s.
+    expect(elapsed).toBeLessThan(3_000);
+    const diagnostics = await readFile(join(stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8").catch(() => "");
+    expect(diagnostics).not.toContain('"kind":"deadline"');
   });
 });

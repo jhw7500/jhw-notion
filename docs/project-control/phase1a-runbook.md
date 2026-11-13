@@ -113,6 +113,8 @@ jhw-control guard preflight
 
 Claude `enforced: true`는 standard `HOME/.claude` source, 네 exact on-disk group, owned executable launcher/core, 실제 `claude -p`에서 repository `UserPromptSubmit`과 inline blocker가 각각 한 번 실행된 0-token/0-API-time/0-cost 결과, direct `PreToolUse` deny probe가 모두 확인된 경우에만 나온다. runtime은 user hook object만 private temporary `CLAUDE_CONFIG_DIR/settings.json`으로 복제하고 원래 `HOME`은 launcher 확장에만 유지한다. 실제 credential/provider와 Project Control 좌표는 제거하며 dummy key를 사용하므로 blocker가 열리면 모델을 호출하지 못하고 실패한다. Claude가 만든 임시 app/session state는 probe 종료 후 함께 제거한다. Codex는 기존 read-only runtime inventory와 direct deny probe를 사용한다. 추가 handler, config override, malformed/timeout/output overflow, model 사용, command probe 실패는 `NO-GO`다. `execution_recheck`가 `pending`이면 다른 축이 `ok`여도 그 사실을 숨기지 않는다. Control 좌표가 전혀 없는 설치는 Guard group 없이 두 adapter의 `SessionEnd`만 유지하는 `UNPROTECTED` 상태이며 보호 완료로 기록하지 않는다.
 
+모든 도구가 `GUARD_*` 코드로 막혀 세션을 이어 갈 수 없을 때 사용자 터미널에서 hook을 잠시 푸는 절차는 `docs/project-control/guard-break-glass.md`를 따른다.
+
 ### 기존 Issue-backed Project fixture 전환
 
 구 구현으로 만든 Issue-backed Project item이 있으면 새 reader는 이를 Project Record로 무시하지 않고 fail-closed한다. 전환은 자동 migration이나 authority cutover가 아니라 승인된 trial fixture 정리이며 다음 순서를 지킨다.

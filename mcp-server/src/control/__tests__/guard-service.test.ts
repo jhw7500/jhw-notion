@@ -20,7 +20,8 @@ import {
 import type { ControlConfig } from "../config.js";
 import type { CanonicalOperation, OperationRequirement } from "../guard-protocol.js";
 import { GuardRequestStore, type GuardRequest } from "../guard-state.js";
-import { GuardJournal, type GuardJournalEvent, type GuardJournalPort } from "../guard-journal.js";
+import { GuardJournal, GuardJournalEventSchema, type GuardJournalEvent, type GuardJournalPort } from "../guard-journal.js";
+import { detectGuardSelfApproval } from "../shell-classifier.js";
 import { runHookAdapter, type HookGuardPort } from "../hook-adapter.js";
 import type { SecureStateDirectoryHooks } from "../journal.js";
 import { MutationLock, type MutationLockRuntime } from "../process.js";
@@ -1627,18 +1628,100 @@ describe("GuardService", () => {
     expect(fixture.barrierCalls).toBe(1);
   });
 
-  it("hard-denies an observed policy result when no trusted observation writer is available", async () => {
+  it("allows and reports an unrecorded observation when no trusted observation writer is available", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
     fixture.currentClaim = activeClaim(fixture.currentContract);
     fixture.activeClaims = [fixture.currentClaim];
+    const record_diagnostic = vi.fn(async () => undefined);
 
-    await expect(fixture.service({ mode: "observe", inspect_guard_state: async () => true })
+    await expect(fixture.service({ mode: "observe", inspect_guard_state: async () => true, record_diagnostic })
       .evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
-      decision: "DENY",
-      code: "GUARD_UNAVAILABLE",
+      decision: "ALLOW",
+      observed_decision: "PERMIT_REQUIRED",
     });
+    expect(record_diagnostic).toHaveBeenCalledExactlyOnceWith({ kind: "unrecorded_allow", adapter: "codex" });
     expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("allows and reports an unrecorded observation once the observe journal reached its row cap", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const stateDir = join(fixture.root, "capped-observe-state");
+    const record_diagnostic = vi.fn(async () => undefined);
+    const options = { mode: "observe" as const, inspect_guard_state: async () => true, record_diagnostic };
+    await fixture.service({ ...options, guard_journal: new GuardJournal(stateDir) })
+      .evaluatePreTool(preTool(fixture.cwd));
+    const observePath = join(stateDir, "guard-observe-journal.v1.jsonl");
+    const row = await readFile(observePath, "utf8");
+    await writeFile(observePath, row.repeat(8 * 1024), { mode: 0o600 });
+    record_diagnostic.mockClear();
+
+    await expect(fixture.service({ ...options, guard_journal: new GuardJournal(stateDir) })
+      .evaluatePreTool(preTool(fixture.cwd, "Edit", undefined, "call-guard-capped")))
+      .resolves.toMatchObject({ decision: "ALLOW", observed_decision: "PERMIT_REQUIRED" });
+    expect(record_diagnostic).toHaveBeenCalledExactlyOnceWith({ kind: "unrecorded_allow", adapter: "codex" });
+    expect((await readFile(observePath, "utf8")).split("\n").length - 1).toBe(8 * 1024);
+  });
+
+  it("asks the decision gate at the permit boundary and commits nothing once it refuses", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const expired = { tryCommit: vi.fn(() => false) };
+    const open = { tryCommit: vi.fn(() => true) };
+
+    await expect(fixture.service({ decision_gate: expired }).evaluatePreTool(preTool(fixture.cwd)))
+      .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    expect(expired.tryCommit).toHaveBeenCalledOnce();
+    expect(fixture.permitCalls).toBe(0);
+
+    await expect(fixture.service({ decision_gate: open }).evaluatePreTool(preTool(fixture.cwd)))
+      .resolves.toMatchObject({ decision: "PERMIT_REQUIRED" });
+    expect(open.tryCommit).toHaveBeenCalledOnce();
+    expect(fixture.permitCalls).toBe(1);
+  });
+
+  it("never asks the decision gate on a path that commits nothing", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const gate = { tryCommit: vi.fn(() => false) };
+
+    await expect(fixture.service({ ...{ mode: "observe" as const, inspect_guard_state: async () => true }, decision_gate: gate })
+      .evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({ decision: "ALLOW" });
+    expect(gate.tryCommit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an all-grants-present call", "Edit", undefined, true],
+    ["a Claim-free read", "Read", { file_path: "src/file.ts" }, false],
+  ] as const)("settles the decision gate before journaling an enforce ALLOW of %s", async (_label, toolName, input, hasClaim) => {
+    if (!hasClaim) {
+      fixture.currentClaim = undefined;
+      fixture.activeClaims = [];
+    }
+    const journalPath = (directory: string) => join(fixture.root, directory, "guard-journal.jsonl");
+    const journaled = async (directory: string): Promise<GuardJournalEvent[]> =>
+      (await readFile(journalPath(directory), "utf8").catch(() => "")).trim().split("\n").filter(Boolean)
+        .map((line) => JSON.parse(line) as GuardJournalEvent);
+
+    const open = { tryCommit: vi.fn(() => true) };
+    await expect(fixture.service({ decision_gate: open, guard_journal: new GuardJournal(join(fixture.root, "gate-open")) })
+      .evaluatePreTool(preTool(fixture.cwd, toolName, input))).resolves.toMatchObject({ decision: "ALLOW" });
+    expect(open.tryCommit).toHaveBeenCalled();
+    expect(await journaled("gate-open")).toHaveLength(1);
+
+    // The deadline already emitted GUARD_DEADLINE_EXCEEDED: no ALLOW may reach the journal.
+    const expired = { tryCommit: vi.fn(() => false) };
+    await fixture.service({ decision_gate: expired, guard_journal: new GuardJournal(join(fixture.root, "gate-expired")) })
+      .evaluatePreTool(preTool(fixture.cwd, toolName, input));
+    expect(expired.tryCommit).toHaveBeenCalled();
+    expect(await journaled("gate-expired")).toEqual([]);
   });
 
   it("allows after durable observation when only the optional legacy row fails", async () => {
@@ -1680,25 +1763,88 @@ describe("GuardService", () => {
       inspect_guard_state: async () => true,
       guard_journal: journal,
     }).evaluatePreTool(preTool(fixture.cwd))).resolves.toMatchObject({
-      decision: "DENY",
-      code: "GUARD_UNAVAILABLE",
+      decision: "ALLOW",
+      observed_decision: "PERMIT_REQUIRED",
     });
     expect(forged).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["state unavailable", { mode: "observe" as const, inspect_guard_state: async (): Promise<boolean> => false }],
-    ["self approval", { mode: "observe" as const, inspect_guard_state: async (): Promise<boolean> => true }],
-  ])("does not observe-convert hard %s denial", async (kind, overrides) => {
-    const event = kind === "self approval"
-      ? preTool(fixture.cwd, "Bash", { command: `jhw-control guard consume ${REQUEST_ID}` })
-      : preTool(fixture.cwd);
+  describe("observe self-failures", () => {
+    const KIB = 1024;
+    const benignPatch = "*** Begin Patch\n*** Add File: added.txt\n+bounded\n*** End Patch";
+    const approval = `jhw-control guard consume ${REQUEST_ID}`;
+    const stateUnavailable = async (): Promise<boolean> => false;
+    const observe = { mode: "observe" as const, inspect_guard_state: async () => true };
 
-    const result = await fixture.service(overrides).evaluatePreTool(event);
+    it("allows and records a tool input that fails its exact identity codec in observe, and denies it in enforce", async () => {
+      const stateDir = join(fixture.root, "self-failure-state");
+      const input = { command: benignPatch, unexpected: true };
+      expect(detectGuardSelfApproval(input.command)).toBe(false);
 
-    expect(result).toMatchObject({
-      decision: "DENY",
-      code: kind === "self approval" ? "GUARD_SELF_APPROVAL_DENIED" : "GUARD_UNAVAILABLE",
+      await expect(fixture.service({ ...observe, guard_journal: new GuardJournal(stateDir) })
+        .evaluatePreTool(preTool(fixture.cwd, "apply_patch", input)))
+        .resolves.toMatchObject({ decision: "ALLOW", observed_decision: "DENY" });
+      const row = JSON.parse(await readFile(join(stateDir, "guard-observe-journal.v1.jsonl"), "utf8"));
+      expect(row).toMatchObject({ mode: "observe", observed_decision: "DENY", decision_code: "GUARD_UNAVAILABLE" });
+      // Rollback guard: only vocabulary a retained release already parses.
+      const { mode: _mode, observed_decision: _observed, ...event } = row;
+      expect(GuardJournalEventSchema.safeParse(event).success).toBe(true);
+      expect(GuardJournalEventSchema.safeParse({ ...event, decision_code: "GUARD_DEADLINE_EXCEEDED" }).success).toBe(false);
+
+      await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "apply_patch", input)))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+    });
+
+    it("allows unavailable Guard state in observe", async () => {
+      await expect(fixture.service({ mode: "observe", inspect_guard_state: stateUnavailable })
+        .evaluatePreTool(preTool(fixture.cwd)))
+        .resolves.toMatchObject({ decision: "ALLOW", observed_decision: "DENY" });
+    });
+
+    it.each([
+      ["a self-approving shell command", "Bash", { command: approval }],
+      ["a self-approving patch whose codec fails", "apply_patch", { command: approval, unexpected: true }],
+    ] as const)("hard-denies %s before any observe-convertible self-failure", async (_label, toolName, input) => {
+      expect(detectGuardSelfApproval(input.command)).toBe(true);
+      for (const overrides of [{ mode: "observe" as const, inspect_guard_state: stateUnavailable }, observe]) {
+        await expect(fixture.service(overrides).evaluatePreTool(preTool(fixture.cwd, toolName, input)))
+          .resolves.toMatchObject({ decision: "DENY", code: "GUARD_SELF_APPROVAL_DENIED" });
+      }
+      // Enforce: a malformed input that also self-approves now reports the approval code (the patch was GUARD_UNAVAILABLE).
+      await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, toolName, input)))
+        .resolves.toMatchObject({ decision: "DENY", code: "GUARD_SELF_APPROVAL_DENIED" });
+    });
+
+    it("hard-denies a runnable command too large to scan whatever the mode or state", async () => {
+      const command = `printf ${"a".repeat(65 * KIB)}`;
+      for (const overrides of [{ mode: "observe" as const, inspect_guard_state: stateUnavailable }, observe, {}]) {
+        await expect(fixture.service(overrides).evaluatePreTool(preTool(fixture.cwd, "Bash", { command })))
+          .resolves.toMatchObject({ decision: "DENY", code: "GUARD_PROTOCOL_MISMATCH" });
+      }
+    });
+
+    it("hard-denies a shell tool whose command is not a string, with the code enforce always gave", async () => {
+      for (const overrides of [observe, {}]) {
+        await expect(fixture.service(overrides).evaluatePreTool(preTool(fixture.cwd, "Bash", { command: 7 })))
+          .resolves.toMatchObject({ decision: "DENY", code: "GUARD_UNAVAILABLE" });
+      }
+    });
+
+    // Preservation pins: these pass on the base release as well. A `command`
+    // that is not a string is not a shell command on these families, so the early
+    // screen never claims it and their decisions stay what they were.
+    it.each([
+      ["a file read", "Read", { file_path: "src/file.ts" }],
+      ["a Notion mutation", "jhw_note", { title: "bounded" }],
+      ["a tracker mutation", "github_issue_edit", { issue_node_id: "I_kwDOfixture" }],
+    ] as const)("leaves a non-string command on %s to the base decision in enforce and observe", async (_label, toolName, input) => {
+      const outcome = async (overrides: Partial<GuardServiceOptions>, toolInput: object) => {
+        const decision = await fixture.service(overrides).evaluatePreTool(preTool(fixture.cwd, toolName, toolInput));
+        return { decision: decision.decision, code: "code" in decision ? decision.code : undefined };
+      };
+      for (const overrides of [observe, {}]) {
+        expect(await outcome(overrides, { ...input, command: 7 })).toEqual(await outcome(overrides, input));
+      }
     });
   });
 
