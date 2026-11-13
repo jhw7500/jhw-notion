@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { normalizeOperation, type NormalizeOperationContext } from "../operation-normalizer.js";
-import { exactGuardUnlockRequestId, type GuardCommonEvent, type PreToolUseEvent } from "../guard-protocol.js";
+import { parseGuardUnlockPrompt, type GuardCommonEvent, type PreToolUseEvent } from "../guard-protocol.js";
 import { NativeHookOutputSchema } from "../hook-codecs.js";
 import type { GuardSideEventResult } from "../guard-service.js";
 import type { GuardDecision } from "../schemas.js";
@@ -214,10 +214,10 @@ describe("recorded native hook contracts", () => {
     }
   });
 
-  it("catches Claude prompt source and title drift and rejects unlock prompts marked non-user", async () => {
+  it("catches Claude prompt source and title drift and carries the source to Guard instead of rejecting unlocks", async () => {
     const codecs = await loadCodecs();
     // Claude Code 2.1.322 omits source on ordinary prompts, so a source-less
-    // unlock still decodes; origin-based unlock decisions belong to #239.
+    // unlock still decodes; origin-based unlock decisions are made by Guard (#239).
     const unlock = fixtureJson("claude", "user-prompt-submit");
     const ordinary = { ...unlock, prompt: "summarize the adapter contract" };
     const sources = ["user", "sdk", "system", "loop_wakeup", "schedule_wakeup", "poll_event"];
@@ -227,17 +227,22 @@ describe("recorded native hook contracts", () => {
         source,
         session_title: "renamed adapter contract session",
       });
-      expect(Object.keys(decoded).sort(), source).toEqual(GUARD_EVENT_KEYS.UserPromptSubmit);
+      expect(Object.keys(decoded).sort(), source).toEqual([...GUARD_EVENT_KEYS.UserPromptSubmit, "prompt_source"].sort());
+      expect(decoded, source).toMatchObject({ prompt_source: source });
     }
-    expect(codecs.claudeHookCodec.decode("UserPromptSubmit", unlock)).toMatchObject({ prompt: unlock.prompt });
+    const sourceless = codecs.claudeHookCodec.decode("UserPromptSubmit", unlock);
+    expect(sourceless).toMatchObject({ prompt: unlock.prompt });
+    expect(Object.keys(sourceless).sort()).toEqual(GUARD_EVENT_KEYS.UserPromptSubmit);
     expect(codecs.claudeHookCodec.decode("UserPromptSubmit", { ...unlock, source: "user" }))
-      .toMatchObject({ prompt: unlock.prompt });
+      .toMatchObject({ prompt: unlock.prompt, prompt_source: "user" });
+    // A non-user unlock now decodes so Guard can refuse it with its dedicated code and journal it.
     for (const source of sources.filter((value) => value !== "user")) {
-      expect(() => codecs.claudeHookCodec.decode("UserPromptSubmit", { ...unlock, source }), source).toThrow();
+      expect(codecs.claudeHookCodec.decode("UserPromptSubmit", { ...unlock, source }), source)
+        .toMatchObject({ prompt: unlock.prompt, prompt_source: source });
       expect(
-        () => codecs.claudeHookCodec.decode("UserPromptSubmit", { ...unlock, prompt: "/jhw:unlock", source }),
+        codecs.claudeHookCodec.decode("UserPromptSubmit", { ...unlock, prompt: "/jhw:unlock", source }),
         `${source} prefix only`,
-      ).toThrow();
+      ).toMatchObject({ prompt: "/jhw:unlock", prompt_source: source });
     }
     for (const drift of [{ source: "operator" }, { source: "" }, { session_title: 7 }]) {
       expect(() => codecs.claudeHookCodec.decode("UserPromptSubmit", { ...ordinary, ...drift })).toThrow();
@@ -436,7 +441,7 @@ describe("recorded native hook contracts", () => {
         )).toThrow();
       }
       const decoded = codec(codecs, adapter).decode("UserPromptSubmit", extraUnlock);
-      expect(decoded.event === "user_prompt_submit" && exactGuardUnlockRequestId(decoded.prompt)).toBeUndefined();
+      expect(decoded.event === "user_prompt_submit" && parseGuardUnlockPrompt(decoded.prompt)).toEqual({ kind: "malformed" });
     }
   });
 

@@ -5,6 +5,7 @@ import {
   GuardAdapterSchema,
   GuardSessionSchema,
   GuardWorktreeRefSchema,
+  GUARD_UNLOCK_PREFIX,
   OperationIdSchema,
   CanonicalOperationRequirementsSchema,
   RequestIdSchema,
@@ -547,7 +548,7 @@ export const GuardDecisionSchema = z.discriminatedUnion("decision", [
 ]).superRefine((decision, context) => {
   if (
     decision.decision === "PERMIT_REQUIRED" &&
-    decision.approval_command !== `/jhw:unlock ${decision.request_id}`
+    decision.approval_command !== `${GUARD_UNLOCK_PREFIX} ${decision.request_id}`
   ) {
     context.addIssue({
       code: z.ZodIssueCode.custom,

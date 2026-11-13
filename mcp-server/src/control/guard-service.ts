@@ -7,12 +7,13 @@ import { z } from "zod";
 
 import {
   ClaimIdSchema,
-  exactGuardUnlockRequestId,
   GuardAdapterSchema,
+  GUARD_UNLOCK_PREFIX,
   GuardPromptContextSchema,
   GuardSessionSchema,
   GuardWorktreeRefSchema,
   OperationRequirementSchema,
+  parseGuardUnlockPrompt,
   RequestIdSchema,
   type CanonicalOperation,
   type GuardAdapter,
@@ -947,7 +948,7 @@ export class GuardService {
         operation_id: operation.operation_id,
         request_id: result.data.request_id,
         summary: operation.summary,
-        approval_command: `/jhw:unlock ${result.data.request_id}`,
+        approval_command: `${GUARD_UNLOCK_PREFIX} ${result.data.request_id}`,
         approval_expires_at: result.data.approval_expires_at,
         ...(result.data.journal_warning ? { journal_warning: result.data.journal_warning } : {}),
       });
@@ -964,7 +965,14 @@ export class GuardService {
     const result = this.safeVariant(UserPromptSubmitEventSchema, eventInput);
     if (!result.success) return this.sideProtocolDeny();
     const event = result.data;
-    const requestId = exactGuardUnlockRequestId(event.prompt);
+    const unlock = parseGuardUnlockPrompt(event.prompt);
+    // #239: an unlock-like prompt whose native source is known and not the user is
+    // refused in both modes. An absent source is treated as user input because Claude
+    // omits it on ordinary prompts.
+    if (unlock.kind !== "none" && event.prompt_source !== undefined && event.prompt_source !== "user") {
+      return this.refuseUnlockPromptOrigin(event.adapter, event.session_id);
+    }
+    const requestId = unlock.kind === "exact" ? unlock.request_id : undefined;
     if (!requestId || this.mode === "observe") {
       const current = await this.readCurrentPromptContext(event.adapter, event.session_id);
       return GuardSideEventResultSchema.parse({
@@ -1244,6 +1252,29 @@ export class GuardService {
       failure.journalWarning,
       failure.reason,
     );
+  }
+
+  private async refuseUnlockPromptOrigin(adapter: GuardAdapter, sessionId: string): Promise<GuardSideEventResult> {
+    const code = "GUARD_PROMPT_ORIGIN_UNSUPPORTED";
+    let journalWarning: "GUARD_JOURNAL_UNAVAILABLE" | undefined = this.journalConfigured && !this.decisionJournal
+      ? "GUARD_JOURNAL_UNAVAILABLE"
+      : undefined;
+    if (this.decisionJournal) {
+      try {
+        await this.decisionJournal.append({
+          protocol_version: 1,
+          event: "decision",
+          evaluation_stage: "hook",
+          occurred_at: new Date(Date.now()).toISOString(),
+          origin_adapter: adapter,
+          session_id: sessionId,
+          decision_code: code,
+        });
+      } catch {
+        journalWarning = "GUARD_JOURNAL_UNAVAILABLE";
+      }
+    }
+    return this.sideDeny(code, "user_prompt_submit", undefined, journalWarning);
   }
 
   private sideDenyForStateFailure(

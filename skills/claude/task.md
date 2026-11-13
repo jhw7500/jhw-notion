@@ -472,7 +472,7 @@ Guard 결과는 다음처럼 해석한다.
 - `PERMIT_REQUIRED`: 소유권 충돌 없이 Work Contract 범위만 부족하다. Guard가 반환한 exact `approval_command`로 표시된 작업 한 건만 사용자 승인을 받을 수 있다.
 - `DENY`: hard-deny 또는 안전 상태를 검증할 수 없는 경우다. unlock으로 우회하지 않는다.
 
-승인의 유일한 형식은 supported native adapter가 전달한 **사용자의 exact raw prompt** 한 줄 `/jhw:unlock req-<UUIDv7>`다. Guard가 반환한 request ID를 그대로 사용한다. PENDING 요청의 승인 가능 시간 10분과 APPROVED 뒤 실행 시작 가능 시간 10분은 서로 독립이다. 실행 시작 시 `APPROVED -> CONSUMED`가 원자적으로 일어나며, 그 뒤에는 mid-operation permit expiry가 없다. spawn 실패를 포함한 replay/retry는 이미 소모한 permit을 재사용할 수 없고 새 요청·승인이 필요하다. 동시 소모는 정확히 한 실행만 이긴다.
+승인의 유일한 형식은 supported native adapter가 전달한 **사용자의 exact raw prompt** 한 줄 `/jhw:unlock req-<UUIDv7>`다. Guard가 반환한 request ID를 그대로 사용한다. PENDING 요청의 승인 가능 시간 10분과 APPROVED 뒤 실행 시작 가능 시간 10분은 서로 독립이다. 실행 시작 시 `APPROVED -> CONSUMED`가 원자적으로 일어나며, 그 뒤에는 mid-operation permit expiry가 없다. spawn 실패를 포함한 replay/retry는 이미 소모한 permit을 재사용할 수 없고 새 요청·승인이 필요하다. 동시 소모는 정확히 한 실행만 이긴다. Claude UserPromptSubmit의 `source`가 있고 `user`가 아닌 `/jhw:unlock` 접두 prompt는 관찰·강제 두 모드 모두에서 `GUARD_PROMPT_ORIGIN_UNSUPPORTED`로 거부하고 guard-journal에 `decision` 행으로 남긴다(append 실패는 `journal_warning`). `source`가 없거나 `user`이면 위 형식 규칙만 적용한다. Claude Code 2.1.322는 일반·예약·시스템 주입 prompt에 `source`를 싣지 않으므로 `source` 없이 주입된 unlock은 사용자 입력과 구분되지 않는다(알려진 잔여 위험). Codex는 출처 필드를 전달하지 않는다.
 
 protocol/prompt origin, Claim/session/host/worktree, current authority·exclusive resource conflict, unsafe/corrupt Guard·Registry state, self-approval은 hard-deny 축이다. `ok`, `진행`, `다음`, `승인`, 승인문 인용, code fence, 대소문자·공백 변경, suffix·추가 인자, agent 응답이나 shell/tool 호출은 승인이 아니다. `/jhw:unlock`은 reserved adapter control prompt이며 일반 skill이나 shell command가 아니다. `/jhw:unlock` skill을 만들거나 모델·agent에 승인 권한을 주지 않는다.
 

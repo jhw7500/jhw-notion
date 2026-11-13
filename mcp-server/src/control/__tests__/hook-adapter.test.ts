@@ -315,6 +315,55 @@ describe("strict hook adapter executable core", () => {
     expect(guard.calls).toEqual([]);
   });
 
+  it("hands a non-user Claude unlock prompt to Guard with its prompt source instead of failing decode", async () => {
+    // #239: the codec no longer rejects the prompt, so Guard can refuse it with its own code and journal it.
+    const { runHookAdapter } = await loadAdapter();
+    const unlock = `/jhw:unlock ${REQUEST_ID}`;
+    const guard = new ObservableGuard();
+    const raw = JSON.stringify({ ...JSON.parse(promptPayload(unlock)) as Record<string, unknown>, source: "sdk" });
+
+    const result = await runHookAdapter(["--adapter", "claude", "--event", "UserPromptSubmit"], raw, guard);
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(guard.calls).toHaveLength(1);
+    expect(guard.calls[0]).toMatchObject({
+      method: "submitUserPrompt",
+      event: { adapter: "claude", event: "user_prompt_submit", prompt: unlock, prompt_source: "sdk" },
+    });
+  });
+
+  it("surfaces the dedicated origin code from Guard in the Claude prompt output", async () => {
+    const { runHookAdapter } = await loadAdapter();
+    const guard = new ObservableGuard({
+      status: "DENY",
+      event: "user_prompt_submit",
+      code: "GUARD_PROMPT_ORIGIN_UNSUPPORTED",
+      summary: "Prompt origin is unsupported",
+    });
+    const raw = JSON.stringify({
+      ...JSON.parse(promptPayload(`/jhw:unlock ${REQUEST_ID}`)) as Record<string, unknown>,
+      source: "sdk",
+    });
+
+    const result = await runHookAdapter(["--adapter", "claude", "--event", "UserPromptSubmit"], raw, guard);
+
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext.split("\n")[0])
+      .toBe("GUARD_PROMPT_ORIGIN_UNSUPPORTED");
+  });
+
+  it("does not set a prompt source for Codex or source-less Claude prompts", async () => {
+    const { runHookAdapter } = await loadAdapter();
+    for (const adapter of ["claude", "codex"] as const) {
+      const guard = new ObservableGuard();
+      await runHookAdapter(
+        ["--adapter", adapter, "--event", "UserPromptSubmit"],
+        promptPayload(`/jhw:unlock ${REQUEST_ID}`, adapter),
+        guard,
+      );
+      expect(guard.calls[0]?.event, adapter).not.toHaveProperty("prompt_source");
+    }
+  });
+
   it.each([
     ["claude", "UserPromptSubmit", promptPayload(), "submitUserPrompt", "user_prompt_submit"],
     ["claude", "PreToolUse", preToolPayload(), "evaluatePreTool", "pre_tool_use"],

@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import {
   GuardCommonEventSchema,
+  GuardPromptSourceSchema,
   type GuardCommonEvent,
 } from "./guard-protocol.js";
 import type { GuardSideEventResult } from "./guard-service.js";
@@ -74,17 +75,9 @@ const ClaudeUserPromptSubmitSchema = z.object({
   cwd,
   hook_event_name: z.literal("UserPromptSubmit"),
   prompt,
-  source: z.enum(["user", "sdk", "system", "loop_wakeup", "schedule_wakeup", "poll_event"]).optional(),
+  source: GuardPromptSourceSchema.optional(),
   session_title: z.string().max(4_096).refine((value) => Buffer.byteLength(value, "utf8") <= 4_096).optional(),
-}).strict().superRefine((native, context) => {
-  // When Claude marks a prompt's author as anything but the user, reject every
-  // prompt that guard-state treats as an unlock attempt. Claude Code 2.1.322
-  // sets source only on its poll-event path, so ordinary, scheduled and
-  // system-injected prompts arrive without it and keep today's handling (#239).
-  if (native.source !== undefined && native.source !== "user" && native.prompt.startsWith("/jhw:unlock")) {
-    context.addIssue({ code: "custom", path: ["source"], message: "Guard unlock requires a user-authored prompt" });
-  }
-});
+}).strict();
 const ClaudePreToolUseSchema = z.object({
   session_id: coordinate(255),
   ...claudeCommonMetadata,
@@ -222,13 +215,19 @@ function decodeNative(
   raw: unknown,
 ): GuardCommonEvent {
   if (event === "UserPromptSubmit") {
-    const native = schemas.UserPromptSubmit.parse(raw) as { session_id: string; prompt: string };
+    const native = schemas.UserPromptSubmit.parse(raw) as {
+      session_id: string;
+      prompt: string;
+      source?: z.infer<typeof GuardPromptSourceSchema>;
+    };
     return GuardCommonEventSchema.parse({
       protocol_version: 1,
       adapter,
       event: "user_prompt_submit",
       session_id: native.session_id,
       prompt: native.prompt,
+      // Origin policy lives in Guard (#239); the codec only carries Claude's `source`.
+      ...(native.source !== undefined ? { prompt_source: native.source } : {}),
     });
   }
   if (event === "PreToolUse") {

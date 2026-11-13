@@ -14,6 +14,7 @@ import {
   GuardAdapterSchema,
   GuardSessionSchema,
   GuardToolUseIdSchema,
+  parseGuardUnlockPrompt,
   type CanonicalOperation,
   type GuardAdapter,
   type OperationRequirement,
@@ -58,8 +59,6 @@ const temporaryFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
   constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const keyCreateFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY |
   constants.O_NOFOLLOW;
-const EXACT_UNLOCK =
-  /^\/jhw:unlock (req-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
 const concreteStateDirectoryRun = MutationLock.prototype.runInStateDirectory;
 const directlyConstructedGuardRequestStores = new WeakMap<object, GuardHostCoordinateAuthority>();
 const productionGuardRequestStores = new WeakMap<object, GuardHostCoordinateAuthority>();
@@ -521,16 +520,16 @@ export class GuardRequestStore {
     sessionInput: string,
     rawPrompt: string,
   ): Promise<GuardPromptApprovalResult> {
-    if (!rawPrompt.startsWith("/jhw:unlock")) return { status: "NOT_UNLOCK_PROMPT" };
-    const match = EXACT_UNLOCK.exec(rawPrompt);
-    if (!match || match[0] !== rawPrompt) throw transitionError("GUARD_REQUEST_NOT_FOUND");
+    const unlock = parseGuardUnlockPrompt(rawPrompt);
+    if (unlock.kind === "none") return { status: "NOT_UNLOCK_PROMPT" };
+    if (unlock.kind === "malformed") throw transitionError("GUARD_REQUEST_NOT_FOUND");
     const adapter = GuardAdapterSchema.safeParse(originAdapterInput);
     if (!adapter.success) {
       throw new ControlError("GUARD_PROMPT_ORIGIN_UNSUPPORTED", "Prompt origin is unsupported");
     }
     const session = GuardSessionSchema.safeParse(sessionInput);
     if (!session.success) throw transitionError("GUARD_PERMIT_MISMATCH");
-    const requestId = match[1] as string;
+    const requestId = unlock.request_id;
 
     return this.runMutation((state, now) => {
       const request = state.requests.find((candidate) => candidate.request_id === requestId);
