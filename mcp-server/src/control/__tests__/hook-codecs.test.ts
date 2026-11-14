@@ -145,6 +145,37 @@ describe("native hook input codecs", () => {
     });
   });
 
+  it("accepts the empty prompt Claude Code sends for an image-only message", async () => {
+    // Break caught: an image-only Claude prompt (prompt: "") fails decode and surfaces GUARD_PROTOCOL_MISMATCH.
+    const codec = (await loadCodecs()).claudeHookCodec;
+    const raw = {
+      session_id: "native-session-17",
+      transcript_path: "/srv/transcripts/native-17.jsonl",
+      cwd: "/srv/worktrees/native-17",
+      prompt_id: "prompt-17",
+      permission_mode: "default",
+      hook_event_name: "UserPromptSubmit",
+      prompt: "",
+    };
+
+    expect(codec.decode("UserPromptSubmit", raw)).toEqual({
+      protocol_version: 1,
+      adapter: "claude",
+      event: "user_prompt_submit",
+      session_id: "native-session-17",
+      prompt: "",
+    });
+  });
+
+  it("still rejects an empty Codex prompt", async () => {
+    // Preservation: the Claude-only evidence must not widen the Codex parser.
+    const codec = (await loadCodecs()).codexHookCodec;
+    expect(() => codec.decode("UserPromptSubmit", {
+      ...nativePayloadFor("codex").UserPromptSubmit,
+      prompt: "",
+    })).toThrow();
+  });
+
   it.each(adapters)("uses only prompt as the authoritative %s prompt field", async (adapter, key) => {
     // Break caught: fallback text such as user_prompt or an embedded transcript can approve a permit.
     const codec = (await loadCodecs())[key];
@@ -201,6 +232,8 @@ describe("native hook input codecs", () => {
         const missing = { ...fixture };
         delete missing[field];
         expect(() => codec.decode(event, missing), `${event}.${field} missing`).toThrow();
+        // Claude sends an empty prompt for an image-only message; covered by its own test.
+        if (adapter === "claude" && event === "UserPromptSubmit" && field === "prompt") continue;
         expect(
           () => codec.decode(event, { ...fixture, [field]: "" }),
           `${event}.${field} empty`,
