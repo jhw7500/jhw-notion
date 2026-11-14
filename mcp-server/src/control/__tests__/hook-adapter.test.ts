@@ -332,6 +332,26 @@ describe("strict hook adapter executable core", () => {
     });
   });
 
+  it("treats an empty Claude prompt like any other non-approval prompt", async () => {
+    // Break caught: an image-only prompt (prompt: "") is rejected as GUARD_PROTOCOL_MISMATCH instead of NO_STATE_CHANGE.
+    const { runHookAdapter } = await loadAdapter();
+    const args = ["--adapter", "claude", "--event", "UserPromptSubmit"];
+    const textGuard = new ObservableGuard();
+    const text = await runHookAdapter(args, promptPayload(), textGuard);
+    const guard = new ObservableGuard();
+
+    const result = await runHookAdapter(args, promptPayload(""), guard);
+
+    expect(result).toEqual(text);
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(result.stdout).not.toContain("GUARD_PROTOCOL_MISMATCH");
+    expect(guard.calls).toHaveLength(1);
+    expect(guard.calls[0]).toMatchObject({
+      method: "submitUserPrompt",
+      event: { adapter: "claude", event: "user_prompt_submit", prompt: "" },
+    });
+  });
+
   it("surfaces the dedicated origin code from Guard in the Claude prompt output", async () => {
     const { runHookAdapter } = await loadAdapter();
     const guard = new ObservableGuard({

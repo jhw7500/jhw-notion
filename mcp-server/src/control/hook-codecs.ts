@@ -74,7 +74,8 @@ const ClaudeUserPromptSubmitSchema = z.object({
   transcript_path: transcriptPath.optional(),
   cwd,
   hook_event_name: z.literal("UserPromptSubmit"),
-  prompt,
+  // An image-only message reaches the hook with an empty prompt.
+  prompt: prompt.or(z.literal("")),
   source: GuardPromptSourceSchema.optional(),
   session_title: z.string().max(4_096).refine((value) => Buffer.byteLength(value, "utf8") <= 4_096).optional(),
 }).strict();

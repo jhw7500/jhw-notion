@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -225,16 +225,102 @@ describe("ObserveJournal", () => {
     expect(await readFile(path, "utf8")).toBe('{"sequence":1}\n');
   });
 
-  it("enforces the bounded row count before writing and preserves all bytes", async () => {
-    const { stateDir, path } = await fixture();
-    await mkdir(stateDir, { mode: 0o700 });
-    const bytes = Buffer.from(Array.from({ length: 8 * 1024 }, (_, sequence) =>
-      JSON.stringify({ sequence })).join("\n") + "\n", "utf8");
-    await writeFile(path, bytes, { mode: 0o600 });
+  describe("rotation", () => {
+    const ARCHIVE_PATTERN = /^guard-observe-journal\.v1\.\d{8}T\d{6}Z-[0-9a-f-]{36}\.jsonl$/;
+    const rows = (count: number): Buffer => Buffer.from(
+      Array.from({ length: count }, (_, sequence) => JSON.stringify({ sequence })).join("\n") + "\n", "utf8");
+    const archives = async (stateDir: string): Promise<string[]> =>
+      (await readdir(stateDir)).filter((name) => name.startsWith("guard-observe-journal.v1.") && name !== "guard-observe-journal.v1.jsonl");
 
-    await expect(new ObserveJournal(stateDir, RowSchema).append({ sequence: 9_000 }))
-      .rejects.toMatchObject({ code: "JOURNAL_WRITE_FAILED" });
-    expect(await readFile(path)).toEqual(bytes);
+    async function prefilled(bytes: Buffer): Promise<{ stateDir: string; path: string }> {
+      const { stateDir, path } = await fixture();
+      await mkdir(stateDir, { mode: 0o700 });
+      await writeFile(path, bytes, { mode: 0o600 });
+      return { stateDir, path };
+    }
+
+    it("rotates a journal holding 4096 rows into a private archive before appending", async () => {
+      const bytes = rows(4096);
+      const { stateDir, path } = await prefilled(bytes);
+
+      await new ObserveJournal(stateDir, RowSchema).append({ sequence: 9_000 });
+
+      expect(await readFile(path, "utf8")).toBe('{"sequence":9000}\n');
+      const found = await archives(stateDir);
+      expect(found).toHaveLength(1);
+      expect(found[0]).toMatch(ARCHIVE_PATTERN);
+      expect(await readFile(join(stateDir, found[0]!))).toEqual(bytes);
+      expect((await lstat(join(stateDir, found[0]!))).mode & 0o7777).toBe(0o600);
+      expect((await lstat(path)).mode & 0o7777).toBe(0o600);
+    });
+
+    it("keeps at most 4096 rows live: no rotation at 4095 rows, rotation on the next append", async () => {
+      const { stateDir, path } = await prefilled(rows(4095));
+      const journal = new ObserveJournal(stateDir, RowSchema);
+
+      await journal.append({ sequence: 9_000 });
+      expect((await readFile(path, "utf8")).trimEnd().split("\n")).toHaveLength(4096);
+      expect(await archives(stateDir)).toEqual([]);
+
+      await journal.append({ sequence: 9_001 });
+      expect(await readFile(path, "utf8")).toBe('{"sequence":9001}\n');
+      const found = await archives(stateDir);
+      expect(found).toHaveLength(1);
+      expect((await readFile(join(stateDir, found[0]!), "utf8")).trimEnd().split("\n")).toHaveLength(4096);
+    });
+
+    it("rotates when the next row would push the file past half the byte bound", async () => {
+      // 1024 valid whitespace-padded rows of exactly 4096 bytes: well under 4096 rows, exactly half the byte bound.
+      const half = 4 * 1024 * 1024;
+      const all = Buffer.from(Array.from({ length: 1024 }, () =>
+        `{"sequence":1${" ".repeat(4096 - 15)}}\n`).join(""), "utf8");
+      expect(all.length).toBe(half);
+      const { stateDir, path } = await prefilled(all);
+
+      await new ObserveJournal(stateDir, RowSchema).append({ sequence: 3 });
+
+      expect(await readFile(path, "utf8")).toBe('{"sequence":3}\n');
+      const found = await archives(stateDir);
+      expect(found).toHaveLength(1);
+      expect(await readFile(join(stateDir, found[0]!))).toEqual(all);
+    });
+
+    it("migrates a journal that already holds the old 8192-row hard bound", async () => {
+      const bytes = rows(8 * 1024);
+      const { stateDir, path } = await prefilled(bytes);
+
+      await new ObserveJournal(stateDir, RowSchema).append({ sequence: 9_000 });
+
+      expect(await readFile(path, "utf8")).toBe('{"sequence":9000}\n');
+      const found = await archives(stateDir);
+      expect(found).toHaveLength(1);
+      expect(await readFile(join(stateDir, found[0]!))).toEqual(bytes);
+    });
+
+    it("never moves a journal that fails validation, even above the rotation threshold", async () => {
+      for (const tail of ['{"unexpected":true}\n', '{"sequence":']) {
+        const bytes = Buffer.concat([rows(4096), Buffer.from(tail, "utf8")]);
+        const { stateDir, path } = await prefilled(bytes);
+
+        await expect(new ObserveJournal(stateDir, RowSchema).append({ sequence: 9_000 }))
+          .rejects.toMatchObject({ code: "JOURNAL_WRITE_FAILED" });
+
+        expect(await archives(stateDir)).toEqual([]);
+        expect(await readFile(path)).toEqual(bytes);
+      }
+    });
+
+    it("appends to a missing and to an empty journal without rotating", async () => {
+      const missing = await fixture();
+      await new ObserveJournal(missing.stateDir, RowSchema).append({ sequence: 1 });
+      expect(await readFile(missing.path, "utf8")).toBe('{"sequence":1}\n');
+      expect(await archives(missing.stateDir)).toEqual([]);
+
+      const empty = await prefilled(Buffer.alloc(0));
+      await new ObserveJournal(empty.stateDir, RowSchema).append({ sequence: 1 });
+      expect(await readFile(empty.path, "utf8")).toBe('{"sequence":1}\n');
+      expect(await archives(empty.stateDir)).toEqual([]);
+    });
   });
 
   it("rejects unsafe observe files and lock files without touching their targets", async () => {

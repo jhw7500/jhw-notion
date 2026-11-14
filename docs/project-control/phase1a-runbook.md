@@ -117,6 +117,8 @@ owned `UserPromptSubmit` 응답은 `additionalContext`와 `systemMessage`의 첫
 
 모든 도구가 `GUARD_*` 코드로 막혀 세션을 이어 갈 수 없을 때 사용자 터미널에서 hook을 잠시 푸는 절차는 `docs/project-control/guard-break-glass.md`를 따른다.
 
+observe 모드의 판정 기록 `guard-observe-journal.v1.jsonl`은 state directory 안에서 스스로 회전한다. 한 행을 덧붙이기 전에 파일 전체를 검증한 뒤 4,096행에 이르렀거나 새 행을 더하면 읽기 한도(8 MiB)의 절반을 넘게 되면, 그 파일을 `guard-observe-journal.v1.<UTC 시각, 예: 20261114T081530Z>-<UUID>.jsonl` 이름의 archive로 옮기고 새 파일에 행을 쓴다. archive는 state directory에 그대로 남고 자동으로 지우지 않으므로 더 필요하지 않게 되면 운영자가 직접 지운다. 검증에 실패하는 파일은 회전하지 않고 옮기거나 고치지도 않으며, 그 행은 기록되지 않은 채 호출만 허용된다.
+
 ### 기존 Issue-backed Project fixture 전환
 
 구 구현으로 만든 Issue-backed Project item이 있으면 새 reader는 이를 Project Record로 무시하지 않고 fail-closed한다. 전환은 자동 migration이나 authority cutover가 아니라 승인된 trial fixture 정리이며 다음 순서를 지킨다.
