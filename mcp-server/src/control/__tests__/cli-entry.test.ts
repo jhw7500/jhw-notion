@@ -263,7 +263,7 @@ describe("jhw-control installed entry", () => {
     const elapsed = performance.now() - started;
 
     expect(outcome).toEqual({ code: 0, stdout: '{"hookSpecificOutput":{"hookEventName":"PreToolUse"}}\n', stderr: "" });
-    // A deadline timer that stayed armed or ref'd would keep the process alive for 6.5 s.
+    // A fast decision exits promptly (well under the 6.5 s deadline) and leaves no deadline row.
     expect(elapsed).toBeLessThan(3_000);
     const diagnostics = await readFile(join(stateDir, "guard-hook-diagnostics.v1.jsonl"), "utf8").catch(() => "");
     expect(diagnostics).not.toContain('"kind":"deadline"');

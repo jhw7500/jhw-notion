@@ -1,8 +1,37 @@
 #!/bin/bash
 set -euo pipefail
+# The product rejects group-writable trusted directories, so fixtures must not inherit a 0002 umask.
+umask 022
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI="$REPO_ROOT/mcp-server/dist/control/cli.js"
+# The product trusts an artifact only if every directory from / down to it is owned by this user or root
+# and not group/other writable (root-owned sticky directories excepted). The build cannot repair the
+# checkout, and the fixtures are created under TMPDIR, so an untrusted chain is reported up front.
+check_trusted_chain() {
+  local label="$1" hint="$3" dir info uid mode
+  dir="$(cd "$2" && pwd -P)"
+  set --
+  while [ "$dir" != "/" ]; do set -- "$dir" "$@"; dir="$(dirname "$dir")"; done
+  set -- / "$@"
+  for dir in "$@"; do
+    info="$(stat -c '%u %a' "$dir")"
+    uid="${info% *}"
+    mode="${info#* }"
+    if [ "$uid" != "$(id -u)" ] && [ "$uid" != 0 ]; then
+      echo "hook preflight: $label directory is not trusted by the product ($dir owner $uid); $hint" >&2
+      exit 1
+    fi
+    if [ $((8#$mode & 8#022)) -ne 0 ] && { [ "$uid" != 0 ] || [ $((8#$mode & 8#1000)) -eq 0 ]; }; then
+      echo "hook preflight: $label directory is not trusted by the product ($dir mode $mode); $hint" >&2
+      exit 1
+    fi
+  done
+}
+checkout_hint="run this test from a checkout whose directories are owned by you or root and are not group- or other-writable (for example one created under umask 022)"
+check_trusted_chain checkout "$REPO_ROOT/scripts" "$checkout_hint"
+check_trusted_chain checkout "$REPO_ROOT/mcp-server" "$checkout_hint"
+check_trusted_chain temporary "${TMPDIR:-/tmp}" "run this test with a TMPDIR whose directories are owned by you or root and are not group- or other-writable (for example /tmp)"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/jhw hook preflight 'runtime.XXXXXX")"
 FAKE_BIN="$ROOT/fake-bin"
 mkdir -p "$FAKE_BIN"
@@ -159,11 +188,17 @@ if (process.env.ANTHROPIC_API_KEY !== "jhw-preflight-no-network" ||
 fs.writeFileSync(path.join(configDir, "probe-state"), "must-be-cleaned", { mode: 0o600 });
 if (process.env.AWS_SECRET_ACCESS_KEY !== undefined || process.env.JHW_FAKE_CLAUDE_LOG !== undefined ||
     process.env.NODE_OPTIONS !== undefined) process.exit(66);
-const logPath = path.join(process.env.HOME, "claude-runtime-probe.log");
+// The probe runs with an isolated HOME, so the log lives in the test root: the parent of
+// fake-bin, or this file's own directory when a scenario moved the fake into the root.
+const selfDir = path.dirname(fs.realpathSync(process.argv[1]));
+const logPath = path.join(path.basename(selfDir) === "fake-bin" ? path.dirname(selfDir) : selfDir, "claude-runtime-probe.log");
+let hookLink;
+try { hookLink = fs.readlinkSync(path.join(process.env.HOME, ".local", "bin", "jhw-control-hook")); } catch {}
 fs.appendFileSync(logPath, `${JSON.stringify({
   args,
   configDir,
   home: process.env.HOME,
+  hookLink,
   cwd: process.cwd(),
   entrypoint: process.argv[1],
 })}\n`, "utf8");
@@ -339,7 +374,8 @@ run_preflight() {
     *) mode="trusted" ;;
   esac
   log="$ROOT/$scenario-app-server.log"
-  claude_log="$home/claude-runtime-probe.log"
+  claude_log="$ROOT/claude-runtime-probe.log"
+  rm -f "$claude_log"
   probe_log="$ROOT/$scenario-shell-probe.log"
   probe_cwd_log="$ROOT/$scenario-shell-probe-cwd.log"
   runtime_shell="${SHELL:-/bin/sh}"
@@ -472,8 +508,10 @@ if (scenario === "claude-exact-trusted") {
   const calls = fs.readFileSync(claudeLogPath, "utf8").trim().split("\n").map(JSON.parse);
   if (calls.length !== 1) fail("Claude runtime probe did not run exactly once");
   const call = calls[0];
-  if (!Array.isArray(call.args) || call.home !== expectedHome) {
-    fail("Claude runtime probe did not retain the exact launcher HOME");
+  if (!Array.isArray(call.args) || call.home === expectedHome || typeof call.configDir !== "string" ||
+      call.home !== path.join(call.configDir, "home") ||
+      call.hookLink !== path.join(expectedHome, ".local", "bin", "jhw-control-hook")) {
+    fail("Claude runtime probe did not use an isolated HOME linked to the launcher hook");
   }
   if (!/^\/(?:proc\/self|dev)\/fd\/3$/.test(call.entrypoint)) {
     fail("Claude runtime probe was not bound to the inspected executable descriptor");

@@ -2412,6 +2412,32 @@ describe("GuardService", () => {
         ]);
       });
 
+      it("records the refusal row without a request_id", async () => {
+        const stateDir = join(fixture.root, "origin-no-request-id");
+        const service = integratedService({ guard_journal: new GuardJournal(stateDir) });
+        await service.submitUserPrompt(promptEvent(
+          "/jhw:unlock req-018f21e0-7b2c-7a00-8000-000000000099",
+          { prompt_source: "sdk" },
+        ));
+        const rows = await decisionRows(stateDir);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).not.toHaveProperty("request_id");
+      });
+
+      it("reports a journal warning on the refusal when the journal is configured but not a direct GuardJournal", async () => {
+        const service = integratedService({
+          guard_journal: { append: async () => undefined } as unknown as GuardJournal,
+        });
+        await expect(service.submitUserPrompt(promptEvent(
+          "/jhw:unlock req-018f21e0-7b2c-7a00-8000-000000000099",
+          { prompt_source: "sdk" },
+        ))).resolves.toMatchObject({
+          status: "DENY",
+          code: "GUARD_PROMPT_ORIGIN_UNSUPPORTED",
+          journal_warning: "GUARD_JOURNAL_UNAVAILABLE",
+        });
+      });
+
       it("refuses a non-user malformed unlock-prefixed prompt with the same code", async () => {
         const stateDir = join(fixture.root, "origin-malformed");
         const service = integratedService({ guard_journal: new GuardJournal(stateDir) });

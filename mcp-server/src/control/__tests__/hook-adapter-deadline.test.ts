@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HOOK_DECISION_DEADLINE_MS,
   HOOK_LATENCY_WARNING_MS,
+  recordBoundedDiagnostic,
   runHookAdapter,
   runHookAdapterWithDeadline,
   type HookDeadlineIo,
@@ -219,6 +220,33 @@ describe("PreToolUse decision deadline", () => {
     expect(await rows(ctx)).toEqual([]);
   });
 
+  describe("stdout write failure", () => {
+    it.each(["observe", "enforce"] as const)("resolves, writes once and records nothing when stdout rejects in %s", async (mode) => {
+      const ctx = await context(mode);
+      const f = fakeIo();
+      f.io.write.mockImplementation(async () => { throw new Error("EPIPE"); });
+      const result = await runHookAdapterWithDeadline(argv, payload("PreToolUse"), port(async () => allow()), f.io, ctx);
+      expect(result.exitCode).toBe(0);
+      expect(f.io.write).toHaveBeenCalledOnce();
+      expect(result.stdout).toBe(f.io.write.mock.calls[0]![0]);
+      expect(f.io.exit).not.toHaveBeenCalled();
+      expect(await rows(ctx)).toEqual([]);
+    });
+
+    it("keeps a render failure in observe a neutral allow with one GUARD_PROTOCOL_MISMATCH row", async () => {
+      const ctx = await context("observe");
+      const f = fakeIo();
+      const result = await runHookAdapterWithDeadline(
+        argv, payload("PreToolUse"), port(async () => ({ decision: "BOGUS" }) as never), f.io, ctx,
+      );
+      expect(result.stdout).toBe(NEUTRAL);
+      expect(f.io.write).toHaveBeenCalledExactlyOnceWith(NEUTRAL);
+      expect(await rows(ctx)).toEqual([expect.objectContaining({
+        kind: "unrecorded_allow", code: "GUARD_PROTOCOL_MISMATCH", mode: "observe",
+      })]);
+    });
+  });
+
   describe("observe self-failure allow", () => {
     const withoutSession = JSON.stringify((({ session_id: _session, ...rest }) => rest)(JSON.parse(payload("PreToolUse"))));
     const failures = [
@@ -268,6 +296,25 @@ describe("PreToolUse decision deadline", () => {
       expect(order).toEqual(["write", "exit"]);
       expect(f.io.exit).toHaveBeenCalledOnce();
     });
+  });
+
+  it("does not let a slow diagnostics append started inside the Guard call hold the verdict or the process", async () => {
+    const ctx = await context("observe");
+    const f = fakeIo();
+    const order: string[] = [];
+    f.io.write.mockImplementation(async () => { order.push("write"); });
+    f.io.exit.mockImplementation(() => { order.push("exit"); });
+    slowAppend.delayMs = 2_000;
+    const guard = port(async () => {
+      await recordBoundedDiagnostic(ctx, { adapter: "claude", event: "PreToolUse", kind: "unrecorded_allow" }, f.io);
+      return allow();
+    });
+    const started = Date.now();
+    const result = await runHookAdapterWithDeadline(argv, payload("PreToolUse"), guard, f.io, ctx);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result.exitCode).toBe(0);
+    expect(order).toEqual(["write", "exit"]);
+    expect(f.io.exit).toHaveBeenCalledOnce();
   });
 
   it.each(["UserPromptSubmit", "PostToolUse", "SessionEnd"] as const)(

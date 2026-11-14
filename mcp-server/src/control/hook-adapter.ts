@@ -264,7 +264,8 @@ interface DeadlineRun {
 
 type HookFailureCode = "GUARD_UNAVAILABLE" | "GUARD_PROTOCOL_MISMATCH";
 
-async function recordBoundedDiagnostic(
+/** Exported for tests; this is the diagnostics sink production gives the Guard service. */
+export async function recordBoundedDiagnostic(
   context: HookRunContext | undefined,
   row: Omit<GuardDiagnosticRow, "mode">,
   io?: HookDeadlineIo,
@@ -379,17 +380,25 @@ async function executeHookAdapter(
     return failed("GUARD_UNAVAILABLE", "unrecorded_allow");
   }
 
+  let rendered: HookRunResult;
   try {
-    const rendered = selection.event === "UserPromptSubmit"
+    const native = selection.event === "UserPromptSubmit"
       ? codec.renderPrompt(parseSideResult(rawResult, "user_prompt_submit"))
       : selection.event === "PreToolUse"
         ? codec.renderPreTool(GuardDecisionSchema.parse(rawResult))
         : selection.event === "PostToolUse"
           ? codec.renderPostTool(parseSideResult(rawResult, "post_tool_use"))
           : codec.renderSessionEnd(rawResult);
-    return await finish({ exitCode: 0, stdout: serializeNative(selection.event, rendered), stderr: "" });
+    rendered = { exitCode: 0, stdout: serializeNative(selection.event, native), stderr: "" };
   } catch {
     return failed("GUARD_PROTOCOL_MISMATCH", "unrecorded_allow");
+  }
+  try {
+    return await finish(rendered);
+  } catch {
+    // A stdout write failure is not a render failure and is deliberately not
+    // recorded. The emission latch is already set, so nothing further is written.
+    return rendered;
   }
 }
 
@@ -531,6 +540,9 @@ async function main(): Promise<void> {
   try {
     raw = await readBoundedHookStdin(process.stdin);
   } catch {
+    // Oversized or unreadable stdin keeps the generic denial: nothing can be
+    // recorded before the mode and state directory are resolved, and a distinct
+    // code would not change the outcome.
     const result = failureResult(fallbackEvent(argv), "GUARD_PROTOCOL_MISMATCH");
     await writeResult(process.stdout, result.stdout);
     process.exitCode = 0;
