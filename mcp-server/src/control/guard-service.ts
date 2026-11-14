@@ -1256,25 +1256,30 @@ export class GuardService {
 
   private async refuseUnlockPromptOrigin(adapter: GuardAdapter, sessionId: string): Promise<GuardSideEventResult> {
     const code = "GUARD_PROMPT_ORIGIN_UNSUPPORTED";
-    let journalWarning: "GUARD_JOURNAL_UNAVAILABLE" | undefined = this.journalConfigured && !this.decisionJournal
-      ? "GUARD_JOURNAL_UNAVAILABLE"
-      : undefined;
-    if (this.decisionJournal) {
-      try {
-        await this.decisionJournal.append({
-          protocol_version: 1,
-          event: "decision",
-          evaluation_stage: "hook",
-          occurred_at: new Date(Date.now()).toISOString(),
-          origin_adapter: adapter,
-          session_id: sessionId,
-          decision_code: code,
-        });
-      } catch {
-        journalWarning = "GUARD_JOURNAL_UNAVAILABLE";
-      }
-    }
+    // No request_id: the only id here is the one typed in the prompt, and this
+    // returns before any request-store read, so it is unverified text from a
+    // non-user source.
+    const journalWarning = await this.appendPlainDecision({
+      protocol_version: 1,
+      event: "decision",
+      evaluation_stage: "hook",
+      occurred_at: new Date(Date.now()).toISOString(),
+      origin_adapter: adapter,
+      session_id: sessionId,
+      decision_code: code,
+    });
     return this.sideDeny(code, "user_prompt_submit", undefined, journalWarning);
+  }
+
+  // Appends a plain (non-observation) decision row; returns the warning to surface.
+  private async appendPlainDecision(event: GuardJournalEvent): Promise<"GUARD_JOURNAL_UNAVAILABLE" | undefined> {
+    if (!this.decisionJournal) return this.journalConfigured ? "GUARD_JOURNAL_UNAVAILABLE" : undefined;
+    try {
+      await this.decisionJournal.append(event);
+      return undefined;
+    } catch {
+      return "GUARD_JOURNAL_UNAVAILABLE";
+    }
   }
 
   private sideDenyForStateFailure(
@@ -1342,19 +1347,15 @@ export class GuardService {
           : undefined
       : undefined;
     const requiresObservation = decision.decision === "ALLOW" && decision.observed_decision !== undefined;
-    if (!this.decisionJournal || (requiresObservation && observation === undefined)) {
-      if (requiresObservation) return this.unrecordedAllow(decision, event?.adapter, observedCode);
-      return this.journalConfigured ? this.withJournalWarning(decision) : decision;
+    if (!requiresObservation) {
+      return await this.appendPlainDecision(journalEvent) ? this.withJournalWarning(decision) : decision;
     }
+    if (!this.decisionJournal || observation === undefined) return this.unrecordedAllow(decision, event?.adapter, observedCode);
     try {
-      if (observation !== undefined) {
-        const result = await this.decisionJournal.appendObservedDecision(journalEvent, observation);
-        return result.legacy_journal_warning ? this.withJournalWarning(decision) : decision;
-      }
-      await this.decisionJournal.append(journalEvent);
-      return decision;
+      const result = await this.decisionJournal.appendObservedDecision(journalEvent, observation);
+      return result.legacy_journal_warning ? this.withJournalWarning(decision) : decision;
     } catch {
-      return requiresObservation ? this.unrecordedAllow(decision, event?.adapter, observedCode) : this.withJournalWarning(decision);
+      return this.unrecordedAllow(decision, event?.adapter, observedCode);
     }
   }
 
