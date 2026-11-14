@@ -119,6 +119,8 @@ owned `UserPromptSubmit` 응답은 `additionalContext`와 `systemMessage`의 첫
 
 observe 모드의 판정 기록 `guard-observe-journal.v1.jsonl`은 state directory 안에서 스스로 회전한다. 한 행을 덧붙이기 전에 파일 전체를 검증한 뒤 4,096행에 이르렀거나 새 행을 더하면 읽기 한도(8 MiB)의 절반을 넘게 되면, 그 파일을 `guard-observe-journal.v1.<UTC 시각, 예: 20261114T081530Z>-<UUID>.jsonl` 이름의 archive로 옮기고 새 파일에 행을 쓴다. archive는 state directory에 그대로 남고 자동으로 지우지 않으므로 더 필요하지 않게 되면 운영자가 직접 지운다. 검증에 실패하는 파일은 회전하지 않고 옮기거나 고치지도 않으며, 그 행은 기록되지 않은 채 호출만 허용된다.
 
+request store는 쓰는 동안만 state directory에 `.guard-requests.<UUID>.tmp` 임시 파일을 만들고 쓰기가 성공하든 실패하든 끝나면 지운다. hook 프로세스가 쓰는 도중에 끝나면(예: deadline에 이르러 종료하거나 바깥에서 종료시킬 때) 이 파일이 남을 수 있다. request store는 정해진 이름의 `guard-requests.yaml`과 `guard-requests.lock`만 열고 state directory를 훑지 않으므로 남은 임시 파일은 store에 영향을 주지 않으며, 실행 중인 hook이 없을 때 운영자가 지워도 된다. request store lock은 `flock -w 5`로 최대 5초 기다리므로, 기다리는 `flock` 자식 프로세스는 hook 프로세스보다 최대 5초 더 남을 수 있다.
+
 ### 기존 Issue-backed Project fixture 전환
 
 구 구현으로 만든 Issue-backed Project item이 있으면 새 reader는 이를 Project Record로 무시하지 않고 fail-closed한다. 전환은 자동 migration이나 authority cutover가 아니라 승인된 trial fixture 정리이며 다음 순서를 지킨다.
