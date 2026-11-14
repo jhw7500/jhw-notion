@@ -1,5 +1,6 @@
 import { constants, type BigIntStats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { TextDecoder } from "node:util";
 
@@ -13,6 +14,11 @@ const OBSERVE_JOURNAL_FILE = "guard-observe-journal.v1.jsonl";
 const MAX_OBSERVE_LINE_BYTES = 8 * 1024;
 const MAX_OBSERVE_READ_BYTES = 8 * 1024 * 1024;
 const MAX_OBSERVE_READ_LINES = 8 * 1024;
+// Rotate at half the hard bounds. A file this code leaves behind holds at most
+// that much, so an older release that still fails at the hard bound has the
+// other half as headroom before it gets there.
+const ROTATE_OBSERVE_ROWS = MAX_OBSERVE_READ_LINES / 2;
+const ROTATE_OBSERVE_BYTES = MAX_OBSERVE_READ_BYTES / 2;
 const createFlags = constants.O_CREAT | constants.O_EXCL | constants.O_APPEND |
   constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const existingFlags = constants.O_APPEND | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK;
@@ -36,6 +42,11 @@ function sameStableFile(left: BigIntStats, right: BigIntStats): boolean {
     && left.size === right.size
     && left.mtimeNs === right.mtimeNs
     && left.ctimeNs === right.ctimeNs;
+}
+
+function archiveName(): string {
+  const stamp = new Date().toISOString().replace(/\.\d+Z$/, "Z").replace(/[-:]/g, "");
+  return `guard-observe-journal.v1.${stamp}-${randomUUID()}.jsonl`;
 }
 
 export class ObserveJournal<Row> {
@@ -68,19 +79,34 @@ export class ObserveJournal<Row> {
   async #appendLocked(directory: SecureStateDirectory, encoded: Buffer): Promise<void> {
     let file: FileHandle | undefined;
     try {
-      try {
-        file = await directory.openFile(OBSERVE_JOURNAL_FILE, createFlags, 0o600);
-      } catch (cause) {
-        if (!isAlreadyExists(cause)) throw cause;
-        file = await directory.openFile(OBSERVE_JOURNAL_FILE, existingFlags);
-      }
+      let before: BigIntStats;
+      let existing: { bytes: Buffer; rows: number };
+      for (let rotated = false; ; rotated = true) {
+        try {
+          file = await directory.openFile(OBSERVE_JOURNAL_FILE, createFlags, 0o600);
+        } catch (cause) {
+          if (!isAlreadyExists(cause)) throw cause;
+          file = await directory.openFile(OBSERVE_JOURNAL_FILE, existingFlags);
+        }
 
-      const before = await file.stat({ bigint: true });
-      this.#assertPrivateFile(before);
+        before = await file.stat({ bigint: true });
+        this.#assertPrivateFile(before);
+        // Validate before any bound decision: a file that fails validation is never moved.
+        existing = await this.#readAndValidate(file, Number(before.size));
+        const needsRotation = existing.rows >= ROTATE_OBSERVE_ROWS
+          || before.size + BigInt(encoded.byteLength) > BigInt(ROTATE_OBSERVE_BYTES);
+        if (!needsRotation || rotated) break;
+
+        await this.#assertCurrentPathIdentity(directory, before);
+        await file.close();
+        file = undefined;
+        await directory.renameWithin(OBSERVE_JOURNAL_FILE, archiveName());
+        if (this.#hooks.syncJournalDirectory) await this.#hooks.syncJournalDirectory(directory);
+        else await directory.sync();
+      }
       if (before.size + BigInt(encoded.byteLength) > BigInt(MAX_OBSERVE_READ_BYTES)) {
         throw unavailable("Guard observation journal exceeds its bounded stream size");
       }
-      const existing = await this.#readAndValidate(file, Number(before.size));
       if (existing.rows >= MAX_OBSERVE_READ_LINES) {
         throw unavailable("Guard observation journal exceeds its bounded row count");
       }

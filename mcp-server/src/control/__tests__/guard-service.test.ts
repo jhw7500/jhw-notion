@@ -1644,7 +1644,7 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
-  it("allows and reports an unrecorded observation once the observe journal reached its row cap", async () => {
+  it("allows and reports an unrecorded observation once the observe journal fails validation", async () => {
     fixture.currentContract = contract(TASK_ID, [grant("repo.inspect")]);
     fixture.currentTask = taskWith(fixture.currentContract);
     fixture.currentClaim = activeClaim(fixture.currentContract);
@@ -1656,14 +1656,15 @@ describe("GuardService", () => {
       .evaluatePreTool(preTool(fixture.cwd));
     const observePath = join(stateDir, "guard-observe-journal.v1.jsonl");
     const row = await readFile(observePath, "utf8");
-    await writeFile(observePath, row.repeat(8 * 1024), { mode: 0o600 });
+    const invalid = `${row}{"unexpected":true}\n`;
+    await writeFile(observePath, invalid, { mode: 0o600 });
     record_diagnostic.mockClear();
 
     await expect(fixture.service({ ...options, guard_journal: new GuardJournal(stateDir) })
       .evaluatePreTool(preTool(fixture.cwd, "Edit", undefined, "call-guard-capped")))
       .resolves.toMatchObject({ decision: "ALLOW", observed_decision: "PERMIT_REQUIRED" });
     expect(record_diagnostic).toHaveBeenCalledExactlyOnceWith({ kind: "unrecorded_allow", adapter: "codex" });
-    expect((await readFile(observePath, "utf8")).split("\n").length - 1).toBe(8 * 1024);
+    expect(await readFile(observePath, "utf8")).toBe(invalid);
   });
 
   it("asks the decision gate at the permit boundary and commits nothing once it refuses", async () => {
