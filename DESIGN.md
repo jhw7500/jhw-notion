@@ -429,6 +429,32 @@ launcher/skill/prompt 제거는 같은 parent의 private capture transaction으�
 바뀐 foreign replacement를 삭제하지 않는다. control/hook launcher transaction도 parent를
 retained no-follow descriptor로 고정하며 반환 직전 논리 parent identity를 다시 검증한다.
 
+session wrapper의 binding은 release를 고정한다. `--activate-compatible`은 기존 binding을
+바꾸지 않고 신규 세션의 default만 게시한다. 호환성은 release 내부의
+`mcp-server/src/control/runtime-compatibility.json`과 보호된 manifest entries로 결정한다.
+선언은 exact `{version:1,generation:<positive safe integer>,guardFloor:<positive safe integer>}`이며,
+기존 release/session/activation/journal의 closed schema에 필드를 추가하지 않는다. 선언이 없는
+retained release는 이전 v1 지문을 그대로 사용하므로 저장된 session digest가 바뀌지 않는다.
+선언이 있는 release는 별도 지문 domain을 사용하고 legacy release와 호환으로 판정하지 않는다.
+
+`generation`은 Registry Task/Claim/완료 증거, host worktree/board/authority/registration 상태,
+Guard request/key/journal/diagnostics, handoff/portfolio 산출물의 공유 계약을 나타낸다.
+필드와 enum뿐 아니라 저장 경로, lock 이름, digest의 입력·해석을 바꿀 때도 세대를 올린다.
+세대별 golden 문서는 실제 writer/reader 결과와 경로·lock·digest 경계를 검증하기 위한
+계약 증거이며, 구현 의미 전체를 자동으로 증명하지는 않는다. `guardFloor`는 같은 공유 형식이어도
+보안상 이전 구현과 공존하면 안 되는 경우 올리는 별도 정수다. 두 정수 모두 일치해야 공존하며,
+호스트 전역의 단조 증가 security floor나 일반 rollback 제한을 구현하지 않는다.
+초기 golden corpus는 Guard 요청·키, board·등록 기록과 lock·operation digest의 대표 경계를
+다룬다. 모든 lifecycle 변형을 증명하는 것으로 해석하지 않으며, 공유 기록 writer와 검증되지 않은
+Registry/worktree/authority/journal/handoff/portfolio 계약 모듈은 지문에서 내용 전체를 보호한다.
+
+지문 완화는 명시적으로 허용한 regular control 구현·기존 테스트/fixture와 비실행 스킬 Markdown의
+내용 hash에 한정한다. 경로·종류·권한과 모든 symlink target은 유지하며, 설정·schema·스킬 실행
+스크립트·bootstrap·wiring·dependency bytes는 계속 보호한다. 스킬은 `current/skills`를 읽으므로
+문서 내용 변경도 공존 중인 이전 control 구현과의 절차 호환성을 검토해야 한다.
+bootstrap helper인 `runtime-store.mjs` 자체가 바뀌는 최초 도입은 consumer 정지 후 일반 activation과
+bootstrap refresh를 요구한다. bootstrap 세대 전환과 publication 경합 완화는 별도 작업이다.
+
 activation validation은 fresh worker의 exact host contract v5와 Guard preflight, managed MCP
 `initialize`·`notifications/initialized`·`tools/list`를 bounded output/timeout으로 검사한다.
 그 뒤 admission을 다시 독점하고 consumer inventory와 pointer read-back을 반복해야

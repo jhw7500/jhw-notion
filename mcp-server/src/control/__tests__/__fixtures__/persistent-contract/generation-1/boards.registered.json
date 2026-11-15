@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "boards": {
+    "wlan-01": {
+      "description": "wlan target",
+      "interfaces": [
+        {
+          "type": "serial",
+          "address": "/dev/ttyUSB0"
+        }
+      ],
+      "registered_at": "2026-08-25T01:00:00.000Z",
+      "holders": [],
+      "reservations": []
+    }
+  }
+}

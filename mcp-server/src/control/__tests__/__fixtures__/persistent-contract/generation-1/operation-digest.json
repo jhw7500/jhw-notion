@@ -1,0 +1,28 @@
+{
+  "key_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "material": {
+    "protocol_version": 1,
+    "tool": "file.modify",
+    "raw_tool_identity": "Edit",
+    "origin_adapter": "codex",
+    "task_id": "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+    "claim_id": "clm-018f21e0-7b2c-7a00-8000-000000000002",
+    "session_id": "codex-persistent-contract",
+    "cwd_worktree_ref": "wt-persistent-contract",
+    "cwd_relative": "src",
+    "requirements": [
+      {
+        "capability": "repo.modify",
+        "resource": {
+          "kind": "repository",
+          "id": "repo-jhw-notion"
+        }
+      }
+    ],
+    "execution": {
+      "path": "src/file.ts",
+      "content": "bounded"
+    }
+  },
+  "digest": "6309adadae7fb9abec99111bc951412d4fed5b4078a738fd3625a4dccc7cd83a"
+}

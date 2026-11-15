@@ -8,8 +8,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DeploymentError, acquireLease } from './runtime-safety.mjs';
 import { prepareRelease, publishActivation, readActivation, releaseCompatibility } from './runtime-store.mjs';
-import { installBootstrap } from './runtime-entry.mjs';
-import { runDeployment } from './runtime-deploy.mjs';
+import { runDeployment, wiringPhase } from './runtime-deploy.mjs';
 
 const source = path.dirname(fileURLToPath(import.meta.url));
 const helpers = ['runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs','runtime-deploy.mjs','install-wiring.sh','install-config.mjs','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'];
@@ -26,19 +25,22 @@ async function fixture(t) {
   for(const [name,value] of Object.entries({
     '.gitignore':'.jhw-runtime/\nhome/\nproc/\n',
     'mcp-server/package.json':'{"type":"module"}','mcp-server/package-lock.json':'{"lockfileVersion":3}',
-    'mcp-server/tsconfig.json':'{}','mcp-server/src/index.ts':'export const generation=1;',
+    'mcp-server/tsconfig.json':'{}','mcp-server/src/index.ts':'export const generation=1;','mcp-server/src/config.ts':'export const config=1;',
+    'mcp-server/src/control/runtime-compatibility.json':'{"version":1,"generation":1,"guardFloor":1}\n',
+    'mcp-server/src/control/hook-adapter.ts':'export const implementation="A";',
     'mcp-server/src/control/schemas.ts':'export const stateVersion=1;',
     'mcp-server/scripts/clean-dist.mjs':'','scripts/sync-codex-skills.mjs':'',
-    'skills/claude/task.md':'same immutable skills',
+    'skills/claude/task.md':'same immutable skills','skills/codex/jhw-task/SKILL.md':'generated fixture skill',
   })) write(root,name,value);
   for(const name of helpers) write(root,'scripts/'+name,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);
   for(const args of [['init','-q'],['add','.'],['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']]) {
     const r=spawnSync('git',args,{cwd:root,encoding:'utf8'}); assert.equal(r.status,0,r.stderr);
   }
-  let broken=false;let mcpOptions={protocolVersion:'2024-11-05',capabilities:{},tools:[{name:'fixture',inputSchema:{type:'object'}}]};
+  let broken=false;let implementation='A';let mcpOptions={protocolVersion:'2024-11-05',capabilities:{},tools:[{name:'fixture',inputSchema:{type:'object'}}]};
   const build=async({stagingRoot})=>{
-    const control="process.stdout.write(JSON.stringify({release:require('node:path').basename(globalThis.__JHW_MANAGED_RELEASE_ROOT__)})+'\\n');if(process.argv.includes('--hold'))process.stdin.resume();";
-    const hook="const event=process.argv.at(-1);const release=require('node:path').basename(globalThis.__JHW_MANAGED_RELEASE_ROOT__);if(process.env.JHW_TEST_TRACE)require('node:fs').appendFileSync(process.env.JHW_TEST_TRACE,JSON.stringify({event,release})+'\\n');const value=event==='SessionEnd'?{}:event==='PostToolUse'?{systemMessage:release}:event==='UserPromptSubmit'?{hookSpecificOutput:{hookEventName:event,additionalContext:release},systemMessage:release}:{hookSpecificOutput:{hookEventName:event}};process.stdout.write(JSON.stringify(value)+'\\n');";
+    const stableControl="process.stdout.write(JSON.stringify({release:require('node:path').basename(globalThis.__JHW_MANAGED_RELEASE_ROOT__)})+'\\n');if(process.argv.includes('--hold'))process.stdin.resume();";
+    const control="// "+implementation+"\n"+stableControl;
+    const hook="// "+implementation+"\nconst event=process.argv.at(-1);const release=require('node:path').basename(globalThis.__JHW_MANAGED_RELEASE_ROOT__);if(process.env.JHW_TEST_TRACE)require('node:fs').appendFileSync(process.env.JHW_TEST_TRACE,JSON.stringify({event,release})+'\\n');const value=event==='SessionEnd'?{}:event==='PostToolUse'?{systemMessage:release}:event==='UserPromptSubmit'?{hookSpecificOutput:{hookEventName:event,additionalContext:release},systemMessage:release}:{hookSpecificOutput:{hookEventName:event}};process.stdout.write(JSON.stringify(value)+'\\n');";
     const mcp=broken?"process.stderr.write('candidate failed\\n');process.exitCode=1;":String.raw`
       const contract=__MCP_CONTRACT__;
       const lines=require('node:readline').createInterface({input:process.stdin});
@@ -47,7 +49,7 @@ async function fixture(t) {
         process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\n');
       });`.replace('__MCP_CONTRACT__',JSON.stringify(mcpOptions));
     for(const [name,body,mode] of [
-      ['mcp-server/dist/index.js',mcp,0o644],['mcp-server/dist/control/cli.js',control,0o755],
+      ['mcp-server/dist/index.js',mcp,0o644],['mcp-server/dist/control/cli.js',stableControl,0o755],
       ['mcp-server/dist/control/hook-adapter.js',hook,0o755],['mcp-server/dist/runtime/mcp.cjs',mcp,0o644],
       ['mcp-server/dist/runtime/control.cjs',control,0o755],['mcp-server/dist/runtime/hook.cjs',hook,0o755],
     ]) write(stagingRoot,name,body,mode);
@@ -55,12 +57,12 @@ async function fixture(t) {
   };
   const prepare=()=>prepareRelease({repositoryRoot:root,build});
   const first=await prepare();
-  const deploy=acquireLease(path.join(root,'.jhw-runtime/deploy.lock'));
-  const admission=acquireLease(path.join(root,'.jhw-runtime/admission.lock'),{create:true});
-  try { await installBootstrap({repositoryRoot:root,releaseId:first.releaseId}); publishActivation({repositoryRoot:root,releaseId:first.releaseId,expectedCurrent:null}); }
-  finally {admission.close();deploy.close();}
-  write(root,'.jhw-runtime/wiring.json','{"version":1,"installed":true}\n',0o600);
-  return {root,home,procRoot,first,prepare,breakCandidate:()=>{broken=true;},configureMcp:value=>{mcpOptions={...mcpOptions,...value};},entry:path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry')};
+  const hostContract={commands:['unlock','preflight','portfolio status','task start','task child-start','task contract','task completion-ready','task promote','task status','task handoff','task finish','task recover','task assert-owner','board status','board acquire','board with'],credential_policy:'secure-store-only',name:'jhw-control-host',version:5};
+  write(home,'.local/bin/jhw-control-host',`#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(hostContract)}'\n`,0o755);
+  for(const name of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(home,name),{recursive:true,mode:0o700});
+  await runDeployment({repositoryRoot:root,home,procRoot,argv:['--activate',first.releaseId],
+    phaseRunner:options=>options.phase==='validate'?undefined:wiringPhase(options)});
+  return {root,home,procRoot,first,prepare,breakCandidate:()=>{broken=true;},changeImplementation:()=>{implementation='B';write(root,'mcp-server/src/control/hook-adapter.ts','export const implementation="B";');write(root,'skills/claude/task.md','changed ordinary Markdown');write(root,'skills/codex/jhw-task/SKILL.md','changed generated Markdown');},configureMcp:value=>{mcpOptions={...mcpOptions,...value};},entry:path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry')};
 }
 function run(f,args,options={}) {
   return spawnSync(process.execPath,[f.entry,...args],{encoding:'utf8',timeout:12000,...options});
@@ -144,8 +146,11 @@ const compatible=(f,releaseId)=>runDeployment({repositoryRoot:f.root,home:f.home
 test('live A keeps control, reconnecting MCP and every hook on A while new B uses B',async t=>{
   const f=await fixture(t);const a=startClient(t,f);await a.ready();
   snapshotConsumer(f,a.child.pid);assertSample(await a.request('sample'),f.first.releaseId);
-  write(f.root,'mcp-server/src/index.ts','export const generation=2;');const second=await f.prepare();
-  const published=await compatible(f,second.releaseId);
+  f.changeImplementation();const second=await f.prepare();
+  let verifiedRealWiring=false;
+  const published=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,
+    argv:['--activate-compatible',second.releaseId],phaseRunner:async options=>{verifiedRealWiring=true;return wiringPhase(options);}});
+  assert.equal(verifiedRealWiring,true);
   assert.equal(published.inventory.before.bound.managed,1);assert.equal(a.child.exitCode,null);
   assertSample(await a.request('sample'),f.first.releaseId);
   const b=startClient(t,f);await b.ready();assertSample(await b.request('sample'),second.releaseId);
@@ -168,7 +173,11 @@ test('failed candidate initialization preserves the default and clears only the 
   assert.equal((await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--status']})).recoveryPending,0);
 });
 for(const [label,name,value] of [
-  ['skills','skills/claude/task.md','changed skills'],['shared state','mcp-server/src/control/schemas.ts','export const stateVersion=2;'],
+  ['shared state','mcp-server/src/control/schemas.ts','export const stateVersion=2;'],
+  ['public config','mcp-server/src/config.ts','export const config=2;'],
+  ['generation','mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n'],
+  ['guard floor','mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":1,"guardFloor":2}\n'],
+  ['new control file','mcp-server/src/control/new-implementation.ts','export const value=1;'],
   ['bootstrap','scripts/jhw-runtime-hook','#!/usr/bin/env node\n// changed\n'],
 ])test('compatible activation rejects changed '+label+' without moving the default',async t=>{
   const f=await fixture(t);write(f.root,name,value,name.startsWith('scripts/jhw-')?0o755:0o644);const candidate=await f.prepare();

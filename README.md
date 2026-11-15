@@ -124,9 +124,35 @@ MCP/control/네 종류의 hook이 그 binding을 다시 검증하도록 전달�
 ./install.sh --activate-compatible RELEASE_ID
 ~~~
 
-이 경로는 기존 MCP tool/entry 영역의 변경만 허용한다. bootstrap helper, 공용 wiring,
-skills, control/hook 코드와 상태 계약, package/lockfile, 실제 dependency bytes와 그 외
-공용 파일의 집합·내용·모드가 같아야 한다. current와 후보의 MCP를 각각 초기화하고
+release 안의 `mcp-server/src/control/runtime-compatibility.json`은 공유 영속 계약의
+`generation`과 공존 가능한 보안 세대 `guardFloor`를 선언한다. 두 값이 같은 release끼리는
+기존 MCP tool/entry 영역 외에도 명시적으로 허용한 Guard/control 구현 파일과 일반 스킬
+Markdown의 내용 변경을 허용한다. 파일 경로·종류·권한과 모든 symlink 대상은 계속 비교한다.
+새 파일·디렉터리의 추가·삭제와 allowlist에 없는 구현 파일 변경은 호환 전환으로 처리하지 않는다.
+
+| 비교 대상 | 호환 전환 조건 |
+|---|---|
+| `generation`, `guardFloor` | 두 release의 값이 각각 같음 |
+| 허용된 Guard/control 구현과 기존 테스트·fixture 파일 | regular file의 내용만 달라도 됨; 경로·종류·권한은 같음 |
+| 일반 스킬 Markdown | 실행 권한이 없는 regular file의 내용만 달라도 됨 |
+| `config`, `private-control-config`, `guard-policy`, `session-end-config`, `schemas`와 대응 컴파일 산출물 | 내용까지 같음; MCP의 public config도 포함 |
+| 스킬의 `scripts` 아래 파일과 모든 symlink | 실행 스크립트 내용과 링크 대상까지 같음 |
+| bootstrap helper, 공용 wiring, package/lockfile, 실제 dependency bytes, 그 밖의 공용 파일 | 집합·내용·권한까지 같음 |
+
+공유 기록을 직접 쓰는 store와 Registry/worktree/authority/journal/handoff/portfolio 계약 모듈은
+구현 allowlist에 자동 포함하지 않는다. 이들 파일의 변경도 계속 내용 전체로 비교한다.
+`generation`은 공유 레코드의 필드뿐 아니라 저장 경로·lock 이름·digest 해석도 포함한다.
+그 계약을 바꿀 때는 세대를 올리고 저장소의 해당 세대 golden 계약 시험을 갱신한다.
+`guardFloor`는 보안 수정 때문에 이전 구현과 공존을 허용할 수 없을 때 올린다.
+이는 호스트에 저장되는 단조 증가 최소 버전이나 일반 rollback 금지를 뜻하지 않는다.
+두 값 또는 보호된 파일이 다르면 `DEPLOY_COMPATIBILITY_MISMATCH`로 거부하며, 기존
+default와 세션 binding은 유지한다. 비호환 변경은 기존 consumer 정지 배포 절차를 따른다.
+
+선언이 없는 이전 release는 기존 MCP tool/entry 전용 지문 계산을 유지하며 새 선언이 있는
+release와 공존 전환하지 않는다. 이 계약을 처음 도입할 때도 bootstrap helper가 바뀌므로
+consumer를 정지한 뒤 일반 `--activate`와 `--refresh-bootstrap`을 실행해야 한다.
+
+current와 후보의 MCP를 각각 초기화하고
 tools/list를 확인해 protocol·capabilities 및 기존 tool의 input/output schema·annotations·
 execution·_meta와 기타 동작 필드가 같은지도 검사한다. title·description·icons는 표시
 metadata로 보고 계약 비교에서 제외한다. MCP 형식 검증을 통과한 새 tool 추가는 허용한다.
@@ -152,9 +178,9 @@ shared fingerprint와 bootstrap을 확인해 확실한 미게시/게시 상태�
   같은 release를 사용하며, 새 버전을 사용하려면 독립 wrapper/서버를 시작해야 한다.
 - 기존 외부 서버에 접속하는 proxy, binding이 없는 consumer, PID/부모 관계나 lease가
   불확실한 consumer는 호환 전환을 차단한다.
-- skills는 current/skills 링크를 유지한다. 공존하는 release의 skills bytes가 같다는
-  검증이 이를 뒷받침한다. skills·공용 상태·bootstrap·의존성을 바꾸는 업데이트에는
-  기존 maintenance 절차를 사용한다.
+- skills는 current/skills 링크를 유지하므로 기존 세션에서도 갱신된 문서를 읽을 수 있다.
+  문서는 공존하는 이전 control 구현에서도 수행 가능한 절차여야 한다. 실행 스크립트,
+  공유 계약, bootstrap, 의존성이 바뀌는 업데이트에는 기존 maintenance 절차를 사용한다.
 - 현재 별도 설치된 jhw-control-host는 binding 환경을 전달하지 않는다. 해당 secure host
   launcher 및 SSH처럼 환경을 재구성하는 경로는 별도 연동이 필요하며, 누락 시 거부된다.
 - 실제 클라이언트의 환경 상속과 서버 공유 방식은 별도로 확인해야 한다. 격리된 Node
