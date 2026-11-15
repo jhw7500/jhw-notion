@@ -421,11 +421,10 @@ function hasRepositoryEnvironmentOverride(
 ): boolean {
   const executable = executableName(commandArgv[0] as string);
   const prefixes = classifiedArgv.slice(0, classifiedArgv.length - commandArgv.length);
-  const names = executable === "git"
-    ? new Set(["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_INDEX_FILE"])
-    : executable === "gh"
-      ? new Set(["GH_REPO", "GH_HOST"])
-      : new Set<string>();
+  // Environment supplied with git can name programs for it to run, which cannot be
+  // enumerated, so any assignment or env prefix leaves the repository unbound.
+  if (executable === "git") return prefixes.length > 0;
+  const names = executable === "gh" ? new Set(["GH_REPO", "GH_HOST"]) : new Set<string>();
   return prefixes.some((argument) => {
     const separator = argument.indexOf("=");
     return separator > 0 && names.has(argument.slice(0, separator));
@@ -530,14 +529,9 @@ async function gitDetection(
       index += argument === "--work-tree" ? 2 : 1;
       continue;
     }
-    if (argument === "-c" || argument === "--config-env" || argument === "--namespace" || argument === "--exec-path") {
-      if (arguments_[index + 1] === undefined) return unresolved();
-      index += 2;
-      continue;
-    }
+    // Only flag-only options are skipped. Value-taking ones (-c, --config-env, --exec-path, --namespace) can name
+    // programs for git to run or change what it operates on, which cannot be enumerated, so they stay unresolved below.
     if (
-      argument.startsWith("-c=") || argument.startsWith("--config-env=") ||
-      argument.startsWith("--namespace=") || argument.startsWith("--exec-path=") ||
       new Set(["-p", "-P", "--paginate", "--no-pager", "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--no-optional-locks"]).has(argument)
     ) {
       index += 1;

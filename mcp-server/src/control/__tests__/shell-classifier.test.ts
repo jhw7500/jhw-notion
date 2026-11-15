@@ -222,6 +222,109 @@ describe("conservative shell classification", () => {
   });
 
   it.each([
+    ["git -c user.name=x commit -m x", "git.commit"],
+    ["git -c a.b=c commit -m x", "git.commit"],
+    ["git --config-env a.b=V commit -m x", "git.commit"],
+    ["git --config-env=a.b=V commit -m x", "git.commit"],
+    ["git --exec-path=d commit -m x", "git.commit"],
+    ["git --exec-path d commit -m x", "git.commit"],
+    ["git --namespace x commit -m x", "git.commit"],
+    ["git --namespace=x commit -m x", "git.commit"],
+    ["git -p -c a.b=c commit -m x", "git.commit"],
+    ["git -c a.b=c push", "git.publish"],
+  ] as const)("does not bind value-taking Git global option form %s to repository authority", async (command, capability) => {
+    const result = await classifyShell(command, context);
+
+    expect(result.requirements.map((requirement) => requirement.capability)).not.toContain(capability);
+    expect(result.unresolved_signals).toContainEqual({ capability, boundary: "guarded_command" });
+  });
+
+  it.each([
+    ["A=1 git commit -m x", "git.commit"],
+    ["A=1 B=2 C=3 git commit -m x", "git.commit"],
+    ["GIT_AUTHOR_DATE=x git commit -m x", "git.commit"],
+    ["env V=1 git commit -m x", "git.commit"],
+    ["env -u A git commit -m x", "git.commit"],
+    ["env --unset=A git commit -m x", "git.commit"],
+    ['"X=1" git commit -m x', "git.commit"],
+    ["A=1 git push origin HEAD", "git.publish"],
+  ] as const)("does not bind environment-prefixed Git form %s to repository authority", async (command, capability) => {
+    const result = await classifyShell(command, context);
+
+    expect(result.requirements.map((requirement) => requirement.capability)).not.toContain(capability);
+    expect(result.unresolved_signals).toContainEqual({ capability, boundary: "guarded_command" });
+  });
+
+  it.each([
+    ["guard", "git -c a.b=c commit -m x"],
+    ["guard", "A=1 git commit -m x"],
+    ["board", "git -c a.b=c commit -m x"],
+    ["board", "A=1 git commit -m x"],
+  ] as const)("does not let the owned %s wrapper bind %s to repository authority", async (wrapper, inner) => {
+    const prefix = wrapper === "guard"
+      ? "jhw-control guard with --task tsk-018f21e0-7b2c-7a00-8000-000000000001 --claim clm-018f21e0-7b2c-7a00-8000-000000000002 --session codex-local --origin-adapter codex --"
+      : "jhw-control board with --board board-alpha --mode exclusive --task tsk-018f21e0-7b2c-7a00-8000-000000000001 --claim clm-018f21e0-7b2c-7a00-8000-000000000002 --session codex-local --origin-adapter codex --purpose bounded --";
+    const result = await classifyShell(`${prefix} ${inner}`, context);
+
+    expect(result.owned_wrapper).toBe(wrapper);
+    expect(result.requirements.map((requirement) => requirement.capability)).not.toContain("git.commit");
+    expect(result.unresolved_signals).toContainEqual({ capability: "git.commit", boundary: "guarded_command" });
+  });
+
+  it.each([
+    "git commit -m x",
+    "git -p commit -m x",
+    "git --no-pager commit -m x",
+  ])("keeps binding flag-only Git form %s to the current repository", async (command) => {
+    const result = await classifyShell(command, context);
+
+    expect(result.requirements).toContainEqual({ capability: "git.commit", resource: repository });
+    expect(result.unresolved_signals).toEqual([]);
+  });
+
+  it("keeps binding a repository-relative git-dir from the repository root", async () => {
+    const result = await classifyShell("git --git-dir=.git commit -m x", { ...context, cwd: root });
+
+    expect(result.requirements).toContainEqual({ capability: "git.commit", resource: repository });
+    expect(result.unresolved_signals).toEqual([]);
+  });
+
+  it("keeps a plain git commit inside the owned guard and board wrappers bound as before", async () => {
+    const guard = await classifyShell(
+      "jhw-control guard with --task tsk-018f21e0-7b2c-7a00-8000-000000000001 --claim clm-018f21e0-7b2c-7a00-8000-000000000002 --session codex-local --origin-adapter codex -- git commit -m x",
+      context,
+    );
+    const boardWrapped = await classifyShell(
+      "jhw-control board with --board board-alpha --mode exclusive --task tsk-018f21e0-7b2c-7a00-8000-000000000001 --claim clm-018f21e0-7b2c-7a00-8000-000000000002 --session codex-local --origin-adapter codex --purpose bounded -- git commit -m x",
+      context,
+    );
+
+    expect(guard.owned_wrapper).toBe("guard");
+    expect(guard.requirements).toEqual([{ capability: "git.commit", resource: repository }]);
+    expect(guard.unresolved_signals).toEqual([]);
+    expect(boardWrapped.owned_wrapper).toBe("board");
+    expect(boardWrapped.requirements).toEqual([
+      { capability: "board.execute", resource: board },
+      { capability: "git.commit", resource: repository },
+    ]);
+    expect(boardWrapped.unresolved_signals).toEqual([]);
+  });
+
+  it("leaves a Git command with a config option unclassified when no commit or push word appears among its arguments", async () => {
+    const result = await classifyShell("git -c x=y log -1", context);
+
+    expect(result.requirements).toEqual([{ capability: "shell.unclassified", resource: repository }]);
+    expect(result.unresolved_signals).toEqual([]);
+  });
+
+  it("falls back to an unresolved commit for a config option before a literal commit argument, as unknown global options already did", async () => {
+    const result = await classifyShell("git -c a.b=c show commit", context);
+
+    expect(result.requirements.map((requirement) => requirement.capability)).not.toContain("git.commit");
+    expect(result.unresolved_signals).toContainEqual({ capability: "git.commit", boundary: "guarded_command" });
+  });
+
+  it.each([
     "git push origin HEAD",
     "git -C . push origin HEAD",
     "gh pr create --title bounded",

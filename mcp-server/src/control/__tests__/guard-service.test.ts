@@ -1519,6 +1519,70 @@ describe("GuardService", () => {
     expect(fixture.permitCalls).toBe(0);
   });
 
+  it("allows a plain git commit through an exact git.commit grant", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("git.commit")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    await expect(fixture.service().evaluatePreTool(preTool(fixture.cwd, "Bash", { command: "git commit -m x" })))
+      .resolves.toMatchObject({ decision: "ALLOW", execution_boundary: "hook" });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("requires the owned wrapper for a config-injected git commit even with an exact git.commit grant", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("git.commit")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+
+    await expect(fixture.service().evaluatePreTool(preTool(
+      fixture.cwd,
+      "Bash",
+      { command: "git -c a.b=c commit -m x" },
+    ))).resolves.toMatchObject({ decision: "DENY", code: "GUARD_WRAPPER_REQUIRED" });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
+  it("does not let a git.commit grant allow a launcher-prefixed git commit that also needs shell.unclassified", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("git.commit")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const decideMissingGrant = vi.fn((fixture.permit as GuardPermitDecisionPort).decideMissingGrant);
+    fixture.permit = { decideMissingGrant };
+
+    const result = await fixture.service().evaluatePreTool(preTool(
+      fixture.cwd,
+      "Bash",
+      { command: "nice git -c a.b=c commit -m x" },
+    ));
+
+    expect(result).toMatchObject({ decision: "PERMIT_REQUIRED", request_id: REQUEST_ID });
+    expect(result.decision).not.toBe("ALLOW");
+    expect(decideMissingGrant).toHaveBeenCalledOnce();
+    expect(decideMissingGrant.mock.calls[0]?.[1]).toEqual([{ capability: "shell.unclassified", resource: REPOSITORY }]);
+    expect(fixture.permitCalls).toBe(1);
+  });
+
+  it("allows and records a config-injected git commit as an observed wrapper denial in observe mode", async () => {
+    fixture.currentContract = contract(TASK_ID, [grant("git.commit")]);
+    fixture.currentTask = taskWith(fixture.currentContract);
+    fixture.currentClaim = activeClaim(fixture.currentContract);
+    fixture.activeClaims = [fixture.currentClaim];
+    const stateDir = join(fixture.root, "observe-config-commit-state");
+
+    await expect(fixture.service({
+      mode: "observe",
+      inspect_guard_state: async () => true,
+      guard_journal: new GuardJournal(stateDir),
+    }).evaluatePreTool(preTool(fixture.cwd, "Bash", { command: "git -c a.b=c commit -m x" })))
+      .resolves.toMatchObject({ decision: "ALLOW", observed_decision: "DENY" });
+    expect(JSON.parse(await readFile(join(stateDir, "guard-observe-journal.v1.jsonl"), "utf8")))
+      .toMatchObject({ mode: "observe", observed_decision: "DENY", decision_code: "GUARD_WRAPPER_REQUIRED" });
+    expect(fixture.permitCalls).toBe(0);
+  });
+
   it("keeps exclusive ownership and authority ahead of a direct Notion wrapper denial", async () => {
     const notion = { kind: "notion_database", id: "knowledgeBase" } as const;
     fixture.currentContract = contract(TASK_ID, [grant("notion.mutate", notion, "shared")]);
