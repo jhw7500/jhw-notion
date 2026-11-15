@@ -5928,10 +5928,18 @@ async function main() {
       assert.match((await geminiCase({ text })).stdout, geminiExcluded(reason),
         `a run-bound Gemini ${reason} artifact must exclude gemini from this round`);
     }
+    // The first line a provider-side deadline wrote on PR #257 (run 43616477112).
+    assert.match((await geminiCase({
+      text: "Failed to generate Gemini review: 504 DEADLINE_EXCEEDED. {'error': {'code': 504, 'message': 'Deadline expired before operation could complete.', 'status': 'DEADLINE_EXCEEDED'}}\n",
+    })).stdout, geminiExcluded("provider_timeout"),
+    "a run-bound Gemini 504 DEADLINE_EXCEEDED artifact must exclude gemini as provider_timeout");
     for (const [name, text] of [
       ["an unrecognized provider error", "Failed to generate Gemini review: 500 INTERNAL.\n"],
       ["an authentication failure", "Failed to generate Gemini review: 400 INVALID_ARGUMENT. API key not valid.\n"],
       ["an empty model output", "Failed to generate Gemini review: Gemini returned no review text after 3 attempts\n"],
+      ["a 504 with another status", "Failed to generate Gemini review: 504 GATEWAY_TIMEOUT.\n"],
+      ["a deadline status under another code", "Failed to generate Gemini review: 500 DEADLINE_EXCEEDED.\n"],
+      ["a 504 deadline line without the review prefix", "504 DEADLINE_EXCEEDED. Failed to generate Gemini review\n"],
     ]) {
       assert.match((await geminiCase({ text })).stdout, geminiKept("provider_failed"),
         `${name} must stay a blocking Gemini failure`);
