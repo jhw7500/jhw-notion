@@ -21,6 +21,17 @@ function repeatDirectoryEntry(directory,name,count) {
   };
   return {restore(){fs.opendirSync=original;},reads(){return reads;}};
 }
+function writePrivateEvidence({directory,name,id,kind,pair,parentBinding,template}) {
+  const target=path.join(directory,name);fs.mkdirSync(target,{recursive:true,mode:0o700});fs.chmodSync(target,0o700);
+  const lease=path.join(target,'lease');fs.writeFileSync(lease,'',{mode:0o600});fs.chmodSync(lease,0o600);
+  const manifest=path.join(target,'manifest.json');const fd=fs.openSync(manifest,'wx',0o600);
+  try{fs.fchmodSync(fd,0o600);const manifestStat=fs.fstatSync(fd,{bigint:true});const leaseStat=fs.statSync(lease,{bigint:true});
+    const record={version:2,id,kind,...pair,parentBinding,repository:template.record.repository,owner:template.record.owner,
+      manifest:{dev:String(manifestStat.dev),ino:String(manifestStat.ino)},
+      lease:{dev:String(leaseStat.dev),ino:String(leaseStat.ino),fd:template.record.lease.fd},createdAt:template.record.createdAt};
+    fs.writeFileSync(fd,canonical(record)+'\n');fs.fsyncSync(fd);
+  }finally{fs.closeSync(fd);}
+}
 function normalizeRecord(record) {
   assert.deepEqual(Object.keys(record).sort(),[
     'bootstrapId','compatibilityDigest','createdAt','id','kind','lease','manifest','owner',
@@ -169,19 +180,24 @@ test('v2 root authority rejects forged digest, PID reuse identity, and manifest 
 });
 
 test('v2 interrupted creating and retired namespaces never become public or unlocked deletes', async t => {
-  const {f}=await prepared(t);
+  const {f,pair}=await prepared(t);
   const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');fs.mkdirSync(sessions,{recursive:true,mode:0o700});
   const creating=`.creating.s-${'1'.repeat(32)}`;
   const retired=`.retired.s-${'2'.repeat(32)}.${'3'.repeat(32)}`;
+  const invocation=`.creating.i-${'4'.repeat(32)}`;
+  const invocations=path.join(f.root,'.jhw-runtime/v2/invocations',pair.bootstrapId);
   fs.mkdirSync(path.join(sessions,creating),{mode:0o700});
   fs.mkdirSync(path.join(sessions,retired),{mode:0o700});
+  fs.mkdirSync(path.join(invocations,invocation),{recursive:true,mode:0o700});
+  fs.chmodSync(path.dirname(invocations),0o700);fs.chmodSync(invocations,0o700);
   fs.writeFileSync(path.join(sessions,retired,'unknown'),'',{mode:0o600});
-  assert.deepEqual(store.inspectSessionBindingsV2({repositoryRoot:f.root}),[]);
+  assert.throws(()=>store.inspectSessionBindingsV2({repositoryRoot:f.root}),{code:'DEPLOY_SESSION_INVALID'});
   const result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:false});
   assert.deepEqual(result.retired,[]);
-  assert.deepEqual(result.preserved.sort(),[creating,retired].sort());
+  assert.deepEqual(result.preserved.sort(),[creating,retired,invocation].sort());
   assert.equal(fs.existsSync(path.join(sessions,creating)),true);
   assert.equal(fs.existsSync(path.join(sessions,retired)),true);
+  assert.equal(fs.existsSync(path.join(invocations,invocation)),true);
 });
 
 test('v2 reaper completes an interrupted private retirement only after generation and binding leases release', async t => {
@@ -189,6 +205,7 @@ test('v2 reaper completes an interrupted private retirement only after generatio
   const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});
   const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');const interrupted=`.creating.${root.id}`;
   fs.renameSync(path.join(sessions,root.id),path.join(sessions,interrupted));
+  assert.deepEqual(store.inspectSessionBindingsV2({repositoryRoot:f.root}),[]);
   root.close();
   const result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:false});
   assert.deepEqual(result,{retired:[interrupted],preserved:[]});
@@ -281,7 +298,11 @@ test('v2 inventory applies SESSION_LIMIT per namespace and reaper has a separate
   ];
   t.after(()=>roots.forEach(root=>root.close()));
   const group=path.join(f.root,'.jhw-runtime/v2/invocations',pair.bootstrapId);fs.mkdirSync(group,{recursive:true,mode:0o700});
-  for(let index=0;index<1023;index++)fs.mkdirSync(path.join(group,`.creating.i-${index.toString(16).padStart(32,'0')}`),{mode:0o700});
+  for(let index=0;index<1023;index++){
+    const id=`i-${index.toString(16).padStart(32,'0')}`;
+    writePrivateEvidence({directory:group,name:`.creating.${id}`,id,kind:'invocation',pair,
+      parentBinding:roots[0].token,template:roots[0]});
+  }
   const rows=store.inspectSessionBindingsV2({repositoryRoot:f.root});
   assert.equal(rows.filter(row=>row.kind==='session').length,2);
   const result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:true,limit:1});

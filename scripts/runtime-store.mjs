@@ -1651,6 +1651,24 @@ function v2BootstrapIds(directory,{deadline=null,scan=null}={}) {
   }}finally{stream.closeSync();}
   directory.verify();return {ids:result.sort(),complete:true};
 }
+function v2PrivateEvidence(namespace,rootStat,repositoryRoot,kind,bootstrapId,entry) {
+  let directory;
+  try{directory=namespace.child(entry.name,false,true);
+    if(canonical(names(directory))!==canonical(['lease','manifest.json']))return null;
+    const manifest=readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT);
+    const record=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifest.bytes));
+    const leaseStat=fs.lstatSync(directory.at('lease'),{bigint:true});
+    const manifestStat=fs.lstatSync(directory.at('manifest.json'),{bigint:true});
+    if(manifest.mode!==0o600||!validV2SessionRecord(record)||record.id!==entry.id||record.kind!==kind||
+      bootstrapId!==null&&record.bootstrapId!==bootstrapId||
+      !validRepositoryIdentity(record.repository,repositoryRoot,rootStat)||
+      !validManifestIdentity(record.manifest,manifestStat)||!validLeaseIdentity(record.lease,leaseStat)||
+      manifest.bytes.toString('utf8')!==canonical(record)+'\n')return null;
+    directory.verify();
+    return {record,bytes:manifest.bytes,directory:{dev:String(directory.stat.dev),ino:String(directory.stat.ino)},
+      manifest:{dev:String(manifestStat.dev),ino:String(manifestStat.ino)}};
+  }finally{directory?.close();}
+}
 function verifyV2Pair(runtime, repositoryRoot, record) {
   readGeneration(runtime, repositoryRoot, record.bootstrapId);
   if (releaseCompatibilityIn(runtime, repositoryRoot, record.releaseId) !== record.compatibilityDigest) sessionFail();
@@ -1802,11 +1820,11 @@ function inspectSessionBindingsV2WithLimit({repositoryRoot,limit=Number.MAX_SAFE
     try{v2=runtime.child('v2',false,true);}catch(error){if(error.code==='ENOENT')return[];throw error;}
     try{
       let roots;try{roots=v2.child('sessions',false,true);}catch(error){if(error.code!=='ENOENT')throw error;}
-      if(roots){const index=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);try{const snapshot=v2BindingEntries(roots,'session',{scan});if(!snapshot.complete)sessionFail();for(const entry of snapshot.entries){if(entry.state!=='public'||rows.length>=limit)continue;const data=v2Record(runtime,root,repositoryRoot,entry.id);rows.push({...data.record,token:data.token,live:leaseIsHeld(data.leaseFile)});}}finally{index.close();roots.close();}}
+      if(roots){const index=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);try{const snapshot=v2BindingEntries(roots,'session',{scan});if(!snapshot.complete)sessionFail();for(const entry of snapshot.entries){if(entry.state!=='public'){if(v2PrivateEvidence(roots,root.stat,repositoryRoot,'session',null,entry)===null)sessionFail();continue;}if(rows.length>=limit)continue;const data=v2Record(runtime,root,repositoryRoot,entry.id);rows.push({...data.record,token:data.token,live:leaseIsHeld(data.leaseFile)});}}finally{index.close();roots.close();}}
       let invocations;try{invocations=v2.child('invocations',false,true);}catch(error){if(error.code==='ENOENT')return rows;throw error;}
       // Invocation records need their digest to form a token; read the bytes once under their index.
       const groups=v2BootstrapIds(invocations,{scan});if(!groups.complete)sessionFail();
-      for(const bootstrapId of groups.ids){const group=invocations.child(bootstrapId,false,true);const index=v2IndexLease(repositoryRoot,bootstrapId,'invocation',true);try{const snapshot=v2BindingEntries(group,'invocation',{scan});if(!snapshot.complete)sessionFail();for(const entry of snapshot.entries){if(entry.state!=='public'||rows.length>=limit)continue;const directory=group.child(entry.id,false,true);let bytes;try{bytes=readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT).bytes;}finally{directory.close();}const token=`v2:${bootstrapId}:${entry.id}:${digest(bytes)}`;const data=v2Record(runtime,root,repositoryRoot,entry.id,token);rows.push({...data.record,token:data.token,live:leaseIsHeld(data.leaseFile)});}}finally{index.close();group.close();}}
+      for(const bootstrapId of groups.ids){const group=invocations.child(bootstrapId,false,true);const index=v2IndexLease(repositoryRoot,bootstrapId,'invocation',true);try{const snapshot=v2BindingEntries(group,'invocation',{scan});if(!snapshot.complete)sessionFail();for(const entry of snapshot.entries){if(entry.state!=='public'){if(v2PrivateEvidence(group,root.stat,repositoryRoot,'invocation',bootstrapId,entry)===null)sessionFail();continue;}if(rows.length>=limit)continue;const directory=group.child(entry.id,false,true);let bytes;try{bytes=readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT).bytes;}finally{directory.close();}const token=`v2:${bootstrapId}:${entry.id}:${digest(bytes)}`;const data=v2Record(runtime,root,repositoryRoot,entry.id,token);rows.push({...data.record,token:data.token,live:leaseIsHeld(data.leaseFile)});}}finally{index.close();group.close();}}
       invocations.close();return rows.sort((a,b)=>a.kind===b.kind?a.id.localeCompare(b.id):a.kind==='session'?-1:1);
     }finally{v2.close();}
   }));
@@ -1818,16 +1836,9 @@ function reapV2PrivateCandidate({repositoryRoot,kind,bootstrapId,name,dryRun}) {
   let snapshot;let snapshotIndex;
   try{snapshotIndex=v2IndexLease(repositoryRoot,bootstrapId??'b-'+'0'.repeat(64),kind,true);
     snapshot=withStore(repositoryRoot,false,(runtime,root)=>{
-    const location=v2Namespace(runtime,bootstrapId,kind);let directory;
-    try{directory=location.namespace.child(name,false,true);if(canonical(names(directory))!==canonical(['lease','manifest.json']))return null;
-      const manifest=readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT);const record=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifest.bytes));
-      const lease=fs.lstatSync(directory.at('lease'),{bigint:true});const manifestStat=fs.lstatSync(directory.at('manifest.json'),{bigint:true});
-      if(!validV2SessionRecord(record)||record.id!==id||record.kind!==kind||bootstrapId!==null&&record.bootstrapId!==bootstrapId||
-        !validRepositoryIdentity(record.repository,repositoryRoot,root.stat)||!validManifestIdentity(record.manifest,manifestStat)||
-        !validLeaseIdentity(record.lease,lease)||manifest.bytes.toString('utf8')!==canonical(record)+'\n')return null;
-      return {record,bytes:manifest.bytes,directory:{dev:String(directory.stat.dev),ino:String(directory.stat.ino)},
-        manifest:{dev:String(manifestStat.dev),ino:String(manifestStat.ino)}};
-    }finally{directory?.close();closeV2Namespace(location);}
+    const location=v2Namespace(runtime,bootstrapId,kind);
+    try{return v2PrivateEvidence(location.namespace,root.stat,repositoryRoot,kind,bootstrapId,{name,id});}
+    finally{closeV2Namespace(location);}
   });}catch{return false;}finally{snapshotIndex?.close();}
   if(!snapshot||dryRun)return false;
   let generation;let index;let exclusive;
@@ -1838,7 +1849,7 @@ function reapV2PrivateCandidate({repositoryRoot,kind,bootstrapId,name,dryRun}) {
       const location=v2Namespace(runtime,snapshot.record.bootstrapId,kind);let directory;
       try{directory=location.namespace.child(name,false,true);if(canonical(names(directory))!==canonical(['lease','manifest.json']))sessionFail();const manifest=readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT);
         const record=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifest.bytes));const manifestStat=fs.lstatSync(directory.at('manifest.json'),{bigint:true});const leaseStat=fs.lstatSync(directory.at('lease'),{bigint:true});
-        if(String(directory.stat.dev)!==snapshot.directory.dev||String(directory.stat.ino)!==snapshot.directory.ino||
+        if(manifest.mode!==0o600||String(directory.stat.dev)!==snapshot.directory.dev||String(directory.stat.ino)!==snapshot.directory.ino||
           !manifest.bytes.equals(snapshot.bytes)||canonical(record)!==canonical(snapshot.record)||
           !validRepositoryIdentity(record.repository,repositoryRoot,root.stat)||!validManifestIdentity(record.manifest,manifestStat)||
           !validLeaseIdentity(record.lease,leaseStat)||record.manifest.dev!==snapshot.manifest.dev||record.manifest.ino!==snapshot.manifest.ino)sessionFail();
