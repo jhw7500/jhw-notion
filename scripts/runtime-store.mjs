@@ -632,6 +632,8 @@ export function rollbackActivation({ repositoryRoot, expectedCurrent, onPointerI
 const SESSION_ID = /^s-[a-f0-9]{32}$/;
 const SESSION_PRIVATE = /^(?:\.creating\.s-[a-f0-9]{32}|\.retired\.s-[a-f0-9]{32}\.[a-f0-9]{32})$/;
 const SESSION_TOKEN = /^(s-[a-f0-9]{32}):([a-f0-9]{64})$/;
+const INVOCATION_ID = /^i-[a-f0-9]{32}$/;
+const V2_ROOT_TOKEN = /^v2:(b-[a-f0-9]{64}):(s-[a-f0-9]{32}):([a-f0-9]{64})$/;
 const SESSION_LIMIT = 1024;
 const SESSION_MANIFEST_LIMIT = 16 * 1024;
 const PROCESS_RECORD_LIMIT = 128 * 1024;
@@ -640,17 +642,47 @@ const DECIMAL = /^\d{1,32}$/;
 // as negative. Identity is compared as the same string, so only the sign is new.
 const SIGNED_DECIMAL = /^-?\d{1,32}$/;
 const BOOT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
-function validV2SessionRecord(value) {
-  return exact(value, ['version', 'id', 'kind', 'releaseId', 'bootstrapId', 'runtimeContract',
-    'compatibilityDigest', 'parentBinding', 'repository', 'owner', 'manifest', 'lease', 'createdAt']) &&
-    value.version === 2 && /^(?:s|i)-[a-f0-9]{32}$/.test(value.id) &&
-    ['session', 'invocation'].includes(value.kind) && validRuntimePair({
+const nonnegativeInteger = value => Number.isSafeInteger(value) && value >= 0;
+function validRepositoryIdentity(value, repositoryRoot = null, rootStat = null) {
+  if (!exact(value, ['path', 'dev', 'ino']) || typeof value.path !== 'string' || !path.isAbsolute(value.path) ||
+      path.resolve(value.path) !== value.path || value.path.includes('\0') ||
+      !SIGNED_DECIMAL.test(value.dev) || !SIGNED_DECIMAL.test(value.ino)) return false;
+  return repositoryRoot === null || value.path === repositoryRoot && value.dev === String(rootStat.dev) &&
+    value.ino === String(rootStat.ino);
+}
+function validOwnerIdentity(value) {
+  return exact(value, ['uid', 'pid', 'startTime', 'bootId', 'commandDigest', 'exeDev', 'exeIno']) &&
+    value.uid === process.getuid() && nonnegativeInteger(value.pid) && value.pid >= 1 &&
+    DECIMAL.test(value.startTime) && BOOT_ID.test(value.bootId) && DIGEST.test(value.commandDigest) &&
+    SIGNED_DECIMAL.test(value.exeDev) && SIGNED_DECIMAL.test(value.exeIno);
+}
+function validManifestIdentity(value, file = null) {
+  return exact(value, ['dev', 'ino']) && SIGNED_DECIMAL.test(value.dev) && SIGNED_DECIMAL.test(value.ino) &&
+    (file === null || value.dev === String(file.dev) && value.ino === String(file.ino));
+}
+function validLeaseIdentity(value, lease = null) {
+  if (!exact(value, ['dev', 'ino', 'fd']) || !SIGNED_DECIMAL.test(value.dev) || !SIGNED_DECIMAL.test(value.ino) ||
+      !nonnegativeInteger(value.fd) || value.fd > 1048576) return false;
+  return lease === null || lease.isFile() && lease.uid === BigInt(process.getuid()) && lease.nlink === 1n &&
+    (Number(lease.mode) & 0o7777) === 0o600 && value.dev === String(lease.dev) && value.ino === String(lease.ino);
+}
+// This is the pure closed-schema gate. The v2 reader additionally resolves the
+// recorded process, manifest, lease, and parent token identities before use.
+export function validV2SessionRecord(value) {
+  if (!exact(value, ['version', 'id', 'kind', 'releaseId', 'bootstrapId', 'runtimeContract',
+    'compatibilityDigest', 'parentBinding', 'repository', 'owner', 'manifest', 'lease', 'createdAt'])) return false;
+  if (value === null || value.version !== 2 || !validRuntimePair({
       releaseId: value.releaseId, bootstrapId: value.bootstrapId, runtimeContract: value.runtimeContract,
       compatibilityDigest: value.compatibilityDigest,
-    }) &&
-    (value.parentBinding === null || typeof value.parentBinding === 'string') && timestamp(value.createdAt) &&
-    exact(value.repository, ['path', 'dev', 'ino']) && exact(value.manifest, ['dev', 'ino']) &&
-    exact(value.lease, ['dev', 'ino', 'fd']) && value.owner !== null && typeof value.owner === 'object' && !Array.isArray(value.owner);
+    }) || !timestamp(value.createdAt) || !validRepositoryIdentity(value.repository) ||
+      !validOwnerIdentity(value.owner) || !validManifestIdentity(value.manifest) ||
+      !validLeaseIdentity(value.lease)) return false;
+  if (SESSION_ID.test(value.id)) return value.kind === 'session' && value.parentBinding === null;
+  if (!INVOCATION_ID.test(value.id) || value.kind !== 'invocation') return false;
+  if (value.parentBinding === null) return true;
+  if (typeof value.parentBinding !== 'string') return false;
+  const parent = V2_ROOT_TOKEN.exec(value.parentBinding);
+  return parent !== null && parent[1] === value.bootstrapId;
 }
 const sessionFail = () => fail('DEPLOY_SESSION_INVALID');
 // Readers hold a shared namespace lease only while taking the directory snapshot;
@@ -848,7 +880,6 @@ function sessionRecord(runtime, root, repositoryRoot, id, token = null) {
     const actualToken = id + ':' + digest(bytes);
     const file = fs.lstatSync(directory.at('manifest.json'), { bigint: true });
     const lease = fs.lstatSync(directory.at('lease'), { bigint: true });
-    const integer = value => Number.isSafeInteger(value) && value >= 0;
     if (token !== null && token !== actualToken ||
         !exact(record, ['version', 'id', 'kind', 'releaseId', 'compatibilityDigest', 'parentBinding',
           'repository', 'owner', 'manifest', 'lease', 'createdAt']) ||
@@ -856,16 +887,9 @@ function sessionRecord(runtime, root, repositoryRoot, id, token = null) {
         !RELEASE.test(record.releaseId) || !DIGEST.test(record.compatibilityDigest) ||
         !(record.parentBinding === null || typeof record.parentBinding === 'string' && SESSION_TOKEN.test(record.parentBinding)) ||
         record.kind === 'session' && record.parentBinding !== null || !timestamp(record.createdAt) ||
-        !exact(record.repository, ['path', 'dev', 'ino']) || record.repository.path !== repositoryRoot ||
-        record.repository.dev !== String(root.stat.dev) || record.repository.ino !== String(root.stat.ino) ||
-        !exact(record.owner, ['uid', 'pid', 'startTime', 'bootId', 'commandDigest', 'exeDev', 'exeIno']) ||
-        record.owner.uid !== process.getuid() || !integer(record.owner.pid) || record.owner.pid < 1 ||
-        !DECIMAL.test(record.owner.startTime) || !BOOT_ID.test(record.owner.bootId) ||
-        !DIGEST.test(record.owner.commandDigest) || !SIGNED_DECIMAL.test(record.owner.exeDev) || !SIGNED_DECIMAL.test(record.owner.exeIno) ||
-        !exact(record.manifest, ['dev', 'ino']) || record.manifest.dev !== String(file.dev) || record.manifest.ino !== String(file.ino) ||
-        !exact(record.lease, ['dev', 'ino', 'fd']) || !integer(record.lease.fd) || record.lease.fd > 1048576 ||
-        !lease.isFile() || lease.uid !== BigInt(process.getuid()) || lease.nlink !== 1n || (Number(lease.mode) & 0o7777) !== 0o600 ||
-        record.lease.dev !== String(lease.dev) || record.lease.ino !== String(lease.ino) ||
+        !validRepositoryIdentity(record.repository, repositoryRoot, root.stat) ||
+        !validOwnerIdentity(record.owner) || !validManifestIdentity(record.manifest, file) ||
+        !validLeaseIdentity(record.lease, lease) ||
         bytes.toString('utf8') !== canonical(record) + '\n') sessionFail();
     directory.verify();
     return { record, token: actualToken, leaseFile: path.join(repositoryRoot, '.jhw-runtime/sessions', id, 'lease') };

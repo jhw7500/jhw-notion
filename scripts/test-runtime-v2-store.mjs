@@ -84,6 +84,30 @@ test('v2 contract rejects mixed snapshots and preserves v1', () => {
   assert.equal(store.validRuntimePair({ ...runtimePair, unexpected: true }), false);
 });
 
+test('v2 binding records close identity fields and token relationships', () => {
+  const withUid = record => ({...record, owner: {...record.owner, uid: process.getuid()}});
+  const rootRecord = withUid(contracts.rootRecord);
+  const invocationRecord = withUid(contracts.invocationRecord);
+  assert.equal(store.validV2SessionRecord(rootRecord), true);
+  assert.equal(store.validV2SessionRecord(invocationRecord), true);
+  assert.equal(store.validV2SessionRecord({...invocationRecord, parentBinding: null}), true);
+
+  for (const [label, invalid] of [
+    ['session id with invocation kind', {...rootRecord, kind: 'invocation'}],
+    ['invocation id with session kind', {...invocationRecord, kind: 'session', parentBinding: null}],
+    ['root parent token', {...rootRecord, parentBinding: invocationRecord.parentBinding}],
+    ['arbitrary parent token', {...invocationRecord, parentBinding: 'unverified'}],
+    ['foreign bootstrap parent token', {...invocationRecord,
+      parentBinding: invocationRecord.parentBinding.replace(contracts.v2.bootstrapId, `b-${'0'.repeat(64)}`)}],
+    ['relative repository', {...rootRecord, repository: {...rootRecord.repository, path: 'relative'}}],
+    ['malformed repository identity', {...rootRecord, repository: {...rootRecord.repository, dev: 'device'}}],
+    ['malformed owner', {...rootRecord, owner: {...rootRecord.owner, pid: 0}}],
+    ['malformed manifest identity', {...rootRecord, manifest: {...rootRecord.manifest, ino: 'inode'}}],
+    ['malformed lease identity', {...rootRecord, lease: {...rootRecord.lease, fd: -1}}],
+    ['unknown key', {...rootRecord, unexpected: true}],
+  ]) assert.equal(store.validV2SessionRecord(invalid), false, label);
+});
+
 test('v2 activation reader accepts an initial migration and rejects a v1 priorCurrent', async t => {
   const f = await releaseFixture(t);
   const release = await f.prepare();

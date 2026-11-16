@@ -28,6 +28,17 @@ const origin = {
   predecessorActivationId: `a-${'2'.repeat(32)}`,
   observation: {target:`activations/a-${'1'.repeat(32)}`,dev:'1',ino:'2',ctimeNs:'3'},
 };
+const v2Origin = {
+  version: 2,
+  activationId: `a-${'5'.repeat(32)}`,
+  releaseId: `r-${'e'.repeat(40)}-${'f'.repeat(64)}`,
+  bootstrapId: `b-${'6'.repeat(64)}`,
+  runtimeContract: 2,
+  compatibilityDigest: '7'.repeat(64),
+  predecessorActivationId: null,
+  migrationId: `m-${'8'.repeat(32)}`,
+  observation: {target:`v2/activations/a-${'5'.repeat(32)}`,dev:'4',ino:'5',ctimeNs:'6'},
+};
 const destination = `a-${'3'.repeat(32)}`;
 
 function write(file, value, mode = 0o600) {
@@ -270,6 +281,23 @@ test('reads missing transition evidence as null but rejects malformed present ev
   });
   writeGuardTransitionEvidence({journalDirectory: f.journalDirectory, evidence});
   assert.deepEqual(readGuardTransitionEvidence({journalDirectory: f.journalDirectory}), evidence);
+});
+
+test('public Guard evidence accepts v2 origins and rejects mixed snapshots', t => {
+  const f = fixture(t);
+  const evidence = captureGuardTransitionEvidence({
+    home: f.home, repositoryRoot: f.repositoryRoot, candidateReleaseId: releaseId, origin: v2Origin,
+  });
+  writeGuardTransitionEvidence({journalDirectory: f.journalDirectory, evidence});
+  assert.deepEqual(readGuardTransitionEvidence({journalDirectory: f.journalDirectory}), evidence);
+
+  const mixed = {...v2Origin, observation: origin.observation};
+  assert.throws(() => captureGuardTransitionEvidence({
+    home: f.home, repositoryRoot: f.repositoryRoot, candidateReleaseId: releaseId, origin: mixed,
+  }), {code: 'DEPLOY_RECOVERY_REQUIRED'});
+  assert.throws(() => writeGuardTransitionEvidence({
+    journalDirectory: f.journalDirectory, evidence: {...evidence, origin: mixed},
+  }), {code: 'DEPLOY_RECOVERY_REQUIRED'});
 });
 
 test('rejects unsafe source files and published snapshots that differ from prediction', t => {
