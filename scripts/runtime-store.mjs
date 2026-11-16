@@ -354,7 +354,7 @@ function generationSource(runtime, repositoryRoot, releaseId) {
     const manifest = readJson(release);
     if (canonical(summary(manifest)) !== canonical(validated)) fail('DEPLOY_BOOTSTRAP_INVALID');
     const declaration = compatibilityDeclaration(release, manifest);
-    if (declaration?.generation !== 2) fail('DEPLOY_BOOTSTRAP_INVALID');
+    if (declaration?.generation !== 2 || declaration.guardFloor !== 1) fail('DEPLOY_BOOTSTRAP_INVALID');
     scripts = release.child('scripts', false);
     const files = [];
     const helperBytes = new Map();

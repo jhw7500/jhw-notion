@@ -171,7 +171,7 @@ function requireGenerationTwo(repositoryRoot,releaseId,manifest,runtimeHandle=nu
     if(hash(bytes)!==record.sha256)fail();
     const declaration=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
     if(!exact(declaration,['version','generation','guardFloor'])||declaration.version!==1||declaration.generation!==2||
-        !Number.isSafeInteger(declaration.guardFloor)||declaration.guardFloor<=0)fail();
+        typeof declaration.guardFloor!=='number'||declaration.guardFloor!==1)fail();
   } finally { directory.close(); }
 }
 
@@ -257,7 +257,7 @@ export async function installRouterV2({repositoryRoot,releaseId,deployLease,admi
     let previous;
     try{fs.lstatSync(runtime.at('bootstrap'));previous=validateBootstrap({repositoryRoot});}
     catch(error){if(error.code!=='ENOENT')throw error;}
-    if(previous?.version===2&&canonical(previous)===canonical(manifest))return {sourceReleaseId:releaseId,routerContract:1};
+    if(previous?.version===2&&canonical(previous)===canonical(manifest))return {sourceReleaseId:releaseId,routerContract:1,previousDirectory:null};
     stageName=`.bootstrap.stage.${randomBytes(16).toString('hex')}`;
     fs.mkdirSync(runtime.at(stageName),{mode:0o700});fs.chmodSync(runtime.at(stageName),0o700);
     stage=new Directory(path.join(repositoryRoot,'.jhw-runtime',stageName));
@@ -276,14 +276,18 @@ export async function installRouterV2({repositoryRoot,releaseId,deployLease,admi
     }
     const installed=validateBootstrap({repositoryRoot});
     if(canonical(installed)!==canonical(manifest))fail('DEPLOY_BOOTSTRAP_CHANGED');
-    return {sourceReleaseId:installed.sourceReleaseId,routerContract:installed.routerContract};
+    return {sourceReleaseId:installed.sourceReleaseId,routerContract:installed.routerContract,previousDirectory};
   } catch(error){if(error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code))throw error;fail();}
   finally{stage?.close();source?.close();runtime?.close();}
 }
 export function validateRetainedBootstrap({repositoryRoot,name,runtimeHandle=null}) {
   if(typeof name!=='string'||!/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(name))fail();
   let directory;
-  try { directory=runtimeHandle?anchoredDirectory(runtimeHandle,[name]):new Directory(path.join(repositoryRoot,'.jhw-runtime',name)); return readSet(directory,repositoryRoot,runtimeHandle); }
+  try {
+    directory=runtimeHandle?anchoredDirectory(runtimeHandle,[name]):new Directory(path.join(repositoryRoot,'.jhw-runtime',name));
+    const preliminary=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read(directory,'manifest.json',0o600,16384)));
+    return preliminary?.version===2?readRouterSet(directory,repositoryRoot,runtimeHandle):readSet(directory,repositoryRoot,runtimeHandle);
+  }
   catch { fail(); }
   finally { directory?.close(); }
 }

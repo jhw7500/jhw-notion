@@ -341,7 +341,46 @@ test('v2 generation validates exact children and modes', async t => {
   assert.deepEqual([...validated.helperBytes.keys()], ['runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs']);
   const generation = path.join(f.root, `.jhw-runtime/v2/bootstraps/${pair.bootstrapId}`);
   assert.deepEqual(fs.readdirSync(generation).sort(), ['lease','manifest.json','runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs']);
-  fs.chmodSync(path.join(generation, 'runtime-entry.mjs'), 0o600);
-  assert.throws(() => store.validateBootstrapGeneration({repositoryRoot:f.root,bootstrapId:pair.bootstrapId}),
-    {code:'DEPLOY_BOOTSTRAP_INVALID'});
+  assert.equal(fs.lstatSync(generation).mode & 0o777, 0o700);
+  assert.equal(fs.lstatSync(path.dirname(generation)).mode & 0o777, 0o700);
+  assert.equal(fs.lstatSync(path.join(generation,'manifest.json')).mode & 0o777, 0o600);
+  assert.equal(fs.lstatSync(path.join(generation,'lease')).mode & 0o777, 0o600);
+  assert.equal(fs.readFileSync(path.join(generation,'lease')).length, 0);
+  for (const helper of ['runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs']) {
+    assert.equal(fs.lstatSync(path.join(generation,helper)).mode & 0o777, 0o644);
+  }
+  for (const [label, mutate, restore] of [
+    ['bootstraps directory mode', () => fs.chmodSync(path.dirname(generation),0o755), () => fs.chmodSync(path.dirname(generation),0o700)],
+    ['generation directory mode', () => fs.chmodSync(generation,0o755), () => fs.chmodSync(generation,0o700)],
+    ['manifest mode', () => fs.chmodSync(path.join(generation,'manifest.json'),0o644), () => fs.chmodSync(path.join(generation,'manifest.json'),0o600)],
+    ['lease mode', () => fs.chmodSync(path.join(generation,'lease'),0o644), () => fs.chmodSync(path.join(generation,'lease'),0o600)],
+    ['nonempty lease', () => fs.writeFileSync(path.join(generation,'lease'),'x'), () => fs.writeFileSync(path.join(generation,'lease'),'')],
+    ['helper mode', () => fs.chmodSync(path.join(generation,'runtime-entry.mjs'),0o600), () => fs.chmodSync(path.join(generation,'runtime-entry.mjs'),0o644)],
+    ['extra child', () => fs.writeFileSync(path.join(generation,'extra'),'x',{mode:0o600}), () => fs.unlinkSync(path.join(generation,'extra'))],
+  ]) {
+    assert.equal(store.validateBootstrapGeneration({repositoryRoot:f.root,bootstrapId:pair.bootstrapId}).manifest.bootstrapId,pair.bootstrapId,label);
+    mutate();
+    assert.throws(() => store.validateBootstrapGeneration({repositoryRoot:f.root,bootstrapId:pair.bootstrapId}),
+      error => /^DEPLOY_(?:BOOTSTRAP_INVALID|UNTRUSTED_PATH)$/.test(error.code), label);
+    restore();
+    assert.equal(store.validateBootstrapGeneration({repositoryRoot:f.root,bootstrapId:pair.bootstrapId}).manifest.bootstrapId,pair.bootstrapId,label);
+  }
+});
+
+test('generation 2 declaration requires guardFloor 1 with closed scalar types', async t => {
+  for (const declaration of [
+    {version:1,generation:2,guardFloor:0},
+    {version:1,generation:2,guardFloor:2},
+    {version:1,generation:2,guardFloor:'1'},
+    {version:1,generation:2,guardFloor:1,unknown:true},
+  ]) {
+    const f = await createRuntimeFixture(t);
+    f.write('mcp-server/src/control/runtime-compatibility.json', JSON.stringify(declaration) + '\n');
+    const release = await f.prepare();
+    const deployLease = acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+    try {
+      assert.throws(() => store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease}),
+        {code:'DEPLOY_BOOTSTRAP_INVALID'}, JSON.stringify(declaration));
+    } finally { deployLease.close(); }
+  }
 });
