@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 
 import {
   GUARD_TRANSITION_PATHS,
@@ -20,6 +21,7 @@ import {
   prepareIncompleteGuardRollbackEvidence,
   restoreGuardRollbackEvidence,
 } from './runtime-guard.mjs';
+import {readRuntimeJournalV2,recordDeploymentRetention} from './runtime-prune.mjs';
 
 const releaseId = `r-${'a'.repeat(40)}-${'b'.repeat(64)}`;
 const origin = {
@@ -40,6 +42,41 @@ const v2Origin = {
   observation: {target:`v2/activations/a-${'5'.repeat(32)}`,dev:'4',ino:'5',ctimeNs:'6'},
 };
 const destination = `a-${'3'.repeat(32)}`;
+
+test('v2 pair journal parser and receipt keep the variant closed',t=>{
+  const repositoryRoot=fs.mkdtempSync(path.join(os.tmpdir(),'jhw-pair-journal-'));fs.chmodSync(repositoryRoot,0o700);
+  t.after(()=>fs.rmSync(repositoryRoot,{recursive:true,force:true}));
+  const journalDirectory=path.join(repositoryRoot,'.jhw-runtime/v2/journals',`d-${'4'.repeat(32)}`);
+  fs.mkdirSync(journalDirectory,{recursive:true,mode:0o700});
+  for(const directory of [path.join(repositoryRoot,'.jhw-runtime'),path.join(repositoryRoot,'.jhw-runtime/v2'),path.dirname(journalDirectory),journalDirectory])fs.chmodSync(directory,0o700);
+  const candidate={releaseId:v2Origin.releaseId,bootstrapId:v2Origin.bootstrapId,runtimeContract:2,compatibilityDigest:v2Origin.compatibilityDigest};
+  const activationId=`a-${'9'.repeat(32)}`;const activation=path.join(repositoryRoot,'.jhw-runtime/v2/activations',activationId);
+  fs.mkdirSync(activation,{recursive:true,mode:0o700});fs.chmodSync(path.dirname(activation),0o700);fs.chmodSync(activation,0o700);
+  const prior={...v2Origin,migrationId:null};const manifest={version:2,activationId,...candidate,predecessorActivationId:prior.activationId,migrationId:null,
+    createdAt:'2026-11-17T00:00:00.000Z',priorCurrent:prior};
+  const canonical=value=>Array.isArray(value)?`[${value.map(canonical).join(',')}]`:value!==null&&typeof value==='object'?`{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`:JSON.stringify(value);
+  write(path.join(activation,'manifest.json'),canonical(manifest)+'\n');
+  const current=path.join(repositoryRoot,'.jhw-runtime/current');fs.symlinkSync(`v2/activations/${activationId}`,current);
+  const witnessDirectory=path.join(journalDirectory,'pointer-witness');fs.mkdirSync(witnessDirectory,{mode:0o700});fs.linkSync(current,path.join(witnessDirectory,'current'));
+  const identity=(stat,{times=false,links=false}={})=>({dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:Number(stat.mode&0o7777n),
+    ...(links?{nlink:Number(stat.nlink)}:{}),...(times?{mtimeNs:String(stat.mtimeNs),ctimeNs:String(stat.ctimeNs)}:{})});
+  const witness={directory:identity(fs.lstatSync(witnessDirectory,{bigint:true}),{times:true}),
+    pointer:{...identity(fs.lstatSync(path.join(witnessDirectory,'current'),{bigint:true})),target:`v2/activations/${activationId}`},
+    activation:{directory:identity(fs.lstatSync(activation,{bigint:true}),{times:true}),
+      manifest:{...identity(fs.lstatSync(path.join(activation,'manifest.json'),{bigint:true}),{times:true,links:true}),sha256:createHash('sha256').update(fs.readFileSync(path.join(activation,'manifest.json'))).digest('hex')}}};
+  const observed=fs.lstatSync(current,{bigint:true});const destinationSnapshot={version:2,activationId,...candidate,predecessorActivationId:prior.activationId,migrationId:null,
+    observation:{target:`v2/activations/${activationId}`,dev:String(observed.dev),ino:String(observed.ino),ctimeNs:String(observed.ctimeNs)}};
+  const state={version:2,kind:'pair',status:'complete',operation:'activate',phase:'complete',origin:prior,candidate,
+    destination:destinationSnapshot,witness,outcome:'pointer_published'};
+  write(path.join(journalDirectory,'state.json'),JSON.stringify(state)+'\n');
+  write(path.join(journalDirectory,'candidate-probe.log'),'validated\n');
+  const parsed=readRuntimeJournalV2({repositoryRoot,journalDirectory});
+  assert.deepEqual(parsed.state,state);assert.deepEqual([...parsed.files.keys()].sort(),['candidate-probe.log','state.json']);
+  const receipt=recordDeploymentRetention({repositoryRoot,journalDirectory});assert.equal(receipt.version,2);
+  assert.deepEqual([...readRuntimeJournalV2({repositoryRoot,journalDirectory}).files.keys()].sort(),['candidate-probe.log','retention.json','state.json']);
+  write(path.join(journalDirectory,'foreign.json'),'{}\n');
+  assert.throws(()=>readRuntimeJournalV2({repositoryRoot,journalDirectory}),{code:'DEPLOY_PRUNE_BLOCKED',reason:'unverified_journal'});
+});
 
 function write(file, value, mode = 0o600) {
   fs.mkdirSync(path.dirname(file), {recursive: true, mode: 0o700});

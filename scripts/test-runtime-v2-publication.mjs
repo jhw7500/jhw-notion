@@ -259,6 +259,23 @@ test('prepared activation publishes exact v2 destination without duplicate paylo
   assert.deepEqual(store.readActivation({repositoryRoot:state.f.root}),snapshot);
 });
 
+test('durable pointer witness keeps object identity across delayed rename ctime change',async t=>{
+  const state=await prepared(t,{reuse:true});
+  const journals=path.join(state.f.root,'.jhw-runtime/v2/journals');fs.mkdirSync(journals,{recursive:true,mode:0o700});
+  for(const directory of [path.join(state.f.root,'.jhw-runtime/v2'),journals])fs.chmodSync(directory,0o700);
+  const journalDirectory=path.join(journals,`d-${'3'.repeat(32)}`);fs.mkdirSync(journalDirectory,{mode:0o700});
+  let intent;let preRenameCtime;const lease=publicationLease(state.f.root);let snapshot;
+  try{
+    snapshot=store.publishPreparedActivation({repositoryRoot:state.f.root,destination:state.destination,
+      expectedCurrent:state.expectedCurrent,evidence:state.evidence,publicationLease:lease,journalDirectory,
+      onPointerIntent:(_destination,value)=>{intent=value;preRenameCtime=String(fs.lstatSync(path.join(journalDirectory,'pointer-witness/current'),{bigint:true}).ctimeNs);const until=Date.now()+25;while(Date.now()<until){}}});
+  }finally{lease.close();}
+  const linked=fs.lstatSync(path.join(journalDirectory,'pointer-witness/current'),{bigint:true});
+  assert.equal(intent.witness.pointer.dev,String(linked.dev));assert.equal(intent.witness.pointer.ino,String(linked.ino));
+  assert.equal(snapshot.observation.dev,intent.witness.pointer.dev);assert.equal(snapshot.observation.ino,intent.witness.pointer.ino);
+  assert.notEqual(snapshot.observation.ctimeNs,preRenameCtime,'published ctime must come from the actual pointer, not a pre-rename timestamp');
+});
+
 test('publication requires prepared evidence for the exact v2 origin pair', async t => {
   const f=await createRuntimeFixture(t);
   const releaseA=await f.prepare();

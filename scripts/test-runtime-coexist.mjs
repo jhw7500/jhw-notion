@@ -3,11 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import {randomBytes} from 'node:crypto';
 import { once } from 'node:events';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DeploymentError, acquireLease } from './runtime-safety.mjs';
-import { prepareRelease, publishActivation, readActivation, releaseCompatibility } from './runtime-store.mjs';
+import { prepareRelease, publishActivation, readActivation, releaseCompatibility,ensureBootstrapGeneration,inspectSessionBindingsV2 } from './runtime-store.mjs';
+import {installRouterV2} from './runtime-entry.mjs';
 import { runDeployment, wiringPhase } from './runtime-deploy.mjs';
 
 const source = path.dirname(fileURLToPath(import.meta.url));
@@ -64,6 +66,35 @@ async function fixture(t) {
     phaseRunner:options=>options.phase==='validate'?undefined:wiringPhase(options)});
   return {root,home,procRoot,first,prepare,breakCandidate:()=>{broken=true;},changeImplementation:()=>{implementation='B';write(root,'mcp-server/src/control/hook-adapter.ts','export const implementation="B";');write(root,'skills/claude/task.md','changed ordinary Markdown');write(root,'skills/codex/jhw-task/SKILL.md','changed generated Markdown');},configureMcp:value=>{mcpOptions={...mcpOptions,...value};},entry:path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry')};
 }
+function seedV2Current(f,pair) {
+  const activationId=`a-${randomBytes(16).toString('hex')}`;
+  const activation=path.join(f.root,'.jhw-runtime/v2/activations',activationId);
+  fs.mkdirSync(activation,{recursive:true,mode:0o700});
+  for(const directory of [path.join(f.root,'.jhw-runtime/v2'),path.dirname(activation),activation])fs.chmodSync(directory,0o700);
+  for(const name of ['mcp-server','scripts','skills'])fs.symlinkSync(`../../../releases/${pair.releaseId}/${name}`,path.join(activation,name));
+  fs.symlinkSync(`../../bootstraps/${pair.bootstrapId}`,path.join(activation,'bootstrap'));
+  const manifest={version:2,activationId,...pair,predecessorActivationId:null,migrationId:null,createdAt:new Date().toISOString(),priorCurrent:null};
+  write(activation,'manifest.json',JSON.stringify(manifest)+'\n',0o600);
+  const current=path.join(f.root,'.jhw-runtime/current');fs.unlinkSync(current);fs.symlinkSync(`v2/activations/${activationId}`,current);
+  return readActivation({repositoryRoot:f.root});
+}
+async function v2Fixture(t) {
+  const f=await fixture(t);
+  write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+  write(f.root,'mcp-server/src/index.ts','export const generation="v2-a";');
+  const releaseA=await f.prepare();const deploy=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const admission=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'));
+  let pairA;try{
+    pairA=ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:releaseA.releaseId,deployLease:deploy});
+    await installRouterV2({repositoryRoot:f.root,releaseId:releaseA.releaseId,deployLease:deploy,admissionLease:admission});
+  }finally{admission.close();deploy.close();}
+  seedV2Current(f,pairA);return {...f,pairA,releaseA};
+}
+function pairForToken(f,token) {
+  const row=inspectSessionBindingsV2({repositoryRoot:f.root}).find(item=>item.kind==='session'&&item.token===token&&item.live);
+  assert.ok(row,`live v2 root binding missing for ${token}; rows=${JSON.stringify(inspectSessionBindingsV2({repositoryRoot:f.root}).map(item=>({token:item.token,kind:item.kind,live:item.live})))}`);
+  return {releaseId:row.releaseId,bootstrapId:row.bootstrapId,runtimeContract:row.runtimeContract,compatibilityDigest:row.compatibilityDigest};
+}
 function run(f,args,options={}) {
   return spawnSync(process.execPath,[f.entry,...args],{encoding:'utf8',timeout:12000,...options});
 }
@@ -111,7 +142,7 @@ readline.createInterface({input:process.stdin}).on('line',command=>{
     const events=['PreToolUse','PostToolUse','UserPromptSubmit','SessionEnd'];const codes=[];
     for(const event of events){const r=call(['hook','--adapter','codex','--event',event],'{}');codes.push(r.status);}
     const hooks=fs.readFileSync(trace,'utf8').trim().split('\n').slice(-4).map(JSON.parse);
-    send({control:JSON.parse(control.stdout).release,mcp:mcp.stdout.trim().split('\n').map(JSON.parse).find(x=>x.id===1).result.serverInfo.version,hooks,codes});
+    send({control:JSON.parse(control.stdout).release,mcp:mcp.stdout.trim().split('\n').map(JSON.parse).find(x=>x.id===1).result.serverInfo.version,hooks,codes,token:process.env.JHW_RUNTIME_SESSION_BINDING});
   }catch(error){send({error:error.message});}
 });`;
 
@@ -159,6 +190,159 @@ test('live A keeps control, reconnecting MCP and every hook on A while new B use
   const c=startClient(t,f);await c.ready();assertSample(await c.request('sample'),f.first.releaseId);
   assert.throws(()=>acquireLease(path.join(f.root,'.jhw-runtime/admission.lock')),{code:'DEPLOY_LOCK_CONTENDED'});
   await assert.rejects(runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate',f.first.releaseId],phaseRunner:async()=>{}}),{code:'DEPLOY_CONSUMERS_ACTIVE'});
+});
+test('v2 compatible publication keeps both bound pairs callable',async t=>{
+  const f=await v2Fixture(t);const samples=[];
+  const a=startClient(t,f);await a.ready();snapshotConsumer(f,a.child.pid);
+  const oldResponse=await a.request('sample');const oldSample={...oldResponse,pair:pairForToken(f,oldResponse.token),denied:false};samples.push(oldSample);
+  assert.deepEqual(oldSample.pair,f.pairA);
+  write(f.root,'mcp-server/src/index.ts','export const generation="v2-b";');const releaseB=await f.prepare();
+  let verifiedRealWiring=false;const published=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,
+    argv:['--activate-compatible',releaseB.releaseId],phaseRunner:async options=>{verifiedRealWiring=true;return wiringPhase(options);}});
+  assert.equal(published.code,'DEPLOY_COMPATIBLE_ACTIVATED');
+  assert.equal(verifiedRealWiring,true);
+  const selected=readActivation({repositoryRoot:f.root});
+  const pairB={releaseId:selected.releaseId,bootstrapId:selected.bootstrapId,runtimeContract:selected.runtimeContract,
+    compatibilityDigest:selected.compatibilityDigest};
+  const b=startClient(t,f);await b.ready();snapshotConsumer(f,b.child.pid);
+  const newResponse=await b.request('sample');const newSample={...newResponse,pair:pairForToken(f,newResponse.token),denied:false};samples.push(newSample);
+  assert.deepEqual(newSample.pair,pairB);
+  const rollback=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,
+    argv:['--rollback'],phaseRunner:async()=>{}});
+  assert.equal(rollback.code,'DEPLOY_ROLLED_BACK');
+  const afterA=await a.request('sample');const afterB=await b.request('sample');
+  samples.push({...afterA,pair:pairForToken(f,afterA.token),denied:false});
+  samples.push({...afterB,pair:pairForToken(f,afterB.token),denied:false});
+  assert.deepEqual(samples.at(-2).pair,f.pairA);assert.deepEqual(samples.at(-1).pair,pairB);
+  assert.equal(samples.some(row=>row.denied),false);
+  assert.equal((await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--status']})).recoveryPending,0);
+});
+test('v2 candidate MCP contract rejection preserves current',async t=>{
+  const f=await v2Fixture(t);const a=startClient(t,f);await a.ready();snapshotConsumer(f,a.child.pid);
+  const before=readActivation({repositoryRoot:f.root});f.configureMcp({tools:[]});
+  write(f.root,'mcp-server/src/index.ts','export const generation="v2-contract-rejected";');const candidate=await f.prepare();
+  await assert.rejects(runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,
+    argv:['--activate-compatible',candidate.releaseId],phaseRunner:async()=>{}}),{code:'DEPLOY_CONSUMERS_ACTIVE',reason:'stopped_rollback_required'});
+  assert.deepEqual(readActivation({repositoryRoot:f.root}),before);
+  const journal=fs.readdirSync(path.join(f.root,'.jhw-runtime/v2/journals')).find(name=>name.startsWith('d-'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/v2/journals',journal,'state.json'),'utf8')).status,'complete');
+});
+test('v2 publication refuses an unknown legacy consumer',async t=>{
+  const f=await v2Fixture(t);const before=readActivation({repositoryRoot:f.root});
+  const p=path.join(f.procRoot,'101');fs.mkdirSync(p);write(p,'status','Uid:\t'+[process.getuid(),process.getuid(),process.getuid(),process.getuid()].join('\t')+'\n',0o600);
+  write(p,'stat','101 (fixture) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0\n',0o600);
+  write(p,'cmdline','jhw-control\0',0o600);write(p,'environ','',0o600);fs.symlinkSync(f.root,path.join(p,'cwd'));
+  write(f.root,'mcp-server/src/index.ts','export const generation="v2-unknown-consumer";');const candidate=await f.prepare();
+  await assert.rejects(runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,
+    argv:['--activate-compatible',candidate.releaseId],phaseRunner:async()=>{}}),{code:'DEPLOY_CONSUMERS_ACTIVE'});
+  assert.deepEqual(readActivation({repositoryRoot:f.root}),before);
+});
+test('v2 publication rejects current identity replacement before pointer intent',async t=>{
+  const f=await v2Fixture(t);write(f.root,'mcp-server/src/index.ts','export const generation="v2-current-race";');const candidate=await f.prepare();
+  const phase=async()=>{};phase.observe=value=>{
+    if(value.phase!=='publication_acquired')return;
+    const current=path.join(f.root,'.jhw-runtime/current');const target=fs.readlinkSync(current);fs.unlinkSync(current);fs.symlinkSync(target,current);
+  };
+  await assert.rejects(runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,
+    argv:['--activate-compatible',candidate.releaseId],phaseRunner:phase}),{code:'DEPLOY_CURRENT_CHANGED'});
+  const journals=fs.readdirSync(path.join(f.root,'.jhw-runtime/v2/journals')).filter(name=>name.startsWith('d-'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/v2/journals',journals[0],'state.json'),'utf8')).status,'pending');
+});
+test('v2 publication keeps probes and log fsync outside exclusive interval',async t=>{
+  const f=await v2Fixture(t);write(f.root,'mcp-server/src/index.ts','export const generation="v2-timing";');const candidate=await f.prepare();
+  const events=[];const phase=async()=>{};phase.observe=value=>{
+    const event={...value,observedNs:String(process.hrtime.bigint())};
+    if(value.phase==='root_index_held'){
+      const safety=new URL('./runtime-safety.mjs',import.meta.url).href;
+      const source=`import {acquireLease} from ${JSON.stringify(safety)};try{acquireLease(process.argv[1]);console.log('acquired')}catch(error){console.log(error.code)}`;
+      const result=spawnSync(process.execPath,['--input-type=module','-e',source,path.join(f.root,'.jhw-runtime/v2/session-index.lock')],{encoding:'utf8'});
+      assert.equal(result.status,0,result.stderr);event.contender=result.stdout.trim();
+    }
+    events.push(event);
+  };
+  await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,
+    argv:['--activate-compatible',candidate.releaseId],phaseRunner:phase});
+  for(const name of ['candidate_probe_start','candidate_probe_complete','log_fsync_start','log_fsync_complete'])
+    assert.equal(events.find(row=>row.phase===name)?.exclusive,false,name);
+  for(const name of ['publication_acquired','pointer_intent','pointer_renamed'])assert.equal(events.find(row=>row.phase===name)?.exclusive,true,name);
+  assert.equal(events.find(row=>row.phase==='publication_released')?.exclusive,false);
+  assert.equal(events.find(row=>row.phase==='root_index_held')?.contender,'DEPLOY_LOCK_CONTENDED');
+  assert.ok(BigInt(events.find(row=>row.phase==='pointer_renamed').elapsedNs)<1_000_000_000n);
+  const acquired=BigInt(events.find(row=>row.phase==='publication_acquired').observedNs);
+  const released=BigInt(events.find(row=>row.phase==='publication_released').observedNs);
+  assert.ok(released-acquired<1_000_000_000n);
+  console.log(JSON.stringify({timing:events}));
+});
+test('v2 publication aborts over-budget caller recheck before pointer rename',async t=>{
+  const f=await v2Fixture(t);const before=readActivation({repositoryRoot:f.root});
+  write(f.root,'mcp-server/src/index.ts','export const generation="v2-budget";');const candidate=await f.prepare();
+  const phase=async()=>{};phase.observe=value=>{if(value.phase==='publication_acquired'){const until=Date.now()+1050;while(Date.now()<until){}}};
+  await assert.rejects(runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,
+    argv:['--activate-compatible',candidate.releaseId],phaseRunner:phase}),{code:'DEPLOY_SOURCE_CHANGED'});
+  assert.deepEqual(readActivation({repositoryRoot:f.root}),before);
+});
+test('v2 rollback reconstructs a reclaimed predecessor generation from catalog source',async t=>{
+  const f=await v2Fixture(t);write(f.root,'mcp-server/src/index.ts','export const generation="v2-reconstruct-b";');const candidate=await f.prepare();
+  await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate-compatible',candidate.releaseId],phaseRunner:async()=>{}});
+  const reclaimed=path.join(f.root,'.jhw-runtime/v2/bootstraps',f.pairA.bootstrapId);fs.rmSync(reclaimed,{recursive:true});
+  const rolled=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--rollback'],phaseRunner:async()=>{}});
+  assert.equal(rolled.releaseId,f.pairA.releaseId);assert.equal(fs.existsSync(reclaimed),true);
+  const a=startClient(t,f);await a.ready();const sample=await a.request('sample');assert.equal(sample.control,f.pairA.releaseId);
+  assert.deepEqual(pairForToken(f,sample.token),f.pairA);
+});
+test('noncompatible v2 rollback uses admission EX after consumers stop',async t=>{
+  const f=await v2Fixture(t);f.configureMcp({tools:[{name:'fixture',inputSchema:{type:'object',required:['changed']}}]});
+  write(f.root,'mcp-server/src/index.ts','export const generation="v2-stopped-b";');const candidate=await f.prepare();
+  await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate-compatible',candidate.releaseId],phaseRunner:async()=>{}});
+  let contender;const phase=async()=>{};phase.observe=value=>{
+    if(value.phase!=='publication_acquired')return;
+    const safety=new URL('./runtime-safety.mjs',import.meta.url).href;
+    const source=`import {acquireLease} from ${JSON.stringify(safety)};try{acquireLease(process.argv[1],{shared:true});console.log('acquired')}catch(error){console.log(error.code)}`;
+    contender=spawnSync(process.execPath,['--input-type=module','-e',source,path.join(f.root,'.jhw-runtime/admission.lock')],{encoding:'utf8'}).stdout.trim();
+  };
+  const rolled=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--rollback'],phaseRunner:phase});
+  assert.equal(rolled.releaseId,f.pairA.releaseId);assert.equal(contender,'DEPLOY_LOCK_CONTENDED');
+});
+async function interruptedV2Pair(t,phase) {
+  const f=await v2Fixture(t);write(f.root,'mcp-server/src/index.ts',`export const generation=${JSON.stringify(phase)};`);const candidate=await f.prepare();
+  const moduleUrl=new URL('./runtime-deploy.mjs',import.meta.url).href;
+  const childSource=`import {runDeployment} from ${JSON.stringify(moduleUrl)};const phase=async()=>{};phase.observe=value=>{if(value.phase===process.argv[1])process.exit(37)};await runDeployment({...JSON.parse(process.argv[2]),phaseRunner:phase});`;
+  const options={repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate-compatible',candidate.releaseId]};
+  const result=spawnSync(process.execPath,['--input-type=module','-e',childSource,phase,JSON.stringify(options)],{encoding:'utf8',timeout:15000});
+  assert.equal(result.status,37,result.stderr);
+  const journals=fs.readdirSync(path.join(f.root,'.jhw-runtime/v2/journals')).filter(name=>name.startsWith('d-'));
+  assert.equal(journals.length,1);const journalDirectory=path.join(f.root,'.jhw-runtime/v2/journals',journals[0]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(journalDirectory,'state.json'),'utf8')).status,'pending');
+  return {f,candidate,journalDirectory,options};
+}
+for(const phase of ['pointer_intent','pointer_renamed'])test(`v2 pair journal recovers crash at ${phase}`,async t=>{
+  const interrupted=await interruptedV2Pair(t,phase);
+  const recovered=await runDeployment({...interrupted.options,phaseRunner:async()=>{}});
+  assert.equal(recovered.recovery.outcome,phase==='pointer_intent'?'pointer_not_published':'pointer_published');
+  const recoveredJournal=JSON.parse(fs.readFileSync(path.join(interrupted.journalDirectory,'state.json'),'utf8'));
+  assert.equal(recoveredJournal.status,'complete');
+});
+test('v2 pointer intent rejects a foreign same-target current symlink',async t=>{
+  const {f,options,journalDirectory}=await interruptedV2Pair(t,'pointer_renamed');
+  const current=path.join(f.root,'.jhw-runtime/current');const target=fs.readlinkSync(current);fs.unlinkSync(current);fs.symlinkSync(target,current);
+  await assert.rejects(runDeployment({...options,phaseRunner:async()=>{}}),{code:'DEPLOY_RECOVERY_REQUIRED'});
+  assert.equal(JSON.parse(fs.readFileSync(path.join(journalDirectory,'state.json'),'utf8')).status,'pending');
+});
+for(const mutation of ['missing','replaced'])test(`v2 pointer intent rejects ${mutation} witness directory`,async t=>{
+  const {f,options,journalDirectory}=await interruptedV2Pair(t,'pointer_renamed');const witness=path.join(journalDirectory,'pointer-witness');
+  fs.unlinkSync(path.join(witness,'current'));fs.rmdirSync(witness);
+  if(mutation==='replaced'){fs.mkdirSync(witness,{mode:0o700});fs.linkSync(path.join(f.root,'.jhw-runtime/current'),path.join(witness,'current'));}
+  await assert.rejects(runDeployment({...options,phaseRunner:async()=>{}}),{code:'DEPLOY_RECOVERY_REQUIRED'});
+  assert.equal(JSON.parse(fs.readFileSync(path.join(journalDirectory,'state.json'),'utf8')).status,'pending');
+});
+test('v2 pointer intent rejects changed destination manifest evidence',async t=>{
+  const {f,journalDirectory}=await interruptedV2Pair(t,'pointer_renamed');
+  const state=JSON.parse(fs.readFileSync(path.join(journalDirectory,'state.json'),'utf8'));
+  const manifest=path.join(f.root,'.jhw-runtime/v2/activations',state.destination.activationId,'manifest.json');
+  const bytes=fs.readFileSync(manifest);fs.writeFileSync(manifest,bytes); // ctime changes while canonical content stays identical.
+  const {reconcilePairJournal}=await import('./runtime-deploy.mjs');
+  assert.throws(()=>reconcilePairJournal({repositoryRoot:f.root,journalDirectory}),{code:'DEPLOY_RECOVERY_REQUIRED'});
+  assert.equal(JSON.parse(fs.readFileSync(path.join(journalDirectory,'state.json'),'utf8')).status,'pending');
 });
 test('a session descendant that loses its pin is denied after promotion',async t=>{
   const f=await fixture(t);const a=startClient(t,f);await a.ready();snapshotConsumer(f,a.child.pid);

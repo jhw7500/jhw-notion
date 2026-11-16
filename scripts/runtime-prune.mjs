@@ -3,10 +3,11 @@ import path from 'node:path';
 import {createHash,randomBytes} from 'node:crypto';
 import {DeploymentError,trustedDirectory} from './runtime-safety.mjs';
 import {validateRetainedBootstrap} from './runtime-entry.mjs';
-import {validV1Current as validCurrent} from './runtime-store.mjs';
+import {validV1Current as validCurrent,validCurrent as validRuntimeCurrent,validRuntimePair} from './runtime-store.mjs';
 
 const C=fs.constants;
 const JOURNAL=/^\.deploy\.[a-f0-9]{32}$/;
+const JOURNAL_V2=/^d-[a-f0-9]{32}$/;
 const PREVIOUS=/^\.bootstrap\.previous\.[a-f0-9]{32}$/;
 const LOG=/^(verify|wire|validate|finalize|rollback|uninstall)\.[a-f0-9]{16}\.log$/;
 const OPERATIONS=new Set(['activate','rollback','uninstall','refresh-bootstrap']);
@@ -20,6 +21,7 @@ const COUNTER='.retention-sequence.v1.json';
 const PRUNE='.prune.v1';
 export const DEPLOY_VARIABLE_KEYS=['HOOK_LINK_CREATED','INSTALL_TRANSACTION_ACTIVE','HOOKS_CONFIG_CHANGED','HOOKS_CONFIG_FILE','HOOKS_ADAPTER','HOOKS_DISPLAY_NAME','HOOKS_TRANSACTION_DIR','HOOKS_TRANSACTION_STAGE','HOOKS_TRANSACTION_METADATA','HOOKS_TRANSACTION_PRESERVE','CLAUDE_HOOKS_CONFIG_CHANGED','CLAUDE_HOOKS_CONFIG_FILE','CLAUDE_HOOKS_TRANSACTION_DIR','CLAUDE_HOOKS_TRANSACTION_STAGE','CLAUDE_HOOKS_TRANSACTION_METADATA','CLAUDE_HOOKS_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_TRANSACTION_DIR','CONTROL_HOOK_LINK_TRANSACTION_STAGE','CONTROL_HOOK_LINK_TRANSACTION_METADATA','CONTROL_HOOK_LINK_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_REMOVE_OUTCOME','INSTALL_UNPROTECTED','MIGRATION_HOOK_TRANSACTION_DIR','CODEX_BACKUP_PRUNE_FILE','ENV_DROPPED','ENV_DROPPED_REPORTED'];
 const digest=value=>createHash('sha256').update(value).digest('hex');
+const canonical=value=>Array.isArray(value)?`[${value.map(canonical).join(',')}]`:value!==null&&typeof value==='object'?`{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`:JSON.stringify(value);
 const exact=(value,keys)=>value!==null&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).sort().join(',')===[...keys].sort().join(',');
 const fail=(reason,partial=false)=>{throw new DeploymentError(partial?'DEPLOY_PRUNE_PARTIAL':'DEPLOY_PRUNE_BLOCKED',reason);};
 const permissions=mode=>Number(typeof mode==='bigint'?mode&0o7777n:mode&0o7777);
@@ -76,6 +78,94 @@ function directoryIdentity(directory) {
  let info;try{info=fs.lstatSync(directory,{bigint:true});}catch{fail('unverified_journal');}
  if(!info.isDirectory()||info.uid!==BigInt(process.getuid())||(info.mode&0o7777n)!==0o700n)fail('unverified_journal');
  return objectIdentity(info);
+}
+function validPairDestination(value) {
+ return exact(value,['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId'])&&
+  value.version===2&&/^a-[a-f0-9]{32}$/.test(value.activationId)&&validRuntimePair({releaseId:value.releaseId,
+   bootstrapId:value.bootstrapId,runtimeContract:value.runtimeContract,compatibilityDigest:value.compatibilityDigest})&&
+  (value.predecessorActivationId===null||/^a-[a-f0-9]{32}$/.test(value.predecessorActivationId))&&value.migrationId===null;
+}
+function validWitnessIdentity(value,{times=false,links=null,mode}={}) {
+ const keys=['dev','ino','uid','mode',...(links?['nlink']:[]),...(times?['mtimeNs','ctimeNs']:[])];
+ return exact(value,keys)&&[value.dev,value.ino,...(times?[value.mtimeNs,value.ctimeNs]:[])].every(item=>typeof item==='string'&&/^\d{1,32}$/.test(item))&&
+  Number.isSafeInteger(value.uid)&&value.uid===process.getuid()&&Number.isSafeInteger(value.mode)&&value.mode===mode&&
+  (links===null||Number.isSafeInteger(value.nlink)&&value.nlink===links);
+}
+function validPointerWitness(value,destination) {
+ return exact(value,['directory','pointer','activation'])&&validWitnessIdentity(value.directory,{times:true,mode:0o700})&&
+  exact(value.pointer,['dev','ino','uid','mode','target'])&&
+  validWitnessIdentity(Object.fromEntries(Object.entries(value.pointer).filter(([key])=>key!=='target')),{mode:0o777})&&
+  value.pointer.target===`v2/activations/${destination.activationId}`&&exact(value.activation,['directory','manifest'])&&
+  validWitnessIdentity(value.activation.directory,{times:true,mode:0o700})&&
+  exact(value.activation.manifest,['dev','ino','uid','mode','nlink','mtimeNs','ctimeNs','sha256'])&&
+  validWitnessIdentity(Object.fromEntries(Object.entries(value.activation.manifest).filter(([key])=>key!=='sha256')),{times:true,links:1,mode:0o600})&&
+  typeof value.activation.manifest.sha256==='string'&&/^[a-f0-9]{64}$/.test(value.activation.manifest.sha256);
+}
+function validPairJournalState(state) {
+ if(!exact(state,['version','kind','status','operation','phase','origin','candidate','destination','witness','outcome'])||
+   state.version!==2||state.kind!=='pair'||!['pending','complete'].includes(state.status)||
+   !['activate','rollback'].includes(state.operation)||!['prepared','blocked','pointer_intent','published','complete','rejected'].includes(state.phase)||
+   !validRuntimeCurrent(state.origin)||state.origin?.version!==2||!validRuntimePair(state.candidate)||
+   !(state.destination===null||validPairDestination(state.destination)||validRuntimeCurrent(state.destination)&&state.destination?.version===2)||
+   !(state.outcome===null||['pointer_not_published','pointer_published','candidate_rejected'].includes(state.outcome)))return false;
+ if(state.phase==='prepared')return state.status==='pending'&&state.destination===null&&state.witness===null&&state.outcome===null;
+ if(state.phase==='blocked')return state.status==='pending'&&state.destination===null&&state.witness===null&&state.outcome===null;
+ if(state.phase==='pointer_intent')return state.status==='pending'&&validPairDestination(state.destination)&&validPointerWitness(state.witness,state.destination)&&state.outcome===null;
+ if(state.phase==='published')return state.status==='pending'&&validRuntimeCurrent(state.destination)&&state.destination?.version===2&&validPointerWitness(state.witness,state.destination)&&state.outcome===null;
+ if(state.phase==='rejected')return state.status==='complete'&&['pointer_not_published','candidate_rejected'].includes(state.outcome);
+ return state.status==='complete'&&validRuntimeCurrent(state.destination)&&state.destination?.version===2&&validPointerWitness(state.witness,state.destination)&&state.outcome==='pointer_published';
+}
+function verifyPairWitnessFiles({repositoryRoot,journalDirectory,state}) {
+ const witnessDirectory=path.join(journalDirectory,'pointer-witness');
+ if(state.witness===null){if(fs.existsSync(witnessDirectory))fail('unverified_journal');return;}
+ let directory;let pointer;let activation;let manifest;let target;let manifestRecord;
+ try{
+  directory=fs.lstatSync(witnessDirectory,{bigint:true});pointer=fs.lstatSync(path.join(witnessDirectory,'current'),{bigint:true});
+  target=fs.readlinkSync(path.join(witnessDirectory,'current'));
+  const activationDirectory=path.join(repositoryRoot,'.jhw-runtime/v2/activations',state.destination.activationId);
+  activation=fs.lstatSync(activationDirectory,{bigint:true});manifest=fs.lstatSync(path.join(activationDirectory,'manifest.json'),{bigint:true});
+  manifestRecord=readRegular(activationDirectory,'manifest.json',65536);
+ }catch(error){if(error instanceof DeploymentError)throw error;fail('unverified_journal');}
+ const identity=(stat,{times=false,links=false}={})=>({dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:permissions(stat.mode),
+  ...(links?{nlink:Number(stat.nlink)}:{}),...(times?{mtimeNs:String(stat.mtimeNs),ctimeNs:String(stat.ctimeNs)}:{})});
+ if(!directory.isDirectory()||!pointer.isSymbolicLink()||!activation.isDirectory()||!manifest.isFile()||
+  fs.readdirSync(witnessDirectory).join(',')!=='current'||JSON.stringify(identity(directory,{times:true}))!==JSON.stringify(state.witness.directory)||
+  JSON.stringify({...identity(pointer),target})!==JSON.stringify(state.witness.pointer)||
+  JSON.stringify(identity(activation,{times:true}))!==JSON.stringify(state.witness.activation.directory)||
+  JSON.stringify({...identity(manifest,{times:true,links:true}),sha256:digest(manifestRecord.bytes)})!==JSON.stringify(state.witness.activation.manifest))fail('unverified_journal');
+ const value=parseJson(manifestRecord.bytes);const destination=Object.fromEntries(['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId'].map(key=>[key,value[key]]));
+ if(!exact(value,['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId','createdAt','priorCurrent'])||
+  canonical(value)+'\n'!==manifestRecord.bytes.toString('utf8')||JSON.stringify(destination)!==JSON.stringify(Object.fromEntries(Object.entries(state.destination).filter(([key])=>key!=='observation'))))fail('unverified_journal');
+}
+
+/** Exact shared parser for v2 runtime journals. Future journal kinds extend this
+ * closed dispatch rather than adding deploy- or prune-local readers. */
+export function readRuntimeJournalV2({repositoryRoot,journalDirectory}) {
+ const runtimeRoot=path.join(repositoryRoot,'.jhw-runtime');
+ const journalsRoot=path.join(runtimeRoot,'v2/journals');
+ const name=path.basename(journalDirectory);
+ if(!JOURNAL_V2.test(name)||path.dirname(journalDirectory)!==journalsRoot)fail('unverified_journal');
+ const root=runtimeDirectory(repositoryRoot);let v2;let journals;let journal;
+ try {
+  v2=new PinnedDirectory(root.at('v2'),{parentVerify:()=>root.verify()});
+  journals=new PinnedDirectory(v2.at('journals'),{parentVerify:()=>v2.verify()});
+  journal=new PinnedDirectory(journals.at(name),{parentVerify:()=>journals.verify()});
+  const children=fs.readdirSync(`/proc/self/fd/${journal.fd}`).sort();
+  if(children.length>4||!children.includes('state.json')||children.some(child=>!['state.json','candidate-probe.log','retention.json','pointer-witness'].includes(child)))fail('unverified_journal');
+  const files=new Map();
+  for(const child of children.filter(child=>child!=='pointer-witness'))files.set(child,readRegular(`/proc/self/fd/${journal.fd}`,child,child==='candidate-probe.log'?FILE_LIMIT:FILE_LIMIT));
+  const state=parseJson(files.get('state.json').bytes);
+  if(!validPairJournalState(state))fail('unverified_journal');
+  verifyPairWitnessFiles({repositoryRoot,journalDirectory,state});
+  if(files.has('retention.json')){
+   const receipt=parseJson(files.get('retention.json').bytes);const time=Date.parse(receipt.completedAt);
+   if(!exact(receipt,['version','sequence','journal','stateSha256','completedAt','previous'])||receipt.version!==2||
+    !Number.isSafeInteger(receipt.sequence)||receipt.sequence<1||receipt.journal!==name||receipt.stateSha256!==digest(files.get('state.json').bytes)||
+    typeof receipt.completedAt!=='string'||!Number.isFinite(time)||new Date(time).toISOString()!==receipt.completedAt||receipt.previous!==null)fail('unverified_journal');
+  }
+  journal.verify();journals.verify();v2.verify();root.verify();
+  return {state,files,identity:objectIdentity(journal.stat)};
+ }finally{journal?.close();journals?.close();v2?.close();root.close();}
 }
 function validReceipt(value,name,stateBytes) {
  if(!exact(value,['version','sequence','journal','stateSha256','completedAt','previous'])||value.version!==1||!Number.isSafeInteger(value.sequence)||value.sequence<1||value.journal!==name||value.stateSha256!==digest(stateBytes)||typeof value.completedAt!=='string')return false;
@@ -262,11 +352,15 @@ export function applyRuntimePrune(options) {
 
 export function recordDeploymentRetention({repositoryRoot,journalDirectory,previousDirectory=null,completedAt=new Date().toISOString()}) {
  const runtime=runtimeDirectory(repositoryRoot);try {
- const name=path.basename(journalDirectory);if(!JOURNAL.test(name)||path.dirname(journalDirectory)!==runtime.name)throw new Error('retention journal invalid');const anchoredJournal=runtime.at(name);
+ const name=path.basename(journalDirectory);const v2Journal=JOURNAL_V2.test(name)&&path.dirname(journalDirectory)===path.join(runtime.name,'v2/journals');
+ if(!v2Journal&&(!JOURNAL.test(name)||path.dirname(journalDirectory)!==runtime.name))throw new Error('retention journal invalid');
+ if(v2Journal&&previousDirectory!==null)throw new Error('retention journal invalid');
+ const anchoredJournal=v2Journal?journalDirectory:runtime.at(name);
+ if(v2Journal)readRuntimeJournalV2({repositoryRoot,journalDirectory});
  const state=readRegular(anchoredJournal,'state.json').bytes;let sequence=0;const counter=runtime.at(COUNTER);const counterExists=fs.existsSync(counter);
  if(counterExists) {const value=parseJson(readRegular(`/proc/self/fd/${runtime.fd}`,COUNTER,4096).bytes);if(!exact(value,['version','sequence'])||value.version!==1||!Number.isSafeInteger(value.sequence)||value.sequence<0)throw new Error('retention counter invalid');sequence=value.sequence;}
  sequence++;writePrivate(counter,{version:1,sequence},{exclusive:!counterExists,directoryFd:runtime.fd});runtime.sync();
  let previous=null;if(previousDirectory){const previousName=path.basename(previousDirectory);validateRetainedBootstrap({repositoryRoot,name:previousName,runtimeHandle:{fd:runtime.fd,verify:()=>runtime.verify()}});const previousRoot=runtime.at(previousName);const info=fs.lstatSync(previousRoot,{bigint:true});const manifestBytes=readCandidateFile(previousRoot,'manifest.json',16384,0o600).bytes;previous={name:previousName,dev:String(info.dev),ino:String(info.ino),manifestSha256:digest(manifestBytes)};}
- const receipt={version:1,sequence,journal:name,stateSha256:digest(state),completedAt,previous};const journalRoot=new PinnedDirectory(anchoredJournal,{parentVerify:()=>runtime.verify()});try{writePrivate(journalRoot.at('retention.json'),receipt,{directoryFd:journalRoot.fd});journalRoot.verify();}finally{journalRoot.close();}runtime.verify();return receipt;
+ const receipt={version:v2Journal?2:1,sequence,journal:name,stateSha256:digest(state),completedAt,previous};const journalRoot=new PinnedDirectory(anchoredJournal,{parentVerify:()=>runtime.verify()});try{writePrivate(journalRoot.at('retention.json'),receipt,{directoryFd:journalRoot.fd});journalRoot.verify();}finally{journalRoot.close();}runtime.verify();return receipt;
  } finally {runtime.close();}
 }

@@ -4,9 +4,9 @@ import {createHash, randomBytes} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, inspectSessionConsumers, requireQuiescence} from './runtime-safety.mjs';
-import {prepareRelease, validateRelease, readActivation, validCurrent, publishActivation, rollbackActivation, createSessionBinding, resolveSessionBinding, inspectSessionBindings, releaseCompatibility} from './runtime-store.mjs';
+import {prepareRelease, validateRelease, readActivation, validCurrent, publishActivation, rollbackActivation, createSessionBinding, resolveSessionBinding, inspectSessionBindings, releaseCompatibility,ensureBootstrapGeneration,prepareRuntimeEvidence,preparePairActivation,publishPreparedActivation,inspectSessionBindingsV2,resolveSessionBindingV2,selectPairRollbackTarget,validRuntimePair} from './runtime-store.mjs';
 import {installBootstrap, validateBootstrap} from './runtime-entry.mjs';
-import {DEPLOY_VARIABLE_KEYS,applyRuntimePrune,planRuntimePrune,recordDeploymentRetention} from './runtime-prune.mjs';
+import {DEPLOY_VARIABLE_KEYS,applyRuntimePrune,planRuntimePrune,recordDeploymentRetention,readRuntimeJournalV2} from './runtime-prune.mjs';
 import {readGuardHostPolicy,captureGuardTransitionEvidence,writeGuardTransitionEvidence,readGuardTransitionEvidence,recordGuardPolicyContext,recordGuardPublishedSnapshots,recordGuardDestination,markGuardTransitionFinalized,findGuardTransitionEvidence,prepareGuardRollbackEvidence,prepareIncompleteGuardRollbackEvidence,restoreGuardRollbackEvidence} from './runtime-guard.mjs';
 
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
@@ -384,6 +384,9 @@ function pending(runtime) {
  return names.filter(name=>/^\.deploy\.[a-f0-9]{32}$/.test(name)).filter(name=>privateRead(path.join(runtime,name,'state.json')).status!=='complete');
 }
 function checkpoint(directory,state) {privateWrite(path.join(directory,'state.json'),state);}
+function pairOf(snapshot){return snapshot&&snapshot.version===2?{releaseId:snapshot.releaseId,bootstrapId:snapshot.bootstrapId,runtimeContract:snapshot.runtimeContract,compatibilityDigest:snapshot.compatibilityDigest}:null;}
+function pairDestination(snapshot){if(!snapshot)return null;const {observation:_,...destination}=snapshot;return destination;}
+function sameJson(left,right){return JSON.stringify(left)===JSON.stringify(right);}
 // A new process receives real lease descriptors for each mutation phase. No
 // persistent process retains exclusive admission during runtime validation.
 const WORKER = `set -euo pipefail
@@ -506,11 +509,14 @@ export async function wiringPhase({repositoryRoot,home,environment,phase,managed
  } finally {logging=false;clearTimeout(phaseTimer);fs.fsyncSync(logFd);fs.closeSync(logFd);try{logDirectory.verify();}finally{logDirectory.close();}}
 }
 
-async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,logFd}) {
+async function mcpProbe({repositoryRoot,home,environment,deployLease,directory,logFd,releaseId=null}) {
  const env={...environment,HOME:home,PATH:[path.dirname(process.execPath),'/usr/local/bin','/usr/bin','/bin'].join(':')};
  for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV'])delete env[key];
  adoptEnvironment(env);
- const child=spawn(process.execPath,[path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp'],{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd]});
+ const argv=releaseId===null?[path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']:
+  ['-e',"Object.defineProperty(globalThis,'__JHW_MANAGED_RELEASE_ROOT__',{value:process.argv[1]});require(process.argv[2]);",
+   path.join(repositoryRoot,'.jhw-runtime/releases',releaseId),path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'mcp-server/dist/runtime/mcp.cjs')];
+ const child=spawn(process.execPath,argv,{cwd:directory,env,stdio:['pipe','pipe','pipe',deployLease.fd]});
  let input='';let bytes=0;let stderrBytes=0;let stage=0;let failure=false;let logging=true;let initialization;let advertisedTools;let nextCursor;
  child.stdin.on('error',()=>{failure=true;});
  const send=value=>child.stdin.write(JSON.stringify(value)+'\n');
@@ -600,6 +606,232 @@ function mcpContract(value) {
     tools.set(tool.name,JSON.stringify(normalize(contract)));
   }
   return {protocol:value.protocolVersion,capabilities:JSON.stringify(normalize(value.capabilities)),tools};
+}
+
+function pairJournalRoot(repositoryRoot) {
+  const runtime=path.join(repositoryRoot,'.jhw-runtime');
+  const v2=path.join(runtime,'v2');
+  trustedDirectory(v2);
+  const journals=path.join(v2,'journals');
+  if(!exists(journals))createPrivateDirectory(v2,'journals');
+  if((trustedDirectory(journals).mode&0o7777)!==0o700)fail('DEPLOY_UNTRUSTED_PATH');
+  return journals;
+}
+function createPairJournalCandidate(repositoryRoot,state) {
+  const journals=pairJournalRoot(repositoryRoot);
+  const suffix=randomBytes(16).toString('hex');const staging=createPrivateDirectory(journals,`.candidate.${suffix}`);
+  checkpoint(staging,state);return {journals,staging,name:`d-${suffix}`};
+}
+function publishPairJournal(candidate) {
+  const parent=pinnedDirectory(candidate.journals);
+  try{parent.verify();fs.renameSync(parent.at(path.basename(candidate.staging)),parent.at(candidate.name));fs.fsyncSync(parent.fd);parent.verify();return path.join(candidate.journals,candidate.name);}
+  finally{parent.close();}
+}
+function createPairValidationDirectory(repositoryRoot) {
+  return createPrivateDirectory(path.join(repositoryRoot,'.jhw-runtime/v2'),`.pair-validation.${randomBytes(16).toString('hex')}`);
+}
+function removePairValidationDirectory(directory) {
+  if(!directory||!exists(directory))return;
+  const child=pinnedDirectory(directory);const parent=pinnedDirectory(path.dirname(directory));
+  try{
+    const names=fs.readdirSync(`/proc/self/fd/${child.fd}`);
+    if(names.some(name=>name!=='state.json'&&!/^verify\.[a-f0-9]{16}\.log$/.test(name)))fail('DEPLOY_RECOVERY_REQUIRED','validation_evidence_unverified');
+    for(const name of names){const info=fs.lstatSync(child.at(name));if(!info.isFile()||info.uid!==process.getuid()||info.nlink!==1)fail('DEPLOY_RECOVERY_REQUIRED','validation_evidence_unverified');fs.unlinkSync(child.at(name));}
+    fs.fsyncSync(child.fd);child.verify();fs.rmdirSync(parent.at(path.basename(directory)));fs.fsyncSync(parent.fd);parent.verify();
+  }finally{child.close();parent.close();}
+}
+function pairRows(repositoryRoot) {
+  if(inspectSessionBindings({repositoryRoot}).length)fail('DEPLOY_COMPATIBILITY_MISMATCH','v1_session');
+  const rows=inspectSessionBindingsV2({repositoryRoot});
+  if(rows.some(row=>row.kind==='invocation'&&row.parentBinding===null))fail('DEPLOY_CONSUMERS_ACTIVE','unbound_invocation');
+  const roots=rows.filter(row=>row.kind==='session'&&row.live).map(({live,...row})=>row).sort((a,b)=>a.id.localeCompare(b.id));
+  return {rows,roots};
+}
+function pairProcessInventory({repositoryRoot,procRoot,roots}) {
+  const inventory=inspectSessionConsumers({repositoryRoot,procRoot,excludePids:[process.pid]},observation=>{
+    if(observation.category==='legacy'||(observation.category==='app_server'&&observation.args.includes('proxy')))return false;
+    const token=observation.token??roots.find(row=>row.owner.pid===observation.pid&&row.owner.startTime===observation.startTime)?.token;
+    if(token===undefined)return false;
+    try{resolveSessionBindingV2({repositoryRoot,token,pid:observation.pid});return true;}catch{return false;}
+  });
+  if(inventory.uncertain)throw Object.assign(new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN'),{inventory});
+  if(!inventory.clear)throw Object.assign(new DeploymentError('DEPLOY_CONSUMERS_ACTIVE'),{inventory});
+  return inventory;
+}
+function completePairInventory({repositoryRoot,procRoot}) {
+  const {rows,roots}=pairRows(repositoryRoot);
+  return {rows,roots,processes:pairProcessInventory({repositoryRoot,procRoot,roots})};
+}
+function recheckPairRoots(repositoryRoot,expected,observer) {
+  const index=acquireLease(path.join(repositoryRoot,'.jhw-runtime/v2/session-index.lock'),{shared:true,create:true});
+  try {
+    observer?.({phase:'root_index_held',exclusive:true});
+    const actual=pairRows(repositoryRoot).roots;
+    const known=new Map(expected.map(row=>[row.id,JSON.stringify(row)]));
+    if(actual.some(row=>known.get(row.id)!==JSON.stringify(row)))fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');
+    return actual;
+  } finally {index.close();}
+}
+function sameDestination(snapshot,destination) {
+  return snapshot?.version===2&&sameJson(pairDestination(snapshot),destination);
+}
+function verifyPairWitness({repositoryRoot,journalDirectory,state,current}) {
+  const witnessDirectory=path.join(journalDirectory,'pointer-witness');const witness=state.witness;
+  let directoryInfo;let pointerInfo;let activationInfo;let manifestInfo;let target;let manifestBytes;
+  try {
+    directoryInfo=fs.lstatSync(witnessDirectory,{bigint:true});pointerInfo=fs.lstatSync(path.join(witnessDirectory,'current'),{bigint:true});
+    target=fs.readlinkSync(path.join(witnessDirectory,'current'));
+    const activation=path.join(repositoryRoot,'.jhw-runtime/v2/activations',state.destination.activationId);
+    activationInfo=fs.lstatSync(activation,{bigint:true});manifestInfo=fs.lstatSync(path.join(activation,'manifest.json'),{bigint:true});
+    manifestBytes=fs.readFileSync(path.join(activation,'manifest.json'));
+  }catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');}
+  const identity=(stat,{times=false,links=false}={})=>({dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:Number(stat.mode&0o7777n),
+    ...(links?{nlink:Number(stat.nlink)}:{}),...(times?{mtimeNs:String(stat.mtimeNs),ctimeNs:String(stat.ctimeNs)}:{})});
+  if(!directoryInfo.isDirectory()||!pointerInfo.isSymbolicLink()||!activationInfo.isDirectory()||!manifestInfo.isFile()||
+    fs.readdirSync(witnessDirectory).join(',')!=='current'||!sameJson(identity(directoryInfo,{times:true}),witness.directory)||
+    !sameJson({...identity(pointerInfo),target},witness.pointer)||
+    !sameJson(identity(activationInfo,{times:true}),witness.activation.directory)||
+    !sameJson({...identity(manifestInfo,{times:true,links:true}),sha256:createHash('sha256').update(manifestBytes).digest('hex')},witness.activation.manifest))
+    fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');
+  let manifest;try{manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifestBytes));}catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');}
+  if(JSON.stringify(manifest)+'\n'!==manifestBytes.toString('utf8')||manifest.activationId!==state.destination.activationId||
+    !sameJson({version:manifest.version,activationId:manifest.activationId,releaseId:manifest.releaseId,bootstrapId:manifest.bootstrapId,
+      runtimeContract:manifest.runtimeContract,compatibilityDigest:manifest.compatibilityDigest,predecessorActivationId:manifest.predecessorActivationId,
+      migrationId:manifest.migrationId},state.destination))fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');
+  if(current!==null&&sameDestination(current,state.destination)) {
+    const currentLink=fs.lstatSync(path.join(repositoryRoot,'.jhw-runtime/current'),{bigint:true});
+    if(String(currentLink.dev)!==witness.pointer.dev||String(currentLink.ino)!==witness.pointer.ino||fs.readlinkSync(path.join(repositoryRoot,'.jhw-runtime/current'))!==target)
+      fail('DEPLOY_RECOVERY_REQUIRED','pair_pointer_changed');
+  }
+}
+
+export function reconcilePairJournal({repositoryRoot,journalDirectory}) {
+  let parsed;try{parsed=readRuntimeJournalV2({repositoryRoot,journalDirectory});}catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_unverified');}
+  const {state}=parsed;
+  if(state.status==='complete')return {transaction:path.basename(journalDirectory),outcome:state.outcome};
+  const current=readActivation({repositoryRoot});
+  const atOrigin=sameJson(current,state.origin);
+  const atDestination=state.phase==='pointer_intent'?sameDestination(current,state.destination):state.destination!==null&&sameJson(current,state.destination);
+  if(state.phase==='prepared'&&atOrigin) {
+    state.status='complete';state.phase='rejected';state.outcome='pointer_not_published';checkpoint(journalDirectory,state);
+    return {transaction:path.basename(journalDirectory),outcome:state.outcome};
+  }
+  if(['pointer_intent','published'].includes(state.phase)&&(atOrigin||atDestination)) {
+    verifyPairWitness({repositoryRoot,journalDirectory,state,current:atDestination?current:null});
+    if(atDestination)state.destination=current;
+    state.status='complete';state.phase=atDestination?'complete':'rejected';
+    state.outcome=atDestination?'pointer_published':'pointer_not_published';checkpoint(journalDirectory,state);
+    if(atDestination)recordDeploymentRetention({repositoryRoot,journalDirectory});
+    return {transaction:path.basename(journalDirectory),outcome:state.outcome};
+  }
+  fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_identity_changed');
+}
+
+function reconcilePairJournals(repositoryRoot) {
+  const journals=pairJournalRoot(repositoryRoot);
+  const names=fs.readdirSync(journals).filter(name=>/^d-[a-f0-9]{32}$/.test(name)).sort();
+  const pending=[];
+  for(const name of names){const directory=path.join(journals,name);let parsed;try{parsed=readRuntimeJournalV2({repositoryRoot,journalDirectory:directory});}catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_unverified');}if(parsed.state.status==='pending')pending.push(directory);}
+  if(pending.length>1)fail('DEPLOY_RECOVERY_REQUIRED','multiple_pair_journals');
+  return pending.length?reconcilePairJournal({repositoryRoot,journalDirectory:pending[0]}):null;
+}
+function pendingPairJournalCount(repositoryRoot) {
+  const journals=path.join(repositoryRoot,'.jhw-runtime/v2/journals');if(!exists(journals))return 0;
+  let count=0;for(const name of fs.readdirSync(journals).filter(name=>/^d-[a-f0-9]{32}$/.test(name))){
+    try{if(readRuntimeJournalV2({repositoryRoot,journalDirectory:path.join(journals,name)}).state.status==='pending')count++;}
+    catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_unverified');}
+  }
+  return count;
+}
+
+export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId,rollback=false,phaseRunner=wiringPhase,phaseTimeoutMs=45000}) {
+  const runtime=path.join(repositoryRoot,'.jhw-runtime');
+  let writer;let admission;let publication;let evidence;let directory;let logFd;let state;let journalCandidate;let validationDirectory;
+  try {
+    writer=acquireLease(path.join(runtime,'deploy.lock'));
+    const recovery=reconcilePairJournals(repositoryRoot);
+    const origin=readActivation({repositoryRoot});
+    if(origin?.version!==2)fail('DEPLOY_COMPATIBILITY_MISMATCH','v2_current_required');
+    let candidate;
+    if(rollback)candidate=selectPairRollbackTarget({repositoryRoot,current:origin,deployLease:writer}).pair;
+    else {
+      validateRelease({repositoryRoot,releaseId});
+      try{candidate=ensureBootstrapGeneration({repositoryRoot,releaseId,reuseBootstrapId:origin.bootstrapId,deployLease:writer});}
+      catch(error){if(error.code!=='DEPLOY_BOOTSTRAP_INVALID')throw error;candidate=ensureBootstrapGeneration({repositoryRoot,releaseId,deployLease:writer});}
+    }
+    if(!validRuntimePair(candidate))fail('DEPLOY_COMPATIBILITY_MISMATCH');
+    const preliminary=completePairInventory({repositoryRoot,procRoot});
+    const active=preliminary.roots.length>0||Object.values(preliminary.processes.bound).some(value=>value>0);
+    const compatible=candidate.compatibilityDigest===origin.compatibilityDigest;
+    if(active&&!compatible)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
+    const pairMap=new Map([pairOf(origin),candidate,...preliminary.roots.map(pairOf)].filter(Boolean).map(pair=>[JSON.stringify(pair),pair]));
+    evidence=prepareRuntimeEvidence({repositoryRoot,pairs:[...pairMap.values()]});
+    state={version:2,kind:'pair',status:'pending',operation:rollback?'rollback':'activate',phase:'prepared',origin,
+      candidate,destination:null,witness:null,outcome:null};
+    journalCandidate=createPairJournalCandidate(repositoryRoot,state);directory=journalCandidate.staging;
+    validationDirectory=createPairValidationDirectory(repositoryRoot);const phaseState={variables:{}};
+    try{await phaseRunner({repositoryRoot,home,environment,phase:'verify',managed:true,deployLease:writer,directory:validationDirectory,state:phaseState,phaseTimeoutMs,
+      candidateReleaseId:candidate.releaseId});}
+    catch(error){if(phaseState.workerDetached){state.phase='blocked';checkpoint(directory,state);directory=publishPairJournal(journalCandidate);validationDirectory=undefined;fail('DEPLOY_RECOVERY_REQUIRED','pair_validation_worker_detached');}throw error;}
+    removePairValidationDirectory(validationDirectory);validationDirectory=undefined;directory=journalCandidate.staging;
+    const logDirectory=pinnedDirectory(directory);
+    try{logFd=fs.openSync(logDirectory.at('candidate-probe.log'),fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);fs.fchmodSync(logFd,0o600);}
+    finally{logDirectory.close();}
+    const inspectCandidate=async pair=>mcpContract(await mcpProbe({repositoryRoot,home,environment,deployLease:writer,
+      directory,logFd,releaseId:pair.releaseId}));
+    phaseRunner.observe?.({phase:'candidate_probe_start',exclusive:false});
+    const currentContract=await inspectCandidate(pairOf(origin));
+    const candidateContract=await inspectCandidate(candidate);
+    phaseRunner.observe?.({phase:'candidate_probe_complete',exclusive:false});
+    const contractCompatible=currentContract.protocol===candidateContract.protocol&&currentContract.capabilities===candidateContract.capabilities&&
+      [...currentContract.tools].every(([name,contract])=>candidateContract.tools.get(name)===contract);
+    if(active&&!contractCompatible)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
+    const prepared=preparePairActivation({repositoryRoot,pair:candidate,expectedCurrent:origin,deployLease:writer});
+    directory=publishPairJournal(journalCandidate);
+    const before=completePairInventory({repositoryRoot,procRoot});
+    if(!active||!compatible||!contractCompatible){
+      admission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
+      const quiet=requireQuiescence({repositoryRoot,procRoot,excludePids:[process.pid]});
+      if(pairRows(repositoryRoot).roots.length)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
+      before.processes=quiet;
+    }
+    publication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
+    const started=process.hrtime.bigint();phaseRunner.observe?.({phase:'publication_acquired',exclusive:true,elapsedNs:'0'});
+    if(!sameJson(readActivation({repositoryRoot}),origin))fail('DEPLOY_CURRENT_CHANGED');
+    const processes=pairProcessInventory({repositoryRoot,procRoot,roots:before.roots});
+    const roots=recheckPairRoots(repositoryRoot,before.roots,phaseRunner.observe);
+    const current=publishPreparedActivation({repositoryRoot,destination:prepared,expectedCurrent:origin,evidence,publicationLease:publication,journalDirectory:directory,publicationStartedNs:started,
+      onPointerIntent:(destination,intent)=>{
+        if(!intent?.witness)fail('DEPLOY_RECOVERY_REQUIRED','pointer_identity_unavailable');
+        state.destination=destination;state.witness=intent.witness;state.phase='pointer_intent';checkpoint(directory,state);
+        phaseRunner.observe?.({phase:'pointer_intent',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
+      }});
+    phaseRunner.observe?.({phase:'pointer_renamed',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
+    state.destination=current;state.phase='published';checkpoint(directory,state);
+    publication.close();publication=undefined;
+    phaseRunner.observe?.({phase:'publication_released',exclusive:false,elapsedNs:String(process.hrtime.bigint()-started)});
+    if(!sameJson(current,state.destination))fail('DEPLOY_CURRENT_CHANGED');
+    state.status='complete';state.phase='complete';state.outcome='pointer_published';checkpoint(directory,state);
+    phaseRunner.observe?.({phase:'log_fsync_start',exclusive:false,elapsedNs:String(process.hrtime.bigint()-started)});
+    if(logFd!==undefined){fs.fsyncSync(logFd);fs.closeSync(logFd);logFd=undefined;}
+    phaseRunner.observe?.({phase:'log_fsync_complete',exclusive:false,elapsedNs:String(process.hrtime.bigint()-started)});
+    recordDeploymentRetention({repositoryRoot,journalDirectory:directory});
+    return {code:rollback?'DEPLOY_ROLLED_BACK':'DEPLOY_COMPATIBLE_ACTIVATED',releaseId:current.releaseId,
+      previousReleaseId:origin.releaseId,predecessorAvailable:current.predecessorActivationId!==null,
+      inventory:{before:{...before,processes},after:{roots,processes}},existingSessionsPreserved:true,recovery};
+  }catch(error){
+    if(state?.phase==='prepared'){
+      try{if(sameJson(readActivation({repositoryRoot}),state.origin)){
+        state.status='complete';state.phase='rejected';state.outcome='candidate_rejected';checkpoint(directory,state);
+        if(journalCandidate&&directory===journalCandidate.staging)directory=publishPairJournal(journalCandidate);
+      }}catch{}
+    }
+    throw error;
+  }finally{
+    removePairValidationDirectory(validationDirectory);
+    evidence?.close();if(logFd!==undefined){fs.fsyncSync(logFd);fs.closeSync(logFd);}
+    publication?.close();admission?.close();writer?.close();
+  }
 }
 
 function reconcileCompatibleJournal({repositoryRoot,runtime}) {
@@ -744,6 +976,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
  const runtime=path.join(repositoryRoot,'.jhw-runtime');
+ if(command.operation==='prune'&&exists(runtime)&&pendingPairJournalCount(repositoryRoot)>0)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
  if(command.operation==='prune'&&!command.apply)return planRuntimePrune({repositoryRoot});
  if(command.operation==='prune') {
   const before=requireQuiescence(inventoryOptions);let pruneWriter;let pruneAdmission;
@@ -754,14 +987,21 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
    return {...applyRuntimePrune({repositoryRoot}),inventory:{before,after}};
   } finally {pruneAdmission?.close();pruneWriter?.close();}
  }
- if(command.operation==='activate-compatible')return runCompatibleDeployment({repositoryRoot,home,procRoot,environment,releaseId:command.releaseId,phaseRunner,phaseTimeoutMs});
+ if(command.operation==='activate-compatible') {
+  const current=exists(runtime)?readActivation({repositoryRoot}):null;
+  if(current?.version===2)return runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId:command.releaseId,rollback:false,phaseRunner,phaseTimeoutMs});
+  return runCompatibleDeployment({repositoryRoot,home,procRoot,environment,releaseId:command.releaseId,phaseRunner,phaseTimeoutMs});
+ }
  if(command.operation==='status') {
   const inventory=inspectConsumers(inventoryOptions);const current=exists(runtime)?readActivation({repositoryRoot}):null;
-  return {code:'DEPLOY_STATUS',advisory:true,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,recoveryPending:pending(runtime).length,inventory};
+  return {code:'DEPLOY_STATUS',advisory:true,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,recoveryPending:pending(runtime).length+pendingPairJournalCount(repositoryRoot),inventory};
  }
  if(command.operation==='default'&&existingInstallation(repositoryRoot,home))return {code:'DEPLOY_EXPLICIT_ACTIVATION_REQUIRED',next:['--prepare','--activate RELEASE_ID']};
  if(command.operation==='prepare')return {code:'DEPLOY_PREPARED',...await prepareRelease({repositoryRoot,build})};
  if(command.operation==='default'){const release=await prepareRelease({repositoryRoot,build});command.operation='activate';command.releaseId=release.releaseId;}
+ if(command.operation==='rollback'&&exists(runtime)&&readActivation({repositoryRoot})?.version===2)
+  return runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,rollback:true,phaseRunner,phaseTimeoutMs});
+ if(exists(runtime)&&pendingPairJournalCount(repositoryRoot)>0)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
  if(command.adoptFrom)validateAdoptSource(repositoryRoot,command.adoptFrom);
  // Adoption also requires the legacy checkout to have no consumers.
  const quiesce=()=>{const result=requireQuiescence(inventoryOptions);if(command.adoptFrom)requireQuiescence({...inventoryOptions,repositoryRoot:command.adoptFrom});return result;};

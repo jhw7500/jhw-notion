@@ -279,6 +279,14 @@ candidate activation은 current에 연결하기 전에 완성·fsync한다. 게�
 숨겨서 반복하지 않는 별도 내부 API이며, 준비 증거와 retained directory handles가 없으면 호출할 수 없다.
 공개 CLI/환경변수로 이 API나 증거를 주입할 수 없다.
 
+일반 pair journal의 pointer intent는 임시 current symlink 자체를 journal의 전용
+`pointer-witness/` 아래에 hardlink하고 두 directory를 fsync한 뒤 기록한다. witness directory의
+identity·owner·mode·mtimeNs·ctimeNs·정확한 child set, symlink의 dev/ino/target, destination activation
+directory와 canonical manifest의 identity·전체 digest를 함께 봉인한다. rename은 dev/ino를 유지하지만
+ctimeNs를 바꿀 수 있으므로 intent 복구는 witness와 current가 같은 객체·target인지 비교하고 pre-rename
+ctimeNs 일치를 요구하지 않는다. 게시 완료 상태는 rename 뒤 실제 observation의 ctimeNs까지 기록한다.
+이 증거는 같은 객체와 내용을 증명하며 누가 rename했는지까지 귀속하지 않는다.
+
 최종 consumer 확인은 실제 PID/시작 시각/부모/lease/record identity를 다시 확인한다.
 동일 release에 대한 중복 content hash는 준비 증거의 전체 metadata 재검증으로 대체하며,
 새롭거나 검증하지 않은 pair, v1/legacy/proxy, 불확실한 consumer를 허용하지 않는다.
@@ -372,6 +380,11 @@ origin이면 unpublished evidence, destination이면 published completion/receip
 다른 pointer/manifest/identity면 pending을 유지하고 다음 mutation을 거부한다.
 불확실한 상태에서 current를 추정 복원하거나 journal을 지우지 않는다.
 이전 세대의 정상 bound 호출은 자신의 세대가 검증되는 한 pending publication과 독립적으로 동작한다.
+pointer_intent의 destination 판정은 위 durable hardlink witness와 activation/manifest 증거가 모두 그대로일
+때만 허용한다. published 복구는 rename 뒤 기록한 완전한 destination snapshot까지 정확히 일치해야 한다.
+foreign same-target symlink, witness 또는 witness directory 교체·누락, destination manifest identity/digest
+변경은 pending을 유지한다. witness는 journal과 함께 보존하며 current에 연결된 witness의 GC 보호는 8절의
+root 정책과 prune apply 재검증에 포함한다.
 
 ## 8. 보존 root와 prune
 

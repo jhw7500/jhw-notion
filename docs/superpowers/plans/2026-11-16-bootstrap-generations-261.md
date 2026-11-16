@@ -158,6 +158,9 @@ fresh reviewer가 거부하면 그 task 범위에서 수정·재검증한다. �
 **Files:** Modify `scripts/runtime-deploy.mjs`의 runCompatibleDeployment/compatibleInventory/reconcileCompatibleJournal/runDeployment, `scripts/runtime-store.mjs`의 rollback 대상 선택, `scripts/runtime-prune.mjs`의 공용 journal 판독·receipt writer. Extend `scripts/test-runtime-v2-publication.mjs`, `scripts/test-runtime-coexist.mjs`, `scripts/test-runtime-guard.mjs`.
 
 **Interfaces:** Task 2·4의 pair/세대/증거 API를 소비한다. 기존 `runDeployment(options):Promise<object>`와 `--activate-compatible <release>`/`--rollback`을 유지한다. 내부 `runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId,rollback,phaseRunner,phaseTimeoutMs}):Promise<object>`와 `reconcilePairJournal({repositoryRoot,journalDirectory}):void`를 추가한다. v2 journal은 `v2/journals/d-32hex/`의 닫힌 `kind:'pair'` variant다. `runtime-prune.mjs`에 `readRuntimeJournalV2({repositoryRoot,journalDirectory}):{state:object,files:Map,identity:object}`를 두고 기존 `recordDeploymentRetention`을 v2 receipt에도 확장한다. Task 7·8은 이 공용 판독기에 해당 kind를 추가하고 deploy/GC가 동일 parser를 사용한다.
+`publishPreparedActivation`의 첫 callback 인자는 그대로 유지하고, 검증된 pair journal 경로를 받은 경우
+두 번째 인자로 sealed durable pointer witness descriptor를 전달한다. publisher가 hardlink witness 생성과
+fsync를 소유하며 deploy callback은 그 descriptor를 동기적으로 journal intent에 기록한다.
 
 - [ ] **1. 실제 호출과 중단 시험을 작성한다.** `v2 compatible publication keeps both bound pairs callable`은 A 세션을 유지한 채 B 게시→B 세션 생성→rollback 후 A/B 모두 원래 pair로 호출함을 검사한다. candidate MCP 계약 거부, v1/unknown consumer, current identity 변경과 pointer intent 양쪽 crash를 포함한다.
 
