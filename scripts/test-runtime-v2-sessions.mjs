@@ -12,6 +12,15 @@ import {createRuntimeFixture} from './test-support/runtime-v2.mjs';
 
 const canonical = value => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` :
   value !== null && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
+function repeatDirectoryEntry(directory,name,count) {
+  const original=fs.opendirSync;let reads=0;
+  fs.opendirSync=function(location,...args){
+    let target=null;try{target=fs.readlinkSync(location);}catch{}
+    if(target!==directory)return original.call(this,location,...args);
+    return {readSync(){reads++;return reads<=count?{name}:null;},closeSync(){}};
+  };
+  return {restore(){fs.opendirSync=original;},reads(){return reads;}};
+}
 function normalizeRecord(record) {
   assert.deepEqual(Object.keys(record).sort(),[
     'bootstrapId','compatibilityDigest','createdAt','id','kind','lease','manifest','owner',
@@ -285,6 +294,43 @@ test('v2 reaper remains bounded when one namespace exceeds registration capacity
   for(let index=0;index<1025;index++)fs.mkdirSync(path.join(sessions,`.creating.s-${index.toString(16).padStart(32,'0')}`),{mode:0o700});
   const result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:true,limit:1});
   assert.equal(result.retired.length+result.preserved.length,1);
+});
+
+test('v2 scan and time budgets cannot masquerade as a complete inventory', async t => {
+  await t.test('authoritative inventory fails when the 65536-entry scan budget is exhausted',async t=>{
+    const {f,pair}=await prepared(t);const invocations=path.join(f.root,'.jhw-runtime/v2/invocations');
+    fs.mkdirSync(path.join(invocations,pair.bootstrapId),{recursive:true,mode:0o700});
+    fs.chmodSync(invocations,0o700);const repeated=repeatDirectoryEntry(invocations,pair.bootstrapId,65537);
+    try{assert.throws(()=>store.inspectSessionBindingsV2({repositoryRoot:f.root}),{code:'DEPLOY_SESSION_INVALID'});}
+    finally{repeated.restore();}
+    assert.equal(repeated.reads(),65537);
+  });
+
+  await t.test('reaper scan exhaustion returns only processed candidates and preserves unprocessed evidence',async t=>{
+    const {f}=await prepared(t);const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');
+    fs.mkdirSync(sessions,{recursive:true,mode:0o700});const name=`.creating.s-${'2'.repeat(32)}`;
+    fs.mkdirSync(path.join(sessions,name),{mode:0o700});const repeated=repeatDirectoryEntry(sessions,name,65537);
+    const clock=process.hrtime.bigint;process.hrtime.bigint=()=>0n;
+    let result;try{result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:true,limit:1});}
+    finally{process.hrtime.bigint=clock;repeated.restore();}
+    assert.deepEqual(result,{retired:[],preserved:[name]});assert.equal(repeated.reads(),65537);
+    assert.equal(fs.existsSync(path.join(sessions,name)),true);
+  });
+
+  await t.test('reaper time exhaustion prevents the next candidate from starting',async t=>{
+    const {f}=await prepared(t);const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');
+    fs.mkdirSync(sessions,{recursive:true,mode:0o700});
+    const names=['3','4'].map(digit=>`.creating.s-${digit.repeat(32)}`);
+    for(const name of names)fs.mkdirSync(path.join(sessions,name),{mode:0o700});
+    const clock=process.hrtime.bigint;let calls=0;
+    process.hrtime.bigint=()=>++calls<7?0n:2_000_000_000n;
+    let result;try{result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:true,limit:2});}
+    finally{process.hrtime.bigint=clock;}
+    assert.equal(result.retired.length+result.preserved.length,1);
+    assert.ok(names.includes(result.preserved[0]));
+    assert.equal(names.filter(name=>!result.preserved.includes(name)).length,1);
+    for(const name of names)assert.equal(fs.existsSync(path.join(sessions,name)),true);
+  });
 });
 
 test('v2 invocation index wait succeeds below and fails at the 500ms boundary', async t => {
