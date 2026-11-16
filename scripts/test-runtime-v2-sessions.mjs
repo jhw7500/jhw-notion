@@ -13,9 +13,29 @@ import {createRuntimeFixture} from './test-support/runtime-v2.mjs';
 const canonical = value => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` :
   value !== null && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
 function normalizeRecord(record) {
-  return {...record,id:'<id>',createdAt:'<createdAt>',repository:{path:'<repository>',dev:'<dev>',ino:'<ino>'},
-    owner:{uid:record.owner.uid,pid:'<pid>',startTime:'<startTime>',bootId:'<bootId>',commandDigest:'<commandDigest>',exeDev:'<exeDev>',exeIno:'<exeIno>'},
-    manifest:{dev:'<dev>',ino:'<ino>'},lease:{dev:'<dev>',ino:'<ino>',fd:'<fd>'}};
+  assert.deepEqual(Object.keys(record).sort(),[
+    'bootstrapId','compatibilityDigest','createdAt','id','kind','lease','manifest','owner',
+    'parentBinding','releaseId','repository','runtimeContract','version',
+  ].sort());
+  assert.deepEqual(Object.keys(record.repository).sort(),['dev','ino','path']);
+  assert.deepEqual(Object.keys(record.owner).sort(),['bootId','commandDigest','exeDev','exeIno','pid','startTime','uid']);
+  assert.deepEqual(Object.keys(record.manifest).sort(),['dev','ino']);
+  assert.deepEqual(Object.keys(record.lease).sort(),['dev','fd','ino']);
+  assert.match(record.id,record.kind==='session'?/^s-[a-f0-9]{32}$/:/^i-[a-f0-9]{32}$/);
+  assert.equal(record.parentBinding===null,record.kind==='session');
+  assert.equal(typeof record.repository.path,'string');
+  for(const value of [record.repository.dev,record.repository.ino,record.owner.startTime,record.owner.exeDev,
+    record.owner.exeIno,record.manifest.dev,record.manifest.ino,record.lease.dev,record.lease.ino])assert.match(value,/^\d+$/);
+  assert.equal(typeof record.owner.uid,'number');assert.equal(typeof record.owner.pid,'number');
+  assert.match(record.owner.bootId,/^[a-f0-9-]{36}$/);assert.match(record.owner.commandDigest,/^[a-f0-9]{64}$/);
+  assert.equal(typeof record.lease.fd,'number');assert.equal(new Date(record.createdAt).toISOString(),record.createdAt);
+  const normalized=structuredClone(record);
+  normalized.id='<id>';normalized.createdAt='<createdAt>';normalized.repository.path='<repository>';
+  for(const key of ['dev','ino'])normalized.repository[key]=`<${key}>`;
+  for(const key of ['pid','startTime','bootId','commandDigest','exeDev','exeIno'])normalized.owner[key]=`<${key}>`;
+  for(const key of ['dev','ino'])normalized.manifest[key]=`<${key}>`;
+  for(const key of ['dev','ino','fd'])normalized.lease[key]=`<${key}>`;
+  return normalized;
 }
 
 async function prepared(t) {
@@ -47,13 +67,16 @@ test('v2 root and invocation records preserve the selected pair and exact closed
   assert.equal(invocation.record.parentBinding, root.token);
   const rootBytes=fs.readFileSync(path.join(f.root,'.jhw-runtime/v2/sessions',root.id,'manifest.json'));
   const invocationBytes=fs.readFileSync(path.join(f.root,`.jhw-runtime/v2/invocations/${pair.bootstrapId}`,invocation.id,'manifest.json'));
+  const rootDisk=JSON.parse(rootBytes);const invocationDisk=JSON.parse(invocationBytes);
+  assert.equal(rootBytes.toString('utf8'),canonical(rootDisk)+'\n');
+  assert.equal(invocationBytes.toString('utf8'),canonical(invocationDisk)+'\n');
   assert.equal(root.token,`v2:${pair.bootstrapId}:${root.id}:${createHash('sha256').update(rootBytes).digest('hex')}`);
   assert.equal(invocation.token,`v2:${pair.bootstrapId}:${invocation.id}:${createHash('sha256').update(invocationBytes).digest('hex')}`);
   assert.equal(root.record.lease.fd,root.lease.fd);assert.equal(invocation.record.lease.fd,invocation.lease.fd);
-  assert.deepEqual(normalizeRecord(root.record),{version:2,id:'<id>',kind:'session',...pair,parentBinding:null,
+  assert.deepEqual(normalizeRecord(rootDisk),{version:2,id:'<id>',kind:'session',...pair,parentBinding:null,
     repository:{path:'<repository>',dev:'<dev>',ino:'<ino>'},owner:{uid:process.getuid(),pid:'<pid>',startTime:'<startTime>',bootId:'<bootId>',commandDigest:'<commandDigest>',exeDev:'<exeDev>',exeIno:'<exeIno>'},
     manifest:{dev:'<dev>',ino:'<ino>'},lease:{dev:'<dev>',ino:'<ino>',fd:'<fd>'},createdAt:'<createdAt>'});
-  assert.deepEqual(normalizeRecord(invocation.record),{version:2,id:'<id>',kind:'invocation',...pair,parentBinding:root.token,
+  assert.deepEqual(normalizeRecord(invocationDisk),{version:2,id:'<id>',kind:'invocation',...pair,parentBinding:root.token,
     repository:{path:'<repository>',dev:'<dev>',ino:'<ino>'},owner:{uid:process.getuid(),pid:'<pid>',startTime:'<startTime>',bootId:'<bootId>',commandDigest:'<commandDigest>',exeDev:'<exeDev>',exeIno:'<exeIno>'},
     manifest:{dev:'<dev>',ino:'<ino>'},lease:{dev:'<dev>',ino:'<ino>',fd:'<fd>'},createdAt:'<createdAt>'});
   assert.deepEqual(
@@ -225,6 +248,43 @@ test('v2 inventory fails closed on unknown namespace entries', async t => {
   fs.mkdirSync(sessions,{recursive:true,mode:0o700});fs.mkdirSync(path.join(sessions,'unknown-consumer'),{mode:0o700});
   assert.throws(()=>store.inspectSessionBindingsV2({repositoryRoot:f.root}),{code:'DEPLOY_SESSION_INVALID'});
   assert.throws(()=>store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:false}),{code:'DEPLOY_SESSION_INVALID'});
+});
+
+test('v2 inventory and reaper reject non-directory or wrong-kind private entries', async t => {
+  for(const variant of ['file','symlink','mode','kind'])await t.test(variant,async t=>{
+    const {f,pair}=await prepared(t);const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');
+    fs.mkdirSync(sessions,{recursive:true,mode:0o700});
+    const name=variant==='kind'?`.creating.i-${'1'.repeat(32)}`:`.creating.s-${'1'.repeat(32)}`;
+    const target=path.join(sessions,name);
+    if(variant==='file')fs.writeFileSync(target,'',{mode:0o600});
+    else if(variant==='symlink')fs.symlinkSync(path.join(f.root,`.jhw-runtime/v2/bootstraps/${pair.bootstrapId}`),target);
+    else {fs.mkdirSync(target,{mode:variant==='mode'?0o755:0o700});if(variant==='mode')fs.chmodSync(target,0o755);}
+    assert.throws(()=>store.inspectSessionBindingsV2({repositoryRoot:f.root}),{code:'DEPLOY_SESSION_INVALID'});
+    assert.throws(()=>store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:false,limit:1}),{code:'DEPLOY_SESSION_INVALID'});
+  });
+});
+
+test('v2 inventory applies SESSION_LIMIT per namespace and reaper has a separate candidate budget', async t => {
+  const {f,pair,admissionLease}=await prepared(t);
+  const roots=[
+    store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease}),
+    store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease}),
+  ];
+  t.after(()=>roots.forEach(root=>root.close()));
+  const group=path.join(f.root,'.jhw-runtime/v2/invocations',pair.bootstrapId);fs.mkdirSync(group,{recursive:true,mode:0o700});
+  for(let index=0;index<1023;index++)fs.mkdirSync(path.join(group,`.creating.i-${index.toString(16).padStart(32,'0')}`),{mode:0o700});
+  const rows=store.inspectSessionBindingsV2({repositoryRoot:f.root});
+  assert.equal(rows.filter(row=>row.kind==='session').length,2);
+  const result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:true,limit:1});
+  assert.equal(result.retired.length+result.preserved.length,1);
+});
+
+test('v2 reaper remains bounded when one namespace exceeds registration capacity', async t => {
+  const {f}=await prepared(t);const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');
+  fs.mkdirSync(sessions,{recursive:true,mode:0o700});
+  for(let index=0;index<1025;index++)fs.mkdirSync(path.join(sessions,`.creating.s-${index.toString(16).padStart(32,'0')}`),{mode:0o700});
+  const result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:true,limit:1});
+  assert.equal(result.retired.length+result.preserved.length,1);
 });
 
 test('v2 invocation index wait succeeds below and fails at the 500ms boundary', async t => {

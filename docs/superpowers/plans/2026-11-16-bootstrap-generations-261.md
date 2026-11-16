@@ -132,6 +132,7 @@ fresh reviewer가 거부하면 그 task 범위에서 수정·재검증한다. �
 - [ ] **2. RED를 확인한다.** `rtk proxy node --test scripts/test-runtime-v2-sessions.mjs scripts/test-runtime-v2-entry.mjs`.
 - [ ] **3. 등록·종료·회수 경로를 구현한다.** root는 publication SH→generation SH→root index EX, bound 호출은 generation SH→invocation index EX를 따른다(admission SH 선행). root token을 후손에게 유지한다. FD 6을 닫은 뒤 해당 index EX와 binding EX try로 퇴역하고 parent FD 8/세대를 마지막에 닫는다. reaper는 index를 놓고 generation부터 재획득하며 unlocked delete를 만들지 않는다. root membership은 writer의 index SH 동안 고정되고 그 뒤 publication EX 동안 축소만 가능하다.
 - [ ] **4. GREEN을 확인한다.** 위 명령과 `rtk proxy node --test scripts/test-runtime-sessions.mjs scripts/test-runtime-entry.mjs scripts/test-runtime-safety.mjs`. 동시 root/child, forged token, PID 재사용, inode 교체, `.creating`/`.retired` 중단, lease 경합을 포함한다. 실제 writer record의 exact key/FD/token을 golden과 대조하고 PID·시간·inode 같은 동적 값만 명시적으로 정규화한다. reselect 3회는 router/binder 전체 합산이며 이미 발행한 binding은 재선택하지 않는다. wrapper/child의 종료는 시험용 IPC로 유도한다.
+- [ ] **승인된 capacity/evidence 경계를 확인한다.** `SESSION_LIMIT`은 root와 각 bootstrap invocation namespace에 각각 적용하고 전체 합계에는 적용하지 않는다. 등록·inventory·reaper가 같은 no-follow type/owner/mode/ID-kind 분류를 사용하되 reaper의 후보 `limit`, `SESSION_SCAN_LIMIT`, 1.5초 시간 예산은 등록 용량과 분리한다. authoritative inventory는 완전하거나 명시적으로 실패한다. FD 5는 fixture helper의 실제 `fstat(5)` 직후 inode로 증명하고, golden은 중첩 key shape를 먼저 검사한 뒤 동적 scalar만 정규화하며, 실제 owner 종료와 마지막 FD 8 수명은 fixture IPC로 관측한다.
 - [ ] **5. 커밋한다.** 제목: `feat(runtime): 세대별 호출 등록과 부모 lease 수명을 보장한다`.
 
 ### Task 4: 전체 검증 증거와 게시 직전 재검증

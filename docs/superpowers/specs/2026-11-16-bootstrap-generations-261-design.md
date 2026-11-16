@@ -200,6 +200,21 @@ writer가 session-index SH를 보유한 동안 root 집합은 고정된다. 해�
 publication EX 아래에서는 root retirement에 의한 축소만 가능하다. index 없이 record를 지우지 않는다.
 orphan lease/불명확한 부모/알 수 없는 consumer는 기존처럼 fail-closed한다.
 
+기존 `SESSION_LIMIT=1024`는 root namespace와 각 세대 invocation namespace에 각각 적용한다.
+각 namespace의 public·`.creating`·`.retired` 항목을 모두 세고 등록 예약 1개를 해당 index EX
+아래에서 합산한다. 전체 namespace 합계나 bootstrap group 수에는 이 용량 상한을 적용하지 않는다.
+등록·authoritative inventory·reaper는 이름의 공개/private 상태와 ID-kind를 같은 방식으로 분류하고,
+이름이 유효해도 no-follow directory·현재 사용자 소유·0700·identity를 확인한다. authoritative
+inventory는 완전한 결과를 반환하거나 명시적으로 실패하며, 제한된 결과를 빈 전체 inventory로
+표현하지 않는다.
+
+reaper의 용량 판정과 작업 예산은 분리한다. `limit`은 live·private·보존 후보를 포함한 처리 후보
+수이고, 열거는 기존 `SESSION_SCAN_LIMIT=65536`, 다음 작업 시작은 기존 1.5초 reclaim 시간 예산을
+사용한다. 후보 snapshot 뒤 index를 놓고 generation부터 재획득하며 random start로 앞쪽 live
+항목 편향을 줄인다. 예산 소진 시 미처리 항목을 남기고 `{retired,preserved}`에는 처리한 후보만
+기록한다. private 증거가 불완전하거나 identity가 불명확하면 보존하며 정상 빈 inventory의 근거로
+사용하지 않는다.
+
 invocation은 부모가 유효할 때 parent root lease SH를 FD 8로 획득하고 부모 identity/owner를
 다시 증명한 뒤 자신의 record를 공개한다. payload도 FD 8을 상속해 종료할 때까지 유지한다.
 root owner가 먼저 종료돼도 살아 있는 invocation의 FD 8 때문에 root record는 회수되지 않는다.
