@@ -113,6 +113,125 @@ class Directory {
   }
   close() { fs.closeSync(this.fd); }
 }
+
+const preparedEvidence = new WeakMap();
+const preparedDestinations = new WeakMap();
+
+function evidenceStat(stat) {
+  return Object.freeze({
+    dev:stat.dev, ino:stat.ino, uid:stat.uid, gid:stat.gid, mode:stat.mode,
+    nlink:stat.nlink, size:stat.size, mtimeNs:stat.mtimeNs, ctimeNs:stat.ctimeNs,
+  });
+}
+
+function statKind(stat) {
+  if (stat.isDirectory()) return 'directory';
+  if (stat.isFile()) return 'file';
+  if (stat.isSymbolicLink()) return 'symlink';
+  fail('DEPLOY_SOURCE_CHANGED');
+}
+
+// This is deliberately separate from walk(): preparation hashes every retained
+// file through a descriptor and keeps directory descriptors for the later,
+// metadata-only publication check. It is never serialized or accepted from a caller.
+function captureEvidenceTree(root, artifactPaths = new Set()) {
+  const directories = [];
+  const records = [];
+  const artifacts = new Map();
+  function visit(directory, prefix, parent = null, name = null, captured = null) {
+    directories.push(directory);
+    const children = names(directory);
+    records.push({path:prefix,type:'directory',stat:evidenceStat(captured ?? fs.fstatSync(directory.fd,{bigint:true})),
+      children,parent,name,directory});
+    for (const name of children) {
+      if (records.length >= MAX_ENTRIES) fail('DEPLOY_SOURCE_CHANGED');
+      const relative = prefix ? `${prefix}/${name}` : name;
+      const before = fs.lstatSync(directory.at(name),{bigint:true});
+      const type = statKind(before);
+      if (type === 'directory') {
+        safeStat(before,'directory');
+        const child = directory.child(name);
+        visit(child,relative,directory,name,before);
+      } else if (type === 'file') {
+        const retained = readBytes(directory,name);
+        const after = fs.lstatSync(directory.at(name),{bigint:true});
+        if (!same(before,after)) fail('DEPLOY_SOURCE_CHANGED');
+        const sha256 = digest(retained.bytes);
+        const record = {path:relative,type,stat:evidenceStat(before),parent:directory,name,sha256};
+        if (name === 'manifest.json') record.bytes = Buffer.from(retained.bytes);
+        if (artifactPaths.has(relative)) artifacts.set(relative,Buffer.from(retained.bytes));
+        records.push(record);
+      } else {
+        const retained = readLink(directory,name);
+        if (!same(before,retained.stat)) fail('DEPLOY_SOURCE_CHANGED');
+        records.push({path:relative,type,stat:evidenceStat(before),parent:directory,name,target:retained.target});
+      }
+    }
+    if (canonical(children) !== canonical(names(directory))) fail('DEPLOY_SOURCE_CHANGED');
+    directory.verify();
+  }
+  try {
+    visit(root,'');
+    return {directories,records,artifacts};
+  } catch (error) {
+    for (const directory of directories.reverse()) {
+      try { directory.close(); } catch {}
+    }
+    throw error;
+  }
+}
+
+function closeEvidenceTree(tree) {
+  for (const directory of [...tree.directories].reverse()) {
+    try { directory.close(); } catch {}
+  }
+}
+
+function revalidateEvidenceTree(tree) {
+  for (const record of tree.records) {
+    if (record.type === 'directory') {
+      if (!same(record.stat,fs.fstatSync(record.directory.fd,{bigint:true})) ||
+          record.parent !== null && !same(record.stat,fs.lstatSync(record.parent.at(record.name),{bigint:true})) ||
+          canonical(record.children) !== canonical(names(record.directory))) fail('DEPLOY_SOURCE_CHANGED');
+      record.directory.verify();
+      continue;
+    }
+    const current = fs.lstatSync(record.parent.at(record.name),{bigint:true});
+    if (statKind(current) !== record.type || !same(record.stat,current)) fail('DEPLOY_SOURCE_CHANGED');
+    if (record.type === 'symlink' && fs.readlinkSync(record.parent.at(record.name)) !== record.target) {
+      fail('DEPLOY_SOURCE_CHANGED');
+    }
+    record.parent.verify();
+  }
+}
+
+function evidenceSnapshot(tree) {
+  return tree.records.map(record=>({path:record.path,type:record.type,stat:record.stat,
+    children:record.children,target:record.target}));
+}
+
+function revalidateEvidenceSnapshot(root, snapshot) {
+  const byPath=new Map(snapshot.map(record=>[record.path,record]));
+  function visit(directory,prefix) {
+    const expected=byPath.get(prefix);
+    if(expected?.type!=='directory' || !same(expected.stat,fs.fstatSync(directory.fd,{bigint:true})) ||
+        canonical(expected.children)!==canonical(names(directory)))fail('DEPLOY_SOURCE_CHANGED');
+    for(const name of expected.children){
+      const relative=prefix?`${prefix}/${name}`:name;
+      const record=byPath.get(relative);
+      const current=fs.lstatSync(directory.at(name),{bigint:true});
+      if(!record || statKind(current)!==record.type || !same(record.stat,current))fail('DEPLOY_SOURCE_CHANGED');
+      if(record.type==='directory'){
+        const child=directory.child(name);
+        try{visit(child,relative);}finally{child.close();}
+      }else if(record.type==='symlink'&&fs.readlinkSync(directory.at(name))!==record.target){
+        fail('DEPLOY_SOURCE_CHANGED');
+      }
+    }
+    directory.verify();
+  }
+  visit(root,'');
+}
 function withStore(repositoryRoot, create, callback) {
   let root; let runtime;
   try {
@@ -331,13 +450,13 @@ export function validateRelease({ repositoryRoot, releaseId }) {
   });
 }
 
-function requireLeaseIdentity(lease, file) {
-  if (!lease || !Number.isInteger(lease.fd) || lease.fd < 0) fail('DEPLOY_BOOTSTRAP_INVALID');
+function requireLeaseIdentity(lease, file, code = 'DEPLOY_BOOTSTRAP_INVALID') {
+  if (!lease || !Number.isInteger(lease.fd) || lease.fd < 0) fail(code);
   let held; let named;
   try { held = fs.fstatSync(lease.fd, {bigint:true}); named = fs.lstatSync(file, {bigint:true}); }
-  catch { fail('DEPLOY_BOOTSTRAP_INVALID'); }
+  catch { fail(code); }
   if (!held.isFile() || held.uid !== BigInt(process.getuid()) || held.nlink !== 1n ||
-      (Number(held.mode) & 0o7777) !== 0o600 || !same(held, named)) fail('DEPLOY_BOOTSTRAP_INVALID');
+      (Number(held.mode) & 0o7777) !== 0o600 || !same(held, named)) fail(code);
 }
 
 function bootstrapManifestId(manifest) {
@@ -502,6 +621,101 @@ export function restoreBootstrapGeneration({repositoryRoot, bootstrapId, deployL
     publishGeneration({runtime, repositoryRoot, manifest:source.manifest, helperBytes:source.helperBytes});
     return {bootstrapId,sourceReleaseId:source.manifest.sourceReleaseId,runtimeContract:2};
   });
+}
+
+function closePreparedEvidence(state) {
+  if (state.closed) return;
+  state.closed = true;
+  for (const tree of [...state.trees].reverse()) closeEvidenceTree(tree);
+  for (const anchor of [...state.anchors].reverse()) {
+    try { anchor.close(); } catch {}
+  }
+  try { state.runtime.close(); } catch {}
+  try { state.root.close(); } catch {}
+}
+
+function evidenceState(evidence) {
+  const state = preparedEvidence.get(evidence);
+  if (!state || state.closed) fail('DEPLOY_SOURCE_CHANGED');
+  return state;
+}
+
+function pairKey(pair) { return canonical(pair); }
+
+/** Complete validation and hashing happen here, outside publication.lock. The
+ * returned object is only an identity-bearing process-local handle. */
+export function prepareRuntimeEvidence({repositoryRoot,pairs}) {
+  if (typeof repositoryRoot !== 'string' || path.resolve(repositoryRoot) !== repositoryRoot ||
+      !Array.isArray(pairs) || pairs.length === 0 || pairs.length > MAX_ENTRIES) fail('DEPLOY_SOURCE_CHANGED');
+  let root; let runtime; const trees=[]; const anchors=[];
+  try {
+    root = new Directory(repositoryRoot);
+    runtime = root.child('.jhw-runtime',false,true);
+    const unique = new Map();
+    for (const pair of pairs) {
+      if (!validRuntimePair(pair) || unique.has(pairKey(pair))) fail('DEPLOY_SOURCE_CHANGED');
+      validateReleaseIn(runtime,repositoryRoot,pair.releaseId);
+      if (releaseCompatibilityIn(runtime,repositoryRoot,pair.releaseId) !== pair.compatibilityDigest) fail('DEPLOY_SOURCE_CHANGED');
+      const generation = readGeneration(runtime,repositoryRoot,pair.bootstrapId);
+      if (generation.manifest.runtimeContract !== pair.runtimeContract) fail('DEPLOY_SOURCE_CHANGED');
+      unique.set(pairKey(pair),{pair:{...pair},sourceReleaseId:generation.manifest.sourceReleaseId});
+    }
+    const releases = runtime.child('releases',false,true);
+    anchors.push(releases);
+    {
+      const releaseIds = new Set();
+      for (const value of unique.values()) {
+        releaseIds.add(value.pair.releaseId); releaseIds.add(value.sourceReleaseId);
+      }
+      for (const releaseId of releaseIds) {
+        const release = releases.child(releaseId,false,true);
+        trees.push(captureEvidenceTree(release,new Set([
+          'mcp-server/dist/runtime/mcp.cjs','mcp-server/dist/runtime/control.cjs',
+          'mcp-server/dist/runtime/hook.cjs',...BOOTSTRAP_HELPERS.map(name=>`scripts/${name}`),
+        ])));
+      }
+    }
+    const v2 = runtime.child('v2',false,true);
+    anchors.push(v2);
+    let bootstraps;
+    {
+      bootstraps = v2.child('bootstraps',false,true);
+      anchors.push(bootstraps);
+      for (const bootstrapId of new Set([...unique.values()].map(value=>value.pair.bootstrapId))) {
+        const generation = bootstraps.child(bootstrapId,false,true);
+        trees.push(captureEvidenceTree(generation,new Set(BOOTSTRAP_HELPERS)));
+      }
+    }
+    // Close the validation/capture gap by proving that the bytes just captured
+    // still satisfy the pair and original generation provenance.
+    for (const value of unique.values()) {
+      validateReleaseIn(runtime,repositoryRoot,value.pair.releaseId);
+      if (value.sourceReleaseId !== value.pair.releaseId) validateReleaseIn(runtime,repositoryRoot,value.sourceReleaseId);
+      if (releaseCompatibilityIn(runtime,repositoryRoot,value.pair.releaseId) !== value.pair.compatibilityDigest ||
+          readGeneration(runtime,repositoryRoot,value.pair.bootstrapId).manifest.sourceReleaseId !== value.sourceReleaseId) {
+        fail('DEPLOY_SOURCE_CHANGED');
+      }
+    }
+    const state={repositoryRoot,root,runtime,trees,anchors,pairs:unique,closed:false};
+    const evidence=Object.freeze({close(){closePreparedEvidence(state);}});
+    preparedEvidence.set(evidence,state);
+    root=undefined; runtime=undefined;
+    return evidence;
+  } catch (error) {
+    for (const tree of trees.reverse()) closeEvidenceTree(tree);
+    for (const anchor of anchors.reverse()) {
+      try { anchor.close(); } catch {}
+    }
+    throw error;
+  } finally { runtime?.close(); root?.close(); }
+}
+
+export function revalidateRuntimeEvidence(evidence) {
+  const state=evidenceState(evidence);
+  try {
+    state.root.verify(); state.runtime.verify();
+    for (const tree of state.trees) revalidateEvidenceTree(tree);
+  } catch { fail('DEPLOY_SOURCE_CHANGED'); }
 }
 function git(root, args) {
   root.verify();
@@ -755,6 +969,12 @@ function checkCurrent(runtime, repositoryRoot, expectedCurrent) {
   if (canonical(actual) !== canonical(expectedCurrent)) fail('DEPLOY_CURRENT_CHANGED');
   return actual;
 }
+function checkCurrentWithoutContentHash(runtime, repositoryRoot, expectedCurrent) {
+  if (!validCurrent(expectedCurrent)) fail('DEPLOY_CURRENT_CHANGED');
+  const actual = currentIn(runtime,repositoryRoot,false);
+  if (canonical(actual) !== canonical(expectedCurrent)) fail('DEPLOY_CURRENT_CHANGED');
+  return actual;
+}
 function switchPointer(runtime, repositoryRoot, activationId, expectedCurrent, onPointerIntent) {
   const temporary = `.current.${randomBytes(16).toString('hex')}`;
   let created = false;
@@ -804,6 +1024,118 @@ export function publishActivation({ repositoryRoot, releaseId, expectedCurrent, 
       activations?.close();
     }
   });
+}
+
+function destinationValue(manifest) {
+  return Object.freeze({version:2,activationId:manifest.activationId,releaseId:manifest.releaseId,
+    bootstrapId:manifest.bootstrapId,runtimeContract:manifest.runtimeContract,
+    compatibilityDigest:manifest.compatibilityDigest,predecessorActivationId:manifest.predecessorActivationId,
+    migrationId:manifest.migrationId});
+}
+
+function closePreparedDestination(state) {
+  if (state.closed) return;
+  state.closed=true;
+}
+
+/** Prepare and fsync a complete v2 activation without changing current. Initial
+ * v1 migration remains Task 8: this compatible publisher only accepts null or v2. */
+export function preparePairActivation({repositoryRoot,pair,expectedCurrent,migrationId=null,deployLease}) {
+  requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'),'DEPLOY_ACTIVATION_INVALID');
+  if (!validRuntimePair(pair) || migrationId !== null ||
+      expectedCurrent !== null && !validV2Current(expectedCurrent)) fail('DEPLOY_ACTIVATION_INVALID');
+  let root; let runtime; let v2; let activations; let stage; let stageName; let activationTree;
+  try {
+    root=new Directory(repositoryRoot);
+    runtime=root.child('.jhw-runtime',false,true);
+    checkCurrent(runtime,repositoryRoot,expectedCurrent);
+    validateReleaseIn(runtime,repositoryRoot,pair.releaseId);
+    if (releaseCompatibilityIn(runtime,repositoryRoot,pair.releaseId)!==pair.compatibilityDigest) fail('DEPLOY_ACTIVATION_INVALID');
+    const generation=readGeneration(runtime,repositoryRoot,pair.bootstrapId);
+    if (generation.manifest.runtimeContract!==pair.runtimeContract) fail('DEPLOY_ACTIVATION_INVALID');
+    v2=runtime.child('v2',true,true);
+    activations=v2.child('activations',true,true);
+    stageName=`.stage.${randomBytes(16).toString('hex')}`;
+    stage=activations.child(stageName,true,true);
+    const manifest={version:2,activationId:`a-${randomBytes(16).toString('hex')}`,...pair,
+      predecessorActivationId:expectedCurrent?.activationId??null,migrationId:null,
+      createdAt:new Date().toISOString(),priorCurrent:expectedCurrent};
+    for(const name of ['mcp-server','scripts','skills']) {
+      fs.symlinkSync(`../../../releases/${pair.releaseId}/${name}`,stage.at(name));
+    }
+    fs.symlinkSync(`../../bootstraps/${pair.bootstrapId}`,stage.at('bootstrap'));
+    writeBytes(stage,'manifest.json',`${canonical(manifest)}\n`,0o600);
+    fs.fsyncSync(stage.fd); stage.verify(); activations.verify();
+    checkCurrent(runtime,repositoryRoot,expectedCurrent);
+    fs.renameSync(activations.at(stageName),activations.at(manifest.activationId));
+    stage.close(); stage=undefined; stageName=undefined;
+    fs.fsyncSync(activations.fd);
+    const validated=activationIn(runtime,repositoryRoot,manifest.activationId,true,2);
+    if(canonical(validated)!==canonical(manifest))fail('DEPLOY_ACTIVATION_INVALID');
+    const activation=activations.child(manifest.activationId,false,true);
+    activationTree=captureEvidenceTree(activation);
+    const activationSnapshot=evidenceSnapshot(activationTree);
+    closeEvidenceTree(activationTree);activationTree=undefined;
+    const destination=destinationValue(manifest);
+    const prepared={repositoryRoot,pairKey:pairKey(pair),expectedCurrent:canonical(expectedCurrent),
+      activationSnapshot,closed:false};
+    preparedDestinations.set(destination,prepared);
+    return destination;
+  } catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
+  finally{
+    if(stage){
+      try{stage.verify();fs.rmSync(activations.at(stageName),{recursive:true});}catch{}
+      stage.close();
+    }
+    if(activationTree)closeEvidenceTree(activationTree);
+    activations?.close();v2?.close();runtime?.close();root?.close();
+  }
+}
+
+export function publishPreparedActivation({repositoryRoot,destination,expectedCurrent,evidence,
+    publicationLease,onPointerIntent}) {
+  const state=evidenceState(evidence);
+  const prepared=preparedDestinations.get(destination);
+  if(state.repositoryRoot!==repositoryRoot)fail('DEPLOY_SOURCE_CHANGED');
+  if(!prepared || prepared.closed || prepared.repositoryRoot!==repositoryRoot || prepared.expectedCurrent!==canonical(expectedCurrent) ||
+      !state.pairs.has(prepared.pairKey))fail('DEPLOY_ACTIVATION_INVALID');
+  if(expectedCurrent?.version===2 && !state.pairs.has(pairKey({releaseId:expectedCurrent.releaseId,
+      bootstrapId:expectedCurrent.bootstrapId,runtimeContract:expectedCurrent.runtimeContract,
+      compatibilityDigest:expectedCurrent.compatibilityDigest})))fail('DEPLOY_SOURCE_CHANGED');
+  requireLeaseIdentity(publicationLease,path.join(repositoryRoot,'.jhw-runtime/publication.lock'),'DEPLOY_ACTIVATION_INVALID');
+  const started=process.hrtime.bigint();
+  let root;let runtime;let temporary;let created=false;
+  try{
+    root=new Directory(repositoryRoot);runtime=root.child('.jhw-runtime',false,true);
+    checkCurrentWithoutContentHash(runtime,repositoryRoot,expectedCurrent);
+    const manifest=activationIn(runtime,repositoryRoot,destination.activationId,false,2);
+    if(canonical(destinationValue(manifest))!==canonical(destination))fail('DEPLOY_ACTIVATION_INVALID');
+    let v2;let activations;let activation;
+    try{
+      v2=runtime.child('v2',false,true);activations=v2.child('activations',false,true);
+      activation=activations.child(destination.activationId,false,true);
+      revalidateEvidenceSnapshot(activation,prepared.activationSnapshot);
+    }finally{activation?.close();activations?.close();v2?.close();}
+    revalidateRuntimeEvidence(evidence);
+    if(process.hrtime.bigint()-started>1_000_000_000n)fail('DEPLOY_SOURCE_CHANGED');
+    temporary=`.current.${randomBytes(16).toString('hex')}`;
+    fs.symlinkSync(`v2/activations/${destination.activationId}`,runtime.at(temporary));created=true;
+    runtime.verify();
+    if(canonical(observation(runtime))!==canonical(expectedCurrent?.observation??null))fail('DEPLOY_CURRENT_CHANGED');
+    const intentResult=onPointerIntent?.(destination);
+    if(intentResult!==null && (typeof intentResult==='object'||typeof intentResult==='function') &&
+        typeof intentResult.then==='function')fail('DEPLOY_ACTIVATION_INVALID');
+    fs.renameSync(runtime.at(temporary),runtime.at('current'));created=false;
+    fs.fsyncSync(runtime.fd);
+    const result=currentIn(runtime,repositoryRoot,false);
+    if(canonical({...destination,observation:result?.observation})!==canonical(result))fail('DEPLOY_CURRENT_CHANGED');
+    return result;
+  }catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
+  finally{
+    if(created){try{runtime.verify();fs.unlinkSync(runtime.at(temporary));}catch{}}
+    runtime?.close();root?.close();
+    closePreparedDestination(prepared);
+  }
 }
 export function rollbackActivation({ repositoryRoot, expectedCurrent, onPointerIntent }) {
   return withStore(repositoryRoot, false, runtime => {
