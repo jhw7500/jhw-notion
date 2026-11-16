@@ -91,15 +91,17 @@ function validWitnessIdentity(value,{times=false,links=null,mode}={}) {
   Number.isSafeInteger(value.uid)&&value.uid===process.getuid()&&Number.isSafeInteger(value.mode)&&value.mode===mode&&
   (links===null||Number.isSafeInteger(value.nlink)&&value.nlink===links);
 }
+function validActivationWitness(value) {
+ return exact(value,['directory','manifest'])&&validWitnessIdentity(value.directory,{times:true,mode:0o700})&&
+  exact(value.manifest,['dev','ino','uid','mode','nlink','mtimeNs','ctimeNs','sha256'])&&
+  validWitnessIdentity(Object.fromEntries(Object.entries(value.manifest).filter(([key])=>key!=='sha256')),{times:true,links:1,mode:0o600})&&
+  typeof value.manifest.sha256==='string'&&/^[a-f0-9]{64}$/.test(value.manifest.sha256);
+}
 function validPointerWitness(value,destination) {
- return exact(value,['directory','pointer','activation'])&&validWitnessIdentity(value.directory,{times:true,mode:0o700})&&
+ return exact(value,['directory','pointer','origin','destination'])&&validWitnessIdentity(value.directory,{times:true,mode:0o700})&&
   exact(value.pointer,['dev','ino','uid','mode','target'])&&
   validWitnessIdentity(Object.fromEntries(Object.entries(value.pointer).filter(([key])=>key!=='target')),{mode:0o777})&&
-  value.pointer.target===`v2/activations/${destination.activationId}`&&exact(value.activation,['directory','manifest'])&&
-  validWitnessIdentity(value.activation.directory,{times:true,mode:0o700})&&
-  exact(value.activation.manifest,['dev','ino','uid','mode','nlink','mtimeNs','ctimeNs','sha256'])&&
-  validWitnessIdentity(Object.fromEntries(Object.entries(value.activation.manifest).filter(([key])=>key!=='sha256')),{times:true,links:1,mode:0o600})&&
-  typeof value.activation.manifest.sha256==='string'&&/^[a-f0-9]{64}$/.test(value.activation.manifest.sha256);
+  value.pointer.target===`v2/activations/${destination.activationId}`&&validActivationWitness(value.origin)&&validActivationWitness(value.destination);
 }
 function validPairJournalState(state) {
  if(!exact(state,['version','kind','status','operation','phase','origin','candidate','destination','witness','outcome'])||
@@ -118,24 +120,32 @@ function validPairJournalState(state) {
 function verifyPairWitnessFiles({repositoryRoot,journalDirectory,state}) {
  const witnessDirectory=path.join(journalDirectory,'pointer-witness');
  if(state.witness===null){if(fs.existsSync(witnessDirectory))fail('unverified_journal');return;}
- let directory;let pointer;let activation;let manifest;let target;let manifestRecord;
+ let directory;let pointer;let target;
  try{
   directory=fs.lstatSync(witnessDirectory,{bigint:true});pointer=fs.lstatSync(path.join(witnessDirectory,'current'),{bigint:true});
   target=fs.readlinkSync(path.join(witnessDirectory,'current'));
-  const activationDirectory=path.join(repositoryRoot,'.jhw-runtime/v2/activations',state.destination.activationId);
-  activation=fs.lstatSync(activationDirectory,{bigint:true});manifest=fs.lstatSync(path.join(activationDirectory,'manifest.json'),{bigint:true});
-  manifestRecord=readRegular(activationDirectory,'manifest.json',65536);
  }catch(error){if(error instanceof DeploymentError)throw error;fail('unverified_journal');}
  const identity=(stat,{times=false,links=false}={})=>({dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:permissions(stat.mode),
   ...(links?{nlink:Number(stat.nlink)}:{}),...(times?{mtimeNs:String(stat.mtimeNs),ctimeNs:String(stat.ctimeNs)}:{})});
- if(!directory.isDirectory()||!pointer.isSymbolicLink()||!activation.isDirectory()||!manifest.isFile()||
+ if(!directory.isDirectory()||!pointer.isSymbolicLink()||
   fs.readdirSync(witnessDirectory).join(',')!=='current'||JSON.stringify(identity(directory,{times:true}))!==JSON.stringify(state.witness.directory)||
-  JSON.stringify({...identity(pointer),target})!==JSON.stringify(state.witness.pointer)||
-  JSON.stringify(identity(activation,{times:true}))!==JSON.stringify(state.witness.activation.directory)||
-  JSON.stringify({...identity(manifest,{times:true,links:true}),sha256:digest(manifestRecord.bytes)})!==JSON.stringify(state.witness.activation.manifest))fail('unverified_journal');
- const value=parseJson(manifestRecord.bytes);const destination=Object.fromEntries(['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId'].map(key=>[key,value[key]]));
- if(!exact(value,['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId','createdAt','priorCurrent'])||
-  canonical(value)+'\n'!==manifestRecord.bytes.toString('utf8')||JSON.stringify(destination)!==JSON.stringify(Object.fromEntries(Object.entries(state.destination).filter(([key])=>key!=='observation'))))fail('unverified_journal');
+  JSON.stringify({...identity(pointer),target})!==JSON.stringify(state.witness.pointer))fail('unverified_journal');
+ const verifyActivation=(activationId,expected)=>{
+  let activation;let manifest;let manifestRecord;
+  try{const activationDirectory=path.join(repositoryRoot,'.jhw-runtime/v2/activations',activationId);
+   activation=fs.lstatSync(activationDirectory,{bigint:true});manifest=fs.lstatSync(path.join(activationDirectory,'manifest.json'),{bigint:true});
+   manifestRecord=readRegular(activationDirectory,'manifest.json',65536);
+  }catch{fail('unverified_journal');}
+  if(!activation.isDirectory()||!manifest.isFile()||JSON.stringify(identity(activation,{times:true}))!==JSON.stringify(expected.directory)||
+   JSON.stringify({...identity(manifest,{times:true,links:true}),sha256:digest(manifestRecord.bytes)})!==JSON.stringify(expected.manifest))fail('unverified_journal');
+  return {value:parseJson(manifestRecord.bytes),bytes:manifestRecord.bytes};
+ };
+ const originRecord=verifyActivation(state.origin.activationId,state.witness.origin);const origin=originRecord.value;
+ const destinationRecord=verifyActivation(state.destination.activationId,state.witness.destination);const value=destinationRecord.value;
+ const destination=Object.fromEntries(['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId'].map(key=>[key,value[key]]));
+ const destinationCanonical=canonical(value)+'\n'===destinationRecord.bytes.toString('utf8');
+ const destinationMatches=canonical(destination)===canonical(Object.fromEntries(Object.entries(state.destination).filter(([key])=>key!=='observation')));
+ if(origin.activationId!==state.origin.activationId||!destinationCanonical||!destinationMatches)fail('unverified_journal');
 }
 
 /** Exact shared parser for v2 runtime journals. Future journal kinds extend this

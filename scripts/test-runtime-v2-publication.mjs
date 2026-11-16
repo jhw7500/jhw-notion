@@ -260,7 +260,14 @@ test('prepared activation publishes exact v2 destination without duplicate paylo
 });
 
 test('durable pointer witness keeps object identity across delayed rename ctime change',async t=>{
-  const state=await prepared(t,{reuse:true});
+  const f=await createRuntimeFixture(t);const releaseA=await f.prepare();let deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  t.after(()=>deployLease?.close());const pairA=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:releaseA.releaseId,deployLease});
+  const expectedCurrent=f.seedPair(pairA);deployLease.close();deployLease=null;f.write('mcp-server/src/index.ts','export const second = true;\n');const releaseB=await f.prepare();
+  deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const pairB=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:releaseB.releaseId,reuseBootstrapId:pairA.bootstrapId,deployLease});
+  const evidence=store.prepareRuntimeEvidence({repositoryRoot:f.root,pairs:[pairA,pairB]});t.after(()=>evidence.close());
+  const destination=store.preparePairActivation({repositoryRoot:f.root,pair:pairB,expectedCurrent,deployLease});
+  const state={f,evidence,destination,expectedCurrent};
   const journals=path.join(state.f.root,'.jhw-runtime/v2/journals');fs.mkdirSync(journals,{recursive:true,mode:0o700});
   for(const directory of [path.join(state.f.root,'.jhw-runtime/v2'),journals])fs.chmodSync(directory,0o700);
   const journalDirectory=path.join(journals,`d-${'3'.repeat(32)}`);fs.mkdirSync(journalDirectory,{mode:0o700});

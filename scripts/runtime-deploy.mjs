@@ -4,7 +4,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, inspectSessionConsumers, requireQuiescence} from './runtime-safety.mjs';
-import {prepareRelease, validateRelease, readActivation, validCurrent, publishActivation, rollbackActivation, createSessionBinding, resolveSessionBinding, inspectSessionBindings, releaseCompatibility,ensureBootstrapGeneration,prepareRuntimeEvidence,preparePairActivation,publishPreparedActivation,inspectSessionBindingsV2,resolveSessionBindingV2,selectPairRollbackTarget,validRuntimePair} from './runtime-store.mjs';
+import {prepareRelease, validateRelease, readActivation, validCurrent, publishActivation, rollbackActivation, createSessionBinding, resolveSessionBinding, inspectSessionBindings, releaseCompatibility,ensureBootstrapGeneration,prepareRuntimeEvidence,preparePairActivation,publishPreparedActivation,inspectSessionBindingsV2,resolveSessionBindingV2,selectPairRollbackTarget,validRuntimePair,preparePairPublicationEvidence,revalidatePairPublicationEvidence,verifyPairPublicationConsumer} from './runtime-store.mjs';
 import {installBootstrap, validateBootstrap} from './runtime-entry.mjs';
 import {DEPLOY_VARIABLE_KEYS,applyRuntimePrune,planRuntimePrune,recordDeploymentRetention,readRuntimeJournalV2} from './runtime-prune.mjs';
 import {readGuardHostPolicy,captureGuardTransitionEvidence,writeGuardTransitionEvidence,readGuardTransitionEvidence,recordGuardPolicyContext,recordGuardPublishedSnapshots,recordGuardDestination,markGuardTransitionFinalized,findGuardTransitionEvidence,prepareGuardRollbackEvidence,prepareIncompleteGuardRollbackEvidence,restoreGuardRollbackEvidence} from './runtime-guard.mjs';
@@ -647,12 +647,13 @@ function pairRows(repositoryRoot) {
   const roots=rows.filter(row=>row.kind==='session'&&row.live).map(({live,...row})=>row).sort((a,b)=>a.id.localeCompare(b.id));
   return {rows,roots};
 }
-function pairProcessInventory({repositoryRoot,procRoot,roots}) {
+function pairProcessInventory({repositoryRoot,procRoot,roots,prepared=null}) {
   const inventory=inspectSessionConsumers({repositoryRoot,procRoot,excludePids:[process.pid]},observation=>{
     if(observation.category==='legacy'||(observation.category==='app_server'&&observation.args.includes('proxy')))return false;
     const token=observation.token??roots.find(row=>row.owner.pid===observation.pid&&row.owner.startTime===observation.startTime)?.token;
     if(token===undefined)return false;
-    try{resolveSessionBindingV2({repositoryRoot,token,pid:observation.pid});return true;}catch{return false;}
+    try{return prepared===null?(resolveSessionBindingV2({repositoryRoot,token,pid:observation.pid}),true):
+      verifyPairPublicationConsumer({prepared,observation:{...observation,token}});}catch{return false;}
   });
   if(inventory.uncertain)throw Object.assign(new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN'),{inventory});
   if(!inventory.clear)throw Object.assign(new DeploymentError('DEPLOY_CONSUMERS_ACTIVE'),{inventory});
@@ -662,39 +663,34 @@ function completePairInventory({repositoryRoot,procRoot}) {
   const {rows,roots}=pairRows(repositoryRoot);
   return {rows,roots,processes:pairProcessInventory({repositoryRoot,procRoot,roots})};
 }
-function recheckPairRoots(repositoryRoot,expected,observer) {
-  const index=acquireLease(path.join(repositoryRoot,'.jhw-runtime/v2/session-index.lock'),{shared:true,create:true});
-  try {
-    observer?.({phase:'root_index_held',exclusive:true});
-    const actual=pairRows(repositoryRoot).roots;
-    const known=new Map(expected.map(row=>[row.id,JSON.stringify(row)]));
-    if(actual.some(row=>known.get(row.id)!==JSON.stringify(row)))fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');
-    return actual;
-  } finally {index.close();}
-}
 function sameDestination(snapshot,destination) {
   return snapshot?.version===2&&sameJson(pairDestination(snapshot),destination);
 }
 function verifyPairWitness({repositoryRoot,journalDirectory,state,current}) {
   const witnessDirectory=path.join(journalDirectory,'pointer-witness');const witness=state.witness;
-  let directoryInfo;let pointerInfo;let activationInfo;let manifestInfo;let target;let manifestBytes;
+  let directoryInfo;let pointerInfo;let target;
   try {
     directoryInfo=fs.lstatSync(witnessDirectory,{bigint:true});pointerInfo=fs.lstatSync(path.join(witnessDirectory,'current'),{bigint:true});
     target=fs.readlinkSync(path.join(witnessDirectory,'current'));
-    const activation=path.join(repositoryRoot,'.jhw-runtime/v2/activations',state.destination.activationId);
-    activationInfo=fs.lstatSync(activation,{bigint:true});manifestInfo=fs.lstatSync(path.join(activation,'manifest.json'),{bigint:true});
-    manifestBytes=fs.readFileSync(path.join(activation,'manifest.json'));
   }catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');}
   const identity=(stat,{times=false,links=false}={})=>({dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:Number(stat.mode&0o7777n),
     ...(links?{nlink:Number(stat.nlink)}:{}),...(times?{mtimeNs:String(stat.mtimeNs),ctimeNs:String(stat.ctimeNs)}:{})});
-  if(!directoryInfo.isDirectory()||!pointerInfo.isSymbolicLink()||!activationInfo.isDirectory()||!manifestInfo.isFile()||
+  if(!directoryInfo.isDirectory()||!pointerInfo.isSymbolicLink()||
     fs.readdirSync(witnessDirectory).join(',')!=='current'||!sameJson(identity(directoryInfo,{times:true}),witness.directory)||
-    !sameJson({...identity(pointerInfo),target},witness.pointer)||
-    !sameJson(identity(activationInfo,{times:true}),witness.activation.directory)||
-    !sameJson({...identity(manifestInfo,{times:true,links:true}),sha256:createHash('sha256').update(manifestBytes).digest('hex')},witness.activation.manifest))
+    !sameJson({...identity(pointerInfo),target},witness.pointer))
     fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');
-  let manifest;try{manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifestBytes));}catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');}
-  if(JSON.stringify(manifest)+'\n'!==manifestBytes.toString('utf8')||manifest.activationId!==state.destination.activationId||
+  const verifyActivation=(activationId,expected)=>{let activationInfo;let manifestInfo;let manifestBytes;
+    try{const activation=path.join(repositoryRoot,'.jhw-runtime/v2/activations',activationId);
+      activationInfo=fs.lstatSync(activation,{bigint:true});manifestInfo=fs.lstatSync(path.join(activation,'manifest.json'),{bigint:true});manifestBytes=fs.readFileSync(path.join(activation,'manifest.json'));
+    }catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');}
+    if(!activationInfo.isDirectory()||!manifestInfo.isFile()||!sameJson(identity(activationInfo,{times:true}),expected.directory)||
+      !sameJson({...identity(manifestInfo,{times:true,links:true}),sha256:createHash('sha256').update(manifestBytes).digest('hex')},expected.manifest))
+      fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');
+    try{return {value:JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifestBytes)),bytes:manifestBytes};}catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');}
+  };
+  verifyActivation(state.origin.activationId,witness.origin);
+  const verified=verifyActivation(state.destination.activationId,witness.destination);const manifest=verified.value;
+  if(JSON.stringify(manifest)+'\n'!==verified.bytes.toString('utf8')||manifest.activationId!==state.destination.activationId||
     !sameJson({version:manifest.version,activationId:manifest.activationId,releaseId:manifest.releaseId,bootstrapId:manifest.bootstrapId,
       runtimeContract:manifest.runtimeContract,compatibilityDigest:manifest.compatibilityDigest,predecessorActivationId:manifest.predecessorActivationId,
       migrationId:manifest.migrationId},state.destination))fail('DEPLOY_RECOVERY_REQUIRED','pair_witness_changed');
@@ -746,7 +742,7 @@ function pendingPairJournalCount(repositoryRoot) {
 
 export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId,rollback=false,phaseRunner=wiringPhase,phaseTimeoutMs=45000}) {
   const runtime=path.join(repositoryRoot,'.jhw-runtime');
-  let writer;let admission;let publication;let evidence;let directory;let logFd;let state;let journalCandidate;let validationDirectory;
+  let writer;let admission;let publication;let evidence;let publicationEvidence;let directory;let logFd;let state;let journalCandidate;let validationDirectory;
   try {
     writer=acquireLease(path.join(runtime,'deploy.lock'));
     const recovery=reconcilePairJournals(repositoryRoot);
@@ -764,6 +760,7 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
     const active=preliminary.roots.length>0||Object.values(preliminary.processes.bound).some(value=>value>0);
     const compatible=candidate.compatibilityDigest===origin.compatibilityDigest;
     if(active&&!compatible)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
+    if(!compatible&&!rollback)fail('DEPLOY_COMPATIBILITY_MISMATCH','incompatible_candidate');
     const pairMap=new Map([pairOf(origin),candidate,...preliminary.roots.map(pairOf)].filter(Boolean).map(pair=>[JSON.stringify(pair),pair]));
     evidence=prepareRuntimeEvidence({repositoryRoot,pairs:[...pairMap.values()]});
     state={version:2,kind:'pair',status:'pending',operation:rollback?'rollback':'activate',phase:'prepared',origin,
@@ -786,10 +783,12 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
     const contractCompatible=currentContract.protocol===candidateContract.protocol&&currentContract.capabilities===candidateContract.capabilities&&
       [...currentContract.tools].every(([name,contract])=>candidateContract.tools.get(name)===contract);
     if(active&&!contractCompatible)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
+    if(!contractCompatible&&!rollback)fail('DEPLOY_COMPATIBILITY_MISMATCH','incompatible_candidate');
     const prepared=preparePairActivation({repositoryRoot,pair:candidate,expectedCurrent:origin,deployLease:writer});
     directory=publishPairJournal(journalCandidate);
     const before=completePairInventory({repositoryRoot,procRoot});
-    if(!active||!compatible||!contractCompatible){
+    publicationEvidence=preparePairPublicationEvidence({repositoryRoot,evidence,current:origin,roots:before.roots});
+    if(rollback&&(!active||!compatible||!contractCompatible)){
       admission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
       const quiet=requireQuiescence({repositoryRoot,procRoot,excludePids:[process.pid]});
       if(pairRows(repositoryRoot).roots.length)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
@@ -797,9 +796,9 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
     }
     publication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
     const started=process.hrtime.bigint();phaseRunner.observe?.({phase:'publication_acquired',exclusive:true,elapsedNs:'0'});
-    if(!sameJson(readActivation({repositoryRoot}),origin))fail('DEPLOY_CURRENT_CHANGED');
-    const processes=pairProcessInventory({repositoryRoot,procRoot,roots:before.roots});
-    const roots=recheckPairRoots(repositoryRoot,before.roots,phaseRunner.observe);
+    const processes=pairProcessInventory({repositoryRoot,procRoot,roots:before.roots,prepared:publicationEvidence});
+    let roots;try{roots=revalidatePairPublicationEvidence({repositoryRoot,prepared:publicationEvidence,observer:phaseRunner.observe});}
+    catch(error){if(error.code==='DEPLOY_CURRENT_CHANGED')throw error;fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');}
     const current=publishPreparedActivation({repositoryRoot,destination:prepared,expectedCurrent:origin,evidence,publicationLease:publication,journalDirectory:directory,publicationStartedNs:started,
       onPointerIntent:(destination,intent)=>{
         if(!intent?.witness)fail('DEPLOY_RECOVERY_REQUIRED','pointer_identity_unavailable');
@@ -808,6 +807,7 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
       }});
     phaseRunner.observe?.({phase:'pointer_renamed',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
     state.destination=current;state.phase='published';checkpoint(directory,state);
+    phaseRunner.observe?.({phase:'published_checkpointed',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
     publication.close();publication=undefined;
     phaseRunner.observe?.({phase:'publication_released',exclusive:false,elapsedNs:String(process.hrtime.bigint()-started)});
     if(!sameJson(current,state.destination))fail('DEPLOY_CURRENT_CHANGED');
@@ -828,9 +828,14 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
     }
     throw error;
   }finally{
-    removePairValidationDirectory(validationDirectory);
-    evidence?.close();if(logFd!==undefined){fs.fsyncSync(logFd);fs.closeSync(logFd);}
-    publication?.close();admission?.close();writer?.close();
+    let cleanupError;const cleanup=operation=>{try{operation();}catch(error){cleanupError??=error;}};
+    cleanup(()=>publication?.close());publication=undefined;
+    cleanup(()=>admission?.close());admission=undefined;
+    cleanup(()=>removePairValidationDirectory(validationDirectory));validationDirectory=undefined;
+    cleanup(()=>evidence?.close());evidence=undefined;
+    cleanup(()=>{if(logFd!==undefined){fs.fsyncSync(logFd);fs.closeSync(logFd);logFd=undefined;}});
+    cleanup(()=>writer?.close());writer=undefined;
+    if(cleanupError)throw cleanupError;
   }
 }
 

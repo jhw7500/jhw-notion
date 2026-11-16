@@ -116,6 +116,7 @@ class Directory {
 
 const preparedEvidence = new WeakMap();
 const preparedDestinations = new WeakMap();
+const preparedPairPublications = new WeakMap();
 
 function evidenceStat(stat) {
   return Object.freeze({
@@ -1061,11 +1062,23 @@ function durableIdentity(stat,{times=false,links=false}={}) {
   if(times){value.mtimeNs=String(stat.mtimeNs);value.ctimeNs=String(stat.ctimeNs);}
   return value;
 }
-function preparePointerWitness({repositoryRoot,runtime,journalDirectory,temporary,destination,manifest}) {
+function activationDurableProof(activation) {
+  const manifestRecord=readBytes(activation,'manifest.json',65536);
+  const manifestStat=fs.lstatSync(activation.at('manifest.json'),{bigint:true});
+  return Object.freeze({directory:durableIdentity(fs.fstatSync(activation.fd,{bigint:true}),{times:true}),
+    manifest:{...durableIdentity(manifestStat,{times:true,links:true}),sha256:digest(manifestRecord.bytes)}});
+}
+function revalidateActivationDurableProof(activation,proof) {
+  const manifestStat=fs.lstatSync(activation.at('manifest.json'),{bigint:true});
+  if(canonical(durableIdentity(fs.fstatSync(activation.fd,{bigint:true}),{times:true}))!==canonical(proof.directory)||
+    canonical(durableIdentity(manifestStat,{times:true,links:true}))!==canonical(Object.fromEntries(Object.entries(proof.manifest).filter(([key])=>key!=='sha256'))))
+    fail('DEPLOY_ACTIVATION_INVALID');
+}
+function preparePointerWitness({repositoryRoot,runtime,journalDirectory,temporary,destination,originProof,destinationProof}) {
   const expectedParent=path.join(repositoryRoot,'.jhw-runtime/v2/journals');
   if(typeof journalDirectory!=='string'||path.dirname(journalDirectory)!==expectedParent||
       !/^d-[a-f0-9]{32}$/.test(path.basename(journalDirectory)))fail('DEPLOY_ACTIVATION_INVALID');
-  let journal;let witness;let v2;let activations;let activation;
+  let journal;let witness;let v2;let activations;let originActivation;let destinationActivation;
   try {
     journal=new Directory(journalDirectory,null,true);
     if(names(journal).some(name=>name==='pointer-witness'))fail('DEPLOY_ACTIVATION_INVALID');
@@ -1076,20 +1089,20 @@ function preparePointerWitness({repositoryRoot,runtime,journalDirectory,temporar
     const target=fs.readlinkSync(witness.at('current'));
     if(!source.isSymbolicLink()||!linked.isSymbolicLink()||String(source.dev)!==String(linked.dev)||String(source.ino)!==String(linked.ino)||
       target!==`v2/activations/${destination.activationId}`||names(witness).join(',')!=='current')fail('DEPLOY_ACTIVATION_INVALID');
-    v2=runtime.child('v2',false,true);activations=v2.child('activations',false,true);activation=activations.child(destination.activationId,false,true);
-    const manifestRecord=readBytes(activation,'manifest.json',65536);let parsed;
-    try{parsed=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifestRecord.bytes));}catch{fail('DEPLOY_ACTIVATION_INVALID');}
-    if(canonical(parsed)!==canonical(manifest)||!manifestRecord.bytes.equals(Buffer.from(canonical(manifest)+'\n')))fail('DEPLOY_ACTIVATION_INVALID');
-    const manifestStat=fs.lstatSync(activation.at('manifest.json'),{bigint:true});
+    v2=runtime.child('v2',false,true);activations=v2.child('activations',false,true);
+    originActivation=activations.child(originProof.activationId,false,true);
+    destinationActivation=activations.child(destination.activationId,false,true);
+    revalidateActivationDurableProof(originActivation,originProof.activation);
+    revalidateActivationDurableProof(destinationActivation,destinationProof);
     const descriptor=Object.freeze({
       directory:durableIdentity(fs.fstatSync(witness.fd,{bigint:true}),{times:true}),
       pointer:{...durableIdentity(linked),target},
-      activation:{directory:durableIdentity(fs.fstatSync(activation.fd,{bigint:true}),{times:true}),
-        manifest:{...durableIdentity(manifestStat,{times:true,links:true}),sha256:digest(manifestRecord.bytes)}},
+      origin:originProof.activation,
+      destination:destinationProof,
     });
     return {descriptor,journal,witness};
   }catch(error){witness?.close();journal?.close();boundary(error,'DEPLOY_ACTIVATION_INVALID');}
-  finally{activation?.close();activations?.close();v2?.close();}
+  finally{destinationActivation?.close();originActivation?.close();activations?.close();v2?.close();}
 }
 function verifyPointerWitness({runtime,temporary,witness,descriptor,destination}) {
   witness.verify();
@@ -1142,10 +1155,17 @@ export function preparePairActivation({repositoryRoot,pair,expectedCurrent,migra
     const activation=activations.child(manifest.activationId,false,true);
     activationTree=captureEvidenceTree(activation);
     const activationSnapshot=evidenceSnapshot(activationTree);
+    const destinationProof=activationDurableProof(activation);
     closeEvidenceTree(activationTree);activationTree=undefined;
+    let originActivation;let originTree;let originSnapshot;let originProof;
+    if(expectedCurrent!==null)try{
+        originActivation=activations.child(expectedCurrent.activationId,false,true);
+        originTree=captureEvidenceTree(originActivation);originSnapshot=evidenceSnapshot(originTree);
+        originProof={activationId:expectedCurrent.activationId,activation:activationDurableProof(originActivation)};
+      }finally{if(originTree)closeEvidenceTree(originTree);else originActivation?.close();}
     const destination=destinationValue(manifest);
     const prepared={repositoryRoot,pairKey:pairKey(pair),expectedCurrent:canonical(expectedCurrent),
-      activationSnapshot,closed:false};
+      activationSnapshot,destinationProof,originSnapshot,originProof,closed:false};
     preparedDestinations.set(destination,prepared);
     return destination;
   } catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
@@ -1176,22 +1196,24 @@ export function publishPreparedActivation({repositoryRoot,destination,expectedCu
   let root;let runtime;let temporary;let created=false;let durableWitness;let intentAttempted=false;
   try{
     root=new Directory(repositoryRoot);runtime=root.child('.jhw-runtime',false,true);
-    checkCurrentWithoutContentHash(runtime,repositoryRoot,expectedCurrent);
-    const manifest=activationIn(runtime,repositoryRoot,destination.activationId,false,2);
-    if(canonical(destinationValue(manifest))!==canonical(destination))fail('DEPLOY_ACTIVATION_INVALID');
-    let v2;let activations;let activation;
+    if(canonical(observation(runtime))!==canonical(expectedCurrent?.observation??null))fail('DEPLOY_CURRENT_CHANGED');
+    let v2;let activations;let activation;let originActivation;
     try{
       v2=runtime.child('v2',false,true);activations=v2.child('activations',false,true);
+      if(expectedCurrent!==null){originActivation=activations.child(expectedCurrent.activationId,false,true);
+        revalidateEvidenceSnapshot(originActivation,prepared.originSnapshot);}
       activation=activations.child(destination.activationId,false,true);
       revalidateEvidenceSnapshot(activation,prepared.activationSnapshot);
-    }finally{activation?.close();activations?.close();v2?.close();}
+    }finally{activation?.close();originActivation?.close();activations?.close();v2?.close();}
     revalidateRuntimeEvidence(evidence);
     if(process.hrtime.bigint()-started>1_000_000_000n)fail('DEPLOY_SOURCE_CHANGED');
     temporary=`.current.${randomBytes(16).toString('hex')}`;
     fs.symlinkSync(`v2/activations/${destination.activationId}`,runtime.at(temporary));created=true;
     runtime.verify();
     if(canonical(observation(runtime))!==canonical(expectedCurrent?.observation??null))fail('DEPLOY_CURRENT_CHANGED');
-    if(journalDirectory!==null)durableWitness=preparePointerWitness({repositoryRoot,runtime,journalDirectory,temporary,destination,manifest});
+    if(journalDirectory!==null){if(prepared.originProof===undefined)fail('DEPLOY_ACTIVATION_INVALID');durableWitness=preparePointerWitness({repositoryRoot,runtime,journalDirectory,temporary,destination,
+      originProof:prepared.originProof,destinationProof:prepared.destinationProof});
+    }
     if(process.hrtime.bigint()-started>1_000_000_000n)fail('DEPLOY_SOURCE_CHANGED');
     intentAttempted=true;
     const intentResult=onPointerIntent?.(destination,durableWitness?Object.freeze({witness:durableWitness.descriptor}):undefined);
@@ -1201,9 +1223,9 @@ export function publishPreparedActivation({repositoryRoot,destination,expectedCu
     fs.renameSync(runtime.at(temporary),runtime.at('current'));created=false;
     fs.fsyncSync(runtime.fd);
     if(durableWitness)verifyPointerWitness({runtime,temporary:'current',witness:durableWitness.witness,descriptor:durableWitness.descriptor,destination});
-    const result=currentIn(runtime,repositoryRoot,false);
-    if(canonical({...destination,observation:result?.observation})!==canonical(result))fail('DEPLOY_CURRENT_CHANGED');
-    return result;
+    const publishedObservation=observation(runtime);
+    if(publishedObservation?.target!==`v2/activations/${destination.activationId}`)fail('DEPLOY_CURRENT_CHANGED');
+    return {...destination,observation:publishedObservation};
   }catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
   finally{
     if(created){try{runtime.verify();fs.unlinkSync(runtime.at(temporary));}catch{}}
@@ -1238,6 +1260,14 @@ export function selectPairRollbackTarget({repositoryRoot,current,deployLease}) {
     const manifest=activationIn(runtime,repositoryRoot,current.activationId,true,2);
     const prior=manifest.priorCurrent;
     if(!validV2Current(prior)||prior===null||prior.activationId!==current.predecessorActivationId)fail('DEPLOY_PREDECESSOR_INVALID');
+    let predecessor;
+    try{predecessor=activationIn(runtime,repositoryRoot,current.predecessorActivationId,false,2);}
+    catch{fail('DEPLOY_PREDECESSOR_INVALID');}
+    const predecessorCurrent={version:2,activationId:predecessor.activationId,releaseId:predecessor.releaseId,
+      bootstrapId:predecessor.bootstrapId,runtimeContract:predecessor.runtimeContract,
+      compatibilityDigest:predecessor.compatibilityDigest,predecessorActivationId:predecessor.predecessorActivationId,
+      migrationId:predecessor.migrationId,observation:prior.observation};
+    if(canonical(predecessorCurrent)!==canonical(prior))fail('DEPLOY_PREDECESSOR_INVALID');
     const pair={releaseId:prior.releaseId,bootstrapId:prior.bootstrapId,runtimeContract:prior.runtimeContract,
       compatibilityDigest:prior.compatibilityDigest};
     try{readGeneration(runtime,repositoryRoot,pair.bootstrapId);}
@@ -2264,6 +2294,81 @@ function inspectSessionBindingsV2WithLimit({repositoryRoot,limit=Number.MAX_SAFE
   }));
 }
 export function inspectSessionBindingsV2({repositoryRoot}){return inspectSessionBindingsV2WithLimit({repositoryRoot});}
+
+/** Prepare an opaque, fully validated root set whose publication-time checks
+ * use only pointer, process, lease, and filesystem metadata. */
+export function preparePairPublicationEvidence({repositoryRoot,evidence,current,roots}) {
+  const evidenceRecord=evidenceState(evidence);
+  if(evidenceRecord.repositoryRoot!==repositoryRoot||!validV2Current(current)||!Array.isArray(roots))sessionFail();
+  const handle=Object.freeze({});
+  const captured=withStore(repositoryRoot,false,(runtime,root)=>{
+    if(!runtime)sessionFail();
+    const records=new Map();
+    for(const row of roots){
+      const record=Object.fromEntries(Object.entries(row).filter(([key])=>key!=='token'));
+      if(!validV2SessionRecord(record)||row.kind!=='session'||!statePairPresent(evidenceRecord,row))sessionFail();
+      const data=v2Record(runtime,root,repositoryRoot,row.id,row.token);
+      if(canonical(data.record)!==canonical(record))sessionFail();
+      const location=v2Namespace(runtime,null,'session');let directory;
+      try{directory=location.namespace.child(row.id,false,true);
+        records.set(row.id,{row:Object.freeze({...row}),directory:evidenceStat(fs.fstatSync(directory.fd,{bigint:true})),
+          manifest:evidenceStat(fs.lstatSync(directory.at('manifest.json'),{bigint:true})),
+          lease:evidenceStat(fs.lstatSync(directory.at('lease'),{bigint:true}))});
+      }finally{directory?.close();closeV2Namespace(location);}
+    }
+    const legacy=sessionDirectory(runtime);let legacyIds=[];
+    try{if(legacy)legacyIds=sessionInventory(legacy).ids;}finally{legacy?.close();}
+    if(legacyIds.length)sessionFail();
+    return records;
+  });
+  const pair={releaseId:current.releaseId,bootstrapId:current.bootstrapId,runtimeContract:current.runtimeContract,
+    compatibilityDigest:current.compatibilityDigest};
+  if(!statePairPresent(evidenceRecord,pair))sessionFail();
+  preparedPairPublications.set(handle,{repositoryRoot,evidence,current:canonical(current),records:captured});
+  return handle;
+}
+function statePairPresent(evidenceRecord,value) {
+  return evidenceRecord.pairs.has(pairKey({releaseId:value.releaseId,bootstrapId:value.bootstrapId,
+    runtimeContract:value.runtimeContract,compatibilityDigest:value.compatibilityDigest}));
+}
+export function revalidatePairPublicationEvidence({repositoryRoot,prepared,observer}) {
+  const state=preparedPairPublications.get(prepared);
+  if(!state||state.repositoryRoot!==repositoryRoot)evidenceFail();
+  const evidenceRecord=evidenceState(state.evidence);
+  if(evidenceRecord.repositoryRoot!==repositoryRoot)evidenceFail();
+  const legacyIndex=sessionIndexLease(repositoryRoot,true);
+  const v2Index=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);
+  try{return withStore(repositoryRoot,false,runtime=>{
+    if(!runtime||canonical(observation(runtime))!==canonical(JSON.parse(state.current).observation))fail('DEPLOY_CURRENT_CHANGED');
+    const legacy=sessionDirectory(runtime);try{if(legacy&&sessionInventory(legacy).ids.length)sessionFail();}finally{legacy?.close();}
+    observer?.({phase:'root_index_held',exclusive:true});
+    let location;try{location=v2Namespace(runtime,null,'session');}
+    catch(error){if(error.code==='ENOENT'&&state.records.size===0)return[];throw error;}
+    try{
+      const actual=sessionNames(location.namespace);const rows=[];
+      for(const id of actual){
+        const expected=state.records.get(id);if(!expected)sessionFail();let directory;
+        try{directory=location.namespace.child(id,false,true);
+          if(!same(expected.directory,fs.fstatSync(directory.fd,{bigint:true}))||
+            !same(expected.manifest,fs.lstatSync(directory.at('manifest.json'),{bigint:true}))||
+            !same(expected.lease,fs.lstatSync(directory.at('lease'),{bigint:true}))||
+            !leaseIsHeld(path.join(repositoryRoot,'.jhw-runtime/v2/sessions',id,'lease')))sessionFail();
+          ownerMatches(expected.row);rows.push(expected.row);
+        }finally{directory?.close();}
+      }
+      return rows;
+    }finally{closeV2Namespace(location);}
+  });}finally{v2Index.close();legacyIndex.close();}
+}
+export function verifyPairPublicationConsumer({prepared,observation}) {
+  const state=preparedPairPublications.get(prepared);
+  if(!state||!observation||typeof observation!=='object')return false;
+  const expected=observation.token===undefined
+    ?[...state.records.values()].find(item=>item.row.owner.pid===observation.pid&&item.row.owner.startTime===observation.startTime)
+    :[...state.records.values()].find(item=>item.row.token===observation.token);
+  if(!expected)return false;
+  try{requireSessionDescendant(observation.pid,expected.row);ownerMatches(expected.row);return true;}catch{return false;}
+}
 function reapV2PrivateCandidate({repositoryRoot,kind,bootstrapId,name,dryRun}) {
   const match=V2_PRIVATE_BINDING.exec(name);const id=match?.[1]??match?.[2];
   if(!id||(kind==='session'?!SESSION_ID.test(id):!INVOCATION_ID.test(id)))return false;
