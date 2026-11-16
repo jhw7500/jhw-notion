@@ -117,7 +117,7 @@ fresh reviewer가 거부하면 그 task 범위에서 수정·재검증한다. �
 
 ### Task 3: root·invocation 등록과 lease 수명
 
-**Files:** Modify `scripts/runtime-store.mjs`의 binding/retirement/reaper, `scripts/runtime-entry.mjs`의 runManaged/runPinnedHook/자식 stdio, 필요 범위의 `scripts/runtime-safety.mjs`. Create `scripts/test-runtime-v2-sessions.mjs`. Extend `scripts/test-runtime-v2-entry.mjs`, `scripts/test-support/runtime-v2.mjs`.
+**Files:** Modify `scripts/jhw-runtime-entry`의 bound token 세대 선택, `scripts/runtime-store.mjs`의 binding/retirement/reaper, `scripts/runtime-entry.mjs`의 runManaged/runPinnedHook/자식 stdio, 필요 범위의 `scripts/runtime-safety.mjs`. Create `scripts/test-runtime-v2-sessions.mjs`. Extend `scripts/test-runtime-v2-entry.mjs`, `scripts/test-support/runtime-v2.mjs`.
 
 **Interfaces:** `bindEntryPair({repositoryRoot,token,kind='invocation',selectedPair,admissionLease}):BindingV2|{retryCurrent:true}`, `resolveSessionBindingV2({repositoryRoot,token,pid=process.pid}):RuntimePair & {id:string,kind:string}`, `inspectSessionBindingsV2({repositoryRoot}):object[]`, `reapCompletedSessionBindingsV2({repositoryRoot,dryRun=true,limit=128}):{retired:string[],preserved:string[]}`. v1 API는 그대로 두고 entry에서 형식에 따라 dispatch한다.
 

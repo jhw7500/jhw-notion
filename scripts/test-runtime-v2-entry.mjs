@@ -166,3 +166,68 @@ test('guardFloor variants are refused by installer and stable router source vali
     assert.equal(result.stderr,'DEPLOY_BOOTSTRAP_INVALID\n');
   }
 });
+
+test('production v2 entry binds selected pair and bound calls bypass publication current selection', async t => {
+  const f = await createRuntimeFixture(t,{productionEntry:true});
+  f.write('mcp-server/.env','NOTION_API_KEY=fixture-secret\n',0o600);
+  const release = await f.prepare();
+  const deployLease = acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const admissionLease = acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{create:true});
+  const pair = store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  await entry.installRouterV2({repositoryRoot:f.root,releaseId:release.releaseId,deployLease,admissionLease});
+  admissionLease.close();deployLease.close();f.seedPair(pair);
+  const payload = String.raw`
+const {spawnSync}=require('node:child_process');
+const path=require('node:path');
+(async()=>{
+  const root=process.argv[1];
+  const safety=await import('file://'+path.join(root,'scripts/runtime-safety.mjs'));
+  const publication=safety.acquireLease(path.join(root,'.jhw-runtime/publication.lock'));
+  const bound=spawnSync(path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),['mcp'],{encoding:'utf8',env:process.env,timeout:6000});
+  const unboundEnv={...process.env};delete unboundEnv.JHW_RUNTIME_SESSION_BINDING;
+  const started=Date.now();
+  const unbound=spawnSync(path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),['mcp'],{encoding:'utf8',env:unboundEnv,timeout:6000});
+  const elapsed=Date.now()-started;publication.close();
+  process.stdout.write(JSON.stringify({bound:{status:bound.status,stdout:bound.stdout,stderr:bound.stderr},unbound:{status:unbound.status,stderr:unbound.stderr,elapsed}})+'\n');
+})().catch(error=>{console.error(error);process.exit(1)});
+`;
+  const result = await f.run(['jhw-runtime-entry','session','--',process.execPath,'-e',payload,f.root]);
+  assert.equal(result.status,0,result.stderr);
+  const observed=JSON.parse(result.stdout.trim().split('\n').at(-1));
+  assert.equal(observed.bound.status,0,observed.bound.stderr);
+  const boundCall=JSON.parse(observed.bound.stdout);
+  assert.deepEqual(boundCall.observedFdRoles,{3:'admission',5:'credential',6:'binding',7:'generation',8:'parent'});
+  assert.equal(boundCall.releaseRoot,path.join(f.root,'.jhw-runtime/releases',pair.releaseId));
+  assert.equal(observed.unbound.status,75);
+  assert.equal(observed.unbound.stderr,'DEPLOY_MAINTENANCE\n');
+  assert.ok(observed.unbound.elapsed>=450,`new root waited only ${observed.unbound.elapsed}ms`);
+});
+
+test('production runtime entry returns retryCurrent when current moved after router selection', async t => {
+  const f = await createRuntimeFixture(t,{productionEntry:true});
+  const release = await f.prepare();
+  const deployLease = acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const admissionLease = acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{create:true});
+  const pair = store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  const router = await entry.installRouterV2({repositoryRoot:f.root,releaseId:release.releaseId,deployLease,admissionLease});
+  admissionLease.close();deployLease.close();f.seedPair(pair);
+  const generation=path.join(f.root,`.jhw-runtime/v2/bootstraps/${pair.bootstrapId}`);
+  const moved={...pair,releaseId:pair.releaseId.replace(/.$/,pair.releaseId.endsWith('0')?'1':'0')};
+  const result=await entry.runManaged({repositoryRoot:f.root,selector:'mcp',args:[],sourceReleaseId:router.sourceReleaseId,
+    safetySource:fs.readFileSync(path.join(generation,'runtime-safety.mjs')),
+    storeSource:fs.readFileSync(path.join(generation,'runtime-store.mjs')),selectedPair:moved});
+  assert.deepEqual(result,{retryCurrent:true});
+});
+
+test('stable router and binder share one three-attempt current retry budget', async t => {
+  const f = await createRuntimeFixture(t,{retryHelper:true});
+  const release = await f.prepare();
+  const deployLease = acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const admissionLease = acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{create:true});
+  const pair = store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  await entry.installRouterV2({repositoryRoot:f.root,releaseId:release.releaseId,deployLease,admissionLease});
+  admissionLease.close();deployLease.close();f.seedPair(pair);
+  const result=await f.run(['jhw-runtime-entry','mcp']);
+  assert.equal(result.status,75);
+  assert.equal(fs.readFileSync(path.join(f.root,'.retry-count'),'utf8'),'3');
+});

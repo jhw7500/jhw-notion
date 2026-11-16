@@ -1558,6 +1558,277 @@ function createSessionBindingWith({ repositoryRoot, releaseId, kind, parentBindi
   });
 }
 
+const V2_BINDING_TOKEN = /^v2:(b-[a-f0-9]{64}):((?:s|i)-[a-f0-9]{32}):([a-f0-9]{64})$/;
+const V2_PRIVATE_BINDING = /^(?:\.creating\.((?:s|i)-[a-f0-9]{32})|\.retired\.((?:s|i)-[a-f0-9]{32})\.[a-f0-9]{32})$/;
+function v2IndexLease(repositoryRoot, bootstrapId, kind, shared) {
+  const file = kind === 'session'
+    ? path.join(repositoryRoot, '.jhw-runtime/v2/session-index.lock')
+    : path.join(repositoryRoot, `.jhw-runtime/v2/invocation-index/${bootstrapId}.lock`);
+  withStore(repositoryRoot,false,runtime => {
+    if(!runtime)sessionFail();
+    const v2=runtime.child('v2',false,true);let indexes;
+    try{if(kind==='invocation')indexes=v2.child('invocation-index',true,true);}
+    finally{indexes?.close();v2.close();}
+  });
+  const deadline = process.hrtime.bigint() + SESSION_INDEX_WAIT_NS;
+  for (;;) {
+    try { return acquireLease(file, {shared,create:true}); }
+    catch (error) {
+      if (error.code !== 'DEPLOY_LOCK_CONTENDED' || process.hrtime.bigint() >= deadline) sessionFail();
+      Atomics.wait(SESSION_INDEX_SLEEP, 0, 0, 5);
+    }
+  }
+}
+function v2Namespace(runtime, bootstrapId, kind, create = false) {
+  const v2 = runtime.child('v2', create, true);
+  let group; let namespace;
+  try {
+    if (kind === 'session') namespace = v2.child('sessions', create, true);
+    else {
+      group = v2.child('invocations', create, true);
+      namespace = group.child(bootstrapId, create, true);
+    }
+    return {v2,group,namespace};
+  } catch (error) { namespace?.close(); group?.close(); v2.close(); throw error; }
+}
+function closeV2Namespace(value) { value.namespace.close(); value.group?.close(); value.v2.close(); }
+function v2Record(runtime, root, repositoryRoot, id, expectedToken = null) {
+  const kind = SESSION_ID.test(id) ? 'session' : INVOCATION_ID.test(id) ? 'invocation' : sessionFail();
+  const tokenMatch = expectedToken === null ? null : V2_BINDING_TOKEN.exec(expectedToken);
+  if (expectedToken !== null && (!tokenMatch || tokenMatch[2] !== id)) sessionFail();
+  const bootstrapId = tokenMatch?.[1] ?? null;
+  if (kind === 'invocation' && bootstrapId === null) sessionFail();
+  const location = v2Namespace(runtime, bootstrapId, kind); let directory;
+  try {
+    directory = location.namespace.child(id, false, true);
+    if (canonical(names(directory)) !== canonical(['lease','manifest.json'])) sessionFail();
+    const manifest = readBytes(directory, 'manifest.json', SESSION_MANIFEST_LIMIT);
+    if (manifest.mode !== 0o600) sessionFail();
+    const record = JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifest.bytes));
+    const actualToken = `v2:${record.bootstrapId}:${id}:${digest(manifest.bytes)}`;
+    const manifestStat = fs.lstatSync(directory.at('manifest.json'), {bigint:true});
+    const leaseStat = fs.lstatSync(directory.at('lease'), {bigint:true});
+    if (!validV2SessionRecord(record) || record.id !== id || record.kind !== kind ||
+        record.repository.path !== repositoryRoot || record.repository.dev !== String(root.stat.dev) ||
+        record.repository.ino !== String(root.stat.ino) || !validManifestIdentity(record.manifest,manifestStat) ||
+        !validLeaseIdentity(record.lease,leaseStat) || manifest.bytes.toString('utf8') !== canonical(record)+'\n' ||
+        expectedToken !== null && actualToken !== expectedToken) sessionFail();
+    directory.verify();
+    const leaseFile = kind === 'session'
+      ? path.join(repositoryRoot,'.jhw-runtime/v2/sessions',id,'lease')
+      : path.join(repositoryRoot,'.jhw-runtime/v2/invocations',record.bootstrapId,id,'lease');
+    return {record,token:actualToken,leaseFile};
+  } catch { sessionFail(); }
+  finally { directory?.close(); closeV2Namespace(location); }
+}
+function verifyV2Pair(runtime, repositoryRoot, record) {
+  readGeneration(runtime, repositoryRoot, record.bootstrapId);
+  if (releaseCompatibilityIn(runtime, repositoryRoot, record.releaseId) !== record.compatibilityDigest) sessionFail();
+}
+function verifyV2Live(runtime, repositoryRoot, data, pid) {
+  if (!leaseIsHeld(data.leaseFile)) sessionFail();
+  ownerMatches(data.record);
+  requireSessionDescendant(pid, data.record);
+  verifyV2Pair(runtime, repositoryRoot, data.record);
+  if (!leaseIsHeld(data.leaseFile)) sessionFail();
+  ownerMatches(data.record);
+}
+function v2RootByToken(runtime, root, repositoryRoot, token, pid) {
+  const parsed = V2_ROOT_TOKEN.exec(token);
+  if (!parsed) sessionFail();
+  const data = v2Record(runtime, root, repositoryRoot, parsed[2], token);
+  if (data.record.kind !== 'session' || data.record.bootstrapId !== parsed[1]) sessionFail();
+  verifyV2Live(runtime, repositoryRoot, data, pid);
+  return data;
+}
+export function resolveSessionBindingV2({repositoryRoot,token,pid=process.pid}) {
+  return sessionBoundary(() => {
+    sessionRootName(repositoryRoot);
+    return withStore(repositoryRoot,false,(runtime,root) => {
+      if (!runtime) sessionFail();
+      const data = v2RootByToken(runtime,root,repositoryRoot,token,pid);
+      const {releaseId,bootstrapId,runtimeContract,compatibilityDigest,id,kind} = data.record;
+      return {releaseId,bootstrapId,runtimeContract,compatibilityDigest,id,kind};
+    });
+  });
+}
+function retireV2Record({repositoryRoot,record,token}) {
+  let generation;
+  try {
+    generation=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${record.bootstrapId}/lease`),{shared:true});
+    const index = v2IndexLease(repositoryRoot,record.bootstrapId,record.kind,false);
+    try {
+      return withStore(repositoryRoot,false,(runtime,root) => {
+      const data = v2Record(runtime,root,repositoryRoot,record.id,token);
+      if (canonical(data.record) !== canonical(record)) sessionFail();
+      let exclusive;
+      try { exclusive = acquireLease(data.leaseFile); }
+      catch (error) { if (error.code === 'DEPLOY_LOCK_CONTENDED') return false; throw error; }
+      const location = v2Namespace(runtime,record.bootstrapId,record.kind); let directory;
+      try {
+        directory = location.namespace.child(record.id,false,true);
+        const retired = `.retired.${record.id}.${randomBytes(16).toString('hex')}`;
+        fs.renameSync(location.namespace.at(record.id),location.namespace.at(retired)); fs.fsyncSync(location.namespace.fd);
+        directory.close(); directory = location.namespace.child(retired,false,true);
+        const check = readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT);
+        if (`v2:${record.bootstrapId}:${record.id}:${digest(check.bytes)}` !== token) sessionFail();
+        fs.unlinkSync(directory.at('manifest.json')); fs.unlinkSync(directory.at('lease')); fs.fsyncSync(directory.fd);
+        directory.close(); directory=undefined; fs.rmdirSync(location.namespace.at(retired)); fs.fsyncSync(location.namespace.fd);
+        return true;
+      } finally { directory?.close(); closeV2Namespace(location); exclusive.close(); }
+      });
+    } finally { index.close(); }
+  } finally { generation?.close(); }
+}
+function createV2Record({repositoryRoot,selectedPair,kind,parentBinding,generationLease,parentLease}) {
+  return withStore(repositoryRoot,false,(runtime,root) => {
+    const observed=sessionProcess(process.pid);
+    const owner={uid:observed.uid,pid:observed.pid,startTime:observed.startTime,bootId:sessionBootId(),
+      commandDigest:observed.commandDigest,exeDev:observed.exeDev,exeIno:observed.exeIno};
+    const id=(kind==='session'?'s-':'i-')+randomBytes(16).toString('hex');
+    const staging='.creating.'+id;
+    const index=v2IndexLease(repositoryRoot,selectedPair.bootstrapId,kind,false);
+    const location=v2Namespace(runtime,selectedPair.bootstrapId,kind,true);
+    let directory;let lease;let manifestFd;let published=false;
+    try {
+      fs.mkdirSync(location.namespace.at(staging),{mode:0o700});
+      directory=location.namespace.child(staging,false,true);
+      writeBytes(directory,'lease','',0o600);
+      const leaseFile=kind==='session'
+        ? path.join(repositoryRoot,'.jhw-runtime/v2/sessions',staging,'lease')
+        : path.join(repositoryRoot,'.jhw-runtime/v2/invocations',selectedPair.bootstrapId,staging,'lease');
+      lease=acquireLease(leaseFile,{shared:true});
+      manifestFd=fs.openSync(directory.at('manifest.json'),C.O_WRONLY|C.O_CREAT|C.O_EXCL|C.O_NOFOLLOW,0o600);
+      fs.fchmodSync(manifestFd,0o600);
+      const manifestIdentity=fs.fstatSync(manifestFd,{bigint:true});
+      const leaseIdentity=fs.fstatSync(lease.fd,{bigint:true});
+      const record={version:2,id,kind,...selectedPair,parentBinding,
+        repository:{path:repositoryRoot,dev:String(root.stat.dev),ino:String(root.stat.ino)},owner,
+        manifest:{dev:String(manifestIdentity.dev),ino:String(manifestIdentity.ino)},
+        lease:{dev:String(leaseIdentity.dev),ino:String(leaseIdentity.ino),fd:lease.fd},createdAt:new Date().toISOString()};
+      if (!validV2SessionRecord(record)) sessionFail();
+      const bytes=canonical(record)+'\n'; fs.writeFileSync(manifestFd,bytes); fs.fsyncSync(manifestFd);
+      fs.closeSync(manifestFd);manifestFd=undefined;fs.fsyncSync(directory.fd);
+      ownerMatches(record);fs.renameSync(location.namespace.at(staging),location.namespace.at(id));published=true;
+      fs.fsyncSync(location.namespace.fd);directory.close();directory=undefined;
+      const token=`v2:${selectedPair.bootstrapId}:${id}:${digest(bytes)}`;
+      v2Record(runtime,root,repositoryRoot,id,token);ownerMatches(record);
+      const held=lease;lease=undefined;let closed=false;
+      return {id,token,record,lease:held,generationLease,parentLease,close(){
+        if(closed)return;closed=true;held.close();
+        try{retireV2Record({repositoryRoot,record,token});}catch{}
+        parentLease?.close();generationLease.close();
+      }};
+    } finally {
+      if(manifestFd!==undefined)fs.closeSync(manifestFd);lease?.close();
+      if(!published&&directory){try{for(const name of names(directory))fs.unlinkSync(directory.at(name));fs.rmdirSync(location.namespace.at(staging));}catch{}}
+      directory?.close();closeV2Namespace(location);index.close();
+    }
+  });
+}
+export function bindEntryPair({repositoryRoot,token,kind='invocation',selectedPair,admissionLease}) {
+  return sessionBoundary(() => {
+    sessionRootName(repositoryRoot);
+    if(!validRuntimePair(selectedPair)||!['session','invocation'].includes(kind)||kind==='session'&&token!==undefined)sessionFail();
+    requireLeaseIdentity(admissionLease,path.join(repositoryRoot,'.jhw-runtime/admission.lock'));
+    if(token===undefined){
+      const current=withStore(repositoryRoot,false,runtime=>currentIn(runtime,repositoryRoot,false));
+      if(!current||current.version!==2||canonical({releaseId:current.releaseId,bootstrapId:current.bootstrapId,
+          runtimeContract:current.runtimeContract,compatibilityDigest:current.compatibilityDigest})!==canonical(selectedPair))return {retryCurrent:true};
+    }
+    let generationLease=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${selectedPair.bootstrapId}/lease`),{shared:true});
+    let parentLease=null;
+    try {
+      validateBootstrapGeneration({repositoryRoot,bootstrapId:selectedPair.bootstrapId});
+      if(token!==undefined){
+        const parent=withStore(repositoryRoot,false,(runtime,root)=>v2RootByToken(runtime,root,repositoryRoot,token,process.pid));
+        const pair={releaseId:parent.record.releaseId,bootstrapId:parent.record.bootstrapId,runtimeContract:parent.record.runtimeContract,
+          compatibilityDigest:parent.record.compatibilityDigest};
+        if(canonical(pair)!==canonical(selectedPair))sessionFail();
+        parentLease=acquireLease(parent.leaseFile,{shared:true});
+        withStore(repositoryRoot,false,(runtime,root)=>v2RootByToken(runtime,root,repositoryRoot,token,process.pid));
+      }
+      const result=createV2Record({repositoryRoot,selectedPair,kind,parentBinding:token??null,generationLease,parentLease});
+      generationLease=undefined;parentLease=undefined;return result;
+    } finally {parentLease?.close();generationLease?.close();}
+  });
+}
+export function inspectSessionBindingsV2({repositoryRoot}) {
+  return sessionBoundary(() => withStore(repositoryRoot,false,(runtime,root) => {
+    if(!runtime)return[];const rows=[];let v2;
+    try{v2=runtime.child('v2',false,true);}catch(error){if(error.code==='ENOENT')return[];throw error;}
+    try{
+      let roots;try{roots=v2.child('sessions',false,true);}catch(error){if(error.code!=='ENOENT')throw error;}
+      if(roots){const index=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);try{for(const id of names(roots).filter(name=>SESSION_ID.test(name)).sort()){const data=v2Record(runtime,root,repositoryRoot,id);rows.push({...data.record,token:data.token,live:leaseIsHeld(data.leaseFile)});}}finally{index.close();roots.close();}}
+      let invocations;try{invocations=v2.child('invocations',false,true);}catch(error){if(error.code==='ENOENT')return rows;throw error;}
+      // Invocation records need their digest to form a token; read the bytes once under their index.
+      for(const bootstrapId of names(invocations).filter(name=>BOOTSTRAP.test(name)).sort()){const group=invocations.child(bootstrapId,false,true);const index=v2IndexLease(repositoryRoot,bootstrapId,'invocation',true);try{for(const id of names(group).filter(name=>INVOCATION_ID.test(name)).sort()){const directory=group.child(id,false,true);let bytes;try{bytes=readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT).bytes;}finally{directory.close();}const token=`v2:${bootstrapId}:${id}:${digest(bytes)}`;const data=v2Record(runtime,root,repositoryRoot,id,token);rows.push({...data.record,token:data.token,live:leaseIsHeld(data.leaseFile)});}}finally{index.close();group.close();}}
+      invocations.close();return rows.sort((a,b)=>a.kind===b.kind?a.id.localeCompare(b.id):a.kind==='session'?-1:1);
+    }finally{v2.close();}
+  }));
+}
+function reapV2PrivateCandidate({repositoryRoot,kind,bootstrapId,name,dryRun}) {
+  const match=V2_PRIVATE_BINDING.exec(name);const id=match?.[1]??match?.[2];
+  if(!id||(kind==='session'?!SESSION_ID.test(id):!INVOCATION_ID.test(id)))return false;
+  let snapshot;
+  try{snapshot=withStore(repositoryRoot,false,runtime=>{
+    const location=v2Namespace(runtime,bootstrapId,kind);let directory;
+    try{directory=location.namespace.child(name,false,true);if(canonical(names(directory))!==canonical(['lease','manifest.json']))return null;
+      const manifest=readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT);const record=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifest.bytes));
+      const lease=fs.lstatSync(directory.at('lease'),{bigint:true});
+      if(!validV2SessionRecord(record)||record.id!==id||record.kind!==kind||bootstrapId!==null&&record.bootstrapId!==bootstrapId||
+        !validLeaseIdentity(record.lease,lease)||manifest.bytes.toString('utf8')!==canonical(record)+'\n')return null;
+      return {record,bytes:manifest.bytes};
+    }finally{directory?.close();closeV2Namespace(location);}
+  });}catch{return false;}
+  if(!snapshot||dryRun)return false;
+  let generation;let index;let exclusive;
+  try{
+    generation=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${snapshot.record.bootstrapId}/lease`),{shared:true});
+    index=v2IndexLease(repositoryRoot,snapshot.record.bootstrapId,kind,false);
+    return withStore(repositoryRoot,false,runtime=>{
+      const location=v2Namespace(runtime,snapshot.record.bootstrapId,kind);let directory;
+      try{directory=location.namespace.child(name,false,true);const manifest=readBytes(directory,'manifest.json',SESSION_MANIFEST_LIMIT);
+        if(!manifest.bytes.equals(snapshot.bytes))sessionFail();
+        const leaseFile=kind==='session'?path.join(repositoryRoot,'.jhw-runtime/v2/sessions',name,'lease'):
+          path.join(repositoryRoot,'.jhw-runtime/v2/invocations',snapshot.record.bootstrapId,name,'lease');
+        try{exclusive=acquireLease(leaseFile);}catch(error){if(error.code==='DEPLOY_LOCK_CONTENDED')return false;throw error;}
+        const held=fs.fstatSync(exclusive.fd,{bigint:true});if(!validLeaseIdentity(snapshot.record.lease,held))sessionFail();
+        fs.unlinkSync(directory.at('manifest.json'));fs.unlinkSync(directory.at('lease'));fs.fsyncSync(directory.fd);
+        directory.close();directory=undefined;fs.rmdirSync(location.namespace.at(name));fs.fsyncSync(location.namespace.fd);return true;
+      }finally{directory?.close();closeV2Namespace(location);}
+    });
+  }catch{return false;}
+  finally{exclusive?.close();index?.close();generation?.close();}
+}
+export function reapCompletedSessionBindingsV2({repositoryRoot,dryRun=true,limit=128}) {
+  return sessionBoundary(() => {
+    if(typeof dryRun!=='boolean'||!Number.isInteger(limit)||limit<1||limit>SESSION_LIMIT)sessionFail();
+    const rows=inspectSessionBindingsV2({repositoryRoot});const retired=[];const preserved=[];
+    for(const row of rows.slice(0,limit)){
+      if(leaseIsHeld(path.join(repositoryRoot,row.kind==='session'?`.jhw-runtime/v2/sessions/${row.id}/lease`:`.jhw-runtime/v2/invocations/${row.bootstrapId}/${row.id}/lease`))){preserved.push(row.id);continue;}
+      const {token,live:_live,...record}=row;
+      if(!dryRun&&retireV2Record({repositoryRoot,record,token}))retired.push(row.id);else preserved.push(row.id);
+    }
+    if(retired.length+preserved.length<limit){
+      const privateRows=withStore(repositoryRoot,false,runtime=>{
+        const result=[];let v2;try{v2=runtime.child('v2',false,true);}catch(error){if(error.code==='ENOENT')return result;throw error;}
+        try{
+          let roots;try{roots=v2.child('sessions',false,true);}catch(error){if(error.code!=='ENOENT')throw error;}
+          if(roots){const index=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);try{for(const name of names(roots))if(V2_PRIVATE_BINDING.test(name))result.push({kind:'session',bootstrapId:null,name});}finally{index.close();roots.close();}}
+          let invocations;try{invocations=v2.child('invocations',false,true);}catch(error){if(error.code!=='ENOENT')throw error;}
+          if(invocations){try{for(const bootstrapId of names(invocations).filter(name=>BOOTSTRAP.test(name))){const group=invocations.child(bootstrapId,false,true);const index=v2IndexLease(repositoryRoot,bootstrapId,'invocation',true);try{for(const name of names(group))if(V2_PRIVATE_BINDING.test(name))result.push({kind:'invocation',bootstrapId,name});}finally{index.close();group.close();}}}finally{invocations.close();}}
+          return result;
+        }finally{v2.close();}
+      });
+      for(const candidate of privateRows.slice(0,limit-retired.length-preserved.length)){
+        if(reapV2PrivateCandidate({repositoryRoot,dryRun,...candidate}))retired.push(candidate.name);else preserved.push(candidate.name);
+      }
+    }
+    return {retired,preserved};
+  });
+}
+
 
 // Missing pins must not turn a descendant of a pinned wrapper into an unbound
 // caller. Ancestor traversal reads only PID relationship metadata, including for

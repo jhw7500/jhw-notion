@@ -13,6 +13,8 @@ const COMPATIBILITY_DECLARATION = 'mcp-server/src/control/runtime-compatibility.
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
 const BOOTSTRAP = /^b-[a-f0-9]{64}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
+const PUBLICATION_WAIT_NS=500_000_000n;
+const PUBLICATION_SLEEP=new Int32Array(new SharedArrayBuffer(4));
 export const STARTUP_ENVIRONMENT = ['NODE_OPTIONS','NODE_PATH','NODE_REPL_EXTERNAL_MODULE','BASH_ENV','ENV'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const modeFor = name => name.startsWith('jhw-') ? 0o755 : 0o644;
@@ -22,6 +24,10 @@ function runtimeEnvironment() {
   return environment;
 }
 function fail(code = 'DEPLOY_BOOTSTRAP_INVALID') { const error = new Error(code); error.code = code; throw error; }
+function acquirePublication(safety,file,bounded){
+  const deadline=process.hrtime.bigint()+PUBLICATION_WAIT_NS;
+  for(;;){try{return safety.acquireLease(file,{shared:true,create:true});}catch(error){if(!bounded||error.code!=='DEPLOY_LOCK_CONTENDED'||process.hrtime.bigint()>=deadline)throw error;Atomics.wait(PUBLICATION_SLEEP,0,0,5);}}
+}
 function exact(value, keys) { return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join(',') === [...keys].sort().join(','); }
 function same(a, b) { return ['dev','ino','uid','gid','mode','nlink','size','ctimeNs','mtimeNs'].every(key => a[key] === b[key]); }
 
@@ -401,6 +407,11 @@ const fs=require('node:fs'); const path=require('node:path');
 const entry=process.argv[1]; const releaseRoot=process.argv[2]; const selector=process.argv[3]; const credential=process.argv[4]; const args=process.argv.slice(5);
 const invalid=()=>{ throw Object.assign(new Error('DEPLOY_RUNTIME_BINDING_INVALID'),{code:'DEPLOY_RUNTIME_BINDING_INVALID'}); };
 const same=(a,b)=>['dev','ino','uid','gid','mode','nlink','size','ctimeNs','mtimeNs'].every(key=>a[key]===b[key]);
+const fdRoles={3:'admission',6:'binding',7:'generation'};
+if(credential==='fd')fdRoles[5]='credential';
+if(process.env.JHW_RUNTIME_SESSION_BINDING!==undefined)fdRoles[8]='parent';
+for(const fd of Object.keys(fdRoles)){try{fs.fstatSync(Number(fd));}catch{invalid();}}
+Object.defineProperty(globalThis,'__JHW_MANAGED_FD_ROLES__',{value:fdRoles,writable:false,configurable:false,enumerable:false});
 const parseCredential=bytes=>{
   let text; try { text=new TextDecoder('utf-8',{fatal:true}).decode(bytes); } catch { invalid(); }
   if(text.includes('\0')) invalid();
@@ -497,7 +508,7 @@ const finish=(code,signal)=>{
   const output=!overflow && code===0 && signal===null ? validate(Buffer.concat(chunks,length)) : undefined;
   if(output) process.stdout.write(output); else fallback(timedOut ? 'GUARD_HOOK_TIMEOUT' : 'GUARD_UNAVAILABLE');
 };
-try { child=spawn(process.execPath,['-e',coreRunner,'--','/proc/self/fd/4',releaseRoot,'hook','none',...args],{stdio:['inherit','pipe','inherit',3,4,'ignore',6]}); }
+try { child=spawn(process.execPath,['-e',coreRunner,'--','/proc/self/fd/4',releaseRoot,'hook','none',...args],{stdio:['inherit','pipe','inherit',3,4,'ignore',6,7,8]}); }
 catch { fallback('GUARD_UNAVAILABLE'); process.exit(0); }
 child.stdout.on('data',chunk=>{ if(overflow) return; length+=chunk.length; if(length>12*1024) { overflow=true; chunks.length=0; child.kill('SIGTERM'); } else chunks.push(chunk); });
 child.stdout.on('error',()=>{ overflow=true; child.kill('SIGTERM'); });
@@ -510,7 +521,7 @@ function runPinnedHook({args,artifact,lease,binding,releaseRoot}) {
     let child;
     try {
       artifact.verify();
-      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',releaseRoot,...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd,'ignore',binding.fd],env:runtimeEnvironment()});
+      child=spawn(process.execPath,['-e',HOOK_RUNNER_SOURCE,'--',releaseRoot,...args],{stdio:['inherit','inherit','inherit',lease.fd,artifact.fd,'ignore',binding.lease?.fd??binding.fd,binding.generationLease?.fd??'ignore',binding.parentLease?.fd??'ignore'],env:runtimeEnvironment()});
       fs.closeSync(artifact.fd); artifact.fd=undefined;
     } catch { if(artifact.fd!==undefined) { fs.closeSync(artifact.fd); artifact.fd=undefined; } resolve(failure('hook',args,'GUARD_UNAVAILABLE')); return; }
     child.once('error',()=>resolve(failure('hook',args,'GUARD_UNAVAILABLE')));
@@ -535,15 +546,17 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
     if(selector==='session' && token!==undefined) fail('DEPLOY_SESSION_INVALID');
     const validated=validateBootstrap({repositoryRoot});
     if(sourceReleaseId!==validated.sourceReleaseId || !Buffer.isBuffer(safetySource) || !Buffer.isBuffer(storeSource)) fail('DEPLOY_BOOTSTRAP_CHANGED');
-    const byName=new Map(validated.files.map(record=>[record.name,record]));
-    if(hash(safetySource)!==byName.get('runtime-safety.mjs')?.sha256 || hash(storeSource)!==byName.get('runtime-store.mjs')?.sha256) fail('DEPLOY_BOOTSTRAP_CHANGED');
+    if(selectedPair===null){
+      const byName=new Map(validated.files.map(record=>[record.name,record]));
+      if(hash(safetySource)!==byName.get('runtime-safety.mjs')?.sha256 || hash(storeSource)!==byName.get('runtime-store.mjs')?.sha256) fail('DEPLOY_BOOTSTRAP_CHANGED');
+    }
     const moduleUrl=bytes=>'data:text/javascript;base64,'+Buffer.from(bytes).toString('base64');
     const safetyUrl=moduleUrl(safetySource);
     const safety=await import(safetyUrl);
     try {
       // Keep the original lifetime lease: even orphan children still block ordinary maintenance.
       lease=safety.acquireLease(path.join(repositoryRoot,'.jhw-runtime/admission.lock'),{shared:true});
-      publication=safety.acquireLease(path.join(repositoryRoot,'.jhw-runtime/publication.lock'),{shared:true,create:true});
+      if(selectedPair===null || token===undefined) publication=acquirePublication(safety,path.join(repositoryRoot,'.jhw-runtime/publication.lock'),selectedPair!==null);
     } catch(error) { if(error.code==='DEPLOY_LOCK_CONTENDED') fail('DEPLOY_MAINTENANCE'); throw error; }
     if(canonical(validateBootstrap({repositoryRoot}))!==canonical(validated)) fail('DEPLOY_BOOTSTRAP_CHANGED');
     const storeText=new TextDecoder('utf-8',{fatal:true}).decode(storeSource);
@@ -551,16 +564,22 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
     if(storeText.split(safetySpecifier).length!==2) fail('DEPLOY_BOOTSTRAP_CHANGED');
     const store=await import(moduleUrl(Buffer.from(storeText.replace(safetySpecifier,JSON.stringify(safetyUrl)))));
     if(token===undefined) store.assertNoSessionAncestor({repositoryRoot});
-    const bound=store.bindEntryRelease({repositoryRoot,token,kind:selector==='session'?'session':'invocation'});
-    binding=bound.binding;
-    const selected={releaseId:bound.releaseId};
+    let selected;
+    if(selectedPair===null){
+      const bound=store.bindEntryRelease({repositoryRoot,token,kind:selector==='session'?'session':'invocation'});
+      binding=bound.binding;selected={releaseId:bound.releaseId};
+    }else{
+      const bound=store.bindEntryPair({repositoryRoot,token,kind:selector==='session'?'session':'invocation',selectedPair,admissionLease:lease});
+      if(bound?.retryCurrent===true)return {retryCurrent:true};
+      binding=bound;selected=selectedPair;
+    }
     const release=path.join(repositoryRoot,'.jhw-runtime/releases',selected.releaseId);
     if(selector==='session') {
       const environment=runtimeEnvironment();
       environment.JHW_RUNTIME_SESSION_BINDING=binding.token;
-      publication.close(); publication=undefined;
+      publication?.close(); publication=undefined;
       return await new Promise((resolve,reject)=>{
-        const child=spawn(args[1],args.slice(2),{stdio:['inherit','inherit','inherit',lease.fd,'ignore','ignore',binding.fd],env:environment});
+        const child=spawn(args[1],args.slice(2),{stdio:['inherit','inherit','inherit',lease.fd,'ignore','ignore',binding.lease?.fd??binding.fd,binding.generationLease?.fd??'ignore',binding.parentLease?.fd??'ignore'],env:environment});
         child.once('error',()=>reject(Object.assign(new Error('DEPLOY_START_FAILED'),{code:'DEPLOY_START_FAILED'})));
         child.once('exit',(code,signal)=>resolve(code??(128+(osConstants.signals[signal]??1))));
       });
@@ -568,14 +587,14 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
     const target=path.join(release,selector==='mcp'?'mcp-server/dist/runtime/mcp.cjs':selector==='control'?'mcp-server/dist/runtime/control.cjs':'mcp-server/dist/runtime/hook.cjs');
     artifacts.push(openArtifact(repositoryRoot,selected.releaseId,path.relative(release,target)));
     if(selector==='mcp') credential=openCredential(repositoryRoot,selected.releaseId);
-    publication.close(); publication=undefined;
+    publication?.close(); publication=undefined;
     if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease,binding,releaseRoot:release});
     const childArgs=['-e',MODULE_RUNNER_SOURCE,'--','/proc/self/fd/4',release,selector,credential?'fd':'none',...args];
     return await new Promise((resolve,reject)=>{
       for(const artifact of artifacts) artifact.verify();
       credential?.verify();
       // Credential remains fd 5; session lifetime proof has a separate inherited fd 6.
-      const child=spawn(process.execPath,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd),credential?.fd??'ignore',binding.fd],env:runtimeEnvironment()});
+      const child=spawn(process.execPath,childArgs,{stdio:['inherit','inherit','inherit',lease.fd,...artifacts.map(artifact=>artifact.fd),credential?.fd??'ignore',binding.lease?.fd??binding.fd,binding.generationLease?.fd??'ignore',binding.parentLease?.fd??'ignore'],env:runtimeEnvironment()});
       for(const artifact of artifacts.splice(0)) fs.closeSync(artifact.fd);
       if(credential){fs.closeSync(credential.fd);credential.fd=undefined;}
       child.once('error',()=>reject(Object.assign(new Error('DEPLOY_START_FAILED'),{code:'DEPLOY_START_FAILED'})));

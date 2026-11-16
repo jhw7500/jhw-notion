@@ -16,7 +16,7 @@ function checkedSpawn(command, args, options, label) {
   return result;
 }
 
-export async function createRuntimeFixture(t, {realDependencies = false, legacyRevision = null} = {}) {
+export async function createRuntimeFixture(t, {realDependencies = false, legacyRevision = null, productionEntry = false, retryHelper = false} = {}) {
   if (realDependencies) throw new Error('realDependencies build is not available in this fixture phase');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jhw-runtime-v2-fixture-'));
   const home = path.join(root, 'home');
@@ -83,7 +83,15 @@ export async function createRuntimeFixture(t, {realDependencies = false, legacyR
     for (const name of ['jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','runtime-safety.mjs','runtime-store.mjs']) {
       write(`scripts/${name}`,fs.readFileSync(path.join(scriptsRoot,name)),name.startsWith('jhw-')?0o755:0o644);
     }
-    write('scripts/runtime-entry.mjs', `
+    write('scripts/runtime-entry.mjs', productionEntry ? fs.readFileSync(path.join(scriptsRoot,'runtime-entry.mjs')) : retryHelper ? `
+import fs from 'node:fs';
+export async function runManaged({repositoryRoot}) {
+  const file=repositoryRoot+'/.retry-count';
+  let count=0;try{count=Number(fs.readFileSync(file,'utf8'))}catch{}
+  fs.writeFileSync(file,String(count+1));
+  return {retryCurrent:true};
+}
+` : `
 export async function runManaged({selector, args, selectedPair}) {
   if (!selectedPair || selectedPair.runtimeContract !== 2) return {retryCurrent:true};
   process.stdout.write(JSON.stringify({selector,args,selectedPair,artifact:'generation-a',home:process.env.HOME})+'\\n');
@@ -109,7 +117,10 @@ export async function runManaged({selector, args, selectedPair}) {
     built('mcp-server/dist/index.js');
     built('mcp-server/dist/control/cli.js');
     built('mcp-server/dist/control/hook-adapter.js');
-    built('mcp-server/dist/runtime/mcp.cjs');
+    built('mcp-server/dist/runtime/mcp.cjs', productionEntry ? `
+const fs=require('node:fs');
+process.stdout.write(JSON.stringify({observedFdRoles:globalThis.__JHW_MANAGED_FD_ROLES__,releaseRoot:globalThis.__JHW_MANAGED_RELEASE_ROOT__})+'\\n');
+` : '');
     built('mcp-server/dist/runtime/control.cjs');
     built('mcp-server/dist/runtime/hook.cjs');
     fs.mkdirSync(path.join(stagingRoot,'mcp-server/node_modules'),{recursive:true,mode:0o755});
