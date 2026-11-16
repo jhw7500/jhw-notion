@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "requests": [
+    {
+      "request_id": "req-018f21e0-7b2c-7a00-8000-000000000011",
+      "state": "PENDING",
+      "origin_adapter": "codex",
+      "session_id": "codex-persistent-contract",
+      "task_id": "tsk-018f21e0-7b2c-7a00-8000-000000000001",
+      "claim_id": "clm-018f21e0-7b2c-7a00-8000-000000000002",
+      "cwd_worktree_ref": "wt-persistent-contract",
+      "requirements": [
+        {
+          "capability": "repo.modify",
+          "resource": {
+            "kind": "repository",
+            "id": "repo-jhw-notion"
+          }
+        }
+      ],
+      "operation_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "summary": "Modify the claimed repository",
+      "requested_at": "2026-08-25T01:00:00.000Z",
+      "approval_expires_at": "2026-08-25T01:10:00.000Z"
+    }
+  ]
+}

@@ -42,35 +42,54 @@ async function fixture(t) {
     'mcp-server/src/index.ts': 'export const version = "A";',
     'mcp-server/src/server.ts': 'export const server = "A";',
     'mcp-server/src/tools/read.ts': 'export const read = "A";',
+    'mcp-server/src/control/runtime-compatibility.json': '{"version":1,"generation":1,"guardFloor":1}\n',
+    'mcp-server/src/control/hook-adapter.ts': 'export const hook = "A";',
+    'mcp-server/src/control/authority.ts': 'export const authority = "A";',
     'mcp-server/src/control/schemas.ts': 'export const schema = 1;',
+    'mcp-server/src/control/guard-policy.ts': 'export const policy = 1;',
+    'mcp-server/src/control/private-control-config.ts': 'export const privateConfig = 1;',
+    'mcp-server/src/control/session-end-config.ts': 'export const sessionEndConfig = 1;',
+    'mcp-server/src/control/notes.md': 'protected control notes',
+    'mcp-server/src/control/__tests__/authority.test.ts': 'export const fixture = "A";',
     'mcp-server/src/config.ts': 'export const config = 1;',
     'mcp-server/scripts/clean-dist.mjs': '',
     'scripts/sync-codex-skills.mjs': '',
     'scripts/runtime-entry.mjs': 'export const helper = 1;',
     'skills/claude/task.md': 'fixture task',
+    'skills/claude/scripts/readme.md': 'protected skill script documentation',
+    'skills/codex/jhw-task/SKILL.md': 'generated fixture skill',
   })) write(root, name, text);
+  fs.mkdirSync(path.join(root, 'skills/codex/jhw-task/references'), { recursive: true, mode: 0o755 });
+  fs.symlinkSync('../../../claude/task.md', path.join(root, 'skills/codex/jhw-task/references/task.md'));
   write(root, 'scripts/jhw-control-hook', '#!/bin/sh\nexit 0\n', 0o755);
   git(root, 'init', '-q');
   git(root, 'add', '.');
   git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture');
   let mcpVersion = 'A';
   let controlVersion = 'A';
+  let hookVersion = 'A';
   let dependencyVersion = 'A';
+  let dependencyMarkdownVersion = 'A';
   const build = async ({ stagingRoot }) => {
     write(stagingRoot, 'mcp-server/dist/index.js', 'export const version = ' + JSON.stringify(mcpVersion) + ';');
     write(stagingRoot, 'mcp-server/dist/server.js', 'export const version = ' + JSON.stringify(mcpVersion) + ';');
     write(stagingRoot, 'mcp-server/dist/tools/read.js', 'export const version = ' + JSON.stringify(mcpVersion) + ';');
-    write(stagingRoot, 'mcp-server/dist/control/cli.js', '#!/usr/bin/env node\n// ' + controlVersion, 0o755);
-    write(stagingRoot, 'mcp-server/dist/control/hook-adapter.js', '#!/usr/bin/env node\n// stable', 0o755);
+    write(stagingRoot, 'mcp-server/dist/control/cli.js', '#!/usr/bin/env node\n// A', 0o755);
+    write(stagingRoot, 'mcp-server/dist/control/hook-adapter.js', '#!/usr/bin/env node\n// ' + hookVersion, 0o755);
+    write(stagingRoot, 'mcp-server/dist/control/schemas.js', 'export const schema = 1;');
+    write(stagingRoot, 'mcp-server/dist/control/guard-policy.js', 'export const policy = 1;');
+    write(stagingRoot, 'mcp-server/dist/control/private-control-config.js', 'export const privateConfig = 1;');
+    write(stagingRoot, 'mcp-server/dist/control/session-end-config.js', 'export const sessionEndConfig = 1;');
     write(stagingRoot, 'mcp-server/dist/config.js', 'export const config = 1;');
     write(stagingRoot, 'mcp-server/dist/runtime/mcp.cjs', 'exports.version = ' + JSON.stringify(mcpVersion) + ';');
     write(stagingRoot, 'mcp-server/dist/runtime/control.cjs', '#!/usr/bin/env node\n// ' + controlVersion, 0o755);
-    write(stagingRoot, 'mcp-server/dist/runtime/hook.cjs', '#!/usr/bin/env node\n// stable', 0o755);
+    write(stagingRoot, 'mcp-server/dist/runtime/hook.cjs', '#!/usr/bin/env node\n// ' + hookVersion, 0o755);
     write(stagingRoot, 'mcp-server/node_modules/example/index.js', '// ' + dependencyVersion);
+    write(stagingRoot, 'mcp-server/node_modules/example/README.md', '# dependency ' + dependencyMarkdownVersion);
   };
   const prepare = () => store.prepareRelease({ repositoryRoot: root, build });
   const release = await prepare();
-  return { root, release, prepare, mcp(value) { mcpVersion = value; }, control(value) { controlVersion = value; }, dependency(value) { dependencyVersion = value; } };
+  return { root, release, prepare, mcp(value) { mcpVersion = value; }, control(value) { controlVersion = value; }, hook(value) { hookVersion = value; }, dependency(value) { dependencyVersion = value; }, dependencyMarkdown(value) { dependencyMarkdownVersion = value; } };
 }
 function create(f, options = {}) {
   return store.createSessionBinding({ repositoryRoot: f.root, releaseId: f.release.releaseId, ...options });
@@ -225,12 +244,17 @@ test('a binding is not accepted in a different canonical runtime store', async t
   finally { binding.close(); }
 });
 
-test('compatibility permits only MCP tool/entry output changes and checks the whole retained artifact', async t => {
+test('declared compatibility permits MCP, control, hook, control-test, and ordinary Markdown byte changes', async t => {
   const f = await fixture(t);
   const first = store.releaseCompatibility({ repositoryRoot: f.root, releaseId: f.release.releaseId });
   f.mcp('B');
+  f.control('B');
+  f.hook('B');
   write(f.root, 'mcp-server/src/tools/read.ts', 'export const read = "B";');
   write(f.root, 'mcp-server/src/index.ts', 'export const version = "B";');
+  write(f.root, 'mcp-server/src/control/hook-adapter.ts', 'export const hook = "B";');
+  write(f.root, 'mcp-server/src/control/__tests__/authority.test.ts', 'export const fixture = "B";');
+  write(f.root, 'skills/claude/task.md', 'changed ordinary Markdown');
   const next = await f.prepare();
   assert.notEqual(next.releaseId, f.release.releaseId);
   assert.equal(store.releaseCompatibility({ repositoryRoot: f.root, releaseId: next.releaseId }), first);
@@ -240,14 +264,25 @@ test('compatibility permits only MCP tool/entry output changes and checks the wh
 });
 
 for (const [label, mutate] of [
-  ['skill bytes', f => write(f.root, 'skills/claude/task.md', 'changed')],
   ['helper bytes', f => write(f.root, 'scripts/runtime-entry.mjs', 'export const helper = 2;')],
-  ['control source', f => write(f.root, 'mcp-server/src/control/schemas.ts', 'export const schema = 2;')],
+  ['schema source', f => write(f.root, 'mcp-server/src/control/schemas.ts', 'export const schema = 2;')],
+  ['guard policy source', f => write(f.root, 'mcp-server/src/control/guard-policy.ts', 'export const policy = 2;')],
+  ['private control config source', f => write(f.root, 'mcp-server/src/control/private-control-config.ts', 'export const privateConfig = 2;')],
+  ['session end config source', f => write(f.root, 'mcp-server/src/control/session-end-config.ts', 'export const sessionEndConfig = 2;')],
+  ['uncovered authority source', f => write(f.root, 'mcp-server/src/control/authority.ts', 'export const authority = "B";')],
   ['config source', f => write(f.root, 'mcp-server/src/config.ts', 'export const config = 2;')],
   ['new shared source', f => write(f.root, 'mcp-server/src/shared-policy.ts', 'export const policy = 1;')],
-  ['control bundle', f => f.control('B')],
+  ['new control source', f => write(f.root, 'mcp-server/src/control/new-implementation.ts', 'export const value = 1;')],
+  ['new control test', f => write(f.root, 'mcp-server/src/control/__tests__/new.test.ts', 'export const fixture = 1;')],
+  ['removed known control source', f => fs.unlinkSync(path.join(f.root, 'mcp-server/src/control/hook-adapter.ts'))],
   ['dependency bytes', f => f.dependency('B')],
+  ['dependency Markdown bytes', f => f.dependencyMarkdown('B')],
+  ['skill script Markdown bytes', f => write(f.root, 'skills/claude/scripts/readme.md', 'changed protected skill script documentation')],
+  ['Markdown bytes outside skills', f => write(f.root, 'mcp-server/src/control/notes.md', 'changed protected control notes')],
   ['skill mode', f => fs.chmodSync(path.join(f.root, 'skills/claude/task.md'), 0o600)],
+  ['skill symlink target', f => { const link = path.join(f.root, 'skills/codex/jhw-task/references/task.md'); fs.unlinkSync(link); fs.symlinkSync('../SKILL.md', link); }],
+  ['generation', f => write(f.root, 'mcp-server/src/control/runtime-compatibility.json', '{"version":1,"generation":2,"guardFloor":1}\n')],
+  ['guard floor', f => write(f.root, 'mcp-server/src/control/runtime-compatibility.json', '{"version":1,"generation":1,"guardFloor":2}\n')],
 ]) {
   test('compatibility rejects changed ' + label, async t => {
     const f = await fixture(t);
@@ -257,6 +292,61 @@ for (const [label, mutate] of [
     assert.notEqual(store.releaseCompatibility({ repositoryRoot: f.root, releaseId: next.releaseId }), first);
   });
 }
+
+for (const [label, declaration] of [
+  ['extra key', '{"version":1,"generation":1,"guardFloor":1,"extra":true}\n'],
+  ['zero generation', '{"version":1,"generation":0,"guardFloor":1}\n'],
+  ['fractional guard floor', '{"version":1,"generation":1,"guardFloor":1.5}\n'],
+  ['unsupported version', '{"version":2,"generation":1,"guardFloor":1}\n'],
+  ['invalid JSON', '{'],
+]) {
+  test('compatibility rejects malformed declaration with ' + label, async t => {
+    const f = await fixture(t);
+    write(f.root, 'mcp-server/src/control/runtime-compatibility.json', declaration);
+    const next = await f.prepare();
+    assert.throws(() => store.releaseCompatibility({ repositoryRoot: f.root, releaseId: next.releaseId }), { code: 'DEPLOY_RELEASE_INVALID' });
+  });
+}
+
+test('compatibility rejects a declaration symlink instead of treating it as legacy', async t => {
+  const f = await fixture(t);
+  const declaration = path.join(f.root, 'mcp-server/src/control/runtime-compatibility.json');
+  fs.unlinkSync(declaration);
+  fs.symlinkSync('schemas.ts', declaration);
+  const next = await f.prepare();
+  assert.throws(() => store.releaseCompatibility({ repositoryRoot: f.root, releaseId: next.releaseId }), { code: 'DEPLOY_RELEASE_INVALID' });
+});
+
+test('legacy releases retain their v1 digest and do not match declared releases', async t => {
+  const f = await fixture(t);
+  fs.unlinkSync(path.join(f.root, 'mcp-server/src/control/runtime-compatibility.json'));
+  const legacy = await f.prepare();
+  const legacyDigest = store.releaseCompatibility({ repositoryRoot: f.root, releaseId: legacy.releaseId });
+  assert.equal(legacyDigest, '01127deb376782c08d951e12c2e6009cef9e882ec8e7e61beff8cf53b7a5a93c');
+  assert.notEqual(legacyDigest, store.releaseCompatibility({ repositoryRoot: f.root, releaseId: f.release.releaseId }));
+  f.mcp('legacy-B');
+  write(f.root, 'mcp-server/src/index.ts', 'export const version = "legacy-B";');
+  const nextLegacy = await f.prepare();
+  assert.equal(store.releaseCompatibility({ repositoryRoot: f.root, releaseId: nextLegacy.releaseId }), legacyDigest);
+});
+
+test('walk-free pinned resolution rejects changed declaration bytes and an undeclared orphan', async t => {
+  const f = await fixture(t);
+  const binding = create(f);
+  try {
+    const retained = path.join(f.root, '.jhw-runtime/releases', f.release.releaseId, 'mcp-server/src/control/runtime-compatibility.json');
+    fs.writeFileSync(retained, '{"version":1,"generation":1,"guardFloor":2}\n');
+    failure(() => store.bindEntryRelease({ repositoryRoot: f.root, token: binding.token }));
+  } finally { binding.close(); }
+
+  fs.unlinkSync(path.join(f.root, 'mcp-server/src/control/runtime-compatibility.json'));
+  const legacy = await f.prepare();
+  const legacyBinding = store.createSessionBinding({ repositoryRoot: f.root, releaseId: legacy.releaseId });
+  try {
+    write(path.join(f.root, '.jhw-runtime/releases', legacy.releaseId), 'mcp-server/src/control/runtime-compatibility.json', '{"version":1,"generation":1,"guardFloor":1}\n');
+    failure(() => store.bindEntryRelease({ repositoryRoot: f.root, token: legacyBinding.token }));
+  } finally { legacyBinding.close(); }
+});
 
 
 test('missing session pins are refused for the owner and descendants before current can be selected', async t => {

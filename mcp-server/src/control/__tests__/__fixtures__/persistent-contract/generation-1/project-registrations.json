@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "records": {
+    "prj-example": {
+      "project_id": "prj-example",
+      "item_id": "PVTI_created",
+      "source_node_id": "DI_created"
+    }
+  }
+}

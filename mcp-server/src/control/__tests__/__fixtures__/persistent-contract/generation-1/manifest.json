@@ -1,0 +1,16 @@
+{
+  "generation": 1,
+  "declaration": {
+    "version": 1,
+    "generation": 1,
+    "guardFloor": 1
+  },
+  "covered": [
+    "guard-requests.yaml pending lifecycle and public reader",
+    "guard-digest.key raw 32-byte key",
+    "boards.yaml registered lifecycle and public reader",
+    "project-registrations.json v1 writer and public reader",
+    "registry.lock, boards.lock, guard-observe-journal.lock, guard-requests.lock",
+    "operation digest fixed vector"
+  ]
+}

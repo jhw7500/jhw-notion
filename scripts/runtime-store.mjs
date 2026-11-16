@@ -11,6 +11,10 @@ const DIGEST = /^[a-f0-9]{64}$/;
 const MAX_ENTRIES = 100000;
 const MAX_FILE = 128 * 1024 * 1024;
 const MAX_MANIFEST = 32 * 1024 * 1024;
+const COMPATIBILITY_DECLARATION = 'mcp-server/src/control/runtime-compatibility.json';
+const COMPATIBLE_CONTROL_IMPLEMENTATIONS = new Set([
+  'guard-service', 'hook-adapter', 'hook-codecs', 'shell-classifier',
+]);
 // Closed v1 manifests (all listed keys required; no additional keys):
 // release: { version, releaseId, sourceRevision, sourceDigest, contentDigest,
 //            dirty, createdAt, entries }
@@ -977,6 +981,63 @@ function compatibleMcpEntry(name) {
     /^mcp-server\/dist\/(?:index|server)\.(?:js(?:\.map)?|d\.ts(?:\.map)?)$/.test(name) ||
     name === 'mcp-server/dist/runtime/mcp.cjs';
 }
+function compatibleControlEntry(name) {
+  if (name === 'mcp-server/dist/runtime/control.cjs' || name === 'mcp-server/dist/runtime/hook.cjs') return true;
+  const source = /^mcp-server\/src\/control\/([^/]+)\.ts$/.exec(name);
+  if (source) return COMPATIBLE_CONTROL_IMPLEMENTATIONS.has(source[1]);
+  const compiled = /^mcp-server\/dist\/control\/([^/]+)\.(?:js(?:\.map)?|d\.ts(?:\.map)?)$/.exec(name);
+  return compiled !== null && COMPATIBLE_CONTROL_IMPLEMENTATIONS.has(compiled[1]);
+}
+function compatibleControlTestEntry(name) {
+  return name.startsWith('mcp-server/src/control/__tests__/') || name.startsWith('mcp-server/src/control/__fixtures__/');
+}
+function flexibleMarkdownEntry(entry) {
+  return entry.type === 'file' && entry.path.startsWith('skills/') && entry.path.endsWith('.md') &&
+    !entry.path.slice('skills/'.length).split('/').includes('scripts') && (entry.mode & 0o111) === 0;
+}
+function compatibilityEntry(entry) {
+  if (entry.type === 'file' && (compatibleMcpEntry(entry.path) || compatibleControlEntry(entry.path) ||
+      compatibleControlTestEntry(entry.path) || flexibleMarkdownEntry(entry) || entry.path === COMPATIBILITY_DECLARATION)) {
+    const { sha256, ...identity } = entry;
+    return identity;
+  }
+  return entry;
+}
+function retainedFile(release, relative) {
+  const parts = relative.split('/');
+  const directories = [];
+  let directory = release;
+  try {
+    for (const part of parts.slice(0, -1)) {
+      directory = directory.child(part);
+      directories.push(directory);
+    }
+    return readBytes(directory, parts.at(-1));
+  } finally {
+    for (const child of directories.reverse()) child.close();
+  }
+}
+function compatibilityDeclaration(release, manifest) {
+  const entry = manifest.entries.find(candidate => candidate.path === COMPATIBILITY_DECLARATION);
+  if (!entry) {
+    try { retainedFile(release, COMPATIBILITY_DECLARATION); }
+    catch (error) { if (error.code === 'ENOENT') return null; fail('DEPLOY_RELEASE_INVALID'); }
+    fail('DEPLOY_RELEASE_INVALID');
+  }
+  if (entry.type !== 'file') fail('DEPLOY_RELEASE_INVALID');
+  let retained;
+  try { retained = retainedFile(release, COMPATIBILITY_DECLARATION); }
+  catch { fail('DEPLOY_RELEASE_INVALID'); }
+  const { bytes, mode } = retained;
+  if (mode !== entry.mode || digest(bytes) !== entry.sha256) fail('DEPLOY_RELEASE_INVALID');
+  let value;
+  try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
+  catch { fail('DEPLOY_RELEASE_INVALID'); }
+  if (!exact(value, ['version', 'generation', 'guardFloor']) || value.version !== 1 ||
+      !Number.isSafeInteger(value.generation) || value.generation <= 0 ||
+      !Number.isSafeInteger(value.guardFloor) || value.guardFloor <= 0) fail('DEPLOY_RELEASE_INVALID');
+  return value;
+}
 function releaseCompatibilityIn(runtime, repositoryRoot, releaseId, walkTree = true) {
   const validated = validateReleaseIn(runtime, repositoryRoot, releaseId, walkTree);
   let releases; let release;
@@ -985,7 +1046,11 @@ function releaseCompatibilityIn(runtime, repositoryRoot, releaseId, walkTree = t
     release = releases.child(releaseId, false, true);
     const manifest = readJson(release);
     if (canonical(summary(manifest)) !== canonical(validated) || contentDigest(manifest) !== validated.contentDigest) fail('DEPLOY_RELEASE_INVALID');
-    const result = digest(canonical({ version: 1, entries: manifest.entries.filter(entry => !compatibleMcpEntry(entry.path)) }));
+    const declaration = compatibilityDeclaration(release, manifest);
+    const result = declaration === null
+      ? digest(canonical({ version: 1, entries: manifest.entries.filter(entry => !compatibleMcpEntry(entry.path)) }))
+      : digest(canonical({ version: 2, generation: declaration.generation, guardFloor: declaration.guardFloor,
+          entries: manifest.entries.map(compatibilityEntry) }));
     release.verify();
     if (canonical(manifest) !== canonical(readJson(release))) fail('DEPLOY_RELEASE_INVALID');
     return result;
