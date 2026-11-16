@@ -8,7 +8,11 @@ import { pathToFileURL } from 'node:url';
 
 const C = fs.constants;
 const FILES = ['jhw-runtime-control', 'jhw-runtime-entry', 'jhw-runtime-hook', 'runtime-entry.mjs', 'runtime-safety.mjs', 'runtime-store.mjs'];
+const ROUTER_FILES = ['jhw-runtime-control', 'jhw-runtime-entry', 'jhw-runtime-hook'];
+const COMPATIBILITY_DECLARATION = 'mcp-server/src/control/runtime-compatibility.json';
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
+const BOOTSTRAP = /^b-[a-f0-9]{64}$/;
+const DIGEST = /^[a-f0-9]{64}$/;
 export const STARTUP_ENVIRONMENT = ['NODE_OPTIONS','NODE_PATH','NODE_REPL_EXTERNAL_MODULE','BASH_ENV','ENV'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const modeFor = name => name.startsWith('jhw-') ? 0o755 : 0o644;
@@ -158,6 +162,18 @@ function releaseManifest(repositoryRoot,releaseId,runtimeHandle=null) {
     return manifest;
   } finally { directory.close(); }
 }
+function requireGenerationTwo(repositoryRoot,releaseId,manifest,runtimeHandle=null) {
+  const record=manifest.entries.find(entry=>entry.path===COMPATIBILITY_DECLARATION);
+  if(!record||record.type!=='file')fail();
+  const directory=runtimeHandle?anchoredDirectory(runtimeHandle,['releases',releaseId,'mcp-server','src','control']):new Directory(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'mcp-server/src/control'));
+  try {
+    const bytes=read(directory,'runtime-compatibility.json',record.mode,16384);
+    if(hash(bytes)!==record.sha256)fail();
+    const declaration=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+    if(!exact(declaration,['version','generation','guardFloor'])||declaration.version!==1||declaration.generation!==2||
+        !Number.isSafeInteger(declaration.guardFloor)||declaration.guardFloor<=0)fail();
+  } finally { directory.close(); }
+}
 
 function readSet(directory,repositoryRoot,runtimeHandle=null) {
   directory.verify();
@@ -180,11 +196,89 @@ function readSet(directory,repositoryRoot,runtimeHandle=null) {
   } finally { sourceDirectory.close(); }
   directory.verify(); return manifest;
 }
+function readRouterSet(directory,repositoryRoot,runtimeHandle=null) {
+  directory.verify();
+  if ((Number(fs.fstatSync(directory.fd).mode)&0o7777)!==0o700) fail();
+  if(fs.readdirSync(`/proc/self/fd/${directory.fd}`).sort().join(',')!==[...ROUTER_FILES,'manifest.json'].sort().join(',')) fail();
+  const manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read(directory,'manifest.json',0o600,16384)));
+  if(!exact(manifest,['version','sourceReleaseId','routerContract','files']) || manifest.version!==2 ||
+      typeof manifest.sourceReleaseId!=='string' || !RELEASE.test(manifest.sourceReleaseId) ||
+      typeof manifest.routerContract!=='number' || manifest.routerContract!==1 ||
+      !Array.isArray(manifest.files) || manifest.files.length!==ROUTER_FILES.length) fail();
+  for(let index=0;index<ROUTER_FILES.length;index++) {
+    const record=manifest.files[index]; const name=ROUTER_FILES[index];
+    if(!exact(record,['name','mode','sha256']) || typeof record.name!=='string' || typeof record.mode!=='number' ||
+        typeof record.sha256!=='string' || record.name!==name || record.mode!==0o755 || !/^[a-f0-9]{64}$/.test(record.sha256) ||
+        hash(read(directory,name,0o755))!==record.sha256) fail();
+  }
+  const source=releaseManifest(repositoryRoot,manifest.sourceReleaseId,runtimeHandle);
+  requireGenerationTwo(repositoryRoot,manifest.sourceReleaseId,source,runtimeHandle);
+  const scripts=runtimeHandle?anchoredDirectory(runtimeHandle,['releases',manifest.sourceReleaseId,'scripts']):new Directory(path.join(repositoryRoot,'.jhw-runtime/releases',manifest.sourceReleaseId,'scripts'));
+  try {
+    for(const record of manifest.files) {
+      const original=source.entries.find(entry=>entry.path===`scripts/${record.name}`);
+      if(!original || original.type!=='file' || original.mode!==record.mode || original.sha256!==record.sha256 ||
+          hash(read(scripts,record.name,record.mode))!==record.sha256) fail();
+    }
+  } finally { scripts.close(); }
+  directory.verify(); return manifest;
+}
 export function validateBootstrap({repositoryRoot}) {
   let directory;
-  try { directory=new Directory(path.join(repositoryRoot,'.jhw-runtime/bootstrap')); return readSet(directory,repositoryRoot); }
+  try {
+    directory=new Directory(path.join(repositoryRoot,'.jhw-runtime/bootstrap'));
+    const preliminary=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read(directory,'manifest.json',0o600,16384)));
+    return preliminary?.version===2 ? readRouterSet(directory,repositoryRoot) : readSet(directory,repositoryRoot);
+  }
   catch { fail(); }
   finally { directory?.close(); }
+}
+function requireLeaseIdentity(lease,file) {
+  if(!lease||!Number.isInteger(lease.fd)||lease.fd<0)fail();
+  let held;let named;try{held=fs.fstatSync(lease.fd,{bigint:true});named=fs.lstatSync(file,{bigint:true});}catch{fail();}
+  if(!held.isFile()||held.uid!==BigInt(process.getuid())||held.nlink!==1n||(Number(held.mode)&0o7777)!==0o600||!same(held,named))fail();
+}
+
+/** Stopped-path-only publication of the stable v2 selector. */
+export async function installRouterV2({repositoryRoot,releaseId,deployLease,admissionLease}) {
+  if(typeof releaseId!=='string'||!RELEASE.test(releaseId))fail();
+  requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'));
+  requireLeaseIdentity(admissionLease,path.join(repositoryRoot,'.jhw-runtime/admission.lock'));
+  const release=releaseManifest(repositoryRoot,releaseId);
+  requireGenerationTwo(repositoryRoot,releaseId,release);
+  let runtime;let source;let stage;let stageName;let previousDirectory=null;
+  try {
+    runtime=new Directory(path.join(repositoryRoot,'.jhw-runtime'));
+    if((fs.fstatSync(runtime.fd).mode&0o7777)!==0o700)fail();
+    source=new Directory(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts'));
+    const contents=ROUTER_FILES.map(name=>({name,bytes:read(source,name,0o755)}));
+    const manifest={version:2,sourceReleaseId:releaseId,routerContract:1,
+      files:contents.map(({name,bytes})=>({name,mode:0o755,sha256:hash(bytes)}))};
+    let previous;
+    try{fs.lstatSync(runtime.at('bootstrap'));previous=validateBootstrap({repositoryRoot});}
+    catch(error){if(error.code!=='ENOENT')throw error;}
+    if(previous?.version===2&&canonical(previous)===canonical(manifest))return {sourceReleaseId:releaseId,routerContract:1};
+    stageName=`.bootstrap.stage.${randomBytes(16).toString('hex')}`;
+    fs.mkdirSync(runtime.at(stageName),{mode:0o700});fs.chmodSync(runtime.at(stageName),0o700);
+    stage=new Directory(path.join(repositoryRoot,'.jhw-runtime',stageName));
+    for(const {name,bytes} of contents)write(stage,name,bytes,0o755);
+    write(stage,'manifest.json',Buffer.from(canonical(manifest)+'\n'),0o600);
+    readRouterSet(stage,repositoryRoot);fs.fsyncSync(stage.fd);source.verify();runtime.verify();
+    if(previous){
+      if(canonical(validateBootstrap({repositoryRoot}))!==canonical(previous))fail('DEPLOY_BOOTSTRAP_CHANGED');
+      previousDirectory=`.bootstrap.previous.${randomBytes(16).toString('hex')}`;
+      fs.renameSync(runtime.at('bootstrap'),runtime.at(previousDirectory));fs.fsyncSync(runtime.fd);
+    }
+    try{stage.verify();fs.renameSync(runtime.at(stageName),runtime.at('bootstrap'));fs.fsyncSync(runtime.fd);}
+    catch(error){
+      if(previousDirectory){try{fs.lstatSync(runtime.at('bootstrap'));}catch(missing){if(missing.code==='ENOENT'){fs.renameSync(runtime.at(previousDirectory),runtime.at('bootstrap'));fs.fsyncSync(runtime.fd);previousDirectory=null;}}}
+      throw error;
+    }
+    const installed=validateBootstrap({repositoryRoot});
+    if(canonical(installed)!==canonical(manifest))fail('DEPLOY_BOOTSTRAP_CHANGED');
+    return {sourceReleaseId:installed.sourceReleaseId,routerContract:installed.routerContract};
+  } catch(error){if(error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code))throw error;fail();}
+  finally{stage?.close();source?.close();runtime?.close();}
 }
 export function validateRetainedBootstrap({repositoryRoot,name,runtimeHandle=null}) {
   if(typeof name!=='string'||!/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(name))fail();
@@ -420,11 +514,16 @@ function runPinnedHook({args,artifact,lease,binding,releaseRoot}) {
   });
 }
 
-export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseId,safetySource,storeSource}) {
+export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseId,safetySource,storeSource,selectedPair=null}) {
   let lease; let publication; let binding; let credential; const artifacts=[];
   try {
     if(!['mcp','control','hook','session'].includes(selector)) fail('DEPLOY_SELECTOR_INVALID');
     if(!Array.isArray(args) || args.some(value=>typeof value!=='string' || value.includes('\0'))) fail('DEPLOY_SELECTOR_INVALID');
+    if(selectedPair!==null && (!exact(selectedPair,['releaseId','bootstrapId','runtimeContract','compatibilityDigest']) ||
+        typeof selectedPair.releaseId!=='string' || typeof selectedPair.bootstrapId!=='string' ||
+        typeof selectedPair.runtimeContract!=='number' || typeof selectedPair.compatibilityDigest!=='string' ||
+        !RELEASE.test(selectedPair.releaseId) || !BOOTSTRAP.test(selectedPair.bootstrapId) ||
+        selectedPair.runtimeContract!==2 || !DIGEST.test(selectedPair.compatibilityDigest))) fail('DEPLOY_SESSION_INVALID');
     if(selector==='hook' && (args.length!==4 || args[0]!=='--adapter' || !['claude','codex'].includes(args[1]) || args[2]!=='--event' || !['PreToolUse','PostToolUse','UserPromptSubmit','SessionEnd'].includes(args[3]))) return failure(selector,args,'GUARD_PROTOCOL_MISMATCH');
     if(selector==='session' && (args.length<2 || args[0]!=='--' || !args[1])) fail('DEPLOY_SELECTOR_INVALID');
     const token=process.env.JHW_RUNTIME_SESSION_BINDING;

@@ -6,6 +6,8 @@ import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 
 import * as store from './runtime-store.mjs';
+import {acquireLease} from './runtime-safety.mjs';
+import {createRuntimeFixture} from './test-support/runtime-v2.mjs';
 
 const contracts = JSON.parse(fs.readFileSync(new URL('./__fixtures__/runtime-v2/contracts.json', import.meta.url), 'utf8'));
 
@@ -298,4 +300,48 @@ test('generation 2 fingerprints flex only helper contents while generation 1 sta
     assert.notEqual(store.releaseCompatibility({ repositoryRoot: v2.root, releaseId: changed.releaseId }), fingerprintGeneration2, label);
     restore();
   }
+});
+
+test('v2 generation reuse preserves catalog source', async t => {
+  assert.equal(typeof store.ensureBootstrapGeneration, 'function', 'generation catalog API must exist');
+  const f = await createRuntimeFixture(t);
+  const releaseA = await f.prepare();
+  let deployLease = acquireLease(path.join(f.root, '.jhw-runtime/deploy.lock'));
+  t.after(() => deployLease?.close());
+  const original = store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:releaseA.releaseId,deployLease});
+  deployLease.close(); deployLease = null;
+  f.write('mcp-server/src/index.ts', 'export const next = true;\n');
+  const releaseB = await f.prepare();
+  deployLease = acquireLease(path.join(f.root, '.jhw-runtime/deploy.lock'));
+  const reused = store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:releaseB.releaseId,reuseBootstrapId:original.bootstrapId,deployLease});
+  assert.equal(reused.bootstrapId, original.bootstrapId);
+  const catalogFile = path.join(f.root, `.jhw-runtime/v2/bootstrap-catalog/${original.bootstrapId}.json`);
+  const catalog = JSON.parse(fs.readFileSync(catalogFile));
+  assert.equal(catalog.sourceReleaseId, releaseA.releaseId);
+  assert.equal(fs.lstatSync(catalogFile).mode & 0o777, 0o600);
+
+  fs.rmSync(path.join(f.root, `.jhw-runtime/v2/bootstraps/${original.bootstrapId}`), {recursive:true});
+  const restored = store.restoreBootstrapGeneration({repositoryRoot:f.root,bootstrapId:original.bootstrapId,deployLease});
+  assert.equal(restored.sourceReleaseId, releaseA.releaseId);
+  assert.deepEqual(restored, {bootstrapId:original.bootstrapId,sourceReleaseId:releaseA.releaseId,runtimeContract:2});
+  fs.rmSync(path.join(f.root, `.jhw-runtime/releases/${releaseA.releaseId}`), {recursive:true});
+  fs.rmSync(path.join(f.root, `.jhw-runtime/v2/bootstraps/${original.bootstrapId}`), {recursive:true});
+  assert.throws(() => store.restoreBootstrapGeneration({repositoryRoot:f.root,bootstrapId:original.bootstrapId,deployLease}),
+    {code:'DEPLOY_BOOTSTRAP_INVALID'});
+});
+
+test('v2 generation validates exact children and modes', async t => {
+  assert.equal(typeof store.validateBootstrapGeneration, 'function', 'generation validation API must exist');
+  const f = await createRuntimeFixture(t);
+  const release = await f.prepare();
+  const deployLease = acquireLease(path.join(f.root, '.jhw-runtime/deploy.lock'));
+  t.after(() => deployLease.close());
+  const pair = store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  const validated = store.validateBootstrapGeneration({repositoryRoot:f.root,bootstrapId:pair.bootstrapId});
+  assert.deepEqual([...validated.helperBytes.keys()], ['runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs']);
+  const generation = path.join(f.root, `.jhw-runtime/v2/bootstraps/${pair.bootstrapId}`);
+  assert.deepEqual(fs.readdirSync(generation).sort(), ['lease','manifest.json','runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs']);
+  fs.chmodSync(path.join(generation, 'runtime-entry.mjs'), 0o600);
+  assert.throws(() => store.validateBootstrapGeneration({repositoryRoot:f.root,bootstrapId:pair.bootstrapId}),
+    {code:'DEPLOY_BOOTSTRAP_INVALID'});
 });

@@ -1,87 +1,88 @@
 #!/usr/bin/env node
-// Deliberately self-contained root of trust. Only built-ins run before checking
-// the complete helper set. Small selector wrappers exec this canonical verifier.
-const fs = require('node:fs');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const physical = __filename;
-const name = path.basename(physical);
-const selector = process.argv[2];
-const args = process.argv.slice(3);
-function refuse() {
-  const code='DEPLOY_BOOTSTRAP_INVALID';
-  if(selector==='control') { process.stderr.write(JSON.stringify({error:{code}})+'\n'); process.exitCode=75; return; }
-  if(selector!=='hook') { process.stderr.write(code+'\n'); process.exitCode=75; return; }
-  const event=args[2]==='--event' && ['UserPromptSubmit','PostToolUse','SessionEnd'].includes(args[3]) ? args[3] : 'PreToolUse';
-  const value=event==='SessionEnd' ? {} : event==='PostToolUse' ? {systemMessage:code} : event==='UserPromptSubmit' ? {hookSpecificOutput:{hookEventName:event,additionalContext:code},systemMessage:code} : {hookSpecificOutput:{hookEventName:event,permissionDecision:'deny',permissionDecisionReason:code},systemMessage:code};
-  process.stdout.write(JSON.stringify(value)+'\n'); process.exitCode=0;
+// Stable built-ins-only router. No generation helper is imported before its
+// router, catalog, source release, manifest, filesystem shape and bytes agree.
+const fs=require('node:fs');
+const path=require('node:path');
+const crypto=require('node:crypto');
+const C=fs.constants;
+const selector=process.argv[2];
+const args=process.argv.slice(3);
+const RELEASE=/^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
+const BOOTSTRAP=/^b-[a-f0-9]{64}$/;
+const DIGEST=/^[a-f0-9]{64}$/;
+const ROUTERS=['jhw-runtime-control','jhw-runtime-entry','jhw-runtime-hook'];
+const HELPERS=['runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs'];
+const hash=bytes=>crypto.createHash('sha256').update(bytes).digest('hex');
+const canonical=value=>Array.isArray(value)?`[${value.map(canonical).join(',')}]`:value!==null&&typeof value==='object'?`{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`:JSON.stringify(value);
+const exact=(value,keys)=>value!==null&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).sort().join(',')===[...keys].sort().join(',');
+const same=(a,b)=>['dev','ino','uid','gid','mode','nlink','size','mtimeNs','ctimeNs'].every(key=>a[key]===b[key]);
+const sameDirectory=(a,b)=>['dev','ino','uid','gid','mode'].every(key=>a[key]===b[key]);
+function refuse(code='DEPLOY_BOOTSTRAP_INVALID'){
+  if(selector==='control'){process.stderr.write(JSON.stringify({error:{code}})+'\n');process.exitCode=75;return;}
+  if(selector!=='hook'){process.stderr.write(code+'\n');process.exitCode=75;return;}
+  const event=args[2]==='--event'&&['UserPromptSubmit','PostToolUse','SessionEnd'].includes(args[3])?args[3]:'PreToolUse';
+  const value=event==='SessionEnd'?{}:event==='PostToolUse'?{systemMessage:code}:event==='UserPromptSubmit'?{hookSpecificOutput:{hookEventName:event,additionalContext:code},systemMessage:code}:{hookSpecificOutput:{hookEventName:event,permissionDecision:'deny',permissionDecisionReason:code},systemMessage:code};
+  process.stdout.write(JSON.stringify(value)+'\n');process.exitCode=0;
 }
+function directory(name,mode=null){
+  if(typeof name!=='string'||!path.isAbsolute(name)||path.resolve(name)!==name||name.includes('\0'))throw Error();
+  const records=[];let fd;let current='/';const parts=name.split('/').filter(Boolean);
+  try{for(let index=-1;index<parts.length;index++){if(index>=0)current=path.join(current,parts[index]);const next=fs.openSync(index<0?'/':`/proc/self/fd/${fd}/${parts[index]}`,C.O_RDONLY|C.O_DIRECTORY|C.O_NOFOLLOW);const stat=fs.fstatSync(next,{bigint:true});records.push({fd:next,name:current,stat});fd=next;const bits=Number(stat.mode);const leaf=index===parts.length-1;if(!stat.isDirectory()||(stat.uid!==BigInt(process.getuid())&&(leaf||stat.uid!==0n))||(bits&0o022&&(leaf||!(bits&0o1000)))||bits&0o6000||leaf&&mode!==null&&(bits&0o7777)!==mode)throw Error();}}
+  catch(error){for(const record of records.reverse())fs.closeSync(record.fd);throw error;}
+  const stat=records.at(-1).stat;
+  return {fd,name,stat,at(child){if(typeof child!=='string'||!child||child.includes('/')||child==='.'||child==='..')throw Error();return `/proc/self/fd/${fd}/${child}`;},verify(){for(const record of records){if(!sameDirectory(record.stat,fs.fstatSync(record.fd,{bigint:true}))||!sameDirectory(record.stat,fs.lstatSync(record.name,{bigint:true})))throw Error();}},close(){for(const record of records.reverse())fs.closeSync(record.fd);}};
+}
+function read(parent,name,mode,limit=1024*1024){
+  parent.verify();const location=parent.at(name);const fd=fs.openSync(location,C.O_RDONLY|C.O_NONBLOCK|C.O_NOFOLLOW);
+  try{const before=fs.fstatSync(fd,{bigint:true});if(!before.isFile()||before.uid!==BigInt(process.getuid())||before.nlink!==1n||(Number(before.mode)&0o7777)!==mode||before.size>BigInt(limit))throw Error();const bytes=Buffer.alloc(Number(before.size));let offset=0;while(offset<bytes.length){const count=fs.readSync(fd,bytes,offset,bytes.length-offset,null);if(!count)throw Error();offset+=count;}if(fs.readSync(fd,Buffer.alloc(1),0,1,null)!==0||!same(before,fs.fstatSync(fd,{bigint:true}))||!same(before,fs.lstatSync(location,{bigint:true})))throw Error();parent.verify();return bytes;}finally{fs.closeSync(fd);}
+}
+function release(runtime,releaseId){
+  if(typeof releaseId!=='string'||!RELEASE.test(releaseId))throw Error();
+  const releases=directory(path.join(runtime.name,'releases'),0o700);const selected=directory(path.join(releases.name,releaseId),0o700);
+  try{const bytes=read(selected,'manifest.json',0o600,32*1024*1024);const manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));if(!exact(manifest,['version','releaseId','sourceRevision','sourceDigest','contentDigest','dirty','createdAt','entries'])||manifest.version!==1||manifest.releaseId!==releaseId||typeof manifest.sourceRevision!=='string'||!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(manifest.sourceRevision)||typeof manifest.sourceDigest!=='string'||!DIGEST.test(manifest.sourceDigest)||typeof manifest.dirty!=='boolean'||!Array.isArray(manifest.entries)||manifest.entries.length>100000)throw Error();const content=hash(canonical({sourceRevision:manifest.sourceRevision,sourceDigest:manifest.sourceDigest,dirty:manifest.dirty,entries:manifest.entries}));if(manifest.contentDigest!==content||releaseId!==`r-${manifest.sourceRevision}-${content}`)throw Error();return manifest;}finally{selected.close();releases.close();}
+}
+function sourceFiles(runtime,releaseId,names,requiredMode,generationTwo=false){
+  const manifest=release(runtime,releaseId);const scripts=directory(path.join(runtime.name,'releases',releaseId,'scripts'));const result=new Map();
+  let control;
+  try{if(generationTwo){const record=manifest.entries.find(entry=>entry.path==='mcp-server/src/control/runtime-compatibility.json');if(!record||record.type!=='file')throw Error();control=directory(path.join(runtime.name,'releases',releaseId,'mcp-server/src/control'));const bytes=read(control,'runtime-compatibility.json',record.mode,16384);const declaration=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));if(hash(bytes)!==record.sha256||!exact(declaration,['version','generation','guardFloor'])||declaration.version!==1||declaration.generation!==2||!Number.isSafeInteger(declaration.guardFloor)||declaration.guardFloor<=0)throw Error();}for(const name of names){const expected=typeof requiredMode==='function'?requiredMode(name):requiredMode;const record=manifest.entries.find(entry=>entry.path===`scripts/${name}`);if(!record||record.type!=='file'||record.mode!==expected)throw Error();const bytes=read(scripts,name,expected);if(hash(bytes)!==record.sha256)throw Error();result.set(name,bytes);}return {manifest,bytes:result};}finally{control?.close();scripts.close();}
+}
+function validateRecords(records,names,mode){
+  if(!Array.isArray(records)||records.length!==names.length)throw Error();
+  for(let i=0;i<names.length;i++){const record=records[i];if(!exact(record,['name','mode','sha256'])||typeof record.name!=='string'||typeof record.mode!=='number'||typeof record.sha256!=='string'||record.name!==names[i]||record.mode!==mode||!DIGEST.test(record.sha256))throw Error();}
+}
+function validateRouter(bootstrap,runtime){
+  const manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read(bootstrap,'manifest.json',0o600,16384)));
+  if(manifest.version===1)return validateLegacy(bootstrap,runtime,manifest);
+  if(!exact(manifest,['version','sourceReleaseId','routerContract','files'])||manifest.version!==2||typeof manifest.sourceReleaseId!=='string'||typeof manifest.routerContract!=='number'||manifest.routerContract!==1)throw Error();
+  validateRecords(manifest.files,ROUTERS,0o755);if(fs.readdirSync(`/proc/self/fd/${bootstrap.fd}`).sort().join(',')!==[...ROUTERS,'manifest.json'].sort().join(','))throw Error();
+  const original=sourceFiles(runtime,manifest.sourceReleaseId,ROUTERS,0o755,true);for(const record of manifest.files){const bytes=read(bootstrap,record.name,record.mode);if(hash(bytes)!==record.sha256||!bytes.equals(original.bytes.get(record.name)))throw Error();}
+  return {version:2,manifest};
+}
+function validateLegacy(bootstrap,runtime,manifest){
+  const files=[...ROUTERS,...HELPERS];if(!exact(manifest,['version','sourceReleaseId','files'])||manifest.version!==1||typeof manifest.sourceReleaseId!=='string'||!Array.isArray(manifest.files)||manifest.files.length!==files.length)throw Error();
+  const modeFor=name=>name.startsWith('jhw-')?0o755:0o644;
+  for(let i=0;i<files.length;i++){const record=manifest.files[i];if(!exact(record,['name','mode','sha256'])||record.name!==files[i]||record.mode!==modeFor(files[i])||typeof record.sha256!=='string'||!DIGEST.test(record.sha256))throw Error();}
+  if(fs.readdirSync(`/proc/self/fd/${bootstrap.fd}`).sort().join(',')!==[...files,'manifest.json'].sort().join(','))throw Error();const original=sourceFiles(runtime,manifest.sourceReleaseId,files,modeFor);const contents={};for(const record of manifest.files){const bytes=read(bootstrap,record.name,record.mode);if(hash(bytes)!==record.sha256||!bytes.equals(original.bytes.get(record.name)))throw Error();contents[record.name]=bytes;}return {version:1,manifest,contents};
+}
+function validSnapshot(value){
+  if(!exact(value,['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId','observation'])||typeof value.version!=='number'||typeof value.activationId!=='string'||typeof value.releaseId!=='string'||typeof value.bootstrapId!=='string'||typeof value.runtimeContract!=='number'||typeof value.compatibilityDigest!=='string'||value.predecessorActivationId!==null&&typeof value.predecessorActivationId!=='string'||value.migrationId!==null&&typeof value.migrationId!=='string'||!exact(value.observation,['target','dev','ino','ctimeNs'])||['target','dev','ino','ctimeNs'].some(key=>typeof value.observation[key]!=='string'))return false;
+  return value.version===2&&/^a-[a-f0-9]{32}$/.test(value.activationId)&&RELEASE.test(value.releaseId)&&BOOTSTRAP.test(value.bootstrapId)&&value.runtimeContract===2&&DIGEST.test(value.compatibilityDigest)&&(value.predecessorActivationId===null||/^a-[a-f0-9]{32}$/.test(value.predecessorActivationId))&&(value.migrationId===null||value.predecessorActivationId===null&&/^m-[a-f0-9]{32}$/.test(value.migrationId))&&value.observation.target===`v2/activations/${value.activationId}`&&['dev','ino','ctimeNs'].every(key=>/^\d{1,32}$/.test(value.observation[key]));
+}
+function selectedPair(runtime){
+  if(process.env.JHW_RUNTIME_SESSION_BINDING!==undefined)throw Error();
+  const link=runtime.at('current');const before=fs.lstatSync(link,{bigint:true});if(!before.isSymbolicLink())throw Error();const target=fs.readlinkSync(link);const match=/^v2\/activations\/(a-[a-f0-9]{32})$/.exec(target);if(!match)throw Error();const activation=directory(path.join(runtime.name,target),0o700);
+  try{const manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read(activation,'manifest.json',0o600,65536)));if(!exact(manifest,['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId','createdAt','priorCurrent'])||typeof manifest.version!=='number'||typeof manifest.activationId!=='string'||typeof manifest.releaseId!=='string'||typeof manifest.bootstrapId!=='string'||typeof manifest.runtimeContract!=='number'||typeof manifest.compatibilityDigest!=='string'||manifest.predecessorActivationId!==null&&typeof manifest.predecessorActivationId!=='string'||manifest.migrationId!==null&&typeof manifest.migrationId!=='string'||typeof manifest.createdAt!=='string'||manifest.priorCurrent!==null&&(typeof manifest.priorCurrent!=='object'||Array.isArray(manifest.priorCurrent))||manifest.version!==2||manifest.activationId!==match[1]||!RELEASE.test(manifest.releaseId)||!BOOTSTRAP.test(manifest.bootstrapId)||manifest.runtimeContract!==2||!DIGEST.test(manifest.compatibilityDigest)||(manifest.predecessorActivationId!==null&&!/^a-[a-f0-9]{32}$/.test(manifest.predecessorActivationId))||(manifest.migrationId!==null&&!/^m-[a-f0-9]{32}$/.test(manifest.migrationId))||new Date(manifest.createdAt).toISOString()!==manifest.createdAt||manifest.priorCurrent!==null&&!validSnapshot(manifest.priorCurrent)||manifest.predecessorActivationId!==(manifest.priorCurrent?.activationId??null)||manifest.priorCurrent!==null&&manifest.migrationId!==null)throw Error();if(fs.readdirSync(`/proc/self/fd/${activation.fd}`).sort().join(',')!==['bootstrap','manifest.json','mcp-server','scripts','skills'].sort().join(','))throw Error();for(const [name,want] of [['bootstrap',`../../bootstraps/${manifest.bootstrapId}`],['mcp-server',`../../../releases/${manifest.releaseId}/mcp-server`],['scripts',`../../../releases/${manifest.releaseId}/scripts`],['skills',`../../../releases/${manifest.releaseId}/skills`]]){const item=fs.lstatSync(activation.at(name),{bigint:true});if(!item.isSymbolicLink()||fs.readlinkSync(activation.at(name))!==want)throw Error();}if(!same(before,fs.lstatSync(link,{bigint:true}))||fs.readlinkSync(link)!==target)throw Error();return {releaseId:manifest.releaseId,bootstrapId:manifest.bootstrapId,runtimeContract:2,compatibilityDigest:manifest.compatibilityDigest};}finally{activation.close();}
+}
+function generation(runtime,pair){
+  const v2=directory(path.join(runtime.name,'v2'),0o700);const catalog=directory(path.join(v2.name,'bootstrap-catalog'),0o700);const bootstraps=directory(path.join(v2.name,'bootstraps'),0o700);const selected=directory(path.join(bootstraps.name,pair.bootstrapId),0o700);
+  try{const catalogBytes=read(catalog,`${pair.bootstrapId}.json`,0o600,16384);const manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(catalogBytes));if(!exact(manifest,['version','bootstrapId','runtimeContract','sourceReleaseId','files'])||manifest.version!==1||manifest.bootstrapId!==pair.bootstrapId||manifest.runtimeContract!==2||typeof manifest.sourceReleaseId!=='string'||!RELEASE.test(manifest.sourceReleaseId))throw Error();validateRecords(manifest.files,HELPERS,0o644);const identity={version:manifest.version,runtimeContract:manifest.runtimeContract,sourceReleaseId:manifest.sourceReleaseId,files:manifest.files};if(`b-${hash(canonical(identity))}`!==manifest.bootstrapId||catalogBytes.toString('utf8')!==canonical(manifest)+'\n')throw Error();if(fs.readdirSync(`/proc/self/fd/${selected.fd}`).sort().join(',')!==['lease','manifest.json',...HELPERS].sort().join(','))throw Error();if(!read(selected,'manifest.json',0o600,16384).equals(catalogBytes)||read(selected,'lease',0o600,1).length!==0)throw Error();const original=sourceFiles(runtime,manifest.sourceReleaseId,HELPERS,0o644,true);const contents={};for(const record of manifest.files){const bytes=read(selected,record.name,0o644);if(hash(bytes)!==record.sha256||!bytes.equals(original.bytes.get(record.name)))throw Error();contents[record.name]=bytes;}return contents;}finally{selected.close();bootstraps.close();catalog.close();v2.close();}
+}
+const moduleUrl=bytes=>`data:text/javascript;base64,${bytes.toString('base64')}`;
 (async()=>{
-  const directory=path.dirname(physical);
-  const repositoryRoot=path.dirname(path.dirname(directory));
-  if(directory!==path.join(repositoryRoot,'.jhw-runtime/bootstrap') || name!=='jhw-runtime-entry') throw Error();
-  // Refuse symlink/group-writable ancestry before opening any helper.
-  let current='/'; const parts=directory.split('/').filter(Boolean); const held=[];
-  try {
-    for(let i=-1;i<parts.length;i++) {
-      if(i>=0) current=path.join(current,parts[i]);
-      const fd=fs.openSync(i<0 ? '/' : `/proc/self/fd/${held.at(-1).fd}/${parts[i]}`,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
-      const stat=fs.fstatSync(fd,{bigint:true}); held.push({fd,stat,name:current});
-      const mode=Number(stat.mode); const leaf=i===parts.length-1;
-      if(!stat.isDirectory() || (stat.uid!==BigInt(process.getuid()) && (leaf || stat.uid!==0n)) || (mode&0o022 && (leaf || !(mode&0o1000))) || mode&0o6000 || (leaf && (mode&0o7777)!==0o700)) throw Error();
-    }
-    const read=(name,mode,limit,parent=held.at(-1).fd)=>{
-      const file=`/proc/self/fd/${parent}/${name}`;
-      const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NONBLOCK|fs.constants.O_NOFOLLOW);
-      try {
-        const before=fs.fstatSync(fd,{bigint:true});
-        if(!before.isFile() || before.uid!==BigInt(process.getuid()) || before.nlink!==1n || (Number(before.mode)&0o7777)!==mode || before.size>BigInt(limit)) throw Error();
-        const bytes=Buffer.alloc(Number(before.size)); let offset=0;
-        while(offset<bytes.length) { const n=fs.readSync(fd,bytes,offset,bytes.length-offset,null); if(!n) throw Error(); offset+=n; }
-        const after=fs.fstatSync(fd,{bigint:true}); const named=fs.lstatSync(file,{bigint:true});
-        if(fs.readSync(fd,Buffer.alloc(1),0,1,null)!==0 || ['dev','ino','mode','uid','gid','nlink','size','mtimeNs','ctimeNs'].some(key=>before[key]!==after[key] || before[key]!==named[key])) throw Error();
-        return bytes;
-      } finally { fs.closeSync(fd); }
-    };
-    const manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read('manifest.json',0o600,16384)));
-    if(!manifest || Object.keys(manifest).sort().join(',')!=='files,sourceReleaseId,version' || manifest.version!==1 || typeof manifest.sourceReleaseId!=='string' || !/^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/.test(manifest.sourceReleaseId) || !Array.isArray(manifest.files) || manifest.files.length!==6) throw Error();
-    const files=['jhw-runtime-control','jhw-runtime-entry','jhw-runtime-hook','runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs'];
-    if(fs.readdirSync(`/proc/self/fd/${held.at(-1).fd}`).sort().join(',')!==[...files,'manifest.json'].sort().join(',')) throw Error();
-    const contents={};
-    for(let index=0;index<files.length;index++) {
-      const record=manifest.files[index]; const expected=files[index]; const mode=expected.startsWith('jhw-') ? 0o755 : 0o644;
-      const bytes=read(expected,mode,1024*1024); contents[expected]=bytes;
-      if(!record || Object.keys(record).sort().join(',')!=='mode,name,sha256' || record.name!==expected || record.mode!==mode || typeof record.sha256!=='string' || !/^[a-f0-9]{64}$/.test(record.sha256) || crypto.createHash('sha256').update(bytes).digest('hex')!==record.sha256) throw Error();
-    }
-
-    const canonical=value=>Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value!==null && typeof value==='object' ? `{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
-    // The bootstrap checksum alone cannot authorize changed helper bytes. Bind
-    // every helper to its source generation's content-derived ID and bytes.
-    let releasesFd; let sourceFd; let scriptsFd;
-    try {
-      releasesFd=fs.openSync(`/proc/self/fd/${held.at(-2).fd}/releases`,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
-      sourceFd=fs.openSync(`/proc/self/fd/${releasesFd}/${manifest.sourceReleaseId}`,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
-      for(const fd of [releasesFd,sourceFd]) { const stat=fs.fstatSync(fd); if(stat.uid!==process.getuid() || (stat.mode&0o7777)!==0o700) throw Error(); }
-      const source=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read('manifest.json',0o600,32*1024*1024,sourceFd)));
-      if(!source || Object.keys(source).sort().join(',')!=='contentDigest,createdAt,dirty,entries,releaseId,sourceDigest,sourceRevision,version' || source.version!==1 || source.releaseId!==manifest.sourceReleaseId || !Array.isArray(source.entries) || source.entries.length>100000) throw Error();
-      const digest=crypto.createHash('sha256').update(canonical({sourceRevision:source.sourceRevision,sourceDigest:source.sourceDigest,dirty:source.dirty,entries:source.entries})).digest('hex');
-      if(source.contentDigest!==digest || source.releaseId!==`r-${source.sourceRevision}-${digest}`) throw Error();
-      scriptsFd=fs.openSync(`/proc/self/fd/${sourceFd}/scripts`,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);
-      const scriptsStat=fs.fstatSync(scriptsFd);
-      if(scriptsStat.uid!==process.getuid() || (scriptsStat.mode&0o7022)) throw Error();
-      for(const record of manifest.files) {
-        const entries=source.entries.filter(entry=>entry?.path===`scripts/${record.name}`);
-        if(entries.length!==1 || Object.keys(entries[0]).sort().join(',')!=='mode,path,sha256,type' || entries[0].type!=='file' || entries[0].mode!==record.mode || entries[0].sha256!==record.sha256 || crypto.createHash('sha256').update(read(record.name,record.mode,1024*1024,scriptsFd)).digest('hex')!==record.sha256) throw Error();
-      }
-    } finally { if(scriptsFd!==undefined) fs.closeSync(scriptsFd); if(sourceFd!==undefined) fs.closeSync(sourceFd); if(releasesFd!==undefined) fs.closeSync(releasesFd); }
-    for(const record of held) {
-      const stat=fs.lstatSync(record.name,{bigint:true});
-      if(['dev','ino','uid','gid','mode'].some(key=>record.stat[key]!==stat[key])) throw Error();
-    }
-    // Import the descriptor-read bytes themselves. A release pathname replaced
-    // after validation can no longer select different helper code.
-    const moduleUrl=bytes=>`data:text/javascript;base64,${bytes.toString('base64')}`;
-    const entry=await import(moduleUrl(contents['runtime-entry.mjs']));
-    process.exitCode=await entry.runManaged({repositoryRoot,selector,args,sourceReleaseId:manifest.sourceReleaseId,safetySource:contents['runtime-safety.mjs'],storeSource:contents['runtime-store.mjs']});
-  } finally { for(const record of held.reverse()) fs.closeSync(record.fd); }
-})().catch(refuse);
+  const physical=__filename;const bootstrap=directory(path.dirname(physical),0o700);const runtime=directory(path.dirname(bootstrap.name),0o700);
+  try{if(path.basename(physical)!=='jhw-runtime-entry'||bootstrap.name!==path.join(runtime.name,'bootstrap'))throw Error();const router=validateRouter(bootstrap,runtime);if(router.version===1){
+    const entry=await import(moduleUrl(router.contents['runtime-entry.mjs']));process.exitCode=await entry.runManaged({repositoryRoot:path.dirname(runtime.name),selector,args,sourceReleaseId:router.manifest.sourceReleaseId,safetySource:router.contents['runtime-safety.mjs'],storeSource:router.contents['runtime-store.mjs'],selectedPair:null});return;}
+    for(let attempt=0;attempt<3;attempt++){const pair=selectedPair(runtime);const contents=generation(runtime,pair);const entry=await import(moduleUrl(contents['runtime-entry.mjs']));const result=await entry.runManaged({repositoryRoot:path.dirname(runtime.name),selector,args,sourceReleaseId:router.manifest.sourceReleaseId,safetySource:contents['runtime-safety.mjs'],storeSource:contents['runtime-store.mjs'],selectedPair:pair});if(!result||result.retryCurrent!==true){process.exitCode=result;return;}}
+    throw Error();
+  }finally{runtime.close();bootstrap.close();}
+})().catch(()=>refuse());

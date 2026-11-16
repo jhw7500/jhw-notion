@@ -14,6 +14,7 @@ const MAX_ENTRIES = 100000;
 const MAX_FILE = 128 * 1024 * 1024;
 const MAX_MANIFEST = 32 * 1024 * 1024;
 const COMPATIBILITY_DECLARATION = 'mcp-server/src/control/runtime-compatibility.json';
+const BOOTSTRAP_HELPERS = ['runtime-entry.mjs', 'runtime-safety.mjs', 'runtime-store.mjs'];
 const COMPATIBLE_CONTROL_IMPLEMENTATIONS = new Set([
   'guard-service', 'hook-adapter', 'hook-codecs', 'shell-classifier',
 ]);
@@ -327,6 +328,179 @@ export function validateRelease({ repositoryRoot, releaseId }) {
   return withStore(repositoryRoot, false, runtime => {
     if (!runtime) fail('DEPLOY_RELEASE_INVALID');
     return validateReleaseIn(runtime, repositoryRoot, releaseId);
+  });
+}
+
+function requireLeaseIdentity(lease, file) {
+  if (!lease || !Number.isInteger(lease.fd) || lease.fd < 0) fail('DEPLOY_BOOTSTRAP_INVALID');
+  let held; let named;
+  try { held = fs.fstatSync(lease.fd, {bigint:true}); named = fs.lstatSync(file, {bigint:true}); }
+  catch { fail('DEPLOY_BOOTSTRAP_INVALID'); }
+  if (!held.isFile() || held.uid !== BigInt(process.getuid()) || held.nlink !== 1n ||
+      (Number(held.mode) & 0o7777) !== 0o600 || !same(held, named)) fail('DEPLOY_BOOTSTRAP_INVALID');
+}
+
+function bootstrapManifestId(manifest) {
+  const {bootstrapId: _bootstrapId, ...identity} = manifest;
+  return `b-${digest(canonical(identity))}`;
+}
+
+function generationSource(runtime, repositoryRoot, releaseId) {
+  let releases; let release; let scripts;
+  try {
+    const validated = validateReleaseIn(runtime, repositoryRoot, releaseId);
+    releases = runtime.child('releases', false, true);
+    release = releases.child(releaseId, false, true);
+    const manifest = readJson(release);
+    if (canonical(summary(manifest)) !== canonical(validated)) fail('DEPLOY_BOOTSTRAP_INVALID');
+    const declaration = compatibilityDeclaration(release, manifest);
+    if (declaration?.generation !== 2) fail('DEPLOY_BOOTSTRAP_INVALID');
+    scripts = release.child('scripts', false);
+    const files = [];
+    const helperBytes = new Map();
+    for (const name of BOOTSTRAP_HELPERS) {
+      const record = manifest.entries.find(entry => entry.path === `scripts/${name}`);
+      if (!record || record.type !== 'file' || record.mode !== 0o644) fail('DEPLOY_BOOTSTRAP_INVALID');
+      const retained = readBytes(scripts, name, 1024 * 1024);
+      if (retained.mode !== 0o644 || digest(retained.bytes) !== record.sha256) fail('DEPLOY_BOOTSTRAP_INVALID');
+      files.push({name, mode:0o644, sha256:record.sha256});
+      helperBytes.set(name, retained.bytes);
+    }
+    release.verify(); scripts.verify();
+    return {files, helperBytes};
+  } catch { fail('DEPLOY_BOOTSTRAP_INVALID'); }
+  finally { scripts?.close(); release?.close(); releases?.close(); }
+}
+
+function generationManifest(value, bootstrapId = null) {
+  if (!exact(value, ['version','bootstrapId','runtimeContract','sourceReleaseId','files']) ||
+      typeof value.version !== 'number' || typeof value.bootstrapId !== 'string' ||
+      typeof value.runtimeContract !== 'number' || typeof value.sourceReleaseId !== 'string' ||
+      value.version !== 1 || value.runtimeContract !== 2 || !BOOTSTRAP.test(value.bootstrapId) ||
+      bootstrapId !== null && value.bootstrapId !== bootstrapId || !RELEASE.test(value.sourceReleaseId) ||
+      !Array.isArray(value.files) || value.files.length !== BOOTSTRAP_HELPERS.length) return false;
+  for (let index = 0; index < BOOTSTRAP_HELPERS.length; index++) {
+    const record = value.files[index];
+    if (!exact(record, ['name','mode','sha256']) || typeof record.name !== 'string' ||
+        typeof record.mode !== 'number' || typeof record.sha256 !== 'string' ||
+        record.name !== BOOTSTRAP_HELPERS[index] || record.mode !== 0o644 || !DIGEST.test(record.sha256)) return false;
+  }
+  return bootstrapManifestId(value) === value.bootstrapId;
+}
+
+function readGeneration(runtime, repositoryRoot, bootstrapId, requireCopy = true) {
+  let v2; let catalog; let bootstraps; let generation;
+  try {
+    if (typeof bootstrapId !== 'string' || !BOOTSTRAP.test(bootstrapId)) fail('DEPLOY_BOOTSTRAP_INVALID');
+    v2 = runtime.child('v2', false, true);
+    catalog = v2.child('bootstrap-catalog', false, true);
+    const catalogName = `${bootstrapId}.json`;
+    const catalogRecord = readBytes(catalog, catalogName, 16384);
+    if (catalogRecord.mode !== 0o600) fail('DEPLOY_BOOTSTRAP_INVALID');
+    let manifest;
+    try { manifest = JSON.parse(new TextDecoder('utf-8', {fatal:true}).decode(catalogRecord.bytes)); }
+    catch { fail('DEPLOY_BOOTSTRAP_INVALID'); }
+    if (!generationManifest(manifest, bootstrapId) || catalogRecord.bytes.toString('utf8') !== canonical(manifest) + '\n') fail('DEPLOY_BOOTSTRAP_INVALID');
+    const source = generationSource(runtime, repositoryRoot, manifest.sourceReleaseId);
+    if (canonical(source.files) !== canonical(manifest.files)) fail('DEPLOY_BOOTSTRAP_INVALID');
+    if (!requireCopy) return {manifest, helperBytes:source.helperBytes, catalogBytes:catalogRecord.bytes};
+    bootstraps = v2.child('bootstraps', false, true);
+    generation = bootstraps.child(bootstrapId, false, true);
+    if (canonical(names(generation)) !== canonical(['lease','manifest.json',...BOOTSTRAP_HELPERS])) fail('DEPLOY_BOOTSTRAP_INVALID');
+    const generationRecord = readBytes(generation, 'manifest.json', 16384);
+    if (generationRecord.mode !== 0o600 || !generationRecord.bytes.equals(catalogRecord.bytes)) fail('DEPLOY_BOOTSTRAP_INVALID');
+    const lease = readBytes(generation, 'lease', 1);
+    if (lease.mode !== 0o600 || lease.bytes.length !== 0) fail('DEPLOY_BOOTSTRAP_INVALID');
+    const helperBytes = new Map();
+    for (const record of manifest.files) {
+      const retained = readBytes(generation, record.name, 1024 * 1024);
+      if (retained.mode !== record.mode || digest(retained.bytes) !== record.sha256 ||
+          !retained.bytes.equals(source.helperBytes.get(record.name))) fail('DEPLOY_BOOTSTRAP_INVALID');
+      helperBytes.set(record.name, retained.bytes);
+    }
+    generation.verify();
+    return {manifest, helperBytes, catalogBytes:catalogRecord.bytes};
+  } catch (error) { boundary(error, 'DEPLOY_BOOTSTRAP_INVALID'); }
+  finally { generation?.close(); bootstraps?.close(); catalog?.close(); v2?.close(); }
+}
+
+export function validateBootstrapGeneration({repositoryRoot, bootstrapId}) {
+  return withStore(repositoryRoot, false, runtime => {
+    if (!runtime) fail('DEPLOY_BOOTSTRAP_INVALID');
+    const {manifest, helperBytes} = readGeneration(runtime, repositoryRoot, bootstrapId);
+    return {manifest, helperBytes};
+  });
+}
+
+function generationNamespaces(runtime) {
+  const v2 = runtime.child('v2', true, true);
+  let catalog; let bootstraps;
+  try {
+    catalog = v2.child('bootstrap-catalog', true, true);
+    bootstraps = v2.child('bootstraps', true, true);
+    return {v2, catalog, bootstraps};
+  } catch (error) { catalog?.close(); bootstraps?.close(); v2.close(); throw error; }
+}
+
+function publishGeneration({runtime, repositoryRoot, manifest, helperBytes}) {
+  const encoded = Buffer.from(canonical(manifest) + '\n');
+  const {v2, catalog, bootstraps} = generationNamespaces(runtime);
+  let stage;
+  try {
+    const catalogName = `${manifest.bootstrapId}.json`;
+    try {
+      const prior = readBytes(catalog, catalogName, 16384);
+      if (prior.mode !== 0o600 || !prior.bytes.equals(encoded)) fail('DEPLOY_BOOTSTRAP_INVALID');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      writeBytes(catalog, catalogName, encoded, 0o600); fs.fsyncSync(catalog.fd);
+    }
+    try { return readGeneration(runtime, repositoryRoot, manifest.bootstrapId); }
+    catch (error) {
+      try { bootstraps.child(manifest.bootstrapId, false, true).close(); throw error; }
+      catch (missing) { if (missing.code !== 'ENOENT') throw error; }
+    }
+    const stageName = `.stage.${manifest.bootstrapId}.${randomBytes(16).toString('hex')}`;
+    stage = bootstraps.child(stageName, true, true);
+    writeBytes(stage, 'manifest.json', encoded, 0o600);
+    writeBytes(stage, 'lease', Buffer.alloc(0), 0o600);
+    for (const name of BOOTSTRAP_HELPERS) writeBytes(stage, name, helperBytes.get(name), 0o644);
+    fs.fsyncSync(stage.fd); stage.verify(); bootstraps.verify();
+    fs.renameSync(bootstraps.at(stageName), bootstraps.at(manifest.bootstrapId)); fs.fsyncSync(bootstraps.fd);
+    stage.close(); stage = undefined;
+    return readGeneration(runtime, repositoryRoot, manifest.bootstrapId);
+  } finally { stage?.close(); bootstraps.close(); catalog.close(); v2.close(); }
+}
+
+export function ensureBootstrapGeneration({repositoryRoot, releaseId, reuseBootstrapId = null, deployLease}) {
+  requireLeaseIdentity(deployLease, path.join(repositoryRoot, '.jhw-runtime/deploy.lock'));
+  return withStore(repositoryRoot, false, runtime => {
+    if (!runtime) fail('DEPLOY_BOOTSTRAP_INVALID');
+    const source = generationSource(runtime, repositoryRoot, releaseId);
+    let manifest;
+    if (reuseBootstrapId !== null) {
+      const existing = readGeneration(runtime, repositoryRoot, reuseBootstrapId);
+      if (canonical(existing.manifest.files) !== canonical(source.files)) fail('DEPLOY_BOOTSTRAP_INVALID');
+      manifest = existing.manifest;
+    } else {
+      const identity = {version:1,runtimeContract:2,sourceReleaseId:releaseId,files:source.files};
+      manifest = {...identity, bootstrapId:`b-${digest(canonical(identity))}`};
+      manifest = {version:manifest.version,bootstrapId:manifest.bootstrapId,runtimeContract:manifest.runtimeContract,
+        sourceReleaseId:manifest.sourceReleaseId,files:manifest.files};
+      publishGeneration({runtime, repositoryRoot, manifest, helperBytes:source.helperBytes});
+    }
+    return {releaseId,bootstrapId:manifest.bootstrapId,runtimeContract:2,
+      compatibilityDigest:releaseCompatibilityIn(runtime,repositoryRoot,releaseId)};
+  });
+}
+
+export function restoreBootstrapGeneration({repositoryRoot, bootstrapId, deployLease}) {
+  requireLeaseIdentity(deployLease, path.join(repositoryRoot, '.jhw-runtime/deploy.lock'));
+  return withStore(repositoryRoot, false, runtime => {
+    if (!runtime) fail('DEPLOY_BOOTSTRAP_INVALID');
+    const source = readGeneration(runtime, repositoryRoot, bootstrapId, false);
+    publishGeneration({runtime, repositoryRoot, manifest:source.manifest, helperBytes:source.helperBytes});
+    return {bootstrapId,sourceReleaseId:source.manifest.sourceReleaseId,runtimeContract:2};
   });
 }
 function git(root, args) {
