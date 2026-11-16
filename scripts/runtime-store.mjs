@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { DeploymentError, acquireLease, trustedDirectory } from './runtime-safety.mjs';
+import { DeploymentError, acquireLease, trustedDirectory, validLeaseCapability } from './runtime-safety.mjs';
 
 const C = fs.constants;
 const RELEASE = /^r-([a-f0-9]{40}|[a-f0-9]{64})-([a-f0-9]{64})$/;
@@ -203,6 +203,21 @@ function revalidateEvidenceTree(tree) {
     }
     record.parent.verify();
   }
+}
+
+function captureEvidenceFile(directory,name,limit=MAX_FILE) {
+  directory.verify();
+  const before=fs.lstatSync(directory.at(name),{bigint:true});
+  if(!before.isFile())fail('DEPLOY_SOURCE_CHANGED');
+  const retained=readBytes(directory,name,limit);
+  if(!same(before,fs.lstatSync(directory.at(name),{bigint:true})))fail('DEPLOY_SOURCE_CHANGED');
+  return {directory,name,stat:evidenceStat(before),sha256:digest(retained.bytes),bytes:Buffer.from(retained.bytes)};
+}
+
+function revalidateEvidenceFile(record) {
+  record.directory.verify();
+  const current=fs.lstatSync(record.directory.at(record.name),{bigint:true});
+  if(!current.isFile()||!same(record.stat,current))fail('DEPLOY_SOURCE_CHANGED');
 }
 
 function evidenceSnapshot(tree) {
@@ -450,13 +465,8 @@ export function validateRelease({ repositoryRoot, releaseId }) {
   });
 }
 
-function requireLeaseIdentity(lease, file, code = 'DEPLOY_BOOTSTRAP_INVALID') {
-  if (!lease || !Number.isInteger(lease.fd) || lease.fd < 0) fail(code);
-  let held; let named;
-  try { held = fs.fstatSync(lease.fd, {bigint:true}); named = fs.lstatSync(file, {bigint:true}); }
-  catch { fail(code); }
-  if (!held.isFile() || held.uid !== BigInt(process.getuid()) || held.nlink !== 1n ||
-      (Number(held.mode) & 0o7777) !== 0o600 || !same(held, named)) fail(code);
+function requireLeaseIdentity(lease, file, code = 'DEPLOY_BOOTSTRAP_INVALID', exclusive = true) {
+  if (!validLeaseCapability(lease,file,{exclusive})) fail(code);
 }
 
 function bootstrapManifestId(manifest) {
@@ -642,22 +652,30 @@ function evidenceState(evidence) {
 
 function pairKey(pair) { return canonical(pair); }
 
+function validateRuntimePairIn(runtime,repositoryRoot,pair,code) {
+  if(!validRuntimePair(pair))fail(code);
+  validateReleaseIn(runtime,repositoryRoot,pair.releaseId);
+  const source=generationSource(runtime,repositoryRoot,pair.releaseId);
+  const generation=readGeneration(runtime,repositoryRoot,pair.bootstrapId);
+  if(generation.manifest.runtimeContract!==pair.runtimeContract ||
+      canonical(source.files)!==canonical(generation.manifest.files) ||
+      releaseCompatibilityIn(runtime,repositoryRoot,pair.releaseId)!==pair.compatibilityDigest)fail(code);
+  return generation;
+}
+
 /** Complete validation and hashing happen here, outside publication.lock. The
  * returned object is only an identity-bearing process-local handle. */
 export function prepareRuntimeEvidence({repositoryRoot,pairs}) {
   if (typeof repositoryRoot !== 'string' || path.resolve(repositoryRoot) !== repositoryRoot ||
       !Array.isArray(pairs) || pairs.length === 0 || pairs.length > MAX_ENTRIES) fail('DEPLOY_SOURCE_CHANGED');
-  let root; let runtime; const trees=[]; const anchors=[];
+  let root; let runtime; const trees=[]; const files=[]; const anchors=[];
   try {
     root = new Directory(repositoryRoot);
     runtime = root.child('.jhw-runtime',false,true);
     const unique = new Map();
     for (const pair of pairs) {
-      if (!validRuntimePair(pair) || unique.has(pairKey(pair))) fail('DEPLOY_SOURCE_CHANGED');
-      validateReleaseIn(runtime,repositoryRoot,pair.releaseId);
-      if (releaseCompatibilityIn(runtime,repositoryRoot,pair.releaseId) !== pair.compatibilityDigest) fail('DEPLOY_SOURCE_CHANGED');
-      const generation = readGeneration(runtime,repositoryRoot,pair.bootstrapId);
-      if (generation.manifest.runtimeContract !== pair.runtimeContract) fail('DEPLOY_SOURCE_CHANGED');
+      if (unique.has(pairKey(pair))) fail('DEPLOY_SOURCE_CHANGED');
+      const generation=validateRuntimePairIn(runtime,repositoryRoot,pair,'DEPLOY_SOURCE_CHANGED');
       unique.set(pairKey(pair),{pair:{...pair},sourceReleaseId:generation.manifest.sourceReleaseId});
     }
     const releases = runtime.child('releases',false,true);
@@ -677,11 +695,14 @@ export function prepareRuntimeEvidence({repositoryRoot,pairs}) {
     }
     const v2 = runtime.child('v2',false,true);
     anchors.push(v2);
-    let bootstraps;
+    let catalog;let bootstraps;
     {
+      catalog=v2.child('bootstrap-catalog',false,true);
+      anchors.push(catalog);
       bootstraps = v2.child('bootstraps',false,true);
       anchors.push(bootstraps);
       for (const bootstrapId of new Set([...unique.values()].map(value=>value.pair.bootstrapId))) {
+        files.push(captureEvidenceFile(catalog,`${bootstrapId}.json`,16384));
         const generation = bootstraps.child(bootstrapId,false,true);
         trees.push(captureEvidenceTree(generation,new Set(BOOTSTRAP_HELPERS)));
       }
@@ -697,6 +718,7 @@ export function prepareRuntimeEvidence({repositoryRoot,pairs}) {
       }
     }
     const state={repositoryRoot,root,runtime,trees,anchors,pairs:unique,closed:false};
+    state.files=files;
     const evidence=Object.freeze({close(){closePreparedEvidence(state);}});
     preparedEvidence.set(evidence,state);
     root=undefined; runtime=undefined;
@@ -715,6 +737,7 @@ export function revalidateRuntimeEvidence(evidence) {
   try {
     state.root.verify(); state.runtime.verify();
     for (const tree of state.trees) revalidateEvidenceTree(tree);
+    for (const file of state.files) revalidateEvidenceFile(file);
   } catch { fail('DEPLOY_SOURCE_CHANGED'); }
 }
 function git(root, args) {
@@ -1049,10 +1072,7 @@ export function preparePairActivation({repositoryRoot,pair,expectedCurrent,migra
     root=new Directory(repositoryRoot);
     runtime=root.child('.jhw-runtime',false,true);
     checkCurrent(runtime,repositoryRoot,expectedCurrent);
-    validateReleaseIn(runtime,repositoryRoot,pair.releaseId);
-    if (releaseCompatibilityIn(runtime,repositoryRoot,pair.releaseId)!==pair.compatibilityDigest) fail('DEPLOY_ACTIVATION_INVALID');
-    const generation=readGeneration(runtime,repositoryRoot,pair.bootstrapId);
-    if (generation.manifest.runtimeContract!==pair.runtimeContract) fail('DEPLOY_ACTIVATION_INVALID');
+    validateRuntimePairIn(runtime,repositoryRoot,pair,'DEPLOY_ACTIVATION_INVALID');
     v2=runtime.child('v2',true,true);
     activations=v2.child('activations',true,true);
     stageName=`.stage.${randomBytes(16).toString('hex')}`;
@@ -2123,7 +2143,8 @@ export function bindEntryPair({repositoryRoot,token,kind='invocation',selectedPa
   return sessionBoundary(() => {
     sessionRootName(repositoryRoot);
     if(!validRuntimePair(selectedPair)||!['session','invocation'].includes(kind)||kind==='session'&&token!==undefined)sessionFail();
-    requireLeaseIdentity(admissionLease,path.join(repositoryRoot,'.jhw-runtime/admission.lock'));
+    requireLeaseIdentity(admissionLease,path.join(repositoryRoot,'.jhw-runtime/admission.lock'),
+      'DEPLOY_BOOTSTRAP_INVALID',false);
     if(token===undefined){
       const current=withStore(repositoryRoot,false,runtime=>currentIn(runtime,repositoryRoot,false));
       if(!current||current.version!==2||canonical({releaseId:current.releaseId,bootstrapId:current.bootstrapId,

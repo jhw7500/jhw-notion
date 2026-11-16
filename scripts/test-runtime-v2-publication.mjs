@@ -33,6 +33,27 @@ function publicationLease(root) {
   return acquireLease(path.join(root,'.jhw-runtime/publication.lock'),{create:true});
 }
 
+function invalidLease(file, kind) {
+  if (kind === 'raw') {
+    const fd=fs.openSync(file,fs.constants.O_RDWR);
+    return {lease:{fd,close(){fs.closeSync(fd);}},cleanup() {}};
+  }
+  if (kind === 'shared') {
+    const lease=acquireLease(file,{shared:true});
+    return {lease,cleanup(){lease.close();}};
+  }
+  const lease=acquireLease(file);
+  const fd=lease.fd;
+  lease.close();
+  const opened=[];
+  while(!opened.includes(fd)){
+    const candidate=fs.openSync(file,fs.constants.O_RDWR);
+    opened.push(candidate);
+    assert.ok(candidate<=fd,'fixture must be able to reuse the closed descriptor number');
+  }
+  return {lease,cleanup(){for(const openedFd of opened)fs.closeSync(openedFd);}};
+}
+
 test('v2 publication rejects mutation after complete validation', async t => {
   const cases = [
     ['same-size in-place edit with restored mtime', ({f,pair}) => {
@@ -108,6 +129,77 @@ test('reused bootstrap evidence validates its original source release', async t 
   const sourceHelper=path.join(state.f.root,`.jhw-runtime/releases/${state.sourceReleaseId}/scripts/runtime-entry.mjs`);
   fs.writeFileSync(sourceHelper,Buffer.alloc(fs.statSync(sourceHelper).size,0x78));
   assert.throws(() => store.revalidateRuntimeEvidence(state.evidence), {code:'DEPLOY_SOURCE_CHANGED'});
+});
+
+test('catalog evidence rejects content, inode, and deletion changes before publication', async t => {
+  for (const [name,mutate] of [
+    ['content',file=>fs.writeFileSync(file,'{}\n',{mode:0o600})],
+    ['inode',file=>{
+      const replacement=`${file}.replacement`;
+      fs.writeFileSync(replacement,fs.readFileSync(file),{mode:0o600});
+      fs.renameSync(replacement,file);
+    }],
+    ['deletion',file=>fs.unlinkSync(file)],
+  ]) await t.test(name,async t=>{
+    const state=await prepared(t,{reuse:true});
+    const before=store.readActivation({repositoryRoot:state.f.root});
+    const catalog=path.join(state.f.root,`.jhw-runtime/v2/bootstrap-catalog/${state.pair.bootstrapId}.json`);
+    mutate(catalog);
+    assert.throws(()=>store.revalidateRuntimeEvidence(state.evidence),{code:'DEPLOY_SOURCE_CHANGED'});
+    const lease=publicationLease(state.f.root);
+    try {
+      assert.throws(()=>store.publishPreparedActivation({repositoryRoot:state.f.root,
+        destination:state.destination,expectedCurrent:state.expectedCurrent,evidence:state.evidence,
+        publicationLease:lease}),{code:'DEPLOY_SOURCE_CHANGED'});
+    } finally {lease.close();}
+    assert.deepEqual(store.readActivation({repositoryRoot:state.f.root}),before);
+  });
+});
+
+test('prepared APIs reject a payload and bootstrap with different helper sets', async t=>{
+  const f=await createRuntimeFixture(t);
+  const releaseA=await f.prepare();
+  let deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  t.after(()=>deployLease?.close());
+  const pairA=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:releaseA.releaseId,deployLease});
+  deployLease.close();deployLease=null;
+  f.write('scripts/runtime-entry.mjs','export const incompatible = true;\n');
+  const releaseB=await f.prepare();
+  deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const pairB=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:releaseB.releaseId,deployLease});
+  const mismatched={...pairB,bootstrapId:pairA.bootstrapId};
+  assert.throws(()=>store.prepareRuntimeEvidence({repositoryRoot:f.root,pairs:[mismatched]}),
+    {code:'DEPLOY_SOURCE_CHANGED'});
+  assert.throws(()=>store.preparePairActivation({repositoryRoot:f.root,pair:mismatched,
+    expectedCurrent:null,deployLease}),{code:'DEPLOY_ACTIVATION_INVALID'});
+});
+
+test('publication requires a live issued exclusive lease capability',async t=>{
+  for(const kind of ['raw','shared','reused'])await t.test(kind,async t=>{
+    const state=await prepared(t);
+    const lock=path.join(state.f.root,'.jhw-runtime/publication.lock');
+    publicationLease(state.f.root).close();
+    const invalid=invalidLease(lock,kind);
+    try{
+      assert.throws(()=>store.publishPreparedActivation({repositoryRoot:state.f.root,
+        destination:state.destination,expectedCurrent:state.expectedCurrent,evidence:state.evidence,
+        publicationLease:invalid.lease}),{code:'DEPLOY_ACTIVATION_INVALID'});
+    }finally{invalid.cleanup();}
+    assert.deepEqual(store.readActivation({repositoryRoot:state.f.root}),state.expectedCurrent);
+  });
+});
+
+test('activation preparation requires a live issued exclusive deploy lease capability',async t=>{
+  for(const kind of ['raw','shared','reused'])await t.test(kind,async t=>{
+    const state=await prepared(t);
+    state.deployLease.close();state.deployLease=null;
+    const invalid=invalidLease(path.join(state.f.root,'.jhw-runtime/deploy.lock'),kind);
+    try{
+      assert.throws(()=>store.preparePairActivation({repositoryRoot:state.f.root,pair:state.pair,
+        expectedCurrent:state.expectedCurrent,deployLease:invalid.lease}),{code:'DEPLOY_ACTIVATION_INVALID'});
+    }finally{invalid.cleanup();}
+    assert.deepEqual(store.readActivation({repositoryRoot:state.f.root}),state.expectedCurrent);
+  });
 });
 
 test('invalid manifest is rejected before any payload artifact opens', async t => {

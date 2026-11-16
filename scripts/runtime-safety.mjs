@@ -6,6 +6,7 @@ const C = fs.constants;
 const MAX_ENTRIES = 32768;
 const MAX_ARGV_BYTES = 131072;
 const RECORD_BYTES = 65536;
+const issuedLeases = new WeakMap();
 
 /** Only stable, bounded identifiers cross the deployment error boundary. */
 export class DeploymentError extends Error {
@@ -129,18 +130,42 @@ export function acquireLease(file, { shared = false, create = false } = {}) {
     const heldFd = fd;
     fd = undefined;
     let closed = false;
-    return {
+    const state = { fd: heldFd, file: name, shared, stat, closed: false };
+    const lease = {
       fd: heldFd,
       close() {
         // Do not LOCK_UN: an inherited descriptor must retain the lease even
         // when this caller closes its descriptor or exits.
-        if (!closed) { closed = true; fs.closeSync(heldFd); }
+        if (!closed) { closed = true; state.closed = true; fs.closeSync(heldFd); }
       },
     };
+    issuedLeases.set(lease, state);
+    return lease;
   } catch (error) {
     if (error instanceof DeploymentError) throw error;
     throw new DeploymentError('DEPLOY_UNTRUSTED_PATH');
   } finally { if (fd !== undefined) fs.closeSync(fd); chain?.close(); }
+}
+
+/** Process-local proof that acquireLease issued this exact live handle for the
+ * named lock and acquired the required mode. The public Lease shape stays
+ * {fd,close}; capability state is neither enumerable nor caller-forgeable. */
+export function validLeaseCapability(lease, file, { exclusive = false } = {}) {
+  let chain;
+  try {
+    const state = issuedLeases.get(lease);
+    const name = absoluteName(file);
+    if (!state || state.closed || state.file !== name || state.fd !== lease?.fd ||
+        exclusive && state.shared) return false;
+    chain = directoryChain(path.dirname(name), process.getuid());
+    const held = fs.fstatSync(state.fd);
+    const named = fs.lstatSync(`/proc/self/fd/${chain.fd}/${path.basename(name)}`);
+    chain.verify();
+    return sameObject(state.stat, held) && sameObject(state.stat, named) &&
+      held.isFile() && held.uid === process.getuid() && held.nlink === 1 &&
+      (held.mode & 0o7777) === 0o600;
+  } catch { return false; }
+  finally { chain?.close(); }
 }
 
 function uncertain() { throw new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN'); }
