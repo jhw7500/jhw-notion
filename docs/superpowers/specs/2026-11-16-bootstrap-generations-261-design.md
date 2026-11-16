@@ -120,6 +120,12 @@ catalog와 migration anchor의 GC는 이번 범위에 없으며 크기·참조 �
 `validCurrent`는 null 또는 위 union, `isActivationSnapshot`은 null 없는 union을 검사한다.
 Guard 전환 증거, deploy/recovery, prune은 같은 판독 함수를 사용한다. v1의 bytes/허용 범위는 유지한다.
 
+v2 snapshot/pair/activation/record validator는 정규식·경로·날짜 같은 값 검사 전에 선언된 scalar
+타입을 확인한다. 문자열 필드는 string만, 숫자 필드는 number와 각 범위만 허용하며 nullable 필드는
+명시된 null 또는 선언 타입만 허용한다. 숫자·boolean·금지된 null·array·object 같은 JSON 입력을
+문자열로 강제 변환하지 않고 false로 거부한다. 이 엄격한 타입 경계는 v2 전용이며 v1 reader의 기존
+수락 범위는 바꾸지 않는다. 실제 PID, inode, lease와 parent pair 증명은 v2 reader가 별도로 수행한다.
+
 v2 activation manifest의 정확한 키는 version(2), activationId, releaseId, bootstrapId,
 runtimeContract, compatibilityDigest, predecessorActivationId, migrationId, createdAt, priorCurrent다.
 mcp-server/scripts/skills와 bootstrap 링크 네 개를 정확히 검증한다. priorCurrent는 v2 snapshot

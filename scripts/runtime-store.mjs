@@ -469,10 +469,20 @@ export function validV1Current(value) {
     (value.predecessorActivationId === null || ACTIVATION.test(value.predecessorActivationId)) &&
     validObservation(value.observation, value.activationId, 'activations');
 }
+function validV2SnapshotScalarTypes(value) {
+  return typeof value.version === 'number' && typeof value.activationId === 'string' &&
+    typeof value.releaseId === 'string' && typeof value.bootstrapId === 'string' &&
+    typeof value.runtimeContract === 'number' && typeof value.compatibilityDigest === 'string' &&
+    (value.predecessorActivationId === null || typeof value.predecessorActivationId === 'string') &&
+    (value.migrationId === null || typeof value.migrationId === 'string') &&
+    exact(value.observation, ['target', 'dev', 'ino', 'ctimeNs']) &&
+    ['target', 'dev', 'ino', 'ctimeNs'].every(key => typeof value.observation[key] === 'string');
+}
 function validV2Current(value) {
   if (value === null) return true;
   return exact(value, ['version', 'activationId', 'releaseId', 'bootstrapId', 'runtimeContract',
-    'compatibilityDigest', 'predecessorActivationId', 'migrationId', 'observation']) && value.version === 2 &&
+    'compatibilityDigest', 'predecessorActivationId', 'migrationId', 'observation']) &&
+    validV2SnapshotScalarTypes(value) && value.version === 2 &&
     ACTIVATION.test(value.activationId) && RELEASE.test(value.releaseId) && BOOTSTRAP.test(value.bootstrapId) &&
     value.runtimeContract === 2 && DIGEST.test(value.compatibilityDigest) &&
     (value.predecessorActivationId === null || ACTIVATION.test(value.predecessorActivationId)) &&
@@ -484,12 +494,21 @@ export function validCurrent(value) {
 }
 export function validRuntimePair(value) {
   return exact(value, ['releaseId', 'bootstrapId', 'runtimeContract', 'compatibilityDigest']) &&
+    typeof value.releaseId === 'string' && typeof value.bootstrapId === 'string' &&
+    typeof value.runtimeContract === 'number' && typeof value.compatibilityDigest === 'string' &&
     RELEASE.test(value.releaseId) && BOOTSTRAP.test(value.bootstrapId) && value.runtimeContract === 2 &&
     DIGEST.test(value.compatibilityDigest);
 }
 function validV2ActivationManifest(value, activationId) {
   if (!exact(value, ['version', 'activationId', 'releaseId', 'bootstrapId', 'runtimeContract',
       'compatibilityDigest', 'predecessorActivationId', 'migrationId', 'createdAt', 'priorCurrent']) ||
+      typeof value.version !== 'number' || typeof value.activationId !== 'string' ||
+      typeof value.releaseId !== 'string' || typeof value.bootstrapId !== 'string' ||
+      typeof value.runtimeContract !== 'number' || typeof value.compatibilityDigest !== 'string' ||
+      value.predecessorActivationId !== null && typeof value.predecessorActivationId !== 'string' ||
+      value.migrationId !== null && typeof value.migrationId !== 'string' ||
+      typeof value.createdAt !== 'string' ||
+      value.priorCurrent !== null && (typeof value.priorCurrent !== 'object' || Array.isArray(value.priorCurrent)) ||
       value.version !== 2 || value.activationId !== activationId || !validRuntimePair({
         releaseId: value.releaseId, bootstrapId: value.bootstrapId, runtimeContract: value.runtimeContract,
         compatibilityDigest: value.compatibilityDigest,
@@ -666,12 +685,28 @@ function validLeaseIdentity(value, lease = null) {
   return lease === null || lease.isFile() && lease.uid === BigInt(process.getuid()) && lease.nlink === 1n &&
     (Number(lease.mode) & 0o7777) === 0o600 && value.dev === String(lease.dev) && value.ino === String(lease.ino);
 }
+function validV2RecordScalarTypes(value) {
+  return typeof value.version === 'number' && typeof value.id === 'string' && typeof value.kind === 'string' &&
+    typeof value.releaseId === 'string' && typeof value.bootstrapId === 'string' &&
+    typeof value.runtimeContract === 'number' && typeof value.compatibilityDigest === 'string' &&
+    (value.parentBinding === null || typeof value.parentBinding === 'string') &&
+    exact(value.repository, ['path', 'dev', 'ino']) && typeof value.repository.path === 'string' &&
+    typeof value.repository.dev === 'string' && typeof value.repository.ino === 'string' &&
+    exact(value.owner, ['uid', 'pid', 'startTime', 'bootId', 'commandDigest', 'exeDev', 'exeIno']) &&
+    typeof value.owner.uid === 'number' && typeof value.owner.pid === 'number' &&
+    typeof value.owner.startTime === 'string' && typeof value.owner.bootId === 'string' &&
+    typeof value.owner.commandDigest === 'string' && typeof value.owner.exeDev === 'string' &&
+    typeof value.owner.exeIno === 'string' && exact(value.manifest, ['dev', 'ino']) &&
+    typeof value.manifest.dev === 'string' && typeof value.manifest.ino === 'string' &&
+    exact(value.lease, ['dev', 'ino', 'fd']) && typeof value.lease.dev === 'string' &&
+    typeof value.lease.ino === 'string' && typeof value.lease.fd === 'number' && typeof value.createdAt === 'string';
+}
 // This is the pure closed-schema gate. The v2 reader additionally resolves the
 // recorded process, manifest, lease, and parent token identities before use.
 export function validV2SessionRecord(value) {
   if (!exact(value, ['version', 'id', 'kind', 'releaseId', 'bootstrapId', 'runtimeContract',
     'compatibilityDigest', 'parentBinding', 'repository', 'owner', 'manifest', 'lease', 'createdAt'])) return false;
-  if (value === null || value.version !== 2 || !validRuntimePair({
+  if (!validV2RecordScalarTypes(value) || value.version !== 2 || !validRuntimePair({
       releaseId: value.releaseId, bootstrapId: value.bootstrapId, runtimeContract: value.runtimeContract,
       compatibilityDigest: value.compatibilityDigest,
     }) || !timestamp(value.createdAt) || !validRepositoryIdentity(value.repository) ||

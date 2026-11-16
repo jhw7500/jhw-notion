@@ -9,6 +9,19 @@ import * as store from './runtime-store.mjs';
 
 const contracts = JSON.parse(fs.readFileSync(new URL('./__fixtures__/runtime-v2/contracts.json', import.meta.url), 'utf8'));
 
+function atPath(value, field, replacement) {
+  const changed = structuredClone(value);
+  const parts = field.split('.');
+  let target = changed;
+  for (const part of parts.slice(0, -1)) target = target[part];
+  target[parts.at(-1)] = replacement;
+  return changed;
+}
+
+const wrongStrings = value => [123, true, null, [value], {}];
+const wrongNullableStrings = value => wrongStrings(value).filter(candidate => candidate !== null);
+const wrongIntegers = value => [String(value), true, null, [value], {}];
+
 function write(root, name, text = 'fixture\n', mode = 0o644) {
   const file = path.join(root, name);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o755 });
@@ -84,6 +97,41 @@ test('v2 contract rejects mixed snapshots and preserves v1', () => {
   assert.equal(store.validRuntimePair({ ...runtimePair, unexpected: true }), false);
 });
 
+test('v2 snapshot and pair reject every JSON scalar type mismatch without coercion', () => {
+  const {v2, runtimePair} = contracts;
+  for (const field of [
+    'activationId', 'releaseId', 'bootstrapId', 'compatibilityDigest',
+    'observation.target', 'observation.dev', 'observation.ino', 'observation.ctimeNs',
+  ]) {
+    for (const replacement of wrongStrings(field.split('.').reduce((value, key) => value[key], v2))) {
+      assert.equal(store.validCurrent(atPath(v2, field, replacement)), false, `snapshot ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
+  const withPredecessor = {...v2, predecessorActivationId: `a-${'9'.repeat(32)}`, migrationId: null};
+  assert.equal(store.validCurrent(withPredecessor), true);
+  for (const [field, value] of [['predecessorActivationId', withPredecessor.predecessorActivationId], ['migrationId', v2.migrationId]]) {
+    const source = field === 'predecessorActivationId' ? withPredecessor : v2;
+    for (const replacement of wrongNullableStrings(value)) {
+      assert.equal(store.validCurrent({...source, [field]: replacement}), false, `snapshot ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
+  for (const field of ['version', 'runtimeContract']) {
+    for (const replacement of wrongIntegers(v2[field])) {
+      assert.equal(store.validCurrent({...v2, [field]: replacement}), false, `snapshot ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
+
+  for (const field of ['releaseId', 'bootstrapId', 'compatibilityDigest']) {
+    for (const replacement of wrongStrings(runtimePair[field])) {
+      assert.equal(store.validRuntimePair({...runtimePair, [field]: replacement}), false, `pair ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
+  for (const replacement of wrongIntegers(runtimePair.runtimeContract)) {
+    assert.equal(store.validRuntimePair({...runtimePair, runtimeContract: replacement}), false,
+      `pair runtimeContract: ${JSON.stringify(replacement)}`);
+  }
+});
+
 test('v2 binding records close identity fields and token relationships', () => {
   const withUid = record => ({...record, owner: {...record.owner, uid: process.getuid()}});
   const rootRecord = withUid(contracts.rootRecord);
@@ -106,6 +154,35 @@ test('v2 binding records close identity fields and token relationships', () => {
     ['malformed lease identity', {...rootRecord, lease: {...rootRecord.lease, fd: -1}}],
     ['unknown key', {...rootRecord, unexpected: true}],
   ]) assert.equal(store.validV2SessionRecord(invalid), false, label);
+});
+
+test('v2 binding records reject every JSON scalar type mismatch without coercion', () => {
+  const rootRecord = {...contracts.rootRecord, owner: {...contracts.rootRecord.owner, uid: process.getuid()}};
+  const invocationRecord = {...contracts.invocationRecord,
+    owner: {...contracts.invocationRecord.owner, uid: process.getuid()}};
+  for (const field of [
+    'id', 'kind', 'releaseId', 'bootstrapId', 'compatibilityDigest',
+    'repository.path', 'repository.dev', 'repository.ino',
+    'owner.startTime', 'owner.bootId', 'owner.commandDigest', 'owner.exeDev', 'owner.exeIno',
+    'manifest.dev', 'manifest.ino', 'lease.dev', 'lease.ino', 'createdAt',
+  ]) {
+    const original = field.split('.').reduce((value, key) => value[key], rootRecord);
+    for (const replacement of wrongStrings(original)) {
+      assert.equal(store.validV2SessionRecord(atPath(rootRecord, field, replacement)), false,
+        `record ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
+  for (const replacement of wrongNullableStrings(invocationRecord.parentBinding)) {
+    assert.equal(store.validV2SessionRecord({...invocationRecord, parentBinding: replacement}), false,
+      `record parentBinding: ${JSON.stringify(replacement)}`);
+  }
+  for (const field of ['version', 'runtimeContract', 'owner.uid', 'owner.pid', 'lease.fd']) {
+    const original = field.split('.').reduce((value, key) => value[key], rootRecord);
+    for (const replacement of wrongIntegers(original)) {
+      assert.equal(store.validV2SessionRecord(atPath(rootRecord, field, replacement)), false,
+        `record ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
 });
 
 test('v2 activation reader accepts an initial migration and rejects a v1 priorCurrent', async t => {
@@ -149,6 +226,34 @@ test('v2 activation reader accepts an initial migration and rejects a v1 priorCu
   assert.equal(snapshot.observation.target, `v2/activations/${activationId}`);
   for (const key of ['dev', 'ino', 'ctimeNs']) assert.match(snapshot.observation[key], /^\d{1,32}$/);
 
+  for (const field of ['activationId', 'releaseId', 'bootstrapId', 'compatibilityDigest', 'createdAt']) {
+    for (const replacement of wrongStrings(manifest[field])) {
+      fs.writeFileSync(path.join(activation, 'manifest.json'), JSON.stringify({...manifest, [field]: replacement}) + '\n');
+      assert.throws(() => store.readActivation({ repositoryRoot: f.root }), { code: 'DEPLOY_ACTIVATION_INVALID' },
+        `activation ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
+  for (const field of ['predecessorActivationId', 'migrationId']) {
+    const validString = field === 'predecessorActivationId' ? `a-${'9'.repeat(32)}` : manifest.migrationId;
+    for (const replacement of wrongNullableStrings(validString)) {
+      fs.writeFileSync(path.join(activation, 'manifest.json'), JSON.stringify({...manifest, [field]: replacement}) + '\n');
+      assert.throws(() => store.readActivation({ repositoryRoot: f.root }), { code: 'DEPLOY_ACTIVATION_INVALID' },
+        `activation ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
+  for (const field of ['version', 'runtimeContract']) {
+    for (const replacement of wrongIntegers(manifest[field])) {
+      fs.writeFileSync(path.join(activation, 'manifest.json'), JSON.stringify({...manifest, [field]: replacement}) + '\n');
+      assert.throws(() => store.readActivation({ repositoryRoot: f.root }), { code: 'DEPLOY_ACTIVATION_INVALID' },
+        `activation ${field}: ${JSON.stringify(replacement)}`);
+    }
+  }
+  for (const replacement of [123, true, 'v2', [], {}]) {
+    fs.writeFileSync(path.join(activation, 'manifest.json'), JSON.stringify({...manifest, priorCurrent: replacement}) + '\n');
+    assert.throws(() => store.readActivation({ repositoryRoot: f.root }), { code: 'DEPLOY_ACTIVATION_INVALID' },
+      `activation priorCurrent: ${JSON.stringify(replacement)}`);
+  }
+  fs.writeFileSync(path.join(activation, 'manifest.json'), JSON.stringify(manifest) + '\n');
   manifest.compatibilityDigest = '0'.repeat(64);
   fs.writeFileSync(path.join(activation, 'manifest.json'), JSON.stringify(manifest) + '\n');
   assert.throws(() => store.readActivation({ repositoryRoot: f.root }), { code: 'DEPLOY_ACTIVATION_INVALID' });

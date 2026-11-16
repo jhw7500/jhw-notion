@@ -334,8 +334,7 @@ Task worktree mode 때문에 계약 시험이 막히면 소스 commit/diff와 �
 | 기본 whitelist·사용자 env·명시적 한 파일 migration | 6, 7 |
 | 실제 3개 세션·deadline·control 범위·C5·배포 후 item12 | 10 및 별도 승인된 배포 후 확인 |
 
-이 계획은 제품 구현 완료 증거가 아니다. 실행 방식은 아직 선택하지 않았다.
-권장 방식은 **Subagent-driven 순차 실행**이다. 공유 runtime 파일의 인터페이스를 단계별로 고정하고
+이 계획은 제품 구현 완료 증거가 아니다. 실행 방식은 사용자가 승인한 **Subagent-driven 순차 실행**이다.
+공유 runtime 파일의 인터페이스를 단계별로 고정하고
 수명·삭제·복구 결함을 다음 단계에 넘기지 않도록 각 task 직후 독립 검토를 받는다.
 각 구현 agent에는 소유 파일과 push·PR·머지·브랜치 전환 금지를 명시한다.
-사용자가 Native를 선택하면 같은 task 순서를 이 세션에서 직접 수행하고 마지막에 독립 branch review를 받는다.
