@@ -3,6 +3,7 @@ import path from 'node:path';
 import {createHash,randomBytes} from 'node:crypto';
 import {DeploymentError,trustedDirectory} from './runtime-safety.mjs';
 import {validateRetainedBootstrap} from './runtime-entry.mjs';
+import {validV1Current as validCurrent} from './runtime-store.mjs';
 
 const C=fs.constants;
 const JOURNAL=/^\.deploy\.[a-f0-9]{32}$/;
@@ -85,10 +86,6 @@ function validReceipt(value,name,stateBytes) {
 const RELEASE=/^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
 const ACTIVATION=/^a-[a-f0-9]{32}$/;
 const BOOTSTRAP_FILES=[['jhw-runtime-control',0o755],['jhw-runtime-entry',0o755],['jhw-runtime-hook',0o755],['runtime-entry.mjs',0o644],['runtime-safety.mjs',0o644],['runtime-store.mjs',0o644]];
-function validCurrent(value) {
- if(value===null)return true;
- return exact(value,['activationId','releaseId','predecessorActivationId','observation'])&&ACTIVATION.test(value.activationId)&&RELEASE.test(value.releaseId)&&(value.predecessorActivationId===null||ACTIVATION.test(value.predecessorActivationId))&&exact(value.observation,['target','dev','ino','ctimeNs'])&&value.observation.target===`activations/${value.activationId}`&&['dev','ino','ctimeNs'].every(key=>typeof value.observation[key]==='string'&&/^\d{1,32}$/.test(value.observation[key]));
-}
 function validDestination(value,current) {return exact(value,['activationId','releaseId','predecessorActivationId'])&&value.activationId===current.activationId&&value.releaseId===current.releaseId&&value.predecessorActivationId===current.predecessorActivationId;}
 function validVariables(value) {return exact(value,DEPLOY_VARIABLE_KEYS)&&DEPLOY_VARIABLE_KEYS.every(key=>typeof value[key]==='string'&&Buffer.byteLength(value[key])<=256*1024);}
 function validBootstrapManifest(value) {

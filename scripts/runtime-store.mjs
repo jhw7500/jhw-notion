@@ -7,6 +7,8 @@ import { DeploymentError, acquireLease, trustedDirectory } from './runtime-safet
 const C = fs.constants;
 const RELEASE = /^r-([a-f0-9]{40}|[a-f0-9]{64})-([a-f0-9]{64})$/;
 const ACTIVATION = /^a-[a-f0-9]{32}$/;
+const BOOTSTRAP = /^b-[a-f0-9]{64}$/;
+const MIGRATION = /^m-[a-f0-9]{32}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const MAX_ENTRIES = 100000;
 const MAX_FILE = 128 * 1024 * 1024;
@@ -452,46 +454,100 @@ export async function prepareRelease({ repositoryRoot, build = defaultBuild }) {
 function observation(runtime) {
   try {
     const { target, stat } = readLink(runtime, 'current');
-    if (!/^activations\/a-[a-f0-9]{32}$/.test(target)) fail('DEPLOY_ACTIVATION_INVALID');
+    if (!/^(?:activations|v2\/activations)\/a-[a-f0-9]{32}$/.test(target)) fail('DEPLOY_ACTIVATION_INVALID');
     return { target, dev: String(stat.dev), ino: String(stat.ino), ctimeNs: String(stat.ctimeNs) };
   } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
-export function validCurrent(value) {
+function validObservation(value, activationId, prefix) {
+  return exact(value, ['target', 'dev', 'ino', 'ctimeNs']) && value.target === `${prefix}/${activationId}` &&
+    ['dev', 'ino', 'ctimeNs'].every(key => typeof value[key] === 'string' && /^\d{1,32}$/.test(value[key]));
+}
+export function validV1Current(value) {
   if (value === null) return true;
   return exact(value, ['activationId', 'releaseId', 'predecessorActivationId', 'observation']) &&
     ACTIVATION.test(value.activationId) && RELEASE.test(value.releaseId) &&
     (value.predecessorActivationId === null || ACTIVATION.test(value.predecessorActivationId)) &&
-    exact(value.observation, ['target', 'dev', 'ino', 'ctimeNs']) && value.observation.target === `activations/${value.activationId}` &&
-    ['dev', 'ino', 'ctimeNs'].every(key => typeof value.observation[key] === 'string' && /^\d{1,32}$/.test(value.observation[key]));
+    validObservation(value.observation, value.activationId, 'activations');
 }
-function activationIn(runtime, repositoryRoot, activationId, walkTree = true) {
-  let activations; let activation;
+function validV2Current(value) {
+  if (value === null) return true;
+  return exact(value, ['version', 'activationId', 'releaseId', 'bootstrapId', 'runtimeContract',
+    'compatibilityDigest', 'predecessorActivationId', 'migrationId', 'observation']) && value.version === 2 &&
+    ACTIVATION.test(value.activationId) && RELEASE.test(value.releaseId) && BOOTSTRAP.test(value.bootstrapId) &&
+    value.runtimeContract === 2 && DIGEST.test(value.compatibilityDigest) &&
+    (value.predecessorActivationId === null || ACTIVATION.test(value.predecessorActivationId)) &&
+    (value.migrationId === null || value.predecessorActivationId === null && MIGRATION.test(value.migrationId)) &&
+    validObservation(value.observation, value.activationId, 'v2/activations');
+}
+export function validCurrent(value) {
+  return validV1Current(value) || validV2Current(value);
+}
+export function validRuntimePair(value) {
+  return exact(value, ['releaseId', 'bootstrapId', 'runtimeContract', 'compatibilityDigest']) &&
+    RELEASE.test(value.releaseId) && BOOTSTRAP.test(value.bootstrapId) && value.runtimeContract === 2 &&
+    DIGEST.test(value.compatibilityDigest);
+}
+function validV2ActivationManifest(value, activationId) {
+  if (!exact(value, ['version', 'activationId', 'releaseId', 'bootstrapId', 'runtimeContract',
+      'compatibilityDigest', 'predecessorActivationId', 'migrationId', 'createdAt', 'priorCurrent']) ||
+      value.version !== 2 || value.activationId !== activationId || !validRuntimePair({
+        releaseId: value.releaseId, bootstrapId: value.bootstrapId, runtimeContract: value.runtimeContract,
+        compatibilityDigest: value.compatibilityDigest,
+      }) ||
+      !timestamp(value.createdAt) || !validV2Current(value.priorCurrent) ||
+      value.predecessorActivationId !== (value.priorCurrent?.activationId ?? null) ||
+      value.predecessorActivationId === activationId || value.priorCurrent !== null && value.migrationId !== null) return false;
+  return value.migrationId === null || MIGRATION.test(value.migrationId);
+}
+function activationIn(runtime, repositoryRoot, activationId, walkTree = true, version = 1) {
+  let namespace; let activations; let activation;
   try {
     if (!ACTIVATION.test(activationId)) fail('DEPLOY_ACTIVATION_INVALID');
-    activations = runtime.child('activations', false, true);
+    if (version === 2) {
+      namespace = runtime.child('v2', false, true);
+      activations = namespace.child('activations', false, true);
+    } else {
+      activations = runtime.child('activations', false, true);
+    }
     activation = activations.child(activationId, false, true);
-    if (canonical(names(activation)) !== canonical(['manifest.json', 'mcp-server', 'scripts', 'skills'])) fail('DEPLOY_ACTIVATION_INVALID');
+    const children = version === 2 ? ['bootstrap', 'manifest.json', 'mcp-server', 'scripts', 'skills'] :
+      ['manifest.json', 'mcp-server', 'scripts', 'skills'];
+    if (canonical(names(activation)) !== canonical(children)) fail('DEPLOY_ACTIVATION_INVALID');
     const manifest = readJson(activation);
-    if (!exact(manifest, ['version', 'activationId', 'releaseId', 'predecessorActivationId', 'createdAt', 'priorCurrent']) ||
+    if (version === 2 ? !validV2ActivationManifest(manifest, activationId) :
+        !exact(manifest, ['version', 'activationId', 'releaseId', 'predecessorActivationId', 'createdAt', 'priorCurrent']) ||
         manifest.version !== 1 || manifest.activationId !== activationId || !RELEASE.test(manifest.releaseId) ||
-        !timestamp(manifest.createdAt) || !validCurrent(manifest.priorCurrent) ||
+        !timestamp(manifest.createdAt) || !validV1Current(manifest.priorCurrent) ||
         manifest.predecessorActivationId !== (manifest.priorCurrent?.activationId ?? null) || manifest.predecessorActivationId === activationId) fail('DEPLOY_ACTIVATION_INVALID');
     for (const name of ['mcp-server', 'scripts', 'skills']) {
-      if (readLink(activation, name).target !== `../../releases/${manifest.releaseId}/${name}`) fail('DEPLOY_ACTIVATION_INVALID');
+      const target = version === 2 ? `../../../releases/${manifest.releaseId}/${name}` : `../../releases/${manifest.releaseId}/${name}`;
+      if (readLink(activation, name).target !== target) fail('DEPLOY_ACTIVATION_INVALID');
     }
-    validateReleaseIn(runtime, repositoryRoot, manifest.releaseId, walkTree);
+    if (version === 2 && readLink(activation, 'bootstrap').target !== `../../bootstraps/${manifest.bootstrapId}`) fail('DEPLOY_ACTIVATION_INVALID');
+    if (version === 2) {
+      if (releaseCompatibilityIn(runtime, repositoryRoot, manifest.releaseId, walkTree) !== manifest.compatibilityDigest) fail('DEPLOY_ACTIVATION_INVALID');
+    } else {
+      validateReleaseIn(runtime, repositoryRoot, manifest.releaseId, walkTree);
+    }
     if (canonical(readJson(activation)) !== canonical(manifest)) fail('DEPLOY_ACTIVATION_INVALID');
     return manifest;
   } catch (error) { boundary(error, 'DEPLOY_ACTIVATION_INVALID'); }
-  finally { activation?.close(); activations?.close(); }
+  finally { activation?.close(); activations?.close(); namespace?.close(); }
 }
 function currentIn(runtime, repositoryRoot, walkTree = true) {
   if (!runtime) return null;
   const before = observation(runtime);
   if (!before) return null;
-  const manifest = activationIn(runtime, repositoryRoot, before.target.slice('activations/'.length), walkTree);
+  const version = before.target.startsWith('v2/') ? 2 : 1;
+  const prefix = version === 2 ? 'v2/activations/' : 'activations/';
+  const manifest = activationIn(runtime, repositoryRoot, before.target.slice(prefix.length), walkTree, version);
   if (canonical(before) !== canonical(observation(runtime))) fail('DEPLOY_CURRENT_CHANGED');
-  return { activationId: manifest.activationId, releaseId: manifest.releaseId, predecessorActivationId: manifest.predecessorActivationId, observation: before };
+  if (version === 1) return { activationId: manifest.activationId, releaseId: manifest.releaseId,
+    predecessorActivationId: manifest.predecessorActivationId, observation: before };
+  return { version: 2, activationId: manifest.activationId, releaseId: manifest.releaseId,
+    bootstrapId: manifest.bootstrapId, runtimeContract: manifest.runtimeContract,
+    compatibilityDigest: manifest.compatibilityDigest, predecessorActivationId: manifest.predecessorActivationId,
+    migrationId: manifest.migrationId, observation: before };
 }
 /** Strict frozen current-pointer shape shared with Guard transition evidence. */
 export function isActivationSnapshot(value) {
@@ -528,6 +584,7 @@ function switchPointer(runtime, repositoryRoot, activationId, expectedCurrent, o
 export function publishActivation({ repositoryRoot, releaseId, expectedCurrent, onPointerIntent }) {
   return withStore(repositoryRoot, false, runtime => {
     if (!runtime) fail('DEPLOY_RELEASE_INVALID');
+    if (!validV1Current(expectedCurrent)) fail('DEPLOY_CURRENT_CHANGED');
     checkCurrent(runtime, repositoryRoot, expectedCurrent);
     validateReleaseIn(runtime, repositoryRoot, releaseId);
     let activations; let stage; let stageName;
@@ -557,6 +614,7 @@ export function publishActivation({ repositoryRoot, releaseId, expectedCurrent, 
 }
 export function rollbackActivation({ repositoryRoot, expectedCurrent, onPointerIntent }) {
   return withStore(repositoryRoot, false, runtime => {
+    if (!validV1Current(expectedCurrent)) fail('DEPLOY_CURRENT_CHANGED');
     const current = checkCurrent(runtime, repositoryRoot, expectedCurrent);
     if (!current?.predecessorActivationId) fail('DEPLOY_PREDECESSOR_INVALID');
     const manifest = activationIn(runtime, repositoryRoot, current.activationId);
@@ -582,6 +640,18 @@ const DECIMAL = /^\d{1,32}$/;
 // as negative. Identity is compared as the same string, so only the sign is new.
 const SIGNED_DECIMAL = /^-?\d{1,32}$/;
 const BOOT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+function validV2SessionRecord(value) {
+  return exact(value, ['version', 'id', 'kind', 'releaseId', 'bootstrapId', 'runtimeContract',
+    'compatibilityDigest', 'parentBinding', 'repository', 'owner', 'manifest', 'lease', 'createdAt']) &&
+    value.version === 2 && /^(?:s|i)-[a-f0-9]{32}$/.test(value.id) &&
+    ['session', 'invocation'].includes(value.kind) && validRuntimePair({
+      releaseId: value.releaseId, bootstrapId: value.bootstrapId, runtimeContract: value.runtimeContract,
+      compatibilityDigest: value.compatibilityDigest,
+    }) &&
+    (value.parentBinding === null || typeof value.parentBinding === 'string') && timestamp(value.createdAt) &&
+    exact(value.repository, ['path', 'dev', 'ino']) && exact(value.manifest, ['dev', 'ino']) &&
+    exact(value.lease, ['dev', 'ino', 'fd']) && value.owner !== null && typeof value.owner === 'object' && !Array.isArray(value.owner);
+}
 const sessionFail = () => fail('DEPLOY_SESSION_INVALID');
 // Readers hold a shared namespace lease only while taking the directory snapshot;
 // registration and retirement hold the exclusive lease over atomic publication.
@@ -995,9 +1065,13 @@ function flexibleMarkdownEntry(entry) {
   return entry.type === 'file' && entry.path.startsWith('skills/') && entry.path.endsWith('.md') &&
     !entry.path.slice('skills/'.length).split('/').includes('scripts') && (entry.mode & 0o111) === 0;
 }
-function compatibilityEntry(entry) {
+const GENERATION_HELPERS = new Set([
+  'scripts/runtime-entry.mjs', 'scripts/runtime-safety.mjs', 'scripts/runtime-store.mjs',
+]);
+function compatibilityEntry(entry, generation = 1) {
   if (entry.type === 'file' && (compatibleMcpEntry(entry.path) || compatibleControlEntry(entry.path) ||
-      compatibleControlTestEntry(entry.path) || flexibleMarkdownEntry(entry) || entry.path === COMPATIBILITY_DECLARATION)) {
+      compatibleControlTestEntry(entry.path) || flexibleMarkdownEntry(entry) || entry.path === COMPATIBILITY_DECLARATION ||
+      generation === 2 && GENERATION_HELPERS.has(entry.path))) {
     const { sha256, ...identity } = entry;
     return identity;
   }
@@ -1034,7 +1108,7 @@ function compatibilityDeclaration(release, manifest) {
   try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
   catch { fail('DEPLOY_RELEASE_INVALID'); }
   if (!exact(value, ['version', 'generation', 'guardFloor']) || value.version !== 1 ||
-      !Number.isSafeInteger(value.generation) || value.generation <= 0 ||
+      ![1, 2].includes(value.generation) ||
       !Number.isSafeInteger(value.guardFloor) || value.guardFloor <= 0) fail('DEPLOY_RELEASE_INVALID');
   return value;
 }
@@ -1047,10 +1121,18 @@ function releaseCompatibilityIn(runtime, repositoryRoot, releaseId, walkTree = t
     const manifest = readJson(release);
     if (canonical(summary(manifest)) !== canonical(validated) || contentDigest(manifest) !== validated.contentDigest) fail('DEPLOY_RELEASE_INVALID');
     const declaration = compatibilityDeclaration(release, manifest);
+    if (declaration?.generation === 2) {
+      const helpers = manifest.entries.filter(entry => GENERATION_HELPERS.has(entry.path));
+      if (helpers.length !== GENERATION_HELPERS.size || helpers.some(entry => entry.type !== 'file')) fail('DEPLOY_RELEASE_INVALID');
+    }
     const result = declaration === null
       ? digest(canonical({ version: 1, entries: manifest.entries.filter(entry => !compatibleMcpEntry(entry.path)) }))
-      : digest(canonical({ version: 2, generation: declaration.generation, guardFloor: declaration.guardFloor,
-          entries: manifest.entries.map(compatibilityEntry) }));
+      : declaration.generation === 1
+        ? digest(canonical({ version: 2, generation: declaration.generation, guardFloor: declaration.guardFloor,
+            entries: manifest.entries.map(entry => compatibilityEntry(entry, 1)) }))
+        : digest(canonical({ version: 3, generation: declaration.generation, guardFloor: declaration.guardFloor,
+            runtimeContract: 2, routerContract: 1,
+            entries: manifest.entries.map(entry => compatibilityEntry(entry, 2)) }));
     release.verify();
     if (canonical(manifest) !== canonical(readJson(release))) fail('DEPLOY_RELEASE_INVALID');
     return result;

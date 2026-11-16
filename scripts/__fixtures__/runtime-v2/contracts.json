@@ -1,0 +1,35 @@
+{
+  "v1": {
+    "activationId": "a-11111111111111111111111111111111",
+    "releaseId": "r-1111111111111111111111111111111111111111-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "predecessorActivationId": null,
+    "observation": {
+      "target": "activations/a-11111111111111111111111111111111",
+      "dev": "1",
+      "ino": "2",
+      "ctimeNs": "3"
+    }
+  },
+  "v2": {
+    "version": 2,
+    "activationId": "a-22222222222222222222222222222222",
+    "releaseId": "r-2222222222222222222222222222222222222222-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "bootstrapId": "b-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "runtimeContract": 2,
+    "compatibilityDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "predecessorActivationId": null,
+    "migrationId": "m-33333333333333333333333333333333",
+    "observation": {
+      "target": "v2/activations/a-22222222222222222222222222222222",
+      "dev": "4",
+      "ino": "5",
+      "ctimeNs": "6"
+    }
+  },
+  "runtimePair": {
+    "releaseId": "r-2222222222222222222222222222222222222222-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "bootstrapId": "b-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "runtimeContract": 2,
+    "compatibilityDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  }
+}
