@@ -16,7 +16,7 @@ function checkedSpawn(command, args, options, label) {
   return result;
 }
 
-export async function createRuntimeFixture(t, {realDependencies = false, legacyRevision = null, productionEntry = false, retryHelper = false} = {}) {
+export async function createRuntimeFixture(t, {realDependencies = false, legacyRevision = null, productionEntry = false, retryHelper = false, holdingMcp = false} = {}) {
   if (realDependencies) throw new Error('realDependencies build is not available in this fixture phase');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jhw-runtime-v2-fixture-'));
   const home = path.join(root, 'home');
@@ -117,10 +117,21 @@ export async function runManaged({selector, args, selectedPair}) {
     built('mcp-server/dist/index.js');
     built('mcp-server/dist/control/cli.js');
     built('mcp-server/dist/control/hook-adapter.js');
-    built('mcp-server/dist/runtime/mcp.cjs', productionEntry ? `
+    built('mcp-server/dist/runtime/mcp.cjs', productionEntry ? (holdingMcp ? `
+const fs=require('node:fs');const path=require('node:path');const [ready,release]=process.argv.slice(2);
+const roles={3:'admission',6:'binding',7:'generation',8:'parent'};const fdEvidence={};
+for(const [fd,role] of Object.entries(roles)){const stat=fs.fstatSync(Number(fd),{bigint:true});fdEvidence[fd]={role,dev:String(stat.dev),ino:String(stat.ino),target:fs.readlinkSync('/proc/self/fd/'+fd)};}
+const credential=path.resolve(globalThis.__JHW_MANAGED_RELEASE_ROOT__,'../../../mcp-server/.env');const credentialStat=fs.statSync(credential,{bigint:true});
+fdEvidence[5]={role:'credential',dev:String(credentialStat.dev),ino:String(credentialStat.ino),target:credential,loaded:process.env.NOTION_API_KEY==='fixture-secret'};
+fs.writeFileSync(ready,JSON.stringify({fdEvidence,pid:process.pid}));
+const timer=setInterval(()=>{if(fs.existsSync(release)){clearInterval(timer);process.exit(0)}},10);
+` : `
 const fs=require('node:fs');
-process.stdout.write(JSON.stringify({observedFdRoles:globalThis.__JHW_MANAGED_FD_ROLES__,releaseRoot:globalThis.__JHW_MANAGED_RELEASE_ROOT__})+'\\n');
-` : '');
+const path=require('node:path');const roles={3:'admission',6:'binding',7:'generation',8:'parent'};const fdEvidence={};const namedEvidence={};
+for(const [fd,role] of Object.entries(roles)){const stat=fs.fstatSync(Number(fd),{bigint:true});const target=fs.readlinkSync('/proc/self/fd/'+fd);fdEvidence[fd]={role,dev:String(stat.dev),ino:String(stat.ino),target};const named=fs.statSync(target,{bigint:true});namedEvidence[fd]={dev:String(named.dev),ino:String(named.ino)};}
+const credential=path.resolve(globalThis.__JHW_MANAGED_RELEASE_ROOT__,'../../../mcp-server/.env');const credentialStat=fs.statSync(credential,{bigint:true});fdEvidence[5]={role:'credential',dev:String(credentialStat.dev),ino:String(credentialStat.ino),target:credential,loaded:process.env.NOTION_API_KEY==='fixture-secret'};namedEvidence[5]={dev:String(credentialStat.dev),ino:String(credentialStat.ino)};
+process.stdout.write(JSON.stringify({fdEvidence,namedEvidence,releaseRoot:globalThis.__JHW_MANAGED_RELEASE_ROOT__})+'\\n');
+`) : '');
     built('mcp-server/dist/runtime/control.cjs');
     built('mcp-server/dist/runtime/hook.cjs');
     fs.mkdirSync(path.join(stagingRoot,'mcp-server/node_modules'),{recursive:true,mode:0o755});
@@ -145,7 +156,7 @@ process.stdout.write(JSON.stringify({observedFdRoles:globalThis.__JHW_MANAGED_FD
       observation:{target:`v2/activations/${activationId}`,dev:String(observed.dev),ino:String(observed.ino),ctimeNs:String(observed.ctimeNs)}};
   };
 
-  const run = argv => new Promise(resolve => {
+  const spawnManaged = argv => {
     const child = spawn(path.join(root,'.jhw-runtime/bootstrap',argv[0]),argv.slice(1),
       {env:privateEnvironment,stdio:['ignore','pipe','pipe']});
     children.add(child);
@@ -155,9 +166,11 @@ process.stdout.write(JSON.stringify({observedFdRoles:globalThis.__JHW_MANAGED_FD
     child.stdout.on('data',chunk=>{stdout+=chunk;});
     child.stderr.on('data',chunk=>{stderr+=chunk;});
     child.once('error',value=>{error=value;});
-    child.once('close',(status,signal)=>{clearTimeout(timer);clearTimeout(killTimer);children.delete(child);resolve({status,signal,stdout,stderr,error});});
-  });
+    const result=new Promise(resolve=>child.once('close',(status,signal)=>{clearTimeout(timer);clearTimeout(killTimer);children.delete(child);resolve({status,signal,stdout,stderr,error});}));
+    return {child,result};
+  };
+  const run = argv => spawnManaged(argv).result;
 
-  return {root,home,procRoot,entry:path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),write,prepare,run,seedPair,baselineRevision,
+  return {root,home,procRoot,entry:path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),write,prepare,run,spawnManaged,seedPair,baselineRevision,
     compatibility(releaseId){return releaseCompatibility({repositoryRoot:root,releaseId});}};
 }

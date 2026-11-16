@@ -410,8 +410,7 @@ const same=(a,b)=>['dev','ino','uid','gid','mode','nlink','size','ctimeNs','mtim
 const fdRoles={3:'admission',6:'binding',7:'generation'};
 if(credential==='fd')fdRoles[5]='credential';
 if(process.env.JHW_RUNTIME_SESSION_BINDING!==undefined)fdRoles[8]='parent';
-for(const fd of Object.keys(fdRoles)){try{fs.fstatSync(Number(fd));}catch{invalid();}}
-Object.defineProperty(globalThis,'__JHW_MANAGED_FD_ROLES__',{value:fdRoles,writable:false,configurable:false,enumerable:false});
+for(const fd of Object.keys(fdRoles)){try{fs.fstatSync(Number(fd));fs.readlinkSync('/proc/self/fd/'+fd);}catch{invalid();}}
 const parseCredential=bytes=>{
   let text; try { text=new TextDecoder('utf-8',{fatal:true}).decode(bytes); } catch { invalid(); }
   if(text.includes('\0')) invalid();

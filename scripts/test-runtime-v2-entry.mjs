@@ -196,11 +196,20 @@ const path=require('node:path');
   const observed=JSON.parse(result.stdout.trim().split('\n').at(-1));
   assert.equal(observed.bound.status,0,observed.bound.stderr);
   const boundCall=JSON.parse(observed.bound.stdout);
-  assert.deepEqual(boundCall.observedFdRoles,{3:'admission',5:'credential',6:'binding',7:'generation',8:'parent'});
+  assert.deepEqual(Object.fromEntries(Object.entries(boundCall.fdEvidence).map(([fd,value])=>[fd,value.role])),
+    {3:'admission',5:'credential',6:'binding',7:'generation',8:'parent'});
+  for(const value of Object.values(boundCall.fdEvidence)){assert.match(value.dev,/^-?\d+$/);assert.match(value.ino,/^-?\d+$/);}
+  for(const [fd,value] of Object.entries(boundCall.fdEvidence))assert.deepEqual(boundCall.namedEvidence[fd],{dev:value.dev,ino:value.ino});
+  assert.equal(boundCall.fdEvidence[3].target,path.join(f.root,'.jhw-runtime/admission.lock'));
+  assert.equal(boundCall.fdEvidence[5].target,path.join(f.root,'mcp-server/.env'));
+  assert.equal(boundCall.fdEvidence[5].loaded,true);
+  assert.match(boundCall.fdEvidence[6].target,new RegExp(`^${f.root.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}/\\.jhw-runtime/v2/invocations/${pair.bootstrapId}/i-[a-f0-9]{32}/lease$`));
+  assert.equal(boundCall.fdEvidence[7].target,path.join(f.root,`.jhw-runtime/v2/bootstraps/${pair.bootstrapId}/lease`));
+  assert.match(boundCall.fdEvidence[8].target,new RegExp(`^${f.root.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}/\\.jhw-runtime/v2/sessions/s-[a-f0-9]{32}/lease$`));
   assert.equal(boundCall.releaseRoot,path.join(f.root,'.jhw-runtime/releases',pair.releaseId));
   assert.equal(observed.unbound.status,75);
   assert.equal(observed.unbound.stderr,'DEPLOY_MAINTENANCE\n');
-  assert.ok(observed.unbound.elapsed>=450,`new root waited only ${observed.unbound.elapsed}ms`);
+  assert.ok(observed.unbound.elapsed>=450&&observed.unbound.elapsed<1000,`new root waited ${observed.unbound.elapsed}ms`);
 });
 
 test('production runtime entry returns retryCurrent when current moved after router selection', async t => {
@@ -230,4 +239,61 @@ test('stable router and binder share one three-attempt current retry budget', as
   const result=await f.run(['jhw-runtime-entry','mcp']);
   assert.equal(result.status,75);
   assert.equal(fs.readFileSync(path.join(f.root,'.retry-count'),'utf8'),'3');
+});
+
+test('v2 wrapper descendant cannot erase its token and become an unbound current caller', async t => {
+  const f=await createRuntimeFixture(t,{productionEntry:true});
+  const release=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const admissionLease=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{create:true});
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  await entry.installRouterV2({repositoryRoot:f.root,releaseId:release.releaseId,deployLease,admissionLease});
+  admissionLease.close();deployLease.close();f.seedPair(pair);
+  const payload=String.raw`
+const {spawnSync}=require('node:child_process');const path=require('node:path');
+const env={...process.env};delete env.JHW_RUNTIME_SESSION_BINDING;
+const result=spawnSync(path.join(process.argv[1],'.jhw-runtime/bootstrap/jhw-runtime-entry'),['mcp'],{encoding:'utf8',env,timeout:6000});
+process.stdout.write(JSON.stringify({status:result.status,stderr:result.stderr})+'\n');
+`;
+  const wrapper=await f.run(['jhw-runtime-entry','session','--',process.execPath,'-e',payload,f.root]);
+  assert.equal(wrapper.status,0,wrapper.stderr);
+  assert.deepEqual(JSON.parse(wrapper.stdout),{status:75,stderr:'DEPLOY_SESSION_INVALID\n'});
+});
+
+test('managed root owner exit refuses new calls while inherited payload leases preserve the pair', async t => {
+  const f=await createRuntimeFixture(t,{productionEntry:true,holdingMcp:true});
+  f.write('mcp-server/.env','NOTION_API_KEY=fixture-secret\n',0o600);
+  const releaseSummary=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const admissionLease=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{create:true});
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:releaseSummary.releaseId,deployLease});
+  await entry.installRouterV2({repositoryRoot:f.root,releaseId:releaseSummary.releaseId,deployLease,admissionLease});
+  admissionLease.close();deployLease.close();f.seedPair(pair);
+  const files=Object.fromEntries(['token','ready','release','attempt','attempt-result','allow-exit'].map(name=>[name,path.join(f.root,`.ipc-${name}`)]));
+  fs.writeFileSync(files['allow-exit'],'');
+  const payload=String.raw`
+const fs=require('node:fs');const path=require('node:path');const {spawn,spawnSync}=require('node:child_process');
+const [root,tokenFile,ready,release,attempt,resultFile,allowExit]=process.argv.slice(1);
+fs.writeFileSync(tokenFile,process.env.JHW_RUNTIME_SESSION_BINDING);
+const entry=path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry');
+const held=spawn(entry,['mcp',ready,release],{env:process.env,stdio:'inherit'});
+const timer=setInterval(()=>{if(!fs.existsSync(attempt))return;clearInterval(timer);const call=spawnSync(entry,['mcp',ready+'.new',allowExit],{env:process.env,encoding:'utf8',timeout:4000});fs.writeFileSync(resultFile,JSON.stringify({status:call.status,stderr:call.stderr}));},10);
+held.once('close',code=>{clearInterval(timer);process.exit(code??1)});
+`;
+  const managed=f.spawnManaged(['jhw-runtime-entry','session','--',process.execPath,'-e',payload,f.root,files.token,files.ready,files.release,files.attempt,files['attempt-result'],files['allow-exit']]);
+  const waitFor=async predicate=>{const deadline=Date.now()+6000;while(!predicate()){if(Date.now()>deadline)assert.fail('fixture IPC deadline');await new Promise(resolve=>setTimeout(resolve,10));}};
+  await waitFor(()=>fs.existsSync(files.token)&&fs.existsSync(files.ready));
+  const token=fs.readFileSync(files.token,'utf8');const rootId=token.split(':')[2];
+  const ready=JSON.parse(fs.readFileSync(files.ready,'utf8'));
+  assert.deepEqual(Object.fromEntries(Object.entries(ready.fdEvidence).map(([fd,value])=>[fd,value.role])),{3:'admission',5:'credential',6:'binding',7:'generation',8:'parent'});
+  assert.equal(ready.fdEvidence[5].loaded,true);
+  for(const value of Object.values(ready.fdEvidence)){const stat=fs.statSync(value.target,{bigint:true});assert.deepEqual({dev:String(stat.dev),ino:String(stat.ino)},{dev:value.dev,ino:value.ino});}
+  managed.child.kill('SIGTERM');await waitFor(()=>!fs.existsSync(`/proc/${managed.child.pid}`));
+  fs.writeFileSync(files.attempt,'');await waitFor(()=>fs.existsSync(files['attempt-result']));
+  assert.deepEqual(JSON.parse(fs.readFileSync(files['attempt-result'],'utf8')),{status:75,stderr:'DEPLOY_SESSION_INVALID\n'});
+  assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/v2/sessions',rootId)),true);
+  assert.throws(()=>acquireLease(path.join(f.root,`.jhw-runtime/v2/bootstraps/${pair.bootstrapId}/lease`)),{code:'DEPLOY_LOCK_CONTENDED'});
+  fs.writeFileSync(files.release,'');await managed.result;
+  await waitFor(()=>store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:false}).retired.includes(rootId));
+  assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/v2/sessions',rootId)),false);
 });

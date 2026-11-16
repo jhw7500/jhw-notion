@@ -12,6 +12,11 @@ import {createRuntimeFixture} from './test-support/runtime-v2.mjs';
 
 const canonical = value => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` :
   value !== null && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
+function normalizeRecord(record) {
+  return {...record,id:'<id>',createdAt:'<createdAt>',repository:{path:'<repository>',dev:'<dev>',ino:'<ino>'},
+    owner:{uid:record.owner.uid,pid:'<pid>',startTime:'<startTime>',bootId:'<bootId>',commandDigest:'<commandDigest>',exeDev:'<exeDev>',exeIno:'<exeIno>'},
+    manifest:{dev:'<dev>',ino:'<ino>'},lease:{dev:'<dev>',ino:'<ino>',fd:'<fd>'}};
+}
 
 async function prepared(t) {
   const f = await createRuntimeFixture(t);
@@ -40,6 +45,17 @@ test('v2 root and invocation records preserve the selected pair and exact closed
     'parentBinding','releaseId','repository','runtimeContract','version',
   ].sort());
   assert.equal(invocation.record.parentBinding, root.token);
+  const rootBytes=fs.readFileSync(path.join(f.root,'.jhw-runtime/v2/sessions',root.id,'manifest.json'));
+  const invocationBytes=fs.readFileSync(path.join(f.root,`.jhw-runtime/v2/invocations/${pair.bootstrapId}`,invocation.id,'manifest.json'));
+  assert.equal(root.token,`v2:${pair.bootstrapId}:${root.id}:${createHash('sha256').update(rootBytes).digest('hex')}`);
+  assert.equal(invocation.token,`v2:${pair.bootstrapId}:${invocation.id}:${createHash('sha256').update(invocationBytes).digest('hex')}`);
+  assert.equal(root.record.lease.fd,root.lease.fd);assert.equal(invocation.record.lease.fd,invocation.lease.fd);
+  assert.deepEqual(normalizeRecord(root.record),{version:2,id:'<id>',kind:'session',...pair,parentBinding:null,
+    repository:{path:'<repository>',dev:'<dev>',ino:'<ino>'},owner:{uid:process.getuid(),pid:'<pid>',startTime:'<startTime>',bootId:'<bootId>',commandDigest:'<commandDigest>',exeDev:'<exeDev>',exeIno:'<exeIno>'},
+    manifest:{dev:'<dev>',ino:'<ino>'},lease:{dev:'<dev>',ino:'<ino>',fd:'<fd>'},createdAt:'<createdAt>'});
+  assert.deepEqual(normalizeRecord(invocation.record),{version:2,id:'<id>',kind:'invocation',...pair,parentBinding:root.token,
+    repository:{path:'<repository>',dev:'<dev>',ino:'<ino>'},owner:{uid:process.getuid(),pid:'<pid>',startTime:'<startTime>',bootId:'<bootId>',commandDigest:'<commandDigest>',exeDev:'<exeDev>',exeIno:'<exeIno>'},
+    manifest:{dev:'<dev>',ino:'<ino>'},lease:{dev:'<dev>',ino:'<ino>',fd:'<fd>'},createdAt:'<createdAt>'});
   assert.deepEqual(
     store.inspectSessionBindingsV2({repositoryRoot:f.root}).map(row => ({id:row.id,kind:row.kind,parentBinding:row.parentBinding})),
     [{id:root.id,kind:'session',parentBinding:null},{id:invocation.id,kind:'invocation',parentBinding:root.token}],
@@ -163,4 +179,96 @@ process.stdout.write(binding.record.parentBinding+'\n');binding.close();admissio
   const children=Array.from({length:3},()=>spawn(process.execPath,['--input-type=module','-e',script,storeFile,safetyFile,f.root,root.token,JSON.stringify(pair)],{stdio:['ignore','pipe','pipe']}));
   const results=await Promise.all(children.map(child=>new Promise(resolve=>{let stdout='';let stderr='';child.stdout.on('data',b=>stdout+=b);child.stderr.on('data',b=>stderr+=b);child.once('close',status=>resolve({status,stdout,stderr}));})));
   for(const result of results){assert.equal(result.status,0,result.stderr);assert.equal(result.stdout.trim(),root.token);}
+});
+
+test('v2 invocation revalidates parent bytes immediately before publication', async t => {
+  const {f,pair,admissionLease}=await prepared(t);
+  const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});
+  t.after(()=>root.close());
+  const storeFile=fileURLToPath(new URL('./runtime-store.mjs',import.meta.url));
+  const safetyFile=fileURLToPath(new URL('./runtime-safety.mjs',import.meta.url));
+  const indexDirectory=path.join(f.root,'.jhw-runtime/v2/invocation-index');fs.mkdirSync(indexDirectory,{recursive:true,mode:0o700});
+  const index=acquireLease(path.join(indexDirectory,`${pair.bootstrapId}.lock`),{create:true});
+  const childScript=String.raw`
+const wait=Atomics.wait;let observed=false;Atomics.wait=function(){if(!observed){observed=true;process.stdout.write('index-wait\n')}return wait.apply(this,arguments)};
+const store=await import(process.argv[1]);const safety=await import(process.argv[2]);
+const admission=safety.acquireLease(process.argv[3]+'/.jhw-runtime/admission.lock',{shared:true});
+try{const binding=store.bindEntryPair({repositoryRoot:process.argv[3],token:process.argv[4],selectedPair:JSON.parse(process.argv[5]),admissionLease:admission});process.stdout.write(JSON.stringify({ok:true,id:binding.id})+'\n');}
+catch(error){process.stdout.write(JSON.stringify({ok:false,code:error.code})+'\n');}
+`;
+  const child=spawn(process.execPath,['--input-type=module','-e',childScript,storeFile,safetyFile,f.root,root.token,JSON.stringify(pair)],{stdio:['ignore','pipe','pipe']});
+  let stdout='';let stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+  while(!stdout.includes('index-wait\n'))await new Promise(resolve=>setTimeout(resolve,5));
+  const manifest=path.join(f.root,'.jhw-runtime/v2/sessions',root.id,'manifest.json');
+  const record=JSON.parse(fs.readFileSync(manifest));record.owner.startTime=String(BigInt(record.owner.startTime)+1n);
+  fs.writeFileSync(manifest,canonical(record)+'\n');index.close();
+  const status=await new Promise(resolve=>child.once('close',resolve));
+  assert.equal(status,0,stderr);
+  const result=JSON.parse(stdout.trim().split('\n').at(-1));
+  assert.deepEqual(result,{ok:false,code:'DEPLOY_SESSION_INVALID'});
+});
+
+test('v2 private reaper preserves byte-identical manifest inode replacement', async t => {
+  const {f,pair,admissionLease}=await prepared(t);
+  const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});
+  const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');const privateName=`.retired.${root.id}.${'4'.repeat(32)}`;
+  fs.renameSync(path.join(sessions,root.id),path.join(sessions,privateName));root.close();
+  const manifest=path.join(sessions,privateName,'manifest.json');const replacement=manifest+'.new';
+  fs.writeFileSync(replacement,fs.readFileSync(manifest),{mode:0o600});fs.renameSync(replacement,manifest);
+  const result=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:false});
+  assert.deepEqual(result,{retired:[],preserved:[privateName]});
+  assert.equal(fs.existsSync(path.join(sessions,privateName)),true);
+});
+
+test('v2 inventory fails closed on unknown namespace entries', async t => {
+  const {f}=await prepared(t);const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');
+  fs.mkdirSync(sessions,{recursive:true,mode:0o700});fs.mkdirSync(path.join(sessions,'unknown-consumer'),{mode:0o700});
+  assert.throws(()=>store.inspectSessionBindingsV2({repositoryRoot:f.root}),{code:'DEPLOY_SESSION_INVALID'});
+  assert.throws(()=>store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:false}),{code:'DEPLOY_SESSION_INVALID'});
+});
+
+test('v2 invocation index wait succeeds below and fails at the 500ms boundary', async t => {
+  const {f,pair,admissionLease}=await prepared(t);
+  const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});t.after(()=>root.close());
+  const directory=path.join(f.root,'.jhw-runtime/v2/invocation-index');fs.mkdirSync(directory,{recursive:true,mode:0o700});
+  acquireLease(path.join(directory,`${pair.bootstrapId}.lock`),{create:true}).close();
+  const safetyFile=fileURLToPath(new URL('./runtime-safety.mjs',import.meta.url));
+  const holderScript=String.raw`const safety=await import(process.argv[1]);const lock=safety.acquireLease(process.argv[2]);process.stdout.write('ready\n');setTimeout(()=>lock.close(),100);`;
+  const holder=spawn(process.execPath,['--input-type=module','-e',holderScript,safetyFile,path.join(directory,`${pair.bootstrapId}.lock`)],{stdio:['ignore','pipe','pipe']});
+  const holderClosed=new Promise(resolve=>holder.once('close',resolve));
+  await new Promise((resolve,reject)=>{holder.stdout.once('data',resolve);holder.once('error',reject)});
+  const shortStarted=Date.now();const binding=store.bindEntryPair({repositoryRoot:f.root,token:root.token,selectedPair:pair,admissionLease});
+  const shortElapsed=Date.now()-shortStarted;binding.close();
+  assert.ok(shortElapsed>=50&&shortElapsed<500,`short index wait ${shortElapsed}ms`);
+  await holderClosed;
+  const lock=acquireLease(path.join(directory,`${pair.bootstrapId}.lock`),{create:true});
+  const started=Date.now();
+  assert.throws(()=>store.bindEntryPair({repositoryRoot:f.root,token:root.token,selectedPair:pair,admissionLease}),{code:'DEPLOY_SESSION_INVALID'});
+  const elapsed=Date.now()-started;lock.close();
+  assert.ok(elapsed>=450&&elapsed<1000,`index wait ${elapsed}ms`);
+});
+
+test('v2 concurrent roots publish complete records and reaper limit bounds probes', async t => {
+  const {f,pair}=await prepared(t);const storeFile=fileURLToPath(new URL('./runtime-store.mjs',import.meta.url));
+  const safetyFile=fileURLToPath(new URL('./runtime-safety.mjs',import.meta.url));const release=path.join(f.root,'.roots-release');
+  const script=String.raw`
+import fs from 'node:fs';const store=await import(process.argv[1]);const safety=await import(process.argv[2]);
+const admission=safety.acquireLease(process.argv[3]+'/.jhw-runtime/admission.lock',{shared:true});
+const binding=store.bindEntryPair({repositoryRoot:process.argv[3],kind:'session',selectedPair:JSON.parse(process.argv[4]),admissionLease:admission});
+process.stdout.write(binding.token+'\n');const timer=setInterval(()=>{if(fs.existsSync(process.argv[5])){clearInterval(timer);binding.close();admission.close();}},10);
+`;
+  const children=Array.from({length:3},()=>spawn(process.execPath,['--input-type=module','-e',script,storeFile,safetyFile,f.root,JSON.stringify(pair),release],{stdio:['ignore','pipe','pipe']}));
+  const outputs=children.map(child=>({child,stdout:'',stderr:'',closed:new Promise(resolve=>child.once('close',resolve))}));for(const item of outputs){item.child.stdout.on('data',b=>item.stdout+=b);item.child.stderr.on('data',b=>item.stderr+=b);}
+  const deadline=Date.now()+5000;while(outputs.some(item=>!item.stdout.includes('\n'))){if(Date.now()>deadline)assert.fail('concurrent roots deadline');await new Promise(resolve=>setTimeout(resolve,10));}
+  const rows=store.inspectSessionBindingsV2({repositoryRoot:f.root});assert.equal(rows.filter(row=>row.kind==='session').length,3);
+  const preview=store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:true,limit:2});
+  assert.equal(preview.retired.length+preview.preserved.length,2);
+  fs.writeFileSync(release,'');
+  for(const item of outputs){const status=await item.closed;assert.equal(status,0,item.stderr);}
+});
+
+test('v2 registration preserves the existing SESSION_LIMIT bound', async t => {
+  const {f,pair,admissionLease}=await prepared(t);const sessions=path.join(f.root,'.jhw-runtime/v2/sessions');fs.mkdirSync(sessions,{recursive:true,mode:0o700});
+  for(let index=0;index<1024;index++)fs.mkdirSync(path.join(sessions,`.creating.s-${index.toString(16).padStart(32,'0')}`),{mode:0o700});
+  assert.throws(()=>store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease}),{code:'DEPLOY_SESSION_INVALID'});
 });
