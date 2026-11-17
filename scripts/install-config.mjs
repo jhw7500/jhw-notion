@@ -24,6 +24,7 @@ const AMBIGUOUS = 6;
 const CLEANUP_UNCONFIRMED = 7;
 const MANUAL_RECOVERY = 8;
 const ADOPT_UNPRESERVABLE = 9;
+const CODEX_BINDING = "JHW_RUNTIME_SESSION_BINDING";
 // First activation with --adopt-from: the driver validated this sibling
 // checkout of the same repository before passing it.
 const adoptRoot = process.env.JHW_ADOPT_FROM ?? "";
@@ -1593,12 +1594,18 @@ function finalizeControlHookLinkTransaction() {
 function verifyManagedConfiguration() {
   const current = safeExistingFile(configFile);
   if (!current.exists) failForeign();
-  if (operation === "verify-codex") {
+  if (operation === "verify-codex" || operation === "verify-codex-binding") {
     const inspected = ownedToml(current.text);
     if (!inspected.owned) failForeign();
     const parent = inspected.range.lines.slice(inspected.range.start + 1, inspected.range.parentEnd);
-    const args = parent.map(line => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(line)).find(Boolean);
+    const args = parent.map(line => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(line))).find(Boolean);
     if (!args || JSON.stringify(JSON.parse(args[1])) !== JSON.stringify(stdioArgs())) failForeign();
+    if (operation === "verify-codex-binding") {
+      let environment;
+      try { environment = inspectCodexEnvironment(current.text, inspected.range); }
+      catch { failForeign(); }
+      if (environment.envVars.filter((name) => name === CODEX_BINDING).length !== 1) failForeign();
+    }
   } else if (operation === "verify-stdio" || operation === "verify-opencode") {
     const settings = parsedJson(current.text);
     const vector = operation === "verify-stdio" ? settings.mcpServers?.["jhw-notion"] : settings.mcp?.["jhw-notion"];
@@ -1827,6 +1834,34 @@ function tomlAssignmentKeys(line) {
   return undefined;
 }
 
+function tomlAssignmentStringValue(line) {
+  const source = stripTomlComment(line);
+  let quote;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote === '"' && character === "\\" && !escaped) {
+      escaped = true;
+      continue;
+    }
+    if ((character === '"' || character === "'") && !escaped) {
+      if (quote === character) quote = undefined;
+      else if (quote === undefined) quote = character;
+    } else if (character === "=" && quote === undefined) {
+      const value = source.slice(index + 1).trim();
+      if (value.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(value);
+          return typeof parsed === "string" ? parsed : undefined;
+        } catch { return undefined; }
+      }
+      return /^'[^']*'$/.test(value) ? value.slice(1, -1) : undefined;
+    }
+    escaped = false;
+  }
+  return undefined;
+}
+
 function sameNameTomlHeader(line) {
   const keys = tomlHeaderKeys(line);
   return keys?.[0] === "mcp_servers" && keys[1] === "jhw-notion";
@@ -1866,7 +1901,7 @@ function tomlRange(source) {
   const hasAlternate = lines.some((line) => sameNameTomlHeader(line) &&
     line.trim() !== parentHeader && !line.trim().startsWith(childPrefix));
   if (starts.length === 0) return { lines, hasOrphan: hasSameName || hasConflictingAssignment, hasAlternate };
-  if (starts.length !== 1) failForeign();
+  if (starts.length !== 1) return { lines, hasOrphan: true, hasAlternate: true };
   const start = starts[0];
   let parentEnd = start + 1;
   while (parentEnd < lines.length && !/^\s*\[/.test(lines[parentEnd])) parentEnd += 1;
@@ -1892,7 +1927,7 @@ function ownedToml(source) {
   const range = tomlRange(source);
   if (range.start === undefined) return { owned: false, range };
   if (range.hasAlternate) return { owned: false, range };
-  const parent = range.lines.slice(range.start + 1, range.parentEnd);
+  const parent = range.lines.slice(range.start + 1, range.parentEnd).map(stripTomlComment);
   const commands = parent.map((line) => /^\s*command\s*=\s*"([^"]*)"\s*$/.exec(line)).filter(Boolean);
   const argsLines = parent.map((line) => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(line)).filter(Boolean);
   if (commands.length !== 1 || argsLines.length !== 1 || commands[0][1] !== "node") return { owned: false, range };
@@ -1902,12 +1937,13 @@ function ownedToml(source) {
   return { owned, adopted: !owned && adoptedVector(commands[0][1], args), range };
 }
 
-function codexEntry() {
+function codexEntry(environment = [`env_vars = ${JSON.stringify([CODEX_BINDING])}`]) {
   return [
     parentHeader,
     'command = "node"',
     `args = ${JSON.stringify(stdioArgs())}`,
     "startup_timeout_sec = 60.0",
+    ...environment,
   ];
 }
 
@@ -1922,42 +1958,116 @@ function saveToml(current, next) {
   process.exit(CHANGED);
 }
 
+function inspectCodexEnvironment(source, range) {
+  const parent = range.lines.slice(range.start + 1, range.parentEnd);
+  const envAssignments = parent.flatMap((line, index) =>
+    /^\s*env_vars\s*=/.test(stripTomlComment(line)) ? [{ line, index }] : []);
+  if (envAssignments.length > 1) throw new Error("duplicate Codex env_vars assignment");
+  let envVars = [];
+  if (envAssignments.length === 1) {
+    const match = /^\s*env_vars\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(envAssignments[0].line));
+    try { envVars = match ? JSON.parse(match[1]) : undefined; } catch { envVars = undefined; }
+    if (!Array.isArray(envVars) || !envVars.every((name) => typeof name === "string") ||
+        new Set(envVars).size !== envVars.length || envVars.some(isLoaderVariable)) {
+      throw new Error("unsafe Codex env_vars");
+    }
+  }
+  const childLines = range.lines.slice(range.parentEnd, range.end);
+  let inEnvironment = false;
+  const childKeys = [];
+  for (const line of childLines) {
+    const header = tomlHeaderKeys(line) ?? tomlArrayHeaderKeys(line);
+    if (header) {
+      if (line.trim() !== "[mcp_servers.jhw-notion.env]") {
+        throw new Error("unsupported Codex child table");
+      }
+      if (inEnvironment) throw new Error("duplicate Codex env child table");
+      inEnvironment = true;
+      continue;
+    }
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    if (!inEnvironment) throw new Error("ambiguous Codex child environment");
+    const keys = tomlAssignmentKeys(line);
+    if (!keys || keys.length !== 1 || tomlAssignmentStringValue(line) === undefined) {
+      throw new Error("ambiguous Codex env assignment");
+    }
+    childKeys.push(keys[0]);
+  }
+  if (new Set(childKeys).size !== childKeys.length || childKeys.some(isLoaderVariable) ||
+      childKeys.includes(CODEX_BINDING) || childKeys.some((name) => envVars.includes(name))) {
+    throw new Error("duplicate or unsafe Codex environment key");
+  }
+  return {
+    envAssignment: envAssignments[0],
+    envVars,
+    userEnvironmentPresent: envVars.some((name) => name !== CODEX_BINDING) || childKeys.length > 0,
+  };
+}
+
+function mergeCodexBinding(source) {
+  const range = tomlRange(source);
+  if (range.start === undefined || range.hasAlternate) throw new Error("ambiguous Codex entry");
+  const environment = inspectCodexEnvironment(source, range);
+  if (environment.envVars.includes(CODEX_BINDING)) {
+    return { text: source, changed: false, userEnvironmentPresent: environment.userEnvironmentPresent };
+  }
+  const lines = [...range.lines];
+  if (environment.envAssignment) {
+    const lineIndex = range.start + 1 + environment.envAssignment.index;
+    const line = lines[lineIndex];
+    const array = /\[.*\]/.exec(stripTomlComment(line));
+    if (!array) throw new Error("invalid Codex env_vars assignment");
+    const names = JSON.stringify([...environment.envVars, CODEX_BINDING]);
+    lines[lineIndex] = `${line.slice(0, array.index)}${names}${line.slice(array.index + array[0].length)}`;
+  } else {
+    lines.splice(range.parentEnd, 0, `env_vars = ${JSON.stringify([CODEX_BINDING])}`);
+  }
+  return { text: lines.join("\n"), changed: true, userEnvironmentPresent: environment.userEnvironmentPresent };
+}
+
 function inspectCodexRegistration() {
   const current = safeExistingFile(configFile);
   const inspected = ownedToml(current.text);
   if ((inspected.range.start !== undefined && !inspected.owned && !inspected.adopted) ||
       (inspected.range.start === undefined && inspected.range.hasOrphan)) failForeign();
+  let binding;
   let preserved = [];
-  if (inspected.adopted) {
-    // Only env_vars and an env child table carry over from the adopted entry.
-    const { lines, start, parentEnd, end } = inspected.range;
+  if (inspected.range.start !== undefined) {
+    const { lines, start, parentEnd } = inspected.range;
     const parent = lines.slice(start + 1, parentEnd);
-    const children = lines.slice(parentEnd, end);
-    if (!parent.every((line) => /^\s*(#.*)?$/.test(line) || /^\s*(command|args|startup_timeout_sec|env_vars)\s*=/.test(line)) ||
-        !children.every((line) => !/^\s*\[/.test(line) || line.trim() === "[mcp_servers.jhw-notion.env]")) process.exit(ADOPT_UNPRESERVABLE);
-    preserved = [...parent.filter((line) => /^\s*env_vars\s*=/.test(line)), ...children];
-    // Preserved names must be readable and never loader/runtime-control variables.
-    for (const line of preserved) {
-      if (/^\s*(#.*)?$/.test(line) || /^\s*\[/.test(line)) continue;
-      const envVars = /^\s*env_vars\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(line));
-      let names;
-      if (envVars) { try { names = JSON.parse(envVars[1]); } catch { names = undefined; } }
-      else { const keys = tomlAssignmentKeys(line); names = keys?.length === 1 ? keys : undefined; }
-      if (!Array.isArray(names) || !names.every((name) => typeof name === "string") || names.some(isLoaderVariable)) process.exit(ADOPT_UNPRESERVABLE);
+    if (!parent.every((line) => /^\s*(#.*)?$/.test(line) ||
+        /^\s*(command|args|startup_timeout_sec|env_vars)\s*=/.test(line))) {
+      process.exit(ADOPT_UNPRESERVABLE);
+    }
+    const assignmentNames = parent.flatMap((line) => tomlAssignmentKeys(line) ?? []);
+    if (["command", "args", "startup_timeout_sec", "env_vars"].some((name) =>
+      assignmentNames.filter((candidate) => candidate === name).length > 1)) {
+      process.exit(ADOPT_UNPRESERVABLE);
+    }
+    try { binding = mergeCodexBinding(current.text); }
+    catch { process.exit(ADOPT_UNPRESERVABLE); }
+    const mergedRange = tomlRange(binding.text);
+    const mergedParent = mergedRange.lines.slice(mergedRange.start + 1, mergedRange.parentEnd);
+    preserved = [
+      ...mergedParent.filter((line) => /^\s*(#.*)?$/.test(line) || /^\s*env_vars\s*=/.test(line)),
+      ...mergedRange.lines.slice(mergedRange.parentEnd, mergedRange.end),
+    ];
+    if (mergedRange.end === mergedRange.lines.length && binding.text.endsWith("\n") && preserved.at(-1) === "") {
+      preserved.pop();
     }
   }
-  return { current, inspected, preserved };
+  return { current, inspected, preserved, binding };
 }
 
 function registerCodex() {
-  const { current, inspected, preserved } = inspectCodexRegistration();
+  const { current, inspected, preserved, binding } = inspectCodexRegistration();
+  if (inspected.owned) saveToml(current, binding.text);
   let output;
   if (inspected.range.start !== undefined) {
     const suffix = inspected.range.lines.slice(inspected.range.end);
     output = [
       ...inspected.range.lines.slice(0, inspected.range.start),
-      ...codexEntry(),
-      ...preserved,
+      ...codexEntry(preserved),
       ...(suffix.length === 0 && current.text.endsWith("\n") ? [""] : suffix),
     ].join("\n");
   } else {
@@ -1972,10 +2082,11 @@ function unregisterCodex() {
   if (!current.exists) process.exit(UNCHANGED);
   const inspected = ownedToml(current.text);
   if (!inspected.owned || inspected.range.start === undefined) process.exit(UNCHANGED);
-  // The register path writes neither env_vars nor child tables.
   const { lines, start, parentEnd, end } = inspected.range;
-  reportEnvDropped(lines.slice(start + 1, parentEnd).some((line) => /^\s*env_vars\s*=/.test(line)) ||
-    lines.slice(parentEnd, end).some((line) => /^\s*\[/.test(line)));
+  let environment;
+  try { environment = inspectCodexEnvironment(current.text, inspected.range); }
+  catch { preserveUnowned(); }
+  reportEnvDropped(environment.userEnvironmentPresent);
   const output = [
     ...inspected.range.lines.slice(0, inspected.range.start),
     ...inspected.range.lines.slice(inspected.range.end),
@@ -2000,7 +2111,7 @@ try {
     if (guardPolicyOperations.has(operation)) assertTrustedGuardPolicyLocation();
     anchorHookTransactionPaths();
   }
-  if (["verify-stdio","verify-opencode","verify-codex","verify-claude-hooks","verify-codex-hooks"].includes(operation)) verifyManagedConfiguration();
+  if (["verify-stdio","verify-opencode","verify-codex","verify-codex-binding","verify-claude-hooks","verify-codex-hooks"].includes(operation)) verifyManagedConfiguration();
   if (operation === "check-transaction-parent") {
     try { anchorHookTransactionPaths(); } catch { failForeign(); }
     process.exit(CHANGED);
@@ -2008,6 +2119,12 @@ try {
   if (operation === "check-stdio") { inspectStdioRegistration(); process.exit(CHANGED); }
   if (operation === "check-opencode") { inspectOpenCodeRegistration(); process.exit(CHANGED); }
   if (operation === "check-codex") { inspectCodexRegistration(); process.exit(CHANGED); }
+  if (operation === "check-codex-binding-migration") {
+    const { inspected } = inspectCodexRegistration();
+    if (inspected.range.start === undefined || (!inspected.owned && !inspected.adopted)) failForeign();
+    process.stdout.write(`${JSON.stringify({ version: 1, capabilities: ["codex-binding-migration-v1"] })}\n`);
+    process.exit(CHANGED);
+  }
   if (operation === "check-codex-hooks" || operation === "check-claude-hooks") checkCodexHooks();
   if (operation === "check-guard-policy") process.exit(checkGuardPolicy());
   if (operation === "check-guard-policy-target") process.exit(await checkGuardPolicyTarget());

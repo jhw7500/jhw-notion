@@ -2846,6 +2846,7 @@ test_owned_round_trip() {
   node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(s.mcpServers["jhw-notion"].command!=="node") process.exit(1)' "$json"
   node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(s["$schema"]!=="https://opencode.ai/config.json" || s.mcp["jhw-notion"].command[0]!=="node") process.exit(1)' "$home/.config/opencode/opencode.json"
   grep -q '^command = "node"$' "$codex"
+  grep -q '^env_vars = \["JHW_RUNTIME_SESSION_BINDING"\]$' "$codex"
   first_hash="$(sha256sum "$home/.claude.json" "$json" "$home/.config/opencode/opencode.json" "$codex")"
   first_claude_config="$home/.claude.first.json"
   cp -- "$home/.claude.json" "$first_claude_config"
@@ -2888,6 +2889,7 @@ test_owned_round_trip() {
   node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(s.mcpServers["jhw-notion"].command!=="node") process.exit(1)' "$json"
   node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(s["$schema"]!=="https://opencode.ai/config.json" || s.mcp["jhw-notion"].command[0]!=="node") process.exit(1)' "$home/.config/opencode/opencode.json"
   grep -q '^command = "node"$' "$codex"
+  grep -q '^env_vars = \["JHW_RUNTIME_SESSION_BINDING"\]$' "$codex"
   for config in "$home/.claude.json" "$json" "$home/.config/opencode/opencode.json" "$codex"; do
     [ "$(stat -c '%a' "$config")" = "640" ] || { echo "config mode changed after reinstall: $config" >&2; return 1; }
   done
