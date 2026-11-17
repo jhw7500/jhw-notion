@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -29,6 +30,48 @@ function run(operation, config, { adoptFrom, stamp = "20261117000000" } = {}) {
 function writeConfig(file, text) {
   fs.writeFileSync(file, text, { mode: 0o600 });
   fs.chmodSync(file, 0o600);
+}
+
+function transactionFixture(t) {
+  const current = fixture(t);
+  const evidence = path.join(current.root, "d-00000000000000000000000000000000");
+  fs.mkdirSync(evidence, { mode: 0o700 });
+  fs.chmodSync(evidence, 0o700);
+  const source = `[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([entry])}\nstartup_timeout_sec = 60.0\n`;
+  writeConfig(current.config, source);
+  const args = [editor, "migrate-codex-binding-transaction", current.config, entry, repositoryRoot,
+    "r-0000000000000000000000000000000000000000-0000000000000000000000000000000000000000000000000000000000000000", evidence];
+  return { ...current, evidence, source, args };
+}
+
+function startTransaction(current) {
+  return spawn(process.execPath, current.args, { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+}
+
+async function waitUntilStopped(child) {
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    try { if (/^State:\s+T/m.test(fs.readFileSync(`/proc/${child.pid}/status`, "utf8"))) return; }
+    catch { throw new Error("transaction exited before checkpoint stop"); }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("transaction checkpoint did not stop");
+}
+
+function stopAtPhase(child, phase) {
+  return new Promise((resolve, reject) => {
+    const onExit = (code, signal) => reject(new Error(`transaction exited before ${phase}: ${code ?? signal}`));
+    child.once("exit", onExit);
+    child.on("message", async (message) => {
+      await waitUntilStopped(child);
+      if (message?.phase === phase) { child.off("exit", onExit); resolve(); }
+      else process.kill(child.pid, "SIGCONT");
+    });
+  });
+}
+
+function journal(current) {
+  try { return JSON.parse(fs.readFileSync(path.join(current.evidence, "state.json"), "utf8")); }
+  catch { return null; }
 }
 
 function sectionBody(text, header) {
@@ -200,3 +243,71 @@ test("owned Codex registration with binding preserves the complete block bytes",
   assert.equal(after.mtimeNs, before.mtimeNs);
   assert.deepEqual(fs.readdirSync(current.root).filter((name) => name.includes(".bak.")), backupsBefore);
 });
+
+test("codex migration never replaces a foreign reoccupied path", async (t) => {
+  const current = transactionFixture(t);
+  const marker = path.join(current.root, "unrelated"); writeConfig(marker, "unchanged\n");
+  const markerBefore = fs.statSync(marker, { bigint: true });
+  const child = startTransaction(current);
+  await stopAtPhase(child, "quarantined");
+  const foreignText = 'model = "foreign-reoccupied"\n';
+  writeConfig(current.config, foreignText);
+  process.kill(child.pid, "SIGCONT");
+  const [code] = await once(child, "exit");
+  assert.notEqual(code, 0);
+  assert.equal(fs.readFileSync(current.config, "utf8"), foreignText);
+  assert.equal(fs.existsSync(path.join(current.evidence, "quarantine")), true);
+  assert.equal(journal(current).status, "pending");
+  const markerAfter = fs.statSync(marker, { bigint: true });
+  assert.equal(fs.readFileSync(marker, "utf8"), "unchanged\n");
+  assert.deepEqual({ ino: markerAfter.ino, mtimeNs: markerAfter.mtimeNs }, { ino: markerBefore.ino, mtimeNs: markerBefore.mtimeNs });
+});
+
+test("codex migration preserves a source replacement after validation", async (t) => {
+  const current = transactionFixture(t);const child = startTransaction(current);await stopAtPhase(child, "prepared");
+  const foreignText = 'model = "replacement-after-validation"\n';const replacement = path.join(current.root, "replacement");writeConfig(replacement, foreignText);fs.renameSync(replacement, current.config);
+  process.kill(child.pid, "SIGCONT");const [code] = await once(child, "exit");assert.notEqual(code, 0);
+  assert.equal(fs.readFileSync(current.config, "utf8"), foreignText);assert.equal(journal(current).status, "pending");
+});
+
+test("codex migration preserves a symlink reoccupation", async (t) => {
+  const current = transactionFixture(t);const child = startTransaction(current);await stopAtPhase(child, "quarantined");
+  fs.symlinkSync("foreign-target", current.config);process.kill(child.pid, "SIGCONT");const [code] = await once(child, "exit");assert.notEqual(code, 0);
+  assert.equal(fs.readlinkSync(current.config), "foreign-target");assert.equal(journal(current).status, "pending");
+});
+
+test("codex migration preserves writes through an old fd", async (t) => {
+  const current = transactionFixture(t);
+  const oldFd = fs.openSync(current.config, "r+");
+  try {
+    const child = startTransaction(current);
+    await stopAtPhase(child, "quarantined");
+    const changed = Buffer.from(current.source.replace("60.0", "61.0"));
+    fs.ftruncateSync(oldFd, 0); fs.writeSync(oldFd, changed, 0, changed.length, 0); fs.fsyncSync(oldFd);
+    process.kill(child.pid, "SIGCONT");
+    const [code] = await once(child, "exit");
+    assert.notEqual(code, 0);
+    assert.equal(fs.readFileSync(path.join(current.evidence, "quarantine"), "utf8"), changed.toString());
+    assert.equal(fs.readFileSync(current.config, "utf8"), changed.toString());
+    assert.equal(journal(current).status, "pending");
+  } finally { fs.closeSync(oldFd); }
+});
+
+for (const phase of ["quarantine_intent", "quarantined", "publish_intent", "published", "verified"]) {
+  test(`codex migration recovers after ${phase} crash`, async (t) => {
+    const current = transactionFixture(t);
+    const child = startTransaction(current);
+    await stopAtPhase(child, phase);
+    process.kill(child.pid, "SIGKILL");
+    await once(child, "exit");
+    const recovery = spawnSync(process.execPath, current.args, { stdio: "ignore" });
+    if (["quarantine_intent", "quarantined", "publish_intent"].includes(phase)) {
+      assert.equal(recovery.status, 8);assert.equal(journal(current).status, "complete");assert.match(journal(current).outcome,/^(unchanged|restored-before)$/);
+      assert.equal(fs.readFileSync(current.config,"utf8"),current.source);assert.equal(fs.existsSync(path.join(current.evidence,"quarantine")),false);assert.equal(fs.existsSync(path.join(current.evidence,"after")),false);
+      const nextEvidence=path.join(current.root,`d-${"1".repeat(32)}`);fs.mkdirSync(nextEvidence,{mode:0o700});const nextArgs=[...current.args.slice(0,-1),nextEvidence];
+      assert.equal(spawnSync(process.execPath,nextArgs,{stdio:"ignore"}).status,0);assert.equal(run("verify-codex-binding",current.config).status,0);
+    } else {
+      assert.equal(recovery.status, 0);assert.equal(journal(current).status, "complete");assert.equal(run("verify-codex-binding", current.config).status, 0);
+    }
+  });
+}

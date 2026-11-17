@@ -117,6 +117,76 @@ function validPairJournalState(state) {
  if(state.phase==='rejected')return state.status==='complete'&&['pointer_not_published','candidate_rejected'].includes(state.outcome);
  return state.status==='complete'&&validRuntimeCurrent(state.destination)&&state.destination?.version===2&&validPointerWitness(state.witness,state.destination)&&state.outcome==='pointer_published';
 }
+function validCodexIdentity(value) {
+ return exact(value,['dev','ino','uid','mode','nlink','size'])&&[value.dev,value.ino,value.size].every(item=>typeof item==='string'&&/^\d{1,32}$/.test(item))&&
+  value.uid===process.getuid()&&value.mode===0o600&&Number.isSafeInteger(value.nlink)&&value.nlink>=1&&value.nlink<=2;
+}
+function validCodexRecord(value) {return exact(value,['identity','sha256'])&&validCodexIdentity(value.identity)&&typeof value.sha256==='string'&&/^[a-f0-9]{64}$/.test(value.sha256);}
+function validCodexObserved(value) {
+ if(value===null)return true;
+ return exact(value,['reason','live','quarantine','after'])&&typeof value.reason==='string'&&value.reason.length<=128&&
+  ['live','quarantine','after'].every(key=>value[key]===null||validObservedCodexObject(value[key]));
+}
+function validObservedIdentity(value) {return exact(value,['dev','ino','uid','mode','nlink','size'])&&[value.dev,value.ino,value.size].every(item=>typeof item==='string'&&/^\d{1,32}$/.test(item))&&value.uid===process.getuid()&&Number.isSafeInteger(value.mode)&&value.mode>=0&&value.mode<=0o7777&&Number.isSafeInteger(value.nlink)&&value.nlink>=1;}
+function validObservedCodexObject(value) {
+ if(value?.kind==='file')return exact(value,['kind','identity','sha256'])&&validObservedIdentity(value.identity)&&typeof value.sha256==='string'&&/^[a-f0-9]{64}$/.test(value.sha256);
+ if(value?.kind==='symlink')return exact(value,['kind','identity','targetSha256'])&&validObservedIdentity(value.identity)&&typeof value.targetSha256==='string'&&/^[a-f0-9]{64}$/.test(value.targetSha256);
+ return value?.kind==='special'&&exact(value,['kind','identity'])&&validObservedIdentity(value.identity);
+}
+function validCodexJournalState(state) {
+ if(!exact(state,['version','kind','status','phase','config','editorReleaseId','before','after','observed','outcome'])||state.version!==2||state.kind!=='codex-config'||
+  !['pending','complete'].includes(state.status)||!['prepared','quarantine_intent','quarantined','publish_intent','published','verified','ambiguous','complete'].includes(state.phase)||
+  typeof state.config!=='string'||!path.isAbsolute(state.config)||path.basename(state.config)!=='config.toml'||!RELEASE.test(state.editorReleaseId??'')||
+  !exact(state.before,['identity','sha256','copy'])||!validCodexIdentity(state.before.identity)||!validCodexIdentity(state.before.copy)||
+  typeof state.before.sha256!=='string'||!/^[a-f0-9]{64}$/.test(state.before.sha256)||!validCodexRecord(state.after)||!validCodexObserved(state.observed)||
+  !(state.outcome===null||['migrated','unchanged','restored-before'].includes(state.outcome)))return false;
+ if(state.status==='complete')return state.phase==='complete'&&['migrated','unchanged','restored-before'].includes(state.outcome)&&state.observed===null;
+ return state.phase!=='complete'&&state.outcome===null&&(state.phase==='ambiguous'?state.observed!==null:state.observed===null);
+}
+function readCodexObject(file,{allowLinks=[1],limit=FILE_LIMIT}={}) {
+ let fd;try {
+  fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);const before=fs.fstatSync(fd,{bigint:true});
+  if(!before.isFile()||before.uid!==BigInt(process.getuid())||permissions(before.mode)!==0o600||!allowLinks.includes(Number(before.nlink))||before.size>BigInt(limit))fail('unverified_journal');
+  const bytes=Buffer.alloc(Number(before.size)+1);let length=0;while(length<bytes.length){const count=fs.readSync(fd,bytes,length,bytes.length-length,null);if(!count)break;length+=count;}
+  const after=fs.fstatSync(fd,{bigint:true});const named=fs.lstatSync(file,{bigint:true});for(const key of ['dev','ino','uid','mode','nlink','size','ctimeNs','mtimeNs'])if(before[key]!==after[key]||before[key]!==named[key])fail('unverified_journal');
+  if(length!==Number(before.size))fail('unverified_journal');return {bytes:bytes.subarray(0,length),info:after};
+ }catch(error){if(error instanceof DeploymentError)throw error;fail('unverified_journal');}finally{if(fd!==undefined)fs.closeSync(fd);}
+}
+function codexIdentity(info) {return {dev:String(info.dev),ino:String(info.ino),uid:Number(info.uid),mode:permissions(info.mode),nlink:Number(info.nlink),size:String(info.size)};}
+function readObservedCodexObject(file) {
+ let info;try{info=fs.lstatSync(file,{bigint:true});}catch(error){if(error.code==='ENOENT')return null;fail('unverified_journal');}
+ if(info.uid!==BigInt(process.getuid()))fail('unverified_journal');
+ if(info.isSymbolicLink())return {kind:'symlink',identity:codexIdentity(info),targetSha256:digest(Buffer.from(fs.readlinkSync(file)))};
+ if(!info.isFile())return {kind:'special',identity:codexIdentity(info)};
+ const record=readCodexObject(file,{allowLinks:[1,2]});return {kind:'file',identity:codexIdentity(record.info),sha256:digest(record.bytes)};
+}
+function verifyCodexJournalFiles({journalDirectory,state,children}) {
+ const compare=(record,expected,{identity=true}={})=>digest(record.bytes)===expected.sha256&&(!identity||['dev','ino','uid','mode','size'].every(key=>codexIdentity(record.info)[key]===expected.identity[key]));
+ const before=readCodexObject(path.join(journalDirectory,'before'));
+ if(!compare(before,{identity:state.before.copy,sha256:state.before.sha256}))fail('unverified_journal');
+ const quarantine=state.phase!=='ambiguous'&&children.includes('quarantine')?readCodexObject(path.join(journalDirectory,'quarantine'),{allowLinks:[1,2]}):null;
+ const after=state.phase!=='ambiguous'&&children.includes('after')?readCodexObject(path.join(journalDirectory,'after'),{allowLinks:[1,2]}):null;
+ let live=null;if(state.phase!=='ambiguous')try{live=readCodexObject(state.config,{allowLinks:[1,2]});}catch(error){try{fs.lstatSync(state.config);throw error;}catch(cause){if(cause?.code!=='ENOENT')throw error;}}
+ if(state.phase!=='ambiguous') {
+  if(state.status==='complete'&&state.outcome!=='migrated') {
+   if(quarantine||after||!live||!compare(live,{identity:state.before.identity,sha256:state.before.sha256})||live.info.nlink!==1n)fail('unverified_journal');
+   return;
+  }
+  const liveBefore=live&&compare(live,{identity:state.before.identity,sha256:state.before.sha256});
+  const liveAfter=live&&compare(live,state.after);const quarantineBefore=quarantine&&compare(quarantine,{identity:state.before.identity,sha256:state.before.sha256});
+  if(state.phase==='prepared'&&(!liveBefore||quarantine))fail('unverified_journal');
+  if(state.phase==='quarantine_intent'&&!((liveBefore&&!quarantine)||(!live&&quarantineBefore)))fail('unverified_journal');
+  if(state.phase==='quarantined'&&(live||!quarantineBefore))fail('unverified_journal');
+  if(state.phase==='publish_intent'&&(!quarantineBefore||!(live===null||liveAfter)))fail('unverified_journal');
+  if(['published','verified','complete'].includes(state.phase)&&(!quarantineBefore||!liveAfter))fail('unverified_journal');
+  if(['verified','complete'].includes(state.phase)?after!==null:['prepared','quarantine_intent','quarantined','publish_intent'].includes(state.phase)&&after===null)fail('unverified_journal');
+  if(state.phase==='published'&&after===null&&live.info.nlink!==1n)fail('unverified_journal');
+  if(after&&(!compare(after,state.after)||liveAfter&&(after.info.dev!==live.info.dev||after.info.ino!==live.info.ino)))fail('unverified_journal');
+ } else {
+  const actual={live:readObservedCodexObject(state.config),quarantine:readObservedCodexObject(path.join(journalDirectory,'quarantine')),after:readObservedCodexObject(path.join(journalDirectory,'after'))};
+  for(const key of Object.keys(actual))if(JSON.stringify(actual[key])!==JSON.stringify(state.observed[key]))fail('unverified_journal');
+ }
+}
 function verifyPairWitnessFiles({repositoryRoot,journalDirectory,state}) {
  const witnessDirectory=path.join(journalDirectory,'pointer-witness');
  if(state.witness===null){if(fs.existsSync(witnessDirectory))fail('unverified_journal');return;}
@@ -161,10 +231,16 @@ export function readRuntimeJournalV2({repositoryRoot,journalDirectory}) {
   journals=new PinnedDirectory(v2.at('journals'),{parentVerify:()=>v2.verify()});
   journal=new PinnedDirectory(journals.at(name),{parentVerify:()=>journals.verify()});
   const children=fs.readdirSync(`/proc/self/fd/${journal.fd}`).sort();
-  if(children.length>4||!children.includes('state.json')||children.some(child=>!['state.json','candidate-probe.log','retention.json','pointer-witness'].includes(child)))fail('unverified_journal');
+  if(children.length>4||!children.includes('state.json'))fail('unverified_journal');
   const files=new Map();
-  for(const child of children.filter(child=>child!=='pointer-witness'))files.set(child,readRegular(`/proc/self/fd/${journal.fd}`,child,child==='candidate-probe.log'?FILE_LIMIT:FILE_LIMIT));
+  files.set('state.json',readRegular(`/proc/self/fd/${journal.fd}`,'state.json',FILE_LIMIT));
   const state=parseJson(files.get('state.json').bytes);
+  if(state?.kind==='codex-config') {
+   if(children.some(child=>!['state.json','before','after','quarantine'].includes(child))||!validCodexJournalState(state))fail('unverified_journal');
+   verifyCodexJournalFiles({journalDirectory,state,children});journal.verify();journals.verify();v2.verify();root.verify();return {state,files,identity:objectIdentity(journal.stat)};
+  }
+  if(children.some(child=>!['state.json','candidate-probe.log','retention.json','pointer-witness'].includes(child)))fail('unverified_journal');
+  for(const child of children.filter(child=>child!=='pointer-witness'&&child!=='state.json'))files.set(child,readRegular(`/proc/self/fd/${journal.fd}`,child,FILE_LIMIT));
   if(!validPairJournalState(state))fail('unverified_journal');
   verifyPairWitnessFiles({repositoryRoot,journalDirectory,state});
   if(files.has('retention.json')){

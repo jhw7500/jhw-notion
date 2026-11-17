@@ -37,6 +37,46 @@ test('admission shared holder refuses activation preserving current and wiring',
 test('first activation wires stable entries, next activation is pointer-only, rollback and reinstall retain releases',async t=>{const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});const r=await f.run(['--prepare']);const a=await f.run(['--activate',r.releaseId]);assert.equal(a.releaseId,r.releaseId);const config=path.join(f.home,'.claude.json');assert.deepEqual(JSON.parse(fs.readFileSync(config)).mcpServers['jhw-notion'].args,[path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']);assert.equal(fs.readlinkSync(path.join(f.home,'.local/bin/jhw-control-hook')),path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-hook'));assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home,'.config/opencode/opencode.json'))).mcp['jhw-notion'].command,['node',path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']);const codex=fs.readFileSync(path.join(f.home,'.codex/config.toml'),'utf8');assert.match(codex,/"mcp"/);assert.match(codex,/^env_vars = \["JHW_RUNTIME_SESSION_BINDING"\]$/m);const before=fs.statSync(config,{bigint:true});write(f.root,'mcp-server/src/index.ts','export const version=2;');const r2=await f.run(['--prepare']);await f.run(['--activate',r2.releaseId]);assert.equal(fs.statSync(config,{bigint:true}).ino,before.ino);assert.equal(fs.statSync(config,{bigint:true}).mtimeNs,before.mtimeNs);await f.run(['--rollback']);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,r.releaseId);await f.run(['--uninstall']);assert.equal(fs.existsSync(path.join(f.home,'.local/bin/jhw-control')),false);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/releases',r2.releaseId)),true);await f.run(['--activate',r.releaseId]);assert.equal(fs.existsSync(path.join(f.home,'.local/bin/jhw-control')),true);});
 test('first managed activation has no invented legacy predecessor',async t=>{const f=fixture(t);host(f);const r=await f.run(['--prepare']);await f.run(['--activate',r.releaseId]);await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_PREDECESSOR_INVALID'});});
 
+test('explicit Codex config migration uses the current editor and retains exact journal evidence',async t=>{
+ const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
+ const config=path.join(f.home,'.codex/config.toml');const legacy=fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,'');write(f.home,'.codex/config.toml',legacy,0o600);
+ const before=fs.statSync(config,{bigint:true});const result=await f.run(['--migrate-codex-config']);
+ assert.equal(result.code,'DEPLOY_CODEX_CONFIG_MIGRATED');assert.equal(result.changed,true);assert.equal(result.inventory.before.clear,true);assert.equal(result.inventory.after.clear,true);
+ assert.equal(spawnSync(process.execPath,[path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs'),'verify-codex-binding',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId]).status,0);
+ const journals=fs.readdirSync(path.join(f.root,'.jhw-runtime/v2/journals'));assert.equal(journals.length,1);
+ const journal=path.join(f.root,'.jhw-runtime/v2/journals',journals[0]);const state=JSON.parse(fs.readFileSync(path.join(journal,'state.json')));
+ assert.equal(state.kind,'codex-config');assert.equal(state.status,'complete');assert.equal(state.phase,'complete');assert.equal(state.outcome,'migrated');
+ for(const name of ['state.json','before','quarantine'])assert.equal(fs.statSync(path.join(journal,name)).mode&0o7777,0o600);
+ const after=fs.statSync(config,{bigint:true});assert.notEqual(after.ino,before.ino);const retry=await f.run(['--migrate-codex-config']);assert.equal(retry.changed,false);const byteIdenticalAfter=fs.statSync(config,{bigint:true});assert.deepEqual({ino:byteIdenticalAfter.ino,mtimeNs:byteIdenticalAfter.mtimeNs},{ino:after.ino,mtimeNs:after.mtimeNs});
+});
+
+test('Codex migration refuses missing or foreign config without creating a replacement',async t=>{
+ const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);const config=path.join(f.home,'.codex/config.toml');
+ fs.unlinkSync(config);await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_WIRING_CONFLICT',reason:'codex_owned_vector_required'});assert.equal(fs.existsSync(config),false);
+ write(f.home,'.codex/config.toml','[mcp_servers.jhw-notion]\ncommand = "python"\nargs = []\n',0o600);
+ await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_WIRING_CONFLICT',reason:'codex_owned_vector_required'});
+ assert.equal(fs.readFileSync(config,'utf8'),'[mcp_servers.jhw-notion]\ncommand = "python"\nargs = []\n');
+ const journalRoot=path.join(f.root,'.jhw-runtime/v2/journals');assert.equal(fs.existsSync(journalRoot)?fs.readdirSync(journalRoot).length:0,0);
+});
+
+test('pending Codex migration preserves reoccupation and blocks every other mutation',async t=>{
+ const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);write(f.root,'mcp-server/src/index.ts','export const next=1;');const next=await f.run(['--prepare']);
+ const config=path.join(f.home,'.codex/config.toml');write(f.home,'.codex/config.toml',fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,''),0o600);
+ const journals=path.join(f.root,'.jhw-runtime/v2/journals');fs.mkdirSync(journals,{recursive:true,mode:0o700});fs.chmodSync(path.join(f.root,'.jhw-runtime/v2'),0o700);fs.chmodSync(journals,0o700);
+ const evidence=path.join(journals,'d-00000000000000000000000000000000');fs.mkdirSync(evidence,{mode:0o700});
+ const editor=path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs');const child=spawn(process.execPath,[editor,'migrate-codex-binding-transaction',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId,evidence],{stdio:['ignore','ignore','ignore','ipc']});
+ await new Promise((resolve,reject)=>{child.once('exit',(code,signal)=>reject(new Error(`editor exited ${code??signal}`)));child.on('message',async message=>{for(let attempt=0;attempt<1000;attempt++){try{if(/^State:\s+T/m.test(fs.readFileSync(`/proc/${child.pid}/status`,'utf8')))break;}catch{return reject(new Error('editor exited before stop'));}await new Promise(done=>setTimeout(done,1));}if(message?.phase==='quarantined')resolve();else process.kill(child.pid,'SIGCONT');});});
+ const foreign='model = "foreign-reoccupied"\n';write(f.home,'.codex/config.toml',foreign,0o600);process.kill(child.pid,'SIGCONT');await once(child,'exit');
+ assert.equal(JSON.parse(fs.readFileSync(path.join(evidence,'state.json'))).phase,'ambiguous');assert.equal(fs.readFileSync(config,'utf8'),foreign);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);
+ await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'codex_config_migration_pending'});
+ await assert.rejects(f.run(['--activate',next.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ assert.equal(fs.readFileSync(config,'utf8'),foreign);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,release.releaseId);
+});
+
 test('successful deployment writes an additive retention receipt without changing state schema',async t=>{
  const f=fixture(t);host(f);const release=await f.run(['--prepare']);const result=await f.run(['--activate',release.releaseId]);assert.equal(result.warnings,undefined);
  const runtime=path.join(f.root,'.jhw-runtime');const journal=fs.readdirSync(runtime).find(name=>/^\.deploy\.[a-f0-9]{32}$/.test(name));

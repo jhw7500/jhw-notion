@@ -19,7 +19,7 @@ function exists(file) {try {fs.lstatSync(file);return true;}catch(e){if(e.code==
 function parse(argv) {
  if(!Array.isArray(argv)||argv.some(v=>typeof v!=='string'))fail('DEPLOY_ARGUMENTS_INVALID');
  if(argv.length===0)return {operation:'default'};
- if(argv.length===1&&['--prepare','--status','--rollback','--uninstall','--refresh-bootstrap','--help','-h'].includes(argv[0]))return {operation:argv[0].replace(/^--?/,'')};
+ if(argv.length===1&&['--prepare','--status','--rollback','--uninstall','--refresh-bootstrap','--migrate-codex-config','--help','-h'].includes(argv[0]))return {operation:argv[0].replace(/^--?/,'')};
  if(argv.length===1&&argv[0]==='--prune')return {operation:'prune',apply:false};
  if(argv.length===2&&argv[0]==='--prune'&&argv[1]==='--apply')return {operation:'prune',apply:true};
  if(argv.length===2&&argv[0]==='--activate-compatible'&&RELEASE.test(argv[1]))return {operation:'activate-compatible',releaseId:argv[1]};
@@ -34,6 +34,12 @@ function requireMatchingInstaller(repositoryRoot,releaseId) {
  validateRelease({repositoryRoot,releaseId});
  const digest=file=>createHash('sha256').update(fs.readFileSync(file)).digest('hex');
  if(digest(path.join(repositoryRoot,'scripts/runtime-entry.mjs'))!==digest(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts/runtime-entry.mjs')))fail('DEPLOY_ARGUMENTS_INVALID','refresh_installer_mismatch');
+}
+function requireMatchingCodexEditor(repositoryRoot,releaseId) {
+ validateRelease({repositoryRoot,releaseId});
+ const digest=file=>createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+ if(digest(path.join(repositoryRoot,'scripts/install-config.mjs'))!==digest(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts/install-config.mjs')))
+  fail('DEPLOY_ARGUMENTS_INVALID','codex_editor_mismatch');
 }
 // --adopt-from names a distinct, canonical sibling checkout of this repository.
 function validateAdoptSource(repositoryRoot,source) {
@@ -979,15 +985,79 @@ async function runCompatibleDeployment({repositoryRoot,home,procRoot,environment
   }
 }
 
+function codexJournalRoot(repositoryRoot) {
+ const runtime=prepareStore(repositoryRoot);const v2=path.join(runtime,'v2');if(!exists(v2))createPrivateDirectory(runtime,'v2');
+ const journals=path.join(v2,'journals');if(!exists(journals))createPrivateDirectory(v2,'journals');
+ trustedDirectory(v2);trustedDirectory(journals);return journals;
+}
+function codexPendingJournals(repositoryRoot) {
+ const journals=path.join(repositoryRoot,'.jhw-runtime/v2/journals');if(!exists(journals))return [];
+ const pending=[];
+ for(const name of fs.readdirSync(journals).filter(name=>/^d-[a-f0-9]{32}$/.test(name)).sort()) {
+  let parsed;try{parsed=readRuntimeJournalV2({repositoryRoot,journalDirectory:path.join(journals,name)});}catch{fail('DEPLOY_RECOVERY_REQUIRED','runtime_journal_unverified');}
+  if(parsed.state.status==='pending')pending.push({directory:path.join(journals,name),kind:parsed.state.kind});
+ }
+ return pending;
+}
+function createCodexJournal(repositoryRoot) {
+ const journals=codexJournalRoot(repositoryRoot);return createPrivateDirectory(journals,`d-${randomBytes(16).toString('hex')}`);
+}
+function runEditor(editor,args,{environment,home,deployLease,admissionLease,capture=false}) {
+ const env={...environment,HOME:home,PATH:[path.dirname(process.execPath),'/usr/local/bin','/usr/bin','/bin'].join(':')};
+ for(const key of ['NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV','SHELLOPTS','BASHOPTS'])delete env[key];
+ const result=spawnSync(process.execPath,[editor,...args],{env,encoding:capture?'utf8':undefined,stdio:capture?['ignore','pipe','ignore',deployLease.fd,admissionLease.fd]:['ignore','ignore','ignore',deployLease.fd,admissionLease.fd],timeout:45000,maxBuffer:16*1024});
+ if(result.error||result.signal||result.status!==0)return null;return capture?result.stdout:true;
+}
+export async function runCodexConfigMigration({repositoryRoot,home,current,deployLease,admissionLease,environment=process.env}) {
+ if(!current||!RELEASE.test(current.releaseId))fail('DEPLOY_ARGUMENTS_INVALID','managed_activation_required');
+ requireMatchingCodexEditor(repositoryRoot,current.releaseId);
+ const release=path.join(repositoryRoot,'.jhw-runtime/releases',current.releaseId);const editor=path.join(release,'scripts/install-config.mjs');
+ const entry=path.join(repositoryRoot,'.jhw-runtime/bootstrap/jhw-runtime-entry');const config=path.join(home,'.codex/config.toml');
+ trustedFile(editor);trustedFile(entry);
+ const pending=codexPendingJournals(repositoryRoot);
+ if(pending.length>1||pending.some(item=>item.kind!=='codex-config'))fail('DEPLOY_RECOVERY_REQUIRED','runtime_journal_pending');
+ let evidence=pending[0]?.directory;
+ if(!evidence) {
+  if(runEditor(editor,['verify-codex-binding',config,entry,repositoryRoot,current.releaseId],{environment,home,deployLease,admissionLease}))
+   return {code:'DEPLOY_CODEX_CONFIG_MIGRATED',changed:false};
+  if(!runEditor(editor,['verify-codex',config,entry,repositoryRoot,current.releaseId],{environment,home,deployLease,admissionLease}))fail('DEPLOY_WIRING_CONFLICT','codex_owned_vector_required');
+  const capability=runEditor(editor,['check-codex-binding-migration',config,entry,repositoryRoot,current.releaseId],{environment,home,deployLease,admissionLease,capture:true});
+  let parsed;try{parsed=JSON.parse(capability);}catch{fail('DEPLOY_WIRING_CONFLICT','codex_migration_capability_required');}
+  if(JSON.stringify(parsed)!==JSON.stringify({version:1,capabilities:['codex-binding-migration-v1']}))fail('DEPLOY_WIRING_CONFLICT','codex_migration_capability_required');
+  evidence=createCodexJournal(repositoryRoot);
+ }
+ const changed=runEditor(editor,['migrate-codex-binding-transaction',config,entry,repositoryRoot,current.releaseId,evidence],{environment,home,deployLease,admissionLease});
+ if(!changed) {
+  const recovered=readRuntimeJournalV2({repositoryRoot,journalDirectory:evidence}).state;
+  if(recovered.kind==='codex-config'&&recovered.status==='complete'&&['unchanged','restored-before'].includes(recovered.outcome))
+   fail('DEPLOY_WIRING_FAILED','codex_config_migration_recovered');
+  fail('DEPLOY_RECOVERY_REQUIRED','codex_config_migration_pending');
+ }
+ const parsed=readRuntimeJournalV2({repositoryRoot,journalDirectory:evidence});
+ if(parsed.state.kind!=='codex-config'||parsed.state.status!=='complete'||parsed.state.outcome!=='migrated')fail('DEPLOY_RECOVERY_REQUIRED','codex_config_migration_unverified');
+ return {code:'DEPLOY_CODEX_CONFIG_MIGRATED',changed:true};
+}
+
 /** Module-only fixtures may supply private procRoot/build/phaseRunner. Public
  * argv and environment have no gate bypass, lock-fd, or alternate-root option. */
 export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000,planTimeoutMs=45000}={}) {
  const command=parse(argv);
  if([phaseTimeoutMs,planTimeoutMs].some(value=>!Number.isInteger(value)||value<1||value>45000))fail('DEPLOY_ARGUMENTS_INVALID');
- if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate-compatible RELEASE_ID','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--activate RELEASE_ID --guard-observe','--rollback','--uninstall','--refresh-bootstrap','--prune','--prune --apply']};
+ if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate-compatible RELEASE_ID','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--activate RELEASE_ID --guard-observe','--rollback','--uninstall','--refresh-bootstrap','--migrate-codex-config','--prune','--prune --apply']};
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
  const runtime=path.join(repositoryRoot,'.jhw-runtime');
+ if(exists(runtime)&&!['status','migrate-codex-config','prune'].includes(command.operation)&&pendingPairJournalCount(repositoryRoot)>0)
+  fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
+ if(command.operation==='migrate-codex-config') {
+  const before=requireQuiescence(inventoryOptions);let writer;let admission;
+  try {
+   writer=acquireLease(path.join(runtime,'deploy.lock'));admission=acquireLease(path.join(runtime,'admission.lock'));
+   const after=requireQuiescence(inventoryOptions);if(pending(runtime).length)fail('DEPLOY_RECOVERY_REQUIRED','deployment_journal_pending');const current=readActivation({repositoryRoot});
+   const result=await runCodexConfigMigration({repositoryRoot,home,current,deployLease:writer,admissionLease:admission,environment});
+   return {...result,inventory:{before,after}};
+  } finally {admission?.close();writer?.close();}
+ }
  if(command.operation==='prune'&&exists(runtime)&&pendingPairJournalCount(repositoryRoot)>0)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
  if(command.operation==='prune'&&!command.apply)return planRuntimePrune({repositoryRoot});
  if(command.operation==='prune') {

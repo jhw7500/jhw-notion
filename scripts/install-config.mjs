@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { validateBootstrap, STARTUP_ENVIRONMENT } from "./runtime-entry.mjs";
 
@@ -1591,21 +1591,24 @@ function finalizeControlHookLinkTransaction() {
   return CHANGED;
 }
 
+function strictCodexBindingText(text, { bindingRequired }) {
+  const inspected = ownedToml(text);
+  if (!inspected.owned) return false;
+  const parent = inspected.range.lines.slice(inspected.range.start + 1, inspected.range.parentEnd);
+  const args = parent.map(line => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(line))).find(Boolean);
+  if (!args || JSON.stringify(JSON.parse(args[1])) !== JSON.stringify(stdioArgs())) return false;
+  if (bindingRequired) {
+    let environment; try { environment = inspectCodexEnvironment(text, inspected.range); } catch { return false; }
+    if (environment.envVars.filter((name) => name === CODEX_BINDING).length !== 1) return false;
+  }
+  return true;
+}
+
 function verifyManagedConfiguration() {
   const current = safeExistingFile(configFile);
   if (!current.exists) failForeign();
   if (operation === "verify-codex" || operation === "verify-codex-binding") {
-    const inspected = ownedToml(current.text);
-    if (!inspected.owned) failForeign();
-    const parent = inspected.range.lines.slice(inspected.range.start + 1, inspected.range.parentEnd);
-    const args = parent.map(line => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(line))).find(Boolean);
-    if (!args || JSON.stringify(JSON.parse(args[1])) !== JSON.stringify(stdioArgs())) failForeign();
-    if (operation === "verify-codex-binding") {
-      let environment;
-      try { environment = inspectCodexEnvironment(current.text, inspected.range); }
-      catch { failForeign(); }
-      if (environment.envVars.filter((name) => name === CODEX_BINDING).length !== 1) failForeign();
-    }
+    if (!strictCodexBindingText(current.text, { bindingRequired: operation === "verify-codex-binding" })) failForeign();
   } else if (operation === "verify-stdio" || operation === "verify-opencode") {
     const settings = parsedJson(current.text);
     const vector = operation === "verify-stdio" ? settings.mcpServers?.["jhw-notion"] : settings.mcp?.["jhw-notion"];
@@ -2110,6 +2113,189 @@ function registerCodex() {
   saveToml(current, output);
 }
 
+const CODEX_MIGRATION_ARTIFACTS = new Set(["state.json", "before", "after", "quarantine"]);
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const migrationIdentity = (info) => ({
+  dev: String(info.dev), ino: String(info.ino), uid: Number(info.uid),
+  mode: Number(info.mode & 0o7777n), nlink: Number(info.nlink), size: String(info.size),
+});
+const sameMigrationObject = (info, identity, { links = false } = {}) =>
+  info.isFile() && String(info.dev) === identity.dev && String(info.ino) === identity.ino &&
+  Number(info.uid) === identity.uid && Number(info.mode & 0o7777n) === identity.mode &&
+  (!links || Number(info.nlink) === identity.nlink);
+
+function migrationRead(directoryFd, name, limit = 2 * 1024 * 1024) {
+  const file = `/proc/self/fd/${directoryFd}/${name}`;
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const before = fs.fstatSync(fd, { bigint: true });
+    if (!before.isFile() || before.uid !== BigInt(process.getuid()) || before.size > BigInt(limit)) throw new Error("unsafe migration artifact");
+    const bytes = Buffer.alloc(Number(before.size) + 1); let length = 0;
+    while (length < bytes.length) { const count = fs.readSync(fd, bytes, length, bytes.length - length, null); if (!count) break; length += count; }
+    const after = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(file, { bigint: true });
+    if (length !== Number(before.size) || ["dev","ino","uid","mode","nlink","size","ctimeNs","mtimeNs"].some((key) => before[key] !== after[key] || before[key] !== named[key])) throw new Error("migration artifact changed");
+    return { bytes: bytes.subarray(0, length), info: after };
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+function migrationCheckpoint(evidenceFd, state) {
+  const temporary = `.state.${randomUUID()}`;
+  const fd = fs.openSync(`/proc/self/fd/${evidenceFd}/${temporary}`, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try { fs.fchmodSync(fd, 0o600); fs.writeFileSync(fd, `${JSON.stringify(state)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  fs.renameSync(`/proc/self/fd/${evidenceFd}/${temporary}`, `/proc/self/fd/${evidenceFd}/state.json`);
+  fs.fsyncSync(evidenceFd);
+  // The production worker has no IPC channel. Tests may attach one to stop
+  // exactly after a durable checkpoint without adding an environment bypass.
+  if (typeof process.send === "function") { process.send({ phase: state.phase }); process.kill(process.pid, "SIGSTOP"); }
+}
+
+function migrationArtifact(evidenceFd, name, bytes, mode) {
+  if (!CODEX_MIGRATION_ARTIFACTS.has(name) || name === "state.json") throw new Error("unknown migration artifact");
+  const fd = fs.openSync(`/proc/self/fd/${evidenceFd}/${name}`, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try { fs.fchmodSync(fd, mode); fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); return migrationIdentity(fs.fstatSync(fd, { bigint: true })); }
+  finally { fs.closeSync(fd); }
+}
+
+function runCodexBindingTransaction() {
+  if (!transactionEvidence || !path.isAbsolute(transactionEvidence)) throw new Error("missing migration evidence");
+  const logicalParent = path.dirname(path.resolve(logicalConfigFile));
+  const parentInfo = fs.lstatSync(logicalParent, { bigint: true });
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || parentInfo.uid !== BigInt(process.getuid()) || fs.realpathSync(logicalParent) !== logicalParent) throw new Error("unsafe config parent");
+  const parentFd = fs.openSync(logicalParent, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  const evidenceInfo = fs.lstatSync(transactionEvidence, { bigint: true });
+  const evidenceFd = fs.openSync(transactionEvidence, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  const live = `/proc/self/fd/${parentFd}/${path.basename(logicalConfigFile)}`;
+  try {
+    const openedParent = fs.fstatSync(parentFd, { bigint: true });
+    const openedEvidence = fs.fstatSync(evidenceFd, { bigint: true });
+    if (openedParent.dev !== parentInfo.dev || openedParent.ino !== parentInfo.ino || !evidenceInfo.isDirectory() || !openedEvidence.isDirectory() ||
+        openedEvidence.uid !== BigInt(process.getuid()) || (openedEvidence.mode & 0o7777n) !== 0o700n ||
+        openedEvidence.dev !== evidenceInfo.dev || openedEvidence.ino !== evidenceInfo.ino || openedEvidence.dev !== openedParent.dev) throw new Error("unsafe migration evidence");
+    const names = fs.readdirSync(`/proc/self/fd/${evidenceFd}`).sort();
+    if (names.some((name) => !CODEX_MIGRATION_ARTIFACTS.has(name))) throw new Error("unknown migration evidence");
+    let state;const resuming = names.includes("state.json");
+    if (resuming) {
+      const record = migrationRead(evidenceFd, "state.json", 128 * 1024);
+      if ((record.info.mode & 0o7777n) !== 0o600n || record.info.nlink !== 1n) throw new Error("unsafe migration state");
+      state = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(record.bytes));
+    } else {
+      const sourceFd = fs.openSync(live, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      let source;
+      try {
+        const initial = fs.fstatSync(sourceFd, { bigint: true });
+        if (!initial.isFile() || initial.uid !== BigInt(process.getuid()) || initial.nlink !== 1n ||
+            (initial.mode & 0o7777n) !== 0o600n || initial.size > 2n * 1024n * 1024n) failForeign();
+        const bytes = Buffer.alloc(Number(initial.size) + 1); let length = 0;
+        while (length < bytes.length) { const count = fs.readSync(sourceFd, bytes, length, bytes.length - length, null); if (!count) break; length += count; }
+        const final = fs.fstatSync(sourceFd, { bigint: true });
+        const named = fs.lstatSync(live, { bigint: true });
+        if (length !== Number(initial.size) || ["dev","ino","uid","mode","nlink","size","ctimeNs","mtimeNs"].some((key) => initial[key] !== final[key] || initial[key] !== named[key])) throw new Error("source changed");
+        source = { bytes: bytes.subarray(0, length), info: final };
+      } finally { fs.closeSync(sourceFd); }
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(source.bytes);
+      const inspected = ownedToml(text);
+      if (!inspected.owned || inspected.range.start === undefined) failForeign();
+      const transformed = Buffer.from(mergeCodexBinding(text).text, "utf8");
+      if (transformed.equals(source.bytes)) {
+        if (!strictCodexBindingText(text, { bindingRequired: true })) failForeign();
+        process.exit(UNCHANGED);
+      }
+      const beforeCopy = migrationArtifact(evidenceFd, "before", source.bytes, Number(source.info.mode & 0o7777n));
+      const after = migrationArtifact(evidenceFd, "after", transformed, Number(source.info.mode & 0o7777n));
+      state = { version: 2, kind: "codex-config", status: "pending", phase: "prepared",
+        config: path.resolve(logicalConfigFile), editorReleaseId: backupStamp,
+        before: { identity: migrationIdentity(source.info), sha256: sha256(source.bytes), copy: beforeCopy },
+        after: { identity: after, sha256: sha256(transformed) }, observed: null, outcome: null };
+      migrationCheckpoint(evidenceFd, state);
+    }
+    const view = (name) => {
+      const directoryFd = name === "live" ? parentFd : evidenceFd;const leaf = name === "live" ? path.basename(logicalConfigFile) : name;const anchored = `/proc/self/fd/${directoryFd}/${leaf}`;
+      let info;try { info = fs.lstatSync(anchored, { bigint: true }); } catch (cause) { if (cause?.code === "ENOENT") return null; throw cause; }
+      if (info.isSymbolicLink()) return { kind: "symlink", info, targetSha256: sha256(Buffer.from(fs.readlinkSync(anchored))) };
+      if (!info.isFile()) return { kind: "special", info };
+      const record = migrationRead(directoryFd, leaf);return { kind: "file", ...record, hash: sha256(record.bytes) };
+    };
+    const exact = (record, expected, hash, links) => record?.kind === "file" && sameMigrationObject(record.info, expected, { links }) && record.hash === hash;
+    const preserveAmbiguity = (reason) => {
+      const describe = (record) => record ? record.kind === "file" ? { kind: "file", identity: migrationIdentity(record.info), sha256: record.hash } :
+        record.kind === "symlink" ? { kind: "symlink", identity: migrationIdentity(record.info), targetSha256: record.targetSha256 } :
+        { kind: "special", identity: migrationIdentity(record.info) } : null;
+      state.phase = "ambiguous"; state.observed = { reason, live: describe(view("live")), quarantine: describe(view("quarantine")), after: describe(view("after")) };
+      migrationCheckpoint(evidenceFd, state); throw new Error(reason);
+    };
+    let liveView = view("live"), quarantineView = view("quarantine"), tempView = view("after");
+    if (state.phase === "ambiguous") throw new Error("migration recovery ambiguous");
+    const beforeLive = exact(liveView, state.before.identity, state.before.sha256, true);
+    const beforeQuarantine = exact(quarantineView, state.before.identity, state.before.sha256, false);
+    const afterLive = exact(liveView, state.after.identity, state.after.sha256, false);
+    const afterTemp = exact(tempView, state.after.identity, state.after.sha256, false);
+    const finishRecoveryFailure = (outcome) => {
+      const temporary = view("after");
+      if (temporary) {
+        if (!exact(temporary, state.after.identity, state.after.sha256, true) || temporary.info.nlink !== 1n) preserveAmbiguity("migration recovery temp changed");
+        fs.unlinkSync(`/proc/self/fd/${evidenceFd}/after`);fs.fsyncSync(evidenceFd);
+      }
+      state.status = "complete";state.phase = "complete";state.outcome = outcome;migrationCheckpoint(evidenceFd, state);process.exit(MANUAL_RECOVERY);
+    };
+    if (resuming && ['prepared','quarantine_intent'].includes(state.phase) && beforeLive && !quarantineView) finishRecoveryFailure("unchanged");
+    if (resuming && ['quarantine_intent','quarantined','publish_intent'].includes(state.phase) && !liveView && beforeQuarantine) {
+      fs.linkSync(`/proc/self/fd/${evidenceFd}/quarantine`, live);fs.fsyncSync(parentFd);
+      const restored=view("live");if(!exact(restored,state.before.identity,state.before.sha256,false)||restored.info.nlink!==2n)preserveAmbiguity("migration restore changed");
+      fs.unlinkSync(`/proc/self/fd/${evidenceFd}/quarantine`);fs.fsyncSync(evidenceFd);fs.fsyncSync(parentFd);
+      const final=view("live");if(!exact(final,state.before.identity,state.before.sha256,false)||final.info.nlink!==1n)preserveAmbiguity("migration restore changed");
+      finishRecoveryFailure("restored-before");
+    }
+    if (state.phase === "prepared" || state.phase === "quarantine_intent") {
+      if (beforeLive && !quarantineView) {
+        state.phase = "quarantine_intent"; migrationCheckpoint(evidenceFd, state);
+        fs.renameSync(live, `/proc/self/fd/${evidenceFd}/quarantine`); fs.fsyncSync(parentFd); fs.fsyncSync(evidenceFd);
+        quarantineView = view("quarantine");
+      } else if (!liveView && beforeQuarantine) quarantineView = view("quarantine");
+      else preserveAmbiguity("migration source changed");
+      if (!exact(quarantineView, state.before.identity, state.before.sha256, true)) {
+        try { fs.linkSync(`/proc/self/fd/${evidenceFd}/quarantine`, live); fs.fsyncSync(parentFd); } catch (cause) { if (cause?.code !== "EEXIST") throw cause; }
+        preserveAmbiguity("migration quarantine changed");
+      }
+      state.phase = "quarantined"; migrationCheckpoint(evidenceFd, state);
+    } else if (!beforeQuarantine && !afterLive) {
+      if (!liveView && quarantineView) { try { fs.linkSync(`/proc/self/fd/${evidenceFd}/quarantine`, live); fs.fsyncSync(parentFd); } catch (cause) { if (cause?.code !== "EEXIST") throw cause; } }
+      preserveAmbiguity("migration recovery ambiguous");
+    }
+    liveView = view("live"); quarantineView = view("quarantine"); tempView = view("after");
+    if (!liveView) {
+      if (!exact(quarantineView, state.before.identity, state.before.sha256, false)) {
+        if (quarantineView && ["file", "symlink"].includes(quarantineView.kind)) {
+          try { fs.linkSync(`/proc/self/fd/${evidenceFd}/quarantine`, live);fs.fsyncSync(parentFd); }
+          catch (cause) { if (cause?.code !== "EEXIST") preserveAmbiguity("migration recovery ambiguous"); }
+        }
+        preserveAmbiguity("migration recovery ambiguous");
+      }
+      if (!exact(tempView, state.after.identity, state.after.sha256, true)) preserveAmbiguity("migration recovery ambiguous");
+      state.phase = "publish_intent"; migrationCheckpoint(evidenceFd, state);
+      fs.linkSync(`/proc/self/fd/${evidenceFd}/after`, live); fs.fsyncSync(parentFd);
+    } else if (!exact(liveView, state.after.identity, state.after.sha256, false)) preserveAmbiguity("migration live reoccupied");
+    liveView = view("live"); tempView = view("after"); quarantineView = view("quarantine");
+    const publishedWithoutTemp = !tempView && ["published", "verified"].includes(state.phase) && liveView?.info.nlink === 1n;
+    if (!exact(liveView, state.after.identity, state.after.sha256, false) ||
+        (!publishedWithoutTemp && (!exact(tempView, state.after.identity, state.after.sha256, false) || liveView.info.ino !== tempView.info.ino || liveView.info.dev !== tempView.info.dev)) ||
+        !exact(quarantineView, state.before.identity, state.before.sha256, false)) preserveAmbiguity("migration publication changed");
+    state.phase = "published"; migrationCheckpoint(evidenceFd, state);
+    if (tempView?.info.nlink === 2n) { fs.unlinkSync(`/proc/self/fd/${evidenceFd}/after`); fs.fsyncSync(evidenceFd); fs.fsyncSync(parentFd); }
+    liveView = view("live");
+    if (!exact(liveView, state.after.identity, state.after.sha256, false) || liveView.info.nlink !== 1n) preserveAmbiguity("migration final object changed");
+    const namedParent = fs.lstatSync(logicalParent, { bigint: true });
+    if (namedParent.dev !== openedParent.dev || namedParent.ino !== openedParent.ino) preserveAmbiguity("migration parent changed");
+    configFile = logicalConfigFile;
+    const finalText = safeExistingFile(configFile);
+    if (!finalText.exists || !strictCodexBindingText(finalText.text, { bindingRequired: true })) preserveAmbiguity("migration strict verification failed");
+    state.phase = "verified"; migrationCheckpoint(evidenceFd, state);
+    state.status = "complete"; state.phase = "complete"; state.outcome = "migrated"; migrationCheckpoint(evidenceFd, state);
+    process.exit(CHANGED);
+  } finally { fs.closeSync(evidenceFd); fs.closeSync(parentFd); }
+}
+
 function unregisterCodex() {
   const current = safeExistingFile(configFile);
   if (!current.exists) process.exit(UNCHANGED);
@@ -2166,6 +2352,7 @@ try {
   if (operation === "register-opencode") registerOpenCode();
   if (operation === "unregister-opencode") unregisterOpenCode();
   if (operation === "register-codex") registerCodex();
+  if (operation === "migrate-codex-binding-transaction") runCodexBindingTransaction();
   if (operation === "unregister-codex") unregisterCodex();
   if (operation === "unregister-codex-hooks-transaction") process.exit(unregisterCodexHooksTransaction());
   if (operation === "register-codex-hooks-transaction") process.exit(registerCodexHooksTransaction());
