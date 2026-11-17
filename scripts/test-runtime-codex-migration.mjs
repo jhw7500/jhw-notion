@@ -316,6 +316,33 @@ test("codex migration preserves writes through an old fd", async (t) => {
   } finally { fs.closeSync(oldFd); }
 });
 
+for (const action of ["continue", "restart"]) {
+  test(`codex migration never publishes stale after an old fd write at publish intent on ${action}`, async (t) => {
+    const current = transactionFixture(t);
+    const oldFd = fs.openSync(current.config, "r+");
+    t.after(() => fs.closeSync(oldFd));
+    const child = startTransaction(current);
+    await stopAtPhase(child, "publish_intent");
+    const changed = current.source.replace("60.0", "61.0");
+    fs.ftruncateSync(oldFd, 0); fs.writeSync(oldFd, changed, 0, "utf8"); fs.fsyncSync(oldFd);
+    assert.equal(fs.existsSync(current.config), false);
+    assert.equal(parseJournal(current).status, "pending", "recoverable evidence is still readable");
+    let code;
+    if (action === "restart") {
+      process.kill(child.pid, "SIGKILL"); await once(child, "exit");
+      code = spawnSync(process.execPath, current.args, { stdio: "ignore" }).status;
+      assert.equal(fs.readFileSync(current.config, "utf8"), changed);
+    } else {
+      process.kill(child.pid, "SIGCONT"); [code] = await once(child, "exit");
+      assert.equal(fs.existsSync(current.config), false, "normal publication must stop on changed evidence");
+    }
+    assert.notEqual(code, 0);
+    assert.equal(fs.readFileSync(quarantinePath(current), "utf8"), changed);
+    assert.equal(fs.readFileSync(path.join(current.evidence, "before"), "utf8"), current.source);
+    assert.equal(parseJournal(current).status, "pending");
+  });
+}
+
 for (const phase of ["quarantine_intent", "quarantined", "publish_intent", "published", "verified"]) {
   test(`codex migration recovers after ${phase} crash`, async (t) => {
     const current = transactionFixture(t);

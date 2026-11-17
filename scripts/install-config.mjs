@@ -2254,10 +2254,14 @@ function runCodexBindingTransaction() {
       state.phase = "ambiguous"; state.observed = { reason, ...objects() };
       migrationCheckpoint(captureFds.get("control"), state); throw new Error(reason);
     };
-    const validate = () => {
+    const validate = (expectedClassification = "active") => {
       verifyDirectories();
-      try { return readCodexMigrationJournal({ journalDirectory: transactionEvidence }).objects; }
+      let parsed;
+      try { parsed = readCodexMigrationJournal({ journalDirectory: transactionEvidence }); }
       catch { preserveAmbiguity("migration object changed"); }
+      // Readable recovery evidence is not permission for a normal mutation.
+      if (parsed.classification !== expectedClassification) preserveAmbiguity("migration classification changed");
+      return parsed.objects;
     };
     const checkpoint = (phase) => { state.phase = phase; migrationCheckpoint(captureFds.get("control"), state); };
     const matches = (actual, expected, hash, links) => actual?.kind === "file" && actual.sha256 === hash &&
@@ -2273,13 +2277,13 @@ function runCodexBindingTransaction() {
         state.observed = { reason: "migration foreign restore", ...snapshot };
         checkpoint("foreign_restore_intent");
       }
-      const actual = validate();
+      const actual = validate("foreign-restore");
       if (!actual.live) {
         try { fs.linkSync(capturePath("source"), live); fs.fsyncSync(parentFd); }
         catch (cause) { if (cause.code === "EEXIST") preserveAmbiguity("migration live reoccupied"); throw cause; }
         migrationPause("foreign_restore_linked");
       }
-      validate();
+      validate("foreign-restore");
       // Restoring a raced foreign object never certifies a managed migration.
       // Keep both links and all evidence; repeated calls remain pending failures.
       preserveAmbiguity("migration quarantine changed");
