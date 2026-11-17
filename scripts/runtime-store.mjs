@@ -2337,16 +2337,25 @@ export function revalidatePairPublicationEvidence({repositoryRoot,prepared,obser
   const evidenceRecord=evidenceState(state.evidence);
   if(evidenceRecord.repositoryRoot!==repositoryRoot)evidenceFail();
   const legacyIndex=sessionIndexLease(repositoryRoot,true);
-  const v2Index=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);
-  try{return withStore(repositoryRoot,false,runtime=>{
+  let v2Index;
+  try{
+    v2Index=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);
+    return withStore(repositoryRoot,false,(runtime,root)=>{
     if(!runtime||canonical(observation(runtime))!==canonical(JSON.parse(state.current).observation))fail('DEPLOY_CURRENT_CHANGED');
     const legacy=sessionDirectory(runtime);try{if(legacy&&sessionInventory(legacy).ids.length)sessionFail();}finally{legacy?.close();}
     observer?.({phase:'root_index_held',exclusive:true});
     let location;try{location=v2Namespace(runtime,null,'session');}
     catch(error){if(error.code==='ENOENT'&&state.records.size===0)return[];throw error;}
     try{
-      const actual=sessionNames(location.namespace);const rows=[];
-      for(const id of actual){
+      const actual=v2BindingEntries(location.namespace,'session',{scan:{count:0}});
+      if(!actual.complete)sessionFail();
+      const rows=[];
+      for(const entry of actual.entries){
+        if(entry.state!=='public'){
+          if(v2PrivateEvidence(location.namespace,root.stat,repositoryRoot,'session',null,entry)===null)sessionFail();
+          continue;
+        }
+        const id=entry.id;
         const expected=state.records.get(id);if(!expected)sessionFail();let directory;
         try{directory=location.namespace.child(id,false,true);
           if(!same(expected.directory,fs.fstatSync(directory.fd,{bigint:true}))||
@@ -2358,7 +2367,10 @@ export function revalidatePairPublicationEvidence({repositoryRoot,prepared,obser
       }
       return rows;
     }finally{closeV2Namespace(location);}
-  });}finally{v2Index.close();legacyIndex.close();}
+    });
+  }finally{
+    try{v2Index?.close();}finally{legacyIndex.close();}
+  }
 }
 export function verifyPairPublicationConsumer({prepared,observation}) {
   const state=preparedPairPublications.get(prepared);

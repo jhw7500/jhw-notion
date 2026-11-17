@@ -794,22 +794,29 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
       if(pairRows(repositoryRoot).roots.length)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
       before.processes=quiet;
     }
+    let started;let current;let processes;let roots;
     publication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
-    const started=process.hrtime.bigint();phaseRunner.observe?.({phase:'publication_acquired',exclusive:true,elapsedNs:'0'});
-    const processes=pairProcessInventory({repositoryRoot,procRoot,roots:before.roots,prepared:publicationEvidence});
-    let roots;try{roots=revalidatePairPublicationEvidence({repositoryRoot,prepared:publicationEvidence,observer:phaseRunner.observe});}
-    catch(error){if(error.code==='DEPLOY_CURRENT_CHANGED')throw error;fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');}
-    const current=publishPreparedActivation({repositoryRoot,destination:prepared,expectedCurrent:origin,evidence,publicationLease:publication,journalDirectory:directory,publicationStartedNs:started,
-      onPointerIntent:(destination,intent)=>{
-        if(!intent?.witness)fail('DEPLOY_RECOVERY_REQUIRED','pointer_identity_unavailable');
-        state.destination=destination;state.witness=intent.witness;state.phase='pointer_intent';checkpoint(directory,state);
-        phaseRunner.observe?.({phase:'pointer_intent',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
-      }});
-    phaseRunner.observe?.({phase:'pointer_renamed',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
+    try {
+      started=process.hrtime.bigint();
+      phaseRunner.observe?.({phase:'publication_acquired',exclusive:true,elapsedNs:'0'});
+      processes=pairProcessInventory({repositoryRoot,procRoot,roots:before.roots,prepared:publicationEvidence});
+      try{roots=revalidatePairPublicationEvidence({repositoryRoot,prepared:publicationEvidence,observer:phaseRunner.observe});}
+      catch(error){if(error.code==='DEPLOY_CURRENT_CHANGED')throw error;fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');}
+      current=publishPreparedActivation({repositoryRoot,destination:prepared,expectedCurrent:origin,evidence,publicationLease:publication,journalDirectory:directory,publicationStartedNs:started,
+        onPointerIntent:(destination,intent)=>{
+          if(!intent?.witness)fail('DEPLOY_RECOVERY_REQUIRED','pointer_identity_unavailable');
+          state.destination=destination;state.witness=intent.witness;state.phase='pointer_intent';checkpoint(directory,state);
+          phaseRunner.observe?.({phase:'pointer_intent',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
+        }});
+      phaseRunner.observe?.({phase:'pointer_renamed',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
+    } finally {
+      // Finalization and the outer error classifier may read payloads or sync
+      // logs. They must only run after this publication scope has released EX.
+      publication.close();publication=undefined;
+      phaseRunner.observe?.({phase:'publication_released',exclusive:false,elapsedNs:String(process.hrtime.bigint()-started)});
+    }
     state.destination=current;state.phase='published';checkpoint(directory,state);
-    phaseRunner.observe?.({phase:'published_checkpointed',exclusive:true,elapsedNs:String(process.hrtime.bigint()-started)});
-    publication.close();publication=undefined;
-    phaseRunner.observe?.({phase:'publication_released',exclusive:false,elapsedNs:String(process.hrtime.bigint()-started)});
+    phaseRunner.observe?.({phase:'published_checkpointed',exclusive:false,elapsedNs:String(process.hrtime.bigint()-started)});
     if(!sameJson(current,state.destination))fail('DEPLOY_CURRENT_CHANGED');
     state.status='complete';state.phase='complete';state.outcome='pointer_published';checkpoint(directory,state);
     phaseRunner.observe?.({phase:'log_fsync_start',exclusive:false,elapsedNs:String(process.hrtime.bigint()-started)});
@@ -820,7 +827,7 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
       previousReleaseId:origin.releaseId,predecessorAvailable:current.predecessorActivationId!==null,
       inventory:{before:{...before,processes},after:{roots,processes}},existingSessionsPreserved:true,recovery};
   }catch(error){
-    if(state?.phase==='prepared'){
+    if(state?.phase==='prepared'&&!publication){
       try{if(sameJson(readActivation({repositoryRoot}),state.origin)){
         state.status='complete';state.phase='rejected';state.outcome='candidate_rejected';checkpoint(directory,state);
         if(journalCandidate&&directory===journalCandidate.staging)directory=publishPairJournal(journalCandidate);
