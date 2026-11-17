@@ -9,6 +9,9 @@ const [operation, configFileArgument, mcpEntry, repositoryRoot, backupStampArgum
 let configFile = configFileArgument;
 let backupStamp = backupStampArgument;
 if (!operation || !configFile || !mcpEntry || !repositoryRoot) process.exit(2);
+// Legacy registration workers do not need the v2 migration reader.
+const { readCodexMigrationJournal, readObservedCodexObject } = operation === "migrate-codex-binding-transaction"
+  ? await import("./runtime-prune.mjs") : {};
 const logicalConfigFile = configFile;
 // check-* operations are the read-only first-activation plan. They never write,
 // back up, lock, or open transactions; bootstrap is installed before wiring.
@@ -2113,33 +2116,12 @@ function registerCodex() {
   saveToml(current, output);
 }
 
-const CODEX_MIGRATION_ARTIFACTS = new Set(["state.json", "before", "after", "quarantine"]);
+const CODEX_MIGRATION_ARTIFACTS = new Set(["state.json", "before", "after-copy", "after"]);
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const migrationIdentity = (info) => ({
   dev: String(info.dev), ino: String(info.ino), uid: Number(info.uid),
   mode: Number(info.mode & 0o7777n), nlink: Number(info.nlink), size: String(info.size),
 });
-const sameMigrationObject = (info, identity, { links = false } = {}) =>
-  info.isFile() && String(info.dev) === identity.dev && String(info.ino) === identity.ino &&
-  Number(info.uid) === identity.uid && Number(info.mode & 0o7777n) === identity.mode &&
-  (!links || Number(info.nlink) === identity.nlink);
-
-function migrationRead(directoryFd, name, limit = 2 * 1024 * 1024) {
-  const file = `/proc/self/fd/${directoryFd}/${name}`;
-  let fd;
-  try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-    const before = fs.fstatSync(fd, { bigint: true });
-    if (!before.isFile() || before.uid !== BigInt(process.getuid()) || before.size > BigInt(limit)) throw new Error("unsafe migration artifact");
-    const bytes = Buffer.alloc(Number(before.size) + 1); let length = 0;
-    while (length < bytes.length) { const count = fs.readSync(fd, bytes, length, bytes.length - length, null); if (!count) break; length += count; }
-    const after = fs.fstatSync(fd, { bigint: true });
-    const named = fs.lstatSync(file, { bigint: true });
-    if (length !== Number(before.size) || ["dev","ino","uid","mode","nlink","size","ctimeNs","mtimeNs"].some((key) => before[key] !== after[key] || before[key] !== named[key])) throw new Error("migration artifact changed");
-    return { bytes: bytes.subarray(0, length), info: after };
-  } finally { if (fd !== undefined) fs.closeSync(fd); }
-}
-
 function migrationCheckpoint(evidenceFd, state) {
   const temporary = `.state.${randomUUID()}`;
   const fd = fs.openSync(`/proc/self/fd/${evidenceFd}/${temporary}`, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
@@ -2148,7 +2130,11 @@ function migrationCheckpoint(evidenceFd, state) {
   fs.fsyncSync(evidenceFd);
   // The production worker has no IPC channel. Tests may attach one to stop
   // exactly after a durable checkpoint without adding an environment bypass.
-  if (typeof process.send === "function") { process.send({ phase: state.phase }); process.kill(process.pid, "SIGSTOP"); }
+  migrationPause(state.phase);
+}
+
+function migrationPause(phase, details = {}) {
+  if (typeof process.send === "function") { process.send({ phase, ...details }); process.kill(process.pid, "SIGSTOP"); }
 }
 
 function migrationArtifact(evidenceFd, name, bytes, mode) {
@@ -2164,23 +2150,47 @@ function runCodexBindingTransaction() {
   const parentInfo = fs.lstatSync(logicalParent, { bigint: true });
   if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || parentInfo.uid !== BigInt(process.getuid()) || fs.realpathSync(logicalParent) !== logicalParent) throw new Error("unsafe config parent");
   const parentFd = fs.openSync(logicalParent, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
-  const evidenceInfo = fs.lstatSync(transactionEvidence, { bigint: true });
-  const evidenceFd = fs.openSync(transactionEvidence, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  let evidenceFd;
+  const captureFds = new Map();
   const live = `/proc/self/fd/${parentFd}/${path.basename(logicalConfigFile)}`;
   try {
+    const evidenceInfo = fs.lstatSync(transactionEvidence, { bigint: true });
+    evidenceFd = fs.openSync(transactionEvidence, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
     const openedParent = fs.fstatSync(parentFd, { bigint: true });
     const openedEvidence = fs.fstatSync(evidenceFd, { bigint: true });
     if (openedParent.dev !== parentInfo.dev || openedParent.ino !== parentInfo.ino || !evidenceInfo.isDirectory() || !openedEvidence.isDirectory() ||
         openedEvidence.uid !== BigInt(process.getuid()) || (openedEvidence.mode & 0o7777n) !== 0o700n ||
         openedEvidence.dev !== evidenceInfo.dev || openedEvidence.ino !== evidenceInfo.ino || openedEvidence.dev !== openedParent.dev) throw new Error("unsafe migration evidence");
-    const names = fs.readdirSync(`/proc/self/fd/${evidenceFd}`).sort();
-    if (names.some((name) => !CODEX_MIGRATION_ARTIFACTS.has(name))) throw new Error("unknown migration evidence");
-    let state;const resuming = names.includes("state.json");
+    const at = (name) => `/proc/self/fd/${evidenceFd}/${name}`;
+    const directoryIdentity = (info) => ({ dev: String(info.dev), ino: String(info.ino), uid: Number(info.uid), mode: Number(info.mode & 0o7777n) });
+    const sameDirectory = (info, expected) => info.isDirectory() && Object.entries(expected).every(([key, value]) => directoryIdentity(info)[key] === value);
+    const pinCapture = (key, capture) => {
+      const fd = fs.openSync(at(capture.name), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      captureFds.set(key, fd);
+      if (!sameDirectory(fs.fstatSync(fd, { bigint: true }), capture.identity)) throw new Error("migration capture changed");
+    };
+    const reserveCapture = (key) => {
+      const name = `capture-${randomUUID().replaceAll("-", "")}`;
+      migrationPause("capture_reserve_intent", { name, key });
+      fs.mkdirSync(at(name), { mode: 0o700 }); // Exclusive reservation, never recursive or reused.
+      const fd = fs.openSync(at(name), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      captureFds.set(key, fd); fs.fchmodSync(fd, 0o700);
+      const identity = directoryIdentity(fs.fstatSync(fd, { bigint: true }));
+      if (identity.uid !== process.getuid() || identity.mode !== 0o700 || !sameDirectory(fs.lstatSync(at(name), { bigint: true }), identity)) throw new Error("migration capture changed");
+      fs.fsyncSync(fd); fs.fsyncSync(evidenceFd);
+      return { name, identity };
+    };
+    const names = fs.readdirSync(at(""));
+    let state;
+    const resuming = names.includes("state.json");
     if (resuming) {
-      const record = migrationRead(evidenceFd, "state.json", 128 * 1024);
-      if ((record.info.mode & 0o7777n) !== 0o600n || record.info.nlink !== 1n) throw new Error("unsafe migration state");
-      state = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(record.bytes));
+      state = readCodexMigrationJournal({ journalDirectory: transactionEvidence }).state;
+      if (state.config !== path.resolve(logicalConfigFile) || state.editorReleaseId !== backupStamp) throw new Error("migration coordinates changed");
+      for (const key of ["source", "temp", "control"]) pinCapture(key, state.captures[key]);
+      if (state.status === "complete") process.exit(state.outcome === "migrated" ? CHANGED : MANUAL_RECOVERY);
+      if (state.phase === "ambiguous") throw new Error("migration recovery ambiguous");
     } else {
+      if (names.length) throw new Error("unknown migration evidence");
       const sourceFd = fs.openSync(live, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       let source;
       try {
@@ -2202,98 +2212,146 @@ function runCodexBindingTransaction() {
         if (!strictCodexBindingText(text, { bindingRequired: true })) failForeign();
         process.exit(UNCHANGED);
       }
-      const beforeCopy = migrationArtifact(evidenceFd, "before", source.bytes, Number(source.info.mode & 0o7777n));
-      const after = migrationArtifact(evidenceFd, "after", transformed, Number(source.info.mode & 0o7777n));
+      const beforeCopy = migrationArtifact(evidenceFd, "before", source.bytes, 0o600);
+      const afterCopy = migrationArtifact(evidenceFd, "after-copy", transformed, 0o600);
+      const after = migrationArtifact(evidenceFd, "after", transformed, 0o600);
+      const captures = { source: reserveCapture("source"), temp: reserveCapture("temp"), control: reserveCapture("control") };
+      const headerBytes = Buffer.from(`${JSON.stringify({version:2,kind:"codex-config",control:captures.control})}\n`);
+      const headerFd = fs.openSync(at("state.json"), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      let header;
+      try {
+        fs.fchmodSync(headerFd,0o600); fs.writeFileSync(headerFd,headerBytes); fs.fsyncSync(headerFd);
+        header={identity:migrationIdentity(fs.fstatSync(headerFd,{bigint:true})),sha256:sha256(headerBytes)};
+      } finally { fs.closeSync(headerFd); }
+      fs.fsyncSync(evidenceFd);
       state = { version: 2, kind: "codex-config", status: "pending", phase: "prepared",
         config: path.resolve(logicalConfigFile), editorReleaseId: backupStamp,
         before: { identity: migrationIdentity(source.info), sha256: sha256(source.bytes), copy: beforeCopy },
-        after: { identity: after, sha256: sha256(transformed) }, observed: null, outcome: null };
-      migrationCheckpoint(evidenceFd, state);
+        after: { identity: after, sha256: sha256(transformed), copy: afterCopy },
+        captures, header,
+        resolution: null, observed: null, outcome: null };
+      migrationCheckpoint(captureFds.get("control"), state);
     }
-    const view = (name) => {
-      const directoryFd = name === "live" ? parentFd : evidenceFd;const leaf = name === "live" ? path.basename(logicalConfigFile) : name;const anchored = `/proc/self/fd/${directoryFd}/${leaf}`;
-      let info;try { info = fs.lstatSync(anchored, { bigint: true }); } catch (cause) { if (cause?.code === "ENOENT") return null; throw cause; }
-      if (info.isSymbolicLink()) return { kind: "symlink", info, targetSha256: sha256(Buffer.from(fs.readlinkSync(anchored))) };
-      if (!info.isFile()) return { kind: "special", info };
-      const record = migrationRead(directoryFd, leaf);return { kind: "file", ...record, hash: sha256(record.bytes) };
+    const capturePath = (key) => `/proc/self/fd/${captureFds.get(key)}/object`;
+    const verifyDirectories = () => {
+      if (!sameDirectory(fs.lstatSync(logicalParent, { bigint: true }), directoryIdentity(openedParent)) ||
+          !sameDirectory(fs.lstatSync(transactionEvidence, { bigint: true }), directoryIdentity(openedEvidence))) throw new Error("migration parent changed");
+      const header = readObservedCodexObject(at("state.json"));
+      if (header?.kind !== "file" || header.sha256 !== state.header.sha256 ||
+          Object.entries(state.header.identity).some(([key,value]) => header.identity[key] !== value)) throw new Error("migration header changed");
+      for (const key of ["source", "temp", "control"]) {
+        const fd = captureFds.get(key); const capture = state.captures[key];
+        if (!sameDirectory(fs.fstatSync(fd, { bigint: true }), capture.identity) ||
+            !sameDirectory(fs.lstatSync(at(capture.name), { bigint: true }), capture.identity) ||
+            fs.readdirSync(`/proc/self/fd/${fd}`).some(name => name !== (key === "control" ? "state.json" : "object"))) throw new Error("migration capture changed");
+      }
     };
-    const exact = (record, expected, hash, links) => record?.kind === "file" && sameMigrationObject(record.info, expected, { links }) && record.hash === hash;
+    const objects = () => ({ live: readObservedCodexObject(live), quarantine: readObservedCodexObject(capturePath("source")),
+      after: readObservedCodexObject(at("after")), capturedAfter: readObservedCodexObject(capturePath("temp")) });
     const preserveAmbiguity = (reason) => {
-      const describe = (record) => record ? record.kind === "file" ? { kind: "file", identity: migrationIdentity(record.info), sha256: record.hash } :
-        record.kind === "symlink" ? { kind: "symlink", identity: migrationIdentity(record.info), targetSha256: record.targetSha256 } :
-        { kind: "special", identity: migrationIdentity(record.info) } : null;
-      state.phase = "ambiguous"; state.observed = { reason, live: describe(view("live")), quarantine: describe(view("quarantine")), after: describe(view("after")) };
-      migrationCheckpoint(evidenceFd, state); throw new Error(reason);
+      verifyDirectories();
+      state.phase = "ambiguous"; state.observed = { reason, ...objects() };
+      migrationCheckpoint(captureFds.get("control"), state); throw new Error(reason);
     };
-    let liveView = view("live"), quarantineView = view("quarantine"), tempView = view("after");
-    if (state.phase === "ambiguous") throw new Error("migration recovery ambiguous");
-    const beforeLive = exact(liveView, state.before.identity, state.before.sha256, true);
-    const beforeQuarantine = exact(quarantineView, state.before.identity, state.before.sha256, false);
-    const afterLive = exact(liveView, state.after.identity, state.after.sha256, false);
-    const afterTemp = exact(tempView, state.after.identity, state.after.sha256, false);
-    const finishRecoveryFailure = (outcome) => {
-      const temporary = view("after");
-      if (temporary) {
-        if (!exact(temporary, state.after.identity, state.after.sha256, true) || temporary.info.nlink !== 1n) preserveAmbiguity("migration recovery temp changed");
-        fs.unlinkSync(`/proc/self/fd/${evidenceFd}/after`);fs.fsyncSync(evidenceFd);
-      }
-      state.status = "complete";state.phase = "complete";state.outcome = outcome;migrationCheckpoint(evidenceFd, state);process.exit(MANUAL_RECOVERY);
+    const validate = () => {
+      verifyDirectories();
+      try { return readCodexMigrationJournal({ journalDirectory: transactionEvidence }).objects; }
+      catch { preserveAmbiguity("migration object changed"); }
     };
-    if (resuming && ['prepared','quarantine_intent'].includes(state.phase) && beforeLive && !quarantineView) finishRecoveryFailure("unchanged");
-    if (resuming && ['quarantine_intent','quarantined','publish_intent'].includes(state.phase) && !liveView && beforeQuarantine) {
-      fs.linkSync(`/proc/self/fd/${evidenceFd}/quarantine`, live);fs.fsyncSync(parentFd);
-      const restored=view("live");if(!exact(restored,state.before.identity,state.before.sha256,false)||restored.info.nlink!==2n)preserveAmbiguity("migration restore changed");
-      fs.unlinkSync(`/proc/self/fd/${evidenceFd}/quarantine`);fs.fsyncSync(evidenceFd);fs.fsyncSync(parentFd);
-      const final=view("live");if(!exact(final,state.before.identity,state.before.sha256,false)||final.info.nlink!==1n)preserveAmbiguity("migration restore changed");
-      finishRecoveryFailure("restored-before");
-    }
-    if (state.phase === "prepared" || state.phase === "quarantine_intent") {
-      if (beforeLive && !quarantineView) {
-        state.phase = "quarantine_intent"; migrationCheckpoint(evidenceFd, state);
-        fs.renameSync(live, `/proc/self/fd/${evidenceFd}/quarantine`); fs.fsyncSync(parentFd); fs.fsyncSync(evidenceFd);
-        quarantineView = view("quarantine");
-      } else if (!liveView && beforeQuarantine) quarantineView = view("quarantine");
-      else preserveAmbiguity("migration source changed");
-      if (!exact(quarantineView, state.before.identity, state.before.sha256, true)) {
-        try { fs.linkSync(`/proc/self/fd/${evidenceFd}/quarantine`, live); fs.fsyncSync(parentFd); } catch (cause) { if (cause?.code !== "EEXIST") throw cause; }
-        preserveAmbiguity("migration quarantine changed");
+    const checkpoint = (phase) => { state.phase = phase; migrationCheckpoint(captureFds.get("control"), state); };
+    const matches = (actual, expected, hash, links) => actual?.kind === "file" && actual.sha256 === hash &&
+      ["dev", "ino", "uid", "mode", "size"].every(key => actual.identity[key] === expected[key]) && links.includes(actual.identity.nlink);
+    const restoreForeign = () => {
+      const captured = readObservedCodexObject(capturePath("source"));
+      if (captured && ["file", "symlink"].includes(captured.kind)) {
+        try { fs.linkSync(capturePath("source"), live); fs.fsyncSync(parentFd); }
+        catch (cause) { if (cause.code !== "EEXIST") throw cause; }
       }
-      state.phase = "quarantined"; migrationCheckpoint(evidenceFd, state);
-    } else if (!beforeQuarantine && !afterLive) {
-      if (!liveView && quarantineView) { try { fs.linkSync(`/proc/self/fd/${evidenceFd}/quarantine`, live); fs.fsyncSync(parentFd); } catch (cause) { if (cause?.code !== "EEXIST") throw cause; } }
-      preserveAmbiguity("migration recovery ambiguous");
-    }
-    liveView = view("live"); quarantineView = view("quarantine"); tempView = view("after");
-    if (!liveView) {
-      if (!exact(quarantineView, state.before.identity, state.before.sha256, false)) {
-        if (quarantineView && ["file", "symlink"].includes(quarantineView.kind)) {
-          try { fs.linkSync(`/proc/self/fd/${evidenceFd}/quarantine`, live);fs.fsyncSync(parentFd); }
-          catch (cause) { if (cause?.code !== "EEXIST") preserveAmbiguity("migration recovery ambiguous"); }
-        }
-        preserveAmbiguity("migration recovery ambiguous");
+      preserveAmbiguity("migration quarantine changed");
+    };
+    let actual = objects();
+    if (resuming && ["prepared", "quarantine_intent", "quarantined", "publish_intent"].includes(state.phase)) {
+      validate();
+      if (matches(actual.live, state.before.identity, state.before.sha256, [1]) && !actual.quarantine) {
+        state.resolution = "unchanged"; checkpoint("temp_capture_intent");
+      } else if (!actual.live && matches(actual.quarantine, state.before.identity, state.before.sha256, [1])) {
+        state.resolution = "restored-before"; checkpoint("restore_intent");
       }
-      if (!exact(tempView, state.after.identity, state.after.sha256, true)) preserveAmbiguity("migration recovery ambiguous");
-      state.phase = "publish_intent"; migrationCheckpoint(evidenceFd, state);
-      fs.linkSync(`/proc/self/fd/${evidenceFd}/after`, live); fs.fsyncSync(parentFd);
-    } else if (!exact(liveView, state.after.identity, state.after.sha256, false)) preserveAmbiguity("migration live reoccupied");
-    liveView = view("live"); tempView = view("after"); quarantineView = view("quarantine");
-    const publishedWithoutTemp = !tempView && ["published", "verified"].includes(state.phase) && liveView?.info.nlink === 1n;
-    if (!exact(liveView, state.after.identity, state.after.sha256, false) ||
-        (!publishedWithoutTemp && (!exact(tempView, state.after.identity, state.after.sha256, false) || liveView.info.ino !== tempView.info.ino || liveView.info.dev !== tempView.info.dev)) ||
-        !exact(quarantineView, state.before.identity, state.before.sha256, false)) preserveAmbiguity("migration publication changed");
-    state.phase = "published"; migrationCheckpoint(evidenceFd, state);
-    if (tempView?.info.nlink === 2n) { fs.unlinkSync(`/proc/self/fd/${evidenceFd}/after`); fs.fsyncSync(evidenceFd); fs.fsyncSync(parentFd); }
-    liveView = view("live");
-    if (!exact(liveView, state.after.identity, state.after.sha256, false) || liveView.info.nlink !== 1n) preserveAmbiguity("migration final object changed");
-    const namedParent = fs.lstatSync(logicalParent, { bigint: true });
-    if (namedParent.dev !== openedParent.dev || namedParent.ino !== openedParent.ino) preserveAmbiguity("migration parent changed");
-    configFile = logicalConfigFile;
-    const finalText = safeExistingFile(configFile);
-    if (!finalText.exists || !strictCodexBindingText(finalText.text, { bindingRequired: true })) preserveAmbiguity("migration strict verification failed");
-    state.phase = "verified"; migrationCheckpoint(evidenceFd, state);
-    state.status = "complete"; state.phase = "complete"; state.outcome = "migrated"; migrationCheckpoint(evidenceFd, state);
-    process.exit(CHANGED);
-  } finally { fs.closeSync(evidenceFd); fs.closeSync(parentFd); }
+      // A publish_intent crash after link is proven by the shared nlink=2 table.
+    }
+    if (["prepared", "quarantine_intent"].includes(state.phase)) {
+      validate(); checkpoint("quarantine_intent"); verifyDirectories();
+      if (readObservedCodexObject(capturePath("source"))) preserveAmbiguity("migration capture occupied");
+      // The destination is inside a freshly reserved single-writer container.
+      // The public source may race; inspect the object actually moved, never delete it on mismatch.
+      fs.renameSync(live, capturePath("source")); fs.fsyncSync(parentFd); fs.fsyncSync(captureFds.get("source"));
+      migrationPause("quarantine_moved");
+      actual = objects();
+      if (!matches(actual.quarantine, state.before.identity, state.before.sha256, [1])) restoreForeign();
+      checkpoint("quarantined");
+    }
+    if (["quarantined", "publish_intent"].includes(state.phase)) {
+      actual = objects();
+      if (!actual.live && !matches(actual.quarantine, state.before.identity, state.before.sha256, [1])) restoreForeign();
+      validate();
+      if (!actual.live) {
+        checkpoint("publish_intent"); validate();
+        fs.linkSync(at("after"), live); fs.fsyncSync(parentFd); migrationPause("publish_linked");
+      }
+      validate(); checkpoint("published");
+    }
+    if (state.phase === "published") {
+      validate(); state.resolution = "migrated"; checkpoint("temp_capture_intent");
+    }
+    if (state.phase === "restore_intent") {
+      actual = validate();
+      if (!actual.live) {
+        fs.linkSync(capturePath("source"), live); fs.fsyncSync(parentFd); migrationPause("restore_linked");
+      }
+      validate(); checkpoint("quarantine_retire_intent");
+    }
+    if (state.phase === "quarantine_retire_intent") {
+      actual = validate();
+      if (actual.quarantine) {
+        // Only this transaction writes names inside the verified active capture.
+        fs.unlinkSync(capturePath("source")); fs.fsyncSync(captureFds.get("source")); fs.fsyncSync(parentFd);
+        migrationPause("quarantine_retired");
+      }
+      validate(); checkpoint("temp_capture_intent");
+    }
+    if (state.phase === "temp_capture_intent") {
+      actual = validate();
+      if (actual.after) {
+        verifyDirectories();
+        if (readObservedCodexObject(capturePath("temp"))) preserveAmbiguity("migration capture occupied");
+        fs.renameSync(at("after"), capturePath("temp")); fs.fsyncSync(evidenceFd); fs.fsyncSync(captureFds.get("temp"));
+        migrationPause("temp_captured");
+      }
+      validate(); checkpoint("temp_retire_intent");
+    }
+    if (state.phase === "temp_retire_intent") {
+      actual = validate();
+      if (actual.capturedAfter) {
+        fs.unlinkSync(capturePath("temp")); fs.fsyncSync(captureFds.get("temp")); fs.fsyncSync(parentFd);
+        migrationPause("temp_retired");
+      }
+      validate(); checkpoint("verified");
+    }
+    if (state.phase !== "verified") preserveAmbiguity("migration phase invalid");
+    validate();
+    if (state.resolution === "migrated") {
+      configFile = logicalConfigFile;
+      const finalText = safeExistingFile(configFile);
+      if (!finalText.exists || !strictCodexBindingText(finalText.text, { bindingRequired: true })) preserveAmbiguity("migration strict verification failed");
+    }
+    validate();
+    state.status = "complete"; state.outcome = state.resolution; checkpoint("complete");
+    process.exit(state.outcome === "migrated" ? CHANGED : MANUAL_RECOVERY);
+  } finally {
+    for (const fd of captureFds.values()) fs.closeSync(fd);
+    if (evidenceFd !== undefined) fs.closeSync(evidenceFd);
+    fs.closeSync(parentFd);
+  }
 }
 
 function unregisterCodex() {

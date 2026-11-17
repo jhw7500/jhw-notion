@@ -436,17 +436,30 @@ command를 넘기거나 단순 register-codex로 대체하지 않는다.
 binding 이름만 병합한다. byte-identical이면 inode/mtime/backup을 건드리지 않는다.
 변경 시 before bytes/mode/identity, 계산한 after bytes/hash, temp/backup identity를 private journal에 기록한다.
 기존 first-wiring 복구의 quarantine/no-clobber 방식을 Codex 한 파일에 한정해 재사용한다.
-source 검사 뒤 live 경로에 rename으로 덮어쓰는 방식은 사용하지 않는다. 구체적 게시 순서는 다음과 같다.
+source 검사 뒤 live 경로에 rename으로 덮어쓰는 방식은 사용하지 않는다.
 
-1. 동일 filesystem의 private transaction directory에 before preimage와 after temp를 만들고 fsync한다.
+승인된 private capture 경계: 재귀 없는 exclusive mkdir로 새 0700 container를 예약하고 owner·directory
+identity·고정 FD를 검증한다. 새 active container 내부의 pathname은 해당 transaction만 변경한다고
+전제한다. 0700/FD가 동일 UID의 임의 writer를 OS 수준에서 격리한다고 주장하지 않는다. public live,
+기존 evidence 경로 교체와 old-FD 쓰기는 계속 검증·보존하며, 새 container 내부를 계속 교체하는 임의
+동일 UID writer는 보장 범위에서 제외한다. 재개 시에는 기존 container를 새 빈 공간으로 가정하지 않고
+기록된 directory identity와 실제 child를 검증한다. 충돌·교체·unknown child는 보존하고 거부한다.
+source와 회수할 temp는 durable intent 뒤 이 capture 공간으로 옮겨 실제 객체를 판독한다. 정확한
+자기 객체만 capture 내부에서 삭제하며, 모호한 객체는 보존한다. journal의 루트 header는 exclusive 생성 뒤
+변경하지 않고, checkpoint 상태 교체도 별도로 예약한 private control container 안에서만 수행한다.
+새 의존성이나 privileged helper는 없다.
+
+구체적 게시 순서는 다음과 같다.
+
+1. 동일 filesystem의 private transaction directory에 before/after 봉인 사본과 after temp를 만들고 fsync한다.
    journal 상태 prepared에는 원본의 no-follow identity/bytes/mode와 temp identity/hash를 기록한다.
-2. quarantine_intent를 durable하게 쓴 뒤 원본 경로를 그 transaction의 비어 있는 quarantine 경로로
+2. quarantine_intent에 새 source capture container를 결박한 뒤 원본 경로를 그 container의 비어 있는 경로로
    이동한다. 이동된 객체를 열어 검사한 before와 같은 객체·내용인지 재검증한 뒤 quarantined를 기록한다.
    검사 직후 외부 editor가 교체한 객체가 이동됐다면 그 객체를 보존하고 실패 처리한다.
 3. publish_intent를 기록하고 검증된 temp를 live 경로에 **no-clobber hard link**로 게시한다.
    누군가 live 경로를 다시 점유했으면 EEXIST로 중단한다. live 경로에 rename-overwrite하지 않는다.
 4. live/temp가 같은 inode이며 after bytes/mode가 맞는지 검증하고 published를 기록한다.
-   자기 temp link만 제거하고 parent fsync 후 live nlink=1과 최종 bytes/identity를 재검증한다.
+   temp capture/retire intent 뒤 실제 자기 temp link만 제거하고 parent fsync 후 live nlink=1과 최종 bytes/identity를 재검증한다.
    wiring 검증을 통과하면 verified -> complete와 retention 증거를 기록한다.
 
 정지 window에서는 2~3 사이 live 경로가 잠시 없는 것을 허용한다. 외부 editor와의 완전한 CAS를
@@ -465,6 +478,11 @@ identity/bytes/link 수를 대조한다. 매 unlink/link/rename 뒤 crash도 같
 | Live is exact after, original before is quarantined | finish verification, or capture exact own after and restore before with no-clobber link |
 | Live absent, quarantine contains a raced foreign object | restore that captured object only to an absent live path, preserve evidence, report failure |
 | Live reoccupied, symlink/unknown inode, changed bytes, or ambiguous private state | preserve all evidence; pending; no overwrite/unlink of foreign objects |
+
+복원 link 게시, source capture link 회수, temp capture/회수는 각각 durable intent와 syscall 뒤의 실제
+identity/bytes/nlink를 공유 상태표로 판정한다. 복원 단계에서 증명된 live/source 쌍만 nlink=2를 인정한다.
+완료 직전 live 검증과 완료 이력 검증을 분리한다. complete는 봉인된 private before/after 증거로
+검증하며 이후 live의 정상 편집·교체나 다음 migration으로 무효화되지 않는다.
 
 quarantine 이동 직후 journal이 끊긴 경우에도 actual object가 before와 일치하는지 먼저 판정한다.
 foreign 객체를 자동으로 원본이라 명명하거나 삭제하지 않는다. 복원 직전 경합도 no-clobber가 거부한다.

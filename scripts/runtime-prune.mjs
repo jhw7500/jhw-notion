@@ -124,8 +124,8 @@ function validCodexIdentity(value) {
 function validCodexRecord(value) {return exact(value,['identity','sha256'])&&validCodexIdentity(value.identity)&&typeof value.sha256==='string'&&/^[a-f0-9]{64}$/.test(value.sha256);}
 function validCodexObserved(value) {
  if(value===null)return true;
- return exact(value,['reason','live','quarantine','after'])&&typeof value.reason==='string'&&value.reason.length<=128&&
-  ['live','quarantine','after'].every(key=>value[key]===null||validObservedCodexObject(value[key]));
+ return exact(value,['reason','live','quarantine','after','capturedAfter'])&&typeof value.reason==='string'&&value.reason.length<=128&&
+  ['live','quarantine','after','capturedAfter'].every(key=>value[key]===null||validObservedCodexObject(value[key]));
 }
 function validObservedIdentity(value) {return exact(value,['dev','ino','uid','mode','nlink','size'])&&[value.dev,value.ino,value.size].every(item=>typeof item==='string'&&/^\d{1,32}$/.test(item))&&value.uid===process.getuid()&&Number.isSafeInteger(value.mode)&&value.mode>=0&&value.mode<=0o7777&&Number.isSafeInteger(value.nlink)&&value.nlink>=1;}
 function validObservedCodexObject(value) {
@@ -133,59 +133,136 @@ function validObservedCodexObject(value) {
  if(value?.kind==='symlink')return exact(value,['kind','identity','targetSha256'])&&validObservedIdentity(value.identity)&&typeof value.targetSha256==='string'&&/^[a-f0-9]{64}$/.test(value.targetSha256);
  return value?.kind==='special'&&exact(value,['kind','identity'])&&validObservedIdentity(value.identity);
 }
-function validCodexJournalState(state) {
- if(!exact(state,['version','kind','status','phase','config','editorReleaseId','before','after','observed','outcome'])||state.version!==2||state.kind!=='codex-config'||
-  !['pending','complete'].includes(state.status)||!['prepared','quarantine_intent','quarantined','publish_intent','published','verified','ambiguous','complete'].includes(state.phase)||
-  typeof state.config!=='string'||!path.isAbsolute(state.config)||path.basename(state.config)!=='config.toml'||!RELEASE.test(state.editorReleaseId??'')||
-  !exact(state.before,['identity','sha256','copy'])||!validCodexIdentity(state.before.identity)||!validCodexIdentity(state.before.copy)||
-  typeof state.before.sha256!=='string'||!/^[a-f0-9]{64}$/.test(state.before.sha256)||!validCodexRecord(state.after)||!validCodexObserved(state.observed)||
-  !(state.outcome===null||['migrated','unchanged','restored-before'].includes(state.outcome)))return false;
- if(state.status==='complete')return state.phase==='complete'&&['migrated','unchanged','restored-before'].includes(state.outcome)&&state.observed===null;
- return state.phase!=='complete'&&state.outcome===null&&(state.phase==='ambiguous'?state.observed!==null:state.observed===null);
+const CODEX_PHASES = ['prepared','quarantine_intent','quarantined','publish_intent','published',
+ 'restore_intent','quarantine_retire_intent','temp_capture_intent','temp_retire_intent','verified','ambiguous','complete'];
+const CODEX_OUTCOMES = ['migrated','unchanged','restored-before'];
+function validCodexCapture(value) {
+ return exact(value,['name','identity']) && /^capture-[a-f0-9]{32}$/.test(value.name ?? '') &&
+  validWitnessIdentity(value.identity,{mode:0o700});
 }
-function readCodexObject(file,{allowLinks=[1],limit=FILE_LIMIT}={}) {
- let fd;try {
-  fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);const before=fs.fstatSync(fd,{bigint:true});
-  if(!before.isFile()||before.uid!==BigInt(process.getuid())||permissions(before.mode)!==0o600||!allowLinks.includes(Number(before.nlink))||before.size>BigInt(limit))fail('unverified_journal');
-  const bytes=Buffer.alloc(Number(before.size)+1);let length=0;while(length<bytes.length){const count=fs.readSync(fd,bytes,length,bytes.length-length,null);if(!count)break;length+=count;}
-  const after=fs.fstatSync(fd,{bigint:true});const named=fs.lstatSync(file,{bigint:true});for(const key of ['dev','ino','uid','mode','nlink','size','ctimeNs','mtimeNs'])if(before[key]!==after[key]||before[key]!==named[key])fail('unverified_journal');
-  if(length!==Number(before.size))fail('unverified_journal');return {bytes:bytes.subarray(0,length),info:after};
- }catch(error){if(error instanceof DeploymentError)throw error;fail('unverified_journal');}finally{if(fd!==undefined)fs.closeSync(fd);}
+function validCodexJournalState(state) {
+ if(!exact(state,['version','kind','status','phase','config','editorReleaseId','before','after','captures','header','resolution','observed','outcome']) ||
+  state.version!==2 || state.kind!=='codex-config' || !['pending','complete'].includes(state.status) || !CODEX_PHASES.includes(state.phase) ||
+  typeof state.config!=='string' || !path.isAbsolute(state.config) || path.normalize(state.config)!==state.config || path.basename(state.config)!=='config.toml' || !RELEASE.test(state.editorReleaseId??'') ||
+  !exact(state.before,['identity','sha256','copy']) || !validCodexIdentity(state.before.identity) || !validCodexIdentity(state.before.copy) ||
+  !exact(state.after,['identity','sha256','copy']) || !validCodexIdentity(state.after.copy) || !validCodexRecord({identity:state.after.identity,sha256:state.after.sha256}) ||
+  state.before.identity.nlink!==1 || state.before.copy.nlink!==1 || state.after.identity.nlink!==1 || state.after.copy.nlink!==1 ||
+  typeof state.before.sha256!=='string' || !/^[a-f0-9]{64}$/.test(state.before.sha256) ||
+  !exact(state.captures,['source','temp','control']) || !['source','temp','control'].every(key=>validCodexCapture(state.captures[key])) ||
+  new Set(Object.values(state.captures).map(item=>item.name)).size!==3 || !validCodexRecord(state.header) || state.header.identity.nlink!==1 || !validCodexObserved(state.observed) ||
+  !(state.resolution===null || CODEX_OUTCOMES.includes(state.resolution))) return false;
+ if(state.status==='complete') return state.phase==='complete' && CODEX_OUTCOMES.includes(state.outcome) && state.resolution===state.outcome && state.observed===null;
+ if(state.phase==='complete' || state.outcome!==null) return false;
+ if(state.phase==='ambiguous') return state.observed!==null;
+ if(state.observed!==null) return false;
+ if(['restore_intent','quarantine_retire_intent'].includes(state.phase)) return state.resolution==='restored-before';
+ if(['temp_capture_intent','temp_retire_intent','verified'].includes(state.phase)) return CODEX_OUTCOMES.includes(state.resolution);
+ return state.resolution===null;
+}
+function readCodexObject(file,{allowLinks=[1],limit=2*1024*1024,observed=false}={}) {
+ let fd;
+ try {
+  fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);
+  const before=fs.fstatSync(fd,{bigint:true});
+  if(!before.isFile() || before.uid!==BigInt(process.getuid()) || before.size>BigInt(limit) ||
+   (!observed && (permissions(before.mode)!==0o600 || !allowLinks.includes(Number(before.nlink))))) fail('unverified_journal');
+  const bytes=Buffer.alloc(Number(before.size)+1);let length=0;
+  while(length<bytes.length){const count=fs.readSync(fd,bytes,length,bytes.length-length,null);if(!count)break;length+=count;}
+  const after=fs.fstatSync(fd,{bigint:true});const named=fs.lstatSync(file,{bigint:true});
+  for(const key of ['dev','ino','uid','mode','nlink','size','ctimeNs','mtimeNs']) if(before[key]!==after[key] || before[key]!==named[key]) fail('unverified_journal');
+  if(length!==Number(before.size)) fail('unverified_journal');
+  return {bytes:bytes.subarray(0,length),info:after};
+ } catch(error) {if(error instanceof DeploymentError)throw error;fail('unverified_journal');}
+ finally {if(fd!==undefined)fs.closeSync(fd);}
 }
 function codexIdentity(info) {return {dev:String(info.dev),ino:String(info.ino),uid:Number(info.uid),mode:permissions(info.mode),nlink:Number(info.nlink),size:String(info.size)};}
-function readObservedCodexObject(file) {
+export function readObservedCodexObject(file) {
  let info;try{info=fs.lstatSync(file,{bigint:true});}catch(error){if(error.code==='ENOENT')return null;fail('unverified_journal');}
  if(info.uid!==BigInt(process.getuid()))fail('unverified_journal');
  if(info.isSymbolicLink())return {kind:'symlink',identity:codexIdentity(info),targetSha256:digest(Buffer.from(fs.readlinkSync(file)))};
  if(!info.isFile())return {kind:'special',identity:codexIdentity(info)};
- const record=readCodexObject(file,{allowLinks:[1,2]});return {kind:'file',identity:codexIdentity(record.info),sha256:digest(record.bytes)};
+ const record=readCodexObject(file,{observed:true});
+ return {kind:'file',identity:codexIdentity(record.info),sha256:digest(record.bytes)};
 }
-function verifyCodexJournalFiles({journalDirectory,state,children}) {
- const compare=(record,expected,{identity=true}={})=>digest(record.bytes)===expected.sha256&&(!identity||['dev','ino','uid','mode','size'].every(key=>codexIdentity(record.info)[key]===expected.identity[key]));
- const before=readCodexObject(path.join(journalDirectory,'before'));
- if(!compare(before,{identity:state.before.copy,sha256:state.before.sha256}))fail('unverified_journal');
- const quarantine=state.phase!=='ambiguous'&&children.includes('quarantine')?readCodexObject(path.join(journalDirectory,'quarantine'),{allowLinks:[1,2]}):null;
- const after=state.phase!=='ambiguous'&&children.includes('after')?readCodexObject(path.join(journalDirectory,'after'),{allowLinks:[1,2]}):null;
- let live=null;if(state.phase!=='ambiguous')try{live=readCodexObject(state.config,{allowLinks:[1,2]});}catch(error){try{fs.lstatSync(state.config);throw error;}catch(cause){if(cause?.code!=='ENOENT')throw error;}}
- if(state.phase!=='ambiguous') {
-  if(state.status==='complete'&&state.outcome!=='migrated') {
-   if(quarantine||after||!live||!compare(live,{identity:state.before.identity,sha256:state.before.sha256})||live.info.nlink!==1n)fail('unverified_journal');
-   return;
+const codexObjectMatches=(actual,expected,links)=>actual?.kind==='file' && actual.sha256===expected.sha256 &&
+ ['dev','ino','uid','mode','size'].every(key=>actual.identity[key]===expected.identity[key]) && links.includes(actual.identity.nlink);
+
+// The worker and the public deploy/prune parser use this same actual-object table.
+// Intent phases admit both sides of exactly one syscall, including proven nlink=2.
+function codexStageMatches(state,objects) {
+ const {live,quarantine,after,capturedAfter}=objects;
+ const before={identity:state.before.identity,sha256:state.before.sha256};
+ const lb=n=>codexObjectMatches(live,before,[n]);
+ const la=n=>codexObjectMatches(live,state.after,[n]);
+ const q=n=>codexObjectMatches(quarantine,before,[n]);
+ const a=n=>codexObjectMatches(after,state.after,[n]);
+ const c=n=>codexObjectMatches(capturedAfter,state.after,[n]);
+ const original=(lb(1)&&!quarantine)||(!live&&q(1));
+ const published=la(2)&&q(1)&&a(2)&&!capturedAfter;
+ const restored=state.resolution==='migrated' ? q(1) : !quarantine;
+ const finalLive=state.resolution==='migrated' ? la(1) : lb(1);
+ const cleanupLive=n=>state.resolution==='migrated' ? la(n)&&q(1) : lb(1)&&!quarantine;
+ switch(state.phase) {
+  case 'prepared': return lb(1)&&!quarantine&&a(1)&&!capturedAfter;
+  case 'quarantine_intent': return original&&a(1)&&!capturedAfter;
+  case 'quarantined': return !live&&q(1)&&a(1)&&!capturedAfter;
+  case 'publish_intent': return (!live&&q(1)&&a(1)&&!capturedAfter)||published;
+  case 'published': return published;
+  case 'restore_intent': return ((!live&&q(1))||(lb(2)&&q(2)))&&a(1)&&!capturedAfter;
+  case 'quarantine_retire_intent': return ((lb(2)&&q(2))||(lb(1)&&!quarantine))&&a(1)&&!capturedAfter;
+  case 'temp_capture_intent': {
+   const links=state.resolution==='migrated'?2:1;
+   return cleanupLive(links)&&((a(links)&&!capturedAfter)||(!after&&c(links)));
   }
-  const liveBefore=live&&compare(live,{identity:state.before.identity,sha256:state.before.sha256});
-  const liveAfter=live&&compare(live,state.after);const quarantineBefore=quarantine&&compare(quarantine,{identity:state.before.identity,sha256:state.before.sha256});
-  if(state.phase==='prepared'&&(!liveBefore||quarantine))fail('unverified_journal');
-  if(state.phase==='quarantine_intent'&&!((liveBefore&&!quarantine)||(!live&&quarantineBefore)))fail('unverified_journal');
-  if(state.phase==='quarantined'&&(live||!quarantineBefore))fail('unverified_journal');
-  if(state.phase==='publish_intent'&&(!quarantineBefore||!(live===null||liveAfter)))fail('unverified_journal');
-  if(['published','verified','complete'].includes(state.phase)&&(!quarantineBefore||!liveAfter))fail('unverified_journal');
-  if(['verified','complete'].includes(state.phase)?after!==null:['prepared','quarantine_intent','quarantined','publish_intent'].includes(state.phase)&&after===null)fail('unverified_journal');
-  if(state.phase==='published'&&after===null&&live.info.nlink!==1n)fail('unverified_journal');
-  if(after&&(!compare(after,state.after)||liveAfter&&(after.info.dev!==live.info.dev||after.info.ino!==live.info.ino)))fail('unverified_journal');
- } else {
-  const actual={live:readObservedCodexObject(state.config),quarantine:readObservedCodexObject(path.join(journalDirectory,'quarantine')),after:readObservedCodexObject(path.join(journalDirectory,'after'))};
-  for(const key of Object.keys(actual))if(JSON.stringify(actual[key])!==JSON.stringify(state.observed[key]))fail('unverified_journal');
+  case 'temp_retire_intent': {
+   const links=state.resolution==='migrated'?2:1;
+   return !after&&((cleanupLive(links)&&c(links))||(finalLive&&restored&&!capturedAfter));
+  }
+  case 'verified': return finalLive&&restored&&!after&&!capturedAfter;
+  case 'complete':
+   // No live reads: immutable copies prove history; future edits are unrelated.
+   return !after&&!capturedAfter&&(state.outcome==='migrated'?q(1):!quarantine);
+  case 'ambiguous': return canonical(objects)===canonical(Object.fromEntries(Object.entries(state.observed).filter(([key])=>key!=='reason')));
+  default: return false;
  }
+}
+
+/** Shared one-file transaction evidence reader, also used directly by the editor. */
+export function readCodexMigrationJournal({journalDirectory}) {
+ let journal;let control;const captures=[];
+ try {
+  journal=new PinnedDirectory(journalDirectory);
+  const headerRecord=readRegular(`/proc/self/fd/${journal.fd}`,'state.json',FILE_LIMIT);
+  const header=parseJson(headerRecord.bytes);
+  if(!exact(header,['version','kind','control']) || header.version!==2 || header.kind!=='codex-config' || !validCodexCapture(header.control))fail('unverified_journal');
+  control=new PinnedDirectory(journal.at(header.control.name),{parentVerify:()=>journal.verify()});
+  if(!sameIdentity(control.stat,header.control.identity) || fs.readdirSync(`/proc/self/fd/${control.fd}`).join(',')!=='state.json')fail('unverified_journal');
+  const record=readRegular(`/proc/self/fd/${control.fd}`,'state.json',FILE_LIMIT);
+  const state=parseJson(record.bytes);
+  if(!validCodexJournalState(state) || canonical(state.captures.control)!==canonical(header.control) ||
+   !sameIdentity(fs.lstatSync(journal.at('state.json'),{bigint:true}),state.header.identity) || headerRecord.size!==Number(state.header.identity.size) ||
+   digest(headerRecord.bytes)!==state.header.sha256)fail('unverified_journal');
+  const names=fs.readdirSync(`/proc/self/fd/${journal.fd}`);
+  const allowed=['state.json','before','after-copy','after',...Object.values(state.captures).map(item=>item.name)];
+  if(names.some(name=>!allowed.includes(name)))fail('unverified_journal');
+  for(const [name,expected] of [['before',state.before],['after-copy',state.after]]) {
+   const copy=readCodexObject(journal.at(name));
+   if(!codexObjectMatches({kind:'file',identity:codexIdentity(copy.info),sha256:digest(copy.bytes)}, {identity:expected.copy,sha256:expected.sha256},[1])) fail('unverified_journal');
+  }
+  const paths={};
+  for(const key of ['source','temp']) {
+   const expected=state.captures[key];
+   const capture=new PinnedDirectory(journal.at(expected.name),{parentVerify:()=>journal.verify()});captures.push(capture);
+   if(!sameIdentity(capture.stat,expected.identity) || fs.readdirSync(`/proc/self/fd/${capture.fd}`).some(name=>name!=='object'))fail('unverified_journal');
+   paths[key]=capture.at('object');
+  }
+  const objects={live:state.status==='complete'?null:readObservedCodexObject(state.config),
+   quarantine:readObservedCodexObject(paths.source),after:readObservedCodexObject(journal.at('after')),
+   capturedAfter:readObservedCodexObject(paths.temp)};
+  if(!codexStageMatches(state,objects))fail('unverified_journal');
+  for(const capture of captures)capture.verify();control.verify();journal.verify();
+  return {state,objects,record};
+ } finally {for(const capture of captures)capture.close();control?.close();journal?.close();}
 }
 function verifyPairWitnessFiles({repositoryRoot,journalDirectory,state}) {
  const witnessDirectory=path.join(journalDirectory,'pointer-witness');
@@ -231,13 +308,13 @@ export function readRuntimeJournalV2({repositoryRoot,journalDirectory}) {
   journals=new PinnedDirectory(v2.at('journals'),{parentVerify:()=>v2.verify()});
   journal=new PinnedDirectory(journals.at(name),{parentVerify:()=>journals.verify()});
   const children=fs.readdirSync(`/proc/self/fd/${journal.fd}`).sort();
-  if(children.length>4||!children.includes('state.json'))fail('unverified_journal');
+  if(children.length>7||!children.includes('state.json'))fail('unverified_journal');
   const files=new Map();
   files.set('state.json',readRegular(`/proc/self/fd/${journal.fd}`,'state.json',FILE_LIMIT));
   const state=parseJson(files.get('state.json').bytes);
   if(state?.kind==='codex-config') {
-   if(children.some(child=>!['state.json','before','after','quarantine'].includes(child))||!validCodexJournalState(state))fail('unverified_journal');
-   verifyCodexJournalFiles({journalDirectory,state,children});journal.verify();journals.verify();v2.verify();root.verify();return {state,files,identity:objectIdentity(journal.stat)};
+   const parsed=readCodexMigrationJournal({journalDirectory});
+   files.set('state.json',parsed.record);journal.verify();journals.verify();v2.verify();root.verify();return {state:parsed.state,files,identity:objectIdentity(journal.stat)};
   }
   if(children.some(child=>!['state.json','candidate-probe.log','retention.json','pointer-witness'].includes(child)))fail('unverified_journal');
   for(const child of children.filter(child=>child!=='pointer-witness'&&child!=='state.json'))files.set(child,readRegular(`/proc/self/fd/${journal.fd}`,child,FILE_LIMIT));

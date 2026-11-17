@@ -6,6 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { readRuntimeJournalV2 } from "./runtime-prune.mjs";
 
 const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const editor = path.join(repositoryRoot, "scripts", "install-config.mjs");
@@ -34,8 +35,8 @@ function writeConfig(file, text) {
 
 function transactionFixture(t) {
   const current = fixture(t);
-  const evidence = path.join(current.root, "d-00000000000000000000000000000000");
-  fs.mkdirSync(evidence, { mode: 0o700 });
+  const evidence = path.join(current.root, ".jhw-runtime/v2/journals/d-00000000000000000000000000000000");
+  fs.mkdirSync(evidence, { recursive: true, mode: 0o700 });
   fs.chmodSync(evidence, 0o700);
   const source = `[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([entry])}\nstartup_timeout_sec = 60.0\n`;
   writeConfig(current.config, source);
@@ -63,15 +64,27 @@ function stopAtPhase(child, phase) {
     child.once("exit", onExit);
     child.on("message", async (message) => {
       await waitUntilStopped(child);
-      if (message?.phase === phase) { child.off("exit", onExit); resolve(); }
+      if (message?.phase === phase) { child.off("exit", onExit); resolve(message); }
       else process.kill(child.pid, "SIGCONT");
     });
   });
 }
 
 function journal(current) {
-  try { return JSON.parse(fs.readFileSync(path.join(current.evidence, "state.json"), "utf8")); }
+  try {
+    const header = JSON.parse(fs.readFileSync(path.join(current.evidence, "state.json"), "utf8"));
+    return header.control ? JSON.parse(fs.readFileSync(path.join(current.evidence, header.control.name, "state.json"), "utf8")) : header;
+  }
   catch { return null; }
+}
+
+function quarantinePath(current) {
+  const capture = journal(current)?.captures?.source;
+  return capture ? path.join(current.evidence, capture.name, "object") : path.join(current.evidence, "quarantine");
+}
+
+function parseJournal(current) {
+  return readRuntimeJournalV2({ repositoryRoot: current.root, journalDirectory: current.evidence }).state;
 }
 
 function sectionBody(text, header) {
@@ -256,7 +269,7 @@ test("codex migration never replaces a foreign reoccupied path", async (t) => {
   const [code] = await once(child, "exit");
   assert.notEqual(code, 0);
   assert.equal(fs.readFileSync(current.config, "utf8"), foreignText);
-  assert.equal(fs.existsSync(path.join(current.evidence, "quarantine")), true);
+  assert.equal(fs.existsSync(quarantinePath(current)), true);
   assert.equal(journal(current).status, "pending");
   const markerAfter = fs.statSync(marker, { bigint: true });
   assert.equal(fs.readFileSync(marker, "utf8"), "unchanged\n");
@@ -287,7 +300,7 @@ test("codex migration preserves writes through an old fd", async (t) => {
     process.kill(child.pid, "SIGCONT");
     const [code] = await once(child, "exit");
     assert.notEqual(code, 0);
-    assert.equal(fs.readFileSync(path.join(current.evidence, "quarantine"), "utf8"), changed.toString());
+    assert.equal(fs.readFileSync(quarantinePath(current), "utf8"), changed.toString());
     assert.equal(fs.readFileSync(current.config, "utf8"), changed.toString());
     assert.equal(journal(current).status, "pending");
   } finally { fs.closeSync(oldFd); }
@@ -303,7 +316,7 @@ for (const phase of ["quarantine_intent", "quarantined", "publish_intent", "publ
     const recovery = spawnSync(process.execPath, current.args, { stdio: "ignore" });
     if (["quarantine_intent", "quarantined", "publish_intent"].includes(phase)) {
       assert.equal(recovery.status, 8);assert.equal(journal(current).status, "complete");assert.match(journal(current).outcome,/^(unchanged|restored-before)$/);
-      assert.equal(fs.readFileSync(current.config,"utf8"),current.source);assert.equal(fs.existsSync(path.join(current.evidence,"quarantine")),false);assert.equal(fs.existsSync(path.join(current.evidence,"after")),false);
+      assert.equal(fs.readFileSync(current.config,"utf8"),current.source);assert.equal(fs.existsSync(quarantinePath(current)),false);assert.equal(fs.existsSync(path.join(current.evidence,"after")),false);
       const nextEvidence=path.join(current.root,`d-${"1".repeat(32)}`);fs.mkdirSync(nextEvidence,{mode:0o700});const nextArgs=[...current.args.slice(0,-1),nextEvidence];
       assert.equal(spawnSync(process.execPath,nextArgs,{stdio:"ignore"}).status,0);assert.equal(run("verify-codex-binding",current.config).status,0);
     } else {
@@ -311,3 +324,141 @@ for (const phase of ["quarantine_intent", "quarantined", "publish_intent", "publ
     }
   });
 }
+
+for (const target of ["quarantine", "after"]) {
+  test(`codex migration preserves foreign ${target} evidence at mutation boundary`, async (t) => {
+    const current = transactionFixture(t);
+    const child = startTransaction(current);
+    await stopAtPhase(child, target === "quarantine" ? "quarantine_intent" : "published");
+    const file = target === "quarantine" ? quarantinePath(current) : path.join(current.evidence, "after");
+    const replacement = path.join(current.root, "foreign-evidence");
+    writeConfig(replacement, "foreign evidence must survive\n");
+    const heldFd = fs.openSync(replacement, "r");
+    t.after(() => fs.closeSync(heldFd));
+    const identity = fs.fstatSync(heldFd, { bigint: true });
+    fs.renameSync(replacement, file);
+    process.kill(child.pid, "SIGCONT");
+    const [code] = await once(child, "exit");
+    const found = [];
+    const scan = (directory) => { for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
+      const name = path.join(directory, item.name);
+      if (item.isDirectory()) scan(name);
+      else if (item.isFile() && fs.statSync(name, { bigint: true }).ino === identity.ino) found.push(name);
+    } };
+    scan(current.root);
+    assert.equal(found.length, 1, "foreign inode must remain in the fixture");
+    assert.equal(fs.readFileSync(found[0], "utf8"), "foreign evidence must survive\n");
+    assert.notEqual(code, 0);
+    assert.equal(journal(current).status, "pending");
+  });
+}
+
+test("complete codex migration history survives normal live edits and replacements", (t) => {
+  const current = transactionFixture(t);
+  assert.equal(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 0);
+  assert.equal(parseJournal(current).status, "complete");
+  fs.appendFileSync(current.config, "# normal user edit\n");
+  assert.equal(parseJournal(current).status, "complete");
+  fs.unlinkSync(current.config);
+  fs.symlinkSync("user-owned-target", current.config);
+  assert.equal(parseJournal(current).status, "complete");
+});
+
+for (const phase of ["restore_intent", "restore_linked", "quarantine_retire_intent", "quarantine_retired", "temp_capture_intent", "temp_captured", "temp_retire_intent", "temp_retired", "verified"]) {
+  test(`codex before restoration resumes at ${phase} syscall boundary`, async (t) => {
+    const current = transactionFixture(t);
+    const original = startTransaction(current);
+    await stopAtPhase(original, "quarantined");
+    process.kill(original.pid, "SIGKILL"); await once(original, "exit");
+    const restore = startTransaction(current);
+    await stopAtPhase(restore, phase);
+    assert.equal(parseJournal(current).status, "pending");
+    process.kill(restore.pid, "SIGKILL"); await once(restore, "exit");
+    const retry = spawnSync(process.execPath, current.args, { stdio: "ignore" });
+    assert.equal(retry.status, 8);
+    assert.equal(fs.readFileSync(current.config, "utf8"), current.source);
+    assert.equal(fs.statSync(current.config).nlink, 1);
+    assert.equal(parseJournal(current).outcome, "restored-before");
+    fs.appendFileSync(current.config, "# edited after restore\n");
+    assert.equal(parseJournal(current).status, "complete");
+  });
+}
+
+for (const phase of ["quarantine_moved", "publish_linked", "temp_capture_intent", "temp_captured", "temp_retire_intent", "temp_retired"]) {
+  test(`codex publication resumes at ${phase} syscall boundary`, async (t) => {
+    const current = transactionFixture(t); const child = startTransaction(current);
+    await stopAtPhase(child, phase);
+    assert.equal(parseJournal(current).status, "pending");
+    process.kill(child.pid, "SIGKILL"); await once(child, "exit");
+    const retry = spawnSync(process.execPath, current.args, { stdio: "ignore" });
+    const restored = phase === "quarantine_moved";
+    assert.equal(retry.status, restored ? 8 : 0);
+    assert.equal(parseJournal(current).outcome, restored ? "restored-before" : "migrated");
+    assert.equal(fs.statSync(current.config).nlink, 1);
+  });
+}
+
+test("codex capture reservation collision preserves the existing directory", async (t) => {
+  const current = transactionFixture(t); const child = startTransaction(current);
+  const reservation = await stopAtPhase(child, "capture_reserve_intent");
+  const directory = path.join(current.evidence, reservation.name);
+  fs.mkdirSync(directory, { mode: 0o700 });
+  writeConfig(path.join(directory, "foreign"), "reserved by another writer\n");
+  const before = fs.statSync(directory, { bigint: true });
+  process.kill(child.pid, "SIGCONT"); const [code] = await once(child, "exit");
+  assert.notEqual(code, 0);
+  assert.equal(fs.statSync(directory, { bigint: true }).ino, before.ino);
+  assert.equal(fs.readFileSync(path.join(directory, "foreign"), "utf8"), "reserved by another writer\n");
+  assert.equal(fs.readFileSync(current.config, "utf8"), current.source);
+});
+
+for (const damage of ["identity", "unknown-child"]) {
+  test(`codex capture ${damage} is preserved on resume`, async (t) => {
+    const current = transactionFixture(t); const child = startTransaction(current);
+    await stopAtPhase(child, "quarantined");
+    process.kill(child.pid, "SIGKILL"); await once(child, "exit");
+    const directory = path.dirname(quarantinePath(current));
+    const old = `${directory}-original`;
+    if (damage === "identity") {
+      fs.renameSync(directory, old); fs.mkdirSync(directory, { mode: 0o700 });
+    }
+    const marker = path.join(directory, "foreign"); writeConfig(marker, "unknown child survives\n");
+    assert.throws(() => parseJournal(current), { code: "DEPLOY_PRUNE_BLOCKED" });
+    assert.notEqual(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 0);
+    assert.equal(fs.readFileSync(marker, "utf8"), "unknown child survives\n");
+    assert.equal(fs.readFileSync(path.join(damage === "identity" ? old : directory, "object"), "utf8"), current.source);
+  });
+}
+
+test("codex journal header replacement is never overwritten by a checkpoint", async (t) => {
+  const current = transactionFixture(t); const child = startTransaction(current);
+  await stopAtPhase(child, "published");
+  const replacement = path.join(current.root, "foreign-header"); writeConfig(replacement, "foreign header\n");
+  const held = fs.openSync(replacement, "r"); t.after(() => fs.closeSync(held));
+  const before = fs.fstatSync(held, { bigint: true });
+  const header = path.join(current.evidence, "state.json"); fs.renameSync(replacement, header);
+  process.kill(child.pid, "SIGCONT"); const [code] = await once(child, "exit");
+  assert.notEqual(code, 0); assert.equal(fs.statSync(header, { bigint: true }).ino, before.ino);
+  assert.equal(fs.readFileSync(header, "utf8"), "foreign header\n");
+});
+
+test("restored codex history stays valid after a later successful migration", async (t) => {
+  const current = transactionFixture(t); const child = startTransaction(current);
+  await stopAtPhase(child, "quarantined"); process.kill(child.pid, "SIGKILL"); await once(child, "exit");
+  assert.equal(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 8);
+  const nextEvidence = path.join(path.dirname(current.evidence), `d-${"2".repeat(32)}`);
+  fs.mkdirSync(nextEvidence, { mode: 0o700 });
+  assert.equal(spawnSync(process.execPath, [...current.args.slice(0, -1), nextEvidence], { stdio: "ignore" }).status, 0);
+  assert.equal(parseJournal(current).outcome, "restored-before");
+  assert.equal(parseJournal({ ...current, evidence: nextEvidence }).outcome, "migrated");
+});
+
+test("unproven codex restoration links remain pending without deletion", async (t) => {
+  const current = transactionFixture(t); const child = startTransaction(current);
+  await stopAtPhase(child, "quarantined"); process.kill(child.pid, "SIGKILL"); await once(child, "exit");
+  fs.linkSync(quarantinePath(current), current.config);
+  assert.throws(() => parseJournal(current), { code: "DEPLOY_PRUNE_BLOCKED" });
+  assert.notEqual(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 0);
+  assert.equal(fs.statSync(current.config).nlink, 2);
+  assert.equal(fs.readFileSync(quarantinePath(current), "utf8"), current.source);
+});

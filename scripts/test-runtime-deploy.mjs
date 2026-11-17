@@ -8,6 +8,7 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import test from 'node:test';
 import {acquireLease} from './runtime-safety.mjs';
 import {prepareRelease, readActivation} from './runtime-store.mjs';
+import {readRuntimeJournalV2} from './runtime-prune.mjs';
 const deploy = await import('./runtime-deploy.mjs').catch(e => {if(e.code!=='ERR_MODULE_NOT_FOUND')throw e;return {};});
 const source = path.dirname(fileURLToPath(import.meta.url));
 function write(root,name,bytes,mode=0o644) {const p=path.join(root,name);fs.mkdirSync(path.dirname(p),{recursive:true,mode:0o755});fs.writeFileSync(p,bytes,{mode});fs.chmodSync(p,mode);return p;}
@@ -45,10 +46,24 @@ test('explicit Codex config migration uses the current editor and retains exact 
  assert.equal(result.code,'DEPLOY_CODEX_CONFIG_MIGRATED');assert.equal(result.changed,true);assert.equal(result.inventory.before.clear,true);assert.equal(result.inventory.after.clear,true);
  assert.equal(spawnSync(process.execPath,[path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs'),'verify-codex-binding',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId]).status,0);
  const journals=fs.readdirSync(path.join(f.root,'.jhw-runtime/v2/journals'));assert.equal(journals.length,1);
- const journal=path.join(f.root,'.jhw-runtime/v2/journals',journals[0]);const state=JSON.parse(fs.readFileSync(path.join(journal,'state.json')));
+ const journal=path.join(f.root,'.jhw-runtime/v2/journals',journals[0]);const state=readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:journal}).state;
  assert.equal(state.kind,'codex-config');assert.equal(state.status,'complete');assert.equal(state.phase,'complete');assert.equal(state.outcome,'migrated');
- for(const name of ['state.json','before','quarantine'])assert.equal(fs.statSync(path.join(journal,name)).mode&0o7777,0o600);
+ for(const name of ['state.json','before','after-copy',`${state.captures.source.name}/object`,`${state.captures.control.name}/state.json`])assert.equal(fs.statSync(path.join(journal,name)).mode&0o7777,0o600);
  const after=fs.statSync(config,{bigint:true});assert.notEqual(after.ino,before.ino);const retry=await f.run(['--migrate-codex-config']);assert.equal(retry.changed,false);const byteIdenticalAfter=fs.statSync(config,{bigint:true});assert.deepEqual({ino:byteIdenticalAfter.ino,mtimeNs:byteIdenticalAfter.mtimeNs},{ino:after.ino,mtimeNs:after.mtimeNs});
+ fs.appendFileSync(config,'# normal user edit after migration\n');
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+ assert.equal((await f.run(['--migrate-codex-config'])).changed,false);
+ assert.equal((await f.run(['--prepare'])).code,'DEPLOY_PREPARED');
+});
+
+test('Codex migration rejects a mismatched shared journal reader before mutation',async t=>{
+ const f=fixture(t);host(f);for(const name of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,name),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
+ const config=path.join(f.home,'.codex/config.toml');const legacy=fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,'');write(f.home,'.codex/config.toml',legacy,0o600);
+ fs.appendFileSync(path.join(f.root,'scripts/runtime-prune.mjs'),'\n// changed reader version\n');
+ await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_ARGUMENTS_INVALID',reason:'codex_editor_mismatch'});
+ assert.equal(fs.readFileSync(config,'utf8'),legacy);
+ assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/v2/journals')),false);
 });
 
 test('Codex migration refuses missing or foreign config without creating a replacement',async t=>{
@@ -70,7 +85,7 @@ test('pending Codex migration preserves reoccupation and blocks every other muta
  const editor=path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs');const child=spawn(process.execPath,[editor,'migrate-codex-binding-transaction',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId,evidence],{stdio:['ignore','ignore','ignore','ipc']});
  await new Promise((resolve,reject)=>{child.once('exit',(code,signal)=>reject(new Error(`editor exited ${code??signal}`)));child.on('message',async message=>{for(let attempt=0;attempt<1000;attempt++){try{if(/^State:\s+T/m.test(fs.readFileSync(`/proc/${child.pid}/status`,'utf8')))break;}catch{return reject(new Error('editor exited before stop'));}await new Promise(done=>setTimeout(done,1));}if(message?.phase==='quarantined')resolve();else process.kill(child.pid,'SIGCONT');});});
  const foreign='model = "foreign-reoccupied"\n';write(f.home,'.codex/config.toml',foreign,0o600);process.kill(child.pid,'SIGCONT');await once(child,'exit');
- assert.equal(JSON.parse(fs.readFileSync(path.join(evidence,'state.json'))).phase,'ambiguous');assert.equal(fs.readFileSync(config,'utf8'),foreign);
+ assert.equal(readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:evidence}).state.phase,'ambiguous');assert.equal(fs.readFileSync(config,'utf8'),foreign);
  assert.equal((await f.run(['--status'])).recoveryPending,1);
  await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'codex_config_migration_pending'});
  await assert.rejects(f.run(['--activate',next.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});

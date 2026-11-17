@@ -214,7 +214,7 @@ fsync를 소유하며 deploy callback은 그 descriptor를 동기적으로 journ
   ```
 - [ ] **2. RED를 확인한다.** `rtk proxy node --test scripts/test-runtime-codex-migration.mjs`.
 - [ ] **3. CLI와 worker를 연결한다.** deploy EX→admission EX, current installer 일치·capability·기존 owned vector 검증 뒤 실행한다. 구버전 editor에 새 phase/KEYS를 전달하지 않는다. pending부터 판정하고 다른 mutation을 차단한다. 설정 부재/foreign vector는 자동 신규 설치로 바꾸지 않는다.
-- [ ] **4. 설계 9절 transaction과 복구 표를 구현한다.** before/after 봉인→quarantine intent→move된 원본 확인→publish intent→no-clobber link→published 검증→자기 temp link 제거→strict verify→complete다. 자신의 정확한 객체만 회수하며 foreign live/quarantine을 추정 덮어쓰지 않는다. private 증거는 owner·regular·0600/no-follow로 검사하고 비밀 bytes를 출력하지 않는다.
+- [ ] **4. 승인된 설계 9절 A 경계와 복구 표를 구현한다.** 새 active capture container의 단일 writer 전제, directory identity 재검증, 복원 각 syscall intent, 완료 이력의 봉인 사본 검증을 적용한다. before/after 봉인→quarantine intent→move된 원본 확인→publish intent→no-clobber link→published 검증→자기 temp link 제거→strict verify→complete다. 자신의 정확한 객체만 회수하며 foreign live/quarantine을 추정 덮어쓰지 않는다. private 증거는 owner·regular·0600/no-follow로 검사하고 비밀 bytes를 출력하지 않는다.
 - [ ] **5. GREEN을 확인한다.** 위 명령과 `rtk proxy node --test scripts/test-runtime-deploy.mjs`, `rtk proxy bash scripts/test-install-safety.sh`. 매 durable intent와 link/unlink 전후 재실행을 검증한다. 성공한 config 이행은 이후 runtime rollback 때문에 역변환하지 않는다.
 - [ ] **6. 커밋한다.** 제목: `feat(codex): 기존 managed 설정의 안전한 이행을 지원한다`.
 

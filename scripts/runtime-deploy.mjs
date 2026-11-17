@@ -38,8 +38,10 @@ function requireMatchingInstaller(repositoryRoot,releaseId) {
 function requireMatchingCodexEditor(repositoryRoot,releaseId) {
  validateRelease({repositoryRoot,releaseId});
  const digest=file=>createHash('sha256').update(fs.readFileSync(file)).digest('hex');
- if(digest(path.join(repositoryRoot,'scripts/install-config.mjs'))!==digest(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts/install-config.mjs')))
-  fail('DEPLOY_ARGUMENTS_INVALID','codex_editor_mismatch');
+ for(const name of ['install-config.mjs','runtime-prune.mjs']) {
+  if(digest(path.join(repositoryRoot,'scripts',name))!==digest(path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,'scripts',name)))
+   fail('DEPLOY_ARGUMENTS_INVALID','codex_editor_mismatch');
+ }
 }
 // --adopt-from names a distinct, canonical sibling checkout of this repository.
 function validateAdoptSource(repositoryRoot,source) {
