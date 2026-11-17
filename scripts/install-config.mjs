@@ -1834,6 +1834,32 @@ function tomlAssignmentKeys(line) {
   return undefined;
 }
 
+function replaceTomlAssignmentValue(line, value) {
+  const source = stripTomlComment(line);
+  let quote;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote === '"' && character === "\\" && !escaped) {
+      escaped = true;
+      continue;
+    }
+    if ((character === '"' || character === "'") && !escaped) {
+      if (quote === character) quote = undefined;
+      else if (quote === undefined) quote = character;
+    } else if (character === "=" && quote === undefined) {
+      let start = index + 1;
+      while (/\s/.test(source[start] ?? "")) start += 1;
+      let end = source.length;
+      while (end > start && /\s/.test(source[end - 1])) end -= 1;
+      if (start === end) throw new Error("missing TOML assignment value");
+      return `${line.slice(0, start)}${value}${line.slice(end)}`;
+    }
+    escaped = false;
+  }
+  throw new Error("missing TOML assignment");
+}
+
 function tomlAssignmentStringValue(line) {
   const source = stripTomlComment(line);
   let quote;
@@ -1937,13 +1963,13 @@ function ownedToml(source) {
   return { owned, adopted: !owned && adoptedVector(commands[0][1], args), range };
 }
 
-function codexEntry(environment = [`env_vars = ${JSON.stringify([CODEX_BINDING])}`]) {
+function codexEntry() {
   return [
     parentHeader,
     'command = "node"',
     `args = ${JSON.stringify(stdioArgs())}`,
     "startup_timeout_sec = 60.0",
-    ...environment,
+    `env_vars = ${JSON.stringify([CODEX_BINDING])}`,
   ];
 }
 
@@ -1976,9 +2002,10 @@ function inspectCodexEnvironment(source, range) {
   let inEnvironment = false;
   const childKeys = [];
   for (const line of childLines) {
-    const header = tomlHeaderKeys(line) ?? tomlArrayHeaderKeys(line);
+    const tableHeader = tomlHeaderKeys(line);
+    const header = tableHeader ?? tomlArrayHeaderKeys(line);
     if (header) {
-      if (line.trim() !== "[mcp_servers.jhw-notion.env]") {
+      if (!tableHeader || JSON.stringify(tableHeader) !== JSON.stringify(["mcp_servers", "jhw-notion", "env"])) {
         throw new Error("unsupported Codex child table");
       }
       if (inEnvironment) throw new Error("duplicate Codex env child table");
@@ -2025,13 +2052,32 @@ function mergeCodexBinding(source) {
   return { text: lines.join("\n"), changed: true, userEnvironmentPresent: environment.userEnvironmentPresent };
 }
 
+function updateAdoptedCodexVector(source) {
+  const range = tomlRange(source);
+  if (range.start === undefined || range.hasAlternate) throw new Error("ambiguous adopted Codex entry");
+  const lines = [...range.lines];
+  const assignments = new Map();
+  for (let index = range.start + 1; index < range.parentEnd; index += 1) {
+    const keys = tomlAssignmentKeys(lines[index]);
+    if (keys?.length === 1) assignments.set(keys[0], index);
+  }
+  const commandIndex = assignments.get("command");
+  const argsIndex = assignments.get("args");
+  if (commandIndex === undefined || argsIndex === undefined) throw new Error("missing adopted Codex vector");
+  lines[commandIndex] = replaceTomlAssignmentValue(lines[commandIndex], JSON.stringify("node"));
+  lines[argsIndex] = replaceTomlAssignmentValue(lines[argsIndex], JSON.stringify(stdioArgs()));
+  const timeoutIndex = assignments.get("startup_timeout_sec");
+  if (timeoutIndex === undefined) lines.splice(argsIndex + 1, 0, "startup_timeout_sec = 60.0");
+  else lines[timeoutIndex] = replaceTomlAssignmentValue(lines[timeoutIndex], "60.0");
+  return lines.join("\n");
+}
+
 function inspectCodexRegistration() {
   const current = safeExistingFile(configFile);
   const inspected = ownedToml(current.text);
   if ((inspected.range.start !== undefined && !inspected.owned && !inspected.adopted) ||
       (inspected.range.start === undefined && inspected.range.hasOrphan)) failForeign();
   let binding;
-  let preserved = [];
   if (inspected.range.start !== undefined) {
     const { lines, start, parentEnd } = inspected.range;
     const parent = lines.slice(start + 1, parentEnd);
@@ -2046,30 +2092,17 @@ function inspectCodexRegistration() {
     }
     try { binding = mergeCodexBinding(current.text); }
     catch { process.exit(ADOPT_UNPRESERVABLE); }
-    const mergedRange = tomlRange(binding.text);
-    const mergedParent = mergedRange.lines.slice(mergedRange.start + 1, mergedRange.parentEnd);
-    preserved = [
-      ...mergedParent.filter((line) => /^\s*(#.*)?$/.test(line) || /^\s*env_vars\s*=/.test(line)),
-      ...mergedRange.lines.slice(mergedRange.parentEnd, mergedRange.end),
-    ];
-    if (mergedRange.end === mergedRange.lines.length && binding.text.endsWith("\n") && preserved.at(-1) === "") {
-      preserved.pop();
-    }
   }
-  return { current, inspected, preserved, binding };
+  return { current, inspected, binding };
 }
 
 function registerCodex() {
-  const { current, inspected, preserved, binding } = inspectCodexRegistration();
+  const { current, inspected, binding } = inspectCodexRegistration();
   if (inspected.owned) saveToml(current, binding.text);
   let output;
-  if (inspected.range.start !== undefined) {
-    const suffix = inspected.range.lines.slice(inspected.range.end);
-    output = [
-      ...inspected.range.lines.slice(0, inspected.range.start),
-      ...codexEntry(preserved),
-      ...(suffix.length === 0 && current.text.endsWith("\n") ? [""] : suffix),
-    ].join("\n");
+  if (inspected.adopted) {
+    try { output = updateAdoptedCodexVector(binding.text); }
+    catch { process.exit(ADOPT_UNPRESERVABLE); }
   } else {
     const body = current.text.replace(/\n+$/, "");
     output = body ? `${body}\n\n${codexEntry().join("\n")}\n` : `${codexEntry().join("\n")}\n`;

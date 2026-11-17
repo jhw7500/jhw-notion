@@ -33,7 +33,10 @@ function writeConfig(file, text) {
 
 function sectionBody(text, header) {
   const lines = text.split("\n");
-  const start = lines.indexOf(header);
+  const start = lines.findIndex((line) => {
+    const trimmed = line.trim();
+    return trimmed === header || trimmed.startsWith(`${header} #`);
+  });
   if (start < 0) return "";
   let end = start + 1;
   while (end < lines.length && !lines[end].startsWith("[")) end += 1;
@@ -42,7 +45,7 @@ function sectionBody(text, header) {
 
 function parseGeneratedEnvironment(text, parentEnvironment) {
   const parent = sectionBody(text, "[mcp_servers.jhw-notion]");
-  const envLine = /^env_vars\s*=\s*(\[[^\n]*\])\s*(?:#.*)?$/m.exec(parent);
+  const envLine = /^\s*env_vars\s*=\s*(\[[^\n]*\])\s*(?:#.*)?$/m.exec(parent);
   assert.ok(envLine, "generated Codex entry must contain env_vars");
   const envVars = JSON.parse(envLine[1]);
   const childEnvironment = Object.fromEntries(
@@ -106,10 +109,14 @@ test("codex generated whitelist preserves binding and user environment", (t) => 
   const legacyEntry = path.join(adoptRoot, "mcp-server", "dist", "index.js");
   fs.mkdirSync(path.dirname(legacyEntry), { recursive: true, mode: 0o700 });
   fs.writeFileSync(legacyEntry, "legacy", { mode: 0o600 });
-  writeConfig(adopted.config, `[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([legacyEntry])}\nenv_vars = ["NOTION_API_KEY"]\n\n[mcp_servers.jhw-notion.env]\nNOTION_VERSION = "2022-06-28"\n`);
+  const beforeSection = 'model = "fixture"\n# unrelated before bytes\n\n';
+  const afterSection = '\n[unrelated.after]\nkeep = "exact" # unrelated after bytes\n';
+  writeConfig(adopted.config, `${beforeSection}[mcp_servers.jhw-notion]\n  command   =   "node"   # keep command comment\n  args = ${JSON.stringify([legacyEntry])} # keep args comment\n startup_timeout_sec = 17.0 # keep timeout comment\n env_vars = ["NOTION_API_KEY"] # keep whitelist comment\n\n[mcp_servers.jhw-notion.env] # keep child header comment\nNOTION_VERSION = "2022-06-28" # keep child value comment\n${afterSection}`);
   const adoptedResult = run("register-codex", adopted.config, { adoptFrom: adoptRoot });
   assert.equal(adoptedResult.status, 0, adoptedResult.stderr);
-  assertLauncherReceivesBinding(fs.readFileSync(adopted.config, "utf8"));
+  const adoptedText = fs.readFileSync(adopted.config, "utf8");
+  assert.equal(adoptedText, `${beforeSection}[mcp_servers.jhw-notion]\n  command   =   "node"   # keep command comment\n  args = ${JSON.stringify([entry])} # keep args comment\n startup_timeout_sec = 60.0 # keep timeout comment\n env_vars = ["NOTION_API_KEY","${binding}"] # keep whitelist comment\n\n[mcp_servers.jhw-notion.env] # keep child header comment\nNOTION_VERSION = "2022-06-28" # keep child value comment\n${afterSection}`);
+  assertLauncherReceivesBinding(adoptedText);
 });
 
 test("codex binding preflight rejects ambiguous or unsafe environment without mutation", (t) => {
