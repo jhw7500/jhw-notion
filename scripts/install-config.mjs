@@ -2181,13 +2181,14 @@ function runCodexBindingTransaction() {
       return { name, identity };
     };
     const names = fs.readdirSync(at(""));
-    let state;
+    let state; let recoveryClassification;
     const resuming = names.includes("state.json");
     if (resuming) {
-      state = readCodexMigrationJournal({ journalDirectory: transactionEvidence }).state;
+      const parsed = readCodexMigrationJournal({ journalDirectory: transactionEvidence });
+      state = parsed.state; recoveryClassification = parsed.classification;
       if (state.config !== path.resolve(logicalConfigFile) || state.editorReleaseId !== backupStamp) throw new Error("migration coordinates changed");
-      for (const key of ["source", "temp", "control"]) pinCapture(key, state.captures[key]);
       if (state.status === "complete") process.exit(state.outcome === "migrated" ? CHANGED : MANUAL_RECOVERY);
+      for (const key of ["source", "temp", "control"]) pinCapture(key, state.captures[key]);
       if (state.phase === "ambiguous") throw new Error("migration recovery ambiguous");
     } else {
       if (names.length) throw new Error("unknown migration evidence");
@@ -2262,13 +2263,28 @@ function runCodexBindingTransaction() {
     const matches = (actual, expected, hash, links) => actual?.kind === "file" && actual.sha256 === hash &&
       ["dev", "ino", "uid", "mode", "size"].every(key => actual.identity[key] === expected[key]) && links.includes(actual.identity.nlink);
     const restoreForeign = () => {
-      const captured = readObservedCodexObject(capturePath("source"));
-      if (captured && ["file", "symlink"].includes(captured.kind)) {
-        try { fs.linkSync(capturePath("source"), live); fs.fsyncSync(parentFd); }
-        catch (cause) { if (cause.code !== "EEXIST") throw cause; }
+      verifyDirectories();
+      if (state.phase !== "foreign_restore_intent") {
+        const snapshot = objects();
+        const parsed = readCodexMigrationJournal({ journalDirectory: transactionEvidence });
+        if (parsed.classification !== "foreign-capture" || snapshot.live) preserveAmbiguity("migration quarantine changed");
+        // This durable record identifies the actual captured inode/content, never
+        // the numeric FD. The shared reader accepts both sides of the link below.
+        state.observed = { reason: "migration foreign restore", ...snapshot };
+        checkpoint("foreign_restore_intent");
       }
+      const actual = validate();
+      if (!actual.live) {
+        try { fs.linkSync(capturePath("source"), live); fs.fsyncSync(parentFd); }
+        catch (cause) { if (cause.code === "EEXIST") preserveAmbiguity("migration live reoccupied"); throw cause; }
+        migrationPause("foreign_restore_linked");
+      }
+      validate();
+      // Restoring a raced foreign object never certifies a managed migration.
+      // Keep both links and all evidence; repeated calls remain pending failures.
       preserveAmbiguity("migration quarantine changed");
     };
+    if (recoveryClassification === "foreign-capture" || recoveryClassification === "foreign-restore") restoreForeign();
     let actual = objects();
     if (resuming && ["prepared", "quarantine_intent", "quarantined", "publish_intent"].includes(state.phase)) {
       validate();

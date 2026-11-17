@@ -482,7 +482,18 @@ identity/bytes/link 수를 대조한다. 매 unlink/link/rename 뒤 crash도 같
 복원 link 게시, source capture link 회수, temp capture/회수는 각각 durable intent와 syscall 뒤의 실제
 identity/bytes/nlink를 공유 상태표로 판정한다. 복원 단계에서 증명된 live/source 쌍만 nlink=2를 인정한다.
 완료 직전 live 검증과 완료 이력 검증을 분리한다. complete는 봉인된 private before/after 증거로
-검증하며 이후 live의 정상 편집·교체나 다음 migration으로 무효화되지 않는다.
+검증하며 이후 live의 정상 편집·교체나 다음 migration으로 무효화되지 않는다. complete 분기는
+일반 실제-object 관측보다 먼저 분리하고 live/retained 원본 payload를 읽지 않는다. 완료 receipt는
+무결성과 과거 완료 사실만 증명하며, retained 원본의 현재 내용·size·nlink·회수 안전성을 증명하지
+않는다. GC 삭제 권한은 별도 실제-object inventory로 판정하며 변경·불명확한 원본은 보존한다.
+
+active 판독은 구조·봉인 증거와 복구 관측을 구분한다. durable capture intent 및 container identity가
+증명하는 raced foreign capture는 별도 pending 분류다. current-user regular file/symlink만 복원
+대상으로 인정하고, 실제 identity와 bytes hash/target hash를 foreign_restore_intent에 봉인한다.
+FD 번호를 durable 증거로 쓰지 않는다. absent live에만 no-clobber link하고, link 전 captured 객체와
+link 후 정확한 live/capture 쌍을 shared parser/public 재호출에서 모두 인정한다. foreign 객체를
+before라고 간주하거나 정상 완료 처리하지 않고 evidence를 보존한 pending 실패로 끝낸다.
+변경·재점유·special·모호한 객체에서는 덮어쓰기나 삭제 없이 보존한다.
 
 quarantine 이동 직후 journal이 끊긴 경우에도 actual object가 before와 일치하는지 먼저 판정한다.
 foreign 객체를 자동으로 원본이라 명명하거나 삭제하지 않는다. 복원 직전 경합도 no-clobber가 거부한다.

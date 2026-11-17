@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { readRuntimeJournalV2 } from "./runtime-prune.mjs";
+import { readRuntimeJournalV2, planRuntimePrune, applyRuntimePrune } from "./runtime-prune.mjs";
 
 const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const editor = path.join(repositoryRoot, "scripts", "install-config.mjs");
@@ -16,9 +16,17 @@ const binding = "JHW_RUNTIME_SESSION_BINDING";
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jhw-codex-migration-"));
   fs.chmodSync(root, 0o700);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const children = new Set();
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const closed = once(child, "exit"); child.kill("SIGKILL"); await closed;
+      }
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   const config = path.join(root, "config.toml");
-  return { root, config };
+  return { root, config, children };
 }
 
 function run(operation, config, { adoptFrom, stamp = "20261117000000" } = {}) {
@@ -46,7 +54,9 @@ function transactionFixture(t) {
 }
 
 function startTransaction(current) {
-  return spawn(process.execPath, current.args, { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  const child = spawn(process.execPath, current.args, { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  current.children.add(child); child.once("exit", () => current.children.delete(child));
+  return child;
 }
 
 async function waitUntilStopped(child) {
@@ -461,4 +471,128 @@ test("unproven codex restoration links remain pending without deletion", async (
   assert.notEqual(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 0);
   assert.equal(fs.statSync(current.config).nlink, 2);
   assert.equal(fs.readFileSync(quarantinePath(current), "utf8"), current.source);
+});
+
+for (const change of ["payload", "size", "nlink"]) {
+  test(`completed codex receipt ignores retained original ${change} changes without payload reads`, (t) => {
+    const current = transactionFixture(t); const oldFd = fs.openSync(current.config, "r+");
+    t.after(() => fs.closeSync(oldFd));
+    assert.equal(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 0);
+    const beforeCopy = fs.readFileSync(path.join(current.evidence, "before"));
+    const liveBytes = fs.readFileSync(current.config);
+    const retained = fs.fstatSync(oldFd, { bigint: true });
+    if (change === "payload") fs.writeSync(oldFd, Buffer.from("# old FD write"), 0, 14, 0);
+    if (change === "size") fs.ftruncateSync(oldFd, 3 * 1024 * 1024);
+    if (change === "nlink") fs.linkSync(quarantinePath(current), path.join(current.root, "extra-original-link"));
+    fs.fsyncSync(oldFd);
+    const open = fs.openSync; let originalReads = 0;
+    fs.openSync = (file, ...args) => {
+      let info; try { info = fs.lstatSync(file, { bigint: true }); } catch {}
+      if (info?.dev === retained.dev && info?.ino === retained.ino) { originalReads++; throw new Error("completed receipt read mutable original"); }
+      return open(file, ...args);
+    };
+    try { assert.equal(parseJournal(current).status, "complete"); }
+    finally { fs.openSync = open; }
+    assert.equal(originalReads, 0);
+    assert.deepEqual(fs.readFileSync(path.join(current.evidence, "before")), beforeCopy);
+    assert.deepEqual(fs.readFileSync(current.config), liveBytes);
+  });
+}
+
+for (const name of ["before", "after-copy", "state.json", "control"]) {
+  test(`completed codex receipt still rejects corrupted sealed ${name}`, (t) => {
+    const current = transactionFixture(t);
+    assert.equal(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 0);
+    const file = name === "control" ? path.join(current.evidence, journal(current).captures.control.name, "state.json") : path.join(current.evidence, name);
+    fs.appendFileSync(file, "invalid sealed evidence");
+    assert.throws(() => parseJournal(current), { code: "DEPLOY_PRUNE_BLOCKED" });
+  });
+}
+
+async function crashWithForeignCapture(current, kind) {
+  const child = startTransaction(current); await stopAtPhase(child, "quarantine_intent");
+  const replacement = path.join(current.root, "foreign-source");
+  if (kind === "symlink") fs.symlinkSync("foreign-config-target", replacement);
+  else writeConfig(replacement, "foreign source must be restored\n");
+  const identity = fs.lstatSync(replacement, { bigint: true });
+  fs.renameSync(replacement, current.config);
+  child.removeAllListeners("message");
+  const moved = stopAtPhase(child, "quarantine_moved"); process.kill(child.pid, "SIGCONT"); await moved;
+  process.kill(child.pid, "SIGKILL"); await once(child, "exit");
+  return identity;
+}
+
+for (const kind of ["file", "symlink"]) {
+  for (const boundary of ["quarantine_moved", "foreign_restore_intent", "foreign_restore_linked"]) {
+    test(`foreign ${kind} capture resumes after ${boundary} and remains pending`, async (t) => {
+      const current = transactionFixture(t); const heldBefore = fs.openSync(current.config, "r");
+      t.after(() => fs.closeSync(heldBefore));
+      const foreign = await crashWithForeignCapture(current, kind);
+      assert.equal(parseJournal(current).status, "pending");
+      if (boundary !== "quarantine_moved") {
+        const retry = startTransaction(current); await stopAtPhase(retry, boundary);
+        assert.equal(parseJournal(current).status, "pending");
+        process.kill(retry.pid, "SIGKILL"); await once(retry, "exit");
+      }
+      const result = spawnSync(process.execPath, current.args, { stdio: "ignore" });
+      assert.notEqual(result.status, 0);
+      const restored = fs.lstatSync(current.config, { bigint: true });
+      assert.equal(restored.dev, foreign.dev); assert.equal(restored.ino, foreign.ino);
+      assert.equal(fs.lstatSync(quarantinePath(current), { bigint: true }).ino, foreign.ino);
+      assert.equal(kind === "file" ? fs.readFileSync(current.config, "utf8") : fs.readlinkSync(current.config),
+        kind === "file" ? "foreign source must be restored\n" : "foreign-config-target");
+      assert.equal(fs.readFileSync(path.join(current.evidence, "before"), "utf8"), current.source);
+      assert.equal(fs.readFileSync(heldBefore, "utf8"), current.source);
+      assert.equal(parseJournal(current).phase, "ambiguous");
+    });
+  }
+}
+
+for (const change of ["live-file", "live-symlink", "captured-bytes"]) {
+  test(`foreign restore intent preserves ${change} interference`, async (t) => {
+    const current = transactionFixture(t);
+    const foreign = await crashWithForeignCapture(current, "file");
+    const retry = startTransaction(current); await stopAtPhase(retry, "foreign_restore_intent");
+    if (change === "live-file") writeConfig(current.config, "new live occupant\n");
+    if (change === "live-symlink") fs.symlinkSync("new-live-target", current.config);
+    if (change === "captured-bytes") fs.appendFileSync(quarantinePath(current), "changed after intent\n");
+    process.kill(retry.pid, "SIGCONT"); const [code] = await once(retry, "exit");
+    assert.notEqual(code, 0); assert.equal(journal(current).status, "pending");
+    assert.equal(fs.lstatSync(quarantinePath(current), { bigint: true }).ino, foreign.ino);
+    if (change === "live-file") assert.equal(fs.readFileSync(current.config, "utf8"), "new live occupant\n");
+    if (change === "live-symlink") assert.equal(fs.readlinkSync(current.config), "new-live-target");
+    if (change === "captured-bytes") {
+      assert.equal(fs.existsSync(current.config), false);
+      assert.equal(fs.readFileSync(quarantinePath(current), "utf8"), "foreign source must be restored\nchanged after intent\n");
+    }
+  });
+}
+
+test("foreign special capture is preserved without restoring or deleting it", async (t) => {
+  const current = transactionFixture(t); const child = startTransaction(current);
+  await stopAtPhase(child, "quarantine_intent");
+  fs.unlinkSync(current.config); fs.mkdirSync(current.config, { mode: 0o700 });
+  writeConfig(path.join(current.config, "foreign"), "special capture marker\n");
+  child.removeAllListeners("message"); const moved = stopAtPhase(child, "quarantine_moved");
+  process.kill(child.pid, "SIGCONT"); await moved;
+  process.kill(child.pid, "SIGKILL"); await once(child, "exit");
+  assert.notEqual(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 0);
+  assert.equal(fs.existsSync(current.config), false);
+  assert.equal(fs.readFileSync(path.join(quarantinePath(current), "foreign"), "utf8"), "special capture marker\n");
+  assert.equal(journal(current).status, "pending");
+});
+
+test("completed codex receipt grants no deletion authority over a changed retained original", (t) => {
+  const current = transactionFixture(t); const oldFd = fs.openSync(current.config, "r+");
+  t.after(() => fs.closeSync(oldFd));
+  assert.equal(spawnSync(process.execPath, current.args, { stdio: "ignore" }).status, 0);
+  fs.ftruncateSync(oldFd, 0); fs.writeSync(oldFd, "retained old FD edit\n", 0, "utf8"); fs.fsyncSync(oldFd);
+  const original = fs.fstatSync(oldFd, { bigint: true });
+  assert.equal(parseJournal(current).status, "complete");
+  const options = { repositoryRoot: current.root, now: Date.now() + 365 * 86400000 };
+  assert.equal(planRuntimePrune(options).candidates.journals.includes(path.basename(current.evidence)), false);
+  const result = applyRuntimePrune(options);
+  assert.equal(result.removed.journals, 0);
+  assert.equal(fs.statSync(quarantinePath(current), { bigint: true }).ino, original.ino);
+  assert.equal(fs.readFileSync(quarantinePath(current), "utf8"), "retained old FD edit\n");
 });

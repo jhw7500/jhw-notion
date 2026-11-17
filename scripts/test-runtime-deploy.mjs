@@ -42,6 +42,7 @@ test('explicit Codex config migration uses the current editor and retains exact 
  const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
  const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
  const config=path.join(f.home,'.codex/config.toml');const legacy=fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,'');write(f.home,'.codex/config.toml',legacy,0o600);
+ const oldFd=fs.openSync(config,'r+');t.after(()=>fs.closeSync(oldFd));
  const before=fs.statSync(config,{bigint:true});const result=await f.run(['--migrate-codex-config']);
  assert.equal(result.code,'DEPLOY_CODEX_CONFIG_MIGRATED');assert.equal(result.changed,true);assert.equal(result.inventory.before.clear,true);assert.equal(result.inventory.after.clear,true);
  assert.equal(spawnSync(process.execPath,[path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs'),'verify-codex-binding',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId]).status,0);
@@ -50,11 +51,55 @@ test('explicit Codex config migration uses the current editor and retains exact 
  assert.equal(state.kind,'codex-config');assert.equal(state.status,'complete');assert.equal(state.phase,'complete');assert.equal(state.outcome,'migrated');
  for(const name of ['state.json','before','after-copy',`${state.captures.source.name}/object`,`${state.captures.control.name}/state.json`])assert.equal(fs.statSync(path.join(journal,name)).mode&0o7777,0o600);
  const after=fs.statSync(config,{bigint:true});assert.notEqual(after.ino,before.ino);const retry=await f.run(['--migrate-codex-config']);assert.equal(retry.changed,false);const byteIdenticalAfter=fs.statSync(config,{bigint:true});assert.deepEqual({ino:byteIdenticalAfter.ino,mtimeNs:byteIdenticalAfter.mtimeNs},{ino:after.ino,mtimeNs:after.mtimeNs});
+ fs.writeSync(oldFd,'# completed old FD write\n',0,'utf8');fs.fsyncSync(oldFd);
  fs.appendFileSync(config,'# normal user edit after migration\n');
  assert.equal((await f.run(['--status'])).recoveryPending,0);
  assert.equal((await f.run(['--migrate-codex-config'])).changed,false);
  assert.equal((await f.run(['--prepare'])).code,'DEPLOY_PREPARED');
 });
+
+async function stopCodexEditorAt(child,phase) {
+ let listener;
+ await new Promise((resolve,reject)=>{
+  const onExit=(code,signal)=>reject(new Error(`editor exited before ${phase}: ${code??signal}`));child.once('exit',onExit);
+  listener=async message=>{
+   try {
+    let stopped=false;
+    for(let attempt=0;attempt<1000;attempt++) {
+     if(/^State:\s+T/m.test(fs.readFileSync(`/proc/${child.pid}/status`,'utf8'))){stopped=true;break;}
+     await new Promise(done=>setTimeout(done,1));
+    }
+    if(!stopped)throw new Error('editor checkpoint did not stop');
+    if(message.phase===phase){child.off('exit',onExit);resolve();}else process.kill(child.pid,'SIGCONT');
+   }catch(error){reject(error);}
+  };child.on('message',listener);
+ });
+ return ()=>child.off('message',listener);
+}
+
+for(const boundary of ['quarantine_moved','foreign_restore_intent','foreign_restore_linked']) {
+ test(`public Codex retry restores foreign capture after ${boundary} without completing migration`,async t=>{
+  const f=fixture(t);host(f);for(const name of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,name),{recursive:true,mode:0o700});
+  const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
+  const config=path.join(f.home,'.codex/config.toml');const before=fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,'');write(f.home,'.codex/config.toml',before,0o600);
+  const journals=path.join(f.root,'.jhw-runtime/v2/journals');fs.mkdirSync(journals,{recursive:true,mode:0o700});
+  const evidence=path.join(journals,'d-00000000000000000000000000000000');fs.mkdirSync(evidence,{mode:0o700});
+  const args=[path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs'),'migrate-codex-binding-transaction',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId,evidence];
+  const children=new Set();t.after(async()=>{for(const child of children){if(child.exitCode===null&&child.signalCode===null){const closed=once(child,'exit');child.kill('SIGKILL');await closed;}}});
+  const start=()=>{const child=spawn(process.execPath,args,{stdio:['ignore','ignore','ignore','ipc']});children.add(child);child.once('exit',()=>children.delete(child));return child;};
+  const child=start();const detach=await stopCodexEditorAt(child,'quarantine_intent');
+  const replacement=write(f.home,'foreign-config','foreign public recovery\n',0o600);const foreign=fs.statSync(replacement,{bigint:true});fs.renameSync(replacement,config);
+  detach();const moved=stopCodexEditorAt(child,'quarantine_moved');process.kill(child.pid,'SIGCONT');await moved;
+  process.kill(child.pid,'SIGKILL');await once(child,'exit');
+  if(boundary!=='quarantine_moved') {const retry=start();await stopCodexEditorAt(retry,boundary);process.kill(retry.pid,'SIGKILL');await once(retry,'exit');}
+  assert.equal((await f.run(['--status'])).recoveryPending,1);
+  await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'codex_config_migration_pending'});
+  const restored=fs.statSync(config,{bigint:true});assert.equal(restored.dev,foreign.dev);assert.equal(restored.ino,foreign.ino);
+  assert.equal(fs.readFileSync(config,'utf8'),'foreign public recovery\n');
+  const state=readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:evidence}).state;assert.equal(state.status,'pending');assert.equal(state.phase,'ambiguous');
+  assert.equal(fs.readFileSync(path.join(evidence,'before'),'utf8'),before);
+ });
+}
 
 test('Codex migration rejects a mismatched shared journal reader before mutation',async t=>{
  const f=fixture(t);host(f);for(const name of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,name),{recursive:true,mode:0o700});

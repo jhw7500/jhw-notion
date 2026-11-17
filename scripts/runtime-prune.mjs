@@ -134,7 +134,7 @@ function validObservedCodexObject(value) {
  return value?.kind==='special'&&exact(value,['kind','identity'])&&validObservedIdentity(value.identity);
 }
 const CODEX_PHASES = ['prepared','quarantine_intent','quarantined','publish_intent','published',
- 'restore_intent','quarantine_retire_intent','temp_capture_intent','temp_retire_intent','verified','ambiguous','complete'];
+ 'foreign_restore_intent','restore_intent','quarantine_retire_intent','temp_capture_intent','temp_retire_intent','verified','ambiguous','complete'];
 const CODEX_OUTCOMES = ['migrated','unchanged','restored-before'];
 function validCodexCapture(value) {
  return exact(value,['name','identity']) && /^capture-[a-f0-9]{32}$/.test(value.name ?? '') &&
@@ -154,6 +154,9 @@ function validCodexJournalState(state) {
  if(state.status==='complete') return state.phase==='complete' && CODEX_OUTCOMES.includes(state.outcome) && state.resolution===state.outcome && state.observed===null;
  if(state.phase==='complete' || state.outcome!==null) return false;
  if(state.phase==='ambiguous') return state.observed!==null;
+ if(state.phase==='foreign_restore_intent') return state.resolution===null && state.observed!==null &&
+  state.observed.live===null && state.observed.capturedAfter===null &&
+  ['file','symlink'].includes(state.observed.quarantine?.kind) && state.observed.quarantine.identity.nlink===1;
  if(state.observed!==null) return false;
  if(['restore_intent','quarantine_retire_intent'].includes(state.phase)) return state.resolution==='restored-before';
  if(['temp_capture_intent','temp_retire_intent','verified'].includes(state.phase)) return CODEX_OUTCOMES.includes(state.resolution);
@@ -187,6 +190,15 @@ export function readObservedCodexObject(file) {
 const codexObjectMatches=(actual,expected,links)=>actual?.kind==='file' && actual.sha256===expected.sha256 &&
  ['dev','ino','uid','mode','size'].every(key=>actual.identity[key]===expected.identity[key]) && links.includes(actual.identity.nlink);
 
+const sameCodexObservedObject=(actual,expected,links)=>actual!==null && expected!==null && links.includes(actual.identity.nlink) &&
+ canonical({...actual,identity:{...actual.identity,nlink:1}})===canonical({...expected,identity:{...expected.identity,nlink:1}});
+function foreignCodexCapture(state,objects) {
+ return ['quarantine_intent','quarantined','publish_intent'].includes(state.phase) && objects.live===null &&
+  ['file','symlink'].includes(objects.quarantine?.kind) && objects.quarantine.identity.nlink===1 &&
+  !codexObjectMatches(objects.quarantine,{identity:state.before.identity,sha256:state.before.sha256},[1]) &&
+  codexObjectMatches(objects.after,state.after,[1]) && objects.capturedAfter===null;
+}
+
 // The worker and the public deploy/prune parser use this same actual-object table.
 // Intent phases admit both sides of exactly one syscall, including proven nlink=2.
 function codexStageMatches(state,objects) {
@@ -208,6 +220,12 @@ function codexStageMatches(state,objects) {
   case 'quarantined': return !live&&q(1)&&a(1)&&!capturedAfter;
   case 'publish_intent': return (!live&&q(1)&&a(1)&&!capturedAfter)||published;
   case 'published': return published;
+  case 'foreign_restore_intent': {
+   const captured=state.observed.quarantine;
+   const beforeLink=!live&&sameCodexObservedObject(quarantine,captured,[1]);
+   const afterLink=sameCodexObservedObject(live,captured,[2])&&sameCodexObservedObject(quarantine,captured,[2]);
+   return (beforeLink||afterLink)&&a(1)&&!capturedAfter&&codexObjectMatches(state.observed.after,state.after,[1]);
+  }
   case 'restore_intent': return ((!live&&q(1))||(lb(2)&&q(2)))&&a(1)&&!capturedAfter;
   case 'quarantine_retire_intent': return ((lb(2)&&q(2))||(lb(1)&&!quarantine))&&a(1)&&!capturedAfter;
   case 'temp_capture_intent': {
@@ -219,9 +237,6 @@ function codexStageMatches(state,objects) {
    return !after&&((cleanupLive(links)&&c(links))||(finalLive&&restored&&!capturedAfter));
   }
   case 'verified': return finalLive&&restored&&!after&&!capturedAfter;
-  case 'complete':
-   // No live reads: immutable copies prove history; future edits are unrelated.
-   return !after&&!capturedAfter&&(state.outcome==='migrated'?q(1):!quarantine);
   case 'ambiguous': return canonical(objects)===canonical(Object.fromEntries(Object.entries(state.observed).filter(([key])=>key!=='reason')));
   default: return false;
  }
@@ -249,6 +264,13 @@ export function readCodexMigrationJournal({journalDirectory}) {
    const copy=readCodexObject(journal.at(name));
    if(!codexObjectMatches({kind:'file',identity:codexIdentity(copy.info),sha256:digest(copy.bytes)}, {identity:expected.copy,sha256:expected.sha256},[1])) fail('unverified_journal');
   }
+  // Completion proves historical success only. Mutable live/capture objects are
+  // not evidence for that claim and are not opened, hashed or link-counted here.
+  // GC must obtain separate actual-object inventory before authorizing removal.
+  if(state.status==='complete') {
+   control.verify();journal.verify();
+   return {state,objects:null,record,classification:'complete'};
+  }
   const paths={};
   for(const key of ['source','temp']) {
    const expected=state.captures[key];
@@ -256,12 +278,14 @@ export function readCodexMigrationJournal({journalDirectory}) {
    if(!sameIdentity(capture.stat,expected.identity) || fs.readdirSync(`/proc/self/fd/${capture.fd}`).some(name=>name!=='object'))fail('unverified_journal');
    paths[key]=capture.at('object');
   }
-  const objects={live:state.status==='complete'?null:readObservedCodexObject(state.config),
+  const objects={live:readObservedCodexObject(state.config),
    quarantine:readObservedCodexObject(paths.source),after:readObservedCodexObject(journal.at('after')),
    capturedAfter:readObservedCodexObject(paths.temp)};
-  if(!codexStageMatches(state,objects))fail('unverified_journal');
+  const classification=foreignCodexCapture(state,objects)?'foreign-capture':
+   state.phase==='foreign_restore_intent'?'foreign-restore':state.phase==='ambiguous'?'ambiguous':'active';
+  if(classification!=='foreign-capture'&&!codexStageMatches(state,objects))fail('unverified_journal');
   for(const capture of captures)capture.verify();control.verify();journal.verify();
-  return {state,objects,record};
+  return {state,objects,record,classification};
  } finally {for(const capture of captures)capture.close();control?.close();journal?.close();}
 }
 function verifyPairWitnessFiles({repositoryRoot,journalDirectory,state}) {
