@@ -74,6 +74,10 @@ test('pending Codex migration preserves reoccupation and blocks every other muta
  assert.equal((await f.run(['--status'])).recoveryPending,1);
  await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'codex_config_migration_pending'});
  await assert.rejects(f.run(['--activate',next.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ await assert.rejects(f.run(['--activate-compatible',next.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ await assert.rejects(f.run(['--prepare']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ await assert.rejects(f.run(['--prune']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
  assert.equal(fs.readFileSync(config,'utf8'),foreign);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,release.releaseId);
 });
 

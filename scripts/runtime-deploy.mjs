@@ -737,14 +737,15 @@ function reconcilePairJournals(repositoryRoot) {
   if(pending.length>1)fail('DEPLOY_RECOVERY_REQUIRED','multiple_pair_journals');
   return pending.length?reconcilePairJournal({repositoryRoot,journalDirectory:pending[0]}):null;
 }
-function pendingPairJournalCount(repositoryRoot) {
-  const journals=path.join(repositoryRoot,'.jhw-runtime/v2/journals');if(!exists(journals))return 0;
-  let count=0;for(const name of fs.readdirSync(journals).filter(name=>/^d-[a-f0-9]{32}$/.test(name))){
-    try{if(readRuntimeJournalV2({repositoryRoot,journalDirectory:path.join(journals,name)}).state.status==='pending')count++;}
+function pendingRuntimeJournals(repositoryRoot) {
+  const journals=path.join(repositoryRoot,'.jhw-runtime/v2/journals');if(!exists(journals))return [];
+  const pending=[];for(const name of fs.readdirSync(journals).filter(name=>/^d-[a-f0-9]{32}$/.test(name))){
+    try{const state=readRuntimeJournalV2({repositoryRoot,journalDirectory:path.join(journals,name)}).state;if(state.status==='pending')pending.push({name,kind:state.kind});}
     catch{fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_unverified');}
   }
-  return count;
+  return pending;
 }
+function pendingPairJournalCount(repositoryRoot) {return pendingRuntimeJournals(repositoryRoot).length;}
 
 export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId,rollback=false,phaseRunner=wiringPhase,phaseTimeoutMs=45000}) {
   const runtime=path.join(repositoryRoot,'.jhw-runtime');
@@ -1047,8 +1048,11 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
  const runtime=path.join(repositoryRoot,'.jhw-runtime');
- if(exists(runtime)&&!['status','migrate-codex-config','prune'].includes(command.operation)&&pendingPairJournalCount(repositoryRoot)>0)
-  fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
+ if(exists(runtime)&&!['status','migrate-codex-config','prune'].includes(command.operation)) {
+  const pendingV2=pendingRuntimeJournals(repositoryRoot);
+  const pairRecoveryOwner=['activate-compatible','rollback'].includes(command.operation)&&pendingV2.length>0&&pendingV2.every(item=>item.kind==='pair');
+  if(pendingV2.length&&!pairRecoveryOwner)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
+ }
  if(command.operation==='migrate-codex-config') {
   const before=requireQuiescence(inventoryOptions);let writer;let admission;
   try {
