@@ -5,7 +5,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 
 import {DeploymentError, trustedDirectory, trustedFile} from './runtime-safety.mjs';
-import {isActivationSnapshot} from './runtime-store.mjs';
+import {isActivationSnapshot, readMigrationAnchor, validMigrationGuardSeal} from './runtime-store.mjs';
 
 export const GUARD_TRANSITION_PATHS = Object.freeze([
   '.config/jhw-control/guard-policy.json',
@@ -16,6 +16,8 @@ export const GUARD_TRANSITION_PATHS = Object.freeze([
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
 const ACTIVATION = /^a-[a-f0-9]{32}$/;
 const JOURNAL = /^\.deploy\.[a-f0-9]{32}$/;
+const MIGRATION = /^m-[a-f0-9]{32}$/;
+const MIGRATION_JOURNAL = /^(?:\.candidate\.|d-)[a-f0-9]{32}$/;
 const POLICY_TRANSACTION = /^\.guard-policy\.json\.jhw-txn\.[A-Za-z0-9._-]{1,128}$/;
 const FILE_LIMIT = 128 * 1024;
 const EVIDENCE_LIMIT = 4 * 1024 * 1024;
@@ -53,6 +55,74 @@ function pinnedDirectory(directory) {
 
 function digest(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function stableDirectoryIdentity(stat) {
+  return {dev: String(stat.dev), ino: String(stat.ino), uid: Number(stat.uid), gid: Number(stat.gid),
+    mode: Number(stat.mode & 0o7777n)};
+}
+
+function validStableDirectoryIdentity(value) {
+  return exact(value, ['dev', 'ino', 'uid', 'gid', 'mode']) && /^\d+$/.test(value.dev) && /^\d+$/.test(value.ino) &&
+    Number.isInteger(value.uid) && Number.isInteger(value.gid) && value.mode === 0o700;
+}
+
+function evidenceFileProof(journalDirectory) {
+  const directory = pinnedDirectory(journalDirectory);
+  let fd;
+  try {
+    const file = directory.at('before.json');
+    const named = fs.lstatSync(file, {bigint: true});
+    if (!named.isFile() || named.uid !== BigInt(process.getuid()) || named.nlink !== 1n ||
+        (named.mode & 0o7777n) !== 0o600n || named.size > BigInt(EVIDENCE_LIMIT)) fail('guard_evidence_invalid');
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const opened = fs.fstatSync(fd, {bigint: true});
+    if (!sameIdentity(named, opened)) fail('guard_evidence_changed');
+    const bytes = fs.readFileSync(fd);
+    const after = fs.fstatSync(fd, {bigint: true});
+    const final = fs.lstatSync(file, {bigint: true});
+    directory.verify();
+    if (bytes.length !== Number(named.size) || !sameIdentity(named, after) || !sameIdentity(named, final)) {
+      fail('guard_evidence_changed');
+    }
+    return {dev: String(named.dev), ino: String(named.ino), uid: Number(named.uid), gid: Number(named.gid),
+      mode: Number(named.mode & 0o7777n), nlink: Number(named.nlink), size: Number(named.size),
+      ctimeNs: String(named.ctimeNs), mtimeNs: String(named.mtimeNs), sha256: digest(bytes)};
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    directory.close();
+  }
+}
+
+function validEvidenceFileProof(value) {
+  return exact(value, ['dev', 'ino', 'uid', 'gid', 'mode', 'nlink', 'size', 'ctimeNs', 'mtimeNs', 'sha256']) &&
+    /^\d+$/.test(value.dev) && /^\d+$/.test(value.ino) && Number.isInteger(value.uid) && Number.isInteger(value.gid) &&
+    value.mode === 0o600 && value.nlink === 1 && Number.isInteger(value.size) && value.size > 0 &&
+    value.size <= EVIDENCE_LIMIT && /^\d+$/.test(value.ctimeNs) && /^\d+$/.test(value.mtimeNs) &&
+    /^[a-f0-9]{64}$/.test(value.sha256);
+}
+
+function sameJson(left, right) {
+  const canonical = value => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` :
+    value !== null && typeof value === 'object' ?
+      `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` :
+      JSON.stringify(value);
+  return canonical(left) === canonical(right);
+}
+
+function requireMigrationJournal({repositoryRoot, journalDirectory}) {
+  if (typeof repositoryRoot !== 'string' || !path.isAbsolute(repositoryRoot) || path.resolve(repositoryRoot) !== repositoryRoot ||
+      typeof journalDirectory !== 'string' || path.dirname(journalDirectory) !== path.join(repositoryRoot, '.jhw-runtime/v2/journals') ||
+      !MIGRATION_JOURNAL.test(path.basename(journalDirectory))) fail('guard_rollback_coordinates');
+  return pinnedDirectory(journalDirectory);
+}
+
+export function validMigrationGuardReference(value) {
+  return exact(value, ['version', 'kind', 'migrationId', 'guard', 'forward']) && value.version === 1 &&
+    value.kind === 'migration-guard-rollback' && MIGRATION.test(value.migrationId) &&
+    exact(value.guard, ['name', 'identity']) && value.guard.name === 'guard' &&
+    validStableDirectoryIdentity(value.guard.identity) && exact(value.forward, ['journal', 'evidence']) &&
+    JOURNAL.test(value.forward.journal) && validEvidenceFileProof(value.forward.evidence);
 }
 
 function snapshotFile(home, relative) {
@@ -487,21 +557,107 @@ function requireReverse(journalDirectory, options) {
   return evidence;
 }
 
+function reverseEvidence(forward, sourceActivationId, destinationActivationId) {
+  return {
+    version: 1, kind: 'guard-observe-transition', direction: 'reverse', scope: 'finalized-transition', status: 'prepared',
+    source_activation_id: sourceActivationId, destination_activation_id: destinationActivationId,
+    forward_journal: '',
+    entries: forward.entries.map(entry => ({path: entry.path, preimage: entry.preimage,
+      published: entry.published, progress: 'pending'})),
+  };
+}
+
 export function prepareGuardRollbackEvidence({forwardJournalDirectory, rollbackJournalDirectory,
   sourceActivationId, destinationActivationId}) {
   const forward = requireForward(forwardJournalDirectory);
   if (path.dirname(forwardJournalDirectory) !== path.dirname(rollbackJournalDirectory) ||
       forward.status !== 'finalized' || sourceActivationId !== forward.destination_activation_id ||
       destinationActivationId !== forward.origin.activationId) fail('guard_rollback_coordinates');
-  const evidence = {
-    version: 1, kind: 'guard-observe-transition', direction: 'reverse', scope: 'finalized-transition', status: 'prepared',
-    source_activation_id: sourceActivationId, destination_activation_id: destinationActivationId,
-    forward_journal: path.basename(forwardJournalDirectory),
-    entries: forward.entries.map(entry => ({path: entry.path, preimage: entry.preimage,
-      published: entry.published, progress: 'pending'})),
-  };
+  const evidence = reverseEvidence(forward, sourceActivationId, destinationActivationId);
+  evidence.forward_journal = path.basename(forwardJournalDirectory);
   atomicEvidenceWrite(rollbackJournalDirectory, evidence, true);
   return evidence;
+}
+
+function canonicalMigrationAnchor({repositoryRoot, anchor}) {
+  if (!anchor || anchor.repositoryRoot !== repositoryRoot || !MIGRATION.test(anchor.migrationId) ||
+      !anchor.reference) fail('guard_rollback_coordinates');
+  return readMigrationAnchor({repositoryRoot, migrationId: anchor.migrationId, expectedRef: anchor.reference});
+}
+
+function guardMigrationCoordinates(forward, anchor) {
+  return forward.status === 'finalized' &&
+    forward.destination_activation_id === anchor.preMigrationCurrent.activationId &&
+    forward.candidate_release_id === anchor.preMigrationCurrent.releaseId &&
+    forward.origin.activationId === anchor.legacyRollbackTarget.activationId &&
+    forward.origin.releaseId === anchor.legacyRollbackTarget.releaseId &&
+    forward.origin.predecessorActivationId === anchor.legacyRollbackTarget.predecessorActivationId;
+}
+
+function requireForwardAtProof(journalDirectory, expectedProof) {
+  if (!sameJson(evidenceFileProof(journalDirectory), expectedProof)) fail('guard_evidence_changed');
+  const forward = requireForward(journalDirectory);
+  if (!sameJson(evidenceFileProof(journalDirectory), expectedProof)) fail('guard_evidence_changed');
+  return forward;
+}
+
+export function sealMigrationGuardForward({repositoryRoot, journal, current, previous}) {
+  if(typeof journal!=='string'||!JOURNAL.test(journal))fail('guard_rollback_coordinates');
+  const directory=path.join(repositoryRoot,'.jhw-runtime',journal),parent=pinnedDirectory(directory);
+  try {
+    const evidence=evidenceFileProof(directory),forward=requireForwardAtProof(directory,evidence);
+    if(!guardMigrationCoordinates(forward,{preMigrationCurrent:current,legacyRollbackTarget:previous}))fail('guard_rollback_coordinates');
+    const reference={journal,directory:stableDirectoryIdentity(fs.fstatSync(parent.fd,{bigint:true})),evidence};
+    parent.verify();if(!validMigrationGuardSeal(reference))fail('guard_evidence_invalid');return reference;
+  }finally{parent.close();}
+}
+
+function requireSealedMigrationGuard(repositoryRoot,anchor) {
+  const reference=anchor.guard;
+  if(!validMigrationGuardSeal(reference)||reference===null)fail('guard_evidence_invalid');
+  const journalDirectory=path.join(repositoryRoot,'.jhw-runtime',reference.journal),directory=pinnedDirectory(journalDirectory);
+  try {
+    if(!sameJson(stableDirectoryIdentity(fs.fstatSync(directory.fd,{bigint:true})),reference.directory))fail('guard_evidence_changed');
+    const evidence=requireForwardAtProof(journalDirectory,reference.evidence);
+    if(!guardMigrationCoordinates(evidence,anchor))fail('guard_rollback_coordinates');
+    directory.verify();return {journalDirectory,evidence};
+  }finally{directory.close();}
+}
+
+export function prepareMigrationGuardRollback({repositoryRoot, journalDirectory, anchor}) {
+  const journal = requireMigrationJournal({repositoryRoot, journalDirectory});
+  journal.close();
+  const canonicalAnchor = canonicalMigrationAnchor({repositoryRoot, anchor});
+  if (canonicalAnchor.guard === null) return null;
+  const match = requireSealedMigrationGuard(repositoryRoot,canonicalAnchor);
+  const forwardProof = canonicalAnchor.guard.evidence;
+  const forward = requireForwardAtProof(match.journalDirectory, forwardProof);
+  if (!sameJson(forward, match.evidence)) fail('guard_evidence_changed');
+  if (!guardMigrationCoordinates(forward, canonicalAnchor)) fail('guard_rollback_coordinates');
+  const parent = requireMigrationJournal({repositoryRoot, journalDirectory});
+  const guardName = 'guard';
+  try {
+    try { fs.mkdirSync(parent.at(guardName), {mode: 0o700}); }
+    catch (cause) { if (cause?.code === 'EEXIST') fail('guard_rollback_coordinates'); throw cause; }
+    fs.chmodSync(parent.at(guardName), 0o700);
+    fs.fsyncSync(parent.fd);
+    parent.verify();
+  } finally { parent.close(); }
+  const guardDirectory = path.join(journalDirectory, guardName);
+  const evidence = reverseEvidence(forward, canonicalAnchor.preMigrationCurrent.activationId,
+    canonicalAnchor.legacyRollbackTarget.activationId);
+  evidence.forward_journal = path.basename(match.journalDirectory);
+  atomicEvidenceWrite(guardDirectory, evidence, true);
+  requireForwardAtProof(match.journalDirectory, forwardProof);
+  const guard = pinnedDirectory(guardDirectory);
+  let identity;
+  try { identity = stableDirectoryIdentity(fs.fstatSync(guard.fd, {bigint: true})); guard.verify(); }
+  finally { guard.close(); }
+  const reference = {version: 1, kind: 'migration-guard-rollback', migrationId: canonicalAnchor.migrationId,
+    guard: {name: guardName, identity},
+    forward: {journal: path.basename(match.journalDirectory), evidence: forwardProof}};
+  if (!validMigrationGuardReference(reference)) fail('guard_evidence_invalid');
+  return reference;
 }
 
 export function prepareIncompleteGuardRollbackEvidence({forwardJournalDirectory, rollbackJournalDirectory,
@@ -667,9 +823,8 @@ function synchronizePreimage(home, entry) {
   } finally { parent.close(); }
 }
 
-export function restoreGuardRollbackEvidence({home, journalDirectory, faultInjector = () => {}}) {
+function restoreGuardRollbackEvidenceInternal({home, journalDirectory, forward, faultInjector = () => {}}) {
   let evidence = requireReverse(journalDirectory);
-  const forward = requireForward(path.join(path.dirname(journalDirectory), evidence.forward_journal));
   requireHomeIdentity(home, forward.home);
   const finalizedCoordinates = evidence.scope === 'finalized-transition' && forward.status === 'finalized' &&
     evidence.source_activation_id === forward.destination_activation_id;
@@ -809,4 +964,33 @@ export function restoreGuardRollbackEvidence({home, journalDirectory, faultInjec
   evidence.status = 'restored';
   atomicEvidenceWrite(journalDirectory, evidence);
   return evidence;
+}
+
+export function restoreGuardRollbackEvidence({home, journalDirectory, faultInjector = () => {}}) {
+  const evidence = requireReverse(journalDirectory);
+  const forward = requireForward(path.join(path.dirname(journalDirectory), evidence.forward_journal));
+  return restoreGuardRollbackEvidenceInternal({home, journalDirectory, forward, faultInjector});
+}
+
+export function restoreMigrationGuardRollback({repositoryRoot, home, journalDirectory, anchor, reference,
+  faultInjector = () => {}}) {
+  if (!validMigrationGuardReference(reference)) fail('guard_rollback_coordinates');
+  const canonicalAnchor = canonicalMigrationAnchor({repositoryRoot, anchor});
+  if (reference.migrationId !== canonicalAnchor.migrationId) fail('guard_rollback_coordinates');
+  if(canonicalAnchor.guard===null||!sameJson(reference.forward,{journal:canonicalAnchor.guard.journal,evidence:canonicalAnchor.guard.evidence}))fail('guard_evidence_changed');
+  const sealed=requireSealedMigrationGuard(repositoryRoot,canonicalAnchor);
+  const journal = requireMigrationJournal({repositoryRoot, journalDirectory});
+  let guard;
+  try {
+    guard = pinnedDirectory(path.join(journalDirectory, reference.guard.name));
+    const identity = stableDirectoryIdentity(fs.fstatSync(guard.fd, {bigint: true}));
+    guard.verify(); journal.verify();
+    if (!sameJson(identity, reference.guard.identity)) fail('guard_evidence_changed');
+  } finally { guard?.close(); journal.close(); }
+  const guardDirectory = path.join(journalDirectory, reference.guard.name);
+  const forward = sealed.evidence;
+  if (!guardMigrationCoordinates(forward, canonicalAnchor)) fail('guard_rollback_coordinates');
+  const result = restoreGuardRollbackEvidenceInternal({home, journalDirectory: guardDirectory, forward, faultInjector});
+  requireSealedMigrationGuard(repositoryRoot,canonicalAnchor);
+  return result;
 }

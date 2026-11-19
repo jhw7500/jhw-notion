@@ -336,6 +336,13 @@ current를 바꾸기 전에 거부한다. 재구성된 lease는 새 inode이며 
 managed v1의 일반 activate는 pointer-only 의미를 유지한다. B는 이 중간 상태를 위해 v1
 activation/session/token 판독·실행도 지원해야 하며, generation2 선언만으로 v2 token을 강제하지 않는다.
 초기 v2 신규 설치는 기존 최초 wire 단계에서 v2 router/pair를 바로 생성하고 위 legacy 이행은 생략한다.
+신규 설치의 복구 owner는 `initial-install` v2 journal 하나다. v1 worker의 기존 state/KEYS/phase와
+before/listings/logs는 이 journal의 고정 `wiring` 자식에 두고, 전체 자료를 비공개 candidate에서
+준비한 뒤 NOREPLACE로 함께 공개한다. 별도 top-level v1 pending journal을 먼저 만들지 않는다.
+공개 전 실패·중단은 live bootstrap/current/HOME을 바꾸지 않으며 비공개 자료를 보존한 채 새
+activate를 시작할 수 있다. 공개 후에는 동일 release의 activate가 그 owner만 복구한다.
+wiring 자식의 완료와 owner 완료 사이에서 중단돼도 같은 owner가 검증을 재개한다. parser는 자식의
+identity, before/listings 봉인, worker state/logs와 restore scratch를 닫힌 형식으로 검증한다.
 
 activate 실패는 기존 복구 계약을 따른다. config 이행이 pending이면 같은 명령으로 먼저 복구하고
 다른 mutation은 거부한다. config 이행 성공 후 bootstrap 이행이 실패해도 additive env 설정은 유지한다.
@@ -347,6 +354,10 @@ manifest/bytes/identity와 복구 복사본, 새 router/세대, 최초 v2 activa
 legacyRollbackTarget은 destination이 preMigrationCurrent와 정확히 일치하는 **성공한 activate B
 journal의 origin과 receipt**로 증명한다. 임의의 이전 디렉터리·mtime으로 추정하지 않으며 증명이 없으면
 refresh는 변경 전에 거부한다. 첫 v2 activation은 이 anchor의 migrationId와 상호 참조한다.
+성공한 activate B가 guard 전환을 포함했는지도 anchor에 `null | sealed reference`로 봉인한다.
+reference는 원래 journal 이름·디렉터리 identity와 finalized forward evidence의 identity/hash다.
+guard가 있었던 이행은 rollback 때 이 증거의 누락·이동·교체·수정을 mutation 전에 거부하며,
+원래 guard 전환이 없었다고 봉인된 경우에만 guard 복원을 생략한다.
 anchor와 이전 bootstrap/router 복구 재료는 이번 범위에서 영구 보존한다. 별도 finalize 명령은 없다.
 
 이행 journal은 anchor identity/hash와 다음 상태를 가진 닫힌 별도 schema다:
@@ -364,6 +375,10 @@ MCP validation에 admission을 풀어야 하는 구간은 기존 maintenance 계
 
 완료된 최초 v2 activation에서 predecessor=null, migrationId가 있으면 기존 `--rollback`이
 anchor의 legacyRollbackTarget A와 원래 bootstrap을 선택한다. 별도 rollback 명령은 추가하지 않는다.
+이때 migrationId와 최초 activationId에 대응하는 완료된 upgrade journal을 유일하게 찾고,
+그 receipt가 검증한 state의 anchor identity/hash를 다시 요구한다. 현재 anchor에서 새로 읽은
+identity/hash만으로 권한을 갱신하지 않는다. owner 부재·중복·미완료·receipt 불일치와 anchor 변경은
+bootstrap/current 변경 전에 거부한다.
 이 v1 복원은 정지 상태에서만 지원하며 live v2 root/invocation 또는 orphan lease가 있으면 거부한다.
 뒤의 v2 C에서 rollback하면 먼저 v2 B로 돌아가고, B에서 다시 rollback할 때 위 정지 경계가 적용된다.
 신규 v2 설치처럼 predecessor/migrationId 모두 null이면 rollback 대상 없음으로 거부한다.

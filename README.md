@@ -22,6 +22,14 @@ Notion AI Workspace를 여러 AI TUI에서 사용할 수 있는 MCP 서버.
 Node.js 22 이상이 필요하다. Node가 없거나 22보다 오래되면 다른 module을 읽기 전에
 `DEPLOY_NODE_UNSUPPORTED`로 끝난다.
 
+v2 최초 설치·bootstrap 이행·legacy rollback에는 `/usr/bin/python3`의 표준 `ctypes`와
+Linux/libc의 `renameat2(RENAME_NOREPLACE, RENAME_EXCHANGE)` 지원도 필요하다.
+유지보수 명령은 live bootstrap/current를 바꾸기 전에 같은 파일시스템에서 두 연산을 확인한다.
+지원하지 않으면 일반 rename으로 우회하지 않는다. 실행 가능한 Python을 임의 선택하거나
+pip/npm 패키지를 추가하지 않으며, 일반 MCP·hook 호출에는 이 보조 경로를 사용하지 않는다.
+검사에 사용한 두 nonce 디렉터리(`.jhw-atomic-source-*`, `.jhw-atomic-destination-*`)는
+경합 중 들어온 외부 객체를 삭제하지 않도록 남겨 둔다. 자동 정리 대상이 아니다.
+
 ```bash
 git clone https://github.com/jhw7500/jhw-notion.git
 cd jhw-notion
@@ -227,11 +235,14 @@ deployment journal은 자동 삭제하지 않는다. stage와 private evidence�
 설계 근거는 [배포 재획득 정책](docs/deployment-reacquisition-policy.md)에 기록한다.
 
 공개 성공 결과는 `DEPLOY_PREPARED`, `DEPLOY_STATUS`, `DEPLOY_ACTIVATED`,
-`DEPLOY_ROLLED_BACK`, `DEPLOY_UNINSTALLED`, `DEPLOY_BOOTSTRAP_REFRESHED` 중 하나와 bounded release/consumer 정보만
+`DEPLOY_ROLLED_BACK`, `DEPLOY_UNINSTALLED`, `DEPLOY_BOOTSTRAP_REFRESHED`,
+`DEPLOY_ACTIVATION_RESTORED` 중 하나와 bounded release/consumer 정보만
 포함한다. 오류도 PID, argv, 환경변수, 절대 경로, Task/session 좌표를 내보내지 않는다.
 
 | 진단 | operator 조치 |
 |---|---|
+| `DEPLOY_ATOMIC_RENAME_UNSUPPORTED`, `DEPLOY_ATOMIC_RENAME_HELPER_FAILED` | Python3 경로·권한과 libc/kernel의 두 renameat2 연산 지원을 확인한다. 지원 검사 실패 시 live bootstrap/current는 변경하지 않는다. 진행 중 실행 실패라면 journal을 보존하고 동일 명령으로 복구한다. |
+| `DEPLOY_ATOMIC_DESTINATION_EXISTS`, `DEPLOY_ATOMIC_RENAME_FAILED`, `DEPLOY_ATOMIC_RENAME_INVALID` | 목적지·보존 슬롯·journal을 지우지 않고 객체 경합 또는 실행 오류를 조사한다. 처음 설치는 같은 release의 `--activate`, 이행은 `--refresh-bootstrap`, legacy 복원은 `--rollback`이 해당 journal의 복구 명령이다. |
 | `DEPLOY_CONSUMERS_ACTIVE`, `DEPLOY_INVENTORY_UNCERTAIN` | TUI와 app server를 시작하지 못하게 유지하고 supported consumer 또는 `/proc` 관측 불확실성을 해소한다. `--status`는 참고용이며 activation gate를 대체하지 않는다. |
 | `DEPLOY_LOCK_CONTENDED`, managed entry의 `DEPLOY_MAINTENANCE` | 진행 중인 정상 작업이 끝나기를 기다린다. lock file을 지우거나 holder를 종료하지 않는다. |
 | `DEPLOY_SOURCE_INVALID`, `DEPLOY_SOURCE_CHANGED`, `DEPLOY_UNTRUSTED_PATH`, `DEPLOY_RELEASE_INVALID`, `DEPLOY_CURRENT_CHANGED` | 승인 revision의 전용 canonical trusted runtime checkout과 retained manifest/pointer를 검사한다. 임의 tree를 `chmod`하거나 trust 검사를 완화하지 않는다. |

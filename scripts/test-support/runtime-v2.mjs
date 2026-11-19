@@ -8,7 +8,8 @@ import {fileURLToPath} from 'node:url';
 import {prepareRelease, releaseCompatibility} from '../runtime-store.mjs';
 
 const scriptsRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const repositoryRoot = path.dirname(scriptsRoot);
+const repositoryRoot = process.env.JHW_RUNTIME_TEST_SOURCE_ROOT ?? path.dirname(scriptsRoot);
+if (!path.isAbsolute(repositoryRoot)) throw new Error('runtime test source root must be absolute');
 
 function checkedSpawn(command, args, options, label) {
   const result = spawnSync(command, args, {encoding:'utf8', maxBuffer:128*1024*1024, ...options});

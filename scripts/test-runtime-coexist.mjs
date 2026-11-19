@@ -74,7 +74,8 @@ function seedV2Current(f,pair,priorCurrent=null) {
   for(const name of ['mcp-server','scripts','skills'])fs.symlinkSync(`../../../releases/${pair.releaseId}/${name}`,path.join(activation,name));
   fs.symlinkSync(`../../bootstraps/${pair.bootstrapId}`,path.join(activation,'bootstrap'));
   const manifest={version:2,activationId,...pair,predecessorActivationId:priorCurrent?.activationId??null,migrationId:null,createdAt:new Date().toISOString(),priorCurrent};
-  write(activation,'manifest.json',JSON.stringify(manifest)+'\n',0o600);
+  const canonical=value=>Array.isArray(value)?value.map(canonical):value!==null&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
+  write(activation,'manifest.json',JSON.stringify(canonical(manifest))+'\n',0o600);
   const current=path.join(f.root,'.jhw-runtime/current');fs.unlinkSync(current);fs.symlinkSync(`v2/activations/${activationId}`,current);
   return readActivation({repositoryRoot:f.root});
 }

@@ -1,12 +1,35 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 
 const C = fs.constants;
 const MAX_ENTRIES = 32768;
 const MAX_ARGV_BYTES = 131072;
 const RECORD_BYTES = 65536;
 const issuedLeases = new WeakMap();
+const issuedAtomicCapabilities = new WeakMap();
+const PYTHON = '/usr/bin/python3';
+const ATOMIC_HELPER_TIMEOUT_MS = 5000;
+const ATOMIC_HELPER_OUTPUT_BYTES = 4096;
+const ATOMIC_HELPER = String.raw`import ctypes, errno, os, sys
+try:
+    operation = {'noreplace': 1, 'exchange': 2}[sys.argv[1]]
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(3, os.fsencode(sys.argv[2]), 4, os.fsencode(sys.argv[3]), operation)
+    if result == 0:
+        os.write(1, b'{"ok":true}\n')
+    else:
+        value = ctypes.get_errno()
+        os.write(1, ('{"ok":false,"errno":%d}\n' % value).encode('ascii'))
+except (AttributeError, KeyError):
+    os.write(1, ('{"ok":false,"errno":%d}\n' % errno.ENOSYS).encode('ascii'))
+except BaseException:
+    os.write(1, b'{"ok":false,"helper":"exception"}\n')
+`;
 
 /** Only stable, bounded identifiers cross the deployment error boundary. */
 export class DeploymentError extends Error {
@@ -166,6 +189,167 @@ export function validLeaseCapability(lease, file, { exclusive = false } = {}) {
       (held.mode & 0o7777) === 0o600;
   } catch { return false; }
   finally { chain?.close(); }
+}
+
+function atomicInvalid(reason) {
+  throw new DeploymentError('DEPLOY_ATOMIC_RENAME_INVALID', reason);
+}
+
+function atomicIdentity(stat) {
+  return { dev: stat.dev, ino: stat.ino, uid: stat.uid, gid: stat.gid, mode: stat.mode };
+}
+
+function sameAtomicIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.uid === right.uid &&
+    left.gid === right.gid && left.mode === right.mode;
+}
+
+function verifyAtomicDirectory(directory, expected, reason = 'directory') {
+  try {
+    if (!directory || !Number.isSafeInteger(directory.fd) || directory.fd < 0 || typeof directory.verify !== 'function') atomicInvalid(reason);
+    const before = fs.fstatSync(directory.fd);
+    if (!before.isDirectory() || before.uid !== process.getuid() || (before.mode & 0o7777) !== 0o700) atomicInvalid(reason);
+    directory.verify();
+    const after = fs.fstatSync(directory.fd);
+    const identity = atomicIdentity(after);
+    if (!sameAtomicIdentity(atomicIdentity(before), identity) || expected && !sameAtomicIdentity(expected, identity)) atomicInvalid(reason);
+    return identity;
+  } catch (error) {
+    if (error instanceof DeploymentError) throw error;
+    atomicInvalid(reason);
+  }
+}
+
+function atomicName(value) {
+  if (typeof value !== 'string' || value === '.' || value === '..' ||
+      !/^[A-Za-z0-9._-]+$/.test(value) || Buffer.byteLength(value) > 255) atomicInvalid('name');
+  return value;
+}
+
+function pythonProof() {
+  let chain;
+  try {
+    chain = directoryChain(path.dirname(PYTHON), 0, false);
+    const alias = fs.lstatSync(`/proc/self/fd/${chain.fd}/${path.basename(PYTHON)}`);
+    if (alias.uid !== 0 || !alias.isFile() && !alias.isSymbolicLink() ||
+        alias.isFile() && (alias.mode & 0o7022)) throw new Error();
+    chain.verify();
+    if (!sameObject(alias, fs.lstatSync(PYTHON))) throw new Error();
+    const resolved = fs.realpathSync(PYTHON);
+    if (!path.isAbsolute(resolved)) throw new Error();
+    const target = trustedFile(resolved, { uid: 0, executable: true });
+    return { alias: atomicIdentity(alias), resolved, target: atomicIdentity(target) };
+  } catch {
+    throw new DeploymentError('DEPLOY_ATOMIC_RENAME_HELPER_FAILED', 'spawn');
+  } finally { chain?.close(); }
+}
+
+function samePythonProof(left, right) {
+  return left.resolved === right.resolved && sameAtomicIdentity(left.alias, right.alias) &&
+    sameAtomicIdentity(left.target, right.target);
+}
+
+function runAtomicHelper({ sourceDirectory, destinationDirectory, sourceName, destinationName, operation }) {
+  const proof = pythonProof();
+  const result = spawnSync(PYTHON, ['-I', '-S', '-c', ATOMIC_HELPER, operation, sourceName, destinationName], {
+    encoding: 'utf8',
+    env: { LANG: 'C', LC_ALL: 'C' },
+    stdio: ['ignore', 'pipe', 'pipe', sourceDirectory.fd, destinationDirectory.fd],
+    timeout: ATOMIC_HELPER_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+    maxBuffer: ATOMIC_HELPER_OUTPUT_BYTES,
+  });
+  const finalProof = pythonProof();
+  if (!samePythonProof(proof, finalProof)) throw new DeploymentError('DEPLOY_ATOMIC_RENAME_HELPER_FAILED', 'spawn');
+  if (result.error) {
+    const reason = result.error.code === 'ETIMEDOUT' ? 'timeout' : result.error.code === 'ENOBUFS' ? 'output' : 'spawn';
+    throw new DeploymentError('DEPLOY_ATOMIC_RENAME_HELPER_FAILED', reason);
+  }
+  if (result.signal || result.status !== 0) throw new DeploymentError('DEPLOY_ATOMIC_RENAME_HELPER_FAILED', 'exit');
+  if (typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout) > 256 || result.stderr !== '') {
+    throw new DeploymentError('DEPLOY_ATOMIC_RENAME_HELPER_FAILED', 'output');
+  }
+  let response;
+  try { response = JSON.parse(result.stdout); }
+  catch { throw new DeploymentError('DEPLOY_ATOMIC_RENAME_HELPER_FAILED', 'protocol'); }
+  if (response && response.ok === true && Object.keys(response).length === 1) return;
+  if (response && response.ok === false && response.helper === 'exception' && Object.keys(response).length === 2) {
+    throw new DeploymentError('DEPLOY_ATOMIC_RENAME_HELPER_FAILED', 'helper');
+  }
+  if (!response || response.ok !== false || !Number.isInteger(response.errno) || response.errno < 1 || response.errno > 4095 ||
+      Object.keys(response).length !== 2) throw new DeploymentError('DEPLOY_ATOMIC_RENAME_HELPER_FAILED', 'protocol');
+  if ([38, 22, 95].includes(response.errno)) throw new DeploymentError('DEPLOY_ATOMIC_RENAME_UNSUPPORTED', operation);
+  if (operation === 'noreplace' && response.errno === 17) {
+    throw new DeploymentError('DEPLOY_ATOMIC_DESTINATION_EXISTS', 'destination_exists');
+  }
+  throw new DeploymentError('DEPLOY_ATOMIC_RENAME_FAILED', `errno_${response.errno}`);
+}
+
+function probeAtomicRename(directory) {
+  const nonce = randomBytes(16).toString('hex');
+  const sourceName = `.jhw-atomic-source-${nonce}`;
+  const destinationName = `.jhw-atomic-destination-${nonce}`;
+  const sourcePath = `/proc/self/fd/${directory.fd}/${sourceName}`;
+  const destinationPath = `/proc/self/fd/${directory.fd}/${destinationName}`;
+  fs.mkdirSync(sourcePath, 0o700);
+  fs.mkdirSync(destinationPath, 0o700);
+  fs.fsyncSync(directory.fd);
+  const source = atomicIdentity(fs.lstatSync(sourcePath));
+  const destination = atomicIdentity(fs.lstatSync(destinationPath));
+  assertProbeError(() => runAtomicHelper({ sourceDirectory: directory, destinationDirectory: directory, sourceName, destinationName, operation: 'noreplace' }));
+  if (!sameAtomicIdentity(source, atomicIdentity(fs.lstatSync(sourcePath))) ||
+      !sameAtomicIdentity(destination, atomicIdentity(fs.lstatSync(destinationPath)))) atomicInvalid('directory');
+  runAtomicHelper({ sourceDirectory: directory, destinationDirectory: directory, sourceName, destinationName, operation: 'exchange' });
+  fs.fsyncSync(directory.fd);
+  if (!sameAtomicIdentity(destination, atomicIdentity(fs.lstatSync(sourcePath))) ||
+      !sameAtomicIdentity(source, atomicIdentity(fs.lstatSync(destinationPath)))) atomicInvalid('directory');
+}
+
+function assertProbeError(operation) {
+  try { operation(); }
+  catch (error) {
+    if (error instanceof DeploymentError && error.code === 'DEPLOY_ATOMIC_DESTINATION_EXISTS') return;
+    throw error;
+  }
+  throw new DeploymentError('DEPLOY_ATOMIC_RENAME_UNSUPPORTED', 'noreplace');
+}
+
+/** Probe both required renameat2 operations before any caller live-name mutation. */
+export function prepareAtomicRename({ directory } = {}) {
+  const identity = verifyAtomicDirectory(directory);
+  probeAtomicRename(directory);
+  const finalIdentity = verifyAtomicDirectory(directory, identity);
+  const capability = Object.freeze({});
+  issuedAtomicCapabilities.set(capability, { directory, identity: finalIdentity });
+  return capability;
+}
+
+/** Execute only the two probed Linux renameat2 operations through retained parents. */
+export function atomicRename({ capability, sourceDirectory, destinationDirectory, sourceName, destinationName, operation } = {}) {
+  const state = issuedAtomicCapabilities.get(capability);
+  if (!state) atomicInvalid('capability');
+  verifyAtomicDirectory(state.directory, state.identity, 'capability');
+  if (operation !== 'noreplace' && operation !== 'exchange') atomicInvalid('operation');
+  const source = atomicName(sourceName);
+  const destination = atomicName(destinationName);
+  const sourceIdentity = verifyAtomicDirectory(sourceDirectory);
+  const destinationIdentity = verifyAtomicDirectory(destinationDirectory);
+  if (sourceIdentity.dev !== state.identity.dev || destinationIdentity.dev !== state.identity.dev) atomicInvalid('directory');
+  try {
+    runAtomicHelper({ sourceDirectory, destinationDirectory, sourceName: source, destinationName: destination, operation });
+  } catch (error) {
+    fs.fsyncSync(sourceDirectory.fd);
+    if (destinationDirectory.fd !== sourceDirectory.fd) fs.fsyncSync(destinationDirectory.fd);
+    verifyAtomicDirectory(sourceDirectory, sourceIdentity);
+    verifyAtomicDirectory(destinationDirectory, destinationIdentity);
+    verifyAtomicDirectory(state.directory, state.identity, 'capability');
+    throw error;
+  }
+  fs.fsyncSync(sourceDirectory.fd);
+  if (destinationDirectory.fd !== sourceDirectory.fd) fs.fsyncSync(destinationDirectory.fd);
+  verifyAtomicDirectory(sourceDirectory, sourceIdentity);
+  verifyAtomicDirectory(destinationDirectory, destinationIdentity);
+  verifyAtomicDirectory(state.directory, state.identity, 'capability');
 }
 
 function uncertain() { throw new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN'); }

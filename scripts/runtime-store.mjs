@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { DeploymentError, acquireLease, trustedDirectory, validLeaseCapability } from './runtime-safety.mjs';
+import { DeploymentError, acquireLease, trustedDirectory, validLeaseCapability, atomicRename } from './runtime-safety.mjs';
 
 const C = fs.constants;
 const RELEASE = /^r-([a-f0-9]{40}|[a-f0-9]{64})-([a-f0-9]{64})$/;
@@ -1078,7 +1078,7 @@ function preparePointerWitness({repositoryRoot,runtime,journalDirectory,temporar
   const expectedParent=path.join(repositoryRoot,'.jhw-runtime/v2/journals');
   if(typeof journalDirectory!=='string'||path.dirname(journalDirectory)!==expectedParent||
       !/^d-[a-f0-9]{32}$/.test(path.basename(journalDirectory)))fail('DEPLOY_ACTIVATION_INVALID');
-  let journal;let witness;let v2;let activations;let originActivation;let destinationActivation;
+  let journal;let witness;let v2;let activations;let legacyActivations;let originActivation;let destinationActivation;
   try {
     journal=new Directory(journalDirectory,null,true);
     if(names(journal).some(name=>name==='pointer-witness'))fail('DEPLOY_ACTIVATION_INVALID');
@@ -1090,19 +1090,20 @@ function preparePointerWitness({repositoryRoot,runtime,journalDirectory,temporar
     if(!source.isSymbolicLink()||!linked.isSymbolicLink()||String(source.dev)!==String(linked.dev)||String(source.ino)!==String(linked.ino)||
       target!==`v2/activations/${destination.activationId}`||names(witness).join(',')!=='current')fail('DEPLOY_ACTIVATION_INVALID');
     v2=runtime.child('v2',false,true);activations=v2.child('activations',false,true);
-    originActivation=activations.child(originProof.activationId,false,true);
+    legacyActivations=originProof?.version===1?runtime.child('activations',false,true):null;
+    if(originProof!==null)originActivation=(legacyActivations??activations).child(originProof.activationId,false,true);
     destinationActivation=activations.child(destination.activationId,false,true);
-    revalidateActivationDurableProof(originActivation,originProof.activation);
+    if(originProof!==null)revalidateActivationDurableProof(originActivation,originProof.activation);
     revalidateActivationDurableProof(destinationActivation,destinationProof);
     const descriptor=Object.freeze({
       directory:durableIdentity(fs.fstatSync(witness.fd,{bigint:true}),{times:true}),
       pointer:{...durableIdentity(linked),target},
-      origin:originProof.activation,
+      origin:originProof?.activation??null,
       destination:destinationProof,
     });
     return {descriptor,journal,witness};
   }catch(error){witness?.close();journal?.close();boundary(error,'DEPLOY_ACTIVATION_INVALID');}
-  finally{destinationActivation?.close();originActivation?.close();activations?.close();v2?.close();}
+  finally{destinationActivation?.close();originActivation?.close();legacyActivations?.close();activations?.close();v2?.close();}
 }
 function verifyPointerWitness({runtime,temporary,witness,descriptor,destination}) {
   witness.verify();
@@ -1116,17 +1117,252 @@ function verifyPointerWitness({runtime,temporary,witness,descriptor,destination}
     descriptor.pointer.target!==`v2/activations/${destination.activationId}`)fail('DEPLOY_ACTIVATION_INVALID');
 }
 
+// Stopped transitions retain the displaced current instead of destroying it.
+// The witness survives both sides of renameat2 and is never temporary cleanup.
+function transitionValue(value) {
+  if(value===null)return null;
+  return Object.fromEntries(Object.entries(value).filter(([key])=>key!=='observation'));
+}
+function transitionTarget(value) {
+  return `${value.version===2?'v2/activations':'activations'}/${value.activationId}`;
+}
+function transitionPointer(directory,name) {
+  let stat;
+  try{stat=fs.lstatSync(directory.at(name),{bigint:true});}catch(error){if(error.code==='ENOENT')return null;throw error;}
+  if(!stat.isSymbolicLink()||stat.uid!==BigInt(process.getuid()))fail('DEPLOY_CURRENT_CHANGED');
+  const target=fs.readlinkSync(directory.at(name));
+  if(!same(stat,fs.lstatSync(directory.at(name),{bigint:true})))fail('DEPLOY_CURRENT_CHANGED');
+  return {...durableIdentity(stat,{links:true}),target};
+}
+function transitionActivation(runtime,repositoryRoot,value) {
+  if(value===null)return null;
+  const version=value.version===2?2:1;
+  const manifest=activationIn(runtime,repositoryRoot,value.activationId,true,version);
+  const actual=version===2?destinationValue(manifest):{activationId:manifest.activationId,releaseId:manifest.releaseId,predecessorActivationId:manifest.predecessorActivationId};
+  if(canonical(actual)!==canonical(transitionValue(value)))fail('DEPLOY_ACTIVATION_INVALID');
+  let v2;let activations;let activation;
+  try{
+    if(version===2)v2=runtime.child('v2',false,true);
+    activations=(v2??runtime).child('activations',false,true);activation=activations.child(value.activationId,false,true);
+    return activationDurableProof(activation);
+  }finally{activation?.close();activations?.close();v2?.close();}
+}
+function transitionJournal(repositoryRoot,journalDirectory) {
+  if(typeof journalDirectory!=='string'||path.dirname(journalDirectory)!==path.join(repositoryRoot,'.jhw-runtime/v2/journals')||
+    !/^(?:d-|\.candidate\.)[a-f0-9]{32}$/.test(path.basename(journalDirectory)))fail('DEPLOY_ACTIVATION_INVALID');
+  return new Directory(journalDirectory,null,true);
+}
+/** Construct all durable publication evidence before exposing a transaction. */
+export function prepareTransitionPointer({repositoryRoot,journalDirectory,origin,destination,deployLease}) {
+  requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'),'DEPLOY_ACTIVATION_INVALID');
+  if(!validCurrent(origin)||!destination||!ACTIVATION.test(destination.activationId))fail('DEPLOY_ACTIVATION_INVALID');
+  let runtime;let journal;let witness;
+  try{
+    runtime=new Directory(path.join(repositoryRoot,'.jhw-runtime'),null,true);checkCurrent(runtime,repositoryRoot,origin);
+    const originActivation=transitionActivation(runtime,repositoryRoot,origin);
+    const destinationActivation=transitionActivation(runtime,repositoryRoot,destination);
+    const originPointer=transitionPointer(runtime,'current');
+    journal=transitionJournal(repositoryRoot,journalDirectory);
+    if(names(journal).includes('pointer-witness'))fail('DEPLOY_ACTIVATION_INVALID');
+    fs.mkdirSync(journal.at('pointer-witness'),{mode:0o700});fs.fsyncSync(journal.fd);
+    witness=journal.child('pointer-witness',false,true);
+    fs.symlinkSync(transitionTarget(destination),witness.at('slot'));
+    fs.linkSync(witness.at('slot'),witness.at('candidate'));fs.fsyncSync(witness.fd);fs.fsyncSync(journal.fd);
+    const pointer=transitionPointer(witness,'candidate');
+    if(canonical(pointer)!==canonical(transitionPointer(witness,'slot')))fail('DEPLOY_CURRENT_CHANGED');
+    checkCurrent(runtime,repositoryRoot,origin);
+    return {version:1,directory:durableIdentity(fs.fstatSync(witness.fd,{bigint:true})),pointer,originPointer,originActivation,destinationActivation};
+  }catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
+  finally{witness?.close();journal?.close();runtime?.close();}
+}
+function validTransitionIdentity(value,{mode,links=false,times=false}={}) {
+  return exact(value,['dev','ino','uid','mode',...(links?['nlink']:[]),...(times?['mtimeNs','ctimeNs']:[])])&&
+    ['dev','ino',...(times?['mtimeNs','ctimeNs']:[])].every(key=>typeof value[key]==='string'&&/^\d{1,32}$/.test(value[key]))&&
+    value.uid===process.getuid()&&value.mode===mode&&(!links||Number.isSafeInteger(value.nlink)&&value.nlink>=1&&value.nlink<=1024);
+}
+function validTransitionActivation(value) {
+  return exact(value,['directory','manifest'])&&validTransitionIdentity(value.directory,{mode:0o700,times:true})&&
+    exact(value.manifest,['dev','ino','uid','mode','nlink','mtimeNs','ctimeNs','sha256'])&&
+    validTransitionIdentity(Object.fromEntries(Object.entries(value.manifest).filter(([key])=>key!=='sha256')),{mode:0o600,links:true,times:true})&&
+    value.manifest.nlink===1&&DIGEST.test(value.manifest.sha256);
+}
+function validTransitionPointerValue(value,target) {
+  return exact(value,['dev','ino','uid','mode','nlink','target'])&&value.target===target&&
+    validTransitionIdentity(Object.fromEntries(Object.entries(value).filter(([key])=>key!=='target')),{mode:0o777,links:true});
+}
+export function validTransitionWitness(witness,origin,destination) {
+  return destination!==null&&exact(witness,['version','directory','pointer','originPointer','originActivation','destinationActivation'])&&
+    witness.version===1&&validTransitionIdentity(witness.directory,{mode:0o700})&&
+    validTransitionPointerValue(witness.pointer,transitionTarget(destination))&&witness.pointer.nlink===2&&
+    (origin===null?witness.originPointer===null&&witness.originActivation===null:
+      validTransitionPointerValue(witness.originPointer,transitionTarget(origin))&&validTransitionActivation(witness.originActivation))&&
+    validTransitionActivation(witness.destinationActivation);
+}
+/** Classify exact origin/destination, including the object actually displaced. */
+export function inspectTransitionPointer({repositoryRoot,journalDirectory,origin,destination,witness}) {
+  if(!validCurrent(origin)||!validTransitionWitness(witness,origin,destination))fail('DEPLOY_ACTIVATION_INVALID');
+  let runtime;let journal;let directory;
+  try{
+    runtime=new Directory(path.join(repositoryRoot,'.jhw-runtime'),null,true);journal=transitionJournal(repositoryRoot,journalDirectory);
+    directory=journal.child('pointer-witness',false,true);
+    if(canonical(durableIdentity(fs.fstatSync(directory.fd,{bigint:true})))!==canonical(witness.directory)||
+      canonical(transitionPointer(directory,'candidate'))!==canonical(witness.pointer)||
+      canonical(transitionActivation(runtime,repositoryRoot,origin))!==canonical(witness.originActivation)||
+      canonical(transitionActivation(runtime,repositoryRoot,destination))!==canonical(witness.destinationActivation))fail('DEPLOY_ACTIVATION_INVALID');
+    const current=transitionPointer(runtime,'current');const slot=transitionPointer(directory,'slot');const children=names(directory);
+    if(canonical(current)===canonical(witness.originPointer)&&canonical(slot)===canonical(witness.pointer)&&canonical(children)===canonical(['candidate','slot'])){
+      checkCurrent(runtime,repositoryRoot,origin);return {location:'origin',current:origin};
+    }
+    if(canonical(current)===canonical(witness.pointer)&&canonical(slot)===canonical(witness.originPointer)&&
+      canonical(children)===canonical(origin===null?['candidate']:['candidate','slot'])){
+      const published=currentIn(runtime,repositoryRoot);
+      if(canonical(transitionValue(published))!==canonical(destination))fail('DEPLOY_CURRENT_CHANGED');
+      return {location:'destination',current:published};
+    }
+    fail('DEPLOY_CURRENT_CHANGED');
+  }catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
+  finally{directory?.close();journal?.close();runtime?.close();}
+}
+export function publishTransitionPointer({repositoryRoot,journalDirectory,origin,destination,witness,
+    publicationLease,capability,runtimeHandle,observe}) {
+  requireLeaseIdentity(publicationLease,path.join(repositoryRoot,'.jhw-runtime/publication.lock'),'DEPLOY_ACTIVATION_INVALID');
+  const args={repositoryRoot,journalDirectory,origin,destination,witness};
+  if(inspectTransitionPointer(args).location!=='origin')fail('DEPLOY_CURRENT_CHANGED');
+  let runtime;let journal;let directory;
+  try{
+    runtime=new Directory(path.join(repositoryRoot,'.jhw-runtime'),null,true);runtimeHandle.verify();
+    if(canonical(durableIdentity(fs.fstatSync(runtime.fd,{bigint:true})))!==canonical(durableIdentity(fs.fstatSync(runtimeHandle.fd,{bigint:true}))))fail('DEPLOY_CURRENT_CHANGED');
+    journal=transitionJournal(repositoryRoot,journalDirectory);directory=journal.child('pointer-witness',false,true);
+    const result=observe?.('before_atomic_pointer');if(result?.then)fail('DEPLOY_ACTIVATION_INVALID');
+    atomicRename({capability,sourceDirectory:directory,destinationDirectory:runtimeHandle,sourceName:'slot',destinationName:'current',operation:origin===null?'noreplace':'exchange'});
+    const after=observe?.('after_atomic_pointer');if(after?.then)fail('DEPLOY_ACTIVATION_INVALID');
+    const observed=inspectTransitionPointer(args);if(observed.location!=='destination')fail('DEPLOY_CURRENT_CHANGED');
+    return observed.current;
+  }finally{directory?.close();journal?.close();runtime?.close();}
+}
+
 function closePreparedDestination(state) {
   if (state.closed) return;
   state.closed=true;
 }
 
-/** Prepare and fsync a complete v2 activation without changing current. Initial
- * v1 migration remains Task 8: this compatible publisher only accepts null or v2. */
-export function preparePairActivation({repositoryRoot,pair,expectedCurrent,migrationId=null,deployLease}) {
+const migrationAnchors=new WeakSet();
+function migrationObjectProof(tree) {
+  return tree.records.map(record=>({path:record.path,type:record.type,
+    identity:{...durableIdentity(record.stat,{times:true,links:true}),gid:Number(record.stat.gid),size:String(record.stat.size)},
+    ...(record.type==='directory'?{children:record.children}:record.type==='file'?{sha256:record.sha256}:{target:record.target})})).map(record=>{
+      if(record.path==='')delete record.identity.ctimeNs;
+      return record;
+    });
+}
+function migrationAnchorRef(migration) {
+  return {directory:durableIdentity(fs.fstatSync(migration.fd,{bigint:true}),{times:true}),
+    anchor:{...durableIdentity(fs.lstatSync(migration.at('anchor.json'),{bigint:true}),{times:true,links:true}),sha256:digest(readBytes(migration,'anchor.json',65536).bytes)}};
+}
+export function verifyMigrationOriginal({repositoryRoot,anchor,name}) {
+  if(!migrationAnchors.has(anchor)||anchor.repositoryRoot!==repositoryRoot||
+    !/^(?:bootstrap|\.bootstrap\.previous\.[a-f0-9]{32})$/.test(name))fail('DEPLOY_ACTIVATION_INVALID');
+  let directory;let tree;
+  try{directory=new Directory(path.join(repositoryRoot,'.jhw-runtime',name),null,true);tree=captureEvidenceTree(directory);
+    if(canonical(migrationObjectProof(tree))!==canonical(anchor.originalBootstrap.identity))fail('DEPLOY_BOOTSTRAP_CHANGED');
+    return true;
+  }finally{if(tree)closeEvidenceTree(tree);else directory?.close();}
+}
+function migrationTreeSnapshot(tree) {
+  return tree.records.map(record=>({path:record.path,type:record.type,mode:Number(record.stat.mode&0o7777n),
+    ...(record.type==='directory'?{children:record.children}:record.type==='file'?{sha256:record.sha256}:{target:record.target})}));
+}
+
+export function validMigrationGuardSeal(value) {
+  if(value===null)return true;
+  if(!exact(value,['journal','directory','evidence'])||typeof value.journal!=='string'||!/^\.deploy\.[a-f0-9]{32}$/.test(value.journal)||
+    !exact(value.directory,['dev','ino','uid','gid','mode'])||!exact(value.evidence,['dev','ino','uid','gid','mode','nlink','size','ctimeNs','mtimeNs','sha256']))return false;
+  const {directory,evidence}=value;
+  return [directory.dev,directory.ino,evidence.dev,evidence.ino,evidence.ctimeNs,evidence.mtimeNs].every(item=>typeof item==='string'&&/^\d+$/.test(item))&&
+    [directory,evidence].every(item=>Number.isSafeInteger(item.uid)&&item.uid===process.getuid()&&Number.isSafeInteger(item.gid)&&item.gid>=0)&&
+    directory.mode===0o700&&evidence.mode===0o600&&evidence.nlink===1&&Number.isSafeInteger(evidence.size)&&evidence.size>0&&evidence.size<=4*1024*1024&&
+    typeof evidence.sha256==='string'&&DIGEST.test(evidence.sha256);
+}
+
+export function prepareMigrationAnchor({repositoryRoot,migrationId,preMigrationCurrent,legacyRollbackTarget,
+    previousDirectory,router,pair,firstActivationId,legacyReceipt,guard,deployLease}) {
   requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'),'DEPLOY_ACTIVATION_INVALID');
-  if (!validRuntimePair(pair) || migrationId !== null ||
-      expectedCurrent !== null && !validV2Current(expectedCurrent)) fail('DEPLOY_ACTIVATION_INVALID');
+  if(!MIGRATION.test(migrationId)||!validV1Current(preMigrationCurrent)||preMigrationCurrent===null||
+    !validV1Current(legacyRollbackTarget)||legacyRollbackTarget===null||
+    preMigrationCurrent.predecessorActivationId!==legacyRollbackTarget.activationId||
+    typeof previousDirectory!=='string'||!/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(previousDirectory)||
+    !exact(router,['sourceReleaseId','routerContract'])||!RELEASE.test(router.sourceReleaseId)||router.routerContract!==1||
+    !validRuntimePair(pair)||!ACTIVATION.test(firstActivationId)||!validMigrationGuardSeal(guard)||!legacyReceipt||canonical(legacyReceipt.current)!==canonical(preMigrationCurrent)||canonical(legacyReceipt.previous)!==canonical(legacyRollbackTarget)||!DIGEST.test(legacyReceipt.receipt?.stateSha256)||guard!==null&&guard.journal!==legacyReceipt.journal)fail('DEPLOY_ACTIVATION_INVALID');
+  let root;let runtime;let source;let sourceTree;let v2;let migrations;let migration;let backup;let backupTree;
+  try {
+    root=new Directory(repositoryRoot);runtime=root.child('.jhw-runtime',false,true);
+    checkCurrent(runtime,repositoryRoot,preMigrationCurrent);
+    source=runtime.child('bootstrap',false,true);sourceTree=captureEvidenceTree(source);
+    const sourceSnapshot=migrationTreeSnapshot(sourceTree);const manifest=readJson(source);
+    v2=runtime.child('v2',true,true);migrations=v2.child('migrations',true,true);
+    fs.mkdirSync(migrations.at(migrationId),{mode:0o700});fs.fsyncSync(migrations.fd);
+    migration=migrations.child(migrationId,false,true);fs.mkdirSync(migration.at('bootstrap-original'),{mode:0o700});
+    backup=migration.child('bootstrap-original',false,true);
+    fs.cpSync(`/proc/self/fd/${source.fd}/.`,`/proc/self/fd/${backup.fd}/.`,{recursive:true,dereference:false,preserveTimestamps:true});
+    // Copy durability includes each file, not just the containing directory.
+    for(const name of names(backup)){
+      const fd=fs.openSync(backup.at(name),C.O_RDONLY|C.O_NOFOLLOW);try{if(!fs.fstatSync(fd).isFile())fail('DEPLOY_ACTIVATION_INVALID');fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+    }
+    fs.fsyncSync(backup.fd);backupTree=captureEvidenceTree(backup);
+    if(canonical(migrationTreeSnapshot(backupTree))!==canonical(sourceSnapshot))fail('DEPLOY_ACTIVATION_INVALID');
+    const anchor={version:1,migrationId,preMigrationCurrent,legacyRollbackTarget,previousDirectory,
+      originalBootstrap:{manifest,treeSha256:digest(Buffer.from(canonical(sourceSnapshot))),identity:migrationObjectProof(sourceTree)},recoveryCopy:migrationObjectProof(backupTree),legacyReceipt,guard,router,pair,firstActivationId};
+    writeBytes(migration,'anchor.json',`${canonical(anchor)}\n`,0o600);fs.fsyncSync(backup.fd);fs.fsyncSync(migration.fd);fs.fsyncSync(migrations.fd);
+    revalidateEvidenceTree(sourceTree);checkCurrent(runtime,repositoryRoot,preMigrationCurrent);return readMigrationAnchor({repositoryRoot,migrationId,expectedRef:migrationAnchorRef(migration)});
+  }catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
+  finally{if(backupTree)closeEvidenceTree(backupTree);else backup?.close();if(sourceTree)closeEvidenceTree(sourceTree);else source?.close();migration?.close();migrations?.close();v2?.close();runtime?.close();root?.close();}
+}
+
+/** Read and revalidate the immutable stopped v1->v2 migration authority. */
+export function readMigrationAnchor({repositoryRoot,migrationId,expectedRef=null}) {
+  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||!MIGRATION.test(migrationId))
+    fail('DEPLOY_ACTIVATION_INVALID');
+  let root;let runtime;let v2;let migrations;let migration;let backup;
+  try {
+    root=new Directory(repositoryRoot);runtime=root.child('.jhw-runtime',false,true);
+    v2=runtime.child('v2',false,true);migrations=v2.child('migrations',false,true);
+    migration=migrations.child(migrationId,false,true);
+    if(names(migration).sort().join(',')!=='anchor.json,bootstrap-original')fail('DEPLOY_ACTIVATION_INVALID');
+    const reference=migrationAnchorRef(migration);
+    if(expectedRef!==null&&canonical(reference)!==canonical(expectedRef))fail('DEPLOY_ACTIVATION_INVALID');
+    const anchor=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(readBytes(migration,'anchor.json',65536).bytes));
+    if(!exact(anchor,['version','migrationId','preMigrationCurrent','legacyRollbackTarget','previousDirectory','originalBootstrap','recoveryCopy','legacyReceipt','guard','router','pair','firstActivationId'])||
+      anchor.version!==1||anchor.migrationId!==migrationId||!validV1Current(anchor.preMigrationCurrent)||anchor.preMigrationCurrent===null||
+      !validV1Current(anchor.legacyRollbackTarget)||anchor.legacyRollbackTarget===null||
+      anchor.preMigrationCurrent.predecessorActivationId!==anchor.legacyRollbackTarget.activationId||
+      typeof anchor.previousDirectory!=='string'||!/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(anchor.previousDirectory)||
+      !exact(anchor.originalBootstrap,['manifest','treeSha256','identity'])||!Array.isArray(anchor.originalBootstrap.identity)||!Array.isArray(anchor.recoveryCopy)||
+      !anchor.legacyReceipt||canonical(anchor.legacyReceipt.current)!==canonical(anchor.preMigrationCurrent)||canonical(anchor.legacyReceipt.previous)!==canonical(anchor.legacyRollbackTarget)||!DIGEST.test(anchor.legacyReceipt.receipt?.stateSha256)||typeof anchor.originalBootstrap.treeSha256!=='string'||!DIGEST.test(anchor.originalBootstrap.treeSha256)||
+      !exact(anchor.router,['sourceReleaseId','routerContract'])||!RELEASE.test(anchor.router.sourceReleaseId)||anchor.router.routerContract!==1||
+      !validRuntimePair(anchor.pair)||!ACTIVATION.test(anchor.firstActivationId)||!validMigrationGuardSeal(anchor.guard)||anchor.guard!==null&&anchor.guard.journal!==anchor.legacyReceipt.journal)fail('DEPLOY_ACTIVATION_INVALID');
+    backup=migration.child('bootstrap-original',false,true);
+    const snapshot=captureEvidenceTree(backup);
+    try {
+      if(canonical(migrationObjectProof(snapshot))!==canonical(anchor.recoveryCopy)||digest(Buffer.from(canonical(migrationTreeSnapshot(snapshot))))!==anchor.originalBootstrap.treeSha256)fail('DEPLOY_ACTIVATION_INVALID');
+    } finally {closeEvidenceTree(snapshot);backup=undefined;}
+    if(canonical(migrationAnchorRef(migration))!==canonical(reference))fail('DEPLOY_ACTIVATION_INVALID');
+    const result=Object.freeze({...anchor,reference,repositoryRoot});migrationAnchors.add(result);return result;
+  }catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
+  finally{backup?.close();migration?.close();migrations?.close();v2?.close();runtime?.close();root?.close();}
+}
+
+/** Prepare a v2 destination without changing current. Rollback reuses the
+ * verified predecessor activation, preserving its history and migration anchor. */
+export function preparePairActivation({repositoryRoot,pair,expectedCurrent,migrationId=null,migrationAnchor=null,activationId=null,rollback=false,deployLease}) {
+  requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'),'DEPLOY_ACTIVATION_INVALID');
+  const migration=migrationId!==null;
+  if (typeof rollback!=='boolean' || (rollback&&(migration||activationId!==null||expectedCurrent?.version!==2)) ||
+      !validRuntimePair(pair) || (!migration&&migrationAnchor!==null) ||
+      (migration&&(!MIGRATION.test(migrationId)||!migrationAnchors.has(migrationAnchor)||migrationAnchor.repositoryRoot!==repositoryRoot||
+        migrationAnchor.migrationId!==migrationId||canonical(migrationAnchor.preMigrationCurrent)!==canonical(expectedCurrent)||
+        canonical(migrationAnchor.pair)!==canonical(pair)||activationId!==migrationAnchor.firstActivationId)) ||
+      (!migration&&expectedCurrent !== null && !validV2Current(expectedCurrent)) ||
+      (migration&&!validV1Current(expectedCurrent)) || (activationId!==null&&!ACTIVATION.test(activationId))) fail('DEPLOY_ACTIVATION_INVALID');
   let root; let runtime; let v2; let activations; let stage; let stageName; let activationTree;
   try {
     root=new Directory(repositoryRoot);
@@ -1135,37 +1371,50 @@ export function preparePairActivation({repositoryRoot,pair,expectedCurrent,migra
     validateRuntimePairIn(runtime,repositoryRoot,pair,'DEPLOY_ACTIVATION_INVALID');
     v2=runtime.child('v2',true,true);
     activations=v2.child('activations',true,true);
-    stageName=`.stage.${randomBytes(16).toString('hex')}`;
-    stage=activations.child(stageName,true,true);
-    const manifest={version:2,activationId:`a-${randomBytes(16).toString('hex')}`,...pair,
-      predecessorActivationId:expectedCurrent?.activationId??null,migrationId:null,
-      createdAt:new Date().toISOString(),priorCurrent:expectedCurrent};
-    for(const name of ['mcp-server','scripts','skills']) {
-      fs.symlinkSync(`../../../releases/${pair.releaseId}/${name}`,stage.at(name));
+    let manifest;
+    if(rollback) {
+      const origin=activationIn(runtime,repositoryRoot,expectedCurrent.activationId,true,2);
+      if(origin.predecessorActivationId===null)fail('DEPLOY_PREDECESSOR_INVALID');
+      manifest=activationIn(runtime,repositoryRoot,origin.predecessorActivationId,true,2);
+      const prior=origin.priorCurrent;
+      if(!validV2Current(prior)||prior===null||canonical(destinationValue(manifest))!==
+        canonical(destinationValue(prior))||canonical(pair)!==canonical({releaseId:manifest.releaseId,
+          bootstrapId:manifest.bootstrapId,runtimeContract:manifest.runtimeContract,
+          compatibilityDigest:manifest.compatibilityDigest}))fail('DEPLOY_PREDECESSOR_INVALID');
+    } else {
+      stageName=`.stage.${randomBytes(16).toString('hex')}`;
+      stage=activations.child(stageName,true,true);
+      manifest={version:2,activationId:activationId??`a-${randomBytes(16).toString('hex')}`,...pair,
+        predecessorActivationId:migration?null:expectedCurrent?.activationId??null,migrationId,
+        createdAt:new Date().toISOString(),priorCurrent:migration?null:expectedCurrent};
+      for(const name of ['mcp-server','scripts','skills']) {
+        fs.symlinkSync(`../../../releases/${pair.releaseId}/${name}`,stage.at(name));
+      }
+      fs.symlinkSync(`../../bootstraps/${pair.bootstrapId}`,stage.at('bootstrap'));
+      writeBytes(stage,'manifest.json',`${canonical(manifest)}\n`,0o600);
+      fs.fsyncSync(stage.fd); stage.verify(); activations.verify();
+      checkCurrent(runtime,repositoryRoot,expectedCurrent);
+      fs.renameSync(activations.at(stageName),activations.at(manifest.activationId));
+      stage.close(); stage=undefined; stageName=undefined;
+      fs.fsyncSync(activations.fd);
+      const validated=activationIn(runtime,repositoryRoot,manifest.activationId,true,2);
+      if(canonical(validated)!==canonical(manifest))fail('DEPLOY_ACTIVATION_INVALID');
     }
-    fs.symlinkSync(`../../bootstraps/${pair.bootstrapId}`,stage.at('bootstrap'));
-    writeBytes(stage,'manifest.json',`${canonical(manifest)}\n`,0o600);
-    fs.fsyncSync(stage.fd); stage.verify(); activations.verify();
-    checkCurrent(runtime,repositoryRoot,expectedCurrent);
-    fs.renameSync(activations.at(stageName),activations.at(manifest.activationId));
-    stage.close(); stage=undefined; stageName=undefined;
-    fs.fsyncSync(activations.fd);
-    const validated=activationIn(runtime,repositoryRoot,manifest.activationId,true,2);
-    if(canonical(validated)!==canonical(manifest))fail('DEPLOY_ACTIVATION_INVALID');
     const activation=activations.child(manifest.activationId,false,true);
     activationTree=captureEvidenceTree(activation);
     const activationSnapshot=evidenceSnapshot(activationTree);
     const destinationProof=activationDurableProof(activation);
     closeEvidenceTree(activationTree);activationTree=undefined;
-    let originActivation;let originTree;let originSnapshot;let originProof;
+    let originActivation;let originParent;let originTree;let originSnapshot;let originProof=null;
     if(expectedCurrent!==null)try{
-        originActivation=activations.child(expectedCurrent.activationId,false,true);
+        originParent=migration?runtime.child('activations',false,true):activations;
+        originActivation=originParent.child(expectedCurrent.activationId,false,true);
         originTree=captureEvidenceTree(originActivation);originSnapshot=evidenceSnapshot(originTree);
-        originProof={activationId:expectedCurrent.activationId,activation:activationDurableProof(originActivation)};
-      }finally{if(originTree)closeEvidenceTree(originTree);else originActivation?.close();}
+        originProof={version:migration?1:2,activationId:expectedCurrent.activationId,activation:activationDurableProof(originActivation)};
+      }finally{if(originTree)closeEvidenceTree(originTree);else originActivation?.close();if(migration)originParent?.close();}
     const destination=destinationValue(manifest);
     const prepared={repositoryRoot,pairKey:pairKey(pair),expectedCurrent:canonical(expectedCurrent),
-      activationSnapshot,destinationProof,originSnapshot,originProof,closed:false};
+      activationSnapshot,destinationProof,originSnapshot,originProof,migrationAnchor,closed:false};
     preparedDestinations.set(destination,prepared);
     return destination;
   } catch(error){boundary(error,'DEPLOY_ACTIVATION_INVALID');}
@@ -1197,14 +1446,15 @@ export function publishPreparedActivation({repositoryRoot,destination,expectedCu
   try{
     root=new Directory(repositoryRoot);runtime=root.child('.jhw-runtime',false,true);
     if(canonical(observation(runtime))!==canonical(expectedCurrent?.observation??null))fail('DEPLOY_CURRENT_CHANGED');
-    let v2;let activations;let activation;let originActivation;
+    let v2;let activations;let activation;let originActivation;let legacyActivations;
     try{
       v2=runtime.child('v2',false,true);activations=v2.child('activations',false,true);
-      if(expectedCurrent!==null){originActivation=activations.child(expectedCurrent.activationId,false,true);
+      if(expectedCurrent!==null){legacyActivations=prepared.originProof?.version===1?runtime.child('activations',false,true):null;
+        originActivation=(legacyActivations??activations).child(expectedCurrent.activationId,false,true);
         revalidateEvidenceSnapshot(originActivation,prepared.originSnapshot);}
       activation=activations.child(destination.activationId,false,true);
       revalidateEvidenceSnapshot(activation,prepared.activationSnapshot);
-    }finally{activation?.close();originActivation?.close();activations?.close();v2?.close();}
+    }finally{activation?.close();originActivation?.close();legacyActivations?.close();activations?.close();v2?.close();}
     revalidateRuntimeEvidence(evidence);
     if(process.hrtime.bigint()-started>1_000_000_000n)fail('DEPLOY_SOURCE_CHANGED');
     temporary=`.current.${randomBytes(16).toString('hex')}`;
@@ -1833,6 +2083,23 @@ function releaseCompatibilityIn(runtime, repositoryRoot, releaseId, walkTree = t
     if (canonical(manifest) !== canonical(readJson(release))) fail('DEPLOY_RELEASE_INVALID');
     return result;
   } finally { release?.close(); releases?.close(); }
+}
+/** Read the closed declaration from a fully verified retained release. */
+export function releaseRuntimeGeneration({repositoryRoot,releaseId}) {
+  return withStore(repositoryRoot,false,runtime=>{
+    if(!runtime)fail('DEPLOY_RELEASE_INVALID');
+    const validated=validateReleaseIn(runtime,repositoryRoot,releaseId);
+    let releases;let release;
+    try {
+      releases=runtime.child('releases',false,true);release=releases.child(releaseId,false,true);
+      const manifest=readJson(release);
+      if(canonical(summary(manifest))!==canonical(validated)||contentDigest(manifest)!==validated.contentDigest)fail('DEPLOY_RELEASE_INVALID');
+      const declaration=compatibilityDeclaration(release,manifest);
+      release.verify();
+      if(canonical(manifest)!==canonical(readJson(release)))fail('DEPLOY_RELEASE_INVALID');
+      return declaration?.generation??1;
+    } finally {release?.close();releases?.close();}
+  });
 }
 export function releaseCompatibility({ repositoryRoot, releaseId }) {
   return withStore(repositoryRoot, false, runtime => {

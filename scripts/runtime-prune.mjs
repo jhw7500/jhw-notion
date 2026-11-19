@@ -1,9 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash,randomBytes} from 'node:crypto';
+import {validMigrationGuardReference,readGuardTransitionEvidence,sealMigrationGuardForward} from './runtime-guard.mjs';
 import {DeploymentError,trustedDirectory} from './runtime-safety.mjs';
-import {validateRetainedBootstrap} from './runtime-entry.mjs';
-import {validV1Current as validCurrent,validCurrent as validRuntimeCurrent,validRuntimePair} from './runtime-store.mjs';
+import {validateRetainedBootstrap,validBootstrapObjectProof} from './runtime-entry.mjs';
+import {validV1Current as validCurrent,validCurrent as validRuntimeCurrent,validRuntimePair,validTransitionWitness} from './runtime-store.mjs';
 
 const C=fs.constants;
 const JOURNAL=/^\.deploy\.[a-f0-9]{32}$/;
@@ -48,7 +49,7 @@ function scanNames(runtime) {
  runtime.verify();
  return result.sort();
 }
-function readRegular(directory,name,limit=FILE_LIMIT) {
+function readRegular(directory,name,limit=FILE_LIMIT,expectedProof=null) {
  const file=path.join(directory,name);let fd;
  try {
   fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);
@@ -59,6 +60,8 @@ function readRegular(directory,name,limit=FILE_LIMIT) {
   const after=fs.fstatSync(fd,{bigint:true});const named=fs.lstatSync(file,{bigint:true});
   for(const key of ['dev','ino','uid','mode','nlink','size','ctimeNs','mtimeNs'])if(before[key]!==after[key]||before[key]!==named[key])fail('unverified_journal');
   if(length!==Number(before.size))fail('unverified_journal');
+  if(expectedProof!==null&&canonical(expectedProof)!==canonical({...objectIdentity(before),nlink:Number(before.nlink),
+    mtimeNs:String(before.mtimeNs),ctimeNs:String(before.ctimeNs),sha256:digest(bytes.subarray(0,length))}))fail('unverified_journal');
   return {bytes:bytes.subarray(0,length),identity:objectIdentity(before),size:length};
  } catch(error) {if(error instanceof DeploymentError)throw error;fail('unverified_journal');}
  finally {if(fd!==undefined)fs.closeSync(fd);}
@@ -83,7 +86,129 @@ function validPairDestination(value) {
  return exact(value,['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId'])&&
   value.version===2&&/^a-[a-f0-9]{32}$/.test(value.activationId)&&validRuntimePair({releaseId:value.releaseId,
    bootstrapId:value.bootstrapId,runtimeContract:value.runtimeContract,compatibilityDigest:value.compatibilityDigest})&&
-  (value.predecessorActivationId===null||/^a-[a-f0-9]{32}$/.test(value.predecessorActivationId))&&value.migrationId===null;
+  (value.predecessorActivationId===null||/^a-[a-f0-9]{32}$/.test(value.predecessorActivationId))&&
+  (value.migrationId===null||value.predecessorActivationId===null&&/^m-[a-f0-9]{32}$/.test(value.migrationId));
+}
+
+function validInitialInstallState(state) {
+ if(!exact(state,['version','kind','status','phase','origin','candidate','destination','witness','published','wiring','adoptFrom','after','router','outcome'])||
+   state.version!==2||state.kind!=='initial-install'||!['pending','complete'].includes(state.status)||
+   !['prepared','router_intent','wire_intent','wired','pointer_intent','published','validation','restore_intent','complete'].includes(state.phase)||
+   state.origin!==null||!validRuntimePair(state.candidate)||!validPairDestination(state.destination)||
+   state.destination.migrationId!==null||state.destination.predecessorActivationId!==null||
+   !validTransitionWitness(state.witness,null,state.destination)||
+   canonical(state.candidate)!==canonical(Object.fromEntries(['releaseId','bootstrapId','runtimeContract','compatibilityDigest'].map(key=>[key,state.destination[key]])))||
+   !(state.adoptFrom===null||typeof state.adoptFrom==='string'&&path.isAbsolute(state.adoptFrom)&&state.adoptFrom===path.resolve(state.adoptFrom))||
+   !exact(state.wiring,['name','directory','before','listings'])||state.wiring.name!=='wiring'||
+   !validWitnessIdentity(state.wiring.directory,{mode:0o700})||
+   !validActivationWitness({directory:{...state.wiring.directory,mtimeNs:'0',ctimeNs:'0'},manifest:state.wiring.before})||
+   !validActivationWitness({directory:{...state.wiring.directory,mtimeNs:'0',ctimeNs:'0'},manifest:state.wiring.listings})||
+   state.after!==null&&!validActivationWitness({directory:{...state.wiring.directory,mtimeNs:'0',ctimeNs:'0'},manifest:state.after})||
+   !exact(state.router,['stageName','stageProof','previousDirectory','previousProof','parkingDirectory'])||
+   !/^\.bootstrap\.stage\.[a-f0-9]{32}$/.test(state.router.stageName)||!PREVIOUS.test(state.router.previousDirectory)||
+   !/^\.bootstrap\.failed\.[a-f0-9]{32}$/.test(state.router.parkingDirectory)||!validBootstrapObjectProof(state.router.stageProof)||
+   state.router.previousProof!==null&&!validBootstrapObjectProof(state.router.previousProof)||
+   state.published!==null&&(!validRuntimeCurrent(state.published)||
+    canonical(Object.fromEntries(Object.entries(state.published).filter(([key])=>key!=='observation')))!==canonical(state.destination)))return false;
+ if(state.status==='complete')return state.phase==='complete'&&(state.outcome==='restored'&&state.published===null||state.outcome==='installed'&&state.published!==null&&state.after!==null);
+ return state.phase!=='complete'&&state.outcome===null&&(!['wired','pointer_intent','published','validation'].includes(state.phase)||state.after!==null)&&
+  (!['published','validation'].includes(state.phase)||state.published!==null);
+}
+// Restore replay may pretty-print a 2 MiB config up to the deployer's 32 MiB
+// bound. These retained files are inventory only, never recovery authority.
+const INITIAL_SCRATCH_FILE_LIMIT=32*1024*1024;
+const INITIAL_SCRATCH_TOTAL_LIMIT=128*1024*1024;
+const SCRATCH_UUID='[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
+const SCRATCH_TARGET=`[a-f0-9]{16}(?:\\.bak\\.jhw-notion\\.\\d{14}\\.${SCRATCH_UUID})?`;
+const SCRATCH_FILE=new RegExp(`^${SCRATCH_TARGET}$`);
+const SCRATCH_TEMP=new RegExp(`^\\.(${SCRATCH_TARGET})\\.\\d+\\.${SCRATCH_UUID}\\.tmp$`);
+function readInitialScratchFile(directory,name,limit) {
+ let fd;
+ try{
+  const file=path.join(directory,name);fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);
+  const before=fs.fstatSync(fd,{bigint:true}),mode=permissions(before.mode);
+  if(!before.isFile()||before.uid!==BigInt(process.getuid())||![1n,2n].includes(before.nlink)||
+    (mode&~0o644)!==0||(mode&0o400)===0||before.size>BigInt(limit))fail('unverified_journal');
+  const bytes=Buffer.alloc(Number(before.size)+1);let length=0;
+  while(length<bytes.length){const count=fs.readSync(fd,bytes,length,bytes.length-length,null);if(!count)break;length+=count;}
+  const after=fs.fstatSync(fd,{bigint:true}),named=fs.lstatSync(file,{bigint:true});
+  for(const key of ['dev','ino','uid','mode','nlink','size','ctimeNs','mtimeNs'])if(before[key]!==after[key]||before[key]!==named[key])fail('unverified_journal');
+  if(length!==Number(before.size))fail('unverified_journal');
+  return {bytes:bytes.subarray(0,length),identity:objectIdentity(before),size:length,nlink:Number(before.nlink),ctimeNs:String(before.ctimeNs),mtimeNs:String(before.mtimeNs)};
+ }catch(error){if(error instanceof DeploymentError)throw error;fail('unverified_journal');}finally{if(fd!==undefined)fs.closeSync(fd);}
+}
+function readInitialWiring(journal,state,files) {
+ const child=new PinnedDirectory(journal.at('wiring'),{parentVerify:()=>journal.verify()});let scratch;
+ try{
+  if(canonical(objectIdentity(child.stat))!==canonical(state.wiring.directory))fail('unverified_journal');
+  const children=scanNames(child);
+  if(children.length>64||!['state.json','before.json','listings.json'].every(name=>children.includes(name))||
+    children.some(name=>!['state.json','before.json','listings.json','restore'].includes(name)&&!LOG.test(name)))fail('unverified_journal');
+  const directory=`/proc/self/fd/${child.fd}`;
+  files.set('wiring/before.json',readRegular(directory,'before.json',4*1024*1024,state.wiring.before));
+  files.set('wiring/listings.json',readRegular(directory,'listings.json',16*1024*1024,state.wiring.listings));
+  const workerRecord=readRegular(directory,'state.json'),worker=parseJson(workerRecord.bytes);
+  const required=['version','status','operation','phase','previous','variables'],optional=['mutationStarted','workerDetached','stateIncomplete'];
+  if(!worker||!required.every(key=>Object.hasOwn(worker,key))||Object.keys(worker).some(key=>![...required,...optional].includes(key))||
+    worker.version!==1||worker.operation!=='activate'||worker.previous!==null||!['pending','complete'].includes(worker.status)||
+    !['before_mutation','wire','validate','finalize','rollback','wire_rolled_back','complete'].includes(worker.phase)||
+    optional.some(key=>Object.hasOwn(worker,key)&&worker[key]!==true)||
+    !(exact(worker.variables,[])||validVariables(worker.variables))||
+    worker.status==='complete'&&!['wire_rolled_back','complete'].includes(worker.phase)||
+    state.status==='complete'&&(worker.status!=='complete'||worker.phase!==(state.outcome==='restored'?'wire_rolled_back':'complete')))fail('unverified_journal');
+  files.set('wiring/state.json',workerRecord);let size=workerRecord.size;
+  for(const name of children.filter(name=>LOG.test(name))){const record=readRegular(directory,name);files.set(`wiring/${name}`,record);size+=record.size;}
+  if(children.includes('restore')){
+   scratch=new PinnedDirectory(child.at('restore'),{parentVerify:()=>child.verify()});
+   const names=scanNames(scratch);if(names.length>128)fail('scan_limit');let scratchSize=0;const linked=new Map();
+   for(const name of names){
+    const temporary=SCRATCH_TEMP.exec(name);if(!SCRATCH_FILE.test(name)&&!temporary)fail('unverified_journal');
+    const record=readInitialScratchFile(`/proc/self/fd/${scratch.fd}`,name,Math.min(INITIAL_SCRATCH_FILE_LIMIT,INITIAL_SCRATCH_TOTAL_LIMIT-scratchSize));
+    files.set(`wiring/restore/${name}`,record);scratchSize+=record.size;
+    if(record.nlink===2){const key=`${record.identity.dev}:${record.identity.ino}`;if(!linked.has(key))linked.set(key,[]);linked.get(key).push({name,temporary:temporary?.[1]??null,record});}
+   }
+   for(const pair of linked.values()){
+    const temporary=pair.find(item=>item.temporary!==null),target=pair.find(item=>item.temporary===null);
+    if(pair.length!==2||!temporary||!target||temporary.temporary!==target.name||
+      temporary.record.ctimeNs!==target.record.ctimeNs||temporary.record.mtimeNs!==target.record.mtimeNs||
+      !temporary.record.bytes.equals(target.record.bytes))fail('unverified_journal');
+   }
+   if(canonical(scanNames(scratch))!==canonical(names))fail('unverified_journal');scratch.verify();
+  }
+  if(size>STATE_TOTAL_LIMIT)fail('scan_limit');if(canonical(scanNames(child))!==canonical(children))fail('unverified_journal');child.verify();
+ }finally{scratch?.close();child.close();}
+}
+function validBootstrapMigrationState(state) {
+ const phases=['prepared','guard_intent','router_intent','router_published','current_intent','pair_published','validation','restore_intent','complete'];
+ if(!exact(state,['version','kind','operation','status','phase','migrationId','anchor','origin','destination','witness','published','guard','router','outcome'])||
+   state.version!==2||state.kind!=='bootstrap-migration'||!['upgrade','legacy-rollback'].includes(state.operation)||
+   !(state.guard===null||state.operation==='legacy-rollback'&&validMigrationGuardReference(state.guard)&&state.guard.migrationId===state.migrationId)||
+   !['pending','complete'].includes(state.status)||!phases.includes(state.phase)||
+   typeof state.migrationId!=='string'||!/^m-[a-f0-9]{32}$/.test(state.migrationId)||
+   !exact(state.anchor,['directory','anchor'])||!validActivationWitness({directory:state.anchor.directory,manifest:state.anchor.anchor})||
+   !validRuntimeCurrent(state.origin)||state.origin===null||
+   !exact(state.router,['stageName','previousDirectory','stageProof','previousProof','parkingDirectory'])||
+   !validBootstrapObjectProof(state.router.stageProof)||!validBootstrapObjectProof(state.router.previousProof)||
+   !/^\.bootstrap\.failed\.[a-f0-9]{32}$/.test(state.router.parkingDirectory)||
+   new Set([state.router.stageName,state.router.previousDirectory,state.router.parkingDirectory]).size!==3)return false;
+ if(state.operation==='upgrade'){
+  if(!validCurrent(state.origin)||state.origin.predecessorActivationId===null||!validPairDestination(state.destination)||
+    state.destination.predecessorActivationId!==null||state.destination.migrationId!==state.migrationId||
+    !/^\.bootstrap\.stage\.[a-f0-9]{32}$/.test(state.router.stageName)||!PREVIOUS.test(state.router.previousDirectory))return false;
+ }else{
+  if(state.origin.version!==2||state.origin.predecessorActivationId!==null||state.origin.migrationId!==state.migrationId||
+    !exact(state.destination,['activationId','releaseId','predecessorActivationId'])||
+    !validCurrent({...state.destination,observation:{target:`activations/${state.destination.activationId}`,dev:'0',ino:'0',ctimeNs:'0'}})||
+    !PREVIOUS.test(state.router.stageName)||!/^\.bootstrap\.failed\.[a-f0-9]{32}$/.test(state.router.previousDirectory)||state.phase==='restore_intent')return false;
+ }
+ if(!validTransitionWitness(state.witness,state.origin,state.destination)||
+   state.published!==null&&(!validRuntimeCurrent(state.published)||
+    canonical(Object.fromEntries(Object.entries(state.published).filter(([key])=>key!=='observation')))!==canonical(state.destination)))return false;
+ if(state.status==='complete')return state.phase==='complete'&&(
+   state.operation==='upgrade'&&state.outcome==='restored'&&state.published===null||
+   state.published!==null&&state.outcome===(state.operation==='upgrade'?'migrated':'rolled_back'));
+ return state.phase!=='complete'&&state.outcome===null&&
+   (!['pair_published','validation'].includes(state.phase)||state.published!==null);
 }
 function validWitnessIdentity(value,{times=false,links=null,mode}={}) {
  const keys=['dev','ino','uid','mode',...(links?['nlink']:[]),...(times?['mtimeNs','ctimeNs']:[])];
@@ -97,25 +222,26 @@ function validActivationWitness(value) {
   validWitnessIdentity(Object.fromEntries(Object.entries(value.manifest).filter(([key])=>key!=='sha256')),{times:true,links:1,mode:0o600})&&
   typeof value.manifest.sha256==='string'&&/^[a-f0-9]{64}$/.test(value.manifest.sha256);
 }
-function validPointerWitness(value,destination) {
+function validPointerWitness(value,destination,initial=false) {
  return exact(value,['directory','pointer','origin','destination'])&&validWitnessIdentity(value.directory,{times:true,mode:0o700})&&
   exact(value.pointer,['dev','ino','uid','mode','target'])&&
   validWitnessIdentity(Object.fromEntries(Object.entries(value.pointer).filter(([key])=>key!=='target')),{mode:0o777})&&
-  value.pointer.target===`v2/activations/${destination.activationId}`&&validActivationWitness(value.origin)&&validActivationWitness(value.destination);
+  value.pointer.target===`v2/activations/${destination.activationId}`&&(initial?value.origin===null:validActivationWitness(value.origin))&&validActivationWitness(value.destination);
 }
 function validPairJournalState(state) {
  if(!exact(state,['version','kind','status','operation','phase','origin','candidate','destination','witness','outcome'])||
    state.version!==2||state.kind!=='pair'||!['pending','complete'].includes(state.status)||
    !['activate','rollback'].includes(state.operation)||!['prepared','blocked','pointer_intent','published','complete','rejected'].includes(state.phase)||
-   !validRuntimeCurrent(state.origin)||state.origin?.version!==2||!validRuntimePair(state.candidate)||
+   !validRuntimeCurrent(state.origin)||(state.operation==='install'?state.origin!==null:state.origin?.version!==2)||!validRuntimePair(state.candidate)||
    !(state.destination===null||validPairDestination(state.destination)||validRuntimeCurrent(state.destination)&&state.destination?.version===2)||
    !(state.outcome===null||['pointer_not_published','pointer_published','candidate_rejected'].includes(state.outcome)))return false;
+ if(state.operation==='install'&&state.destination!==null&&(state.destination.predecessorActivationId!==null||state.destination.migrationId!==null))return false;
  if(state.phase==='prepared')return state.status==='pending'&&state.destination===null&&state.witness===null&&state.outcome===null;
  if(state.phase==='blocked')return state.status==='pending'&&state.destination===null&&state.witness===null&&state.outcome===null;
- if(state.phase==='pointer_intent')return state.status==='pending'&&validPairDestination(state.destination)&&validPointerWitness(state.witness,state.destination)&&state.outcome===null;
- if(state.phase==='published')return state.status==='pending'&&validRuntimeCurrent(state.destination)&&state.destination?.version===2&&validPointerWitness(state.witness,state.destination)&&state.outcome===null;
+ if(state.phase==='pointer_intent')return state.status==='pending'&&validPairDestination(state.destination)&&validPointerWitness(state.witness,state.destination,state.operation==='install')&&state.outcome===null;
+ if(state.phase==='published')return state.status==='pending'&&validRuntimeCurrent(state.destination)&&state.destination?.version===2&&validPointerWitness(state.witness,state.destination,state.operation==='install')&&state.outcome===null;
  if(state.phase==='rejected')return state.status==='complete'&&['pointer_not_published','candidate_rejected'].includes(state.outcome);
- return state.status==='complete'&&validRuntimeCurrent(state.destination)&&state.destination?.version===2&&validPointerWitness(state.witness,state.destination)&&state.outcome==='pointer_published';
+ return state.status==='complete'&&validRuntimeCurrent(state.destination)&&state.destination?.version===2&&validPointerWitness(state.witness,state.destination,state.operation==='install')&&state.outcome==='pointer_published';
 }
 function validCodexIdentity(value) {
  return exact(value,['dev','ino','uid','mode','nlink','size'])&&[value.dev,value.ino,value.size].every(item=>typeof item==='string'&&/^\d{1,32}$/.test(item))&&
@@ -311,12 +437,12 @@ function verifyPairWitnessFiles({repositoryRoot,journalDirectory,state}) {
    JSON.stringify({...identity(manifest,{times:true,links:true}),sha256:digest(manifestRecord.bytes)})!==JSON.stringify(expected.manifest))fail('unverified_journal');
   return {value:parseJson(manifestRecord.bytes),bytes:manifestRecord.bytes};
  };
- const originRecord=verifyActivation(state.origin.activationId,state.witness.origin);const origin=originRecord.value;
+ const origin=state.origin===null?null:verifyActivation(state.origin.activationId,state.witness.origin).value;
  const destinationRecord=verifyActivation(state.destination.activationId,state.witness.destination);const value=destinationRecord.value;
  const destination=Object.fromEntries(['version','activationId','releaseId','bootstrapId','runtimeContract','compatibilityDigest','predecessorActivationId','migrationId'].map(key=>[key,value[key]]));
  const destinationCanonical=canonical(value)+'\n'===destinationRecord.bytes.toString('utf8');
  const destinationMatches=canonical(destination)===canonical(Object.fromEntries(Object.entries(state.destination).filter(([key])=>key!=='observation')));
- if(origin.activationId!==state.origin.activationId||!destinationCanonical||!destinationMatches)fail('unverified_journal');
+ if(origin?.activationId!==state.origin?.activationId||!destinationCanonical||!destinationMatches)fail('unverified_journal');
 }
 
 /** Exact shared parser for v2 runtime journals. Future journal kinds extend this
@@ -340,6 +466,32 @@ export function readRuntimeJournalV2({repositoryRoot,journalDirectory}) {
    const parsed=readCodexMigrationJournal({journalDirectory});
    files.set('state.json',parsed.record);journal.verify();journals.verify();v2.verify();root.verify();return {state:parsed.state,files,identity:objectIdentity(journal.stat)};
   }
+  if(state?.kind==='initial-install') {
+   if(children.some(child=>!['state.json','retention.json','pointer-witness','wiring-after.json','wiring'].includes(child))||!children.includes('pointer-witness')||!children.includes('wiring')||!validInitialInstallState(state))fail('unverified_journal');
+   readInitialWiring(journal,state,files);
+   if(children.includes('wiring-after.json')){
+    const after=readRegular(`/proc/self/fd/${journal.fd}`,'wiring-after.json',4*1024*1024);files.set('wiring-after.json',after);
+    if(state.after!==null&&digest(after.bytes)!==state.after.sha256)fail('unverified_journal');
+   }else if(state.after!==null)fail('unverified_journal');
+   if(children.includes('retention.json')){
+    const record=readRegular(`/proc/self/fd/${journal.fd}`,'retention.json',FILE_LIMIT);files.set('retention.json',record);const receipt=parseJson(record.bytes);const time=Date.parse(receipt.completedAt);
+    if(!exact(receipt,['version','sequence','journal','stateSha256','completedAt','previous'])||receipt.version!==2||!Number.isSafeInteger(receipt.sequence)||receipt.sequence<1||receipt.journal!==name||receipt.stateSha256!==digest(files.get('state.json').bytes)||typeof receipt.completedAt!=='string'||!Number.isFinite(time)||new Date(time).toISOString()!==receipt.completedAt||receipt.previous!==null)fail('unverified_journal');
+   }
+   journal.verify();journals.verify();v2.verify();root.verify();return {state,files,identity:objectIdentity(journal.stat)};
+  }
+  if(state?.kind==='bootstrap-migration') {
+   if(children.some(child=>!['state.json','retention.json','pointer-witness','validation','guard'].includes(child)&&!LOG.test(child))||!children.includes('validation')||!children.includes('pointer-witness')||!validBootstrapMigrationState(state)||children.includes('guard')!==(state.guard!==null))fail('unverified_journal');
+   const validation=new PinnedDirectory(journal.at('validation'),{parentVerify:()=>journal.verify()});
+   try{const entries=fs.readdirSync(`/proc/self/fd/${validation.fd}`);if(entries.some(child=>child!=='state.json'&&!LOG.test(child)))fail('unverified_journal');for(const child of entries)readRegular(`/proc/self/fd/${validation.fd}`,child,FILE_LIMIT);validation.verify();}finally{validation.close();}
+   for(const child of children.filter(child=>child!=='pointer-witness'&&child!=='validation'&&child!=='guard'&&child!=='state.json'))files.set(child,readRegular(`/proc/self/fd/${journal.fd}`,child,FILE_LIMIT));
+   if(files.has('retention.json')){
+    const receipt=parseJson(files.get('retention.json').bytes);const time=Date.parse(receipt.completedAt);
+    if(!exact(receipt,['version','sequence','journal','stateSha256','completedAt','previous'])||receipt.version!==2||
+      !Number.isSafeInteger(receipt.sequence)||receipt.sequence<1||receipt.journal!==name||receipt.stateSha256!==digest(files.get('state.json').bytes)||
+      typeof receipt.completedAt!=='string'||!Number.isFinite(time)||new Date(time).toISOString()!==receipt.completedAt||receipt.previous!==null)fail('unverified_journal');
+   }
+   journal.verify();journals.verify();v2.verify();root.verify();return {state,files,identity:objectIdentity(journal.stat)};
+  }
   if(children.some(child=>!['state.json','candidate-probe.log','retention.json','pointer-witness'].includes(child)))fail('unverified_journal');
   for(const child of children.filter(child=>child!=='pointer-witness'&&child!=='state.json'))files.set(child,readRegular(`/proc/self/fd/${journal.fd}`,child,FILE_LIMIT));
   if(!validPairJournalState(state))fail('unverified_journal');
@@ -353,6 +505,50 @@ export function readRuntimeJournalV2({repositoryRoot,journalDirectory}) {
   journal.verify();journals.verify();v2.verify();root.verify();
   return {state,files,identity:objectIdentity(journal.stat)};
  }finally{journal?.close();journals?.close();v2?.close();root.close();}
+}
+
+/** Resolve the original completed upgrade seal before granting a new rollback. */
+export function findCompletedBootstrapMigration({repositoryRoot,current}) {
+ if(!validRuntimeCurrent(current)||current?.version!==2||current.predecessorActivationId!==null||current.migrationId===null)fail('unverified_journal');
+ const runtime=runtimeDirectory(repositoryRoot);let v2;let journals;
+ try{
+  v2=new PinnedDirectory(runtime.at('v2'),{parentVerify:()=>runtime.verify()});
+  journals=new PinnedDirectory(v2.at('journals'),{parentVerify:()=>v2.verify()});
+  const matches=[];
+  for(const name of scanNames(journals).filter(name=>JOURNAL_V2.test(name))){
+   const parsed=readRuntimeJournalV2({repositoryRoot,journalDirectory:path.join(repositoryRoot,'.jhw-runtime/v2/journals',name)}),state=parsed.state;
+   if(state.kind!=='bootstrap-migration'||state.operation!=='upgrade'||state.migrationId!==current.migrationId)continue;
+   if(state.status!=='complete'||state.outcome!=='migrated'||!parsed.files.has('retention.json')||
+     canonical(state.destination)!==canonical(Object.fromEntries(Object.entries(current).filter(([key])=>key!=='observation'))))fail('unverified_journal');
+   matches.push(state);
+  }
+  journals.verify();v2.verify();runtime.verify();if(matches.length!==1)fail('unverified_journal');return matches[0];
+ }finally{journals?.close();v2?.close();runtime.close();}
+}
+
+/** Locate the unique receipt-backed v1 activation that moved A to current B. */
+export function findLegacyActivationReceipt({repositoryRoot,current}) {
+ if(!validCurrent(current)||current===null)fail('unverified_journal');
+ const runtime=runtimeDirectory(repositoryRoot);try {
+  const matches=[];for(const name of scanNames(runtime).filter(name=>JOURNAL.test(name))){
+   const item=inspectJournal(runtime,name,{state:0});
+   if(!['success','evidence'].includes(item.kind))continue;
+   const directory=runtime.at(name);const record=readRegular(directory,'state.json',FILE_LIMIT);const state=parseJson(record.bytes);
+   if(state.status!=='complete'||state.phase!=='complete'||state.operation!=='activate'||!successfulState(state)||
+     canonical(state.current)!==canonical(current)||state.previous?.activationId!==current.predecessorActivationId)continue;
+   let receipt;try{receipt=parseJson(readRegular(directory,'retention.json',FILE_LIMIT).bytes);}catch{continue;}
+   if(!validReceipt(receipt,name,record.bytes)||receipt.previous!==null)fail('unverified_journal');
+   let guard=null;
+   if(item.kind==='evidence'){
+    const evidence=readGuardTransitionEvidence({journalDirectory:path.join(repositoryRoot,'.jhw-runtime',name)});
+    if(evidence?.direction!=='forward'||evidence.status!=='finalized'||evidence.destination_activation_id!==current.activationId||
+      canonical(evidence.origin)!==canonical(state.previous))continue;
+   }
+   if(item.kind==='evidence')guard=sealMigrationGuardForward({repositoryRoot,journal:name,current:state.current,previous:state.previous});
+   matches.push({journal:name,previous:state.previous,current:state.current,receipt,guard});
+  }
+  if(matches.length!==1)fail('unverified_journal');return matches[0];
+ } finally {runtime.close();}
 }
 function validReceipt(value,name,stateBytes) {
  if(!exact(value,['version','sequence','journal','stateSha256','completedAt','previous'])||value.version!==1||!Number.isSafeInteger(value.sequence)||value.sequence<1||value.journal!==name||value.stateSha256!==digest(stateBytes)||typeof value.completedAt!=='string')return false;

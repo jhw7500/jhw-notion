@@ -244,15 +244,92 @@ function requireLeaseIdentity(lease,file) {
   let held;let named;try{held=fs.fstatSync(lease.fd,{bigint:true});named=fs.lstatSync(file,{bigint:true});}catch{fail();}
   if(!held.isFile()||held.uid!==BigInt(process.getuid())||held.nlink!==1n||(Number(held.mode)&0o7777)!==0o600||!same(held,named))fail();
 }
+function requireRuntimeHandle(repositoryRoot,runtimeHandle) {
+  if(!runtimeHandle||!Number.isInteger(runtimeHandle.fd)||runtimeHandle.fd<0||typeof runtimeHandle.verify!=='function')fail();
+  runtimeHandle.verify();let held;let named;
+  try{held=fs.fstatSync(runtimeHandle.fd,{bigint:true});named=fs.lstatSync(path.join(repositoryRoot,'.jhw-runtime'),{bigint:true});}catch{fail();}
+  if(!held.isDirectory()||held.uid!==BigInt(process.getuid())||(Number(held.mode)&0o7777)!==0o700)fail();
+  for(const key of ['dev','ino','uid','gid','mode'])if(held[key]!==named[key])fail();
+  return held;
+}
 
-/** Stopped-path-only publication of the stable v2 selector. */
-export async function installRouterV2({repositoryRoot,releaseId,deployLease,admissionLease}) {
+function bootstrapName(name) {
+  if(name!=='bootstrap'&&!/^\.bootstrap\.(?:stage|previous|failed)\.[a-f0-9]{32}$/.test(name))fail();
+  return name;
+}
+function proofInteger(value){return value.toString(10);}
+function proofDirectory(stat){return {dev:proofInteger(stat.dev),ino:proofInteger(stat.ino),uid:proofInteger(stat.uid),gid:proofInteger(stat.gid),
+  mode:Number(stat.mode),nlink:proofInteger(stat.nlink),size:proofInteger(stat.size),mtimeNs:proofInteger(stat.mtimeNs)};}
+function proofFile(directory,name) {
+  let fd;
+  try {
+    fd=fs.openSync(directory.at(name),C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);
+    const before=fs.fstatSync(fd,{bigint:true});
+    if(!before.isFile()||before.uid!==BigInt(process.getuid())||before.nlink!==1n||before.size>4n*1024n*1024n)fail();
+    const bytes=Buffer.alloc(Number(before.size));let offset=0;
+    while(offset<bytes.length){const count=fs.readSync(fd,bytes,offset,bytes.length-offset,null);if(!count)fail();offset+=count;}
+    if(fs.readSync(fd,Buffer.alloc(1),0,1,null)!==0||!same(before,fs.fstatSync(fd,{bigint:true}))||!same(before,fs.lstatSync(directory.at(name),{bigint:true})))fail();
+    return {name,dev:proofInteger(before.dev),ino:proofInteger(before.ino),uid:proofInteger(before.uid),gid:proofInteger(before.gid),
+      mode:Number(before.mode),nlink:proofInteger(before.nlink),size:proofInteger(before.size),ctimeNs:proofInteger(before.ctimeNs),
+      mtimeNs:proofInteger(before.mtimeNs),sha256:hash(bytes)};
+  } finally {if(fd!==undefined)fs.closeSync(fd);}
+}
+function bootstrapProof(repositoryRoot,name,runtimeHandle=null) {
+  bootstrapName(name);let directory;
+  try {
+    if(runtimeHandle)requireRuntimeHandle(repositoryRoot,runtimeHandle);
+    directory=runtimeHandle?anchoredDirectory(runtimeHandle,[name]):new Directory(path.join(repositoryRoot,'.jhw-runtime',name));
+    const first=fs.fstatSync(directory.fd,{bigint:true});
+    if(!first.isDirectory()||first.uid!==BigInt(process.getuid())||(Number(first.mode)&0o7777)!==0o700)fail();
+    const named=runtimeHandle?fs.lstatSync(`/proc/self/fd/${runtimeHandle.fd}/${name}`,{bigint:true}):fs.lstatSync(path.join(repositoryRoot,'.jhw-runtime',name),{bigint:true});
+    for(const key of ['dev','ino','uid','gid','mode'])if(first[key]!==named[key])fail();
+    const preliminary=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(read(directory,'manifest.json',0o600,16384)));
+    preliminary?.version===2?readRouterSet(directory,repositoryRoot,runtimeHandle):readSet(directory,repositoryRoot,runtimeHandle);
+    const names=fs.readdirSync(`/proc/self/fd/${directory.fd}`).sort();
+    const files=names.map(child=>proofFile(directory,child));
+    const last=fs.fstatSync(directory.fd,{bigint:true});
+    for(const key of ['dev','ino','uid','gid','mode','nlink','size','mtimeNs'])if(first[key]!==last[key])fail();
+    directory.verify();
+    return {version:1,directory:proofDirectory(last),files};
+  } finally {directory?.close();}
+}
+
+const PROOF_INTEGER=/^(?:0|[1-9][0-9]{0,39})$/;
+function validProofMode(value){return Number.isInteger(value)&&value>=0&&value<=0o177777;}
+function validProofInteger(value){return typeof value==='string'&&PROOF_INTEGER.test(value);}
+/** Closed structural validator for journal parsing; it grants no filesystem trust. */
+export function validBootstrapObjectProof(value) {
+  if(!exact(value,['version','directory','files'])||value.version!==1||
+      !exact(value.directory,['dev','ino','uid','gid','mode','nlink','size','mtimeNs'])||
+      !validProofInteger(value.directory.dev)||!validProofInteger(value.directory.ino)||
+      !validProofInteger(value.directory.uid)||!validProofInteger(value.directory.gid)||!validProofMode(value.directory.mode)||
+      !validProofInteger(value.directory.nlink)||!validProofInteger(value.directory.size)||
+      !validProofInteger(value.directory.mtimeNs)||!Array.isArray(value.files)||value.files.length<1||value.files.length>16)return false;
+  let previous='';
+  for(const file of value.files){
+    if(!exact(file,['name','dev','ino','uid','gid','mode','nlink','size','ctimeNs','mtimeNs','sha256'])||
+        typeof file.name!=='string'||!/^[A-Za-z0-9._-]+$/.test(file.name)||file.name<=previous||file.name.length>255||
+        !validProofInteger(file.dev)||!validProofInteger(file.ino)||!validProofInteger(file.uid)||!validProofInteger(file.gid)||
+        !validProofMode(file.mode)||!validProofInteger(file.nlink)||!validProofInteger(file.size)||
+        !validProofInteger(file.ctimeNs)||!validProofInteger(file.mtimeNs)||typeof file.sha256!=='string'||!DIGEST.test(file.sha256))return false;
+    previous=file.name;
+  }
+  return true;
+}
+
+/** Durable, JSON-safe proof for a closed bootstrap namespace object. */
+export function bootstrapObjectProof({repositoryRoot,name}) {
+  try{return bootstrapProof(repositoryRoot,name);}
+  catch(error){if(error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code))throw error;fail();}
+}
+
+/** Build and prove a private router stage without reading or changing bootstrap. */
+export async function prepareRouterV2({repositoryRoot,releaseId,deployLease,admissionLease}) {
   if(typeof releaseId!=='string'||!RELEASE.test(releaseId))fail();
   requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'));
   requireLeaseIdentity(admissionLease,path.join(repositoryRoot,'.jhw-runtime/admission.lock'));
-  const release=releaseManifest(repositoryRoot,releaseId);
-  requireGenerationTwo(repositoryRoot,releaseId,release);
-  let runtime;let source;let stage;let stageName;let previousDirectory=null;
+  const release=releaseManifest(repositoryRoot,releaseId);requireGenerationTwo(repositoryRoot,releaseId,release);
+  let runtime;let source;let stage;let stageName;
   try {
     runtime=new Directory(path.join(repositoryRoot,'.jhw-runtime'));
     if((fs.fstatSync(runtime.fd).mode&0o7777)!==0o700)fail();
@@ -260,31 +337,77 @@ export async function installRouterV2({repositoryRoot,releaseId,deployLease,admi
     const contents=ROUTER_FILES.map(name=>({name,bytes:read(source,name,0o755)}));
     const manifest={version:2,sourceReleaseId:releaseId,routerContract:1,
       files:contents.map(({name,bytes})=>({name,mode:0o755,sha256:hash(bytes)}))};
-    let previous;
-    try{fs.lstatSync(runtime.at('bootstrap'));previous=validateBootstrap({repositoryRoot});}
-    catch(error){if(error.code!=='ENOENT')throw error;}
-    if(previous?.version===2&&canonical(previous)===canonical(manifest))return {sourceReleaseId:releaseId,routerContract:1,previousDirectory:null};
     stageName=`.bootstrap.stage.${randomBytes(16).toString('hex')}`;
     fs.mkdirSync(runtime.at(stageName),{mode:0o700});fs.chmodSync(runtime.at(stageName),0o700);
-    stage=new Directory(path.join(repositoryRoot,'.jhw-runtime',stageName));
+    stage=anchoredDirectory(runtime,[stageName]);
     for(const {name,bytes} of contents)write(stage,name,bytes,0o755);
     write(stage,'manifest.json',Buffer.from(canonical(manifest)+'\n'),0o600);
-    readRouterSet(stage,repositoryRoot);fs.fsyncSync(stage.fd);source.verify();runtime.verify();
-    if(previous){
-      if(canonical(validateBootstrap({repositoryRoot}))!==canonical(previous))fail('DEPLOY_BOOTSTRAP_CHANGED');
-      previousDirectory=`.bootstrap.previous.${randomBytes(16).toString('hex')}`;
-      fs.renameSync(runtime.at('bootstrap'),runtime.at(previousDirectory));fs.fsyncSync(runtime.fd);
-    }
-    try{stage.verify();fs.renameSync(runtime.at(stageName),runtime.at('bootstrap'));fs.fsyncSync(runtime.fd);}
-    catch(error){
-      if(previousDirectory){try{fs.lstatSync(runtime.at('bootstrap'));}catch(missing){if(missing.code==='ENOENT'){fs.renameSync(runtime.at(previousDirectory),runtime.at('bootstrap'));fs.fsyncSync(runtime.fd);previousDirectory=null;}}}
-      throw error;
-    }
-    const installed=validateBootstrap({repositoryRoot});
-    if(canonical(installed)!==canonical(manifest))fail('DEPLOY_BOOTSTRAP_CHANGED');
-    return {sourceReleaseId:installed.sourceReleaseId,routerContract:installed.routerContract,previousDirectory};
+    readRouterSet(stage,repositoryRoot,{fd:runtime.fd,verify:()=>runtime.verify()});fs.fsyncSync(stage.fd);source.verify();runtime.verify();
+    const proof=bootstrapProof(repositoryRoot,stageName,{fd:runtime.fd,verify:()=>runtime.verify()});
+    return {stageName,manifest,proof};
   } catch(error){if(error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code))throw error;fail();}
   finally{stage?.close();source?.close();runtime?.close();}
+}
+
+/** Move a proven bootstrap object to an absent closed name with no fallback. */
+export async function moveBootstrapObject({repositoryRoot,sourceName,destinationName,expectedProof,runtimeHandle,capability,deployLease,admissionLease}) {
+  requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'));
+  requireLeaseIdentity(admissionLease,path.join(repositoryRoot,'.jhw-runtime/admission.lock'));
+  bootstrapName(sourceName);bootstrapName(destinationName);
+  if(sourceName===destinationName)fail();
+  try {
+    requireRuntimeHandle(repositoryRoot,runtimeHandle);
+    const before=bootstrapProof(repositoryRoot,sourceName,runtimeHandle);
+    if(canonical(before)!==canonical(expectedProof))fail('DEPLOY_BOOTSTRAP_CHANGED');
+    const safety=await maintenanceSafety();
+    safety.atomicRename({capability,sourceDirectory:runtimeHandle,destinationDirectory:runtimeHandle,sourceName,destinationName,operation:'noreplace'});
+    const after=bootstrapProof(repositoryRoot,destinationName,runtimeHandle);
+    if(canonical(after)!==canonical(expectedProof))fail('DEPLOY_BOOTSTRAP_CHANGED');
+    return after;
+  } catch(error){if(error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code))throw error;fail();}
+}
+
+/** Stopped-path-only publication of the stable v2 selector. */
+export async function installRouterV2({repositoryRoot,releaseId,deployLease,admissionLease,previousDirectory:reservedPreviousDirectory=null,onRouterIntent}) {
+  let runtime;let previousDirectory=null;
+  try {
+    if(typeof releaseId!=='string'||!RELEASE.test(releaseId))fail();
+    requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'));
+    requireLeaseIdentity(admissionLease,path.join(repositoryRoot,'.jhw-runtime/admission.lock'));
+    const release=releaseManifest(repositoryRoot,releaseId);requireGenerationTwo(repositoryRoot,releaseId,release);
+    runtime=new Directory(path.join(repositoryRoot,'.jhw-runtime'));
+    let existing=false;try{fs.lstatSync(runtime.at('bootstrap'));existing=true;}catch(error){if(error.code!=='ENOENT')throw error;}
+    if(existing){const current=validateBootstrap({repositoryRoot});if(current?.version===2&&current.sourceReleaseId===releaseId&&current.routerContract===1)
+      return {sourceReleaseId:releaseId,routerContract:1,previousDirectory:null};}
+    runtime.close();runtime=undefined;
+    const prepared=await prepareRouterV2({repositoryRoot,releaseId,deployLease,admissionLease});
+    runtime=new Directory(path.join(repositoryRoot,'.jhw-runtime'));
+    if((fs.fstatSync(runtime.fd).mode&0o7777)!==0o700)fail();
+    let previousProof=null;let previous;
+    try{fs.lstatSync(runtime.at('bootstrap'));previous=validateBootstrap({repositoryRoot});previousProof=bootstrapProof(repositoryRoot,'bootstrap',{fd:runtime.fd,verify:()=>runtime.verify()});}
+    catch(error){if(error.code!=='ENOENT')throw error;}
+    if(previous?.version===2&&canonical(previous)===canonical(prepared.manifest))return {sourceReleaseId:releaseId,routerContract:1,previousDirectory:null};
+    if(previous){
+      if(canonical(validateBootstrap({repositoryRoot}))!==canonical(previous))fail('DEPLOY_BOOTSTRAP_CHANGED');
+      previousDirectory=reservedPreviousDirectory??`.bootstrap.previous.${randomBytes(16).toString('hex')}`;
+      if(!/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(previousDirectory))fail();
+    }
+    const descriptor={sourceReleaseId:releaseId,routerContract:1,stageName:prepared.stageName,previousDirectory,stageProof:prepared.proof,previousProof};
+    let intentResult=onRouterIntent?.(descriptor);
+    if(intentResult!==null&&(typeof intentResult==='object'||typeof intentResult==='function')&&typeof intentResult.then==='function')fail();
+    const safety=await maintenanceSafety();
+    const capability=safety.prepareAtomicRename({directory:runtime});
+    if(previousProof){
+      await moveBootstrapObject({repositoryRoot,sourceName:'bootstrap',destinationName:previousDirectory,expectedProof:previousProof,
+        runtimeHandle:runtime,capability,deployLease,admissionLease});
+    }
+    await moveBootstrapObject({repositoryRoot,sourceName:prepared.stageName,destinationName:'bootstrap',expectedProof:prepared.proof,
+      runtimeHandle:runtime,capability,deployLease,admissionLease});
+    const installed=validateBootstrap({repositoryRoot});
+    if(canonical(installed)!==canonical(prepared.manifest))fail('DEPLOY_BOOTSTRAP_CHANGED');
+    return {sourceReleaseId:installed.sourceReleaseId,routerContract:installed.routerContract,previousDirectory};
+  } catch(error){if(error.code&&/^DEPLOY_[A-Z_]+$/.test(error.code))throw error;fail();}
+  finally{runtime?.close();}
 }
 export function validateRetainedBootstrap({repositoryRoot,name,runtimeHandle=null}) {
   if(typeof name!=='string'||!/^\.bootstrap\.previous\.[a-f0-9]{32}$/.test(name))fail();
@@ -297,6 +420,7 @@ export function validateRetainedBootstrap({repositoryRoot,name,runtimeHandle=nul
   catch { fail(); }
   finally { directory?.close(); }
 }
+
 function write(directory,name,bytes,mode) {
   directory.verify();
   const fd=fs.openSync(directory.at(name),C.O_WRONLY|C.O_CREAT|C.O_EXCL|C.O_NOFOLLOW,mode);
@@ -304,6 +428,7 @@ function write(directory,name,bytes,mode) {
   finally { fs.closeSync(fd); }
   directory.verify();
 }
+async function maintenanceSafety(){return import('./runtime-safety.mjs');}
 async function localStore(repositoryRoot) {
   // Installer code is caller-trusted; check both modules before the first import.
   const directory=new Directory(path.join(repositoryRoot,'scripts'));
