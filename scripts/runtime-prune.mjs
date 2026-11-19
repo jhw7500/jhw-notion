@@ -615,22 +615,30 @@ function inspectJournal(runtime,name,budget) {
 }
 function snapshotJournalTree(directory) {
  const records=[];let total=0;
- const visit=(current,relative)=>{const entries=fs.readdirSync(current).sort();for(const name of entries){if(records.length>=128)fail('scan_limit');const file=path.join(current,name);const item=relative?`${relative}/${name}`:name;const before=fs.lstatSync(file,{bigint:true});
+ const visit=(current,relative)=>{const entries=fs.readdirSync(current).sort();for(const name of entries){if(records.length>=512)fail('scan_limit');const file=path.join(current,name);const item=relative?`${relative}/${name}`:name;const before=fs.lstatSync(file,{bigint:true});
    if(before.uid!==BigInt(process.getuid()))fail('unverified_journal');
    if(before.isDirectory()){if(permissions(before.mode)!==0o700)fail('unverified_journal');records.push({path:item,type:'directory',identity:objectIdentity(before)});visit(file,item);continue;}
-   if(before.isSymbolicLink()){const target=fs.readlinkSync(file);const after=fs.lstatSync(file,{bigint:true});if(!sameIdentity(after,objectIdentity(before)))fail('unverified_journal');records.push({path:item,type:'symlink',identity:{...objectIdentity(before),nlink:Number(before.nlink),mtimeNs:String(before.mtimeNs),ctimeNs:String(before.ctimeNs)},target});total+=Buffer.byteLength(target);continue;}
+   if(before.isSymbolicLink()){const target=fs.readlinkSync(file);const after=fs.lstatSync(file,{bigint:true});if(!sameIdentity(after,objectIdentity(before))||![1n,2n].includes(before.nlink))fail('unverified_journal');records.push({path:item,type:'symlink',identity:{...objectIdentity(before),nlink:Number(before.nlink),mtimeNs:String(before.mtimeNs),ctimeNs:String(before.ctimeNs)},target});total+=Buffer.byteLength(target);continue;}
    if(!before.isFile()||![1n,2n].includes(before.nlink)||before.size>32n*1024n*1024n)fail('unverified_journal');
    let fd;try{fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);const bytes=Buffer.alloc(Number(before.size));let offset=0;while(offset<bytes.length){const count=fs.readSync(fd,bytes,offset,bytes.length-offset,null);if(!count)break;offset+=count;}const after=fs.fstatSync(fd,{bigint:true});const named=fs.lstatSync(file,{bigint:true});if(offset!==bytes.length||!sameIdentity(after,objectIdentity(before))||!sameIdentity(named,objectIdentity(before))||after.size!==before.size||after.nlink!==before.nlink)fail('unverified_journal');records.push({path:item,type:'file',identity:{...objectIdentity(before),nlink:Number(before.nlink),size:String(before.size)},bytes});total+=bytes.length;}finally{if(fd!==undefined)fs.closeSync(fd);}
    if(total>128*1024*1024)fail('scan_limit');
-  }};visit(directory,'');return records;
+  }};visit(directory,'');
+ const links=new Map();for(const record of records.filter(item=>item.type==='file')){const key=`${record.identity.dev}:${record.identity.ino}`;if(!links.has(key))links.set(key,[]);links.get(key).push(record);}
+ for(const group of links.values()){const expected=group[0].identity.nlink;if(group.length!==expected||![1,2].includes(expected)||group.some(record=>record.identity.nlink!==expected||!record.bytes.equals(group[0].bytes)))fail('unverified_journal');}
+ return records;
 }
 function treeSignature(records){return records.map(record=>({path:record.path,type:record.type,identity:record.identity,...(record.type==='file'?{sha256:digest(record.bytes)}:record.type==='symlink'?{target:record.target}:{})}));}
 function codexActualInventorySafe(directory,state) {
- const observed=name=>readObservedCodexObject(path.join(directory,name));const source=observed(`${state.captures.source.name}/object`);const temp=observed(`${state.captures.temp.name}/object`);const after=observed('after');
+ const capture=key=>{const expected=state.captures[key],root=path.join(directory,expected.name);let info,names;
+  try{info=fs.lstatSync(root,{bigint:true});names=fs.readdirSync(root).sort();}catch{return null;}
+  if(!info.isDirectory()||canonical(objectIdentity(info))!==canonical(expected.identity)||names.some(name=>name!=='object'))return null;
+  return {valid:true,names,object:readObservedCodexObject(path.join(root,'object'))};};
+ const sourceCapture=capture('source'),tempCapture=capture('temp');if(!sourceCapture||!tempCapture)return false;
+ const source=sourceCapture.object,temp=tempCapture.object,after=readObservedCodexObject(path.join(directory,'after'));
  const before=state.before;const exactBefore=source?.kind==='file'&&source.sha256===before.sha256&&source.identity.nlink===1&&
   ['dev','ino','uid','mode','size'].every(key=>source.identity[key]===before.identity[key]);
- if(temp!==null||after!==null)return false;
- return state.outcome==='migrated'?exactBefore:source===null;
+ if(temp!==null||after!==null||tempCapture.names.length)return false;
+ return state.outcome==='migrated'?exactBefore&&sourceCapture.names.join(',')==='object':source===null&&sourceCapture.names.length===0;
 }
 function treePruneCandidate({repositoryRoot,name,parsed,budget}) {
  const directory=path.join(repositoryRoot,'.jhw-runtime/v2/journals',name);if(!parsed.files.has('retention.json'))return {kind:'legacy',name};
@@ -811,13 +819,16 @@ function writeRecoveryFile(payload,name,record) {
  } finally {if(fd!==undefined)fs.closeSync(fd);}
 }
 function recoveryInventory(item,files,recoveryIdentity,payloadIdentity) {
- return {version:1,name:item.name,identity:item.identity,recoveryIdentity,payloadIdentity,files:item.children.map(name=>({name,identity:item.records[name].identity,recoveryIdentity:files[name],size:item.records[name].size,mode:item.records[name].identity.mode,sha256:digest(item.records[name].bytes)}))};
+ const tree=item.special==='v2-tree'?item.treeRecords.map((record,index)=>({path:record.path,type:record.type,proof:record.identity,payload:item.children[index],
+  target:record.type==='symlink'?record.target:null,linkGroup:record.type==='file'&&record.identity.nlink===2?`${record.identity.dev}:${record.identity.ino}`:null})):null;
+ return {version:1,name:item.name,identity:item.identity,recoveryIdentity,payloadIdentity,tree,files:item.children.map(name=>({name,identity:item.records[name].identity,recoveryIdentity:files[name],size:item.records[name].size,mode:item.records[name].identity.mode,sha256:digest(item.records[name].bytes)}))};
 }
 function verifyRecovery(evidence,recoveryRecord,item) {
  const recovery=new PinnedDirectory(recoveryRecord.path,{parentVerify:()=>evidence.verify()});try {
  if(!sameIdentity(recovery.stat,recoveryRecord.identity))fail('recovery_copy_failed',true);
- const inventory=parseJson(readCandidateFile(`/proc/self/fd/${recovery.fd}`,'inventory.json',FILE_LIMIT,0o600).bytes);
- if(!exact(inventory,['version','name','identity','recoveryIdentity','payloadIdentity','files'])||inventory.version!==1||inventory.name!==item.name||JSON.stringify(inventory.identity)!==JSON.stringify(item.identity)||JSON.stringify(inventory.recoveryIdentity)!==JSON.stringify(recoveryRecord.identity)||!Array.isArray(inventory.files)||inventory.files.length!==item.children.length)fail('recovery_copy_failed',true);
+ const inventory=parseJson(readCandidateFile(`/proc/self/fd/${recovery.fd}`,'inventory.json',4*1024*1024,0o600).bytes);
+ if(!exact(inventory,['version','name','identity','recoveryIdentity','payloadIdentity','tree','files'])||inventory.version!==1||inventory.name!==item.name||JSON.stringify(inventory.identity)!==JSON.stringify(item.identity)||JSON.stringify(inventory.recoveryIdentity)!==JSON.stringify(recoveryRecord.identity)||!Array.isArray(inventory.files)||inventory.files.length!==item.children.length)fail('recovery_copy_failed',true);
+ const expectedTree=item.special==='v2-tree'?recoveryInventory(item,{},inventory.recoveryIdentity,inventory.payloadIdentity).tree:null;if(canonical(inventory.tree)!==canonical(expectedTree))fail('recovery_copy_failed',true);
  const payload=new PinnedDirectory(recovery.at('payload'),{parentVerify:()=>recovery.verify()});try {
  if(!sameIdentity(payload.stat,inventory.payloadIdentity)||JSON.stringify(fs.readdirSync(`/proc/self/fd/${payload.fd}`).sort())!==JSON.stringify(item.children))fail('recovery_copy_failed',true);
  for(let index=0;index<item.children.length;index++){
@@ -850,7 +861,8 @@ function removeCaptured(capture,item,faultInjector,index) {
  if(item.special==='v2-tree'){
   verifyTreeCandidate(item,capture);
   const leaves=item.treeRecords.filter(record=>record.type!=='directory').sort((a,b)=>b.path.split('/').length-a.path.split('/').length||b.path.localeCompare(a.path));
-  for(const record of leaves){const file=path.join(capture,record.path);const actual=fs.lstatSync(file,{bigint:true});if(!sameIdentity(actual,record.identity))fail('capture_changed',true);if(record.type==='file'){const observed=snapshotJournalTree(path.dirname(file)).find(value=>value.path===path.basename(file));if(!observed||canonical(observed.identity)!==canonical(record.identity)||digest(observed.bytes)!==digest(record.bytes))fail('capture_changed',true);}else {const proof={...objectIdentity(actual),nlink:Number(actual.nlink),mtimeNs:String(actual.mtimeNs),ctimeNs:String(actual.ctimeNs)};if(!actual.isSymbolicLink()||canonical(proof)!==canonical(record.identity)||fs.readlinkSync(file)!==record.target)fail('capture_changed',true);}fs.unlinkSync(file);syncDirectory(path.dirname(file));faultInjector?.('after_original_unlink',{name:item.name,index,child:record.path});}
+  const removedLinks=new Map();
+  for(const record of leaves){const file=path.join(capture,record.path);const actual=fs.lstatSync(file,{bigint:true});if(!sameIdentity(actual,record.identity))fail('capture_changed',true);if(record.type==='file'){const group=`${record.identity.dev}:${record.identity.ino}`,removed=removedLinks.get(group)??0,expectedLinks=record.identity.nlink-removed;let fd;try{fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);const current=fs.fstatSync(fd,{bigint:true}),bytes=fs.readFileSync(fd);if(!current.isFile()||Number(current.nlink)!==expectedLinks||String(current.size)!==record.identity.size||digest(bytes)!==digest(record.bytes))fail('capture_changed',true);}finally{if(fd!==undefined)fs.closeSync(fd);}removedLinks.set(group,removed+1);}else {const proof={...objectIdentity(actual),nlink:Number(actual.nlink),mtimeNs:String(actual.mtimeNs),ctimeNs:String(actual.ctimeNs)};if(!actual.isSymbolicLink()||canonical(proof)!==canonical(record.identity)||fs.readlinkSync(file)!==record.target)fail('capture_changed',true);}fs.unlinkSync(file);syncDirectory(path.dirname(file));faultInjector?.('after_original_unlink',{name:item.name,index,child:record.path});}
   const directories=item.treeRecords.filter(record=>record.type==='directory').sort((a,b)=>b.path.split('/').length-a.path.split('/').length||b.path.localeCompare(a.path));
   for(const record of directories){const directory=path.join(capture,record.path);const actual=fs.lstatSync(directory,{bigint:true});if(!sameIdentity(actual,record.identity)||fs.readdirSync(directory).length)fail('capture_changed',true);fs.rmdirSync(directory);syncDirectory(path.dirname(directory));}
   fs.rmdirSync(capture);return;
@@ -873,7 +885,7 @@ export function applyRuntimePrune(options) {
  const plan=buildPlan(options);const {runtime}=plan;let evidence;let mutated=false;const removed={journals:0,previous:0};
  try {
   const legacyDeletion=plan.previous.length||plan.journals.some(item=>item.special===undefined);
-  if((plan.bootstrapGenerations.length||plan.hasLiveBindings)&&legacyDeletion)fail('mixed_generation_legacy');
+  if(plan.hasLiveBindings&&legacyDeletion)fail('mixed_generation_legacy');
   if(plan.hasBootstrapGenerations)removed.bootstrapGenerations=0;
   options.faultInjector?.('before_intent');runtime.verify();if(JSON.stringify(scanNames(runtime))!==JSON.stringify(plan.rootNames))fail('snapshot_changed');
   fs.mkdirSync(runtime.at(PRUNE),{mode:0o700});fs.chmodSync(runtime.at(PRUNE),0o700);runtime.sync();
@@ -895,7 +907,7 @@ export function applyRuntimePrune(options) {
     evidence.sync();options.faultInjector?.('after_capture_rmdir_sync',{name:item.name,index});return true;};
    if(type==='bootstrapGenerations'){
     const reclaimed=withUnreferencedBootstrapGeneration({repositoryRoot:options.repositoryRoot,bootstrapId:item.bootstrapId,identity:item.identity,
-      deployLease:options.deployLease,publicationLease:options.publicationLease,remove});
+      deployLease:options.deployLease,publicationLease:options.publicationLease,remove,observe:options.faultInjector});
     if(!reclaimed)continue;
    }else if(item.special==='v2-pair'||item.special==='v2-tree')remove({syncSource:()=>syncDirectory(path.dirname(item.directory))});
    else remove();

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import {spawn} from 'node:child_process';
+import {spawn,spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
 
 import {acquireLease} from './runtime-safety.mjs';
@@ -89,6 +89,40 @@ test('safe Codex journal is deleted and a mutable captured original is retained 
   await runDeployment({repositoryRoot:changed.root,home:changed.home,procRoot:changed.procRoot,argv:['--migrate-codex-config']});
   const changedRoot=path.join(changed.root,'.jhw-runtime/v2/journals');const changedName=fs.readdirSync(changedRoot).find(name=>JSON.parse(fs.readFileSync(path.join(changedRoot,name,'state.json'))).kind==='codex-config');const changedJournal=path.join(changedRoot,changedName),header=JSON.parse(fs.readFileSync(path.join(changedJournal,'state.json'))),state=JSON.parse(fs.readFileSync(path.join(changedJournal,header.control.name,'state.json')));ageReceipt(changedJournal,40);fs.appendFileSync(path.join(changedJournal,state.captures.source.name,'object'),'foreign edit\n');addRecentCompatibleJournals(changed.root);
   const retained=planRuntimePrune({repositoryRoot:changed.root});assert.equal(retained.candidates.journals.includes(changedName),false);assert.ok(retained.skipped.evidence>=1);assert.equal(fs.existsSync(changedJournal),true);
+
+});
+
+async function foreignCodexCapture(t,mutation) {
+  const fixture=await installedFixture(t),config=path.join(fixture.home,'.codex/config.toml');fs.writeFileSync(config,fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,''),{mode:0o600});
+  await runDeployment({repositoryRoot:fixture.root,home:fixture.home,procRoot:fixture.procRoot,argv:['--migrate-codex-config']});
+  const root=path.join(fixture.root,'.jhw-runtime/v2/journals'),name=fs.readdirSync(root).find(value=>JSON.parse(fs.readFileSync(path.join(root,value,'state.json'))).kind==='codex-config'),journal=path.join(root,name),header=JSON.parse(fs.readFileSync(path.join(journal,'state.json'))),control=JSON.parse(fs.readFileSync(path.join(journal,header.control.name,'state.json')));ageReceipt(journal,40);
+  const capture=path.join(journal,control.captures.temp.name);if(mutation==='unknown-child')fs.writeFileSync(path.join(capture,'foreign-data'),'foreign',{mode:0o600});else{const aside=path.join(fixture.root,'.replaced-capture');fs.renameSync(capture,aside);fs.mkdirSync(capture,{mode:0o700});}
+  addRecentCompatibleJournals(fixture.root);return {fixture,name,journal};
+}
+
+for(const mutation of ['unknown-child','replaced-capture'])test(`Codex ${mutation} remains evidence`,async t=>{
+  const value=await foreignCodexCapture(t,mutation),plan=planRuntimePrune({repositoryRoot:value.fixture.root});assert.equal(plan.candidates.journals.includes(value.name),false);assert.ok(plan.skipped.evidence>=1);assert.equal(fs.existsSync(value.journal),true);
+});
+
+async function initialScratchCandidate(t,{full=false}={}) {
+  const fixture=await installedFixture(t),root=path.join(fixture.root,'.jhw-runtime/v2/journals'),name=fs.readdirSync(root)[0],journal=path.join(root,name);ageReceipt(journal,40);await replaceCurrent(fixture);addRecentCompatibleJournals(fixture.root);
+  const scratch=path.join(journal,'wiring/restore');fs.mkdirSync(scratch,{mode:0o700});const target='a'.repeat(16),uuid='00000000-0000-4000-8000-000000000000',temporary=`.${target}.123.${uuid}.tmp`;fs.writeFileSync(path.join(scratch,target),'paired',{mode:0o600});fs.linkSync(path.join(scratch,target),path.join(scratch,temporary));
+  if(full)for(let index=0;index<126;index++)fs.writeFileSync(path.join(scratch,index.toString(16).padStart(16,'0')),'x',{mode:0o600});
+  return {fixture,root,name,journal,target,temporary};
+}
+
+test('initial scratch hardlink pairs delete atomically',async t=>{
+  const clean=await initialScratchCandidate(t);assert.equal(planRuntimePrune({repositoryRoot:clean.fixture.root}).candidates.journals.includes(clean.name),true);const removed=applyRuntimePrune({repositoryRoot:clean.fixture.root});assert.equal(removed.removed.journals,1);assert.equal(fs.existsSync(clean.journal),false);
+});
+
+test('initial scratch preserves the accepted 128-entry capacity',async t=>{
+  const full=await initialScratchCandidate(t,{full:true});assert.equal(planRuntimePrune({repositoryRoot:full.fixture.root}).candidates.journals.includes(full.name),true);assert.equal(applyRuntimePrune({repositoryRoot:full.fixture.root}).removed.journals,1);
+});
+
+test('initial scratch recovery manifest retains paths, types, proofs and link groups',async t=>{
+  const interrupted=await initialScratchCandidate(t);assert.throws(()=>applyRuntimePrune({repositoryRoot:interrupted.fixture.root,faultInjector:point=>{if(point==='after_recovery_durable')throw new Error('stop');}}),{code:'DEPLOY_PRUNE_PARTIAL'});
+  const inventory=JSON.parse(fs.readFileSync(path.join(interrupted.fixture.root,'.jhw-runtime/.prune.v1/recovery.00000000/inventory.json')));assert.equal(Array.isArray(inventory.tree),true);const first=`wiring/restore/${interrupted.target}`,second=`wiring/restore/${interrupted.temporary}`,records=inventory.tree.filter(record=>[first,second].includes(record.path));
+  assert.equal(records.length,2);assert.deepEqual(new Set(records.map(record=>record.type)),new Set(['file']));assert.equal(records[0].linkGroup,records[1].linkGroup);assert.ok(records[0].linkGroup);assert.ok(records.every(record=>record.proof.nlink===2&&typeof record.payload==='string'));
 });
 
 test('v2 nested bytes, symlink, owner and quarantine interruption preserve recoverable evidence',async t=>{
@@ -175,6 +209,37 @@ test('v2 prune preserves current generation and identifies an old unreferenced c
   finally{blockedPublication.close();blockedDeploy.close();}
   assert.equal(blocked.removed.bootstrapGenerations,0);assert.equal(fs.existsSync(oldDirectory),true);
   holder.stdin.end();await new Promise(resolve=>holder.once('close',resolve));
+});
+
+async function staleGenerationFixture(t,{privateState=null}={}) {
+  const fixture=await createRuntimeFixture(t);const first=await fixture.prepare();fixture.write('scripts/runtime-entry.mjs','export const nextGeneration=true;\n');const second=await fixture.prepare(),store=await import('./runtime-store.mjs'),deploy=acquireLease(path.join(fixture.root,'.jhw-runtime/deploy.lock'));let oldPair,currentPair;
+  try{oldPair=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,releaseId:first.releaseId,deployLease:deploy});currentPair=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,releaseId:second.releaseId,deployLease:deploy});}finally{deploy.close();}
+  fixture.seedPair(oldPair);const admission=acquireLease(path.join(fixture.root,'.jhw-runtime/admission.lock'),{shared:true,create:true}),binding=store.bindEntryPair({repositoryRoot:fixture.root,kind:'session',selectedPair:oldPair,admissionLease:admission});fixture.seedPair(currentPair);binding.lease.close();binding.generationLease.close();admission.close();
+  const sessions=path.join(fixture.root,'.jhw-runtime/v2/sessions');let recordName=binding.id;if(privateState){recordName=privateState==='creating'?`.creating.${binding.id}`:`.retired.${binding.id}.${'a'.repeat(32)}`;fs.renameSync(path.join(sessions,binding.id),path.join(sessions,recordName));}
+  const generation=path.join(fixture.root,'.jhw-runtime/v2/bootstraps',oldPair.bootstrapId),old=new Date(Date.now()-40*DAY);fs.utimesSync(generation,old,old);return {fixture,store,oldPair,currentPair,binding,generation,sessions,recordName};
+}
+
+for(const privateState of ['creating','retired'])test(`private ${privateState} records are retired before a later generation reclaim`,async t=>{
+  const value=await staleGenerationFixture(t,{privateState});assert.equal(planRuntimePrune({repositoryRoot:value.fixture.root}).candidates.bootstrapGenerations.includes(value.oldPair.bootstrapId),true);
+  const deploy=acquireLease(path.join(value.fixture.root,'.jhw-runtime/deploy.lock')),publication=acquireLease(path.join(value.fixture.root,'.jhw-runtime/publication.lock'),{create:true});let first;try{first=applyRuntimePrune({repositoryRoot:value.fixture.root,deployLease:deploy,publicationLease:publication});}finally{publication.close();deploy.close();}
+  assert.equal(first.removed.bootstrapGenerations,0);assert.equal(fs.existsSync(value.generation),true);assert.equal(fs.existsSync(path.join(value.sessions,value.recordName)),false);
+  const nextDeploy=acquireLease(path.join(value.fixture.root,'.jhw-runtime/deploy.lock')),nextPublication=acquireLease(path.join(value.fixture.root,'.jhw-runtime/publication.lock'));let second;try{second=applyRuntimePrune({repositoryRoot:value.fixture.root,deployLease:nextDeploy,publicationLease:nextPublication});}finally{nextPublication.close();nextDeploy.close();}assert.equal(second.removed.bootstrapGenerations,1);
+});
+
+async function crossProcessReaperScenario(t,privateState=null) {
+  const value=await staleGenerationFixture(t,{privateState}),storeUrl=pathToFileURL(path.join(path.dirname(new URL(import.meta.url).pathname),'runtime-store.mjs')).href,deploy=acquireLease(path.join(value.fixture.root,'.jhw-runtime/deploy.lock')),publication=acquireLease(path.join(value.fixture.root,'.jhw-runtime/publication.lock'),{create:true});let child;let childResult;
+  try{const first=applyRuntimePrune({repositoryRoot:value.fixture.root,deployLease:deploy,publicationLease:publication,faultInjector:point=>{if(point!=='generation_ex_acquired'||child)return;const source=`import {reapCompletedSessionBindingsV2} from ${JSON.stringify(storeUrl)};console.log(JSON.stringify(reapCompletedSessionBindingsV2({repositoryRoot:process.argv[1],dryRun:false,limit:8})))`;child=spawnSync(process.execPath,['--input-type=module','-e',source,value.fixture.root],{encoding:'utf8',timeout:10000});if(child.status===0)childResult=JSON.parse(child.stdout);}});assert.equal(first.removed.bootstrapGenerations,0);}finally{publication.close();deploy.close();}
+  assert.equal(child.status,0,child.stderr);
+  assert.ok(childResult.preserved.includes(value.recordName));assert.equal(fs.existsSync(value.generation),true);assert.equal(fs.existsSync(path.join(value.sessions,value.recordName)),false);
+  const nextDeploy=acquireLease(path.join(value.fixture.root,'.jhw-runtime/deploy.lock')),nextPublication=acquireLease(path.join(value.fixture.root,'.jhw-runtime/publication.lock'));try{assert.equal(applyRuntimePrune({repositoryRoot:value.fixture.root,deployLease:nextDeploy,publicationLease:nextPublication}).removed.bootstrapGenerations,1);}finally{nextPublication.close();nextDeploy.close();}
+}
+
+test('cross-process public reaper cannot invert generation to index ordering during reclaim',async t=>{
+  await crossProcessReaperScenario(t);
+});
+
+test('cross-process private reaper cannot invert generation to index ordering during reclaim',async t=>{
+  await crossProcessReaperScenario(t,'creating');
 });
 
 test('live v2 binding rejects an eligible legacy batch before prune intent', async t => {

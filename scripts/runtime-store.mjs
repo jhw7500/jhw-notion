@@ -634,11 +634,32 @@ export function restoreBootstrapGeneration({repositoryRoot, bootstrapId, deployL
   });
 }
 
+function gcPrivateBindingRecords(runtime,root,repositoryRoot) {
+  const result=[];
+  const scan=(kind,bootstrapId)=>{
+    const index=v2IndexLease(repositoryRoot,bootstrapId??'b-'+'0'.repeat(64),kind,true);
+    let location;
+    try{location=v2Namespace(runtime,bootstrapId,kind);for(const entry of v2BindingEntries(location.namespace,kind).entries){
+      if(entry.state==='public')continue;
+      const evidence=v2PrivateEvidence(location.namespace,root.stat,repositoryRoot,kind,bootstrapId,entry);if(!evidence)sessionFail();
+      result.push({...evidence.record,token:`v2:${evidence.record.bootstrapId}:${entry.id}:${digest(evidence.bytes)}`,
+        live:false,private:true,privateName:entry.name,privateState:entry.state});
+    }}catch(error){if(error.code!=='ENOENT')throw error;}finally{if(location)closeV2Namespace(location);index.close();}
+  };
+  if(fs.existsSync(path.join(repositoryRoot,'.jhw-runtime/v2/sessions')))scan('session',null);
+  let v2;let invocations;
+  if(!fs.existsSync(path.join(repositoryRoot,'.jhw-runtime/v2/invocations')))return result;
+  try{v2=runtime.child('v2',false,true);invocations=v2.child('invocations',false,true);
+    for(const bootstrapId of v2BootstrapIds(invocations).ids)scan('invocation',bootstrapId);
+  }catch(error){if(error.code!=='ENOENT')throw error;}finally{invocations?.close();v2?.close();}
+  return result;
+}
+
 /** Return a complete, validated generation-copy inventory and the roots that are
  * live independently of deployment journals.  This is intentionally separate
  * from the bounded session reaper: an empty reaper result is not absence proof. */
 export function snapshotBootstrapReferences({repositoryRoot}) {
-  return withStore(repositoryRoot, false, (runtime) => {
+  return withStore(repositoryRoot, false, (runtime, root) => {
     if (!runtime) return {retained:new Set(), generations:[],records:[]};
     const retained=new Set();
     const current=currentIn(runtime,repositoryRoot,false);
@@ -649,7 +670,7 @@ export function snapshotBootstrapReferences({repositoryRoot}) {
     }
     // inspectSessionBindingsV2 is authoritative: it either validates every
     // public/private entry in every namespace or throws.
-    const records=inspectSessionBindingsV2({repositoryRoot});
+    const records=[...inspectSessionBindingsV2({repositoryRoot}),...gcPrivateBindingRecords(runtime,root,repositoryRoot)];
     for(const record of records)if(record.live)retained.add(record.bootstrapId);
     let v2;let bootstraps;
     try{v2=runtime.child('v2',false,true);bootstraps=v2.child('bootstraps',false,true);}
@@ -676,7 +697,7 @@ export function snapshotBootstrapReferences({repositoryRoot}) {
 /** Revalidate a planned generation under the canonical reclaim lock order.
  * The callback runs while generation EX and both authoritative indexes SH are
  * held; it must only capture/remove the already snapshotted generation. */
-export function withUnreferencedBootstrapGeneration({repositoryRoot,bootstrapId,identity,deployLease,publicationLease,remove}) {
+export function withUnreferencedBootstrapGeneration({repositoryRoot,bootstrapId,identity,deployLease,publicationLease,remove,observe}) {
   requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'),'DEPLOY_BOOTSTRAP_INVALID');
   requireLeaseIdentity(publicationLease,path.join(repositoryRoot,'.jhw-runtime/publication.lock'),'DEPLOY_BOOTSTRAP_INVALID');
   if(!BOOTSTRAP.test(bootstrapId)||!identity||typeof remove!=='function')fail('DEPLOY_BOOTSTRAP_INVALID');
@@ -684,6 +705,7 @@ export function withUnreferencedBootstrapGeneration({repositoryRoot,bootstrapId,
   try{generationLease=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${bootstrapId}/lease`));}
   catch(error){if(error.code==='DEPLOY_LOCK_CONTENDED')return false;throw error;}
   try{
+    observe?.('generation_ex_acquired',{bootstrapId});
     sessionIndex=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);
     invocationIndex=v2IndexLease(repositoryRoot,bootstrapId,'invocation',true);
     const snapshot=snapshotBootstrapReferences({repositoryRoot});
@@ -704,7 +726,10 @@ export function withUnreferencedBootstrapGeneration({repositoryRoot,bootstrapId,
      });}
   }finally{invocationIndex?.close();sessionIndex?.close();generationLease.close();}
   if(stale.length){
-    for(const row of stale){const {token,live:_live,...record}=row;try{retireV2Record({repositoryRoot,record,token});}catch{} }
+    for(const row of stale){const {token,live:_live,private:privateRecord,privateName,privateState,...record}=row;try{
+      if(privateRecord)reapV2PrivateCandidate({repositoryRoot,dryRun:false,kind:record.kind,bootstrapId:record.kind==='session'?null:record.bootstrapId,name:privateName});
+      else retireV2Record({repositoryRoot,record,token});
+    }catch{} }
     return false;
   }
   return result;
@@ -2520,7 +2545,8 @@ export function resolveSessionBindingV2({repositoryRoot,token,pid=process.pid}) 
 function retireV2Record({repositoryRoot,record,token}) {
   let generation;
   try {
-    generation=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${record.bootstrapId}/lease`),{shared:true});
+    try { generation=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${record.bootstrapId}/lease`),{shared:true}); }
+    catch (error) { if (error.code === 'DEPLOY_LOCK_CONTENDED') return false; throw error; }
     const index = v2IndexLease(repositoryRoot,record.bootstrapId,record.kind,false);
     try {
       return withStore(repositoryRoot,false,(runtime,root) => {

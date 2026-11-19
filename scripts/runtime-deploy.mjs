@@ -1378,13 +1378,14 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
  if(command.operation==='prune'&&exists(runtime)&&pendingPairJournalCount(repositoryRoot)>0)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
  if(command.operation==='prune'&&!command.apply)return planRuntimePrune({repositoryRoot});
  if(command.operation==='prune') {
-  const proposed=planRuntimePrune({repositoryRoot});const generationOnly=(proposed.candidates.bootstrapGenerations?.length??0)>0;
-  const before=generationOnly?completePairInventory({repositoryRoot,procRoot}):requireQuiescence(inventoryOptions);let pruneWriter;let pruneAdmission;let prunePublication;
+  const proposed=planRuntimePrune({repositoryRoot});const hasGenerations=(proposed.candidates.bootstrapGenerations?.length??0)>0;
+  const hasLegacy=proposed.candidates.previous.length>0||proposed.candidates.journals.some(name=>name.startsWith('.deploy.'));
+  const livePath=hasGenerations&&!hasLegacy;const before=livePath?completePairInventory({repositoryRoot,procRoot}):requireQuiescence(inventoryOptions);let pruneWriter;let pruneAdmission;let prunePublication;
   try {
    pruneWriter=acquireLease(path.join(runtime,'deploy.lock'),{create:true});
-   if(generationOnly)prunePublication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
-   else pruneAdmission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
-   const after=generationOnly?completePairInventory({repositoryRoot,procRoot}):requireQuiescence(inventoryOptions);
+   if(!livePath)pruneAdmission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
+   if(hasGenerations)prunePublication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
+   const after=livePath?completePairInventory({repositoryRoot,procRoot}):requireQuiescence(inventoryOptions);
    return {...applyRuntimePrune({repositoryRoot,deployLease:pruneWriter,publicationLease:prunePublication}),inventory:{before,after}};
   } finally {prunePublication?.close();pruneAdmission?.close();pruneWriter?.close();}
  }
