@@ -123,20 +123,25 @@ const SCRATCH_UUID='[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
 const SCRATCH_TARGET=`[a-f0-9]{16}(?:\\.bak\\.jhw-notion\\.\\d{14}\\.${SCRATCH_UUID})?`;
 const SCRATCH_FILE=new RegExp(`^${SCRATCH_TARGET}$`);
 const SCRATCH_TEMP=new RegExp(`^\\.(${SCRATCH_TARGET})\\.\\d+\\.${SCRATCH_UUID}\\.tmp$`);
-function readInitialScratchFile(directory,name,limit) {
+function readStableFile(file,limit,validate,{reason='unverified_journal',partial=false}={}) {
  let fd;
  try{
-  const file=path.join(directory,name);fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);
-  const before=fs.fstatSync(fd,{bigint:true}),mode=permissions(before.mode);
-  if(!before.isFile()||before.uid!==BigInt(process.getuid())||![1n,2n].includes(before.nlink)||
-    (mode&~0o644)!==0||(mode&0o400)===0||before.size>BigInt(limit))fail('unverified_journal');
+  fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);
+  const before=fs.fstatSync(fd,{bigint:true});
+  if(!before.isFile()||before.uid!==BigInt(process.getuid())||before.size>BigInt(limit)||!validate(before))fail(reason,partial);
   const bytes=Buffer.alloc(Number(before.size)+1);let length=0;
   while(length<bytes.length){const count=fs.readSync(fd,bytes,length,bytes.length-length,null);if(!count)break;length+=count;}
   const after=fs.fstatSync(fd,{bigint:true}),named=fs.lstatSync(file,{bigint:true});
-  for(const key of ['dev','ino','uid','mode','nlink','size','ctimeNs','mtimeNs'])if(before[key]!==after[key]||before[key]!==named[key])fail('unverified_journal');
-  if(length!==Number(before.size))fail('unverified_journal');
+  for(const key of ['dev','ino','uid','mode','nlink','size','ctimeNs','mtimeNs'])if(before[key]!==after[key]||before[key]!==named[key])fail(reason,partial);
+  if(length!==Number(before.size))fail(reason,partial);
   return {bytes:bytes.subarray(0,length),identity:objectIdentity(before),size:length,nlink:Number(before.nlink),ctimeNs:String(before.ctimeNs),mtimeNs:String(before.mtimeNs)};
- }catch(error){if(error instanceof DeploymentError)throw error;fail('unverified_journal');}finally{if(fd!==undefined)fs.closeSync(fd);}
+ }catch(error){if(error instanceof DeploymentError)throw error;fail(reason,partial);}finally{if(fd!==undefined)fs.closeSync(fd);}
+}
+function readInitialScratchFile(directory,name,limit) {
+ return readStableFile(path.join(directory,name),limit,before=>{
+  const mode=permissions(before.mode);
+  return [1n,2n].includes(before.nlink)&&(mode&~0o644)===0&&(mode&0o400)!==0;
+ });
 }
 function readInitialWiring(journal,state,files) {
  const child=new PinnedDirectory(journal.at('wiring'),{parentVerify:()=>journal.verify()});let scratch;
@@ -862,7 +867,23 @@ function removeCaptured(capture,item,faultInjector,index) {
   verifyTreeCandidate(item,capture);
   const leaves=item.treeRecords.filter(record=>record.type!=='directory').sort((a,b)=>b.path.split('/').length-a.path.split('/').length||b.path.localeCompare(a.path));
   const removedLinks=new Map();
-  for(const record of leaves){const file=path.join(capture,record.path);const actual=fs.lstatSync(file,{bigint:true});if(!sameIdentity(actual,record.identity))fail('capture_changed',true);if(record.type==='file'){const group=`${record.identity.dev}:${record.identity.ino}`,removed=removedLinks.get(group)??0,expectedLinks=record.identity.nlink-removed;let fd;try{fd=fs.openSync(file,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);const current=fs.fstatSync(fd,{bigint:true}),bytes=fs.readFileSync(fd);if(!current.isFile()||Number(current.nlink)!==expectedLinks||String(current.size)!==record.identity.size||digest(bytes)!==digest(record.bytes))fail('capture_changed',true);}finally{if(fd!==undefined)fs.closeSync(fd);}removedLinks.set(group,removed+1);}else {const proof={...objectIdentity(actual),nlink:Number(actual.nlink),mtimeNs:String(actual.mtimeNs),ctimeNs:String(actual.ctimeNs)};if(!actual.isSymbolicLink()||canonical(proof)!==canonical(record.identity)||fs.readlinkSync(file)!==record.target)fail('capture_changed',true);}fs.unlinkSync(file);syncDirectory(path.dirname(file));faultInjector?.('after_original_unlink',{name:item.name,index,child:record.path});}
+  for(const record of leaves){
+   const file=path.join(capture,record.path),actual=fs.lstatSync(file,{bigint:true});
+   if(!sameIdentity(actual,record.identity))fail('capture_changed',true);
+   if(record.type==='file'){
+    const group=`${record.identity.dev}:${record.identity.ino}`,removed=removedLinks.get(group)??0;
+    const expectedLinks=record.identity.nlink-removed;
+    const current=readStableFile(file,Number(record.identity.size),before=>
+     sameIdentity(before,record.identity)&&Number(before.nlink)===expectedLinks&&String(before.size)===record.identity.size,
+     {reason:'capture_changed',partial:true});
+    if(digest(current.bytes)!==digest(record.bytes))fail('capture_changed',true);
+    removedLinks.set(group,removed+1);
+   }else{
+    const proof={...objectIdentity(actual),nlink:Number(actual.nlink),mtimeNs:String(actual.mtimeNs),ctimeNs:String(actual.ctimeNs)};
+    if(!actual.isSymbolicLink()||canonical(proof)!==canonical(record.identity)||fs.readlinkSync(file)!==record.target)fail('capture_changed',true);
+   }
+   fs.unlinkSync(file);syncDirectory(path.dirname(file));faultInjector?.('after_original_unlink',{name:item.name,index,child:record.path});
+  }
   const directories=item.treeRecords.filter(record=>record.type==='directory').sort((a,b)=>b.path.split('/').length-a.path.split('/').length||b.path.localeCompare(a.path));
   for(const record of directories){const directory=path.join(capture,record.path);const actual=fs.lstatSync(directory,{bigint:true});if(!sameIdentity(actual,record.identity)||fs.readdirSync(directory).length)fail('capture_changed',true);fs.rmdirSync(directory);syncDirectory(path.dirname(directory));}
   fs.rmdirSync(capture);return;

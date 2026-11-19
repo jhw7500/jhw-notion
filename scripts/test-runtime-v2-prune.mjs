@@ -115,6 +115,45 @@ test('initial scratch hardlink pairs delete atomically',async t=>{
   const clean=await initialScratchCandidate(t);assert.equal(planRuntimePrune({repositoryRoot:clean.fixture.root}).candidates.journals.includes(clean.name),true);const removed=applyRuntimePrune({repositoryRoot:clean.fixture.root});assert.equal(removed.removed.journals,1);assert.equal(fs.existsSync(clean.journal),false);
 });
 
+for(const mutation of ['before-open','during-read-mode','during-read-size','during-read-link','during-read-time','final-name'])test(`v2 deletion preserves evidence on ${mutation} file change`,async t=>{
+  const candidate=await initialScratchCandidate(t),runtime=path.join(candidate.fixture.root,'.jhw-runtime');
+  const captureFile=path.join(runtime,'.prune.v1/capture.00000000/wiring/state.json');
+  const original=fs.readFileSync(path.join(candidate.journal,'wiring/state.json'));
+  const retained=path.join(candidate.fixture.root,'retained-original');
+  const replacement=path.join(candidate.fixture.root,'replacement');
+  fs.writeFileSync(replacement,original,{mode:0o600});
+  const foreignInode=fs.lstatSync(replacement).ino;
+  const open=fs.openSync,fstat=fs.fstatSync;let armed=false,opens=0,selectedFd,changed=false;
+  const replace=()=>{fs.renameSync(captureFile,retained);fs.renameSync(replacement,captureFile);};
+  fs.openSync=function(file,...args){
+    const selected=armed&&String(file).endsWith('/capture.00000000/wiring/state.json')&&++opens===2;
+    if(selected&&mutation==='before-open'){replace();changed=true;}
+    const fd=open.call(this,file,...args);if(selected)selectedFd=fd;return fd;
+  };
+  fs.fstatSync=function(fd,...args){
+    const stat=fstat.call(this,fd,...args);
+    if(fd===selectedFd&&!changed){
+      changed=true;
+      if(mutation==='final-name')replace();
+      else if(mutation==='during-read-mode')fs.chmodSync(captureFile,0o400);
+      else if(mutation==='during-read-size')fs.appendFileSync(captureFile,' ');
+      else if(mutation==='during-read-link')fs.linkSync(captureFile,retained);
+      else if(mutation==='during-read-time')fs.utimesSync(captureFile,new Date(0),new Date(0));
+    }
+    return stat;
+  };
+  try{
+    assert.throws(()=>applyRuntimePrune({repositoryRoot:candidate.fixture.root,faultInjector:point=>{if(point==='after_capture')armed=true;}}),{code:'DEPLOY_PRUNE_PARTIAL'});
+  }finally{fs.openSync=open;fs.fstatSync=fstat;}
+  assert.equal(changed,true,'the deletion read boundary was exercised');
+  assert.equal(fs.existsSync(captureFile),true,'changed file must survive');
+  if(mutation==='before-open'||mutation==='final-name')assert.equal(fs.lstatSync(captureFile).ino,foreignInode,'foreign inode must survive');
+  const recovery=path.join(runtime,'.prune.v1/recovery.00000000');
+  const inventory=JSON.parse(fs.readFileSync(path.join(recovery,'inventory.json')));
+  const record=inventory.tree.find(value=>value.path==='wiring/state.json');
+  assert.deepEqual(fs.readFileSync(path.join(recovery,'payload',record.payload)),original,'durable recovery must survive');
+});
+
 test('initial scratch preserves the accepted 128-entry capacity',async t=>{
   const full=await initialScratchCandidate(t,{full:true});assert.equal(planRuntimePrune({repositoryRoot:full.fixture.root}).candidates.journals.includes(full.name),true);assert.equal(applyRuntimePrune({repositoryRoot:full.fixture.root}).removed.journals,1);
 });
