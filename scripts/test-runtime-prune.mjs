@@ -72,6 +72,19 @@ test('one pending or unverified journal blocks the entire batch',()=>{
  assert.equal(fs.existsSync(eligible.directory),true);
 });
 
+test('prune recognizes compatible journal variants without widening ordinary keys',()=>{
+ const f=fixture(test);const previous={activationId:'a-'+'1'.repeat(32),releaseId:'r-'+'1'.repeat(40)+'-'+'2'.repeat(64),predecessorActivationId:null,observation:{target:'activations/a-'+'1'.repeat(32),dev:'1',ino:'2',ctimeNs:'3'}};
+ const candidate='r-'+'3'.repeat(40)+'-'+'4'.repeat(64);const name='.deploy.'+'a'.repeat(32);const directory=path.join(f.runtime,name);fs.mkdirSync(directory,{mode:0o700});
+ const state={version:1,status:'complete',operation:'activate',compatible:true,candidateReleaseId:candidate,compatibilityDigest:'5'.repeat(64),phase:'complete',previous,variables:{},mutationStarted:true,destination:{activationId:'a-'+'6'.repeat(32),releaseId:candidate,predecessorActivationId:previous.activationId},current:{activationId:'a-'+'6'.repeat(32),releaseId:candidate,predecessorActivationId:previous.activationId,observation:{target:'activations/a-'+'6'.repeat(32),dev:'7',ino:'8',ctimeNs:'9'}}};
+ write(path.join(directory,'state.json'),state);write(path.join(directory,'candidate-probe.log'),'ok\n');
+ prune.recordDeploymentRetention({repositoryRoot:f.root,journalDirectory:directory,completedAt:new Date(NOW-90*24*60*60*1000).toISOString()});
+ for(let sequence=2;sequence<=33;sequence++)journal(f,sequence,{age:60+sequence});
+ assert.ok(prune.planRuntimePrune({repositoryRoot:f.root,now:NOW}).candidates.journals.includes(name));
+ const ordinary=journal(f,34,{age:100,children:{'candidate-probe.log':'not compatible'}});
+ assert.throws(()=>prune.planRuntimePrune({repositoryRoot:f.root,now:NOW}),{code:'DEPLOY_PRUNE_BLOCKED',reason:'unverified_journal'});
+ assert.equal(fs.existsSync(ordinary.directory),true);
+});
+
 test('30 days, newest 32, and completedAt ties are retained',()=>{
  const f=fixture(test);for(let sequence=1;sequence<=35;sequence++)journal(f,sequence,{age:40+sequence});
  // Tie the boundary record to its immediate predecessor; both must survive.

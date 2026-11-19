@@ -969,6 +969,7 @@ async function runCompatibleDeployment({repositoryRoot,home,procRoot,environment
       state.destination=destination;state.phase='pointer_intent';checkpoint(directory,state);
     }});
     state.current=current;state.status='complete';state.phase='complete';checkpoint(directory,state);
+    recordDeploymentRetention({repositoryRoot,journalDirectory:directory});
     return {code:'DEPLOY_COMPATIBLE_ACTIVATED',releaseId:current.releaseId,previousReleaseId:previous.releaseId,
       predecessorAvailable:true,inventory:{before,after},existingSessionsPreserved:true,recovery};
   } catch(error) {
@@ -1039,6 +1040,7 @@ export async function runCodexConfigMigration({repositoryRoot,home,current,deplo
  }
  const parsed=readRuntimeJournalV2({repositoryRoot,journalDirectory:evidence});
  if(parsed.state.kind!=='codex-config'||parsed.state.status!=='complete'||parsed.state.outcome!=='migrated')fail('DEPLOY_RECOVERY_REQUIRED','codex_config_migration_unverified');
+ recordDeploymentRetention({repositoryRoot,journalDirectory:evidence});
  return {code:'DEPLOY_CODEX_CONFIG_MIGRATED',changed:true};
 }
 
@@ -1376,13 +1378,15 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
  if(command.operation==='prune'&&exists(runtime)&&pendingPairJournalCount(repositoryRoot)>0)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
  if(command.operation==='prune'&&!command.apply)return planRuntimePrune({repositoryRoot});
  if(command.operation==='prune') {
-  const before=requireQuiescence(inventoryOptions);let pruneWriter;let pruneAdmission;
+  const proposed=planRuntimePrune({repositoryRoot});const generationOnly=(proposed.candidates.bootstrapGenerations?.length??0)>0;
+  const before=generationOnly?completePairInventory({repositoryRoot,procRoot}):requireQuiescence(inventoryOptions);let pruneWriter;let pruneAdmission;let prunePublication;
   try {
    pruneWriter=acquireLease(path.join(runtime,'deploy.lock'),{create:true});
-   pruneAdmission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
-   const after=requireQuiescence(inventoryOptions);
-   return {...applyRuntimePrune({repositoryRoot}),inventory:{before,after}};
-  } finally {pruneAdmission?.close();pruneWriter?.close();}
+   if(generationOnly)prunePublication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
+   else pruneAdmission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
+   const after=generationOnly?completePairInventory({repositoryRoot,procRoot}):requireQuiescence(inventoryOptions);
+   return {...applyRuntimePrune({repositoryRoot,deployLease:pruneWriter,publicationLease:prunePublication}),inventory:{before,after}};
+  } finally {prunePublication?.close();pruneAdmission?.close();pruneWriter?.close();}
  }
  if(command.operation==='activate-compatible') {
   const current=exists(runtime)?readActivation({repositoryRoot}):null;

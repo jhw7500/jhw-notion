@@ -11,6 +11,7 @@ import { DeploymentError, acquireLease } from './runtime-safety.mjs';
 import { prepareRelease, publishActivation, readActivation, releaseCompatibility,ensureBootstrapGeneration,inspectSessionBindingsV2,prepareRuntimeEvidence,preparePairPublicationEvidence,revalidatePairPublicationEvidence } from './runtime-store.mjs';
 import {installRouterV2} from './runtime-entry.mjs';
 import { runDeployment, wiringPhase, reconcilePairJournal } from './runtime-deploy.mjs';
+import {recordDeploymentRetention} from './runtime-prune.mjs';
 
 const source = path.dirname(fileURLToPath(import.meta.url));
 const helpers = ['runtime-entry.mjs','runtime-safety.mjs','runtime-store.mjs','runtime-deploy.mjs','install-wiring.sh','install-config.mjs','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'];
@@ -18,6 +19,10 @@ function write(root, name, value, mode=0o644) {
   const file=path.join(root,name);
   fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o755});
   fs.writeFileSync(file,value,{mode}); fs.chmodSync(file,mode); return file;
+}
+function addPruneRecent(root,count=32) {
+  const runtime=path.join(root,'.jhw-runtime'),previous={activationId:'a-'+'1'.repeat(32),releaseId:'r-'+'1'.repeat(40)+'-'+'2'.repeat(64),predecessorActivationId:null,observation:{target:'activations/a-'+'1'.repeat(32),dev:'1',ino:'2',ctimeNs:'3'}},releaseId='r-'+'3'.repeat(40)+'-'+'4'.repeat(64);
+  for(let index=0;index<count;index++){const name=`.deploy.${(0x1000+index).toString(16).padStart(32,'0')}`,directory=path.join(runtime,name),activationId=`a-${(0x2000+index).toString(16).padStart(32,'0')}`;fs.mkdirSync(directory,{mode:0o700});write(directory,'state.json',JSON.stringify({version:1,status:'complete',operation:'activate',compatible:true,candidateReleaseId:releaseId,compatibilityDigest:'5'.repeat(64),phase:'complete',previous,variables:{},mutationStarted:true,destination:{activationId,releaseId,predecessorActivationId:previous.activationId},current:{activationId,releaseId,predecessorActivationId:previous.activationId,observation:{target:`activations/${activationId}`,dev:'7',ino:String(index+10),ctimeNs:'9'}}})+'\n',0o600);write(directory,'candidate-probe.log','ok\n',0o600);recordDeploymentRetention({repositoryRoot:root,journalDirectory:directory});}
 }
 async function fixture(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'jhw-coexist-test-')); fs.chmodSync(root,0o700);
@@ -127,6 +132,8 @@ test('compatible activation validates candidate before changing the default',asy
     argv:['--activate-compatible',second.releaseId],phaseRunner:async()=>{}});
   assert.equal(result.code,'DEPLOY_COMPATIBLE_ACTIVATED');
   assert.equal(readActivation({repositoryRoot:f.root}).releaseId,second.releaseId);
+  const journal=fs.readdirSync(path.join(f.root,'.jhw-runtime')).find(name=>/^\.deploy\.[a-f0-9]{32}$/.test(name));
+  assert.ok(journal);assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime',journal,'retention.json'),'utf8')).journal,journal);
 });
 
 const persistentClient=String.raw`const fs=require('node:fs');const {spawnSync}=require('node:child_process');const readline=require('node:readline');
@@ -390,9 +397,15 @@ test('v2 publication aborts over-budget caller recheck before pointer rename',as
   assert.deepEqual(readActivation({repositoryRoot:f.root}),before);
 });
 test('v2 rollback reconstructs a reclaimed predecessor generation from catalog source',async t=>{
-  const f=await v2Fixture(t);write(f.root,'mcp-server/src/index.ts','export const generation="v2-reconstruct-b";');const candidate=await f.prepare();
+  const f=await v2Fixture(t);fs.appendFileSync(path.join(f.root,'scripts/runtime-entry.mjs'),'\n// v2-reconstruct-b\n');write(f.root,'mcp-server/src/index.ts','export const generation="v2-reconstruct-b";');const candidate=await f.prepare();
   await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate-compatible',candidate.releaseId],phaseRunner:async()=>{}});
-  const reclaimed=path.join(f.root,'.jhw-runtime/v2/bootstraps',f.pairA.bootstrapId);fs.rmSync(reclaimed,{recursive:true});
+  fs.appendFileSync(path.join(f.root,'scripts/runtime-entry.mjs'),'// v2-reconstruct-c\n');write(f.root,'mcp-server/src/index.ts','export const generation="v2-reconstruct-c";');const latest=await f.prepare();
+  await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate-compatible',latest.releaseId],phaseRunner:async()=>{}});
+  const journalsRoot=path.join(f.root,'.jhw-runtime/v2/journals'),historicalJournal=fs.readdirSync(journalsRoot).find(name=>{const state=JSON.parse(fs.readFileSync(path.join(journalsRoot,name,'state.json')));return state.kind==='pair'&&state.destination.releaseId===candidate.releaseId;});const historicalReceipt=path.join(journalsRoot,historicalJournal,'retention.json'),receipt=JSON.parse(fs.readFileSync(historicalReceipt));receipt.completedAt=new Date(Date.now()-40*24*60*60*1000).toISOString();write(path.dirname(historicalReceipt),'retention.json',JSON.stringify(receipt)+'\n',0o600);addPruneRecent(f.root);
+  const reclaimed=path.join(f.root,'.jhw-runtime/v2/bootstraps',f.pairA.bootstrapId),old=new Date(Date.now()-40*24*60*60*1000);fs.utimesSync(reclaimed,old,old);
+  const plan=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--prune']});assert.equal(plan.candidates.bootstrapGenerations.includes(f.pairA.bootstrapId),true,JSON.stringify(plan));assert.equal(plan.candidates.journals.includes(historicalJournal),true);
+  const pruned=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--prune','--apply']});assert.equal(pruned.removed.bootstrapGenerations,1);assert.equal(pruned.removed.journals,1);assert.equal(fs.existsSync(reclaimed),false);assert.equal(fs.existsSync(path.join(journalsRoot,historicalJournal)),false);
+  const toB=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--rollback'],phaseRunner:async()=>{}});assert.equal(toB.releaseId,candidate.releaseId);
   const rolled=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--rollback'],phaseRunner:async()=>{}});
   assert.equal(rolled.releaseId,f.pairA.releaseId);assert.equal(fs.existsSync(reclaimed),true);
   const a=startClient(t,f);await a.ready();const sample=await a.request('sample');assert.equal(sample.control,f.pairA.releaseId);

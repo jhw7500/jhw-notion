@@ -634,6 +634,82 @@ export function restoreBootstrapGeneration({repositoryRoot, bootstrapId, deployL
   });
 }
 
+/** Return a complete, validated generation-copy inventory and the roots that are
+ * live independently of deployment journals.  This is intentionally separate
+ * from the bounded session reaper: an empty reaper result is not absence proof. */
+export function snapshotBootstrapReferences({repositoryRoot}) {
+  return withStore(repositoryRoot, false, (runtime) => {
+    if (!runtime) return {retained:new Set(), generations:[],records:[]};
+    const retained=new Set();
+    const current=currentIn(runtime,repositoryRoot,false);
+    if(current?.version===2){
+      retained.add(current.bootstrapId);
+      const manifest=activationIn(runtime,repositoryRoot,current.activationId,false,2);
+      if(manifest.priorCurrent?.version===2)retained.add(manifest.priorCurrent.bootstrapId);
+    }
+    // inspectSessionBindingsV2 is authoritative: it either validates every
+    // public/private entry in every namespace or throws.
+    const records=inspectSessionBindingsV2({repositoryRoot});
+    for(const record of records)if(record.live)retained.add(record.bootstrapId);
+    let v2;let bootstraps;
+    try{v2=runtime.child('v2',false,true);bootstraps=v2.child('bootstraps',false,true);}
+    catch(error){if(error.code==='ENOENT'){v2?.close();return {retained,generations:[],records};}throw error;}
+    try{
+      const generations=[];
+      for(const bootstrapId of names(bootstraps)){
+        if(!BOOTSTRAP.test(bootstrapId))fail('DEPLOY_BOOTSTRAP_INVALID');
+        const generation=bootstraps.child(bootstrapId,false,true);
+        try{
+          const validated=readGeneration(runtime,repositoryRoot,bootstrapId);
+          const stat=fs.fstatSync(generation.fd,{bigint:true});
+          generations.push({bootstrapId,sourceReleaseId:validated.manifest.sourceReleaseId,
+            identity:{dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:Number(stat.mode&0o7777n)},
+            mtimeMs:Number(stat.mtimeNs/1000000n)});
+        }finally{generation.close();}
+      }
+      bootstraps.verify();v2.verify();runtime.verify();
+      return {retained,generations:generations.sort((a,b)=>a.bootstrapId.localeCompare(b.bootstrapId)),records};
+    }finally{bootstraps.close();v2.close();}
+  });
+}
+
+/** Revalidate a planned generation under the canonical reclaim lock order.
+ * The callback runs while generation EX and both authoritative indexes SH are
+ * held; it must only capture/remove the already snapshotted generation. */
+export function withUnreferencedBootstrapGeneration({repositoryRoot,bootstrapId,identity,deployLease,publicationLease,remove}) {
+  requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'),'DEPLOY_BOOTSTRAP_INVALID');
+  requireLeaseIdentity(publicationLease,path.join(repositoryRoot,'.jhw-runtime/publication.lock'),'DEPLOY_BOOTSTRAP_INVALID');
+  if(!BOOTSTRAP.test(bootstrapId)||!identity||typeof remove!=='function')fail('DEPLOY_BOOTSTRAP_INVALID');
+  let generationLease;let sessionIndex;let invocationIndex;let stale=[];let result=false;
+  try{generationLease=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${bootstrapId}/lease`));}
+  catch(error){if(error.code==='DEPLOY_LOCK_CONTENDED')return false;throw error;}
+  try{
+    sessionIndex=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);
+    invocationIndex=v2IndexLease(repositoryRoot,bootstrapId,'invocation',true);
+    const snapshot=snapshotBootstrapReferences({repositoryRoot});
+    if(snapshot.retained.has(bootstrapId))return false;
+    stale=snapshot.records.filter(record=>record.bootstrapId===bootstrapId&&!record.live);
+    if(!stale.length){const planned=snapshot.generations.find(item=>item.bootstrapId===bootstrapId);
+     if(!planned||canonical(planned.identity)!==canonical(identity))fail('DEPLOY_BOOTSTRAP_CHANGED');
+     result=withStore(repositoryRoot,false,runtime=>{
+      const v2=runtime.child('v2',false,true);const bootstraps=v2.child('bootstraps',false,true);
+      const generation=bootstraps.child(bootstrapId,false,true);
+      try{
+        const stat=fs.fstatSync(generation.fd,{bigint:true});
+        const actual={dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:Number(stat.mode&0o7777n)};
+        if(canonical(actual)!==canonical(identity))fail('DEPLOY_BOOTSTRAP_CHANGED');
+        return remove({directory:bootstraps.at(bootstrapId),identity:actual,
+          syncSource:()=>{fs.fsyncSync(bootstraps.fd);bootstraps.verify();}});
+      }finally{generation.close();bootstraps.close();v2.close();}
+     });}
+  }finally{invocationIndex?.close();sessionIndex?.close();generationLease.close();}
+  if(stale.length){
+    for(const row of stale){const {token,live:_live,...record}=row;try{retireV2Record({repositoryRoot,record,token});}catch{} }
+    return false;
+  }
+  return result;
+}
+
 function closePreparedEvidence(state) {
   if (state.closed) return;
   state.closed = true;
