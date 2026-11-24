@@ -720,7 +720,7 @@ function buildPlan({repositoryRoot,now=Date.now(),validatePrevious=validateRetai
  const names=scanNames(runtime);
  if(names.includes(PRUNE))fail('previous_prune_incomplete');
  const budget={state:0};const journals=[];const skipped={evidence:0,legacy:0,unknown:0,retainedAge:0,retainedRecent:0,retainedPrevious:0};
- const fixed=new Set(['releases','activations','current','bootstrap','deploy.lock','admission.lock','publication.lock','wiring.json','v2',COUNTER]);
+ const fixed=new Set(['releases','activations','current','bootstrap','deploy.lock','admission.lock','publication.lock','wiring.json','v2','.jhw-atomic-probe.v1',COUNTER]);
  skipped.unknown=names.filter(name=>!fixed.has(name)&&!JOURNAL.test(name)&&!PREVIOUS.test(name)&&!/^\.(?:stage|bootstrap\.stage)\.[a-f0-9]{32}$/.test(name)).length;
  for(const name of names.filter(name=>JOURNAL.test(name))) {const item=inspectJournal(runtime,name,budget);if(item.kind==='pending')fail('pending_journal');if(item.kind==='success')journals.push(item);else skipped[item.kind]++;}
  const v2Journals=inspectV2JournalsForPrune({repositoryRoot,budget});journals.push(...v2Journals.success);skipped.evidence+=v2Journals.evidence;skipped.legacy+=v2Journals.legacy;

@@ -1,6 +1,7 @@
 """Bind service-owned v2 sessions to the processes of the managed client."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 import errno
 import fcntl
@@ -18,6 +19,7 @@ import threading
 
 from runtime_managed_identity import IdentityRejected, require_descendant
 from runtime_managed_lifetime import require_no_pending_invocations
+from runtime_managed_notion import NotionRelayRejected, request_notion_relay, send_notion_result
 from runtime_managed_profile import trusted_directory
 from runtime_managed_protocol import decode_message, encode_message, receive_message, send_message
 from runtime_managed_transport import ManagedPeer, PeerRejected, local_socket
@@ -31,6 +33,8 @@ _SEALS = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_
 _MAX_ARTIFACT = 16 * 1024 * 1024
 _MAX_SESSIONS = 32
 _REQUEST_SECONDS = 8
+_MAX_NOTION_CALLERS = 32
+_MAX_NOTION_REQUESTS = 3
 
 
 def _matches(regex, value):
@@ -86,7 +90,14 @@ class _Session:
     channel: socket.socket
     pair: tuple[str, str]
     lock: threading.Lock = field(default_factory=threading.Lock)
+    notion_callers: dict = field(default_factory=dict)
     closed: bool = False
+
+    def reap_notion_callers(self):
+        for pid, (_, pidfd) in tuple(self.notion_callers.items()):
+            if process_exited(pidfd):
+                del self.notion_callers[pid]
+                os.close(pidfd)
 
     def close(self):
         with self.lock:
@@ -95,12 +106,17 @@ class _Session:
             self.closed = True
             self.channel.close()
             os.close(self.pidfd)
+            for _, pidfd in self.notion_callers.values():
+                os.close(pidfd)
+            self.notion_callers.clear()
         _reap_provider(self.process)
 
 
 class _Broker:
-    def __init__(self, profile):
+    def __init__(self, profile, notion=None):
         self.profile = profile
+        self.notion = notion
+        self.notion_slots = threading.BoundedSemaphore(_MAX_NOTION_REQUESTS)
         self.sessions = {}
         self.lock = threading.Lock()
         self.starting = 0
@@ -152,7 +168,7 @@ class _Broker:
             if pidfd is not None:
                 os.close(pidfd)
 
-    def invoke(self, peer, binding, selector):
+    def invoke(self, peer, binding, selector, notion=False):
         with self.lock:
             session = self.sessions.get(binding)
         if session is None:
@@ -164,6 +180,10 @@ class _Broker:
                     raise ValueError("managed session closed")
                 require_descendant(root_pid=session.pid, root_pidfd=session.pidfd, worker_pid=peer.pid,
                                    worker_pidfd=pidfd, uid=self.profile.client_uid)
+                if notion:
+                    session.reap_notion_callers()
+                    if peer.pid in session.notion_callers or len(session.notion_callers) >= _MAX_NOTION_CALLERS:
+                        raise ValueError("managed Notion caller limit")
                 descriptors = ()
                 try:
                     send_message(session.channel, {"op": "issue", "selector": selector, "pid": peer.pid}, (pidfd,))
@@ -180,12 +200,56 @@ class _Broker:
                     session.channel.close()
                     raise
                 try:
+                    if notion:
+                        session.notion_callers[peer.pid] = (selector, os.dup(pidfd))
                     peer.send(encode_message(artifact), descriptors)
+                except (OSError, PeerRejected):
+                    caller = session.notion_callers.pop(peer.pid, None) if notion else None
+                    if caller is not None:
+                        os.close(caller[1])
+                    raise
                 finally:
                     # A caller timing out does not invalidate the synchronized worker.
                     os.close(descriptors[0])
         finally:
             os.close(pidfd)
+
+    def read_notion(self, peer, binding, caller_pid, request):
+        if self.notion is None or not self.notion_slots.acquire(blocking=False):
+            raise ValueError("managed Notion relay unavailable")
+        try:
+            with self.lock:
+                session = self.sessions.get(binding)
+            if session is None:
+                raise ValueError("unknown managed session")
+            with ExitStack() as descriptors:
+                with session.lock:
+                    caller = session.notion_callers.get(caller_pid)
+                    if caller is None or session.closed or session.process.poll() is not None:
+                        raise ValueError("unknown managed Notion invocation")
+                    selector, invocation_fd = caller
+                    caller_fd = os.dup(invocation_fd)
+                    descriptors.callback(os.close, caller_fd)
+                    session_fd = os.dup(session.pidfd)
+                    descriptors.callback(os.close, session_fd)
+                reader_fd = peer.duplicate_pidfd()
+                descriptors.callback(os.close, reader_fd)
+
+                if (request.get("operation") == "preflight") != (selector == "control"):
+                    raise ValueError("invalid managed Notion scope")
+                uid = self.profile.client_uid
+                require_descendant(root_pid=session.pid, root_pidfd=session_fd, worker_pid=caller_pid,
+                                   worker_pidfd=caller_fd, uid=uid)
+                require_descendant(root_pid=caller_pid, root_pidfd=caller_fd, worker_pid=peer.pid,
+                                   worker_pidfd=reader_fd, uid=uid, direct=True)
+                payload = request_notion_relay(self.profile, self.notion, selector, request)
+                with session.lock:
+                    if (session.closed or session.process.poll() is not None
+                            or any(process_exited(fd) for fd in (session_fd, caller_fd, reader_fd))):
+                        raise ValueError("managed Notion caller exited")
+                    send_notion_result(peer, payload)
+        finally:
+            self.notion_slots.release()
 
     def handle(self, peer):
         try:
@@ -195,7 +259,15 @@ class _Broker:
             elif (set(request) == {"op", "binding", "selector"} and request["op"] == "invoke"
                   and _matches(BINDING, request["binding"]) and request["selector"] in SELECTORS):
                 self.invoke(peer, request["binding"], request["selector"])
-        except (OSError, ValueError, EOFError, IdentityRejected, PeerRejected):
+            elif (set(request) == {"op", "binding", "selector", "notion"} and request["op"] == "invoke"
+                  and _matches(BINDING, request["binding"]) and type(request["notion"]) is bool
+                  and request["selector"] in ("mcp", "control") and request["notion"]):
+                self.invoke(peer, request["binding"], request["selector"], notion=self.notion is not None)
+            elif (set(request) == {"op", "binding", "callerPid", "request"} and request["op"] == "notion"
+                  and _matches(BINDING, request["binding"]) and type(request["callerPid"]) is int
+                  and 1 < request["callerPid"] <= 0x7FFFFFFF and type(request["request"]) is dict):
+                self.read_notion(peer, request["binding"], request["callerPid"], request["request"])
+        except (OSError, ValueError, EOFError, IdentityRejected, NotionRelayRejected, PeerRejected):
             # Closing the authenticated connection gives the caller a bounded
             # selector-specific failure without sending internal paths or input.
             pass
@@ -209,10 +281,10 @@ class _Broker:
             session.close()
 
 
-def serve(profile):
+def serve(profile, notion=None):
     profile.require_service()
     os.umask(0o077)
-    broker = _Broker(profile)
+    broker = _Broker(profile, notion)
     stopping = threading.Event()
     limits = threading.BoundedSemaphore(16)
 

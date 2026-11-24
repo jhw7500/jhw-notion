@@ -26,6 +26,17 @@ from test_runtime_managed_integration import (
 
 PREPARE = SCRIPTS / "test-support/runtime-managed-acceptance-prepare.mjs"
 CLIENT_PROGRAM = SCRIPTS / "test-support/runtime-managed-acceptance-client.py"
+NOTION_FIXTURE = SCRIPTS / "test-support/runtime-managed-notion-fixture.py"
+HOST_FIXTURE = SCRIPTS / "test-support/runtime-managed-host-fixture.py"
+CREDENTIAL = 61002
+ATOMIC_PROBE_DIRECTORY = ".jhw-atomic-probe.v1"
+NOTION_ROUTES = (
+    ("4430fcd4-bfba-4a46-9a1b-4520db86e883", "d45ed33c-26ee-45be-ad9c-513db7c422e0"),
+    ("4e5ba7f0-b9cc-4171-84a7-f4e430abaf57", "634f7b00-b7a2-447b-9514-a109b57557a8"),
+    ("6c9fbc24-c5fb-4ca9-aa61-781cacc7ecfd", "c1d8d3c3-538e-40a9-a306-2b694a4d8ff9"),
+    ("ec68d6c6-6e8e-47e6-9e8c-85d13b9f1461", "6a4615db-ba17-44a8-b3c7-6688dce9c2fa"),
+    ("979a9412-73d9-4fa4-be0e-cbcafc0a2505", "2917f7ce-c7a7-4301-a2fc-48137876c9a7"),
+)
 RECREATE_OBSOLETE = """
 import fs from 'node:fs';
 import path from 'node:path';
@@ -68,7 +79,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description=(
             "Run the #261 real-dependency managed acceptance scenario in the existing "
-            "disposable two-UID fixture environment."
+            "disposable three-UID fixture environment."
         ),
     )
     parser.add_argument("--trials", type=positive_integer, default=1)
@@ -127,6 +138,25 @@ def configure_guard(directory):
 
     git("init", "-q", "--initial-branch=main", str(registry))
     git("init", "-q", "--bare", "--initial-branch=main", str(remote))
+    checked(
+        [
+            *PYTHON, "-c",
+            "from pathlib import Path; import sys; "
+            "root=Path(sys.argv[1]); (root/'governance').mkdir(); "
+            "(root/'governance/authority.yaml').write_text(sys.argv[2])",
+            str(registry),
+            json.dumps({
+                "authority_epoch": 1,
+                "mode": "legacy",
+                "cutover_at": None,
+                "minimum_tool_version": "1.0.0",
+            }),
+        ],
+        CLIENT,
+        environment,
+        timeout=5,
+    )
+    git("-C", str(registry), "add", "governance/authority.yaml")
     git(
         "-C", str(registry), "-c", "user.name=Fixture",
         "-c", "user.email=fixture@example.invalid", "commit", "-q",
@@ -156,6 +186,8 @@ import sys
 home = Path(sys.argv[1])
 coordinates = json.loads(sys.argv[2])
 (home / 'code' / 'README.md').write_text('fixture\\n')
+(home / 'bin').mkdir(mode=0o755)
+(home / '.preflight-fixture.json').write_text('{"lastReviewed":null}\\n')
 config = home / '.config/jhw-control'
 config.mkdir(mode=0o700, parents=True)
 config_file = config / 'control.env'
@@ -168,7 +200,19 @@ config_file.chmod(0o600)
         environment,
         timeout=5,
     )
-    return {**environment, **coordinates, "JHW_GUARD_MODE": "enforce"}
+    fixture_bin = home / "bin"
+    for name in ("gh", "git"):
+        target = fixture_bin / name
+        shutil.copyfile(HOST_FIXTURE, target)
+        target.chmod(0o755)
+    return {
+        **environment,
+        **coordinates,
+        "PATH": f"{fixture_bin}:{environment['PATH']}",
+        "GH_PROJECT_TOKEN": "synthetic-project-token",
+        "GH_REPO_TOKEN": "synthetic-repository-token",
+        "JHW_GUARD_MODE": "enforce",
+    }
 
 
 def wait_ready(marker, process):
@@ -190,6 +234,22 @@ def stop_process(process, timeout=15):
     except subprocess.TimeoutExpired:
         process.kill()
         return process.communicate(timeout=5)
+
+
+def assert_runtime_records_exclude_credentials(runtime):
+    protected = b"fixture-protected-notion-key"
+    stale = b"fixture-stale-client-credential"
+    for record in (runtime / "v2/managed-invocations").glob("*.json"):
+        payload = record.read_bytes()
+        assert protected not in payload and stale not in payload, record
+
+
+def assert_single_atomic_probe_workspace(runtime):
+    probes = sorted(
+        entry.name for entry in runtime.iterdir()
+        if entry.name.startswith(".jhw-atomic-")
+    )
+    assert probes == [ATOMIC_PROBE_DIRECTORY], probes
 
 
 def remove_owned_tree(path, uid, environment, *, controller_parent=False):
@@ -222,15 +282,24 @@ def main():
     base = Path(tempfile.mkdtemp(prefix="jhw-managed-acceptance-"))
     base.chmod(0o755)
     broker = None
+    notion_relay = None
     clients = []
     fixture_root = None
     service_environment = ENVIRONMENT
     client_environment = ENVIRONMENT
     try:
-        for name, uid in (("socket", SERVICE), ("user", CLIENT)):
+        for name, uid in (("socket", SERVICE), ("user", CLIENT), ("credential", CREDENTIAL)):
             child = base / name
             child.mkdir(mode=0o755)
             os.chown(child, uid, uid)
+        credential_private = base / "credential/private"
+        credential_private.mkdir(mode=0o700)
+        os.chown(credential_private, CREDENTIAL, CREDENTIAL)
+        credential_key = credential_private / "notion.key"
+        credential_key.write_text("fixture-protected-notion-key")
+        credential_key.chmod(0o600)
+        os.chown(credential_key, CREDENTIAL, CREDENTIAL)
+        notion_socket = base / "credential/notion.sock"
         socket = base / "socket/runtime.sock"
         prepared = json.loads(checked(
             [NODE, str(PREPARE)],
@@ -255,11 +324,30 @@ def main():
             "node": NODE,
         }))
         profile.chmod(0o644)
-        cli = [*PYTHON, str(install_test_programs(base / "programs")), "--profile", str(profile)]
+        runtime_program = install_test_programs(base / "programs")
+        notion_fixture = runtime_program.parent / NOTION_FIXTURE.name
+        shutil.copyfile(NOTION_FIXTURE, notion_fixture)
+        notion_fixture.chmod(0o644)
+        notion_profile = profile.with_name(profile.name + ".notion.json")
+        notion_profile.write_text(json.dumps({
+            "version": 1,
+            "credentialUid": CREDENTIAL,
+            "socket": str(notion_socket),
+            "keyFile": str(credential_key),
+            "routes": [
+                {"databaseId": database_id, "dataSourceId": data_source_id}
+                for database_id, data_source_id in NOTION_ROUTES
+            ],
+        }))
+        notion_profile.chmod(0o644)
+        cli = [*PYTHON, str(runtime_program), "--profile", str(profile)]
         service_environment = {**ENVIRONMENT, "HOME": prepared["home"]}
+        credential_environment = {**ENVIRONMENT, "HOME": str(credential_private)}
         client_environment = {
             **configure_guard(base / "user"),
-            "NOTION_API_KEY": "fixture-session-credential",
+            # A stale ambient value proves that session and invocation launchers
+            # remove it instead of handing it to the user process or MCP.
+            "NOTION_API_KEY": "fixture-stale-client-credential",
         }
         work = Path(client_environment["HOME"]) / "code"
 
@@ -294,6 +382,46 @@ def main():
                 service_environment,
                 timeout=5,
             ).strip()
+
+        def start_notion_relay():
+            process = subprocess.Popen(
+                [*PYTHON, str(notion_fixture), str(profile)],
+                **as_user(CREDENTIAL),
+                env=credential_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                wait_for(
+                    lambda: notion_socket.exists()
+                    and stat.S_IMODE(notion_socket.stat().st_mode) == 0o666,
+                    process,
+                )
+            except BaseException:
+                stop_process(process)
+                raise
+            return process
+
+        notion_relay = start_notion_relay()
+        checked([
+            *PYTHON, "-c",
+            "import pathlib, sys; "
+            "entries = pathlib.Path('/proc', sys.argv[1], 'environ').read_bytes().split(b'\\0'); "
+            "assert all(not entry.startswith(b'NOTION_API_KEY=') for entry in entries)",
+            str(notion_relay.pid),
+        ], CREDENTIAL, credential_environment, timeout=4)
+        assert Path(f"/proc/{notion_relay.pid}").stat().st_uid == CREDENTIAL
+        assert credential_key.stat().st_uid == CREDENTIAL
+        assert stat.S_IMODE(credential_key.stat().st_mode) == 0o600
+        unreadable = subprocess.run(
+            ["/usr/bin/test", "!", "-r", str(credential_key)],
+            **as_user(CLIENT),
+            env=client_environment,
+            check=False,
+            timeout=4,
+        )
+        assert unreadable.returncode == 0, "managed client can read the protected Notion key"
 
         broker = subprocess.Popen(
             [*cli, "serve"],
@@ -346,6 +474,13 @@ def main():
                 b_client = start("b")
                 wait_ready(barriers / "b.ready", b_client)
                 assert pair_for_mcp((barriers / "b.pid").read_text()) == prepared["releaseB"]
+                stop_process(notion_relay)
+                (barriers / "relay-stopped").touch()
+                wait_ready(barriers / "b.relay-unavailable", b_client)
+                notion_relay = start_notion_relay()
+                (barriers / "relay-restarted").touch()
+                wait_ready(barriers / "b.relay-ready", b_client)
+                assert_runtime_records_exclude_credentials(runtime)
 
                 rolled_back = deploy("--rollback")
                 assert rolled_back["releaseId"] == prepared["origin"]["releaseId"], rolled_back
@@ -396,6 +531,7 @@ def main():
                 "seconds": round(time.monotonic() - started, 2),
                 "maxMs": maximums,
             }
+            assert_single_atomic_probe_workspace(runtime)
             rows.append(row)
             print(json.dumps(row), flush=True)
 
@@ -404,10 +540,18 @@ def main():
             stop_process(process, timeout=5)
         if broker is not None:
             stop_process(broker)
+        if notion_relay is not None:
+            stop_process(notion_relay)
         if fixture_root is not None:
             remove_owned_tree(fixture_root, SERVICE, service_environment)
         remove_owned_tree(base / "user", CLIENT, client_environment, controller_parent=True)
         remove_owned_tree(base / "socket", SERVICE, service_environment, controller_parent=True)
+        remove_owned_tree(
+            base / "credential",
+            CREDENTIAL,
+            {**ENVIRONMENT, "HOME": str(base / "credential/private")},
+            controller_parent=True,
+        )
         shutil.rmtree(base)
 
     print(json.dumps({"passed": len(rows), "requested": arguments.trials}), flush=True)

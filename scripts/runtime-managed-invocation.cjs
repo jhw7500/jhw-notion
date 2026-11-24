@@ -2,6 +2,7 @@
 'use strict';
 
 const {createHash} = require('node:crypto');
+const {execFile} = require('node:child_process');
 const fs = require('node:fs');
 const Module = require('node:module');
 const path = require('node:path');
@@ -10,6 +11,7 @@ const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 const RELEASE_ID = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
 const SELECTORS = new Set(['control', 'hook', 'mcp']);
+const KEYLESS_BANNER = '// jhw-managed-notion-relay: 1';
 
 function failure(code = 'DEPLOY_RUNTIME_BINDING_INVALID') {
   const error = new Error(code);
@@ -31,11 +33,13 @@ function parseSize(value) {
   return size;
 }
 
+function canonicalPath(value) {
+  return typeof value === 'string' && path.isAbsolute(value) && path.resolve(value) === value
+    && !value.includes('\0');
+}
+
 function validReleaseRoot(value) {
-  return typeof value === 'string'
-    && path.isAbsolute(value)
-    && path.resolve(value) === value
-    && !value.includes('\0')
+  return canonicalPath(value)
     && path.basename(path.dirname(value)) === 'releases'
     && path.basename(path.dirname(path.dirname(value))) === '.jhw-runtime'
     && RELEASE_ID.test(path.basename(value));
@@ -66,13 +70,48 @@ function readArtifact(descriptor, expectedDigest, expectedSize) {
   }
 }
 
-function loadBundle(bytes, releaseRoot, args) {
+function requestNotion(python, profile, request) {
+  const unavailable = () => new Error('NOTION_MANAGED_UNAVAILABLE');
+  const binding = process.env.JHW_RUNTIME_SESSION_BINDING;
+  if (!binding) return Promise.reject(unavailable());
+  const input = JSON.stringify(request);
+  if (typeof input !== 'string' || Buffer.byteLength(input) > 4096) return Promise.reject(unavailable());
+  return new Promise((resolve, reject) => {
+    const child = execFile(python, [
+      '-E', '-s', '-B', path.join(__dirname, 'runtime_managed.py'), '--profile', profile, '_notion-read',
+    ], {
+      env: {JHW_RUNTIME_SESSION_BINDING: binding, LANG: 'C.UTF-8'},
+      timeout: 15000,
+      maxBuffer: 8 * 1024 * 1024,
+    }, (error, stdout) => {
+      if (error) return reject(unavailable());
+      try { resolve(JSON.parse(stdout)); } catch { reject(unavailable()); }
+    });
+    child.stdin.on('error', () => reject(unavailable()));
+    child.stdin.end(input);
+  });
+}
+
+function loadBundle(bytes, releaseRoot, python, profile, selector, args) {
   Object.defineProperty(globalThis, '__JHW_MANAGED_RELEASE_ROOT__', {
     value: releaseRoot,
     writable: false,
     configurable: false,
     enumerable: false,
   });
+
+  if (selector === 'mcp' || (selector === 'control' && args.length === 1 && args[0] === 'preflight')) {
+    const header = bytes.subarray(0, 128).toString('utf8').split('\n', 2);
+    if (header[0] !== KEYLESS_BANNER && !(header[0] === '#!/usr/bin/env node' && header[1] === KEYLESS_BANNER)) {
+      throw failure();
+    }
+    Object.defineProperty(globalThis, '__JHW_MANAGED_NOTION_RELAY__', {
+      value: requestNotion.bind(null, python, profile),
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+  }
 
   const builtins = new Set(Module.builtinModules.flatMap(name => [name, name.startsWith('node:') ? name : `node:${name}`]));
   const nativeRequire = Module.createRequire(__filename);
@@ -93,13 +132,14 @@ function loadBundle(bytes, releaseRoot, args) {
 }
 
 function main() {
-  const [rawDescriptor, digest, rawSize, releaseRoot, selector, ...args] = process.argv.slice(2);
+  const [rawDescriptor, digest, rawSize, releaseRoot, python, profile, selector, ...args] = process.argv.slice(2);
   const descriptor = parseDescriptor(rawDescriptor);
   let bytes;
   let readStarted = false;
   try {
     const size = parseSize(rawSize);
-    if (!SHA256.test(digest ?? '') || !validReleaseRoot(releaseRoot) || !SELECTORS.has(selector)) throw failure();
+    if (!SHA256.test(digest ?? '') || !validReleaseRoot(releaseRoot) || !SELECTORS.has(selector)
+        || !canonicalPath(python) || !canonicalPath(profile)) throw failure();
     readStarted = true;
     bytes = readArtifact(descriptor, digest, size);
   } catch (error) {
@@ -108,7 +148,7 @@ function main() {
     }
     throw error;
   }
-  loadBundle(bytes, releaseRoot, args);
+  loadBundle(bytes, releaseRoot, python, profile, selector, args);
 }
 
 try {

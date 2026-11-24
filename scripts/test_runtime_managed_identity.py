@@ -76,6 +76,11 @@ class ManagedIdentityTest(unittest.TestCase):
         tree = self.start_tree()
         self.assertIsNone(self.require(tree))
 
+    def test_grandchild_cannot_use_a_direct_child_binding(self):
+        tree = self.start_tree()
+        with self.assertRaises(IdentityRejected):
+            self.require(tree, direct=True)
+
     def test_root_itself_is_not_a_descendant(self):
         tree = self.start_tree()
         with self.assertRaises(IdentityRejected):

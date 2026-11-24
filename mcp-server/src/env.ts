@@ -2,6 +2,7 @@ import { config } from "dotenv";
 import { execFileSync } from "child_process";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
+import { hasManagedNotionRelay } from "./notion/managed-relay.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -11,6 +12,7 @@ const SHELL_FALLBACK_TIMEOUT_MS = 3000;
 let loaded = false;
 
 export function loadNotionEnv(): void {
+  if (hasManagedNotionRelay()) return;
   // 키를 못 찾으면 셸 폴백만큼 기동이 지연된다. 진입점과 notion-client에서 각각
   // 호출되므로 가드가 없으면 그 지연이 두 배가 된다.
   if (loaded) return;

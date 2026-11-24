@@ -12,6 +12,8 @@ import {
   prepareAtomicRename,
 } from './runtime-safety.mjs';
 
+const probeName = '.jhw-atomic-probe.v1';
+
 function identity(name) {
   const stat = fs.lstatSync(name, { bigint: true });
   return { dev: stat.dev, ino: stat.ino, mode: stat.mode };
@@ -57,7 +59,9 @@ function invoke(capability, directory, sourceName, destinationName, operation) {
 
 function withSpawnSync(replacement, callback) {
   const original = childProcess.spawnSync;
-  childProcess.spawnSync = replacement;
+  childProcess.spawnSync = (file, args, options) => file === '/usr/bin/python3'
+    ? replacement(file, args, options)
+    : original(file, args, options);
   syncBuiltinESMExports();
   try { return callback(); }
   finally {
@@ -65,6 +69,72 @@ function withSpawnSync(replacement, callback) {
     syncBuiltinESMExports();
   }
 }
+
+test('repeated capability probes reuse one bounded workspace', { concurrency: false }, t => {
+  const { root, directory } = fixture(t);
+  const probe = path.join(root, probeName);
+  prepareAtomicRename({ directory });
+  assert.deepEqual(fs.readdirSync(root), [probeName]);
+  const initial = fs.readdirSync(probe).sort().map(name => identity(path.join(probe, name)).ino).sort();
+  assert.equal(initial.length, 5);
+  for (let count = 0; count < 8; count++) prepareAtomicRename({ directory });
+  assert.deepEqual(fs.readdirSync(root), [probeName]);
+  const final = fs.readdirSync(probe).sort().map(name => identity(path.join(probe, name)).ino).sort();
+  assert.deepEqual(final, initial);
+});
+
+test('existing probe slots without an ownership record are preserved', { concurrency: false }, t => {
+  const { root, directory } = fixture(t);
+  const probe = path.join(root, probeName);
+  const slot = path.join(probe, 'left');
+  fs.mkdirSync(slot, { mode: 0o700, recursive: true });
+  const before = identity(slot);
+  assert.throws(() => prepareAtomicRename({ directory }), { code: 'DEPLOY_ATOMIC_RENAME_INVALID' });
+  assert.deepEqual(fs.readdirSync(root), [probeName]);
+  assert.deepEqual(fs.readdirSync(probe), ['left']);
+  assert.deepEqual(identity(slot), before);
+});
+
+for (const [method, name] of [
+  ['mkdirSync', probeName], ['symlinkSync', 'owner'],
+  ['mkdirSync', 'left'], ['mkdirSync', 'right'], ['symlinkSync', 'proof'], ['symlinkSync', 'ready'],
+]) {
+  test(`workspace initialization can retry after creating ${name}`, { concurrency: false }, t => {
+    const { root, directory } = fixture(t);
+    const original = fs[method];
+    let interrupted = false;
+    fs[method] = (...args) => {
+      const result = original(...args);
+      const location = args[method === 'mkdirSync' ? 0 : 1];
+      if (path.basename(location) === name) {
+        interrupted = true;
+        throw new Error('fixture interruption');
+      }
+      return result;
+    };
+    try {
+      assert.throws(() => prepareAtomicRename({ directory }), { code: 'DEPLOY_ATOMIC_RENAME_INVALID' });
+    } finally { fs[method] = original; }
+    assert.equal(interrupted, true);
+    prepareAtomicRename({ directory });
+    assert.deepEqual(fs.readdirSync(root), [probeName]);
+  });
+}
+
+test('a ready workspace preserves its slots when proof is missing or changed', { concurrency: false }, t => {
+  const { root, directory } = fixture(t);
+  prepareAtomicRename({ directory });
+  const probe = path.join(root, probeName);
+  const proof = path.join(probe, 'proof');
+  const left = identity(path.join(probe, 'left'));
+  fs.unlinkSync(proof);
+  assert.throws(() => prepareAtomicRename({ directory }), { code: 'DEPLOY_ATOMIC_RENAME_INVALID', reason: 'probe_state' });
+  assert.equal(fs.readdirSync(probe).includes('proof'), false);
+  fs.symlinkSync('unexpected evidence', proof);
+  assert.throws(() => prepareAtomicRename({ directory }), { code: 'DEPLOY_ATOMIC_RENAME_INVALID', reason: 'probe_state' });
+  assert.equal(fs.readlinkSync(proof), 'unexpected evidence');
+  assert.deepEqual(identity(path.join(probe, 'left')), left);
+});
 
 test('NOREPLACE preserves occupied empty destination and source identities', { concurrency: false }, t => {
   const { root, directory } = fixture(t);
@@ -198,21 +268,66 @@ test('preparation rejects unsupported and malformed fixed-helper results', { con
 
 test('probe failure retains raced foreign entries instead of deleting pathnames', { concurrency: false }, t => {
   const { root, directory } = fixture(t);
+  const probe = path.join(root, probeName);
+  const retained = path.join(probe, '.owned-probe');
   let calls = 0;
   let racedName;
-  withSpawnSync(() => {
+  let foreign;
+  withSpawnSync((_file, args) => {
     calls++;
     if (calls === 1) return { status: 0, signal: null, stdout: '{"ok":false,"errno":17}\n', stderr: '' };
-    racedName = fs.readdirSync(root).find(name => name.startsWith('.jhw-atomic-source-'));
-    fs.renameSync(path.join(root, racedName), path.join(root, '.owned-probe'));
-    fs.mkdirSync(path.join(root, racedName), 0o700);
+    racedName = path.join(probe, args.at(-2));
+    fs.renameSync(racedName, retained);
+    fs.mkdirSync(racedName, 0o700);
+    foreign = identity(racedName);
     return { status: 0, signal: null, stdout: '{"ok":true}\n', stderr: '' };
   }, () => {
     assert.throws(() => prepareAtomicRename({ directory }), DeploymentError);
   });
 
   assert.ok(racedName);
-  assert.equal(fs.lstatSync(path.join(root, racedName)).isDirectory(), true);
-  assert.equal(fs.lstatSync(path.join(root, '.owned-probe')).isDirectory(), true);
-  assert.equal(fs.readdirSync(root).some(name => name.startsWith('.jhw-atomic-destination-')), true);
+  assert.equal(fs.lstatSync(retained).isDirectory(), true);
+  assert.equal(fs.lstatSync(path.join(probe, 'right')).isDirectory(), true);
+  assert.throws(() => prepareAtomicRename({ directory }), { code: 'DEPLOY_ATOMIC_RENAME_INVALID' });
+  assert.deepEqual(identity(racedName), foreign);
+});
+
+test('an interrupted exchange can retry with exactly the same slots and proof', { concurrency: false }, t => {
+  const { root, directory } = fixture(t);
+  const probe = path.join(root, probeName);
+  const original = childProcess.spawnSync;
+  let identities;
+  withSpawnSync((file, args, options) => {
+    const result = original(file, args, options);
+    if (args.at(-3) !== 'exchange') return result;
+    assert.equal(result.stdout, '{"ok":true}\n');
+    identities = fs.readdirSync(probe).sort().map(name => identity(path.join(probe, name)).ino).sort();
+    return { ...result, signal: 'SIGKILL', stdout: '' };
+  }, () => assert.throws(() => prepareAtomicRename({ directory }), {
+    code: 'DEPLOY_ATOMIC_RENAME_HELPER_FAILED', reason: 'exit',
+  }));
+  assert.ok(identities);
+  prepareAtomicRename({ directory });
+  assert.deepEqual(fs.readdirSync(root), [probeName]);
+  assert.deepEqual(
+    fs.readdirSync(probe).sort().map(name => identity(path.join(probe, name)).ino).sort(),
+    identities,
+  );
+});
+
+test('a separate open description cannot enter a locked probe workspace', { concurrency: false }, t => {
+  const { root, directory } = fixture(t);
+  prepareAtomicRename({ directory });
+  const probe = path.join(root, probeName);
+  const expected = fs.readdirSync(probe).sort();
+  const fd = fs.openSync(probe, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+  try {
+    const lock = childProcess.spawnSync('/usr/bin/flock', ['--exclusive', '--nonblock', '3'], {
+      stdio: ['ignore', 'ignore', 'ignore', fd],
+    });
+    assert.equal(lock.status, 0);
+    assert.throws(() => prepareAtomicRename({ directory }), { code: 'DEPLOY_LOCK_CONTENDED' });
+    assert.deepEqual(fs.readdirSync(probe).sort(), expected);
+  } finally { fs.closeSync(fd); }
+  prepareAtomicRename({ directory });
 });

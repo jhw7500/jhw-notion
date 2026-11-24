@@ -78,6 +78,11 @@ import {
 import { assertPhase1ACommittedLegacy, createAuthorityService } from "./authority.js";
 import { verifyConfiguredNotionAuthorityRoutes } from "../notion/authority-guard.js";
 import {
+  hasManagedNotionRelay,
+  verifyManagedNotionPreflight,
+} from "../notion/managed-relay.js";
+import { DATABASE_SCHEMAS } from "../schema.js";
+import {
   AuthorityRecordSchema,
   ActiveClaimSchema,
   BoardConflictSummarySchema,
@@ -511,6 +516,17 @@ export function createCliDependencies(env: NodeJS.ProcessEnv = process.env): Cli
   };
   const notionProbe = {
     async verifyReadOnlyRoutes() {
+      if (hasManagedNotionRelay()) {
+        try {
+          await verifyManagedNotionPreflight(Object.values(DATABASE_SCHEMAS).map((schema) => ({
+            databaseId: schema.id,
+            dataSourceId: schema.dataSourceId,
+          })));
+          return;
+        } catch {
+          throw new ControlError("NOTION_GUARD_INDETERMINATE", "Notion authority routing proof is unavailable");
+        }
+      }
       if (!env.NOTION_API_KEY) {
         throw new ControlError("MISSING_CREDENTIAL", "Missing host credential", { key: "NOTION_API_KEY" });
       }

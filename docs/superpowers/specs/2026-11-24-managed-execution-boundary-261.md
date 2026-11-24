@@ -146,7 +146,7 @@ set -o pipefail
 git archive HEAD |
   docker run --rm -i --pull never --user 0:0 --read-only \
     --security-opt no-new-privileges --cap-drop ALL \
-    --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add KILL \
+    --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add KILL \
     --tmpfs /work:rw,exec,mode=0755 --tmpfs /tmp:rw,exec,mode=1777 \
     --workdir /work --entrypoint /bin/sh "${review_image:?검증 이미지 지정}" -ec '
       umask 022
@@ -229,3 +229,82 @@ Claim 없는 fixture의 `PostToolUse`는 `GUARD_REQUEST_NOT_FOUND`를 반환했�
 | `2026-11-23-pid-lifetime-evidence-261.md` | `d19e4efa8799302a6b00ab6cbe5902a0ae3486a1c83eaef247351250b89cf913` |
 | `2026-11-23-prune-session-evidence-261.md` | `6918a54346b6fda520cd71bc52c118f43394bb30d2384fc112a4fd13ff276b72` |
 | `2026-11-23-runtime-process-evidence-261.md` | `4cb8d4cd769f2af8ca88ba8024e4bc04bf5fca602f46bae38bb35b849a2bed7e` |
+
+## 관리형 Notion 자격증명 중계 설계안
+
+MCP와 Control과 Guard는 기존 사용자 UID와 HOME에서 동작한다. Notion 키는
+배포 writer와 클라이언트와 분리된 보호 서비스 UID가 보관한다. 사용자는 MCP로
+Notion 도구를 호출하고, 보호 서비스가 등록된 Notion 연결을 사용해 요청을 수행한다.
+Control preflight도 같은 서비스의 정해진 읽기 검사로 연결한다.
+[MCP의 현재 자격증명 취득](../../../mcp-server/src/notion-client.ts#L6) ·
+[Control의 현재 Notion 확인](../../../mcp-server/src/control/cli.ts#L511)
+
+```text
+Client UID:  Codex -> keyless MCP -> typed request
+             Control preflight  -> read-only probe
+                                        |
+Service UID: protected policy + approved request -> relay -> Notion
+```
+
+### 자격증명과 요청 범위
+
+- 관리형 시작 경로는 자격증명 없이 Codex와 그 하위 프로그램을 시작한다. 관리형 MCP는
+  키 값 없이 중계 연결을 사용한다. Control과 hook의 환경과 실행 기록에는 키 값을
+  전달하지 않는다. 관리형 경로의 환경·`.env`·셸 fallback은 닫고 일반 설치는
+  기존 자격증명 공급 경로를 사용한다.
+  [현재 세션 상속 지점](../../../scripts/runtime_managed.py#L32) ·
+  [현재 MCP fallback](../../../mcp-server/src/env.ts#L19)
+- 보호 서비스는 관리자가 등록한 연결과 작업 목록을 사용한다. 요청 형식은 작업별
+  입력과 대상 형식을 고정하고 연결 계정·세션·release/bootstrap pair를 확인한다.
+  임의 URL·HTTP 헤더·외부 목적지가 들어오면 거부한다. 응답에는 작업 결과 또는 제한된
+  오류만 싣는다.
+  [현재 결속과 후손 검증](../../../scripts/runtime_managed_broker.py#L155)
+- Control preflight에는 설정된 데이터 소스와 데이터베이스의 읽기 확인만 허용한다.
+  보호 서비스에서 기존 대상 검사를 실행하고 결과를 Control이 읽는 형식에 맞춘다.
+  [읽기 전용 대상 검사](../../../mcp-server/src/notion/authority-guard.ts#L175)
+
+### 쓰기 권한과 수명
+
+- 기존 사용자 측 쓰기 권한 검사를 유지하고 중계도 대상의 실제 조상과 Registry 정책을
+  확인한다. 중계는 관리자가 고정한 권한 원본과 자체 보존한 최신 epoch를 사용한다.
+  승인되지 않은 대상, 정책 읽기 실패, 이전 epoch 요청은 중단한다.
+  [MCP 쓰기 권한 검사](../../../mcp-server/src/tools/append.ts#L43) ·
+  [Registry 정책과 epoch 검증](../../../mcp-server/src/control/authority.ts#L363)
+- 중계 쓰기는 독립적으로 신뢰할 수 있는 승인 경로에서 발행한 한 번 쓰는 실행 권한이
+  필요하다. 발행 주체의 보호 경계를 확정한 뒤 권한을 세션·Task·Claim·pair·작업·대상·
+  입력 digest·만료·실행 ID에 묶고 원격 변경 전에 원자적으로 소비한다. 중계가 승인된
+  작업의 Notion 호출을 구성한다. 세션 결속이나 호출자가 제공한 승인 값만으로
+  들어온 쓰기는 거부한다. 발행 경로가 확정되기까지 읽기 검증을 수행한다.
+  [직접 Notion 변경의 Guard 계약](../../../mcp-server/src/control/guard-service.ts#L829) ·
+  [기존 승인 소비 의미](../../../mcp-server/src/control/guard-state.ts#L562)
+- 응답이 끊겨 결과를 알 수 없는 비멱등 쓰기는 확인이 끝날 때까지 중지한다. 중계와
+  호출자의 수명 증거로 실행 중인 세대를 보호하고 재시작·롤백 시 승인 소비 상태를
+  대조한다. 두 세대가 서로 다른 중계 계약을 요구하면 호환 전환을 중단한다.
+  [비멱등 append의 기존 계약](../../../mcp-server/src/tools/append.ts#L66) ·
+  [관리형 실행 기록](../../../scripts/runtime_managed_lifetime.py)
+
+### 실행 시험과 변경 범위
+
+- 격리 환경의 합성 키로 일반 셸·MCP·Control·hook의 환경과 실행 기록에 키 값이
+  들어가지 않고 MCP 초기화·허용된 Notion 조회·Control preflight가 동작함을 확인한다.
+- 다른 UID·다른 세션·종료된 실행, 지원하지 않는 작업과 대상, 승인 입력과 다른 요청,
+  이미 소비한 승인, 정책 확인 불가가 모두 거부되는지 확인한다. 허용된 쓰기 한 번과
+  중단 후 중복 방지 검증을 거쳐 관리형 쓰기를 연다.
+- 기존 A 세션의 pair 유지, 새 B 선택, A→B→A, C 회수 및 중계 재시작을 실물 시험한다.
+  실제 승인 `PostToolUse`·C5는 합의된 배포 후 검증이다.
+- MCP의 Notion client, Control preflight 포트, 중계 서비스와 승인 연결을 후속 구현
+  범위에 포함한다. MCP client와 Control 경로는 `1ca1753`의 최초 심사 변경 경로
+  밖이므로 확장된 변경 범위를 승인받아야 한다.
+
+### Atomic rename 검사 디렉터리
+
+별도 결함 A-R1-002의 원인은 성공 검사마다 runtime root에 두 항목이 남고 prune이
+root 전체에 8,192개 검사 상한을 적용하는 것이다. 수정본은 같은 파일시스템의
+`.jhw-atomic-probe.v1` 한 곳에서 이름이 고정된 두 검사 객체를 재사용한다. 열린 검사
+디렉터리의 잠금과 초기 생성·준비 기록으로 runtime·검사 공간·두 객체를 결속한다. 중단 뒤
+초기 생성 중 빠진 디렉터리는 기록을 확인하고 만들 수 있고, 같은 두 객체가 교환된 상태도
+다시 검증할 수 있다. 다른 객체로 교체되거나 완료된 검사의 증거가 사라지면
+`probe_state` 오류로 중단하고 현재 증거를 보존한다. 기존 nonce 이름은 별도 증거가
+확보될 때까지 보존한다.
+[검사 객체 생성과 검증](../../../scripts/runtime-safety.mjs) ·
+[prune의 root 검사 상한](../../../scripts/runtime-prune.mjs#L48)

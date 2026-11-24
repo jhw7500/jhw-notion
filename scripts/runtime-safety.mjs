@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 
 const C = fs.constants;
 const MAX_ENTRIES = 32768;
@@ -10,6 +9,12 @@ const RECORD_BYTES = 65536;
 const issuedLeases = new WeakMap();
 const issuedAtomicCapabilities = new WeakMap();
 const PYTHON = '/usr/bin/python3';
+const ATOMIC_PROBE_DIRECTORY = '.jhw-atomic-probe.v1';
+const ATOMIC_PROBE_SLOTS = ['left', 'right'];
+const ATOMIC_PROBE_OWNER = 'owner';
+const ATOMIC_PROBE_PROOF = 'proof';
+const ATOMIC_PROBE_READY = 'ready';
+const ATOMIC_PROBE_NAMES = [...ATOMIC_PROBE_SLOTS, ATOMIC_PROBE_OWNER, ATOMIC_PROBE_PROOF, ATOMIC_PROBE_READY];
 const ATOMIC_HELPER_TIMEOUT_MS = 5000;
 const ATOMIC_HELPER_OUTPUT_BYTES = 4096;
 const ATOMIC_HELPER = String.raw`import ctypes, errno, os, sys
@@ -121,6 +126,16 @@ export function trustedFile(file, { uid = process.getuid(), executable = false }
   finally { if (fd !== undefined) fs.closeSync(fd); chain?.close(); }
 }
 
+function lockDescriptor(fd, shared = false) {
+  trustedFile('/usr/bin/flock', { uid: 0, executable: true });
+  // fd 3 shares the parent's open-file description, including its lock.
+  const result = spawnSync('/usr/bin/flock',
+    [shared ? '--shared' : '--exclusive', '--nonblock', '--conflict-exit-code', '75', '3'],
+    { stdio: ['ignore', 'ignore', 'ignore', fd] });
+  if (result.status === 75) throw new DeploymentError('DEPLOY_LOCK_CONTENDED');
+  if (result.error || result.signal || result.status !== 0) throw new DeploymentError('DEPLOY_LOCK_FAILED');
+}
+
 export function acquireLease(file, { shared = false, create = false } = {}) {
   let chain; let fd;
   try {
@@ -140,14 +155,7 @@ export function acquireLease(file, { shared = false, create = false } = {}) {
     if ((stat.mode & 0o7777) !== 0o600) untrusted();
     chain.verify();
     if (!sameObject(stat, fs.lstatSync(name))) untrusted();
-    trustedFile('/usr/bin/flock', { uid: 0, executable: true });
-    // flock operates on fd 3, duplicated from this fd: both refer to the same
-    // open-file description. The helper exiting does not release our lease.
-    const result = spawnSync('/usr/bin/flock', [shared ? '--shared' : '--exclusive', '--nonblock', '--conflict-exit-code', '75', '3'], {
-      stdio: ['ignore', 'ignore', 'ignore', fd],
-    });
-    if (result.status === 75) throw new DeploymentError('DEPLOY_LOCK_CONTENDED');
-    if (result.error || result.signal || result.status !== 0) throw new DeploymentError('DEPLOY_LOCK_FAILED');
+    lockDescriptor(fd, shared);
     chain.verify();
     if (!sameObject(stat, fs.fstatSync(fd)) || !sameObject(stat, fs.lstatSync(name))) untrusted();
     const heldFd = fd;
@@ -285,24 +293,133 @@ function runAtomicHelper({ sourceDirectory, destinationDirectory, sourceName, de
   throw new DeploymentError('DEPLOY_ATOMIC_RENAME_FAILED', `errno_${response.errno}`);
 }
 
-function probeAtomicRename(directory) {
-  const nonce = randomBytes(16).toString('hex');
-  const sourceName = `.jhw-atomic-source-${nonce}`;
-  const destinationName = `.jhw-atomic-destination-${nonce}`;
-  const sourcePath = `/proc/self/fd/${directory.fd}/${sourceName}`;
-  const destinationPath = `/proc/self/fd/${directory.fd}/${destinationName}`;
-  fs.mkdirSync(sourcePath, 0o700);
-  fs.mkdirSync(destinationPath, 0o700);
-  fs.fsyncSync(directory.fd);
-  const source = atomicIdentity(fs.lstatSync(sourcePath));
-  const destination = atomicIdentity(fs.lstatSync(destinationPath));
-  assertProbeError(() => runAtomicHelper({ sourceDirectory: directory, destinationDirectory: directory, sourceName, destinationName, operation: 'noreplace' }));
-  if (!sameAtomicIdentity(source, atomicIdentity(fs.lstatSync(sourcePath))) ||
-      !sameAtomicIdentity(destination, atomicIdentity(fs.lstatSync(destinationPath)))) atomicInvalid('directory');
-  runAtomicHelper({ sourceDirectory: directory, destinationDirectory: directory, sourceName, destinationName, operation: 'exchange' });
-  fs.fsyncSync(directory.fd);
-  if (!sameAtomicIdentity(destination, atomicIdentity(fs.lstatSync(sourcePath))) ||
-      !sameAtomicIdentity(source, atomicIdentity(fs.lstatSync(destinationPath)))) atomicInvalid('directory');
+function probePath(directory, name) {
+  return `/proc/self/fd/${directory.fd}/${name}`;
+}
+
+function openProbeDirectory(location, device) {
+  const fd = fs.openSync(location, C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (stat.dev !== device || stat.uid !== BigInt(process.getuid())
+        || (stat.mode & 0o7777n) !== 0o700n) atomicInvalid('probe_state');
+    return { fd, identity: atomicIdentity(stat) };
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+}
+
+function verifyProbeDirectory(directory, location) {
+  if (!sameAtomicIdentity(directory.identity, atomicIdentity(fs.fstatSync(directory.fd, { bigint: true })))
+      || !sameAtomicIdentity(directory.identity, atomicIdentity(fs.lstatSync(location, { bigint: true })))) {
+    atomicInvalid('probe_state');
+  }
+}
+
+function readProbeNames(directory, allowed) {
+  const names = new Set();
+  const stream = fs.opendirSync(`/proc/self/fd/${directory.fd}`);
+  try {
+    for (let entry; (entry = stream.readSync()) !== null;) {
+      if (!allowed.includes(entry.name) || names.has(entry.name)) atomicInvalid('probe_state');
+      names.add(entry.name);
+    }
+    return names;
+  } finally { stream.closeSync(); }
+}
+
+function verifyProbeMarker(probe, name, expected) {
+  const location = probePath(probe, name);
+  const before = fs.lstatSync(location, { bigint: true });
+  if (!before.isSymbolicLink() || before.nlink !== 1n || before.uid !== probe.identity.uid
+      || before.size !== BigInt(Buffer.byteLength(expected)) || fs.readlinkSync(location) !== expected) {
+    atomicInvalid('probe_state');
+  }
+  const after = fs.lstatSync(location, { bigint: true });
+  if (!sameAtomicIdentity(atomicIdentity(before), atomicIdentity(after))
+      || before.ctimeNs !== after.ctimeNs || before.nlink !== after.nlink) atomicInvalid('probe_state');
+}
+
+function writeProbeMarker(probe, name, value) {
+  // Only readlink uses these records. A single exclusive symlink creation
+  // publishes all the bytes even if the process exits before directory sync.
+  fs.symlinkSync(value, probePath(probe, name));
+  fs.fsyncSync(probe.fd);
+}
+
+function probeAtomicRename(directory, expectedIdentity) {
+  const location = probePath(directory, ATOMIC_PROBE_DIRECTORY);
+  let probe;
+  const slots = [];
+  try {
+    try { fs.mkdirSync(location, 0o700); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const root = atomicIdentity(fs.fstatSync(directory.fd, { bigint: true }));
+    probe = openProbeDirectory(location, root.dev);
+    lockDescriptor(probe.fd);
+    verifyAtomicDirectory(directory, expectedIdentity);
+    verifyProbeDirectory(probe, location);
+    const names = readProbeNames(probe, ATOMIC_PROBE_NAMES);
+    const identityKey = identity => Object.values(identity).map(String).join(':');
+    const owner = ['jhw-atomic-probe-v1', identityKey(root), identityKey(probe.identity)].join(' ');
+    if (!names.has(ATOMIC_PROBE_OWNER)) {
+      if (names.size !== 0) atomicInvalid('probe_state');
+      writeProbeMarker(probe, ATOMIC_PROBE_OWNER, owner);
+      fs.fsyncSync(directory.fd);
+    }
+    verifyProbeMarker(probe, ATOMIC_PROBE_OWNER, owner);
+    const sealed = names.has(ATOMIC_PROBE_PROOF);
+    const ready = names.has(ATOMIC_PROBE_READY);
+    if (ready && !sealed) atomicInvalid('probe_state');
+    if (!sealed) {
+      for (const name of ATOMIC_PROBE_SLOTS) {
+        if (!names.has(name)) fs.mkdirSync(probePath(probe, name), 0o700);
+      }
+    }
+    for (const name of ATOMIC_PROBE_SLOTS) slots.push(openProbeDirectory(probePath(probe, name), root.dev));
+    // Either slot order can survive an interrupted EXCHANGE.
+    const proof = [owner, ...slots.map(slot => identityKey(slot.identity)).sort()].join(' ');
+    const verifySlots = ordered => {
+      for (const [index, name] of ATOMIC_PROBE_SLOTS.entries()) {
+        verifyProbeDirectory(ordered[index], probePath(probe, name));
+        readProbeNames(ordered[index], []);
+      }
+    };
+    if (!sealed) {
+      verifySlots(slots);
+      fs.fsyncSync(probe.fd);
+      writeProbeMarker(probe, ATOMIC_PROBE_PROOF, proof);
+    }
+    verifyProbeMarker(probe, ATOMIC_PROBE_PROOF, proof);
+    if (!ready) {
+      writeProbeMarker(probe, ATOMIC_PROBE_READY, ATOMIC_PROBE_PROOF);
+      fs.fsyncSync(directory.fd);
+    }
+    const verify = ordered => {
+      verifyAtomicDirectory(directory, expectedIdentity);
+      verifyProbeDirectory(probe, location);
+      if (readProbeNames(probe, ATOMIC_PROBE_NAMES).size !== ATOMIC_PROBE_NAMES.length) atomicInvalid('probe_state');
+      verifySlots(ordered);
+      verifyProbeMarker(probe, ATOMIC_PROBE_OWNER, owner);
+      verifyProbeMarker(probe, ATOMIC_PROBE_PROOF, proof);
+      verifyProbeMarker(probe, ATOMIC_PROBE_READY, ATOMIC_PROBE_PROOF);
+    };
+    verify(slots);
+    const [sourceName, destinationName] = ATOMIC_PROBE_SLOTS;
+    const operands = { sourceDirectory: probe, destinationDirectory: probe, sourceName, destinationName };
+    assertProbeError(() => runAtomicHelper({ ...operands, operation: 'noreplace' }));
+    verify(slots);
+    runAtomicHelper({ ...operands, operation: 'exchange' });
+    fs.fsyncSync(probe.fd);
+    verify([slots[1], slots[0]]);
+  } catch (error) {
+    if (error instanceof DeploymentError) throw error;
+    atomicInvalid('probe_state');
+  } finally {
+    for (const slot of slots) fs.closeSync(slot.fd);
+    if (probe) fs.closeSync(probe.fd);
+  }
 }
 
 function assertProbeError(operation) {
@@ -317,7 +434,7 @@ function assertProbeError(operation) {
 /** Probe both required renameat2 operations before any caller live-name mutation. */
 export function prepareAtomicRename({ directory } = {}) {
   const identity = verifyAtomicDirectory(directory);
-  probeAtomicRename(directory);
+  probeAtomicRename(directory, identity);
   const finalIdentity = verifyAtomicDirectory(directory, identity);
   const capability = Object.freeze({});
   issuedAtomicCapabilities.set(capability, { directory, identity: finalIdentity });

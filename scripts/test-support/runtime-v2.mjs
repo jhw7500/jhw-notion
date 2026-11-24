@@ -57,6 +57,10 @@ export async function createRuntimeFixture(t, {realDependencies = false, legacyR
       'scripts/runtime-safety.mjs','scripts/runtime-store.mjs','scripts/runtime-entry.mjs','scripts/runtime-deploy.mjs',
       'scripts/runtime-prune.mjs','scripts/runtime-guard.mjs','scripts/install-config.mjs','scripts/install-wiring.sh',
       'scripts/runtime-managed-scope.mjs',
+      'scripts/runtime-managed-invocation.cjs','scripts/runtime_managed.py','scripts/runtime_managed_broker.py',
+      'scripts/runtime_managed_hook.py','scripts/runtime_managed_identity.py','scripts/runtime_managed_lifetime.py',
+      'scripts/runtime_managed_notion.py','scripts/runtime_managed_profile.py','scripts/runtime_managed_protocol.py',
+      'scripts/runtime_managed_service_worker.py','scripts/runtime_managed_transport.py',
       'scripts/jhw-runtime-entry','scripts/jhw-runtime-control','scripts/jhw-runtime-hook',
     ];
     runtimeInputs.push('install.sh');

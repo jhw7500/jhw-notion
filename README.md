@@ -27,8 +27,10 @@ Linux/libc의 `renameat2(RENAME_NOREPLACE, RENAME_EXCHANGE)` 지원도 필요하
 유지보수 명령은 live bootstrap/current를 바꾸기 전에 같은 파일시스템에서 두 연산을 확인한다.
 지원하지 않으면 일반 rename으로 우회하지 않는다. 실행 가능한 Python을 임의 선택하거나
 pip/npm 패키지를 추가하지 않으며, 일반 MCP·hook 호출에는 이 보조 경로를 사용하지 않는다.
-검사에 사용한 두 nonce 디렉터리(`.jhw-atomic-source-*`, `.jhw-atomic-destination-*`)는
-경합 중 들어온 외부 객체를 삭제하지 않도록 남겨 둔다. 자동 정리 대상이 아니다.
+검사는 `.jhw-runtime/.jhw-atomic-probe.v1`에 생성한 두 디렉터리를 재사용한다.
+검사 공간에 잠금을 잡고 소유 증거와 실제 객체가 일치하는지 검증한다. 검사 중단 후에도
+초기 생성 기록이나 같은 두 객체가 확인되면 재시도할 수 있다. `probe_state` 오류가 나면 남은 증거를 보존하고
+조사한다. 이전 버전이 남긴 `.jhw-atomic-source-*`, `.jhw-atomic-destination-*`도 보존한다.
 
 ```bash
 git clone https://github.com/jhw7500/jhw-notion.git
@@ -426,7 +428,7 @@ helper 결과나 fsync가 불명확한 경우 installer는 현재 path 상태를
 ### 전담 서비스 UID로 세션을 유지하는 관리형 옵션
 
 관리형 모드는 전담 서비스 UID가 소유한 별도 v2 설치에서 쓴다. 기존 사용자 UID는
-MCP, control, Guard hook을 자신의 HOME과 자격증명으로 실행한다. 서비스는 Unix 소켓에서
+MCP, Control, Guard hook을 자신의 HOME과 Registry 설정으로 실행한다. 서비스는 Unix 소켓에서
 요청 프로세스의 UID와 세션 후손 여부를 검증하고, 그 세션에 고정된 릴리스의 번들만 전달한다.
 새 세션은 현재 릴리스를 선택한다. 이미 결속된 세션의 호출은 처음 선택한 릴리스를 사용한다.
 
@@ -456,6 +458,7 @@ root 소유의 읽기 가능한 프로필을 준비한다. 프로필의 `node`�
 | 실행 UID | 명령과 용도 |
 | --- | --- |
 | 서비스 | `serve`로 소켓과 세션 등록을 연다. |
+| Notion 중계 전담 UID | `serve-notion`으로 등록된 Notion 연결의 읽기 작업을 제공한다. |
 | 기존 사용자 | `session -- PROGRAM ...`으로 새 세션을 시작한다. |
 | 기존 사용자 | `invoke mcp`, `invoke control ...`, `invoke hook --adapter codex --event EVENT`를 세션 안에서 실행한다. |
 | 서비스 | `deploy -- --prepare`, `deploy -- --status`로 후보를 준비하거나 상태를 본다. |
@@ -472,33 +475,88 @@ root 소유의 읽기 가능한 프로필을 준비한다. 프로필의 `node`�
 중단한다. 회수하려는 세대에 실행 기록이 있으면 그 세대를 보존한다. 관리형 저장소에 일반 설치 명령으로
 전환이나 회수를 요청하면 `DEPLOY_MANAGED_MODE_REQUIRED`를 반환한다.
 
-#### 관리형 MCP 자격증명과 시작 명령
+#### 관리형 Notion 중계와 시작 명령
 
-`NOTION_API_KEY` 값은 `session`을 시작하는 기존 사용자 UID의 환경으로 전달한다.
-이 프로필을 쓰는 Codex의 `jhw-notion` MCP 항목은 같은 프로필의 `invoke mcp`를 실행한다.
-`env_vars`에 키와 세션 바인딩의 이름을 지정한다.
+배포 서비스와 기존 사용자에서 분리된 UID가 Notion 키를 보관한다.
+`keyFile`은 해당 UID가 소유한 쓰기 제한 디렉터리 안의 `0600` 파일이다.
+이 파일에 키만 한 줄로 둔다. 이 설치에 쓰는 키는 사용자의 셸, `.env`, Codex MCP 환경에 설정하지 않는다.
+
+관리자는 기본 프로필 옆에 root 소유 `/etc/jhw-managed.json.notion.json`을 둔다.
+소켓 상위 디렉터리는 중계 UID가 소유하고, 배포 서비스가 탐색할 수 있어야 한다.
+`routes`는 이 릴리스의 `DATABASE_SCHEMAS`에서 사용하는 데이터베이스와 데이터 소스의 연결 목록이다.
+
+~~~json
+{
+  "version": 1,
+  "credentialUid": 61003,
+  "socket": "/run/jhw-notion-reader/relay.sock",
+  "keyFile": "/var/lib/jhw-notion-reader/notion.key",
+  "routes": [
+    {"databaseId":"4430fcd4-bfba-4a46-9a1b-4520db86e883","dataSourceId":"d45ed33c-26ee-45be-ad9c-513db7c422e0"},
+    {"databaseId":"4e5ba7f0-b9cc-4171-84a7-f4e430abaf57","dataSourceId":"634f7b00-b7a2-447b-9514-a109b57557a8"},
+    {"databaseId":"6c9fbc24-c5fb-4ca9-aa61-781cacc7ecfd","dataSourceId":"c1d8d3c3-538e-40a9-a306-2b694a4d8ff9"},
+    {"databaseId":"ec68d6c6-6e8e-47e6-9e8c-85d13b9f1461","dataSourceId":"6a4615db-ba17-44a8-b3c7-6688dce9c2fa"},
+    {"databaseId":"979a9412-73d9-4fa4-be0e-cbcafc0a2505","dataSourceId":"2917f7ce-c7a7-4301-a2fc-48137876c9a7"}
+  ]
+}
+~~~
+
+중계 UID에서 보호 서비스를 시작한다. 배포 서비스가 시작할 때 중계 프로필을 읽는다.
+중계는 프로필에 지정한 배포 서비스 UID의 요청을 받는다. 배포 서비스는 기존 사용자의
+세션과 실제 호출 프로세스를 대조하고 처음 고른 릴리스와 bootstrap을 사용한다.
+
+~~~bash
+/usr/bin/python3 -E -s -B /opt/jhw-managed/scripts/runtime_managed.py --profile /etc/jhw-managed.json serve-notion
+~~~
+
+Codex의 `jhw-notion` MCP 항목은 기존 사용자로 같은 프로필의 `invoke mcp`를 실행한다.
 
 ~~~toml
 [mcp_servers.jhw-notion]
 command = "/usr/bin/python3"
 args = ["-E", "-s", "-B", "/opt/jhw-managed/scripts/runtime_managed.py", "--profile", "/etc/jhw-managed.json", "invoke", "mcp"]
-env_vars = ["JHW_RUNTIME_SESSION_BINDING", "NOTION_API_KEY"]
+env_vars = ["JHW_RUNTIME_SESSION_BINDING"]
 ~~~
 
-기존 사용자 셸에서 키를 입력하고 관리형 세션을 시작한다.
+기존 사용자로 관리형 세션을 시작한다.
 
 ~~~bash
-(
-  IFS= read -r -s -p 'Notion API key: ' NOTION_API_KEY || exit 1
-  printf '\n' >&2
-  test -n "${NOTION_API_KEY:+set}" || exit 1
-  export NOTION_API_KEY
-  exec /usr/bin/python3 -E -s -B /opt/jhw-managed/scripts/runtime_managed.py --profile /etc/jhw-managed.json session -- codex
-)
+/usr/bin/python3 -E -s -B /opt/jhw-managed/scripts/runtime_managed.py --profile /etc/jhw-managed.json session -- codex
 ~~~
 
-현재 운영 Codex 설정과 `jhw-control-host` 연결은 별도 배포 범위다. 관리형 초기 설치와
-클라이언트 설정이 끝난 뒤 실제 승인 요청의 `PostToolUse`와 C5를 함께 검증한다.
+중계는 검색, 등록된 데이터 소스 쿼리, 페이지·데이터베이스·데이터 소스 조회, 하위 블록 목록을 제공한다.
+관리형 MCP의 Notion 변경 요청은 거부한다. `invoke control preflight`는 중계에 등록한 DB와
+데이터 소스가 실제 Notion에서 서로 연결되는지 검증한다. 중계에 연결할 수 없으면 MCP 조회는
+`NOTION_MANAGED_UNAVAILABLE`로, Control의 Notion 검사는 `NOTION_GUARD_INDETERMINATE`로 끝난다.
+중계를 다시 시작하면 살아 있는 관리형 세션에서도 다음 조회를 새로 요청할 수 있다.
+
+#### 첫 관리형 설치와 중계 경계 전환
+
+운영자는 심사를 마친 커밋 하나에서 서비스 checkout과 보호 스크립트를 준비한다.
+보호 스크립트의 목록은 `scripts/runtime_managed_profile.py`의
+`require_protected_programs`에 있다. 이 대상을 git의 파일 모드대로 root 소유 디렉터리에
+설치하고, 설치 파일을 해당 커밋의 바이트와 대조한다. Node 경로와 프로필은 심볼릭 링크 없이
+지정한다.
+
+| 경로 | 소유 및 모드 |
+| --- | --- |
+| 서비스 checkout, HOME, runtime socket 상위 디렉터리 | 배포 서비스 UID. 그룹과 다른 사용자의 쓰기를 제한한다. |
+| `.jhw-runtime`, `v2`, `v2/managed-invocations` | 배포 서비스 UID, `0700` |
+| 두 프로필 및 보호 스크립트 | root. 프로필은 실행 UID가 읽을 수 있는 `0644` 일반 파일로 둔다. |
+| Notion socket 상위 디렉터리, 키 파일 | Notion 중계 UID. 배포 서비스는 socket 경로를 탐색할 수 있고, 키 파일은 `0600`이다. |
+
+1. 배포 서비스로 별도 checkout과 HOME에서 `--prepare`를 실행해 정확한 릴리스 ID를 기록한다.
+   `--status`로 소비자와 pending 상태를 확인한 뒤 승인된 첫 `--activate`를 실행한다.
+   v2 선택을 확인한 다음 `v2/managed-invocations`를 준비한다.
+2. 기존 전담 관리형 설치의 보호 스크립트를 중계 이전 버전에서 바꿀 때는 그 설치의 세션과
+   실행 기록이 모두 정리된 상태에서 전환한다. 중계 계약이 다른 릴리스의 호환 전환은
+   `DEPLOY_COMPATIBILITY_MISMATCH`로 중단된다. 새 실행기는 키 없는 경로를 지원하는
+   MCP·preflight 번들을 검증한다.
+3. 새 세션을 열기 전에 키와 두 프로필을 확인하고 중계, 배포 서비스 순서로 시작한다.
+   새 관리형 시작 경로에 MCP와 Guard hook을 연결한다. 한 세션에서 `invoke control preflight`와
+   MCP 조회를 확인한다. 같은 세션의 실제 승인 요청으로 `PostToolUse`와 C5를 검증한다.
+4. 시작 또는 검증이 실패하면 새 세션 등록을 보류하고 해당 설치의 상태와 복구 기록을 확인한다.
+   변경은 확인된 유지보수 절차와 해당 릴리스의 승인 범위에서 복구한다.
 
 ### Notion API Key 설정
 

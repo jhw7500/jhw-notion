@@ -10,9 +10,10 @@ import sys
 from runtime_managed_broker import BINDING, SELECTORS, require_artifact, require_pair, serve
 from runtime_managed_hook import supervise_hook
 from runtime_managed_lifetime import InvocationInFlight
+from runtime_managed_notion import load_notion_profile, receive_notion_result, serve_notion_relay
 from runtime_managed_profile import load_profile, require_protected_programs
 from runtime_managed_protocol import decode_message, encode_message
-from runtime_managed_transport import ManagedPeer, PeerRejected, local_socket
+from runtime_managed_transport import MAX_PACKET, ManagedPeer, PeerRejected, local_socket
 
 _BINDING_VARIABLE = "JHW_RUNTIME_SESSION_BINDING"
 _EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionEnd")
@@ -40,7 +41,9 @@ def _session(profile, argv):
             raise ValueError("invalid managed session reply")
         require_pair(reply)
     # The caller's process remains the root while the requested user command runs.
-    status = subprocess.call(argv[1:], env={**os.environ, _BINDING_VARIABLE: reply["binding"]})
+    environment = {name: value for name, value in os.environ.items() if name.upper() != "NOTION_API_KEY"}
+    environment[_BINDING_VARIABLE] = reply["binding"]
+    status = subprocess.call(argv[1:], env=environment)
     return 128 - status if status < 0 else status
 
 
@@ -83,7 +86,10 @@ def _invoke(profile, selector, argv):
     try:
         timeout = 1.7 if selector == "hook" and _hook_event(argv) == "SessionEnd" else 6
         with _connect(profile, timeout) as peer:
-            peer.send(encode_message({"op": "invoke", "binding": binding, "selector": selector}))
+            request = {"op": "invoke", "binding": binding, "selector": selector}
+            if selector == "mcp" or (selector == "control" and argv == ["preflight"]):
+                request["notion"] = True
+            peer.send(encode_message(request))
             packet, (descriptor,) = peer.receive(expected_descriptors=1)
             artifact = decode_message(packet)
             release_id, _ = require_artifact(artifact, descriptor, profile.service_uid)
@@ -92,7 +98,7 @@ def _invoke(profile, selector, argv):
         os.set_inheritable(descriptor, True)
         os.execve(profile.node, [
             str(profile.node), str(runner), str(descriptor), artifact["sha256"], str(artifact["bytes"]),
-            str(release_root), selector, *argv,
+            str(release_root), sys.executable, str(profile.path), selector, *argv,
         ], _runtime_environment())
     finally:
         if descriptor is not None:
@@ -101,8 +107,19 @@ def _invoke(profile, selector, argv):
 
 def _runtime_environment():
     return {name: value for name, value in os.environ.items()
-            if name.upper() not in ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
+            if name.upper() not in ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "NOTION_API_KEY")
             and not name.upper().startswith(("NODE_", "LD_", "DYLD_"))}
+
+
+def _read_notion(profile):
+    binding = os.environ.get(_BINDING_VARIABLE, "")
+    if BINDING.fullmatch(binding) is None:
+        raise ValueError("managed session binding required")
+    request = decode_message(sys.stdin.buffer.read(MAX_PACKET + 1))
+    with _connect(profile, 13) as peer:
+        peer.send(encode_message({"op": "notion", "binding": binding, "callerPid": os.getppid(), "request": request}))
+        sys.stdout.buffer.write(receive_notion_result(peer, profile.service_uid))
+    return 0
 
 
 def _supervised_hook(profile, argv):
@@ -136,6 +153,8 @@ def main():
     parser.add_argument("--profile", required=True)
     modes = parser.add_subparsers(dest="mode", required=True)
     modes.add_parser("serve")
+    modes.add_parser("serve-notion")
+    modes.add_parser("_notion-read")
     session = modes.add_parser("session")
     session.add_argument("arguments", nargs=argparse.REMAINDER)
     invocation = modes.add_parser("invoke")
@@ -148,11 +167,20 @@ def main():
         require_protected_programs(Path(__file__).parent)
         profile = load_profile(command.profile)
         if command.mode == "serve":
-            serve(profile)
+            profile.require_service()
+            serve(profile, load_notion_profile(profile))
+            return 0
+        if command.mode == "serve-notion":
+            notion = load_notion_profile(profile)
+            if notion is None:
+                raise ValueError("managed Notion relay is not configured")
+            serve_notion_relay(profile, notion)
             return 0
         if command.mode == "deploy":
             return _deploy(profile, command.arguments)
         profile.require_client()
+        if command.mode == "_notion-read":
+            return _read_notion(profile)
         if command.mode == "session":
             return _session(profile, command.arguments)
         if command.mode == "_hook-worker":

@@ -41,7 +41,8 @@ const SOURCE_INPUTS = [
   'scripts/runtime-managed-artifact.mjs', 'scripts/runtime-managed-worker-probe.mjs',
   'scripts/runtime-managed-invocation.cjs', 'scripts/runtime_managed.py',
   'scripts/runtime_managed_broker.py', 'scripts/runtime_managed_hook.py', 'scripts/runtime_managed_identity.py',
-  'scripts/runtime_managed_lifetime.py', 'scripts/runtime_managed_profile.py', 'scripts/runtime_managed_protocol.py',
+  'scripts/runtime_managed_lifetime.py', 'scripts/runtime_managed_notion.py',
+  'scripts/runtime_managed_profile.py', 'scripts/runtime_managed_protocol.py',
   'scripts/runtime_managed_service_worker.py', 'scripts/runtime_managed_transport.py',
 ];
 const EXCLUDED_SOURCE_NAMES = ['.git', '.ai', '.superpowers', 'node_modules', 'dist'];
@@ -1225,13 +1226,14 @@ async function defaultBuild({ stagingRoot }) {
     throw new DeploymentError('DEPLOY_BUILD_FAILED');
   }
   const controlVersionDefine = `__JHW_BUNDLED_CONTROL_TOOL_VERSION__:${JSON.stringify(packageMetadata.version)}`;
+  const notionRelayBanner = ['--postBanner', '// jhw-managed-notion-relay: 1'];
   const runtime = path.join(mcpRoot, 'dist/runtime');
   fs.mkdirSync(runtime, { recursive: true, mode: 0o755 });
   fs.chmodSync(runtime, 0o755);
   const bundler = path.join(mcpRoot, 'node_modules/.bin/rolldown');
   for (const [input, output, executable, defines] of [
-    ['dist/index.js', 'dist/runtime/mcp.cjs', false, []],
-    ['dist/control/cli.js', 'dist/runtime/control.cjs', true, []],
+    ['dist/index.js', 'dist/runtime/mcp.cjs', false, notionRelayBanner],
+    ['dist/control/cli.js', 'dist/runtime/control.cjs', true, notionRelayBanner],
     // The hook bundle carries the CLI module under its own file name, so the
     // CLI's entry check would pass there too; this define switches it off.
     ['dist/control/hook-adapter.js', 'dist/runtime/hook.cjs', true, ['--transform.define', '__JHW_HOOK_BUNDLE__:true']],

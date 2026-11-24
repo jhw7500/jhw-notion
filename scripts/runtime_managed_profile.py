@@ -62,7 +62,8 @@ def require_protected_programs(directory):
     for name in (
         "runtime_managed.py", "runtime_managed_profile.py", "runtime_managed_protocol.py",
         "runtime_managed_broker.py", "runtime_managed_identity.py", "runtime_managed_hook.py",
-        "runtime_managed_lifetime.py", "runtime_managed_service_worker.py", "runtime_managed_transport.py",
+        "runtime_managed_lifetime.py", "runtime_managed_notion.py",
+        "runtime_managed_service_worker.py", "runtime_managed_transport.py",
         "runtime-managed-invocation.cjs", "runtime-managed-worker-probe.mjs",
         "runtime-managed-artifact.mjs", "runtime-managed-scope.mjs", "runtime-managed-writer.mjs",
         "runtime-deploy.mjs", "runtime-entry.mjs", "runtime-guard.mjs", "runtime-prune.mjs",

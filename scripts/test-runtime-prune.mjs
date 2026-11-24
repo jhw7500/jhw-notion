@@ -77,6 +77,25 @@ test('dry-run is advisory and byte-for-byte non-mutating',()=>{
  assert.deepEqual(names(f.runtime).map(name=>[name,fs.statSync(path.join(f.runtime,name)).ino]),before);
 });
 
+test('prune preserves the fixed probe workspace and legacy probe directories', t => {
+  const f = fixture(t);
+  const workspace = '.jhw-atomic-probe.v1';
+  const legacy = '.jhw-atomic-source-' + 'a'.repeat(32);
+  for (const name of [workspace, legacy]) fs.mkdirSync(path.join(f.runtime, name), 0o700);
+  const options = {repositoryRoot:f.root, now:NOW};
+  const deploy = acquireLease(path.join(f.runtime, 'deploy.lock'), {create:true});
+  const admission = acquireLease(path.join(f.runtime, 'admission.lock'), {create:true});
+  try {
+    const before = names(f.runtime);
+    const preparedPlan = prune.prepareRuntimePrune(options);
+    assert.equal(preparedPlan.plan.skipped.unknown, 1);
+    assert.deepEqual(prune.applyRuntimePrune({
+      ...options, preparedPlan, deployLease:deploy, admissionLease:admission,
+    }).removed, {journals:0, previous:0});
+    assert.deepEqual(names(f.runtime), before);
+  } finally { admission.close(); deploy.close(); }
+});
+
 test('bounded scanner accepts 4096 and 4097 entries and blocks cap plus one',()=>{
  const f=fixture(test);for(let i=0;i<4096;i++)fs.mkdirSync(path.join(f.runtime,`unknown-${i}`));
  assert.equal(prune.planRuntimePrune({repositoryRoot:f.root,now:NOW}).observed.entries,4096);

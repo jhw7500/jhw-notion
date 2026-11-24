@@ -8,6 +8,7 @@ import test from 'node:test';
 
 const runner = new URL('./runtime-managed-invocation.cjs', import.meta.url).pathname;
 const releaseRoot = '/srv/jhw/.jhw-runtime/releases/r-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const keylessBanner = '// jhw-managed-notion-relay: 1\n';
 
 async function invoke(t, source, {selector = 'control', args = [], digest, size, root = releaseRoot, descriptor = 3} = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'jhw-managed-invocation-'));
@@ -22,6 +23,8 @@ async function invoke(t, source, {selector = 'control', args = [], digest, size,
     digest ?? createHash('sha256').update(bytes).digest('hex'),
     String(size ?? bytes.length),
     root,
+    '/usr/bin/python3',
+    '/etc/jhw-managed.json',
     selector,
     ...args,
   ], {
@@ -72,7 +75,8 @@ if (fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename)) void main(
 test('mcp, control, and hook are the only accepted selectors', async t => {
   const source = `process.stdout.write('loaded\\n');`;
   for (const selector of ['mcp', 'control', 'hook']) {
-    const result = await invoke(t, source, {selector});
+    const bundle = selector === 'mcp' ? keylessBanner + source : source;
+    const result = await invoke(t, bundle, {selector});
     assert.equal(result.status, 0, `${selector}: ${result.stderr}`);
     assert.equal(result.stdout, 'loaded\n');
   }
@@ -80,6 +84,35 @@ test('mcp, control, and hook are the only accepted selectors', async t => {
   assert.equal(rejected.status, 1);
   assert.equal(rejected.stdout, '');
   assert.match(rejected.stderr, /DEPLOY_RUNTIME_BINDING_INVALID/u);
+});
+
+test('managed MCP and control preflight reject bundles predating the keyless client', async t => {
+  for (const options of [{selector: 'mcp'}, {selector: 'control', args: ['preflight']}]) {
+    const result = await invoke(t, "process.stdout.write('old credential path');", options);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /DEPLOY_RUNTIME_BINDING_INVALID/u);
+  }
+});
+
+test('only managed MCP and control preflight get an immutable Notion relay', async t => {
+  const source = `
+const relay = Object.getOwnPropertyDescriptor(globalThis, '__JHW_MANAGED_NOTION_RELAY__');
+process.stdout.write(JSON.stringify(relay
+  ? [typeof relay.value, relay.writable, relay.configurable, relay.enumerable]
+  : null));
+`;
+  const calls = [
+    {selector: 'mcp', args: [], eligible: true},
+    {selector: 'control', args: ['preflight'], eligible: true},
+    {selector: 'control', args: ['guard', 'status'], eligible: false},
+    {selector: 'hook', args: [], eligible: false},
+  ];
+  for (const {selector, args, eligible} of calls) {
+    const result = await invoke(t, `#!/usr/bin/env node\n${keylessBanner}${source}`, {selector, args});
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), eligible ? ['function', false, false, false] : null);
+  }
 });
 
 test('multi-digit inherited descriptors are accepted', async t => {

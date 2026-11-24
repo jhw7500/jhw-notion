@@ -160,9 +160,10 @@ def _verify_anchor(proc_fd, anchored, uid):
 
 
 def require_descendant(
-    *, root_pid: int, root_pidfd: int, worker_pid: int, worker_pidfd: int, uid: int
+    *, root_pid: int, root_pidfd: int, worker_pid: int, worker_pidfd: int, uid: int,
+    direct: bool = False,
 ) -> None:
-    """Require a live worker to be a strict descendant of one live root."""
+    """Require a live worker below one live root, optionally as its direct child."""
     root_pid = _integer(root_pid, 1, _PID_MAX)
     worker_pid = _integer(worker_pid, 1, _PID_MAX)
     uid = _integer(uid, 0, _UID_MAX)
@@ -178,7 +179,7 @@ def require_descendant(
             anchored = []
             seen = set()
             current_pid = worker_pid
-            for _ in range(_MAX_ANCESTORS):
+            for _ in range(2 if direct else _MAX_ANCESTORS):
                 if current_pid in seen:
                     _reject()
                 seen.add(current_pid)
