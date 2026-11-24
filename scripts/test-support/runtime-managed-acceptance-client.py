@@ -10,7 +10,6 @@ import time
 
 work, label, barrier, *cli = sys.argv[1:]
 barrier = Path(barrier)
-environment = {**os.environ, "NOTION_API_KEY": "fixture-only"}
 events = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd")
 
 
@@ -22,7 +21,6 @@ def request(selector, arguments, value=None):
         input=None if value is None else json.dumps(value),
         capture_output=True,
         cwd=work,
-        env=environment,
         timeout=13,
         check=False,
     )
@@ -39,7 +37,6 @@ with subprocess.Popen(
     stderr=subprocess.PIPE,
     text=True,
     cwd=work,
-    env=environment,
 ) as mcp:
     try:
         assert mcp.stdin is not None and mcp.stdout is not None
@@ -64,6 +61,10 @@ with subprocess.Popen(
             assert reply.get("id") == request_id and "result" in reply, reply
             if method == "tools/list":
                 assert reply["result"]["tools"], reply
+
+        expected_key = b"NOTION_API_KEY=" + os.environb[b"NOTION_API_KEY"]
+        mcp_environment = Path(f"/proc/{mcp.pid}/environ").read_bytes().split(b"\0")
+        assert expected_key in mcp_environment, "MCP did not inherit the session credential"
 
         (barrier / f"{label}.pid").write_text(str(mcp.pid))
         iterations = 0

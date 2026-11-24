@@ -84,8 +84,8 @@ generation 2 release를 먼저 선택한 뒤 아래의 정지 이행 순서를 �
 version도 build 시 package metadata에서 읽어 bundle bytes에 삽입하므로 실행 중 mutable
 `package.json`을 다시 읽지 않는다. descriptor 실행 전에 bootstrap은 검증한 selected release
 root를 변경 불가능한 process-local binding으로 전달하므로 control이 `/proc/self/fd` 위치를
-저장소 root로 오인하지 않는다. managed MCP는 canonical `mcp-server/.env`를 owner·mode·type·
-single-link·identity 검사 뒤 열린 descriptor로 상속한다. 인증된 runner가 bounded fatal-UTF-8
+저장소 root로 오인하지 않는다. 일반 설치의 bootstrap MCP는 canonical `mcp-server/.env`를
+owner·mode·type·single-link·identity 검사 뒤 열린 descriptor로 상속한다. 인증된 runner가 bounded fatal-UTF-8
 parser로 descriptor를 읽고 전후 identity를 대조한 뒤 `NOTION_API_KEY`만 process environment에
 반영하고 fd를 닫는다. 다른 well-formed key는 실행하거나 전달하지 않으며 Node startup injection
 변수도 selector child environment에서 제거하므로 credential data가 bundle보다 먼저 코드로
@@ -472,10 +472,37 @@ root 소유의 읽기 가능한 프로필을 준비한다. 프로필의 `node`�
 중단한다. 회수하려는 세대에 실행 기록이 있으면 그 세대를 보존한다. 관리형 저장소에 일반 설치 명령으로
 전환이나 회수를 요청하면 `DEPLOY_MANAGED_MODE_REQUIRED`를 반환한다.
 
+#### 관리형 MCP 자격증명과 시작 명령
+
+`NOTION_API_KEY` 값은 `session`을 시작하는 기존 사용자 UID의 환경으로 전달한다.
+이 프로필을 쓰는 Codex의 `jhw-notion` MCP 항목은 같은 프로필의 `invoke mcp`를 실행한다.
+`env_vars`에 키와 세션 바인딩의 이름을 지정한다.
+
+~~~toml
+[mcp_servers.jhw-notion]
+command = "/usr/bin/python3"
+args = ["-E", "-s", "-B", "/opt/jhw-managed/scripts/runtime_managed.py", "--profile", "/etc/jhw-managed.json", "invoke", "mcp"]
+env_vars = ["JHW_RUNTIME_SESSION_BINDING", "NOTION_API_KEY"]
+~~~
+
+기존 사용자 셸에서 키를 입력하고 관리형 세션을 시작한다.
+
+~~~bash
+(
+  IFS= read -r -s -p 'Notion API key: ' NOTION_API_KEY || exit 1
+  printf '\n' >&2
+  test -n "${NOTION_API_KEY:+set}" || exit 1
+  export NOTION_API_KEY
+  exec /usr/bin/python3 -E -s -B /opt/jhw-managed/scripts/runtime_managed.py --profile /etc/jhw-managed.json session -- codex
+)
+~~~
+
 현재 운영 Codex 설정과 `jhw-control-host` 연결은 별도 배포 범위다. 관리형 초기 설치와
 클라이언트 설정이 끝난 뒤 실제 승인 요청의 `PostToolUse`와 C5를 함께 검증한다.
 
 ### Notion API Key 설정
+
+일반 설치의 bootstrap MCP에서 사용하는 checkout에 키 파일을 둔다.
 
 ```bash
 cp mcp-server/.env.example mcp-server/.env

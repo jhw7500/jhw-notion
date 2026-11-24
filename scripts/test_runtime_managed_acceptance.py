@@ -84,7 +84,10 @@ def require_isolated_root():
         raise SystemExit("requires root in a disposable Linux environment")
 
 
-def checked(command, uid, environment, timeout=30, **options):
+def checked(command, uid, environment, timeout=30, *, phase=None, **options):
+    started = time.monotonic()
+    if phase is not None:
+        print(f"{phase} started", file=sys.stderr, flush=True)
     result = subprocess.run(
         command,
         **as_user(uid),
@@ -97,6 +100,8 @@ def checked(command, uid, environment, timeout=30, **options):
     )
     if result.returncode != 0:
         raise RuntimeError((result.returncode, result.stdout[-1500:], result.stderr[-3000:]))
+    if phase is not None:
+        print(f"{phase} finished in {time.monotonic() - started:.2f}s", file=sys.stderr, flush=True)
     return result.stdout
 
 
@@ -232,6 +237,7 @@ def main():
             SERVICE,
             {**ENVIRONMENT, "HOME": str(socket.parent)},
             timeout=240,
+            phase="prepare",
             cwd=SCRIPTS.parent,
         ))
         fixture_root = Path(prepared["root"])
@@ -251,7 +257,10 @@ def main():
         profile.chmod(0o644)
         cli = [*PYTHON, str(install_test_programs(base / "programs")), "--profile", str(profile)]
         service_environment = {**ENVIRONMENT, "HOME": prepared["home"]}
-        client_environment = configure_guard(base / "user")
+        client_environment = {
+            **configure_guard(base / "user"),
+            "NOTION_API_KEY": "fixture-session-credential",
+        }
         work = Path(client_environment["HOME"]) / "code"
 
         def deploy(*deployment_arguments):
@@ -260,6 +269,7 @@ def main():
                 SERVICE,
                 service_environment,
                 timeout=60,
+                phase=" ".join(argument for argument in deployment_arguments if argument.startswith("--")),
             ))
 
         def recreate_obsolete():

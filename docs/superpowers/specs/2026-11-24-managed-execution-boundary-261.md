@@ -136,16 +136,32 @@ UID의 로컬 Registry에서 control과 네 Guard hook을 반복 호출하며 �
 호환 활성화, 롤백, C 회수를 수행했다.
 
 재현 시험은 PID namespace와 임시 파일시스템이 분리된 Linux 컨테이너에서 실행한다.
-Node 24(`/usr/local/bin/node`), Python 3.10 이상, npm 패키지 취득 네트워크와
-Git 모드를 보존한 읽기 전용 checkout(UID 1003)을 사용한다. 시험 컨트이너는 root로 시작하고
-`--cap-drop ALL`에 `SETUID`, `SETGID`, `CHOWN`, `KILL`만 추가한다.
-`--trials 1`로 한 회차를 재실행하고, 반복 검증에서는 `--trials 10`을 지정한다.
+`review_image`에는 Node 24(`/usr/local/bin/node`), Python 3.10 이상, Git과 flock이 있는
+로컬 이미지를 지정한다. 검증 호스트에서는 `jhw-notion-261-qa:node24`를 사용했다.
+npm 패키지 취득 네트워크가 필요하다. 검토할 Git HEAD의 파일과 모드를 임시 작업
+디렉터리에 복원해 UID 1003에 넘긴다.
 
 ```bash
-JHW_MANAGED_TEST_ISOLATED=1 python3 -B scripts/test_runtime_managed_acceptance.py --trials 1
+set -o pipefail
+git archive HEAD |
+  docker run --rm -i --pull never --user 0:0 --read-only \
+    --security-opt no-new-privileges --cap-drop ALL \
+    --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add KILL \
+    --tmpfs /work:rw,exec,mode=0755 --tmpfs /tmp:rw,exec,mode=1777 \
+    --workdir /work --entrypoint /bin/sh "${review_image:?검증 이미지 지정}" -ec '
+      umask 022
+      tar --no-same-owner -xf -
+      git init -q
+      git add .
+      git -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm snapshot
+      chown -R 1003:1003 /work
+      JHW_MANAGED_TEST_ISOLATED=1 python3 -B scripts/test_runtime_managed_acceptance.py --trials 1
+    '
 ```
 
-저장소 명령으로 재실행한 회차는 네 세션을 유지하며 전환과 C 회수를 완료했다.
+한 회차는 준비·정리까지 포함해 187초, 시험 본체는 144.63초가 걸린 기록이 있다. 외부 실행
+제한은 300초로 잡고, 단계별 소요시간은 stderr에서 확인한다. 10회 반복은 `--trials 10`으로
+실행하고 회차 수에 맞춰 외부 제한을 늘린다.
 
 다음은 재현 스크립트를 작성하기 전, 같은 코드의 격리 시험에서 수집한 결과다.
 
@@ -153,7 +169,7 @@ JHW_MANAGED_TEST_ISOLATED=1 python3 -B scripts/test_runtime_managed_acceptance.p
 | --- | --- |
 | A -> B -> A 및 C 회수 | 10/10, 종료코드 0 |
 | 기존 A 세션 3개와 B 세션 1개의 pair 유지 | 10/10 |
-| Control과 네 hook 반복 호출 | 6,493회 |
+| Control 1회와 네 hook을 포함하는 반복 루프 | 6,493회 |
 | 일반 hook 최대 | 4,705ms |
 | SessionEnd 최대 | 245ms |
 | Python 관리형 격리 회귀 | 31/31, 종료코드 0 |
@@ -161,7 +177,30 @@ JHW_MANAGED_TEST_ISOLATED=1 python3 -B scripts/test_runtime_managed_acceptance.p
 | Node 런타임 회귀 | 487 통과, 실패 0, 생략 1, 종료코드 0 |
 | TypeScript 타입 검사 | 종료코드 0 |
 
-실행 요약 SHA-256은 `88b67aa0d4696b7ad0d9dfa92f18e453cfa0755729d510cf1466233268dd271c`이다.
+10회 실행 요약의 원본 바이트를 아래에 보관한다. SHA-256은 `88b67aa0d4696b7ad0d9dfa92f18e453cfa0755729d510cf1466233268dd271c`이다.
+
+```text
+Real v2 fixture prepared
+{"round": 1, "sessions": 4, "iterations": 657, "seconds": 152.88, "maxMs": {"control": 4336.594489, "UserPromptSubmit": 4704.970468, "PreToolUse": 248.337695, "PostToolUse": 279.125487, "SessionEnd": 245.056272}}
+{"round": 2, "sessions": 4, "iterations": 665, "seconds": 151.61, "maxMs": {"control": 4256.865589, "UserPromptSubmit": 4207.003645, "PreToolUse": 250.349532, "PostToolUse": 246.33669, "SessionEnd": 231.817389}}
+{"round": 3, "sessions": 4, "iterations": 649, "seconds": 143.54, "maxMs": {"control": 3869.804144, "UserPromptSubmit": 3781.447773, "PreToolUse": 228.580721, "PostToolUse": 241.110606, "SessionEnd": 239.81702}}
+{"round": 4, "sessions": 4, "iterations": 640, "seconds": 142.81, "maxMs": {"control": 3891.667045, "UserPromptSubmit": 4052.965055, "PreToolUse": 244.61436, "PostToolUse": 253.448031, "SessionEnd": 235.639003}}
+{"round": 5, "sessions": 4, "iterations": 638, "seconds": 144.38, "maxMs": {"control": 4148.381218, "UserPromptSubmit": 4073.911991, "PreToolUse": 232.060241, "PostToolUse": 254.036335, "SessionEnd": 234.129943}}
+{"round": 6, "sessions": 4, "iterations": 636, "seconds": 140.15, "maxMs": {"control": 3796.169041, "UserPromptSubmit": 3879.597295, "PreToolUse": 228.56518, "PostToolUse": 215.218462, "SessionEnd": 236.950798}}
+{"round": 7, "sessions": 4, "iterations": 646, "seconds": 136.28, "maxMs": {"control": 3802.295997, "UserPromptSubmit": 3941.274026, "PreToolUse": 203.642412, "PostToolUse": 211.915252, "SessionEnd": 199.947336}}
+{"round": 8, "sessions": 4, "iterations": 654, "seconds": 132.37, "maxMs": {"control": 3845.371415, "UserPromptSubmit": 3716.318014, "PreToolUse": 194.649947, "PostToolUse": 185.845965, "SessionEnd": 187.495981}}
+{"round": 9, "sessions": 4, "iterations": 654, "seconds": 132.43, "maxMs": {"control": 3702.527143, "UserPromptSubmit": 3759.583436, "PreToolUse": 196.318868, "PostToolUse": 199.174255, "SessionEnd": 200.674977}}
+{"round": 10, "sessions": 4, "iterations": 654, "seconds": 131.52, "maxMs": {"control": 3684.927911, "UserPromptSubmit": 3818.735118, "PreToolUse": 177.718842, "PostToolUse": 173.673694, "SessionEnd": 168.519445}}
+{"passed": 10, "requested": 10}
+```
+
+원본의 첫 줄부터 마지막 줄까지 다음 명령으로 대조한다.
+
+```bash
+sed -n '/^Real v2 fixture prepared$/,/^{"passed": 10, "requested": 10}$/p' \
+  docs/superpowers/specs/2026-11-24-managed-execution-boundary-261.md | sha256sum
+```
+
 Claim 없는 fixture의 `PostToolUse`는 `GUARD_REQUEST_NOT_FOUND`를 반환했다. 실제 사용자가 승인한
 대화형 호출의 `PostToolUse`와 기존 Codex 설정을 통한 C5는 승인된 운영 배포 뒤에 확인한다.
 
