@@ -6,6 +6,7 @@ import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
 import test from 'node:test';
+import {acquireLease} from './runtime-safety.mjs';
 
 const prune = await import('./runtime-prune.mjs');
 const DAY=24*60*60*1000;
@@ -29,6 +30,29 @@ function journal(f,sequence,{age=60,status='complete',phase='complete',operation
  return {name,directory,state,completedAt};
 }
 function names(runtime) {return fs.readdirSync(runtime).sort();}
+
+test('a prepared empty prune requires its original plan and exclusive leases for this runtime', t => {
+  const f=fixture(t);
+  const options={repositoryRoot:f.root,now:NOW};
+  const deploy=acquireLease(path.join(f.runtime,'deploy.lock'),{create:true});
+  let admission=acquireLease(path.join(f.runtime,'admission.lock'),{create:true,shared:true});
+  const apply=preparedPlan=>prune.applyRuntimePrune({...options,preparedPlan,deployLease:deploy,admissionLease:admission});
+  const changed={code:'DEPLOY_PRUNE_BLOCKED',reason:'snapshot_changed'};
+  try {
+    const first=prune.prepareRuntimePrune(options);
+    assert.throws(()=>apply(first),changed);
+    admission.close();
+    admission=acquireLease(path.join(f.runtime,'admission.lock'));
+    assert.throws(()=>apply(first),changed);
+    const next=prune.prepareRuntimePrune(options);
+    assert.throws(()=>apply({plan:next.plan}),changed);
+    assert.throws(()=>apply(prune.prepareRuntimePrune({repositoryRoot:fixture(t).root,now:NOW})),changed);
+    assert.deepEqual(apply(next).removed,{journals:0,previous:0});
+    assert.throws(()=>apply(next),changed);
+    assert.equal(fs.existsSync(path.join(f.runtime,'.prune.v1')),false);
+  } finally { admission.close();deploy.close(); }
+});
+
 function recoveryPayload(runtime,index=0) {
  const recovery=path.join(runtime,'.prune.v1',`recovery.${index.toString().padStart(8,'0')}`);
  const inventory=JSON.parse(fs.readFileSync(path.join(recovery,'inventory.json'),'utf8'));

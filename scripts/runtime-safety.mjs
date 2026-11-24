@@ -352,7 +352,23 @@ export function atomicRename({ capability, sourceDirectory, destinationDirectory
   verifyAtomicDirectory(state.directory, state.identity, 'capability');
 }
 
-function uncertain() { throw new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN'); }
+const INVENTORY_CAUSES = Object.freeze([
+  'pid_set_changed',
+  'process_vanished',
+  'identity_changed',
+  'record_unreadable',
+  'classification_unknown',
+  'root_mismatch',
+]);
+const INVENTORY_STAGES = new Set(['preliminary', 'post_probe', 'publication']);
+function causeCounts() {
+  return Object.fromEntries(INVENTORY_CAUSES.map(cause => [cause, 0]));
+}
+function uncertain(cause = 'record_unreadable') {
+  const error = new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN');
+  Object.defineProperty(error, 'inventoryCause', {value: cause});
+  throw error;
+}
 function stableRecord(a, b) {
   return sameObject(a, b) && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 }
@@ -371,7 +387,9 @@ function readRecord(directoryFd, name, limit, uid) {
       if (size === 0) break;
       length += size;
     }
-    if (length > limit || !stableRecord(before, fs.fstatSync(fd)) || !stableRecord(before, fs.lstatSync(`/proc/self/fd/${directoryFd}/${name}`))) uncertain();
+    if (length > limit || !stableRecord(before, fs.fstatSync(fd)) || !stableRecord(before, fs.lstatSync(`/proc/self/fd/${directoryFd}/${name}`))) {
+      uncertain('identity_changed');
+    }
     return bytes.subarray(0, length);
   } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
@@ -416,16 +434,16 @@ function entryIdentity(argv) {
     if (shell) {
       if (flag === '-' || /^-[a-zA-Z]*c/.test(flag)) return null;
       if (/^[-+][a-zA-Z]*[oO]$/.test(flag)) {
-        if (index + 1 >= argv.length) uncertain();
+        if (index + 1 >= argv.length) uncertain('classification_unknown');
         index += 2; continue;
       }
       if (/^[-+][a-zA-Z]+$/.test(flag) && !/[coO]/.test(flag)) { index++; continue; }
       // Shell options never fall through to Node's consuming-option table:
       // shell -C/-r take no argument; Node -C/-r take an argument.
-      uncertain();
+      uncertain('classification_unknown');
     } else if (binary === 'node' || binary === 'nodejs') {
       if (['-e', '--eval', '-p', '--print', '-'].includes(flag) || /^-[ep].+/.test(flag) || /^--(?:eval|print)=/.test(flag)) return null;
-      if (NODE_VALUE_FLAGS.has(flag)) { if (index + 1 >= argv.length) uncertain(); index += 2; continue; }
+      if (NODE_VALUE_FLAGS.has(flag)) { if (index + 1 >= argv.length) uncertain('classification_unknown'); index += 2; continue; }
       if (NODE_BOOLEAN_FLAGS.has(flag) || /^--[a-z][a-z0-9-]*=/.test(flag)) { index++; continue; }
     } else if (binary === 'python' || binary === 'python3') {
       if (flag === '-' || /^-[cm]/.test(flag)) return null;
@@ -435,7 +453,7 @@ function entryIdentity(argv) {
       if (BUN_BOOLEAN_FLAGS.has(flag)) { index++; continue; }
     }
     // Unknown interpreter options can consume the would-be script. Do not guess.
-    uncertain();
+    uncertain('classification_unknown');
   }
   return index < argv.length ? { entry: argv[index], args: argv.slice(index + 1) } : null;
 }
@@ -472,10 +490,10 @@ function codexCategory(args) {
     const flag = args[index];
     if (flag === '--') return 'tui';
     if (CODEX_BOOLEAN_FLAGS.has(flag)) { index++; continue; }
-    if (CODEX_VALUE_FLAGS.has(flag)) { if (index + 1 >= args.length) uncertain(); index += 2; continue; }
+    if (CODEX_VALUE_FLAGS.has(flag)) { if (index + 1 >= args.length) uncertain('classification_unknown'); index += 2; continue; }
     if (flag.startsWith('--') && flag.includes('=') && CODEX_VALUE_FLAGS.has(flag.split('=')[0])) { index++; continue; }
     if (/^-[cmpsCa]./.test(flag)) { index++; continue; }
-    uncertain();
+    uncertain('classification_unknown');
   }
   return args[index] === 'app-server' ? 'app_server' : 'tui';
 }
@@ -508,11 +526,11 @@ function processObservation(procFd, pid, options) {
     if (!before.isDirectory()) uncertain();
     // Other users' records are deliberately not read (ptrace restrictions).
     if (before.uid !== options.uid) {
-      if (!sameObject(before, fs.lstatSync(anchored))) uncertain();
+      if (!sameObject(before, fs.lstatSync(anchored))) uncertain('identity_changed');
       return null;
     }
     const firstUids = readUids(readRecord(fd, 'status', RECORD_BYTES, options.uid));
-    if (firstUids.some(id => id !== options.uid)) uncertain();
+    if (firstUids.some(id => id !== options.uid)) uncertain('identity_changed');
     const firstStat = parseStat(readRecord(fd, 'stat', RECORD_BYTES, options.uid), pid);
     const firstArgv = readRecord(fd, 'cmdline', options.maxArgvBytes, options.uid);
     const argv = parseArgv(firstArgv);
@@ -524,7 +542,7 @@ function processObservation(procFd, pid, options) {
     };
     // Zombies and PF_KTHREAD tasks cannot start a consumer; all other empty
     // cmdlines are uncertain, including an exec transition through empty argv.
-    if (!argv.length && firstStat.state !== 'Z' && !(firstStat.flags & 0x00200000n)) uncertain();
+    if (!argv.length && firstStat.state !== 'Z' && !(firstStat.flags & 0x00200000n)) uncertain('classification_unknown');
     const identity = argv.length ? entryIdentity(argv) : null;
     const consumer = argv.length ? classify(identity, options.repositoryRoot, readCwd) : null;
     let environment; let bound = false;
@@ -533,7 +551,7 @@ function processObservation(procFd, pid, options) {
       if (environment.length && environment.at(-1) !== 0) uncertain();
       const variables = new TextDecoder('utf-8', {fatal:true}).decode(environment).split('\0');
       const matches = variables.filter(value => value.startsWith('JHW_RUNTIME_SESSION_BINDING='));
-      if (matches.length > 1) uncertain();
+      if (matches.length > 1) uncertain('classification_unknown');
       const token = matches.length ? matches[0].slice('JHW_RUNTIME_SESSION_BINDING='.length) : undefined;
       bound = options.verifySessionConsumer({pid:Number(pid),startTime:firstStat.start,category:consumer,entry:identity?.entry,args:identity?.args??[],token}) === true;
     }
@@ -544,8 +562,8 @@ function processObservation(procFd, pid, options) {
         firstUids.some((id, index) => id !== lastUids[index]) ||
         (!argv.length && (firstStat.state !== lastStat.state || firstStat.flags !== lastStat.flags)) ||
         (cwd !== undefined && cwd !== fs.readlinkSync(`/proc/self/fd/${fd}/cwd`)) ||
-        !sameObject(before, fs.fstatSync(fd)) || !sameObject(before, fs.lstatSync(anchored))) uncertain();
-    if (environment && !environment.equals(readRecord(fd, 'environ', MAX_ARGV_BYTES, options.uid))) uncertain();
+        !sameObject(before, fs.fstatSync(fd)) || !sameObject(before, fs.lstatSync(anchored))) uncertain('identity_changed');
+    if (environment && !environment.equals(readRecord(fd, 'environ', MAX_ARGV_BYTES, options.uid))) uncertain('identity_changed');
     return options.verifySessionConsumer && consumer ? {category:consumer,bound} : consumer;
   } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
@@ -556,14 +574,14 @@ function processNames(procFd, maxEntries) {
   try {
     let entry; let seen = 0;
     while ((entry = directory.readSync()) !== null) {
-      if (++seen > maxEntries) uncertain();
+      if (++seen > maxEntries) uncertain('classification_unknown');
       if (/^[1-9]\d*$/.test(entry.name)) names.push(entry.name);
     }
   } finally { directory.closeSync(); }
   return names.sort();
 }
 
-function scanConsumers({ repositoryRoot, procRoot = '/proc', uid = process.getuid(), excludePids = [], maxEntries = MAX_ENTRIES, maxArgvBytes = MAX_ARGV_BYTES } = {}, verifySessionConsumer) {
+function scanConsumers({ repositoryRoot, procRoot = '/proc', uid = process.getuid(), excludePids = [], maxEntries = MAX_ENTRIES, maxArgvBytes = MAX_ARGV_BYTES } = {}, verifySessionConsumer, causes = null) {
   const result = { clear: false, counts: { tui: 0, app_server: 0, legacy: 0, managed: 0 }, uncertain: 0 };
   if (verifySessionConsumer) result.bound = {tui:0,app_server:0,legacy:0,managed:0};
   let fd;
@@ -583,12 +601,28 @@ function scanConsumers({ repositoryRoot, procRoot = '/proc', uid = process.getui
         const consumer = processObservation(fd, pid, { repositoryRoot: repository, uid, maxArgvBytes, verifySessionConsumer });
         if (consumer && verifySessionConsumer) (consumer.bound ? result.bound : result.counts)[consumer.category]++;
         else if (consumer) result.counts[consumer]++;
-      } catch { result.uncertain++; }
+      } catch (error) {
+        result.uncertain++;
+        if (causes) {
+          let cause = error?.inventoryCause;
+          if (!INVENTORY_CAUSES.includes(cause)) {
+            try { fs.lstatSync(`/proc/self/fd/${fd}/${pid}`); cause = 'record_unreadable'; }
+            catch (current) { cause = current?.code === 'ENOENT' ? 'process_vanished' : 'record_unreadable'; }
+          }
+          causes[cause]++;
+        }
+      }
     }
     const afterNames = processNames(fd, maxEntries);
-    if (names.length !== afterNames.length || names.some((name, index) => name !== afterNames[index]) || !sameObject(before, fs.lstatSync(proc))) result.uncertain++;
+    if (names.length !== afterNames.length || names.some((name, index) => name !== afterNames[index]) || !sameObject(before, fs.lstatSync(proc))) {
+      result.uncertain++;
+      if (causes) causes.pid_set_changed++;
+    }
     result.clear = result.uncertain === 0 && Object.values(result.counts).every(count => count === 0);
-  } catch { result.uncertain++; }
+  } catch (error) {
+    result.uncertain++;
+    if (causes) causes[INVENTORY_CAUSES.includes(error?.inventoryCause) ? error.inventoryCause : 'record_unreadable']++;
+  }
   finally { if (fd !== undefined) fs.closeSync(fd); }
   return result;
 }
@@ -602,6 +636,24 @@ export function inspectConsumers(options = {}) {
 export function inspectSessionConsumers(options, verifySessionConsumer) {
   if (typeof verifySessionConsumer !== 'function') uncertain();
   return scanConsumers(options, verifySessionConsumer);
+}
+
+export function observeSessionConsumers(options, verifySessionConsumer, stage) {
+  if (typeof verifySessionConsumer !== 'function' || !INVENTORY_STAGES.has(stage)) uncertain();
+  const causes = causeCounts();
+  const started = process.hrtime.bigint();
+  const inventory = scanConsumers(options, verifySessionConsumer, causes);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  const disallowed = Object.values(inventory.counts).some(count => count > 0);
+  return {
+    inventory,
+    observation: {
+      stage,
+      outcome: inventory.uncertain > 0 ? 'incomplete' : disallowed ? 'disallowed' : 'complete',
+      elapsedMs,
+      causeCounts: causes,
+    },
+  };
 }
 
 export function requireQuiescence(options) {

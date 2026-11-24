@@ -106,7 +106,7 @@ function openArtifact(repositoryRoot, releaseId, relativeName) {
     const before=fs.fstatSync(fd,{bigint:true});
     if(!before.isFile() || before.uid!==BigInt(process.getuid()) || before.nlink!==1n || (Number(before.mode)&0o7777)!==record.mode || before.size>128n*1024n*1024n) fail('DEPLOY_RELEASE_INVALID');
     const digest=createHash('sha256'); const buffer=Buffer.alloc(64*1024); let total=0;
-    for(;;) { const count=fs.readSync(fd,buffer,0,buffer.length,null); if(!count) break; total+=count; if(total>128*1024*1024) fail('DEPLOY_RELEASE_INVALID'); digest.update(buffer.subarray(0,count)); }
+    for(;;) { const count=fs.readSync(fd,buffer,0,buffer.length,total); if(!count) break; total+=count; if(total>128*1024*1024) fail('DEPLOY_RELEASE_INVALID'); digest.update(buffer.subarray(0,count)); }
     if(digest.digest('hex')!==record.sha256 || !same(before,fs.fstatSync(fd,{bigint:true})) || !same(before,fs.lstatSync(location,{bigint:true}))) fail('DEPLOY_RELEASE_INVALID');
     directory.verify();
     const named=path.join(repositoryRoot,'.jhw-runtime/releases',releaseId,relativeName);
@@ -115,6 +115,17 @@ function openArtifact(repositoryRoot, releaseId, relativeName) {
     }};
   } catch(error) { if(fd!==undefined) fs.closeSync(fd); throw error; }
   finally { directory.close(); }
+}
+
+const RUNTIME_BUNDLES = Object.freeze({
+  mcp: 'mcp-server/dist/runtime/mcp.cjs',
+  control: 'mcp-server/dist/runtime/control.cjs',
+  hook: 'mcp-server/dist/runtime/hook.cjs',
+});
+
+export function openRuntimeBundle({repositoryRoot, releaseId, selector}) {
+  if (typeof selector !== 'string' || !Object.hasOwn(RUNTIME_BUNDLES, selector)) fail('DEPLOY_SELECTOR_INVALID');
+  return openArtifact(repositoryRoot, releaseId, RUNTIME_BUNDLES[selector]);
 }
 
 function openCredential(repositoryRoot, releaseId) {
@@ -708,8 +719,7 @@ export async function runManaged({repositoryRoot,selector,args=[],sourceReleaseI
         child.once('exit',(code,signal)=>resolve(code??(128+(osConstants.signals[signal]??1))));
       });
     }
-    const target=path.join(release,selector==='mcp'?'mcp-server/dist/runtime/mcp.cjs':selector==='control'?'mcp-server/dist/runtime/control.cjs':'mcp-server/dist/runtime/hook.cjs');
-    artifacts.push(openArtifact(repositoryRoot,selected.releaseId,path.relative(release,target)));
+    artifacts.push(openRuntimeBundle({repositoryRoot,releaseId:selected.releaseId,selector}));
     if(selector==='mcp') credential=openCredential(repositoryRoot,selected.releaseId);
     publication?.close(); publication=undefined;
     if(selector==='hook') return await runPinnedHook({args,artifact:artifacts.pop(),lease,binding,releaseRoot:release});

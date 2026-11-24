@@ -487,15 +487,36 @@ test('v2 publication rejects a live cross-process v1 session root',async t=>{
   await assert.rejects(runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate-compatible',candidate.releaseId],phaseRunner:async()=>{}}),{code:'DEPLOY_COMPATIBILITY_MISMATCH',reason:'v1_session'});
   child.stdin.write('exit\n');await once(child,'close');closed=true;assert.equal(child.exitCode,0,error);
 });
-test('publication accepts an actual root that exits and is removed while EX is held',async t=>{
-  const f=await v2Fixture(t);const client=startClient(t,f);await client.ready();const root=inspectSessionBindingsV2({repositoryRoot:f.root}).find(row=>row.kind==='session'&&row.live);
-  assert.ok(root);write(f.root,'mcp-server/src/index.ts','export const generation="v2-root-exit";');const candidate=await f.prepare();let removed=false;
-  const phase=async()=>{};phase.observe=value=>{if(value.phase==='publication_acquired'){
-    client.child.stdin.write('exit\n');const directory=path.join(f.root,'.jhw-runtime/v2/sessions',root.id);
-    for(let attempt=0;attempt<500&&fs.existsSync(directory);attempt++)spawnSync('/bin/sleep',['0.01']);removed=!fs.existsSync(directory);
-  }};
-  const result=await runDeployment({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate-compatible',candidate.releaseId],phaseRunner:phase});
-  assert.equal(removed,true);assert.equal(result.inventory.after.roots.length,0);await client.done;
+test('publication requires a fresh root inventory after a root retires under EX', async t => {
+  const f = await v2Fixture(t);
+  const client = startClient(t, f);
+  await client.ready();
+  const repositoryRoot = f.root;
+  const origin = readActivation({repositoryRoot});
+  const root = inspectSessionBindingsV2({repositoryRoot}).find(row => row.kind === 'session' && row.live);
+  assert.ok(root);
+  write(repositoryRoot, 'mcp-server/src/index.ts', 'export const generation="v2-root-exit";');
+  const candidate = await f.prepare();
+  const options = {repositoryRoot, home: f.home, procRoot: f.procRoot, argv: ['--activate-compatible', candidate.releaseId]};
+  const rootDirectory = path.join(repositoryRoot, '.jhw-runtime/v2/sessions', root.id);
+  const phase = async () => {};
+  phase.observe = ({phase: name}) => {
+    if (name !== 'publication_acquired') return;
+    client.child.stdin.write('exit\n');
+    for (let attempt = 0; attempt < 500 && fs.existsSync(rootDirectory); attempt++) {
+      spawnSync('/bin/sleep', ['0.01']);
+    }
+    assert.equal(fs.existsSync(rootDirectory), false);
+  };
+  await assert.rejects(runDeployment({...options, phaseRunner: phase}),
+    {code: 'DEPLOY_CONSUMERS_ACTIVE', reason: 'root_membership_changed'});
+  assert.deepEqual(readActivation({repositoryRoot}), origin);
+  await client.done;
+  const status = await runDeployment({...options, argv: ['--status']});
+  assert.equal(status.recoveryPending, 0);
+  const retried = await runDeployment({...options, phaseRunner: async () => {}});
+  assert.equal(retried.releaseId, candidate.releaseId);
+  assert.equal(retried.inventory.after.roots.length, 0);
 });
 test('v2 pointer intent rejects a foreign same-target current symlink',async t=>{
   const {f,options,journalDirectory}=await interruptedV2Pair(t,'pointer_renamed');

@@ -374,7 +374,8 @@ description: 세션 마무리 시 Notion 저장 후보 정리 및 승인 저장
 `install.sh`는 Linux `/proc`, Bash, `/usr/bin/flock`, Node.js 22 이상을 요구하는 작은 공개
 dispatcher다. 인자를 그대로 `scripts/runtime-deploy.mjs`에 넘기며 production CLI에는 fixture
 root, lock fd, inventory 우회, force flag가 없다. 공개 command는 `--prepare`, `--status`,
-`--activate RELEASE_ID`, `--rollback`, `--uninstall`뿐이다. release ID는
+`--activate-compatible RELEASE_ID`, `--activate RELEASE_ID`, `--rollback`, `--uninstall`,
+`--refresh-bootstrap`, `--migrate-codex-config`, `--prune[ --apply]`다. release ID는
 `r-<40 또는 64자리 source revision>-<64자리 content digest>`의 lowercase hex exact 값이다.
 
 runtime artifact는 canonical trusted checkout의 `.jhw-runtime/`에 있다.
@@ -383,10 +384,17 @@ runtime artifact는 canonical trusted checkout의 `.jhw-runtime/`에 있다.
 .jhw-runtime/
 |-- deploy.lock
 |-- admission.lock
+|-- publication.lock
 |-- bootstrap/                 # independently validated stable entry helpers
-|-- current -> activations/<activation-id>
+|-- current -> activations/<activation-id> 또는 v2/activations/<activation-id>
 |-- activations/<activation-id>/
 |-- releases/<release-id>/    # immutable built generation
+|-- v2/
+|   |-- bootstraps/<bootstrap-id>/ # immutable helper generation + lifetime lease
+|   |-- bootstrap-catalog/         # generation manifest의 durable 정본
+|   |-- sessions/                  # parent root binding
+|   |-- invocations/               # 호출별 binding
+|   `-- migration-anchors/         # 최초 v1 복원의 pair 증거
 |-- .bootstrap.previous.<id>/ # retained helper evidence, 있을 때
 `-- .deploy.<id>/             # private 0600 state/preimage/phase evidence
 ```
@@ -397,16 +405,22 @@ bundle로 생성한다. manifest와 content digest를 검증한 complete release
 보존하며 live checkout의 `dist`·`node_modules`, `current`, HOME wiring을 바꾸지 않는다.
 staging fixture에서 생긴 ID는 live deployable artifact가 아니다.
 
-`--activate`·`--rollback`·`--uninstall`은 mutation 전 inventory, exclusive deploy/admission
-lease, lease 뒤 두 번째 inventory를 요구한다. TUI, Codex app server, legacy runtime,
+legacy/v1 `--activate`·`--uninstall`과 v1 rollback은 mutation 전 inventory, exclusive
+deploy/admission lease, lease 뒤 두 번째 inventory를 요구한다. 최초 v1→v2 이행과 그 anchor를
+사용한 v1 복원도 이 정지 경계를 사용한다. 이 경로에서 TUI, Codex app server, legacy runtime,
 managed MCP/control/hook 중 하나가 살아 있거나 `/proc` 관측이 불확실하면 shared mutation
-전에 fail-closed한다. force·process signal·lock 삭제는 없다. mutation worker는 실제 두 lease
-fd를 상속한다. runtime validation 동안 exclusive admission은 닫아 managed MCP/control/hook이
-shared admission으로 진입할 수 있게 하고, finalize 전 새 exclusive admission과 inventory를
-다시 얻는다. worker timeout이나 parent EOF는 child를 종료하거나 자동 restore하지 않으며,
-child가 끝날 때까지 상속 lease와 pending evidence가 남는다.
+전에 fail-closed한다. force·process signal·lock 삭제는 없다. legacy mutation worker는 실제 두
+lease fd를 상속한다. runtime validation 동안 exclusive admission은 닫아 managed
+MCP/control/hook이 shared admission으로 진입할 수 있게 하고, finalize 전 새 exclusive
+admission과 inventory를 다시 얻는다. worker timeout이나 parent EOF는 child를 종료하거나 자동
+restore하지 않으며, child가 끝날 때까지 상속 lease와 pending evidence가 남는다.
 
-첫 activation은 stable bootstrap을 설치하고 기존 ownership-aware no-clobber transaction으로
+v2 pair 사이의 `--activate-compatible`과 `--rollback`은 deploy EX와 짧은 publication EX를
+사용하며 호환되는 live root를 허용한다. compatibility digest나 MCP 계약이 다른 v2 rollback만
+admission EX와 정지 inventory를 추가로 요구한다. 따라서 `--rollback`이라는 명령 이름만으로
+정지 경계를 판단하지 않고 현재 snapshot과 선택된 predecessor pair의 계약을 함께 본다.
+
+설치 흔적이 없는 host의 첫 activation은 stable bootstrap을 설치하고 기존 ownership-aware no-clobber transaction으로
 네 TUI의 MCP/skill, control/hook, Claude/Codex hook wiring을 옮긴다. managed MCP vector는
 bootstrap `jhw-runtime-entry mcp`, control/hook link는 bootstrap의 closed selector, skill은
 `current/skills`를 사용한다. configuration은 기존 mode를 적용한 private same-directory temp를
@@ -429,9 +443,35 @@ launcher/skill/prompt 제거는 같은 parent의 private capture transaction으�
 바뀐 foreign replacement를 삭제하지 않는다. control/hook launcher transaction도 parent를
 retained no-follow descriptor로 고정하며 반환 직전 논리 parent identity를 다시 검증한다.
 
-session wrapper의 binding은 release를 고정한다. `--activate-compatible`은 기존 binding을
-바꾸지 않고 신규 세션의 default만 게시한다. 호환성은 release 내부의
+v2 session wrapper의 root binding은 release·bootstrap pair를 고정한다. 후속 selector는
+parent pair 아래에 invocation binding을 등록하고, admission FD 3, invocation FD 6,
+generation FD 7, parent root FD 8을 자식에게 상속한다. bound 호출은 current와 publication
+lock을 다시 읽지 않는다. `--activate-compatible`은 기존 binding을 바꾸지 않고 신규 세션의
+default pair만 게시한다. 호환성은 release 내부의
 `mcp-server/src/control/runtime-compatibility.json`과 보호된 manifest entries로 결정한다.
+
+v2 bootstrap 세대는 helper bytes에서 계산한 `bootstrapId`를 사용한다. generation directory의
+manifest와 별도 catalog manifest는 byte-identical이며 원래 `sourceReleaseId`와 봉인된 helper
+bytes에 연결된다. 같은 helper를 재사용하는 후속 release는 기존 catalog source를 유지한다.
+세대 복사본이 회수된 과거 activation은 catalog가 가리키는 retained source release에서 같은
+`bootstrapId`를 재구성한 뒤에만 rollback 대상으로 쓸 수 있다.
+
+잠금은 다음 순서를 지키고 역순으로 닫는다. 여러 세대를 다룰 때는 `bootstrapId` byte 순서다.
+
+| 경로 | 잠금 순서 |
+|---|---|
+| bound invocation | admission SH → generation SH → invocation-index EX |
+| 새 wrapper/root | admission SH → publication SH → generation SH → session-index EX |
+| compatible writer | deploy EX → publication EX → session-index SH |
+| root 퇴역 | admission SH → generation SH → session-index EX → root binding EX(try) |
+| invocation 퇴역 | admission SH → generation SH → invocation-index EX → own binding EX(try) |
+| generation 회수 | deploy EX → publication EX → generation EX(try) → indexes SH → binding EX(try) |
+| 정지 maintenance | deploy EX → admission EX → publication EX |
+
+compatible writer는 후보 release·bootstrap·MCP 계약과 전체 root/process 증거를 publication 밖에서
+봉인한다. publication EX 아래에서는 증거 재검증과 `current` pointer 게시만 수행한다. 기존 bound
+호출은 parent pair와 generation lease만 사용하므로 이 구간과 경합하지 않는다. root membership이
+달라지거나 증거·pointer identity가 바뀌면 publication 전에 거부한다.
 선언은 exact `{version:1,generation:<positive safe integer>,guardFloor:<positive safe integer>}`이며,
 기존 release/session/activation/journal의 closed schema에 필드를 추가하지 않는다. 선언이 없는
 retained release는 이전 v1 지문을 그대로 사용하므로 저장된 session digest가 바뀌지 않는다.
@@ -448,12 +488,17 @@ Guard request/key/journal/diagnostics, handoff/portfolio 산출물의 공유 계
 다룬다. 모든 lifecycle 변형을 증명하는 것으로 해석하지 않으며, 공유 기록 writer와 검증되지 않은
 Registry/worktree/authority/journal/handoff/portfolio 계약 모듈은 지문에서 내용 전체를 보호한다.
 
-지문 완화는 명시적으로 허용한 regular control 구현·기존 테스트/fixture와 비실행 스킬 Markdown의
-내용 hash에 한정한다. 경로·종류·권한과 모든 symlink target은 유지하며, 설정·schema·스킬 실행
-스크립트·bootstrap·wiring·dependency bytes는 계속 보호한다. 스킬은 `current/skills`를 읽으므로
+지문 완화는 명시적으로 허용한 regular control 구현·기존 테스트/fixture, 비실행 스킬 Markdown,
+generation 2의 세 helper(`runtime-entry.mjs`, `runtime-safety.mjs`, `runtime-store.mjs`)의
+내용 hash에 한정한다. 세 helper도 경로·종류·권한은 유지하고 후보 bytes를 별도 `bootstrapId`
+세대로 봉인한다. 모든 symlink target, stable router 세 파일, 설정·schema·스킬 실행
+스크립트·wiring·deploy·dependency bytes는 계속 보호한다. 스킬은 `current/skills`를 읽으므로
 문서 내용 변경도 공존 중인 이전 control 구현과의 절차 호환성을 검토해야 한다.
-bootstrap helper인 `runtime-store.mjs` 자체가 바뀌는 최초 도입은 consumer 정지 후 일반 activation과
-bootstrap refresh를 요구한다. bootstrap 세대 전환과 publication 경합 완화는 별도 작업이다.
+managed v1 설치가 이 generation 2 계약으로 처음 들어올 때는 consumer 정지 후 일반 activation,
+Codex 설정 이행, bootstrap refresh를 요구한다. fresh host의 generation 2 첫 activation은 첫
+v2 pair와 router를 직접 게시한다. v2 이행 뒤에는 세대 helper bytes가 다른 호환 release도 별도
+immutable 세대로 준비해 release와 pair로 게시한다. stable router나 router contract가 바뀌는
+업데이트는 이 helper 내용 완화에 포함하지 않는다.
 
 activation validation은 fresh worker의 exact host contract v5와 Guard preflight, managed MCP
 `initialize`·`notifications/initialized`·`tools/list`를 bounded output/timeout으로 검사한다.
@@ -475,8 +520,15 @@ schema를 읽고 append·fsync·post-validation한다. poisoned tail·UID/mode/l
 없다(enforce와 self-approval·검사 불가 입력의 차단은 그대로다). optional legacy journal과 SessionEnd의
 별도 advisory 성격은 유지한다. 이 audit는 Claim/permit/Registry authority를 만들지 않는다.
 
-배포 기록 prune은 모든 후보의 검증된 durable recovery copy를 먼저 만들고 원본을 변경한다.
-pending·unknown은 전체 삭제0이며 copy/intent/capture/cleanup의 실패 증거는 보존한다. 정상 삭제와
+공개 prune은 최초 후보의 디렉터리·파일 동일성과 내용 해시를 실행 한 번에 결속한다. 잠금 아래
+최종 후보와 대조하고 파일을 다시 읽는다. 보존 사유가 생긴 세대는 원래 세대와 lease가
+일치할 때 건너뛰며, 최종 후보가 비면 복구 기록 없이 종료한다. 세대 삭제 직전에는
+계획의 lease와 현재 이름의 파일, 보유한 배타 lease의 FD를 대조한다.
+v2 current와 생존 세션이 선택한 pair별로 선택 릴리스 및 bootstrap 원본 릴리스의 증거를 보관한다.
+복구 기록 생성 전과 각 capture 전에 current, 세션 집합·lease, 릴리스 파일 증거를 다시 확인한다.
+세대 후보의 마지막 검사는 해당 세대 EX, 세션 index SH, 해당 세대 invocation index SH 순서로 진행한다.
+삭제할 후보가 있으면 모든 후보의 검증된 durable recovery copy를 먼저 만들고 원본을 변경한다.
+pending·unknown은 전체 삭제를 차단하며 copy/intent/capture/cleanup의 실패 증거는 보존한다. 정상 삭제와
 복사본 정리가 durable하게 끝나야 완료이며 자동 재개나 상태 marker만으로 성공을 추정하지 않는다.
 
 첫 migration에는 managed predecessor가 없다. 실패 시 `.deploy.<id>/state.json`, mutation 전
@@ -507,12 +559,21 @@ cd <canonical-trusted-runtime-checkout>
 ./install.sh --activate '<exact retained RELEASE_ID>'
 ```
 
+현재 설치가 v1이고 활성 release가 runtime generation 2를 선언하면 같은 정지 window에서
+`--migrate-codex-config` 뒤 `--refresh-bootstrap`을 실행한다. 앞 명령은 기존 managed Codex
+항목에 binding 전달만 추가하고 사용자 `env_vars`와 env child table을 보존한다. 뒤 명령은
+원래 v1 current/bootstrap anchor를 내구화한 뒤 stable v2 router와 첫 pair를 게시한다.
+Codex 설정 이행이 필요한데 완료되지 않았으면 bootstrap 이행 전에 거부한다. 이미 정확한 v2
+pair에서는 `--refresh-bootstrap`이 검증 no-op이다.
+
 normal managed update는 validated activation과 `current` pointer만 바꾸며 HOME wiring과 stable
-bootstrap source release를 유지한다. source checkout build나 skill 변경은 즉시 live 반영되지
+bootstrap router를 유지한다. v2 호환 업데이트는 release와 bootstrap 세대를 한 pair로 게시하고
+기존 root는 원래 pair를 계속 사용한다. source checkout build나 skill 변경은 즉시 live 반영되지
 않는다. Claude/Gemini/OpenCode의 whole-directory skill link는 새 `current` content를 보지만,
 Codex의 개별 skill/prompt 이름 집합이 달라지는 release는 pointer publication 전에
 `DEPLOY_WIRING_TOPOLOGY_CHANGED` / `guarded_uninstall_reinstall_required`로 거부된다. helper
-교체 또는 이 Codex topology 변경을 채택할 때만 같은 maintenance gate 아래 다음을 실행한다.
+교체는 v2 pair publication으로 처리한다. Codex topology 변경을 채택할 때만 같은 maintenance
+gate 아래 다음을 실행한다.
 
 ```bash
 ./install.sh --uninstall

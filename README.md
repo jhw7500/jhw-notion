@@ -57,20 +57,26 @@ control/hook link 또는 지원 TUI 설정 파일이 하나라도 있으면 buil
 |---|---|
 | `./install.sh --prepare` | private stage에서 `npm ci`와 build를 수행하고 immutable release를 검증·보존한다. live pointer와 HOME은 그대로다. source 입력(`skills`, `mcp-server/src`, `mcp-server/scripts` 등) 아래에 git이 무시하는 파일이 있으면 `DEPLOY_SOURCE_INVALID` / `ignored_source_files`로 거부한다. 검사는 복사·build 전에 하고 build 뒤에 다시 한다(`.git`·`.ai`·`.superpowers`·`node_modules`·`dist` 아래는 release에서 빠지므로 대상이 아니다). 추적되지 않았지만 무시되지 않은 파일은 release에 복사되고 `dirty: true`로 보고된다. git은 빈 무시 디렉터리를 나열하지 않으므로, 비어 있거나 내용이 모두 제외 이름(`node_modules` 등) 아래에 있는 무시 디렉터리는 거부되지 않고 `dirty`에도 반영되지 않은 채 빈 디렉터리로 release에 복사된다. 인자 없는 첫 설치도 같은 staged build를 거치므로 같은 검사를 받는다. |
 | `./install.sh --status` | 선택된 release, predecessor 유무, pending recovery 수와 `tui`·`app_server`·`legacy`·`managed` 집계만 반환하는 advisory 조회다. |
-| `./install.sh --activate-compatible RELEASE_ID` | 검증된 session binding을 유지하며, 공용 파일과 MCP 계약이 호환되는 후보로 default만 전환한다. 기존 unbound consumer와 불확실성은 거부한다. |
+| `./install.sh --activate-compatible RELEASE_ID` | v2에서는 release와 bootstrap 세대의 검증된 pair를 게시한다. 기존 bound root는 원래 pair를 유지하며, 신규 root만 새 pair를 선택한다. 후보 검증 뒤 publication exclusive 구간에서는 봉인한 root/process 증거와 pointer만 다시 확인한다. |
 | `./install.sh --activate RELEASE_ID` | 두 번의 consumer inventory와 exclusive admission을 통과한 정확한 retained release만 활성화한다. |
 | `./install.sh --activate RELEASE_ID --guard-observe` | 기존 managed 설치를 명시적 host 관찰 모드로 전환한다. 현재 배선을 먼저 검증하고 Claude·Codex 네 이벤트를 배선한 뒤 private policy를 마지막에 게시한다. 첫 설치와 `--adopt-from` 조합은 거부한다. 이미 관찰 모드면 일반 activate와 같다. |
 | `./install.sh --activate RELEASE_ID --adopt-from LEGACY_CHECKOUT` | 첫 managed activation 전용. 같은 저장소의 다른 checkout(정규 절대경로, 같은 git common dir)이 남긴 legacy 설치를 넘겨받는다. 그 checkout을 정확히 가리키는 legacy 링크와 `node <LEGACY_CHECKOUT>/mcp-server/dist/index.js` MCP 항목만 adopt하며 env 키는 보존하고, 이 release에 없는 이름의 legacy Codex 링크는 제거한다(실패 시 preimage로 복원). 두 checkout 모두 consumer가 없어야 한다. 보존된 기본값 외 env는 이후 `--uninstall`에서 항목과 함께 사라지므로 재설치 뒤 다시 입력해야 한다. |
-| `./install.sh --rollback` | 현재 activation manifest에 기록된 validated predecessor 하나만 같은 gate 아래 활성화한다. |
-| `./install.sh --uninstall` | 확인된 installer-owned HOME wiring만 제거한다. release, activation, `current`, bootstrap, recovery evidence는 보존한다. 결과의 `envDropped`는 제거된 jhw-notion MCP 항목이 설치기 기본값과 다른 env(`env`·`environment`·`env_vars`·env 테이블)를 갖고 있던 adapter 이름만 나열한다(값·경로 없음). 이 env는 저장되지 않으므로 다음 `--activate` 뒤 직접 다시 입력해야 한다. 선택된 release의 wiring 라이브러리가 이 보고보다 오래되어 제거 여부를 알 수 없으면 `envDropped`는 `null`이다. |
-| `./install.sh --refresh-bootstrap` | managed 설치 전용. 같은 gate 아래 현재 release의 stable bootstrap helper 세트를 다시 설치한다. pointer, HOME wiring, MCP 항목과 그 env는 바꾸지 않으며, 교체 뒤 live validation이 실패하면 원래 helper 세트를 다시 설치한다. 결과의 `bootstrap.from`/`to`는 refresh 전후 bootstrap이 실제로 고정한 release이며, helper 바이트가 같으면 `to`는 기존 release 그대로다. |
+| `./install.sh --rollback` | v2의 검증된 predecessor pair를 게시한다. 호환되는 live bound root는 계속 원래 pair를 사용한다. 최초 v1→v2 이행을 되돌리는 경우에만 consumer가 없는 정지 상태에서 migration anchor의 v1 current와 원래 bootstrap을 함께 복원한다. |
+| `./install.sh --uninstall` | 확인된 installer-owned HOME wiring만 제거한다. release, activation, `current`, bootstrap, recovery evidence는 보존한다. 결과의 `envDropped`는 제거된 jhw-notion MCP 항목에 사용자 env가 있던 adapter 이름만 나열한다(값·경로 없음). Codex의 기본 `JHW_RUNTIME_SESSION_BINDING` 전달만 제거된 경우는 사용자 env 손실로 보고하지 않는다. 선택된 release의 wiring 라이브러리가 이 구분보다 오래되어 제거 여부를 알 수 없으면 `envDropped`는 `null`이다. |
+| `./install.sh --refresh-bootstrap` | v1 managed 설치에서 현재 release가 runtime generation 2를 선언할 때 consumer가 없는 정지 상태로 stable router와 첫 bootstrap 세대를 설치한다. 이미 v2이고 current pair가 정확하면 `unchanged: true`인 검증 no-op이다. |
+| `./install.sh --migrate-codex-config` | 기존 managed Codex 항목 하나에 `JHW_RUNTIME_SESSION_BINDING` 전달을 추가한다. 사용자 `env_vars`와 env child table은 보존하며 중복·금지 loader 변수·모호한 TOML은 변경 전에 거부한다. |
 | `./install.sh --prune` | 기록 보존·정리 계획만 읽는다. 파일을 만들거나 지우지 않는다. |
-| `./install.sh --prune --apply` | consumer·두 lease gate 아래 계획을 다시 검증한다. 모든 후보의 복구 복사본을 검증·내구화한 뒤 원본을 정리하며 pending·불명 상태가 있으면 전체 삭제를 거부한다. |
+| `./install.sh --prune --apply` | deploy·publication·세대 lease와 binding record 아래 계획을 다시 검증한다. 모든 후보의 복구 복사본을 검증·내구화한 뒤 원본을 정리하며 pending·불명 상태가 있으면 전체 삭제를 거부한다. |
 
-첫 활성화는 legacy entry를 stable bootstrap으로 옮긴다. 성공 뒤 MCP/control/hook은
-`.jhw-runtime/bootstrap/jhw-runtime-{entry,control,hook}`를 거쳐 admission lease를 잡고,
-실행할 release는 유효한 session binding이 있으면 그 retained release로, 없으면
-`.jhw-runtime/current` 아래에서 선택한다. 스킬은
+설치 흔적이 없는 host의 첫 활성화는 stable bootstrap entry를 설치한다. 첫 release가 runtime
+generation 2이면 stable router와 immutable bootstrap 세대 저장소를 바로 만들고, `current`에는
+release와 `bootstrapId`를 묶은 pair를 게시한다. 기존 managed v1 설치는 일반 `--activate`로
+generation 2 release를 먼저 선택한 뒤 아래의 정지 이행 순서를 완료해야 이 pair를 게시한다.
+성공 뒤 MCP/control/hook은
+`.jhw-runtime/bootstrap/jhw-runtime-{entry,control,hook}`를 거쳐 admission lease를 잡는다.
+유효한 v2 parent binding이 있으면 그 binding의 release·bootstrap pair를 선택하고, 없으면
+`.jhw-runtime/current`의 pair를 한 snapshot으로 선택한다. 두 경우 모두 한 호출 안에서
+서로 다른 세대의 helper를 섞지 않는다. 스킬은
 `.jhw-runtime/current/skills`를 가리킨다. 준비 단계는 세 selector마다 npm 실행 코드를
 단일 CJS bundle로 만들며, bootstrap은 manifest로 검증한 bundle inode를 descriptor로 고정해
 실행하고 그 뒤 built-in이 아닌 module load를 거부한다. 따라서 검사 뒤 release의 다른 JS나
@@ -111,16 +117,17 @@ ownership proof와 기존 no-clobber transaction으로 생성한다.
 
 ### 세션을 유지하는 호환 MCP 업데이트
 
-pin-aware bootstrap을 설치한 뒤에는 wrapper가 시작한 클라이언트 프로세스와 그 후손을
-하나의 retained release에 고정할 수 있다. 예를 들어 관리 checkout에서 다음처럼 시작한다.
+v2 bootstrap을 설치한 뒤에는 wrapper가 시작한 클라이언트 프로세스와 그 후손을
+하나의 release·bootstrap pair에 고정할 수 있다. 예를 들어 관리 checkout에서 다음처럼 시작한다.
 
 ~~~bash
 node .jhw-runtime/bootstrap/jhw-runtime-entry session -- codex
 ~~~
 
-wrapper는 release·프로세스 identity·상속 lease에 연결된 private binding을 만들고,
-MCP/control/네 종류의 hook이 그 binding을 다시 검증하도록 전달한다. 이후 default가
-바뀌어도 같은 wrapper의 새 명령과 MCP 재연결은 원래 release를 사용한다.
+wrapper는 pair·프로세스 identity·상속 lease에 연결된 private root binding을 만들고,
+MCP/control/네 종류의 hook은 호출마다 그 parent 아래의 invocation binding을 만든다.
+이때 FD 3은 admission, FD 6은 invocation, FD 7은 bootstrap 세대, FD 8은 parent root의
+수명 증거다. 이후 default가 바뀌어도 같은 wrapper의 새 명령과 MCP 재연결은 원래 pair를 사용한다.
 환경에서 binding이 사라지거나 변조되면 원래 세션의 후속 호출을 거부하며 current로
 대체하지 않는다. binding은 버전 선택 정보이고 기존 control 승인이나 board lease를
 대체하지 않는다.
@@ -145,7 +152,9 @@ Markdown의 내용 변경을 허용한다. 파일 경로·종류·권한과 모�
 | 일반 스킬 Markdown | 실행 권한이 없는 regular file의 내용만 달라도 됨 |
 | `config`, `private-control-config`, `guard-policy`, `session-end-config`, `schemas`와 대응 컴파일 산출물 | 내용까지 같음; MCP의 public config도 포함 |
 | 스킬의 `scripts` 아래 파일과 모든 symlink | 실행 스크립트 내용과 링크 대상까지 같음 |
-| bootstrap helper, 공용 wiring, package/lockfile, 실제 dependency bytes, 그 밖의 공용 파일 | 집합·내용·권한까지 같음 |
+| v2 세대 helper(`runtime-entry.mjs`, `runtime-safety.mjs`, `runtime-store.mjs`) | generation 2끼리는 내용만 달라도 됨. 세 파일의 경로·종류·권한은 같아야 하며 후보 bytes는 별도 `bootstrapId` 세대로 봉인됨 |
+| stable router(`jhw-runtime-entry`, `jhw-runtime-control`, `jhw-runtime-hook`) | 집합·내용·권한까지 같음. router contract 변경은 live 호환 전환 대상이 아님 |
+| 공용 wiring, deploy 구현, package/lockfile, 실제 dependency bytes, 그 밖의 공용 파일 | 집합·내용·권한까지 같음 |
 
 공유 기록을 직접 쓰는 store와 Registry/worktree/authority/journal/handoff/portfolio 계약 모듈은
 구현 allowlist에 자동 포함하지 않는다. 이들 파일의 변경도 계속 내용 전체로 비교한다.
@@ -154,11 +163,14 @@ Markdown의 내용 변경을 허용한다. 파일 경로·종류·권한과 모�
 `guardFloor`는 보안 수정 때문에 이전 구현과 공존을 허용할 수 없을 때 올린다.
 이는 호스트에 저장되는 단조 증가 최소 버전이나 일반 rollback 금지를 뜻하지 않는다.
 두 값 또는 보호된 파일이 다르면 `DEPLOY_COMPATIBILITY_MISMATCH`로 거부하며, 기존
-default와 세션 binding은 유지한다. 비호환 변경은 기존 consumer 정지 배포 절차를 따른다.
+default와 세션 binding은 유지한다. 비호환 변경은 그 변경에 별도로 지원되는 정지 이행
+경로가 있을 때만 해당 절차를 따르며, 지원 경로가 없으면 활성화하지 않는다.
 
-선언이 없는 이전 release는 기존 MCP tool/entry 전용 지문 계산을 유지하며 새 선언이 있는
-release와 공존 전환하지 않는다. 이 계약을 처음 도입할 때도 bootstrap helper가 바뀌므로
-consumer를 정지한 뒤 일반 `--activate`와 `--refresh-bootstrap`을 실행해야 한다.
+선언이 없거나 generation 1인 release는 기존 지문 계산을 유지하며 generation 2 release와
+공존 전환하지 않는다. 이미 managed v1 설치가 generation 2 release를 처음 선택하는 경우에는
+consumer를 정지한 뒤 일반 `--activate`, `--migrate-codex-config`, `--refresh-bootstrap`
+순서로 이행한다. 설치 흔적이 없는 host에 generation 2 release를 처음 활성화하는 경로는 첫
+v2 pair와 router를 직접 게시하므로 이 v1 이행 순서를 적용하지 않는다.
 
 current와 후보의 MCP를 각각 초기화하고
 tools/list를 확인해 protocol·capabilities 및 기존 tool의 input/output schema·annotations·
@@ -166,11 +178,25 @@ execution·_meta와 기타 동작 필드가 같은지도 검사한다. title·de
 metadata로 보고 계약 비교에서 제외한다. MCP 형식 검증을 통과한 새 tool 추가는 허용한다.
 구현의 의미적 호환성까지 이 검사로 증명하지는 않으므로 후보 자체의 제품 시험은 계속 필요하다.
 
-공존 전환은 candidate 검증이 끝난 뒤 짧은 publication lock 아래에서 current를 게시한다.
-실행 중인 세션은 기존 admission lease와 binding lease를 유지하므로 일반 --activate,
---rollback, --refresh-bootstrap, --uninstall의 maintenance gate도 계속 적용된다.
-기존 release를 default로 되돌릴 때도 --activate-compatible에 그 release ID를 지정할 수
-있지만 현재 tool 계약을 제거하는 변경은 거부된다. 기존 세션의 release는 바뀌지 않는다.
+공존 전환은 candidate 검증과 MCP 계약 비교를 publication lock 밖에서 마친다. 그 뒤 짧은
+publication exclusive 구간에서 봉인한 root/process membership과 destination evidence를
+재검증하고 pair pointer만 게시한다. bound 호출은 current와 publication lock을 읽지 않고
+parent pair와 bootstrap 세대 lease를 사용하므로 기존 root는 전환 중·후에도 원래 pair를 유지한다.
+`--rollback`도 v2 pair 사이에서는 같은 publication 경로를 사용한다. compatibility digest가
+다르거나 MCP 계약이 달라지는 rollback은 consumer가 없는 정지 상태에서만 허용한다.
+
+세션 연속성을 확인할 때는 서로 다른 helper로 빌드한 두 release와 세 개 이상의 bound 세션을
+사용한다. 각 호출의 시작부터 종료까지 시간을 재고, 호환 활성화·rollback·prune 중에도
+기존 세션의 pair와 실제 호출 결과를 확인한다. 일반 hook의 제한은 12초, `SessionEnd`는
+3초다. `scripts/test-runtime-v2-integration.mjs`의 격리 시험은 읽기 전용 control, MCP 초기화와
+`tools/list`, claim-free `Read`의 hook 응답을 기록한다. Linux의 독립 PID namespace에서 Node 24로 실행할 때는
+`NODE_OPTIONS=--test-isolation=none node --test scripts/test-runtime-v2-integration.mjs`를 사용한다.
+이 설정은 Node 시험을 한 프로세스에서 실행해 별도 test-runner 부모가 inventory에 추가되는 것을 막는다.
+
+`Read`에 승인 요청이 없을 때 enforce 모드의 `PostToolUse`는 `GUARD_REQUEST_NOT_FOUND`를
+반환한다. 네 hook 모두 거부 0건이라는 수락 기준을 확인하려면 같은 후보의 보호된 대화형
+세션에서 사용자가 실제 요청을 승인하고, 대응하는 `PostToolUse`가 `COMPLETED`인지 확인한다.
+Codex C5는 후보가 생성한 기본 설정으로 MCP 초기화와 읽기 전용 호출을 별도로 확인한다.
 
 후보 초기화 실패나 비호환 변경은 default를 그대로 둔다. 호환 전환 도중 프로세스가
 중단되면 다음 --activate-compatible가 기록된 origin/destination, 실제 current,
@@ -180,35 +206,64 @@ shared fingerprint와 bootstrap을 확인해 확실한 미게시/게시 상태�
 
 적용 범위와 제한:
 
-- 최초 pin-aware bootstrap 도입은 기존 --activate와 --refresh-bootstrap maintenance 절차가
-  필요하다. 이미 실행 중인 unbound 세션을 자동 편입하지 않는다.
+- 기존 managed v1 설치의 최초 v2 이행은 `--activate` 뒤 정지 상태의
+  `--migrate-codex-config`, `--refresh-bootstrap` 순서가 필요하다. 설치 흔적이 없는 host의
+  최초 v2 활성화에는 이 이행 순서를 적용하지 않는다. 이미 실행 중인 unbound 세션을 자동
+  편입하지 않는다.
 - 고정 단위는 wrapper로 시작한 프로세스다. 같은 app-server를 공유하는 여러 채팅은
   같은 release를 사용하며, 새 버전을 사용하려면 독립 wrapper/서버를 시작해야 한다.
 - 기존 외부 서버에 접속하는 proxy, binding이 없는 consumer, PID/부모 관계나 lease가
   불확실한 consumer는 호환 전환을 차단한다.
+- 마지막 검사 중 root가 종료되어 준비한 세션 목록이 달라지면 `DEPLOY_CONSUMERS_ACTIVE` /
+  `root_membership_changed`로 중단한다. 세션 종료가 끝나면 같은 릴리스를 다시 검사할 수 있다.
 - skills는 current/skills 링크를 유지하므로 기존 세션에서도 갱신된 문서를 읽을 수 있다.
   문서는 공존하는 이전 control 구현에서도 수행 가능한 절차여야 한다. 실행 스크립트,
-  공유 계약, bootstrap, 의존성이 바뀌는 업데이트에는 기존 maintenance 절차를 사용한다.
-- 현재 별도 설치된 jhw-control-host는 binding 환경을 전달하지 않는다. 해당 secure host
-  launcher 및 SSH처럼 환경을 재구성하는 경로는 별도 연동이 필요하며, 누락 시 거부된다.
+  공유 영속 계약·stable router·공용 wiring·의존성이 바뀌는 업데이트에는 호환 전환을 쓰지
+  않고 해당 변경이 지원하는 정지 배포 절차를 사용한다. generation 2 세대 helper의 내용
+  변경은 이 제한에 포함되지 않으며 새 `bootstrapId` pair로 공존 전환한다.
+- 별도 설치된 jhw-control-host와 SSH처럼 환경을 다시 만드는 경로는 binding 전달을 별도로
+  지원해야 하며, 누락 시 거부된다.
 - 실제 클라이언트의 환경 상속과 서버 공유 방식은 별도로 확인해야 한다. 격리된 Node
   클라이언트의 공존 시험을 개별 Codex 채팅의 무중단 지원 증거로 해석하지 않는다.
 - 끝났거나 signal로 종료된 wrapper/entry의 binding 기록은 이후 entry가 작은 묶음으로
   회수한다. 기록 수가 한도에 가까우면 한 번에 더 많이 회수하며, lease를 가진 프로세스가
   남아 있거나 형식이 어긋난 기록은 증거로 남긴다.
 
-stable bootstrap helper가 바뀐 release는 먼저 일반 `--activate`로 활성화한 뒤, consumer가
-없는 같은 maintenance window에서 다음 명령으로 현재 release의 helper 세트를 다시 설치한다.
+v1에서 stable router를 처음 도입하는 운영 순서는 다음과 같다. 각 mutation 명령은 별도
+maintenance gate를 통과하며, Codex 설정 이행이 끝나지 않으면 bootstrap 이행을 거부한다.
 
 ```bash
+./install.sh --prepare
+./install.sh --status
+./install.sh --activate '<exact retained RELEASE_ID>'
+./install.sh --migrate-codex-config
 ./install.sh --refresh-bootstrap
 ```
 
-교체된 helper directory는 `.bootstrap.previous.<32 lowercase hex>`로 남는다. bootstrap이 고정한
-release는 helper 검증에 쓰이므로 지우지 않는다. 이 checkout의 `scripts/runtime-entry.mjs`가 현재
-release의 것과 다르면 helper 집합 정의가 다를 수 있으므로 변경 전에 거부된다. validate phase는
-control link를 직접 실행해 확인할 뿐 `jhw-control-host`의 `node <link>` 실행 형태는 실행하지 않으며,
-그 형태는 `scripts/test-runtime-entry.mjs`가 다룬다.
+이행은 v1 current와 원래 bootstrap의 검증된 anchor를 남긴다. 이후 helper가 다른 호환 release는
+`--activate-compatible`이 새 bootstrap 세대를 준비해 pair로 게시하므로 정지 refresh를 반복하지
+않는다. v2 `--refresh-bootstrap`은 current pair와 stable router를 검증하는 no-op이다.
+
+| 변경/상태 | 공개 경로 | live bound root |
+|---|---|---|
+| 설치 흔적 없는 host의 generation 2 첫 설치 | `--activate RELEASE_ID` | 기존 root가 없다는 첫 설치 gate |
+| managed v1 → generation 2 최초 이행 | `--activate` → `--migrate-codex-config` → `--refresh-bootstrap` | 정지 필수 |
+| generation 2 세대 helper 내용 변경, compatibility/MCP 계약 동일 | `--activate-compatible RELEASE_ID` | 허용. 기존 root는 원래 pair 유지 |
+| compatibility/MCP 계약이 같은 v2 predecessor | `--rollback` | 허용. 기존 root는 원래 pair 유지 |
+| 공유 영속 계약, stable router, wiring, deploy, dependency 변경 | 호환 전환 거부. 해당 변경의 별도 정지 이행 경로가 있을 때만 적용 | 허용하지 않음 |
+| 최초 v2 pair → migration anchor의 v1 복원 | `--rollback` | 정지 필수 |
+
+bootstrap 세대는 current, 즉시 predecessor, live root/invocation, pending journal, 최초 이행
+anchor가 참조하면 보존한다. 그 밖에도 최근 세대 최소 1개와 30일 미만 세대를 유지한다.
+`--prune`은 advisory plan이며 `--prune --apply`는 deploy·publication·세대 lease와 binding
+record를 다시 검증하고, 복구 사본을 내구화한 뒤 미참조 세대만 정리한다. 잠금 뒤 새 후보가
+나타나거나 후보의 동일성을 확인할 수 없으면 복구 기록 생성 전에 중단한다. 같은 세대에 새 공유
+lease가 생겨 최종 후보가 0개면 삭제 0건을 반환하고 복구 기록을 만들지 않는다.
+v2 current에서 실행 중인 세션과 함께 세대를 정리할 때에는 복구 사본 작성 후에도 current와
+세션이 쓰는 릴리스·bootstrap·lease를 확인한다. 증거가 달라지면 다음 원본을 보존하고
+`DEPLOY_PRUNE_PARTIAL`로 종료한다. 완료된 호환 journal은
+retention receipt가 있을 때만 age/recent 정책의 후보가 된다. 거부·중단 evidence와 unresolved
+pending은 보존하거나 전체 정리를 차단한다.
 
 Codex에 개별 설치되는 skill/prompt 이름 집합이 달라지면 일반 activation/rollback으로 배선을
 갱신하지 않는다. Codex topology 차이는
@@ -235,8 +290,10 @@ deployment journal은 자동 삭제하지 않는다. stage와 private evidence�
 설계 근거는 [배포 재획득 정책](docs/deployment-reacquisition-policy.md)에 기록한다.
 
 공개 성공 결과는 `DEPLOY_PREPARED`, `DEPLOY_STATUS`, `DEPLOY_ACTIVATED`,
-`DEPLOY_ROLLED_BACK`, `DEPLOY_UNINSTALLED`, `DEPLOY_BOOTSTRAP_REFRESHED`,
-`DEPLOY_ACTIVATION_RESTORED` 중 하나와 bounded release/consumer 정보만
+`DEPLOY_COMPATIBLE_ACTIVATED`, `DEPLOY_ROLLED_BACK`, `DEPLOY_UNINSTALLED`,
+`DEPLOY_BOOTSTRAP_REFRESHED`, `DEPLOY_CODEX_CONFIG_MIGRATED`,
+`DEPLOY_PRUNE_PLAN`, `DEPLOY_PRUNED`, `DEPLOY_ACTIVATION_RESTORED` 중 하나와
+bounded release/consumer 정보만
 포함한다. 오류도 PID, argv, 환경변수, 절대 경로, Task/session 좌표를 내보내지 않는다.
 
 | 진단 | operator 조치 |
@@ -251,11 +308,11 @@ deployment journal은 자동 삭제하지 않는다. stage와 private evidence�
 | `DEPLOY_WIRING_CONFLICT` / `control_host`, `tui_root`, `pending_transaction`, `unsafe_parent`, `parent_unusable`, `control_link`, `hook_link`, `command_dir`, `skill_link`, `prompt_link`, `mcp_entry`, `hook_config`, `plan_unverified`, `adopt_source_invalid`, `adopt_env_unpreservable` | 첫 managed activation의 read-only plan이 변경 전에 거부했다. journal·pointer·HOME 변경은 없다. reason이 가리키는 대상(host 계약, TUI root, 남은 transaction, 부모 디렉터리, 기존 링크·MCP·hook 설정)을 operator가 정리한 뒤 같은 `--activate`를 다시 실행한다. |
 | `DEPLOY_ARGUMENTS_INVALID` / `adopt_requires_first_activation` | 이미 managed wiring이 설치돼 있어 `--adopt-from`을 받지 않는다. 변경은 없다. |
 | `DEPLOY_ARGUMENTS_INVALID` / `refresh_requires_managed_activation`, `refresh_installer_mismatch` | `--refresh-bootstrap` 전제 불충족이다. managed activation이 없거나, 이 checkout의 `scripts/runtime-entry.mjs`가 현재 release와 다르다. 변경은 없다. 먼저 activate하거나 현재 release를 만든 checkout에서 다시 실행한다. |
-| `DEPLOY_VALIDATION_FAILED` / `bootstrap_restored` | refresh한 helper 세트가 live validation에 실패해 refresh 전의 원래 세트를 그 고정 release에서 다시 설치하고 manifest가 원래와 같음을 확인했다. journal은 complete이고 실패한 세트는 `.bootstrap.previous.*`로 남는다. pointer와 wiring은 그대로다. |
-| `DEPLOY_VALIDATION_FAILED` / `bootstrap_unchanged` | live helper 세트가 refresh 전의 원래 세트와 같은 상태에서 validation이 실패했다(바이트가 이미 같았던 경우 등). journal은 complete다. refresh와 별개인 validation 원인을 검토한다. |
-| `DEPLOY_RECOVERY_REQUIRED` / `bootstrap_restore_failed`, `bootstrap_unverified`, `bootstrap_install_unverified` | live helper 세트가 검증된 새 세트도, 원래 세트도 아니라고 판단됐다. 원래 세트 재설치가 실패했거나(`restore_failed`), 원래 bootstrap이 없었거나(`unverified`), 설치 단계 실패 뒤 원래 세트로 남았음을 증명하지 못했다(`install_unverified`). journal은 pending으로 남아 다른 연산은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. 원인을 해소한 뒤 `--refresh-bootstrap`을 다시 실행하거나, journal의 `bootstrap` 기록과 `.bootstrap.previous.*`를 검토해 operator가 복원한다. |
-| `bootstrap_install_failed` reason | refresh의 helper 설치 자체가 실패했지만 live 세트가 원래 세트 그대로임을 확인했다. journal은 complete다. 함께 온 code가 원인(release 무결성 등)을 가리킨다. |
-| 중단된 `--refresh-bootstrap` | pending refresh journal이 남으면(예: `maintenance_reacquisition_failed`) 다른 연산은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. 같은 maintenance window에서 `--refresh-bootstrap`을 다시 실행하면 그 journal을 이어받는다. 재시도는 첫 시도 전에 live였던 세트를 복원 대상으로 삼고, bootstrap이 없어진 경우에도 새로 설치하며, 재시도가 거부되거나 실패해도 journal은 pending으로 남는다. 두 journal이 동시에 pending이면(이어받기 도중 중단) 모든 연산이 거부되므로 operator가 검토한다. |
+| `DEPLOY_VALIDATION_FAILED` / `bootstrap_restored` | generation 1 legacy refresh 경로에서 갱신한 helper 세트가 live validation에 실패해 refresh 전의 원래 세트를 그 고정 release에서 다시 설치하고 manifest가 원래와 같음을 확인했다. journal은 complete이고 실패한 세트는 `.bootstrap.previous.*`로 남는다. pointer와 wiring은 그대로다. |
+| `DEPLOY_VALIDATION_FAILED` / `bootstrap_unchanged` | generation 1 legacy refresh 경로에서 live helper 세트가 refresh 전의 원래 세트와 같은 상태에서 validation이 실패했다(바이트가 이미 같았던 경우 등). journal은 complete다. refresh와 별개인 validation 원인을 검토한다. |
+| `DEPLOY_RECOVERY_REQUIRED` / `bootstrap_restore_failed`, `bootstrap_unverified`, `bootstrap_install_unverified` | generation 1 legacy refresh 경로에서 live helper 세트가 검증된 새 세트도, 원래 세트도 아니라고 판단됐다. 원래 세트 재설치가 실패했거나(`restore_failed`), 원래 bootstrap이 없었거나(`unverified`), 설치 단계 실패 뒤 원래 세트로 남았음을 증명하지 못했다(`install_unverified`). journal은 pending으로 남아 다른 연산은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. 원인을 해소한 뒤 `--refresh-bootstrap`을 다시 실행하거나, journal의 `bootstrap` 기록과 `.bootstrap.previous.*`를 검토해 operator가 복원한다. |
+| `bootstrap_install_failed` reason | generation 1 legacy refresh 경로에서 helper 설치 자체가 실패했지만 live 세트가 원래 세트 그대로임을 확인했다. journal은 complete다. 함께 온 code가 원인(release 무결성 등)을 가리킨다. |
+| generation 1 legacy refresh 도중 중단된 `--refresh-bootstrap` | pending refresh journal이 남으면(예: `maintenance_reacquisition_failed`) 다른 연산은 `DEPLOY_RECOVERY_REQUIRED`로 거부된다. 같은 maintenance window에서 `--refresh-bootstrap`을 다시 실행하면 그 journal을 이어받는다. 재시도는 첫 시도 전에 live였던 세트를 복원 대상으로 삼고, bootstrap이 없어진 경우에도 새로 설치하며, 재시도가 거부되거나 실패해도 journal은 pending으로 남는다. 두 journal이 동시에 pending이면(이어받기 도중 중단) 모든 연산이 거부되므로 operator가 검토한다. |
 | `DEPLOY_WIRING_FAILED` / `first_activation_rolled_back` | 첫 managed activation의 wire가 pointer 게시 전에 실패했다. 모든 known-wiring 경로가 preimage의 type·target·bytes·mode로, wire가 쓸 수 있는 디렉터리의 이름 목록이 시작 시점과 같아졌음을 확인했다(디렉터리 mtime은 다를 수 있다). 이번 wire가 만든 편집기 백업은 제거되고 기존 백업은 그대로다(prune은 finalize에서만 실행). `before.json`·`listings.json`을 담은 complete journal과 비활성 bootstrap이 남고, bootstrap은 재시도 때 재사용된다. 원인을 해소한 뒤 같은 `--activate`를 다시 실행한다. |
 | `DEPLOY_RECOVERY_REQUIRED` / `publication_uncertain` | 첫 managed activation의 wire는 끝났지만 pointer 게시가 실패했고, pointer가 출발점에 그대로라고 증명되지 않았다(목적지로 이미 바뀌었거나 다른 pointer가 있거나 읽을 수 없음). 새 wiring이 이미 유효할 수 있어 HOME을 복원하지 않으며 journal은 pending으로 남는다. maintenance를 유지하고 operator가 `.jhw-runtime/current`와 HOME wiring을 검토한다. pointer가 출발점에 그대로이면 같은 경우가 `first_activation_rolled_back`으로 자동 복원된다. |
 | `DEPLOY_RECOVERY_REQUIRED` / `wire_rollback_failed` | 실패한 첫 wire를 복원했다고 증명하지 못했다. pointer는 게시되지 않았지만 journal은 pending으로 남는다. maintenance와 evidence를 유지하고 operator가 HOME wiring을 수동 검토한다. wire 동안 HOME 루트 등 감시 디렉터리에 무관한 파일이 생겨도 fail-closed로 이 결과가 된다. 수동 복구 전에 pending journal의 `listings.json` 이름 목록을 실제 디렉터리 목록과 비교해 차이(`.jhw-quarantine.*` 포함)를 확인한다. |
@@ -365,6 +422,58 @@ helper 결과나 fsync가 불명확한 경우 installer는 현재 path 상태를
 `allowNewTags: true`의 자동 태그 등록은 스키마 전체 옵션을 전송한다. public API가
 옵션 100개 상한으로 거부하면 Notion 화면에서 옵션을 추가한 뒤 다시 저장하도록
 안내한다. [실측 결과와 대응 절차](docs/notion-multi-select-option-limit.md)를 참조한다.
+
+### 전담 서비스 UID로 세션을 유지하는 관리형 옵션
+
+관리형 모드는 전담 서비스 UID가 소유한 별도 v2 설치에서 쓴다. 기존 사용자 UID는
+MCP, control, Guard hook을 자신의 HOME과 자격증명으로 실행한다. 서비스는 Unix 소켓에서
+요청 프로세스의 UID와 세션 후손 여부를 검증하고, 그 세션에 고정된 릴리스의 번들만 전달한다.
+새 세션은 현재 릴리스를 선택한다. 이미 결속된 세션의 호출은 처음 선택한 릴리스를 사용한다.
+
+같은 Linux PID namespace에서 pathname `SOCK_SEQPACKET`, `SO_PEERPIDFD`, `SCM_CREDENTIALS`
+및 pidfd를 사용할 수 있어야 한다. 전담 UID로는 관리 서비스와 배포 명령을 실행한다.
+관리자가 고정 버전의 `scripts/` 실행 파일과 라이브러리를 root 소유의 쓰기 제한 경로에 설치하고,
+root 소유의 읽기 가능한 프로필을 준비한다. 프로필의 `node`는 root가 소유한 실제 Node 실행 파일이다.
+별도 서비스 저장소에 v2 첫 활성화를 완료한 뒤 서비스가 소유한
+`.jhw-runtime/v2/managed-invocations` 디렉터리를 `0700`으로 준비한다.
+소켓의 상위 디렉터리는 다른 사용자가 경로를 탐색할 수 있고 전담 UID만 쓸 수 있게 설정한다.
+
+~~~json
+{
+  "version": 1,
+  "serviceUid": 61002,
+  "clientUid": 1003,
+  "repositoryRoot": "/srv/jhw-managed/checkout",
+  "serviceHome": "/srv/jhw-managed/home",
+  "socket": "/run/jhw-managed/runtime.sock",
+  "node": "/usr/local/bin/node"
+}
+~~~
+
+관리형 CLI는 지정한 UID에 따라 명령을 받는다. 첫 `session --` 뒤에 기존 사용자로 시작할
+프로그램을 지정한다. MCP 설정과 hook 명령은 같은 profile의 `invoke`를 사용해야 한다.
+
+| 실행 UID | 명령과 용도 |
+| --- | --- |
+| 서비스 | `serve`로 소켓과 세션 등록을 연다. |
+| 기존 사용자 | `session -- PROGRAM ...`으로 새 세션을 시작한다. |
+| 기존 사용자 | `invoke mcp`, `invoke control ...`, `invoke hook --adapter codex --event EVENT`를 세션 안에서 실행한다. |
+| 서비스 | `deploy -- --prepare`, `deploy -- --status`로 후보를 준비하거나 상태를 본다. |
+| 서비스 | `deploy -- --activate-compatible RELEASE_ID`, `deploy -- --rollback`으로 호환 pair를 전환한다. |
+| 서비스 | `deploy -- --prune`으로 대상을 보고 `deploy -- --prune --apply`로 회수한다. |
+
+~~~bash
+/usr/bin/python3 -E -s -B /opt/jhw-managed/scripts/runtime_managed.py --profile /etc/jhw-managed.json serve
+~~~
+
+관리형 게시와 회수에는 기존 v2 publication lock, 세션 인덱스, generation lease와 저널을 사용한다.
+서비스가 번들을 넘기기 전에 실행 기록을 저장하고, 해당 사용자 프로세스가 종료될 때까지 독립 holder가
+관련 lease를 보유한다. 재시작 때 실행 기록이 남아 있으면 새 등록을 `DEPLOY_MANAGED_RECOVERY_REQUIRED`로
+중단한다. 회수하려는 세대에 실행 기록이 있으면 그 세대를 보존한다. 관리형 저장소에 일반 설치 명령으로
+전환이나 회수를 요청하면 `DEPLOY_MANAGED_MODE_REQUIRED`를 반환한다.
+
+현재 운영 Codex 설정과 `jhw-control-host` 연결은 별도 배포 범위다. 관리형 초기 설치와
+클라이언트 설정이 끝난 뒤 실제 승인 요청의 `PostToolUse`와 C5를 함께 검증한다.
 
 ### Notion API Key 설정
 

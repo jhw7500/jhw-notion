@@ -19,7 +19,7 @@ function fixture(t,{legacyRevision=null}={}) {
  const outer=fs.mkdtempSync(path.join(os.tmpdir(),'jhw-deploy-'));fs.chmodSync(outer,0o700);t.after(()=>{ if(t.passed===false) {for(const p of fs.readdirSync(outer,{recursive:true}).filter(p=>p.endsWith('.log'))) t.diagnostic(fs.readFileSync(path.join(outer,p),'utf8'));} fs.rmSync(outer,{recursive:true,force:true});});
  const root=path.join(outer,'repo'),home=path.join(outer,'home'),procRoot=path.join(outer,'proc');for(const p of [root,home,procRoot])fs.mkdirSync(p,{mode:0o700});
  for(const [p,b] of Object.entries({'.gitignore':'.jhw-runtime/\n','mcp-server/package.json':'{"type":"module"}','mcp-server/package-lock.json':'{"lockfileVersion":3}','mcp-server/tsconfig.json':'{}','mcp-server/src/index.ts':'export {};','scripts/sync-codex-skills.mjs':'','skills/claude/task.md':'fixture','skills/codex/jhw-task/SKILL.md':'fixture'}))write(root,p,b);
- for(const name of ['runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);
+ for(const name of ['runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','runtime-managed-scope.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);
  if(legacyRevision!==null){
   assert.match(legacyRevision,/^[a-f0-9]{40}$/);
   const verified=spawnSync('git',['merge-base','--is-ancestor',legacyRevision,'HEAD'],{cwd:path.dirname(source)});assert.equal(verified.status,0);
@@ -33,7 +33,7 @@ function fixture(t,{legacyRevision=null}={}) {
  const options={repositoryRoot:root,home,procRoot,build};
  let useLegacy=legacyRevision!==null;
  return {root,home,procRoot,options,build,builds:()=>builds,
-  useCurrentRuntime:()=>{for(const name of ['runtime-deploy.mjs','runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);useLegacy=false;},
+  useCurrentRuntime:()=>{for(const name of ['runtime-deploy.mjs','runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','runtime-managed-scope.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);useLegacy=false;},
   run:async argv=>{const runner=useLegacy?await import(pathToFileURL(path.join(root,'scripts/runtime-deploy.mjs')).href):deploy;return runner.runDeployment({...options,argv});}};
 }
 function addConsumer(f,name='codex') {const p=path.join(f.procRoot,'100');fs.mkdirSync(p);write(p,'status',`Uid:\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\n`,0o600);write(p,'stat','100 (fixture) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0\n',0o600);write(p,'cmdline',`${name}\0`,0o600);fs.symlinkSync(f.root,path.join(p,'cwd'));}

@@ -3,11 +3,12 @@ import path from 'node:path';
 import {createHash, randomBytes} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, inspectSessionConsumers, requireQuiescence,prepareAtomicRename,atomicRename} from './runtime-safety.mjs';
-import {prepareRelease, validateRelease, readActivation, validCurrent, publishActivation, rollbackActivation, createSessionBinding, resolveSessionBinding, inspectSessionBindings, releaseCompatibility,ensureBootstrapGeneration,prepareRuntimeEvidence,preparePairActivation,publishPreparedActivation,inspectSessionBindingsV2,resolveSessionBindingV2,selectPairRollbackTarget,validRuntimePair,preparePairPublicationEvidence,revalidatePairPublicationEvidence,verifyPairPublicationConsumer,prepareMigrationAnchor,readMigrationAnchor,releaseRuntimeGeneration,verifyMigrationOriginal,prepareTransitionPointer,inspectTransitionPointer,publishTransitionPointer} from './runtime-store.mjs';
+import {DeploymentError, trustedDirectory, trustedFile, acquireLease, inspectConsumers, inspectSessionConsumers, observeSessionConsumers, requireQuiescence,prepareAtomicRename,atomicRename} from './runtime-safety.mjs';
+import {prepareRelease, validateRelease, readActivation, validCurrent, publishActivation, rollbackActivation, createSessionBinding, resolveSessionBinding, inspectSessionBindings, releaseCompatibility,ensureBootstrapGeneration,prepareRuntimeEvidence,revalidateRuntimeEvidence,preparePairActivation,publishPreparedActivation,inspectSessionBindingsV2,resolveSessionBindingV2,selectPairRollbackTarget,validRuntimePair,preparePairPublicationEvidence,preparePrunePublicationEvidence,revalidatePairPublicationEvidence,revalidateRetainedPruneEvidence,verifyPairPublicationConsumer,prepareMigrationAnchor,readMigrationAnchor,releaseRuntimeGeneration,verifyMigrationOriginal,prepareTransitionPointer,inspectTransitionPointer,publishTransitionPointer} from './runtime-store.mjs';
 import {installBootstrap, validateBootstrap,prepareRouterV2,bootstrapObjectProof,moveBootstrapObject} from './runtime-entry.mjs';
-import {DEPLOY_VARIABLE_KEYS,applyRuntimePrune,planRuntimePrune,recordDeploymentRetention,readRuntimeJournalV2,findLegacyActivationReceipt,findCompletedBootstrapMigration} from './runtime-prune.mjs';
+import {DEPLOY_VARIABLE_KEYS,applyRuntimePrune,planRuntimePrune,prepareRuntimePrune,pruneExecutionRoute,recordDeploymentRetention,readRuntimeJournalV2,findLegacyActivationReceipt,findCompletedBootstrapMigration} from './runtime-prune.mjs';
 import {readGuardHostPolicy,captureGuardTransitionEvidence,writeGuardTransitionEvidence,readGuardTransitionEvidence,recordGuardPolicyContext,recordGuardPublishedSnapshots,recordGuardDestination,markGuardTransitionFinalized,findGuardTransitionEvidence,prepareGuardRollbackEvidence,prepareIncompleteGuardRollbackEvidence,restoreGuardRollbackEvidence,prepareMigrationGuardRollback,restoreMigrationGuardRollback} from './runtime-guard.mjs';
+import {requireManagedScope} from './runtime-managed-scope.mjs';
 
 const RELEASE = /^r-(?:[a-f0-9]{40}|[a-f0-9]{64})-[a-f0-9]{64}$/;
 const KEYS = DEPLOY_VARIABLE_KEYS;
@@ -615,6 +616,20 @@ function mcpContract(value) {
   }
   return {protocol:value.protocolVersion,capabilities:JSON.stringify(normalize(value.capabilities)),tools};
 }
+async function comparePairMcpContracts({repositoryRoot,home,environment,deployLease,directory,logFd,
+  origin,candidate,observe,onProbed}) {
+  const inspect=async (name,pair)=>{
+    const contract=mcpContract(await mcpProbe({repositoryRoot,home,environment,deployLease,directory,logFd,
+      releaseId:pair.releaseId}));
+    onProbed?.(name);return contract;
+  };
+  observe?.({phase:'candidate_probe_start',exclusive:false});
+  const currentContract=await inspect('current',pairOf(origin));
+  const candidateContract=await inspect('candidate',candidate);
+  observe?.({phase:'candidate_probe_complete',exclusive:false});
+  return currentContract.protocol===candidateContract.protocol&&currentContract.capabilities===candidateContract.capabilities&&
+    [...currentContract.tools].every(([name,contract])=>candidateContract.tools.get(name)===contract);
+}
 
 function pairJournalRoot(repositoryRoot) {
   const runtime=path.join(repositoryRoot,'.jhw-runtime');
@@ -655,22 +670,308 @@ function pairRows(repositoryRoot) {
   const roots=rows.filter(row=>row.kind==='session'&&row.live).map(({live,...row})=>row).sort((a,b)=>a.id.localeCompare(b.id));
   return {rows,roots};
 }
-function pairProcessInventory({repositoryRoot,procRoot,roots,prepared=null}) {
-  const inventory=inspectSessionConsumers({repositoryRoot,procRoot,excludePids:[process.pid]},observation=>{
+function pairConsumerVerifier({repositoryRoot,roots,prepared}) {
+  return observation=>{
     if(observation.category==='legacy'||(observation.category==='app_server'&&observation.args.includes('proxy')))return false;
     const token=observation.token??roots.find(row=>row.owner.pid===observation.pid&&row.owner.startTime===observation.startTime)?.token;
     if(token===undefined)return false;
     try{return prepared===null?(resolveSessionBindingV2({repositoryRoot,token,pid:observation.pid}),true):
       verifyPairPublicationConsumer({prepared,observation:{...observation,token}});}catch{return false;}
-  });
+  };
+}
+function pairProcessInventory({repositoryRoot,procRoot,roots,prepared=null}) {
+  const inventory=inspectSessionConsumers({repositoryRoot,procRoot,excludePids:[process.pid]},
+    pairConsumerVerifier({repositoryRoot,roots,prepared}));
   if(inventory.uncertain)throw Object.assign(new DeploymentError('DEPLOY_INVENTORY_UNCERTAIN'),{inventory});
   if(!inventory.clear)throw Object.assign(new DeploymentError('DEPLOY_CONSUMERS_ACTIVE'),{inventory});
   return inventory;
 }
-function completePairInventory({repositoryRoot,procRoot}) {
-  const {rows,roots}=pairRows(repositoryRoot);
+function observePairProcesses({repositoryRoot,procRoot,roots,prepared,stage}) {
+  return observeSessionConsumers({repositoryRoot,procRoot,excludePids:[process.pid]},
+    pairConsumerVerifier({repositoryRoot,roots,prepared}),stage);
+}
+function completePairInventory({repositoryRoot,procRoot}, {rows,roots}=pairRows(repositoryRoot)) {
   return {rows,roots,processes:pairProcessInventory({repositoryRoot,procRoot,roots})};
 }
+function completeRetainedPruneInventory({repositoryRoot,procRoot,managedScope=null},snapshot,expected,retainedEvidence) {
+  requirePreparedRootMembership(expected,snapshot.roots);
+  const revalidate=()=>{
+    try{return requirePreparedRootMembership(expected,
+      revalidateRetainedPruneEvidence({repositoryRoot,retainedEvidence}));}
+    catch(error){classifyRootRevalidationError({repositoryRoot,expected,error});}
+  };
+  let roots=revalidate();
+  const processes=deploymentProcessInventory({repositoryRoot,procRoot,roots,prepared:retainedEvidence.prepared,managedScope});
+  roots=revalidate();
+  return {rows:snapshot.rows,roots,processes};
+}
+function supportsPreparedPruneInventory(current,{rows,roots}) {
+  if(current?.version!==2||roots.length===0)return false;
+  // Private transitional records are validated but omitted by pairRows. A
+  // non-live session row here is therefore an inactive public record.
+  return !rows.some(row=>row.kind==='session'&&!row.live);
+}
+function preparePruneReleaseEvidence(repositoryRoot,current,roots) {
+  const pairs=[current,...roots].map(pairOf).filter(Boolean);
+  const unique=new Map(pairs.map(pair=>[JSON.stringify(pair),pair]));
+  return prepareRuntimeEvidence({repositoryRoot,pairs:[...unique.values()]});
+}
+/** Module-only read-only diagnostic. It evaluates the advisory plan and a
+ * baseline generation-only inventory, then returns before acquiring deployment
+ * locks or applying any prune mutation. */
+export function observeLivePruneInventory({repositoryRoot,procRoot='/proc'}={}) {
+  const planStarted=process.hrtime.bigint();
+  const plan=planRuntimePrune({repositoryRoot});
+  const planElapsedMs=Number(process.hrtime.bigint()-planStarted)/1e6;
+  const route=pruneExecutionRoute(plan);
+  const boundedPlan={
+    bootstrapGenerations:plan.candidates.bootstrapGenerations?.length??0,
+    previous:plan.candidates.previous.length,
+    legacyJournals:plan.candidates.journals.filter(name=>name.startsWith('.deploy.')).length,
+    v2Journals:plan.candidates.journals.filter(name=>name.startsWith('d-')).length,
+  };
+  if(!route.livePath)return {code:'DEPLOY_PRUNE_INVENTORY_OBSERVED',route,plan:boundedPlan,
+    elapsedMs:{plan:planElapsedMs,roots:null,scan:null},rootCount:null,inventory:null,observation:null};
+  const rootsStarted=process.hrtime.bigint();
+  const {roots}=pairRows(repositoryRoot);
+  const rootsElapsedMs=Number(process.hrtime.bigint()-rootsStarted)/1e6;
+  const scanStarted=process.hrtime.bigint();
+  const result=observePairProcesses({repositoryRoot,procRoot,roots,prepared:null,stage:'preliminary'});
+  const scanFinished=process.hrtime.bigint();
+  return {code:'DEPLOY_PRUNE_INVENTORY_OBSERVED',route,plan:boundedPlan,
+    elapsedMs:{plan:planElapsedMs,roots:rootsElapsedMs,scan:result.observation.elapsedMs},
+    scanWindow:{startedNs:String(scanStarted),finishedNs:String(scanFinished)},
+    rootCount:roots.length,inventory:result.inventory,observation:result.observation};
+}
+/** Module-only read-only comparison of the two process scans used around prune
+ * locking. The publication stage is modeled without acquiring deployment locks
+ * or applying a prune mutation. */
+export function observePruneScanPair({repositoryRoot,procRoot='/proc',method}={}) {
+  if(!['baseline','prepared'].includes(method))throw new TypeError('unsupported prune scan method');
+  const totalStarted=process.hrtime.bigint();
+  const planStarted=process.hrtime.bigint();
+  const plan=planRuntimePrune({repositoryRoot});
+  const planElapsedMs=Number(process.hrtime.bigint()-planStarted)/1e6;
+  const boundedPlan={
+    bootstrapGenerations:plan.candidates.bootstrapGenerations?.length??0,
+    previous:plan.candidates.previous.length,
+    legacyJournals:plan.candidates.journals.filter(name=>name.startsWith('.deploy.')).length,
+    v2Journals:plan.candidates.journals.filter(name=>name.startsWith('d-')).length,
+  };
+  if(boundedPlan.bootstrapGenerations!==1||boundedPlan.previous!==0||
+      boundedPlan.legacyJournals!==0||boundedPlan.v2Journals!==0){
+    fail('DEPLOY_PRUNE_BLOCKED','diagnostic_plan_changed');
+  }
+  const initialRootsStarted=process.hrtime.bigint();
+  const snapshot=pairRows(repositoryRoot);
+  const initialRootsElapsedMs=Number(process.hrtime.bigint()-initialRootsStarted)/1e6;
+  const rootCount=snapshot.roots.length;
+  if(rootCount===0)fail('DEPLOY_PRUNE_BLOCKED','diagnostic_roots_missing');
+  let evidence;let prepared;let prepareElapsedMs=0;let scans;
+  const revalidatePreparedRoots=()=>{
+    try{return requirePreparedRootMembership(snapshot.roots,
+      revalidatePairPublicationEvidence({repositoryRoot,prepared}));}
+    catch(error){classifyRootRevalidationError({repositoryRoot,expected:snapshot.roots,error});}
+  };
+  const runScan=stage=>{
+    const scanTotalStarted=process.hrtime.bigint();
+    const rootsStarted=process.hrtime.bigint();
+    const fresh=pairRows(repositoryRoot);
+    if(method==='prepared')requirePreparedRootMembership(snapshot.roots,fresh.roots);
+    const rootsElapsedMs=Number(process.hrtime.bigint()-rootsStarted)/1e6;
+    let filesBeforeMs=0;let rootsBeforeMs=0;let filesAfterMs=0;let rootsAfterMs=0;
+    let roots=fresh.roots;
+    if(method==='prepared'){
+      const filesStarted=process.hrtime.bigint();
+      revalidateRuntimeEvidence(evidence);
+      filesBeforeMs=Number(process.hrtime.bigint()-filesStarted)/1e6;
+      const proofStarted=process.hrtime.bigint();
+      roots=revalidatePreparedRoots();
+      rootsBeforeMs=Number(process.hrtime.bigint()-proofStarted)/1e6;
+    }
+    const scanStarted=process.hrtime.bigint();
+    const result=observePairProcesses({repositoryRoot,procRoot,roots,
+      prepared:method==='prepared'?prepared:null,stage});
+    const scanFinished=process.hrtime.bigint();
+    if(method==='prepared'){
+      const filesStarted=process.hrtime.bigint();
+      revalidateRuntimeEvidence(evidence);
+      filesAfterMs=Number(process.hrtime.bigint()-filesStarted)/1e6;
+      const proofStarted=process.hrtime.bigint();
+      revalidatePreparedRoots();
+      rootsAfterMs=Number(process.hrtime.bigint()-proofStarted)/1e6;
+    }
+    return {inventory:result.inventory,observation:result.observation,
+      scanWindow:{startedNs:String(scanStarted),finishedNs:String(scanFinished)},
+      elapsedMs:{roots:rootsElapsedMs,filesBefore:filesBeforeMs,rootsBefore:rootsBeforeMs,
+        scan:result.observation.elapsedMs,filesAfter:filesAfterMs,rootsAfter:rootsAfterMs,
+        total:Number(process.hrtime.bigint()-scanTotalStarted)/1e6}};
+  };
+  try{
+    if(method==='prepared'){
+      const prepareStarted=process.hrtime.bigint();
+      const current=readActivation({repositoryRoot});
+      if(current?.version!==2)fail('DEPLOY_COMPATIBILITY_MISMATCH','v2_current_required');
+      evidence=preparePruneReleaseEvidence(repositoryRoot,current,snapshot.roots);
+      prepared=preparePairPublicationEvidence({repositoryRoot,evidence,current,roots:snapshot.roots});
+      prepareElapsedMs=Number(process.hrtime.bigint()-prepareStarted)/1e6;
+    }
+    scans=[runScan('preliminary'),runScan('publication')];
+  }finally{evidence?.close();}
+  return {method,rootCount,plan:boundedPlan,
+    elapsedMs:{plan:planElapsedMs,initialRoots:initialRootsElapsedMs,prepare:prepareElapsedMs,
+      total:Number(process.hrtime.bigint()-totalStarted)/1e6},
+    scans};
+}
+function rootMembershipChanged(expected,actual) {
+  return !Array.isArray(actual)||!sameJson(expected.map(row=>row.id),actual.map(row=>row.id))||
+    !expected.every((row,index)=>sameJson(row,actual[index]));
+}
+function requirePreparedRootMembership(expected,actual) {
+  if(rootMembershipChanged(expected,actual))fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');
+  return actual;
+}
+function classifyRootRevalidationError({repositoryRoot,expected,error}) {
+  if(error.code==='DEPLOY_CURRENT_CHANGED')throw error;
+  let actual;
+  try{actual=pairRows(repositoryRoot).roots;}catch{throw error;}
+  if(rootMembershipChanged(expected,actual))fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');
+  throw error;
+}
+function deploymentProcessInventory({repositoryRoot,procRoot,roots,prepared,managedScope}) {
+  if(managedScope===null)return pairProcessInventory({repositoryRoot,procRoot,roots,prepared});
+  requireManagedScope(managedScope,repositoryRoot);
+  return {boundary:'dedicated-service',sessionRoots:roots.length,invocationRecords:managedScope.hasInvocationRecords()};
+}
+function completePreparedPairInventory({repositoryRoot,procRoot,current,evidence,snapshot=pairRows(repositoryRoot),managedScope=null}) {
+  const prepared=preparePairPublicationEvidence({repositoryRoot,evidence,current,roots:snapshot.roots});
+  let roots;
+  try{roots=requirePreparedRootMembership(snapshot.roots,revalidatePairPublicationEvidence({repositoryRoot,prepared}));}
+  catch(error){if(error.code==='DEPLOY_CURRENT_CHANGED')throw error;fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');}
+  const processes=deploymentProcessInventory({repositoryRoot,procRoot,roots,prepared,managedScope});
+  try{roots=requirePreparedRootMembership(snapshot.roots,revalidatePairPublicationEvidence({repositoryRoot,prepared}));}
+  catch(error){if(error.code==='DEPLOY_CURRENT_CHANGED')throw error;fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');}
+  return {rows:snapshot.rows,roots,processes,prepared};
+}
+function observePreparedPairInventory({repositoryRoot,procRoot,current,evidence,snapshot,stage}) {
+  let prepared;let roots;
+  try{prepared=preparePairPublicationEvidence({repositoryRoot,evidence,current,roots:snapshot.roots});}
+  catch(error){classifyRootRevalidationError({repositoryRoot,expected:snapshot.roots,error});}
+  try{roots=requirePreparedRootMembership(snapshot.roots,
+    revalidatePairPublicationEvidence({repositoryRoot,prepared}));}
+  catch(error){classifyRootRevalidationError({repositoryRoot,expected:snapshot.roots,error});}
+  const result=observePairProcesses({repositoryRoot,procRoot,roots,prepared,stage});
+  try{requirePreparedRootMembership(snapshot.roots,revalidatePairPublicationEvidence({repositoryRoot,prepared}));}
+  catch(error){classifyRootRevalidationError({repositoryRoot,expected:snapshot.roots,error});}
+  return {...result,prepared,roots};
+}
+/** Module-only diagnostic surface. It follows candidate validation and both MCP
+ * probes from compatible deployment, then structurally returns before activation
+ * preparation, journal publication, pointer intent, or rename. */
+export async function observeCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,
+  releaseId,rollback=false,phaseRunner=wiringPhase,phaseTimeoutMs=45000,observe}) {
+  const runtime=path.join(repositoryRoot,'.jhw-runtime');
+  const stages=[];const probes={current:false,candidate:false};
+  let writer;let publication;let evidence;let validationDirectory;let logFd;
+  const emit=(phase,stage,exclusive)=>observe?.({phase,stage,exclusive});
+  const runStage=(stage,exclusive,operation)=>{
+    const started=performance.now();
+    emit('inventory_start',stage,exclusive);
+    try {
+      const result=operation(stage);
+      result.observation={...result.observation,elapsedMs:performance.now()-started};
+      return result;
+    } catch(error) {
+      const changed=error.code==='DEPLOY_CURRENT_CHANGED';
+      const rootMismatch=error.code==='DEPLOY_CONSUMERS_ACTIVE'&&error.reason==='root_membership_changed';
+      if(changed||rootMismatch)error.observation={stage,outcome:'disallowed',elapsedMs:performance.now()-started,causeCounts:{
+        pid_set_changed:0,process_vanished:0,identity_changed:changed?1:0,record_unreadable:0,
+        classification_unknown:0,root_mismatch:rootMismatch?1:0}};
+      throw error;
+    }
+    finally{emit('inventory_complete',stage,exclusive);}
+  };
+  const finish=current=>{
+    const order=['preliminary','post_probe','publication'];
+    const reached=stages.map(row=>row.observation.stage);
+    return {code:'DEPLOY_PAIR_OBSERVED',stages,reached,missed:order.filter(stage=>!reached.includes(stage)),
+      probes:{...probes},currentBefore:current,currentAfter:readActivation({repositoryRoot})};
+  };
+  try {
+    writer=acquireLease(path.join(runtime,'deploy.lock'));
+    if(pending(runtime).length||pendingPairJournalCount(repositoryRoot))
+      fail('DEPLOY_RECOVERY_REQUIRED','deployment_journal_pending');
+    const current=readActivation({repositoryRoot});
+    if(current?.version!==2)fail('DEPLOY_COMPATIBILITY_MISMATCH','v2_current_required');
+    let candidate;
+    if(rollback)candidate=selectPairRollbackTarget({repositoryRoot,current,deployLease:writer}).pair;
+    else {
+      validateRelease({repositoryRoot,releaseId});
+      try{candidate=ensureBootstrapGeneration({repositoryRoot,releaseId,reuseBootstrapId:current.bootstrapId,deployLease:writer});}
+      catch(error){if(error.code!=='DEPLOY_BOOTSTRAP_INVALID')throw error;
+        candidate=ensureBootstrapGeneration({repositoryRoot,releaseId,deployLease:writer});}
+    }
+    if(!validRuntimePair(candidate))fail('DEPLOY_COMPATIBILITY_MISMATCH');
+    const snapshot=pairRows(repositoryRoot);
+    const pairs=new Map([pairOf(current),candidate,...snapshot.roots.map(pairOf)].filter(Boolean)
+      .map(pair=>[JSON.stringify(pair),pair]));
+    evidence=prepareRuntimeEvidence({repositoryRoot,pairs:[...pairs.values()]});
+    let result=runStage('preliminary',false,stage=>
+      observePreparedPairInventory({repositoryRoot,procRoot,current,evidence,snapshot,stage}));
+    stages.push({inventory:result.inventory,observation:result.observation});
+    if(result.observation.outcome!=='complete')return finish(current);
+    const active=result.roots.length>0||Object.values(result.inventory.bound).some(value=>value>0);
+    const compatible=candidate.compatibilityDigest===current.compatibilityDigest;
+    if(active&&!compatible)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
+    if(!compatible&&!rollback)fail('DEPLOY_COMPATIBILITY_MISMATCH','incompatible_candidate');
+    validationDirectory=createPairValidationDirectory(repositoryRoot);const phaseState={variables:{}};
+    try{await phaseRunner({repositoryRoot,home,environment,phase:'verify',managed:true,deployLease:writer,
+      directory:validationDirectory,state:phaseState,phaseTimeoutMs,candidateReleaseId:candidate.releaseId});}
+    catch(error){if(phaseState.workerDetached){validationDirectory=undefined;
+      fail('DEPLOY_RECOVERY_REQUIRED','pair_validation_worker_detached');}throw error;}
+    const logDirectory=pinnedDirectory(validationDirectory);
+    try{logFd=fs.openSync(logDirectory.at(`verify.${randomBytes(8).toString('hex')}.log`),
+      fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);fs.fchmodSync(logFd,0o600);}
+    finally{logDirectory.close();}
+    const contractCompatible=await comparePairMcpContracts({repositoryRoot,home,environment,deployLease:writer,
+      directory:validationDirectory,logFd,origin:current,candidate,onProbed:name=>{probes[name]=true;}});
+    if(active&&!contractCompatible)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
+    if(!contractCompatible&&!rollback)fail('DEPLOY_COMPATIBILITY_MISMATCH','incompatible_candidate');
+    result=runStage('post_probe',false,stage=>{
+      const fresh=pairRows(repositoryRoot);
+      requirePreparedRootMembership(snapshot.roots,fresh.roots);
+      return observePreparedPairInventory({repositoryRoot,procRoot,current,evidence,snapshot:fresh,stage});
+    });
+    stages.push({inventory:result.inventory,observation:result.observation});
+    if(result.observation.outcome!=='complete')return finish(current);
+    publication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
+    const sealed=result;
+    result=runStage('publication',true,stage=>{
+      const observed=observePairProcesses({repositoryRoot,procRoot,roots:sealed.roots,prepared:sealed.prepared,stage});
+      try{requirePreparedRootMembership(sealed.roots,
+        revalidatePairPublicationEvidence({repositoryRoot,prepared:sealed.prepared}));}
+      catch(error){classifyRootRevalidationError({repositoryRoot,expected:sealed.roots,error});}
+      return {...observed,roots:sealed.roots,prepared:sealed.prepared};
+    });
+    stages.push({inventory:result.inventory,observation:result.observation});
+    return finish(current);
+  } catch(error) {
+    const reached=stages.map(row=>row.observation.stage);
+    error.observations={stages:[...stages],reached,missed:['preliminary','post_probe','publication'].filter(stage=>!reached.includes(stage)),
+      probes:{...probes},
+      ...(error.observation?{failed:error.observation}:{})};
+    throw error;
+  } finally {
+    publication?.close();
+    try {
+      if(logFd!==undefined){try{fs.fsyncSync(logFd);}finally{fs.closeSync(logFd);}}
+    } finally {
+      try{if(validationDirectory!==undefined)removePairValidationDirectory(validationDirectory);}
+      finally{try{evidence?.close();}finally{writer?.close();}}
+    }
+  }
+}
+
 function sameDestination(snapshot,destination) {
   return snapshot?.version===2&&sameJson(pairDestination(snapshot),destination);
 }
@@ -749,11 +1050,17 @@ function pendingRuntimeJournals(repositoryRoot) {
 }
 function pendingPairJournalCount(repositoryRoot) {return pendingRuntimeJournals(repositoryRoot).length;}
 
-export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId,rollback=false,phaseRunner=wiringPhase,phaseTimeoutMs=45000}) {
+function hasManagedInvocationStore(repositoryRoot) {
+  return exists(path.join(repositoryRoot,'.jhw-runtime/v2/managed-invocations'));
+}
+
+export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId,rollback=false,phaseRunner=wiringPhase,phaseTimeoutMs=45000,managedScope=null}) {
   const runtime=path.join(repositoryRoot,'.jhw-runtime');
   let writer;let admission;let publication;let evidence;let publicationEvidence;let directory;let logFd;let state;let journalCandidate;let validationDirectory;
   try {
     writer=acquireLease(path.join(runtime,'deploy.lock'));
+    if(managedScope!==null)requireManagedScope(managedScope,repositoryRoot);
+    else if(hasManagedInvocationStore(repositoryRoot))fail('DEPLOY_MANAGED_MODE_REQUIRED');
     if(pending(runtime).length)fail('DEPLOY_RECOVERY_REQUIRED','deployment_journal_pending');
     const recovery=reconcilePairJournals(repositoryRoot);
     const origin=readActivation({repositoryRoot});
@@ -766,13 +1073,16 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
       catch(error){if(error.code!=='DEPLOY_BOOTSTRAP_INVALID')throw error;candidate=ensureBootstrapGeneration({repositoryRoot,releaseId,deployLease:writer});}
     }
     if(!validRuntimePair(candidate))fail('DEPLOY_COMPATIBILITY_MISMATCH');
-    const preliminary=completePairInventory({repositoryRoot,procRoot});
-    const active=preliminary.roots.length>0||Object.values(preliminary.processes.bound).some(value=>value>0);
+    const preliminarySnapshot=pairRows(repositoryRoot);
+    const pairMap=new Map([pairOf(origin),candidate,...preliminarySnapshot.roots.map(pairOf)].filter(Boolean).map(pair=>[JSON.stringify(pair),pair]));
+    evidence=prepareRuntimeEvidence({repositoryRoot,pairs:[...pairMap.values()]});
+    const preliminary=completePreparedPairInventory({repositoryRoot,procRoot,current:origin,evidence,snapshot:preliminarySnapshot,managedScope});
+    const active=preliminary.roots.length>0||(managedScope!==null
+      ?preliminary.processes.invocationRecords:Object.values(preliminary.processes.bound).some(value=>value>0));
     const compatible=candidate.compatibilityDigest===origin.compatibilityDigest;
+    if(managedScope!==null&&!compatible)fail('DEPLOY_COMPATIBILITY_MISMATCH','incompatible_candidate');
     if(active&&!compatible)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
     if(!compatible&&!rollback)fail('DEPLOY_COMPATIBILITY_MISMATCH','incompatible_candidate');
-    const pairMap=new Map([pairOf(origin),candidate,...preliminary.roots.map(pairOf)].filter(Boolean).map(pair=>[JSON.stringify(pair),pair]));
-    evidence=prepareRuntimeEvidence({repositoryRoot,pairs:[...pairMap.values()]});
     state={version:2,kind:'pair',status:'pending',operation:rollback?'rollback':'activate',phase:'prepared',origin,
       candidate,destination:null,witness:null,outcome:null};
     journalCandidate=createPairJournalCandidate(repositoryRoot,state);directory=journalCandidate.staging;
@@ -784,21 +1094,16 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
     const logDirectory=pinnedDirectory(directory);
     try{logFd=fs.openSync(logDirectory.at('candidate-probe.log'),fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);fs.fchmodSync(logFd,0o600);}
     finally{logDirectory.close();}
-    const inspectCandidate=async pair=>mcpContract(await mcpProbe({repositoryRoot,home,environment,deployLease:writer,
-      directory,logFd,releaseId:pair.releaseId}));
-    phaseRunner.observe?.({phase:'candidate_probe_start',exclusive:false});
-    const currentContract=await inspectCandidate(pairOf(origin));
-    const candidateContract=await inspectCandidate(candidate);
-    phaseRunner.observe?.({phase:'candidate_probe_complete',exclusive:false});
-    const contractCompatible=currentContract.protocol===candidateContract.protocol&&currentContract.capabilities===candidateContract.capabilities&&
-      [...currentContract.tools].every(([name,contract])=>candidateContract.tools.get(name)===contract);
+    const contractCompatible=await comparePairMcpContracts({repositoryRoot,home,environment,deployLease:writer,
+      directory,logFd,origin,candidate,observe:phaseRunner.observe});
+    if(managedScope!==null&&!contractCompatible)fail('DEPLOY_COMPATIBILITY_MISMATCH','incompatible_candidate');
     if(active&&!contractCompatible)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
     if(!contractCompatible&&!rollback)fail('DEPLOY_COMPATIBILITY_MISMATCH','incompatible_candidate');
     const prepared=preparePairActivation({repositoryRoot,pair:candidate,expectedCurrent:origin,rollback,deployLease:writer});
     directory=publishPairJournal(journalCandidate);
-    const before=completePairInventory({repositoryRoot,procRoot});
-    publicationEvidence=preparePairPublicationEvidence({repositoryRoot,evidence,current:origin,roots:before.roots});
-    if(rollback&&(!active||!compatible||!contractCompatible)){
+    const before=completePreparedPairInventory({repositoryRoot,procRoot,current:origin,evidence,managedScope});
+    publicationEvidence=before.prepared;
+    if(managedScope===null&&rollback&&(!active||!compatible||!contractCompatible)){
       admission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
       const quiet=requireQuiescence({repositoryRoot,procRoot,excludePids:[process.pid]});
       if(pairRows(repositoryRoot).roots.length)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
@@ -809,8 +1114,8 @@ export async function runCompatiblePairDeployment({repositoryRoot,home,procRoot,
     try {
       started=process.hrtime.bigint();
       phaseRunner.observe?.({phase:'publication_acquired',exclusive:true,elapsedNs:'0'});
-      processes=pairProcessInventory({repositoryRoot,procRoot,roots:before.roots,prepared:publicationEvidence});
-      try{roots=revalidatePairPublicationEvidence({repositoryRoot,prepared:publicationEvidence,observer:phaseRunner.observe});}
+      processes=deploymentProcessInventory({repositoryRoot,procRoot,roots:before.roots,prepared:publicationEvidence,managedScope});
+      try{roots=requirePreparedRootMembership(before.roots,revalidatePairPublicationEvidence({repositoryRoot,prepared:publicationEvidence,observer:phaseRunner.observe}));}
       catch(error){if(error.code==='DEPLOY_CURRENT_CHANGED')throw error;fail('DEPLOY_CONSUMERS_ACTIVE','root_membership_changed');}
       current=publishPreparedActivation({repositoryRoot,destination:prepared,expectedCurrent:origin,evidence,publicationLease:publication,journalDirectory:directory,publicationStartedNs:started,
         onPointerIntent:(destination,intent)=>{
@@ -1351,18 +1656,32 @@ async function recoverBootstrapTransition(options,operation) {
 
 /** Module-only fixtures may supply private procRoot/build/phaseRunner. Public
  * argv and environment have no gate bypass, lock-fd, or alternate-root option. */
-export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000,planTimeoutMs=45000}={}) {
+export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[],procRoot='/proc',build,environment=process.env,phaseRunner=wiringPhase,phaseTimeoutMs=45000,planTimeoutMs=45000,managedScope=null}={}) {
  const command=parse(argv);
  if([phaseTimeoutMs,planTimeoutMs].some(value=>!Number.isInteger(value)||value<1||value>45000))fail('DEPLOY_ARGUMENTS_INVALID');
- if(command.operation==='help'||command.operation==='h')return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate-compatible RELEASE_ID','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--activate RELEASE_ID --guard-observe','--rollback','--uninstall','--refresh-bootstrap','--migrate-codex-config','--prune','--prune --apply']};
+ if(command.operation==='help'||command.operation==='h'){
+  if(managedScope!==null){
+   requireManagedScope(managedScope,repositoryRoot);
+   return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate-compatible RELEASE_ID','--rollback','--prune','--prune --apply']};
+  }
+  return {code:'DEPLOY_USAGE',commands:['--prepare','--status','--activate-compatible RELEASE_ID','--activate RELEASE_ID','--activate RELEASE_ID --adopt-from LEGACY_CHECKOUT','--activate RELEASE_ID --guard-observe','--rollback','--uninstall','--refresh-bootstrap','--migrate-codex-config','--prune','--prune --apply']};
+ }
  if(typeof repositoryRoot!=='string'||!path.isAbsolute(repositoryRoot)||typeof home!=='string'||!path.isAbsolute(home))fail('DEPLOY_ARGUMENTS_INVALID');
  const inventoryOptions={repositoryRoot,procRoot,excludePids:[process.pid]};
  const runtime=path.join(repositoryRoot,'.jhw-runtime');
+ const administrativeRead=command.operation==='status'||(command.operation==='prune'&&!command.apply);
+ if(managedScope!==null){
+  requireManagedScope(managedScope,repositoryRoot);
+  if(home!==managedScope.home||!['prepare','status','activate-compatible','rollback','prune'].includes(command.operation))
+   fail('DEPLOY_MANAGED_MODE_REQUIRED');
+  if(readActivation({repositoryRoot})?.version!==2)fail('DEPLOY_COMPATIBILITY_MISMATCH','v2_current_required');
+ }else if(!administrativeRead&&command.operation!=='prepare'&&hasManagedInvocationStore(repositoryRoot))
+  fail('DEPLOY_MANAGED_MODE_REQUIRED');
  if(exists(runtime)&&!['status','migrate-codex-config','prune'].includes(command.operation)) {
   const pendingV2=pendingRuntimeJournals(repositoryRoot);
   if(command.operation==='activate'&&pendingV2.length===1&&pendingV2[0].kind==='initial-install')return recoverInitialInstallation({repositoryRoot,home,procRoot,environment,phaseRunner,phaseTimeoutMs},command.releaseId);
   const pairRecoveryOwner=['activate-compatible','rollback'].includes(command.operation)&&pendingV2.length>0&&pendingV2.every(item=>item.kind==='pair');
-  const bootstrapRecoveryOwner=['refresh-bootstrap','rollback'].includes(command.operation)&&pendingV2.length===1&&pendingV2[0].kind==='bootstrap-migration';
+  const bootstrapRecoveryOwner=managedScope===null&&['refresh-bootstrap','rollback'].includes(command.operation)&&pendingV2.length===1&&pendingV2[0].kind==='bootstrap-migration';
   if(bootstrapRecoveryOwner)return recoverBootstrapTransition({repositoryRoot,home,procRoot,environment,phaseRunner,phaseTimeoutMs},command.operation==='refresh-bootstrap'?'upgrade':'legacy-rollback');
   if(pendingV2.length&&!pairRecoveryOwner&&!bootstrapRecoveryOwner)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
  }
@@ -1378,24 +1697,52 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
  if(command.operation==='prune'&&exists(runtime)&&pendingPairJournalCount(repositoryRoot)>0)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
  if(command.operation==='prune'&&!command.apply)return planRuntimePrune({repositoryRoot});
  if(command.operation==='prune') {
-  const proposed=planRuntimePrune({repositoryRoot});const hasGenerations=(proposed.candidates.bootstrapGenerations?.length??0)>0;
-  const hasLegacy=proposed.candidates.previous.length>0||proposed.candidates.journals.some(name=>name.startsWith('.deploy.'));
-  const livePath=hasGenerations&&!hasLegacy;const before=livePath?completePairInventory({repositoryRoot,procRoot}):requireQuiescence(inventoryOptions);let pruneWriter;let pruneAdmission;let prunePublication;
+  const preparedPlan=prepareRuntimePrune({repositoryRoot});
+  const {hasGenerations,hasLegacy,livePath:ordinaryLivePath}=pruneExecutionRoute(preparedPlan.plan);
+  if(managedScope!==null&&hasLegacy)fail('DEPLOY_PRUNE_BLOCKED','managed_legacy_prune_requires_offline');
+  const livePath=managedScope!==null||ordinaryLivePath;
+  let pruneWriter;let pruneAdmission;let prunePublication;let evidence;
   try {
+   let retainedEvidence;let scanInventory;let before;
+   if(livePath){
+    const snapshot=pairRows(repositoryRoot);
+    const current=readActivation({repositoryRoot});
+    const preparedInventory=managedScope!==null||supportsPreparedPruneInventory(current,snapshot);
+    if(current?.version===2){
+     evidence=preparePruneReleaseEvidence(repositoryRoot,current,snapshot.roots);
+     const prepared=preparePrunePublicationEvidence({repositoryRoot,evidence,current,roots:snapshot.roots});
+     retainedEvidence={evidence,prepared};
+    }
+    scanInventory=preparedInventory
+      ?(next=pairRows(repositoryRoot))=>completeRetainedPruneInventory(
+        {repositoryRoot,procRoot,managedScope},next,snapshot.roots,retainedEvidence)
+      :next=>completePairInventory({repositoryRoot,procRoot},next);
+    before=scanInventory(snapshot);
+   }else{
+    scanInventory=()=>requireQuiescence(inventoryOptions);
+    before=scanInventory();
+   }
    pruneWriter=acquireLease(path.join(runtime,'deploy.lock'),{create:true});
+   if(managedScope===null&&hasManagedInvocationStore(repositoryRoot))fail('DEPLOY_MANAGED_MODE_REQUIRED');
+   const now=Date.now();
    if(!livePath)pruneAdmission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
-   if(hasGenerations)prunePublication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
-   const after=livePath?completePairInventory({repositoryRoot,procRoot}):requireQuiescence(inventoryOptions);
-   return {...applyRuntimePrune({repositoryRoot,deployLease:pruneWriter,publicationLease:prunePublication}),inventory:{before,after}};
-  } finally {prunePublication?.close();pruneAdmission?.close();pruneWriter?.close();}
+   if(hasGenerations||managedScope!==null)prunePublication=acquireLease(path.join(runtime,'publication.lock'),{create:true});
+   const after=scanInventory();
+   if(livePath)requirePreparedRootMembership(before.roots,after.roots);
+   const result=applyRuntimePrune({repositoryRoot,now,preparedPlan,retainedEvidence,managedScope,
+    deployLease:pruneWriter,admissionLease:pruneAdmission,publicationLease:prunePublication});
+   return {...result,inventory:{before,after}};
+  } finally {prunePublication?.close();pruneAdmission?.close();pruneWriter?.close();evidence?.close();}
  }
  if(command.operation==='activate-compatible') {
   const current=exists(runtime)?readActivation({repositoryRoot}):null;
-  if(current?.version===2)return runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId:command.releaseId,rollback:false,phaseRunner,phaseTimeoutMs});
+  if(current?.version===2)return runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,releaseId:command.releaseId,rollback:false,phaseRunner,phaseTimeoutMs,managedScope});
   return runCompatibleDeployment({repositoryRoot,home,procRoot,environment,releaseId:command.releaseId,phaseRunner,phaseTimeoutMs});
  }
  if(command.operation==='status') {
-  const inventory=inspectConsumers(inventoryOptions);const current=exists(runtime)?readActivation({repositoryRoot}):null;
+  const inventory=managedScope===null?inspectConsumers(inventoryOptions):
+   deploymentProcessInventory({repositoryRoot,roots:pairRows(repositoryRoot).roots,managedScope});
+  const current=exists(runtime)?readActivation({repositoryRoot}):null;
   return {code:'DEPLOY_STATUS',advisory:true,releaseId:current?.releaseId??null,predecessorAvailable:current?.predecessorActivationId!==null&&current!==null,recoveryPending:pending(runtime).length+pendingPairJournalCount(repositoryRoot),inventory};
  }
  if(command.operation==='default'&&existingInstallation(repositoryRoot,home))return {code:'DEPLOY_EXPLICIT_ACTIVATION_REQUIRED',next:['--prepare','--activate RELEASE_ID']};
@@ -1426,17 +1773,20 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
  }
  if(command.operation==='rollback'&&exists(runtime)){
   const current=readActivation({repositoryRoot});
-  if(current?.version===2&&current.predecessorActivationId===null&&current.migrationId){const before=requireQuiescence(inventoryOptions);let rollbackWriter;let rollbackAdmission;
+  if(managedScope===null&&current?.version===2&&current.predecessorActivationId===null&&current.migrationId){const before=requireQuiescence(inventoryOptions);let rollbackWriter;let rollbackAdmission;
    try{rollbackWriter=acquireLease(path.join(runtime,'deploy.lock'));rollbackAdmission=acquireLease(path.join(runtime,'admission.lock'));const after=requireQuiescence(inventoryOptions);
     if(pairRows(repositoryRoot).roots.length)fail('DEPLOY_CONSUMERS_ACTIVE','stopped_rollback_required');
     const owner=findCompletedBootstrapMigration({repositoryRoot,current});
     const anchor=readMigrationAnchor({repositoryRoot,migrationId:current.migrationId,expectedRef:owner.anchor});const result=await rollbackLegacyMigration({repositoryRoot,home,current,anchor,deployLease:rollbackWriter,admissionLease:rollbackAdmission,procRoot,environment,phaseRunner,phaseTimeoutMs});
     return {...result,inventory:{before,after}};
    }finally{rollbackAdmission?.close();rollbackWriter?.close();}}
-  if(current?.version===2)return runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,rollback:true,phaseRunner,phaseTimeoutMs});
+  if(current?.version===2)return runCompatiblePairDeployment({repositoryRoot,home,procRoot,environment,rollback:true,phaseRunner,phaseTimeoutMs,managedScope});
  }
  if(exists(runtime)&&pendingPairJournalCount(repositoryRoot)>0)fail('DEPLOY_RECOVERY_REQUIRED','pair_journal_pending');
- if(command.adoptFrom)validateAdoptSource(repositoryRoot,command.adoptFrom);
+ if(command.adoptFrom){
+  validateAdoptSource(repositoryRoot,command.adoptFrom);
+  if(hasManagedInvocationStore(command.adoptFrom))fail('DEPLOY_MANAGED_MODE_REQUIRED');
+ }
  // Adoption also requires the legacy checkout to have no consumers.
  const quiesce=()=>{const result=requireQuiescence(inventoryOptions);if(command.adoptFrom)requireQuiescence({...inventoryOptions,repositoryRoot:command.adoptFrom});return result;};
  const before=quiesce(); // Before any shared mutation.
@@ -1444,6 +1794,7 @@ export async function runDeployment({repositoryRoot,home=process.env.HOME,argv=[
  let writer;let admission;let directory;let state;
  try {
   writer=acquireLease(path.join(runtime,'deploy.lock'),{create:true});
+  if(hasManagedInvocationStore(repositoryRoot))fail('DEPLOY_MANAGED_MODE_REQUIRED');
   admission=acquireLease(path.join(runtime,'admission.lock'),{create:true});
   const after=quiesce();
   const previous=readActivation({repositoryRoot});

@@ -2,9 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {createHash,randomBytes} from 'node:crypto';
 import {validMigrationGuardReference,readGuardTransitionEvidence,sealMigrationGuardForward} from './runtime-guard.mjs';
-import {DeploymentError,acquireLease,trustedDirectory} from './runtime-safety.mjs';
+import {DeploymentError,acquireLease,trustedDirectory,validLeaseCapability} from './runtime-safety.mjs';
 import {validateRetainedBootstrap,validBootstrapObjectProof} from './runtime-entry.mjs';
-import {validV1Current as validCurrent,validCurrent as validRuntimeCurrent,validRuntimePair,validTransitionWitness,readMigrationAnchor,snapshotBootstrapReferences,withUnreferencedBootstrapGeneration} from './runtime-store.mjs';
+import {validV1Current as validCurrent,validCurrent as validRuntimeCurrent,validRuntimePair,validTransitionWitness,readMigrationAnchor,snapshotBootstrapReferences,revalidateRetainedPruneEvidence,withUnreferencedBootstrapGeneration} from './runtime-store.mjs';
+import {requireManagedScope} from './runtime-managed-scope.mjs';
 
 const C=fs.constants;
 const JOURNAL=/^\.deploy\.[a-f0-9]{32}$/;
@@ -21,6 +22,7 @@ const MIN_RECENT=32;
 const MIN_RECENT_GENERATIONS=1;
 const COUNTER='.retention-sequence.v1.json';
 const PRUNE='.prune.v1';
+const preparedPrunePlans = new WeakMap();
 export const DEPLOY_VARIABLE_KEYS=['HOOK_LINK_CREATED','INSTALL_TRANSACTION_ACTIVE','HOOKS_CONFIG_CHANGED','HOOKS_CONFIG_FILE','HOOKS_ADAPTER','HOOKS_DISPLAY_NAME','HOOKS_TRANSACTION_DIR','HOOKS_TRANSACTION_STAGE','HOOKS_TRANSACTION_METADATA','HOOKS_TRANSACTION_PRESERVE','CLAUDE_HOOKS_CONFIG_CHANGED','CLAUDE_HOOKS_CONFIG_FILE','CLAUDE_HOOKS_TRANSACTION_DIR','CLAUDE_HOOKS_TRANSACTION_STAGE','CLAUDE_HOOKS_TRANSACTION_METADATA','CLAUDE_HOOKS_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_TRANSACTION_DIR','CONTROL_HOOK_LINK_TRANSACTION_STAGE','CONTROL_HOOK_LINK_TRANSACTION_METADATA','CONTROL_HOOK_LINK_TRANSACTION_PRESERVE','CONTROL_HOOK_LINK_REMOVE_OUTCOME','INSTALL_UNPROTECTED','MIGRATION_HOOK_TRANSACTION_DIR','CODEX_BACKUP_PRUNE_FILE','ENV_DROPPED','ENV_DROPPED_REPORTED'];
 const digest=value=>createHash('sha256').update(value).digest('hex');
 const canonical=value=>Array.isArray(value)?`[${value.map(canonical).join(',')}]`:value!==null&&typeof value==='object'?`{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`:JSON.stringify(value);
@@ -712,7 +714,7 @@ function inspectBootstrapCandidates({repositoryRoot,retained,budget}) {
  }
  return result;
 }
-function buildPlan({repositoryRoot,now=Date.now(),validatePrevious=validateRetainedBootstrap}) {
+function buildPlan({repositoryRoot,now=Date.now(),validatePrevious=validateRetainedBootstrap}, compareLiveState=false) {
  if(!Number.isFinite(now))fail('unverified_journal');const runtime=runtimeDirectory(repositoryRoot);
  try {
  const names=scanNames(runtime);
@@ -752,11 +754,76 @@ function buildPlan({repositoryRoot,now=Date.now(),validatePrevious=validateRetai
  const referenceSnapshot=snapshotBootstrapReferences({repositoryRoot});
  const roots=collectBootstrapRoots({repositoryRoot,now});if(roots.uncertain)fail('unverified_journal');
  const bootstrapGenerations=inspectBootstrapCandidates({repositoryRoot,retained:roots.retained,budget});
- runtime.verify();return {runtime,rootNames:names,journals:candidates,previous,bootstrapGenerations,hasBootstrapGenerations:referenceSnapshot.generations.length>0,hasLiveBindings:referenceSnapshot.records.some(record=>record.live),observed:{entries:names.length,journals:journals.length+skipped.evidence+skipped.legacy,previous:names.filter(name=>PREVIOUS.test(name)).length},skipped};
+ const liveState = compareLiveState ? digest(canonical([referenceSnapshot.currentObservation,
+   referenceSnapshot.records.filter(record => record.live && record.kind === 'session')])) : null;
+ runtime.verify();return {runtime,rootNames:names,journals:candidates,previous,bootstrapGenerations,liveState,retained:roots.retained,hasBootstrapGenerations:referenceSnapshot.generations.length>0,hasLiveBindings:referenceSnapshot.records.some(record=>record.live),observed:{entries:names.length,journals:journals.length+skipped.evidence+skipped.legacy,previous:names.filter(name=>PREVIOUS.test(name)).length},skipped};
  } catch(error) {runtime.close();throw error;}
 }
 
 export function planRuntimePrune(options) {const plan=buildPlan(options);try{return publicPlan(plan,true);}finally{plan.runtime.close();}}
+
+export function pruneExecutionRoute(plan) {
+  const hasGenerations = (plan.candidates.bootstrapGenerations?.length ?? 0) > 0;
+  const hasLegacy = plan.candidates.previous.length > 0 ||
+    plan.candidates.journals.some(name => JOURNAL.test(name));
+  return {hasGenerations, hasLegacy, livePath: hasGenerations && !hasLegacy};
+}
+
+function candidateFingerprint(item) {
+  const files = item.treeRecords ? treeSignature(item.treeRecords) : item.children.map(name => {
+    const record = item.records[name];
+    return [name, record.sourceIdentity ?? record.identity, digest(record.bytes)];
+  });
+  return digest(canonical([item.special ?? null, item.identity, files]));
+}
+
+// The public plan only lists names. Bind this apply attempt to the objects that
+// were actually observed before choosing the inventory and lock requirements.
+export function prepareRuntimePrune(options) {
+  const initial = buildPlan(options, true);
+  try {
+    const handle = Object.freeze({plan: publicPlan(initial)});
+    const candidates = new Map();
+    for (const item of [...initial.previous, ...initial.journals, ...initial.bootstrapGenerations]) {
+      candidates.set(item.name, {
+        fingerprint: candidateFingerprint(item),
+        // A disappearing generation may be skipped if its original files still
+        // match and the final retention pass positively protected that copy.
+        generation: item.bootstrapId ? item : null,
+      });
+    }
+    preparedPrunePlans.set(handle, {
+      repositoryRoot: options.repositoryRoot,
+      runtimeIdentity: objectIdentity(initial.runtime.stat),
+      route: pruneExecutionRoute(handle.plan),
+      liveState: initial.liveState,
+      candidates,
+    });
+    return handle;
+  } finally { initial.runtime.close(); }
+}
+
+function verifyPreparedPrune(initial, plan, options) {
+  if (!initial || initial.repositoryRoot !== options.repositoryRoot ||
+      !sameIdentity(plan.runtime.stat, initial.runtimeIdentity)) fail('snapshot_changed');
+  const lock = (handle, name) => validLeaseCapability(handle, path.join(plan.runtime.name, name), {exclusive:true});
+  if (!lock(options.deployLease, 'deploy.lock') ||
+      (!initial.route.livePath && !lock(options.admissionLease, 'admission.lock')) ||
+      (initial.route.hasGenerations && !lock(options.publicationLease, 'publication.lock'))) fail('snapshot_changed');
+  if (initial.route.livePath && initial.liveState !== plan.liveState) fail('snapshot_changed');
+  const pending = new Map(initial.candidates);
+  const final = [...plan.previous, ...plan.journals, ...plan.bootstrapGenerations];
+  for (const item of final) {
+    if (pending.get(item.name)?.fingerprint !== candidateFingerprint(item)) fail('snapshot_changed');
+    try { verifyCandidate(item); } catch { fail('snapshot_changed'); }
+    pending.delete(item.name);
+  }
+  if (final.length && initial.route.livePath !== pruneExecutionRoute(publicPlan(plan)).livePath) fail('snapshot_changed');
+  for (const [name, expected] of pending) {
+    if (!expected.generation || !plan.retained.has(name)) fail('snapshot_changed');
+    try { verifyCandidate(expected.generation); } catch { fail('snapshot_changed'); }
+  }
+}
 
 // Complete generation roots used by both advisory planning and apply-time
 // revalidation. Bounded reaper output is deliberately not consulted here.
@@ -903,12 +970,30 @@ function removeRecovery(evidence,recoveryRecord,item) {
 }
 function syncDirectory(directory) {const fd=fs.openSync(directory,C.O_RDONLY|C.O_DIRECTORY|C.O_NOFOLLOW);try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
 export function applyRuntimePrune(options) {
- const plan=buildPlan(options);const {runtime}=plan;let evidence;let mutated=false;const removed={journals:0,previous:0};
+ const {repositoryRoot,retainedEvidence=null,managedScope=null}=options;
+ if(managedScope!==null){requireManagedScope(managedScope,repositoryRoot);managedScope.hasInvocationRecords();}
+ else {
+  try {
+   fs.lstatSync(path.join(repositoryRoot,'.jhw-runtime/v2/managed-invocations'));
+   throw new DeploymentError('DEPLOY_MANAGED_MODE_REQUIRED');
+  }
+  catch(error){if(error.code!=='ENOENT')throw error;}
+ }
+ const prepared = options.preparedPlan;
+ const initial = preparedPrunePlans.get(prepared);
+ if (prepared !== undefined && !preparedPrunePlans.delete(prepared)) fail('snapshot_changed');
+ const plan=buildPlan(options, prepared !== undefined);const {runtime}=plan;let evidence;let mutated=false;const removed={journals:0,previous:0};
  try {
   const legacyDeletion=plan.previous.length||plan.journals.some(item=>item.special===undefined);
+  if(managedScope!==null&&legacyDeletion)fail('managed_legacy_prune_requires_offline');
   if(plan.hasLiveBindings&&legacyDeletion)fail('mixed_generation_legacy');
   if(plan.hasBootstrapGenerations)removed.bootstrapGenerations=0;
   options.faultInjector?.('before_intent');runtime.verify();if(JSON.stringify(scanNames(runtime))!==JSON.stringify(plan.rootNames))fail('snapshot_changed');
+  if (prepared !== undefined) verifyPreparedPrune(initial, plan, options);
+  if (retainedEvidence!==null) revalidateRetainedPruneEvidence({repositoryRoot,retainedEvidence});
+  if (!plan.previous.length && !plan.journals.length && !plan.bootstrapGenerations.length) {
+    return {...publicPlan(plan,false), code:'DEPLOY_PRUNED', removed};
+  }
   fs.mkdirSync(runtime.at(PRUNE),{mode:0o700});fs.chmodSync(runtime.at(PRUNE),0o700);runtime.sync();
   evidence=new PinnedDirectory(runtime.at(PRUNE),{parentVerify:()=>runtime.verify()});
   writePrivate(evidence.at('intent.json'),{version:1,candidates:[...plan.previous,...plan.journals].map(item=>({name:item.name,identity:item.identity,children:item.children}))},{directoryFd:evidence.fd});
@@ -922,13 +1007,17 @@ export function applyRuntimePrune(options) {
   writePrivate(evidence.at('state.json'),{version:1,status:'pending',phase:'copies_durable',recovered:ordered.length,removed},{exclusive:false,directoryFd:evidence.fd});evidence.sync();options.faultInjector?.('after_recovery_durable');
   for(let index=0;index<ordered.length;index++){
    const {type,item}=ordered[index];verifyRecovery(evidence,recoveries[index],item);verifyCandidate(item);
+   if (retainedEvidence!==null) revalidateRetainedPruneEvidence({repositoryRoot,retainedEvidence});
    const remove=({directory=item.directory,syncSource=()=>runtime.sync()}={})=>{const captureName=`capture.${index.toString().padStart(8,'0')}`;const capture=evidence.at(captureName);fs.renameSync(directory,capture);mutated=true;evidence.sync();options.faultInjector?.('after_destination_sync',{name:item.name,index});syncSource();options.faultInjector?.('after_rename_sync',{name:item.name,index});
     const captured=fs.lstatSync(capture,{bigint:true});if(!sameIdentity(captured,item.identity))fail('capture_changed',true);
     options.faultInjector?.('after_capture',{name:item.name,index});removeCaptured(capture,item,options.faultInjector,index);removed[type]++;
     evidence.sync();options.faultInjector?.('after_capture_rmdir_sync',{name:item.name,index});return true;};
    if(type==='bootstrapGenerations'){
-    const reclaimed=withUnreferencedBootstrapGeneration({repositoryRoot:options.repositoryRoot,bootstrapId:item.bootstrapId,identity:item.identity,
-      deployLease:options.deployLease,publicationLease:options.publicationLease,remove,observe:options.faultInjector});
+    const reclaimed=withUnreferencedBootstrapGeneration({repositoryRoot,bootstrapId:item.bootstrapId,identity:item.identity,
+      leaseIdentity:item.records.lease.identity,deployLease:options.deployLease,
+      publicationLease:options.publicationLease,retainedEvidence,
+      remove:managedScope===null?remove:source=>managedScope.hasGenerationIntent(item.bootstrapId)?false:remove(source),
+      observe:options.faultInjector});
     if(!reclaimed)continue;
    }else if(item.special==='v2-pair'||item.special==='v2-tree')remove({syncSource:()=>syncDirectory(path.dirname(item.directory))});
    else remove();

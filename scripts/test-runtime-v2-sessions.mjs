@@ -21,6 +21,34 @@ function repeatDirectoryEntry(directory,name,count) {
   };
   return {restore(){fs.opendirSync=original;},reads(){return reads;}};
 }
+function countReleaseFileOpens(releases,relative) {
+  const original=fs.openSync;const counts=new Map(releases.map(release=>[release,0]));
+  fs.openSync=function(location,...args){
+    if(typeof location==='string'&&path.basename(location)===path.basename(relative)){
+      const match=/^\/proc\/self\/fd\/(\d+)\/([^/]+)$/.exec(location);
+      if(match&&match[2]===path.basename(relative)){
+        try{
+          const parent=fs.readlinkSync(`/proc/self/fd/${match[1]}`);
+          for(const release of releases){
+            if(parent===path.join(release,path.dirname(relative)))counts.set(release,counts.get(release)+1);
+          }
+        }catch{}
+      }
+    }
+    return original.call(this,location,...args);
+  };
+  return {restore(){fs.openSync=original;},count(release){return counts.get(release);}};
+}
+function trackDirectoryFdPeak() {
+  const originalOpen=fs.openSync;const originalClose=fs.closeSync;const live=new Set();let peak=0;
+  fs.openSync=function(location,flags,...args){
+    const fd=originalOpen.call(this,location,flags,...args);
+    if(typeof flags==='number'&&(flags&fs.constants.O_DIRECTORY)){live.add(fd);peak=Math.max(peak,live.size);}
+    return fd;
+  };
+  fs.closeSync=function(fd,...args){live.delete(fd);return originalClose.call(this,fd,...args);};
+  return {restore(){fs.openSync=originalOpen;fs.closeSync=originalClose;},peak(){return peak;}};
+}
 function writePrivateEvidence({directory,name,id,kind,pair,parentBinding,template}) {
   const target=path.join(directory,name);fs.mkdirSync(target,{recursive:true,mode:0o700});fs.chmodSync(target,0o700);
   const lease=path.join(target,'lease');fs.writeFileSync(lease,'',{mode:0o600});fs.chmodSync(lease,0o600);
@@ -103,6 +131,69 @@ test('v2 root and invocation records preserve the selected pair and exact closed
     store.inspectSessionBindingsV2({repositoryRoot:f.root}).map(row => ({id:row.id,kind:row.kind,parentBinding:row.parentBinding})),
     [{id:root.id,kind:'session',parentBinding:null},{id:invocation.id,kind:'invocation',parentBinding:root.token}],
   );
+});
+
+test('v2 bound invocation hashes each unique retained release once', async t => {
+  const {f,pair,admissionLease}=await prepared(t);
+  const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});
+  t.after(()=>root.close());
+  const release=path.join(f.root,'.jhw-runtime/releases',pair.releaseId);
+  const counter=countReleaseFileOpens([release],'mcp-server/package.json');
+  let invocation;
+  try{invocation=store.bindEntryPair({repositoryRoot:f.root,token:root.token,selectedPair:pair,admissionLease});}
+  finally{counter.restore();}
+  invocation.close();
+  assert.equal(counter.count(release),1);
+});
+
+test('v2 bound invocation validates distinct selected and bootstrap source releases once each', async t => {
+  const {f,pair:sourcePair,admissionLease}=await prepared(t);
+  f.write('mcp-server/src/control/hook-adapter.ts','export const revision = 2;\n');
+  const selectedRelease=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const selectedPair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:selectedRelease.releaseId,
+    reuseBootstrapId:sourcePair.bootstrapId,deployLease});
+  deployLease.close();f.seedPair(selectedPair);
+  const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair,admissionLease});
+  t.after(()=>root.close());
+  const source=path.join(f.root,'.jhw-runtime/releases',sourcePair.releaseId);
+  const selected=path.join(f.root,'.jhw-runtime/releases',selectedPair.releaseId);
+  const counter=countReleaseFileOpens([source,selected],'mcp-server/package.json');
+  let invocation;
+  try{invocation=store.bindEntryPair({repositoryRoot:f.root,token:root.token,selectedPair,admissionLease});}
+  finally{counter.restore();}
+  invocation.close();
+  assert.equal(counter.count(source),1);
+  assert.equal(counter.count(selected),1);
+});
+
+test('v2 entry validation rejects a regular release credential before reading its bytes', async t => {
+  const {f,pair,admissionLease}=await prepared(t);
+  const release=path.join(f.root,'.jhw-runtime/releases',pair.releaseId);
+  const credential=path.join(release,'mcp-server/.env');
+  fs.unlinkSync(credential);fs.writeFileSync(credential,'fixture marker\n',{mode:0o600});
+  const counter=countReleaseFileOpens([release],'mcp-server/.env');
+  try{
+    assert.throws(()=>store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease}),
+      {code:'DEPLOY_SESSION_INVALID'});
+  }finally{counter.restore();}
+  assert.equal(counter.count(release),0);
+});
+
+test('v2 entry validation does not retain one directory descriptor per sibling', async t => {
+  const f=await createRuntimeFixture(t);
+  for(let index=0;index<256;index++)f.write(`skills/fd-${String(index).padStart(4,'0')}/item.md`,'fixture\n');
+  const release=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  deployLease.close();f.seedPair(pair);
+  const admissionLease=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true,create:true});
+  t.after(()=>admissionLease.close());
+  const tracker=trackDirectoryFdPeak();let root;
+  try{root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});}
+  finally{tracker.restore();}
+  root.close();
+  assert.ok(tracker.peak()<64,`peak directory descriptors: ${tracker.peak()}`);
 });
 
 test('v2 moved current asks the shared router budget to retry without publishing a root', async t => {
@@ -255,6 +346,111 @@ catch(error){process.stdout.write(JSON.stringify({ok:false,code:error.code})+'\n
   assert.equal(status,0,stderr);
   const result=JSON.parse(stdout.trim().split('\n').at(-1));
   assert.deepEqual(result,{ok:false,code:'DEPLOY_SESSION_INVALID'});
+});
+
+test('v2 invocation revalidates full release evidence after index contention', async t => {
+  const f=await createRuntimeFixture(t);
+  f.write('skills/index-probe/unrelated.md','fixture\n');
+  const release=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  deployLease.close();f.seedPair(pair);
+  const admissionLease=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true,create:true});
+  t.after(()=>admissionLease.close());
+  const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});
+  t.after(()=>root.close());
+  const storeFile=fileURLToPath(new URL('./runtime-store.mjs',import.meta.url));
+  const safetyFile=fileURLToPath(new URL('./runtime-safety.mjs',import.meta.url));
+  const indexDirectory=path.join(f.root,'.jhw-runtime/v2/invocation-index');fs.mkdirSync(indexDirectory,{recursive:true,mode:0o700});
+  const index=acquireLease(path.join(indexDirectory,`${pair.bootstrapId}.lock`),{create:true});
+  const childScript=String.raw`
+const wait=Atomics.wait;let observed=false;Atomics.wait=function(){if(!observed){observed=true;process.stdout.write('index-wait\n')}return wait.apply(this,arguments)};
+const store=await import(process.argv[1]);const safety=await import(process.argv[2]);
+const admission=safety.acquireLease(process.argv[3]+'/.jhw-runtime/admission.lock',{shared:true});
+try{const binding=store.bindEntryPair({repositoryRoot:process.argv[3],token:process.argv[4],selectedPair:JSON.parse(process.argv[5]),admissionLease:admission});process.stdout.write(JSON.stringify({ok:true,id:binding.id})+'\n');}
+catch(error){process.stdout.write(JSON.stringify({ok:false,code:error.code})+'\n');}
+`;
+  const child=spawn(process.execPath,['--input-type=module','-e',childScript,storeFile,safetyFile,f.root,root.token,JSON.stringify(pair)],{stdio:['ignore','pipe','pipe']});
+  let stdout='';let stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+  while(!stdout.includes('index-wait\n'))await new Promise(resolve=>setTimeout(resolve,5));
+  const selected=path.join(f.root,'.jhw-runtime/releases',pair.releaseId,'skills/index-probe/unrelated.md');
+  const changed=fs.readFileSync(selected);changed[0]^=1;fs.writeFileSync(selected,changed);index.close();
+  const status=await new Promise(resolve=>child.once('close',resolve));
+  assert.equal(status,0,stderr);
+  const result=JSON.parse(stdout.trim().split('\n').at(-1));
+  assert.deepEqual(result,{ok:false,code:'DEPLOY_SESSION_INVALID'});
+  const invocations=path.join(f.root,'.jhw-runtime/v2/invocations',pair.bootstrapId);
+  assert.deepEqual(fs.existsSync(invocations)?fs.readdirSync(invocations).filter(name=>name.startsWith('.creating.')):[],[]);
+});
+
+test('v2 invocation never walks a release while holding its index', async t => {
+  const f=await createRuntimeFixture(t);
+  f.write('skills/index-probe/unrelated.md','fixture\n');
+  const release=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  deployLease.close();f.seedPair(pair);
+  const admissionLease=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true,create:true});
+  t.after(()=>admissionLease.close());
+  const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});
+  t.after(()=>root.close());
+  const storeFile=fileURLToPath(new URL('./runtime-store.mjs',import.meta.url));
+  const safetyFile=fileURLToPath(new URL('./runtime-safety.mjs',import.meta.url));
+  const indexFile=path.join(f.root,'.jhw-runtime/v2/invocation-index',`${pair.bootstrapId}.lock`);
+  fs.mkdirSync(path.dirname(indexFile),{recursive:true,mode:0o700});
+  const index=acquireLease(indexFile,{create:true});
+  const childScript=String.raw`
+import fs from 'node:fs';import path from 'node:path';import {spawnSync} from 'node:child_process';
+let waited=false,probed=false,packageOpens=0;const originalLstat=fs.lstatSync,originalOpen=fs.openSync;
+fs.openSync=function(location,...args){if(path.basename(String(location))==='package.json')packageOpens++;return originalOpen.call(this,location,...args)};
+fs.lstatSync=function(location,...args){
+  if(waited&&!probed&&String(location).endsWith('/unrelated.md')){
+    probed=true;
+    const probe=spawnSync(process.execPath,['--input-type=module','-e',
+      "const safety=await import(process.argv[1]);try{safety.acquireLease(process.argv[2]).close();process.stdout.write('free')}catch(error){process.stdout.write(error.code==='DEPLOY_LOCK_CONTENDED'?'held':'error')}",
+      process.argv[2],process.argv[6]],{encoding:'utf8'});
+    process.stdout.write('release-walk-index='+probe.stdout+'\n');
+  }
+  return originalLstat.call(this,location,...args);
+};
+const wait=Atomics.wait;Atomics.wait=function(){if(!waited){waited=true;process.stdout.write('index-wait\n')}return wait.apply(this,arguments)};
+const store=await import(process.argv[1]);const safety=await import(process.argv[2]);
+const admission=safety.acquireLease(process.argv[3]+'/.jhw-runtime/admission.lock',{shared:true});
+try{const binding=store.bindEntryPair({repositoryRoot:process.argv[3],token:process.argv[4],selectedPair:JSON.parse(process.argv[5]),admissionLease:admission});binding.close();process.stdout.write(JSON.stringify({ok:true,packageOpens})+'\n');}
+catch(error){process.stdout.write(JSON.stringify({ok:false,code:error.code})+'\n');}
+`;
+  const child=spawn(process.execPath,['--input-type=module','-e',childScript,storeFile,safetyFile,f.root,root.token,JSON.stringify(pair),indexFile],{stdio:['ignore','pipe','pipe']});
+  let stdout='';let stderr='';child.stdout.on('data',chunk=>stdout+=chunk);child.stderr.on('data',chunk=>stderr+=chunk);
+  while(!stdout.includes('index-wait\n'))await new Promise(resolve=>setTimeout(resolve,5));
+  index.close();
+  const status=await new Promise(resolve=>child.once('close',resolve));
+  assert.equal(status,0,stderr);
+  assert.match(stdout,/release-walk-index=free\n/);
+  assert.deepEqual(JSON.parse(stdout.trim().split('\n').at(-1)),{ok:true,packageOpens:1});
+});
+
+test('v2 bounded publication check removes private staging on anchor change', async t => {
+  const {f,pair,admissionLease}=await prepared(t);
+  const root=store.bindEntryPair({repositoryRoot:f.root,kind:'session',selectedPair:pair,admissionLease});
+  t.after(()=>root.close());
+  const selected=path.join(f.root,'.jhw-runtime/releases',pair.releaseId,'mcp-server/package.json');
+  const originalFsync=fs.fsyncSync;let changed=false;
+  fs.fsyncSync=function(fd,...args){
+    if(!changed){
+      let target='';try{target=fs.readlinkSync(`/proc/self/fd/${fd}`);}catch{}
+      if(path.basename(target).startsWith('.creating.i-')){
+        const bytes=fs.readFileSync(selected);bytes[0]^=1;fs.writeFileSync(selected,bytes);changed=true;
+      }
+    }
+    return originalFsync.call(this,fd,...args);
+  };
+  try{
+    assert.throws(()=>store.bindEntryPair({repositoryRoot:f.root,token:root.token,selectedPair:pair,admissionLease}),
+      {code:'DEPLOY_SESSION_INVALID'});
+  }finally{fs.fsyncSync=originalFsync;}
+  assert.equal(changed,true);
+  const invocations=path.join(f.root,'.jhw-runtime/v2/invocations',pair.bootstrapId);
+  assert.deepEqual(fs.readdirSync(invocations).filter(name=>name.startsWith('.creating.')),[]);
 });
 
 test('v2 private reaper preserves byte-identical manifest inode replacement', async t => {

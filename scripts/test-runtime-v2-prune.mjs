@@ -6,14 +6,90 @@ import {spawn,spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
 
 import {acquireLease} from './runtime-safety.mjs';
-import {applyRuntimePrune,collectBootstrapRoots,planRuntimePrune,recordDeploymentRetention} from './runtime-prune.mjs';
-import {runDeployment,wiringPhase} from './runtime-deploy.mjs';
+import {applyRuntimePrune,collectBootstrapRoots,planRuntimePrune,prepareRuntimePrune,
+  recordDeploymentRetention} from './runtime-prune.mjs';
+import {observePruneScanPair,runDeployment,wiringPhase} from './runtime-deploy.mjs';
 import {readActivation} from './runtime-store.mjs';
 import {createRuntimeFixture} from './test-support/runtime-v2.mjs';
 
 const DAY=24*60*60*1000;
 let replacementSequence=0;
 const writeJson=(file,value)=>{fs.writeFileSync(file,JSON.stringify(value)+'\n',{mode:0o600});fs.chmodSync(file,0o600);};
+const writeProcFile=(file,value)=>{fs.writeFileSync(file,value,{mode:0o600});fs.chmodSync(file,0o600);};
+function stableProcEntry({procRoot,repositoryRoot,pid=100,startTime='12345',token}) {
+  const directory=path.join(procRoot,String(pid));fs.mkdirSync(directory,{mode:0o700});
+  const uid=process.getuid();
+  writeProcFile(path.join(directory,'status'),'Name:\tnode\nUid:\t'+uid+'\t'+uid+'\t'+uid+'\t'+uid+'\n');
+  writeProcFile(path.join(directory,'stat'),
+    pid+' (node) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 '+startTime+' 0 0\n');
+  writeProcFile(path.join(directory,'cmdline'),
+    'node\0'+repositoryRoot+'/.jhw-runtime/bootstrap/jhw-runtime-entry\0');
+  writeProcFile(path.join(directory,'environ'),token===undefined?'':
+    `JHW_RUNTIME_SESSION_BINDING=${token}\0`);
+  fs.symlinkSync(repositoryRoot,path.join(directory,'cwd'));
+}
+
+async function startBoundSessionChild(t,value) {
+  const ready=path.join(value.fixture.home,'.bound-session.json');
+  const storeUrl=new URL('./runtime-store.mjs',import.meta.url).href;
+  const safetyUrl=new URL('./runtime-safety.mjs',import.meta.url).href;
+  const source=[
+    `import fs from 'node:fs'`,
+    `import {acquireLease} from ${JSON.stringify(safetyUrl)}`,
+    `import {bindEntryPair} from ${JSON.stringify(storeUrl)}`,
+    `const [repositoryRoot,pairText,ready]=process.argv.slice(1)`,
+    `const admission=acquireLease(repositoryRoot+'/.jhw-runtime/admission.lock',{shared:true})`,
+    `const binding=bindEntryPair({repositoryRoot,kind:'session',selectedPair:JSON.parse(pairText),admissionLease:admission})`,
+    `fs.writeFileSync(ready,JSON.stringify({id:binding.id,token:binding.token})+'\\n',{mode:0o600})`,
+    `process.stdin.resume()`,
+    `process.stdin.on('end',()=>{binding.close();admission.close();process.exit(0)})`,
+  ].join(';');
+  const child=spawn(process.execPath,['--input-type=module','-e',source,value.fixture.root,
+    JSON.stringify(value.pairB),ready],{stdio:['pipe','ignore','pipe']});
+  let stderr='';child.stderr.on('data',chunk=>{stderr+=chunk;});
+  t.after(async()=>{
+    if(child.exitCode===null){child.stdin.end();await new Promise(resolve=>child.once('close',resolve));}
+  });
+  const deadline=Date.now()+5000;
+  while(!fs.existsSync(ready)&&child.exitCode===null&&Date.now()<deadline){
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);
+  }
+  assert.equal(fs.existsSync(ready),true,stderr||`bound session child exited ${child.exitCode}`);
+  const published=JSON.parse(fs.readFileSync(ready));
+  const row=value.store.inspectSessionBindingsV2({repositoryRoot:value.fixture.root})
+    .find(item=>item.id===published.id);
+  assert.ok(row?.live);
+  return {child,row};
+}
+
+function countReleaseReadsDuringProcScans(procRoot,releasesRoot) {
+  const selectedProcRoot=fs.realpathSync(procRoot);
+  const releasePrefix=fs.realpathSync(releasesRoot)+path.sep;
+  const originalOpendir=fs.opendirSync;
+  const originalRead=fs.readSync;
+  const counts=[0,0];let procReads=0;let activeScan=-1;
+  fs.opendirSync=function(directory,...args){
+    let target;
+    try{target=fs.realpathSync(directory);}catch{}
+    if(target===selectedProcRoot){
+      procReads++;
+      activeScan=procReads%2===1?Math.floor(procReads/2):-1;
+    }
+    return originalOpendir.call(this,directory,...args);
+  };
+  fs.readSync=function(fd,...args){
+    if(activeScan>=0&&activeScan<counts.length){
+      try{
+        if(fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(releasePrefix))counts[activeScan]++;
+      }catch{}
+    }
+    return originalRead.call(this,fd,...args);
+  };
+  return {
+    counts,
+    close(){fs.readSync=originalRead;fs.opendirSync=originalOpendir;return procReads;},
+  };
+}
 
 function addRecentCompatibleJournals(root,count=32) {
   const runtime=path.join(root,'.jhw-runtime');
@@ -40,7 +116,7 @@ function hostContract(home) {
 
 async function installedFixture(t) {
   const fixture=await createRuntimeFixture(t,{productionEntry:true});const source=path.dirname(new URL(import.meta.url).pathname);
-  for(const name of ['install-config.mjs','install-wiring.sh','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs'])fixture.write(`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.endsWith('.sh')?0o755:0o644);
+  for(const name of ['install-config.mjs','install-wiring.sh','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','runtime-managed-scope.mjs'])fixture.write(`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.endsWith('.sh')?0o755:0o644);
   fixture.write('skills/codex/jhw-task/SKILL.md','fixture\n');
   fixture.write('mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');hostContract(fixture.home);
   for(const directory of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(fixture.home,directory),{recursive:true,mode:0o700});
@@ -196,6 +272,54 @@ test('generation policy keeps recent-one ties and collects the exact 30-day boun
   assert.equal(planRuntimePrune({repositoryRoot:boundary.root,now:boundaryNow}).candidates.bootstrapGenerations.includes(boundaryPairs[0].bootstrapId),true);
 });
 
+test('baseline and prepared prune scans agree on a stable unbound managed consumer', async t => {
+  const fixture=await createRuntimeFixture(t);
+  const staleRelease=await fixture.prepare();
+  fixture.write('scripts/runtime-entry.mjs','export const retainedGeneration = true;\n');
+  const currentRelease=await fixture.prepare();
+  const deploy=acquireLease(path.join(fixture.root,'.jhw-runtime/deploy.lock'));
+  const store=await import('./runtime-store.mjs');
+  let stalePair;let currentPair;
+  try {
+    stalePair=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,
+      releaseId:staleRelease.releaseId,deployLease:deploy});
+    currentPair=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,
+      releaseId:currentRelease.releaseId,deployLease:deploy});
+  } finally {deploy.close();}
+  const current=fixture.seedPair(currentPair);
+  const admission=acquireLease(path.join(fixture.root,'.jhw-runtime/admission.lock'),{shared:true,create:true});
+  const binding=store.bindEntryPair({repositoryRoot:fixture.root,kind:'session',
+    selectedPair:currentPair,admissionLease:admission});
+  t.after(()=>{try{binding.close();}catch{}try{admission.close();}catch{}});
+  const staleDirectory=path.join(fixture.root,'.jhw-runtime/v2/bootstraps',stalePair.bootstrapId);
+  const staleTime=new Date(Date.now()-40*DAY);fs.utimesSync(staleDirectory,staleTime,staleTime);
+  assert.deepEqual(planRuntimePrune({repositoryRoot:fixture.root}).candidates.bootstrapGenerations,
+    [stalePair.bootstrapId]);
+  const procRoot=path.join(fixture.home,'stable-unbound-proc');fs.mkdirSync(procRoot,{mode:0o700});
+  stableProcEntry({procRoot,repositoryRoot:fixture.root});
+
+  const baseline=observePruneScanPair({repositoryRoot:fixture.root,procRoot,method:'baseline'});
+  const prepared=observePruneScanPair({repositoryRoot:fixture.root,procRoot,method:'prepared'});
+  assert.equal(baseline.rootCount,1);assert.equal(prepared.rootCount,1);
+  assert.deepEqual(baseline.plan,prepared.plan);
+  assert.equal(baseline.scans.length,2);assert.equal(prepared.scans.length,2);
+  for(let index=0;index<2;index++){
+    const original=baseline.scans[index];const reused=prepared.scans[index];
+    assert.deepEqual(reused.inventory,original.inventory);
+    assert.deepEqual(reused.observation.causeCounts,original.observation.causeCounts);
+    assert.equal(reused.observation.outcome,original.observation.outcome);
+    assert.equal(original.observation.outcome,'disallowed');
+    assert.equal(original.inventory.uncertain,0);
+    assert.deepEqual(original.inventory.bound,{tui:0,app_server:0,legacy:0,managed:0});
+    assert.deepEqual(original.inventory.counts,{tui:0,app_server:0,legacy:0,managed:1});
+  }
+  assert.deepEqual(store.readActivation({repositoryRoot:fixture.root}),current);
+  assert.equal(fs.existsSync(staleDirectory),true);
+  assert.equal(fs.existsSync(path.join(fixture.root,'.jhw-runtime/.prune.v1')),false);
+  assert.deepEqual(planRuntimePrune({repositoryRoot:fixture.root}).candidates.bootstrapGenerations,
+    [stalePair.bootstrapId]);
+});
+
 test('v2 prune preserves current generation and identifies an old unreferenced copy', async t => {
   const fixture=await createRuntimeFixture(t);
   const firstRelease=await fixture.prepare();
@@ -248,6 +372,616 @@ test('v2 prune preserves current generation and identifies an old unreferenced c
   finally{blockedPublication.close();blockedDeploy.close();}
   assert.equal(blocked.removed.bootstrapGenerations,0);assert.equal(fs.existsSync(oldDirectory),true);
   holder.stdin.end();await new Promise(resolve=>holder.once('close',resolve));
+});
+
+async function unreferencedGenerationFixture(t) {
+  const fixture=await createRuntimeFixture(t);
+  const staleRelease=await fixture.prepare();
+  fixture.write('scripts/runtime-entry.mjs','export const currentGeneration = true;\n');
+  const currentRelease=await fixture.prepare();
+  const store=await import('./runtime-store.mjs');
+  const deploy=acquireLease(path.join(fixture.root,'.jhw-runtime/deploy.lock'));
+  let stalePair;let currentPair;
+  try {
+    stalePair=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,
+      releaseId:staleRelease.releaseId,deployLease:deploy});
+    currentPair=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,
+      releaseId:currentRelease.releaseId,deployLease:deploy});
+  } finally {deploy.close();}
+  const current=fixture.seedPair(currentPair);
+  const runtime=path.join(fixture.root,'.jhw-runtime');
+  const generation=path.join(runtime,'v2/bootstraps',stalePair.bootstrapId);
+  const generationLease=path.join(generation,'lease');
+  fs.utimesSync(generation,new Date(Date.now()-40*DAY),new Date(Date.now()-40*DAY));
+  assert.deepEqual(planRuntimePrune({repositoryRoot:fixture.root}).candidates.bootstrapGenerations,
+    [stalePair.bootstrapId]);
+  const identity=file=>{const stat=fs.lstatSync(file,{bigint:true});return {
+    dev:String(stat.dev),ino:String(stat.ino),ctimeNs:String(stat.ctimeNs),
+  };};
+  return {fixture,stalePair,current,runtime,generation,generationLease,
+    generationIdentity:identity(generation),leaseIdentity:identity(generationLease),identity};
+}
+
+async function retainedGenerationFixture(t,{prunePrepared=false,inactiveRoot=false,secondCandidate=false}={}) {
+  const fixture=await createRuntimeFixture(t);
+  const releaseC=await fixture.prepare();
+  let releaseD;
+  if(secondCandidate){
+    fixture.write('scripts/runtime-entry.mjs','export const unreferencedD = true;\n');
+    releaseD=await fixture.prepare();
+  }
+  fixture.write('scripts/runtime-entry.mjs','export const retainedA = true;\n');
+  const releaseA=await fixture.prepare();
+  fixture.write('scripts/runtime-entry.mjs','export const retainedB = true;\n');
+  const releaseB=await fixture.prepare();
+  const store=await import('./runtime-store.mjs');
+  const deploy=acquireLease(path.join(fixture.root,'.jhw-runtime/deploy.lock'));
+  let pairC;let pairD;let pairA;let pairB;
+  try {
+    pairC=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,
+      releaseId:releaseC.releaseId,deployLease:deploy});
+    if(releaseD)pairD=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,
+      releaseId:releaseD.releaseId,deployLease:deploy});
+    pairA=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,
+      releaseId:releaseA.releaseId,deployLease:deploy});
+    pairB=store.ensureBootstrapGeneration({repositoryRoot:fixture.root,
+      releaseId:releaseB.releaseId,deployLease:deploy});
+  } finally {deploy.close();}
+  fixture.seedPair(pairA);
+  const admission=acquireLease(path.join(fixture.root,'.jhw-runtime/admission.lock'),
+    {shared:true,create:true});
+  let rootA=store.bindEntryPair({repositoryRoot:fixture.root,kind:'session',
+    selectedPair:pairA,admissionLease:admission});
+  const current=fixture.seedPair(pairB);
+  let rootB=store.bindEntryPair({repositoryRoot:fixture.root,kind:'session',
+    selectedPair:pairB,admissionLease:admission});
+  let inactive;
+  if(inactiveRoot){
+    inactive=store.bindEntryPair({repositoryRoot:fixture.root,kind:'session',
+      selectedPair:pairB,admissionLease:admission});
+    inactive.lease.close();inactive.generationLease.close();
+  }
+  t.after(()=>{inactive?.close();rootB?.close();rootA?.close();admission.close();});
+  const runtime=path.join(fixture.root,'.jhw-runtime');
+  const generation=path.join(runtime,'v2/bootstraps',pairC.bootstrapId);
+  fs.utimesSync(generation,new Date(Date.now()-40*DAY),new Date(Date.now()-40*DAY));
+  const generationD=pairD?path.join(runtime,'v2/bootstraps',pairD.bootstrapId):null;
+  if(generationD)fs.utimesSync(generationD,new Date(Date.now()-40*DAY),new Date(Date.now()-40*DAY));
+  const roots=store.inspectSessionBindingsV2({repositoryRoot:fixture.root})
+    .filter(row=>row.kind==='session'&&row.live).map(({live,...row})=>row);
+  assert.equal(roots.length,2);
+  const evidence=store.prepareRuntimeEvidence({repositoryRoot:fixture.root,pairs:[pairA,pairB]});
+  t.after(()=>evidence.close());
+  const prepare=prunePrepared
+    ?store.preparePrunePublicationEvidence:store.preparePairPublicationEvidence;
+  const prepared=prepare({
+    repositoryRoot:fixture.root,evidence,current,roots,
+  });
+  const preparedPlan=prepareRuntimePrune({repositoryRoot:fixture.root});
+  assert.deepEqual(new Set(preparedPlan.plan.candidates.bootstrapGenerations),
+    new Set([pairC.bootstrapId,...(pairD?[pairD.bootstrapId]:[])]));
+  return {
+    fixture,store,pairC,pairD,pairA,pairB,current,runtime,generation,generationD,
+    evidence,prepared,preparedPlan,
+    generationA:path.join(runtime,'v2/bootstraps',pairA.bootstrapId),
+    generationB:path.join(runtime,'v2/bootstraps',pairB.bootstrapId),
+    releaseA:path.join(runtime,'releases',pairA.releaseId),
+    inactive,
+    retainedEvidence:{evidence,prepared},
+    closeRootA(){rootA.close();rootA=null;},
+  };
+}
+
+function applyRetainedFixture(value,{faultInjector}={}) {
+  const deployLease=acquireLease(path.join(value.runtime,'deploy.lock'));
+  const publicationLease=acquireLease(path.join(value.runtime,'publication.lock'),{create:true});
+  try {
+    return applyRuntimePrune({repositoryRoot:value.fixture.root,preparedPlan:value.preparedPlan,
+      retainedEvidence:value.retainedEvidence,deployLease,publicationLease,faultInjector});
+  } finally {publicationLease.close();deployLease.close();}
+}
+
+test('retained A and B evidence stays valid through C capture', async t => {
+  const value=await retainedGenerationFixture(t);
+  let durable=false;let generationLocked=false;
+  const result=applyRetainedFixture(value,{faultInjector:point=>{
+    if(point==='after_recovery_durable')durable=fs.existsSync(path.join(value.runtime,'.prune.v1'));
+    if(point==='generation_ex_acquired')generationLocked=true;
+  }});
+  assert.equal(durable,true);
+  assert.equal(generationLocked,true);
+  assert.equal(result.removed.bootstrapGenerations,1);
+  assert.equal(fs.existsSync(value.generation),false);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+});
+
+test('a retained root ending at generation capture preserves C and recovery evidence', async t => {
+  const value=await retainedGenerationFixture(t);
+  let durable=false;let rootClosed=false;
+  assert.throws(()=>applyRetainedFixture(value,{faultInjector:point=>{
+    if(point==='after_recovery_durable')durable=true;
+    if(point==='generation_ex_acquired'){value.closeRootA();rootClosed=true;}
+  }}),{code:'DEPLOY_PRUNE_PARTIAL',reason:'snapshot_changed'});
+  assert.equal(durable,true);
+  assert.equal(rootClosed,true);
+  assert.equal(fs.existsSync(value.generation),true);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),true);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1/recovery.00000000')),true);
+  const state=JSON.parse(fs.readFileSync(path.join(value.runtime,'.prune.v1/state.json')));
+  assert.equal(state.phase,'copies_durable');
+  assert.deepEqual(state.removed,{journals:0,previous:0,bootstrapGenerations:0});
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+});
+
+test('a retained root ending after one deletion preserves the second candidate and both recoveries', async t => {
+  const value=await retainedGenerationFixture(t,{secondCandidate:true});
+  const candidates=value.preparedPlan.plan.candidates.bootstrapGenerations;
+  const directories=new Map([
+    [value.pairC.bootstrapId,value.generation],
+    [value.pairD.bootstrapId,value.generationD],
+  ]);
+  const first=directories.get(candidates[0]);
+  const second=directories.get(candidates[1]);
+  const secondIdentity=plannedIdentity(second);
+  let rootClosed=false;
+  assert.throws(()=>applyRetainedFixture(value,{faultInjector:(point,details)=>{
+    if(point==='after_capture_rmdir_sync'&&details.index===0){
+      value.closeRootA();rootClosed=true;
+    }
+  }}),{code:'DEPLOY_PRUNE_PARTIAL',reason:'snapshot_changed'});
+  assert.equal(rootClosed,true);
+  assert.equal(fs.existsSync(first),false);
+  assert.equal(fs.existsSync(second),true);
+  assert.deepEqual(plannedIdentity(second),secondIdentity);
+  const marker=path.join(value.runtime,'.prune.v1');
+  const recovery0=path.join(marker,'recovery.00000000');
+  const recovery1=path.join(marker,'recovery.00000001');
+  assert.equal(fs.existsSync(path.join(recovery0,'payload')),true);
+  assert.equal(fs.existsSync(path.join(recovery1,'payload')),true);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(recovery0,'inventory.json'))).name,candidates[0]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(recovery1,'inventory.json'))).name,candidates[1]);
+  const state=JSON.parse(fs.readFileSync(path.join(marker,'state.json')));
+  assert.equal(state.phase,'removing_originals');
+  assert.deepEqual(state.removed,{journals:0,previous:0,bootstrapGenerations:1});
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(value.generationA),true);
+  assert.equal(fs.existsSync(value.generationB),true);
+});
+
+test('closed retained release evidence blocks prune before recovery evidence', async t => {
+  const value=await retainedGenerationFixture(t);
+  value.evidence.close();
+  assert.throws(()=>applyRetainedFixture(value),
+    {code:'DEPLOY_SOURCE_CHANGED'});
+  assert.equal(fs.existsSync(value.generation),true);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+});
+
+test('retained release metadata drift blocks prune before recovery evidence', async t => {
+  const value=await retainedGenerationFixture(t);
+  const releaseFile=path.join(value.releaseA,'scripts/runtime-entry.mjs');
+  const bytes=fs.readFileSync(releaseFile);
+  const beforeRelease=fs.statSync(releaseFile,{bigint:true});
+  const objects=[value.generation,value.generationA,value.generationB].map(plannedIdentity);
+  fs.utimesSync(releaseFile,Number(beforeRelease.atimeNs)/1e9,Number(beforeRelease.mtimeNs)/1e9+10);
+  assert.deepEqual(fs.readFileSync(releaseFile),bytes);
+  assert.notEqual(fs.statSync(releaseFile,{bigint:true}).mtimeNs,beforeRelease.mtimeNs);
+  assert.throws(()=>applyRetainedFixture(value),{code:'DEPLOY_SOURCE_CHANGED'});
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+  assert.deepEqual([value.generation,value.generationA,value.generationB].map(plannedIdentity),objects);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+});
+
+test('prune retained evidence tolerates an inactive published root', async t => {
+  const value=await retainedGenerationFixture(t,{prunePrepared:true,inactiveRoot:true});
+  const before=value.store.inspectSessionBindingsV2({repositoryRoot:value.fixture.root});
+  assert.equal(before.some(row=>row.id===value.inactive.id&&!row.live),true);
+  const result=applyRetainedFixture(value);
+  assert.equal(result.removed.bootstrapGenerations,1);
+  assert.equal(fs.existsSync(value.generation),false);
+  const after=value.store.inspectSessionBindingsV2({repositoryRoot:value.fixture.root});
+  assert.equal(after.some(row=>row.id===value.inactive.id&&!row.live),true);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+});
+
+test('public prune rejects a live v1 session and preserves a released v1 record', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const {root:repositoryRoot,home,environment}=value.fixture;
+  const procRoot=path.join(home,'legacy-session-prune-proc');
+  fs.mkdirSync(procRoot,{mode:0o700});
+  const apply=()=>runDeployment({repositoryRoot,home,procRoot,environment,argv:['--prune','--apply']});
+  const store=await import('./runtime-store.mjs');
+  const releaseId=value.current.releaseId;
+  const live=store.createSessionBinding({repositoryRoot,releaseId});
+  try {
+    await assert.rejects(apply(),{code:'DEPLOY_COMPATIBILITY_MISMATCH',reason:'v1_session'});
+    assert.equal(fs.existsSync(value.generation),true);
+    assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+  } finally {live.close();}
+
+  // An exited v1 owner leaves a valid public record and releases its kernel lease.
+  const moduleUrl=new URL('./runtime-store.mjs',import.meta.url).href;
+  const childSource=[
+    'import {createSessionBinding} from '+JSON.stringify(moduleUrl),
+    'const [repositoryRoot,releaseId]=process.argv.slice(1)',
+    'console.log(createSessionBinding({repositoryRoot,releaseId}).id)',
+  ].join('\n');
+  const child=spawnSync(process.execPath,['--input-type=module','-e',childSource,repositoryRoot,releaseId],
+    {encoding:'utf8',timeout:10000});
+  assert.equal(child.status,0,child.stderr);
+  const id=child.stdout.trim();
+  assert.match(id,/^s-[a-f0-9]{32}$/);
+  assert.deepEqual(store.inspectSessionBindings({repositoryRoot}),[]);
+  const manifest=path.join(value.runtime,'sessions',id,'manifest.json');
+  const before=value.identity(manifest);
+  const result=await apply();
+  assert.equal(result.code,'DEPLOY_PRUNED');
+  assert.equal(result.removed.bootstrapGenerations,1);
+  assert.equal(fs.existsSync(value.generation),false);
+  assert.deepEqual(value.identity(manifest),before);
+  assert.deepEqual(readActivation({repositoryRoot}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+});
+
+test('public prune preserves C when retained release metadata cannot be read after recovery', async t => {
+  const value=await retainedGenerationFixture(t,{prunePrepared:true});
+  const marker=path.join(value.runtime,'.prune.v1');
+  const procRoot=path.join(value.fixture.home,'retained-prune-proc');
+  fs.mkdirSync(procRoot,{mode:0o700});
+  const originalFstat=fs.fstatSync;let injected=0;
+  fs.fstatSync=function(fd,...args){
+    let target;
+    try{target=fs.readlinkSync('/proc/self/fd/'+fd);}catch{}
+    if(target===value.releaseA&&fs.existsSync(path.join(marker,'state.json'))){
+      const state=JSON.parse(fs.readFileSync(path.join(marker,'state.json')));
+      if(state.phase==='copies_durable'){
+        injected++;
+        throw Object.assign(new Error('fixture metadata read failed'),{code:'EIO'});
+      }
+    }
+    return originalFstat.call(this,fd,...args);
+  };
+  try {
+    await assert.rejects(runDeployment({repositoryRoot:value.fixture.root,home:value.fixture.home,
+      procRoot,environment:value.fixture.environment,
+      argv:['--prune','--apply']}),{code:'DEPLOY_PRUNE_PARTIAL',reason:'snapshot_changed'});
+  } finally {fs.fstatSync=originalFstat;}
+  assert.ok(injected>0);
+  assert.equal(fs.existsSync(value.generation),true);
+  assert.equal(fs.existsSync(path.join(marker,'recovery.00000000')),true);
+  const state=JSON.parse(fs.readFileSync(path.join(marker,'state.json')));
+  assert.equal(state.phase,'copies_durable');
+  assert.deepEqual(state.removed,{journals:0,previous:0,bootstrapGenerations:0});
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+});
+
+test('public prune accepts the prepared verifier in both scans and removes only C', async t => {
+  const value=await retainedGenerationFixture(t,{prunePrepared:true});
+  const {row}=await startBoundSessionChild(t,value);
+  const procRoot=path.join(value.fixture.home,'bound-retained-prune-proc');
+  fs.mkdirSync(procRoot,{mode:0o700});
+  stableProcEntry({procRoot,repositoryRoot:value.fixture.root,pid:row.owner.pid,
+    startTime:row.owner.startTime,token:row.token});
+
+  const releaseReads=countReleaseReadsDuringProcScans(procRoot,path.join(value.runtime,'releases'));
+  let result;let procReads;
+  try{
+    result=await runDeployment({repositoryRoot:value.fixture.root,home:value.fixture.home,
+      procRoot,environment:value.fixture.environment,argv:['--prune','--apply']});
+  }finally{procReads=releaseReads.close();}
+  assert.equal(procReads,4);
+  assert.deepEqual(releaseReads.counts,[0,0]);
+  assert.equal(result.code,'DEPLOY_PRUNED');
+  assert.equal(result.removed.bootstrapGenerations,1);
+  assert.deepEqual(result.inventory.before.processes.bound,
+    {tui:0,app_server:0,legacy:0,managed:1});
+  assert.deepEqual(result.inventory.after.processes.bound,
+    {tui:0,app_server:0,legacy:0,managed:1});
+  assert.equal(result.inventory.before.processes.clear,true);
+  assert.equal(result.inventory.after.processes.clear,true);
+  assert.equal(fs.existsSync(value.generation),false);
+  assert.equal(fs.existsSync(value.generationA),true);
+  assert.equal(fs.existsSync(value.generationB),true);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+});
+
+test('public prune uses baseline release validation for inactive public sessions', async t => {
+  const value=await retainedGenerationFixture(t,{prunePrepared:true,inactiveRoot:true});
+  const {row}=await startBoundSessionChild(t,value);
+  const procRoot=path.join(value.fixture.home,'inactive-root-baseline-proc');
+  fs.mkdirSync(procRoot,{mode:0o700});
+  stableProcEntry({procRoot,repositoryRoot:value.fixture.root,pid:row.owner.pid,
+    startTime:row.owner.startTime,token:row.token});
+  const releaseReads=countReleaseReadsDuringProcScans(procRoot,path.join(value.runtime,'releases'));
+  let result;let procReads;
+  try{
+    result=await runDeployment({repositoryRoot:value.fixture.root,home:value.fixture.home,
+      procRoot,environment:value.fixture.environment,argv:['--prune','--apply']});
+  }finally{procReads=releaseReads.close();}
+  assert.equal(procReads,4);
+  assert.ok(releaseReads.counts[0]>0,`first baseline scan read count: ${releaseReads.counts[0]}`);
+  assert.ok(releaseReads.counts[1]>0,`second baseline scan read count: ${releaseReads.counts[1]}`);
+  assert.equal(result.removed.bootstrapGenerations,1);
+  assert.deepEqual(result.inventory.before.processes.bound,
+    {tui:0,app_server:0,legacy:0,managed:1});
+  assert.deepEqual(result.inventory.after.processes.bound,
+    {tui:0,app_server:0,legacy:0,managed:1});
+  assert.equal(fs.existsSync(value.generation),false);
+  assert.equal(fs.existsSync(value.generationA),true);
+  assert.equal(fs.existsSync(value.generationB),true);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+});
+
+for(const boundary of [
+  {name:'first',procRead:2},
+  {name:'second',procRead:4},
+])test(`public prune rejects retained source drift after the ${boundary.name} PID scan`, async t => {
+  const value=await retainedGenerationFixture(t,{prunePrepared:true});
+  const procRoot=path.join(value.fixture.home,`${boundary.name}-source-drift-proc`);
+  fs.mkdirSync(procRoot,{mode:0o700});
+  const releaseFile=path.join(value.releaseA,'scripts/runtime-entry.mjs');
+  const initial=fs.statSync(releaseFile,{bigint:true});
+  const originalOpendir=fs.opendirSync;let procReads=0;
+  fs.opendirSync=function(directory,...args){
+    const opened=originalOpendir.call(this,directory,...args);
+    let target;
+    try{target=fs.realpathSync(directory);}catch{}
+    if(target===fs.realpathSync(procRoot)&&++procReads===boundary.procRead){
+      fs.utimesSync(releaseFile,Number(initial.atimeNs)/1e9,Number(initial.mtimeNs)/1e9+10);
+    }
+    return opened;
+  };
+  let failure;
+  try {
+    try{
+      await runDeployment({repositoryRoot:value.fixture.root,home:value.fixture.home,
+        procRoot,environment:value.fixture.environment,argv:['--prune','--apply']});
+    }catch(error){failure=error;}
+  } finally {fs.opendirSync=originalOpendir;}
+  assert.equal(failure?.code,'DEPLOY_SOURCE_CHANGED');
+  assert.match(failure?.stack??'',/completeRetainedPruneInventory/,
+    'the scan post-check must reject before applyRuntimePrune pre-intent validation');
+  assert.equal(procReads,boundary.procRead);
+  assert.equal(fs.existsSync(value.generation),true);
+  assert.equal(fs.existsSync(value.generationA),true);
+  assert.equal(fs.existsSync(value.generationB),true);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+});
+
+test('a generation lease acquired after durable recovery preserves C and cleans prune evidence', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const deploy=acquireLease(path.join(value.runtime,'deploy.lock'));
+  const publication=acquireLease(path.join(value.runtime,'publication.lock'),{create:true});
+  let generationLease;let durableMarker;let locksHeld=false;
+  try {
+    const result=applyRuntimePrune({repositoryRoot:value.fixture.root,
+      deployLease:deploy,publicationLease:publication,
+      faultInjector:point=>{
+        if(point!=='after_recovery_durable')return;
+        durableMarker=fs.existsSync(path.join(value.runtime,'.prune.v1'));
+        let otherDeploy;let otherPublication;
+        try{otherDeploy=acquireLease(path.join(value.runtime,'deploy.lock'));}
+        catch(error){assert.equal(error.code,'DEPLOY_LOCK_CONTENDED');}
+        try{otherPublication=acquireLease(path.join(value.runtime,'publication.lock'));}
+        catch(error){assert.equal(error.code,'DEPLOY_LOCK_CONTENDED');}
+        locksHeld=otherDeploy===undefined&&otherPublication===undefined;
+        otherPublication?.close();otherDeploy?.close();
+        generationLease=acquireLease(value.generationLease,{shared:true});
+      }});
+    assert.equal(result.removed.bootstrapGenerations,0);
+  } finally {
+    generationLease?.close();publication.close();deploy.close();
+  }
+  assert.equal(durableMarker,true);
+  assert.equal(locksHeld,true);
+  assert.equal(fs.existsSync(value.generation),true);
+  assert.deepEqual(value.identity(value.generation),value.generationIdentity);
+  assert.deepEqual(value.identity(value.generationLease),value.leaseIdentity);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+  assert.deepEqual(planRuntimePrune({repositoryRoot:value.fixture.root}).candidates.bootstrapGenerations,
+    [value.stalePair.bootstrapId]);
+});
+
+test('a generation lease acquired after routing makes the final empty plan marker-free', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const preparedPlan=prepareRuntimePrune({repositoryRoot:value.fixture.root});
+  assert.deepEqual(preparedPlan.plan.candidates.bootstrapGenerations,[value.stalePair.bootstrapId]);
+  const deploy=acquireLease(path.join(value.runtime,'deploy.lock'));
+  const publication=acquireLease(path.join(value.runtime,'publication.lock'),{create:true});
+  const generationLease=acquireLease(value.generationLease,{shared:true});
+  const points=[];const marker=path.join(value.runtime,'.prune.v1');
+  const markerParent=fs.realpathSync(value.runtime);
+  const mkdirSync=fs.mkdirSync;let markerCreateCalls=0;
+  fs.mkdirSync=function(directory,...args){
+    if(typeof directory==='string'&&path.basename(directory)==='.prune.v1'){
+      try {
+        if(fs.realpathSync(path.dirname(directory))===markerParent)markerCreateCalls++;
+      } catch {}
+    }
+    return mkdirSync.call(this,directory,...args);
+  };
+  try {
+    const result=applyRuntimePrune({repositoryRoot:value.fixture.root,
+      preparedPlan,deployLease:deploy,publicationLease:publication,
+      faultInjector:point=>{
+        points.push(point);
+        assert.equal(fs.existsSync(marker),false,point);
+      }});
+    assert.equal(result.removed.bootstrapGenerations,0);
+  } finally {
+    fs.mkdirSync=mkdirSync;
+    generationLease.close();publication.close();deploy.close();
+  }
+  assert.deepEqual(points,['before_intent']);
+  assert.equal(markerCreateCalls,0);
+  assert.equal(fs.existsSync(value.generation),true);
+  assert.deepEqual(value.identity(value.generation),value.generationIdentity);
+  assert.deepEqual(value.identity(value.generationLease),value.leaseIdentity);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(marker),false);
+});
+
+test('a generation becoming eligible after route selection is blocked before prune intent', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const generationLease=acquireLease(value.generationLease,{shared:true});
+  const preparedPlan=prepareRuntimePrune({repositoryRoot:value.fixture.root});
+  assert.deepEqual(preparedPlan.plan.candidates.bootstrapGenerations,[]);
+  const deploy=acquireLease(path.join(value.runtime,'deploy.lock'));
+  const admission=acquireLease(path.join(value.runtime,'admission.lock'),{create:true});
+  generationLease.close();
+  const points=[];const marker=path.join(value.runtime,'.prune.v1');
+  try {
+    assert.throws(()=>applyRuntimePrune({repositoryRoot:value.fixture.root,
+      preparedPlan,deployLease:deploy,admissionLease:admission,
+      faultInjector:point=>{
+        points.push(point);
+        assert.equal(fs.existsSync(marker),false,point);
+      }}),{code:'DEPLOY_PRUNE_BLOCKED',reason:'snapshot_changed'});
+  } finally {admission.close();deploy.close();}
+  assert.deepEqual(points,['before_intent']);
+  assert.equal(fs.existsSync(marker),false);
+  assert.equal(fs.existsSync(value.generation),true);
+  assert.deepEqual(value.identity(value.generation),value.generationIdentity);
+  assert.deepEqual(value.identity(value.generationLease),value.leaseIdentity);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.deepEqual(planRuntimePrune({repositoryRoot:value.fixture.root})
+    .candidates.bootstrapGenerations,[value.stalePair.bootstrapId]);
+});
+
+function plannedIdentity(file) {
+  const stat=fs.lstatSync(file,{bigint:true});
+  return {dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:Number(stat.mode&0o7777n)};
+}
+
+test('an unreadable final generation blocks apply before recovery starts', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const options={repositoryRoot:value.fixture.root};
+  const preparedPlan=prepareRuntimePrune(options);
+  const deployLease=acquireLease(path.join(value.runtime,'deploy.lock'));
+  const publicationLease=acquireLease(path.join(value.runtime,'publication.lock'),{create:true});
+  let checked=false;
+  const marker=path.join(value.runtime,'.prune.v1');
+  const readdir=fs.readdirSync;
+  try {
+    assert.throws(()=>applyRuntimePrune({...options,preparedPlan,deployLease,publicationLease,
+      faultInjector(point) {
+        if(point!=='before_intent')return;
+        t.mock.method(fs,'readdirSync',function(directory,...args) {
+          if(directory===value.generation){
+            checked=true;
+            assert.equal(fs.existsSync(marker),false);
+            throw Object.assign(new Error('fixture read failed'),{code:'EIO'});
+          }
+          return readdir.call(this,directory,...args);
+        });
+      },
+    }),{code:'DEPLOY_PRUNE_BLOCKED',reason:'snapshot_changed'});
+  } finally {t.mock.restoreAll();publicationLease.close();deployLease.close();}
+  assert.equal(checked,true);
+  assert.equal(fs.existsSync(marker),false);
+  assert.deepEqual(value.identity(value.generation),value.generationIdentity);
+  assert.deepEqual(value.identity(value.generationLease),value.leaseIdentity);
+});
+
+test('generation reclaim rejects a mismatched planned lease proof before remove', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const store=await import('./runtime-store.mjs');
+  const deploy=acquireLease(path.join(value.runtime,'deploy.lock'));
+  const publication=acquireLease(path.join(value.runtime,'publication.lock'),{create:true});
+  const wrongLease=path.join(value.runtime,'v2/bootstraps',value.current.bootstrapId,'lease');
+  let removeCalls=0;let shared;
+  try {
+    const reclaim=()=>store.withUnreferencedBootstrapGeneration({
+      repositoryRoot:value.fixture.root,bootstrapId:value.stalePair.bootstrapId,
+      identity:plannedIdentity(value.generation),leaseIdentity:plannedIdentity(wrongLease),
+      deployLease:deploy,publicationLease:publication,
+      remove:()=>{removeCalls++;return true;},
+    });
+    assert.throws(reclaim,{code:'DEPLOY_BOOTSTRAP_CHANGED'});
+    shared=acquireLease(value.generationLease,{shared:true});
+    assert.throws(reclaim,{code:'DEPLOY_BOOTSTRAP_CHANGED'});
+  } finally {shared?.close();publication.close();deploy.close();}
+  assert.equal(removeCalls,0);
+  assert.equal(fs.existsSync(value.generation),true);
+  assert.deepEqual(value.identity(value.generation),value.generationIdentity);
+  assert.deepEqual(value.identity(value.generationLease),value.leaseIdentity);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+});
+
+test('retained generation reclaim still rejects a mismatched planned lease proof', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const store=await import('./runtime-store.mjs');
+  const currentGeneration=path.join(value.runtime,'v2/bootstraps',value.current.bootstrapId);
+  const currentLease=path.join(currentGeneration,'lease');
+  const currentLeaseIdentity=plannedIdentity(currentLease);
+  const deploy=acquireLease(path.join(value.runtime,'deploy.lock'));
+  const publication=acquireLease(path.join(value.runtime,'publication.lock'),{create:true});
+  let removeCalls=0;
+  try {
+    assert.throws(()=>store.withUnreferencedBootstrapGeneration({
+      repositoryRoot:value.fixture.root,bootstrapId:value.current.bootstrapId,
+      identity:plannedIdentity(currentGeneration),leaseIdentity:plannedIdentity(value.generationLease),
+      deployLease:deploy,publicationLease:publication,
+      remove:()=>{removeCalls++;return true;},
+    }),{code:'DEPLOY_BOOTSTRAP_CHANGED'});
+  } finally {publication.close();deploy.close();}
+  assert.equal(removeCalls,0);
+  assert.equal(fs.existsSync(currentGeneration),true);
+  assert.deepEqual(plannedIdentity(currentLease),currentLeaseIdentity);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+});
+
+test('an unchanged unreferenced generation is removed under deploy and publication locks', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const deploy=acquireLease(path.join(value.runtime,'deploy.lock'));
+  const publication=acquireLease(path.join(value.runtime,'publication.lock'),{create:true});
+  let durableMarker=false;let locksHeld=false;
+  try {
+    const result=applyRuntimePrune({repositoryRoot:value.fixture.root,
+      deployLease:deploy,publicationLease:publication,
+      faultInjector:point=>{
+        if(point!=='after_recovery_durable')return;
+        durableMarker=fs.existsSync(path.join(value.runtime,'.prune.v1'));
+        let otherDeploy;let otherPublication;
+        try{otherDeploy=acquireLease(path.join(value.runtime,'deploy.lock'));}
+        catch(error){assert.equal(error.code,'DEPLOY_LOCK_CONTENDED');}
+        try{otherPublication=acquireLease(path.join(value.runtime,'publication.lock'));}
+        catch(error){assert.equal(error.code,'DEPLOY_LOCK_CONTENDED');}
+        locksHeld=otherDeploy===undefined&&otherPublication===undefined;
+        otherPublication?.close();otherDeploy?.close();
+      }});
+    assert.equal(result.removed.bootstrapGenerations,1);
+  } finally {publication.close();deploy.close();}
+  assert.equal(durableMarker,true);
+  assert.equal(locksHeld,true);
+  assert.equal(fs.existsSync(value.generation),false);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
+  assert.deepEqual(planRuntimePrune({repositoryRoot:value.fixture.root}).candidates.bootstrapGenerations,[]);
+});
+
+test('public prune apply removes an unchanged C generation in an isolated fixture', async t => {
+  const value=await unreferencedGenerationFixture(t);
+  const procRoot=path.join(value.fixture.home,'empty-prune-proc');
+  fs.mkdirSync(procRoot,{mode:0o700});
+  const result=await runDeployment({repositoryRoot:value.fixture.root,home:value.fixture.home,
+    procRoot,environment:value.fixture.environment,argv:['--prune','--apply']});
+  assert.equal(result.code,'DEPLOY_PRUNED');
+  assert.equal(result.removed.bootstrapGenerations,1);
+  assert.equal(result.inventory.before.processes.clear,true);
+  assert.equal(result.inventory.after.processes.clear,true);
+  assert.equal(fs.existsSync(value.generation),false);
+  assert.deepEqual(readActivation({repositoryRoot:value.fixture.root}),value.current);
+  assert.equal(fs.existsSync(path.join(value.runtime,'.prune.v1')),false);
 });
 
 async function staleGenerationFixture(t,{privateState=null}={}) {

@@ -37,6 +37,12 @@ const SOURCE_INPUTS = [
   'scripts/runtime-safety.mjs', 'scripts/runtime-store.mjs',
   'scripts/runtime-entry.mjs', 'scripts/runtime-deploy.mjs', 'scripts/runtime-prune.mjs', 'scripts/runtime-guard.mjs', 'scripts/install-config.mjs', 'scripts/install-wiring.sh',
   'scripts/jhw-runtime-entry', 'scripts/jhw-runtime-control', 'scripts/jhw-runtime-hook',
+  'scripts/runtime-managed-scope.mjs', 'scripts/runtime-managed-writer.mjs',
+  'scripts/runtime-managed-artifact.mjs', 'scripts/runtime-managed-worker-probe.mjs',
+  'scripts/runtime-managed-invocation.cjs', 'scripts/runtime_managed.py',
+  'scripts/runtime_managed_broker.py', 'scripts/runtime_managed_hook.py', 'scripts/runtime_managed_identity.py',
+  'scripts/runtime_managed_lifetime.py', 'scripts/runtime_managed_profile.py', 'scripts/runtime_managed_protocol.py',
+  'scripts/runtime_managed_service_worker.py', 'scripts/runtime_managed_transport.py',
 ];
 const EXCLUDED_SOURCE_NAMES = ['.git', '.ai', '.superpowers', 'node_modules', 'dist'];
 const REQUIRED = new Map([
@@ -117,6 +123,11 @@ class Directory {
 const preparedEvidence = new WeakMap();
 const preparedDestinations = new WeakMap();
 const preparedPairPublications = new WeakMap();
+const preparedEntryPairs = new WeakMap();
+const ENTRY_RELEASE_ANCHORS = new Set([
+  'manifest.json', COMPATIBILITY_DECLARATION, ...REQUIRED.keys(),
+  ...BOOTSTRAP_HELPERS.map(name=>`scripts/${name}`),
+]);
 
 function evidenceStat(stat) {
   return Object.freeze({
@@ -224,6 +235,72 @@ function revalidateEvidenceFile(record) {
 function evidenceSnapshot(tree) {
   return tree.records.map(record=>({path:record.path,type:record.type,stat:record.stat,
     children:record.children,target:record.target}));
+}
+
+function evidenceAnchors(snapshot,paths) {
+  const byPath=new Map(snapshot.map(record=>[record.path,record]));
+  const root=byPath.get('');
+  if(root?.type!=='directory')fail('DEPLOY_SOURCE_CHANGED');
+  const anchors=[root];
+  for(const path of paths){
+    const record=byPath.get(path);
+    if(record?.type!=='file')fail('DEPLOY_SOURCE_CHANGED');
+    anchors.push(record);
+  }
+  return anchors;
+}
+
+function revalidateEvidenceAnchors(root,anchors) {
+  const rootRecord=anchors[0];
+  if(rootRecord.path!==''||rootRecord.type!=='directory'||!same(rootRecord.stat,fs.fstatSync(root.fd,{bigint:true}))){
+    fail('DEPLOY_SOURCE_CHANGED');
+  }
+  root.verify();
+  for(const record of anchors.slice(1)){
+    const parts=record.path.split('/');const leaf=parts.pop();const opened=[];let directory=root;
+    try{
+      for(const part of parts){directory=directory.child(part);opened.push(directory);}
+      const current=fs.lstatSync(directory.at(leaf),{bigint:true});
+      if(statKind(current)!==record.type||!same(record.stat,current))fail('DEPLOY_SOURCE_CHANGED');
+      directory.verify();
+    }finally{for(const child of opened.reverse())child.close();}
+  }
+}
+
+function captureEvidenceSnapshot(root,{repositoryRoot=null,artifactPaths=new Set(),limit=()=>MAX_FILE}={}) {
+  const records=[];const artifacts=new Map();
+  function visit(directory,prefix,captured=null) {
+    const children=names(directory);
+    records.push({path:prefix,type:'directory',stat:evidenceStat(captured??fs.fstatSync(directory.fd,{bigint:true})),children});
+    for(const name of children){
+      if(records.length>=MAX_ENTRIES)fail('DEPLOY_SOURCE_CHANGED');
+      const relative=prefix?`${prefix}/${name}`:name;
+      const before=fs.lstatSync(directory.at(name),{bigint:true});
+      if(repositoryRoot!==null&&name==='.env'){
+        if(relative!=='mcp-server/.env'||!before.isSymbolicLink())fail('DEPLOY_RELEASE_INVALID');
+        const retained=readLink(directory,name);
+        if(retained.target!==path.join(repositoryRoot,'mcp-server/.env')||!same(before,retained.stat))fail('DEPLOY_RELEASE_INVALID');
+        records.push({path:relative,type:'symlink',stat:evidenceStat(before),target:retained.target});
+      }else if(before.isDirectory()){
+        safeStat(before,'directory');const child=directory.child(name);
+        try{visit(child,relative,before);}finally{child.close();}
+      }else if(before.isFile()){
+        const retained=readBytes(directory,name,limit(relative));
+        if(!same(before,fs.lstatSync(directory.at(name),{bigint:true})))fail('DEPLOY_SOURCE_CHANGED');
+        const record={path:relative,type:'file',stat:evidenceStat(before),sha256:digest(retained.bytes)};
+        if(relative==='manifest.json')record.bytes=Buffer.from(retained.bytes);
+        if(artifactPaths.has(relative))artifacts.set(relative,Buffer.from(retained.bytes));
+        records.push(record);
+      }else if(before.isSymbolicLink()){
+        const retained=readLink(directory,name);
+        if(!same(before,retained.stat))fail('DEPLOY_SOURCE_CHANGED');
+        records.push({path:relative,type:'symlink',stat:evidenceStat(before),target:retained.target});
+      }else fail('DEPLOY_SOURCE_CHANGED');
+    }
+    if(canonical(children)!==canonical(names(directory)))fail('DEPLOY_SOURCE_CHANGED');
+    directory.verify();
+  }
+  visit(root,'');return {records,artifacts};
 }
 
 function revalidateEvidenceSnapshot(root, snapshot) {
@@ -660,9 +737,10 @@ function gcPrivateBindingRecords(runtime,root,repositoryRoot) {
  * from the bounded session reaper: an empty reaper result is not absence proof. */
 export function snapshotBootstrapReferences({repositoryRoot}) {
   return withStore(repositoryRoot, false, (runtime, root) => {
-    if (!runtime) return {retained:new Set(), generations:[],records:[]};
+    if (!runtime) return {retained:new Set(),generations:[],records:[],currentObservation:null};
     const retained=new Set();
     const current=currentIn(runtime,repositoryRoot,false);
+    const currentObservation=current?.observation??null;
     if(current?.version===2){
       retained.add(current.bootstrapId);
       const manifest=activationIn(runtime,repositoryRoot,current.activationId,false,2);
@@ -674,7 +752,7 @@ export function snapshotBootstrapReferences({repositoryRoot}) {
     for(const record of records)if(record.live)retained.add(record.bootstrapId);
     let v2;let bootstraps;
     try{v2=runtime.child('v2',false,true);bootstraps=v2.child('bootstraps',false,true);}
-    catch(error){if(error.code==='ENOENT'){v2?.close();return {retained,generations:[],records};}throw error;}
+    catch(error){if(error.code==='ENOENT'){v2?.close();return {retained,generations:[],records,currentObservation};}throw error;}
     try{
       const generations=[];
       for(const bootstrapId of names(bootstraps)){
@@ -689,41 +767,116 @@ export function snapshotBootstrapReferences({repositoryRoot}) {
         }finally{generation.close();}
       }
       bootstraps.verify();v2.verify();runtime.verify();
-      return {retained,generations:generations.sort((a,b)=>a.bootstrapId.localeCompare(b.bootstrapId)),records};
+      return {retained,generations:generations.sort((a,b)=>a.bootstrapId.localeCompare(b.bootstrapId)),
+        records,currentObservation};
     }finally{bootstraps.close();v2.close();}
+  });
+}
+
+function withPlannedBootstrapGeneration(planned,generationLease,remove) {
+  const {repositoryRoot,bootstrapId,identity,leaseIdentity,leasePath}=planned;
+  return withStore(repositoryRoot,false,runtime=>{
+    let v2;let bootstraps;let generation;
+    try {
+      if(!runtime)fail('DEPLOY_BOOTSTRAP_CHANGED');
+      v2=runtime.child('v2',false,true);
+      bootstraps=v2.child('bootstraps',false,true);
+      generation=bootstraps.child(bootstrapId,false,true);
+      if(generationLease){
+        requireLeaseIdentity(generationLease,leasePath,'DEPLOY_BOOTSTRAP_CHANGED');
+        const held=fs.fstatSync(generationLease.fd,{bigint:true});
+        if(canonical(durableIdentity(held))!==canonical(leaseIdentity))fail('DEPLOY_BOOTSTRAP_CHANGED');
+      }
+      const actual=durableIdentity(fs.fstatSync(generation.fd,{bigint:true}));
+      const named=fs.lstatSync(generation.at('lease'),{bigint:true});
+      if(canonical(actual)!==canonical(identity)||!named.isFile()||named.nlink!==1n||
+          canonical(durableIdentity(named))!==canonical(leaseIdentity))fail('DEPLOY_BOOTSTRAP_CHANGED');
+      generation.verify();
+      return remove?.({directory:bootstraps.at(bootstrapId),identity:actual,
+        syncSource:()=>{fs.fsyncSync(bootstraps.fd);bootstraps.verify();}});
+    } catch(error) { boundary(error,'DEPLOY_BOOTSTRAP_CHANGED'); }
+    finally { generation?.close();bootstraps?.close();v2?.close(); }
+  });
+}
+
+function retainedPruneState(repositoryRoot,retainedEvidence) {
+  if(!retainedEvidence||typeof retainedEvidence!=='object'||Array.isArray(retainedEvidence)||
+      !exact(retainedEvidence,['evidence','prepared']))fail('DEPLOY_SOURCE_CHANGED');
+  const {evidence,prepared}=retainedEvidence;
+  const {state,evidenceRecord}=pairPublicationState(repositoryRoot,prepared);
+  if(state.evidence!==evidence)fail('DEPLOY_SOURCE_CHANGED');
+  return {state,evidenceRecord};
+}
+function retainedPruneReferences({repositoryRoot,bootstrapId,retainedEvidence}) {
+  const {state,evidenceRecord}=retainedPruneState(repositoryRoot,retainedEvidence);
+  return withStore(repositoryRoot,false,(runtime,root)=>{
+    if(!runtime)fail('DEPLOY_SOURCE_CHANGED');
+    readGeneration(runtime,repositoryRoot,bootstrapId);
+    const current=JSON.parse(state.current);
+    const retained=new Set([current.bootstrapId]);const records=[];
+    const activation=activationIn(runtime,repositoryRoot,current.activationId,false,2);
+    if(activation.priorCurrent?.version===2)retained.add(activation.priorCurrent.bootstrapId);
+    let location;
+    try{location=v2Namespace(runtime,bootstrapId,'invocation');}
+    catch(error){if(error.code!=='ENOENT')throw error;}
+    try{
+      if(location){
+        const actual=v2BindingEntries(location.namespace,'invocation',{scan:{count:0}});
+        if(!actual.complete)sessionFail();
+        for(const entry of actual.entries){
+          if(entry.state!=='public'){
+            const value=v2PrivateEvidence(location.namespace,root.stat,repositoryRoot,'invocation',bootstrapId,entry);
+            if(value===null)sessionFail();
+            records.push({...value.record,
+              token:`v2:${value.record.bootstrapId}:${entry.id}:${digest(value.bytes)}`,
+              live:false,private:true,privateName:entry.name,privateState:entry.state});
+            continue;
+          }
+          const data=v2Record(runtime,root,repositoryRoot,entry.id,null,bootstrapId);
+          const live=leaseIsHeld(data.leaseFile);
+          records.push({...data.record,token:data.token,live});
+          if(live)retained.add(bootstrapId);
+        }
+      }
+    }finally{if(location)closeV2Namespace(location);}
+    revalidateRuntimeEvidenceState(evidenceRecord);
+    const sessionSnapshot=revalidatePairPublicationIn({repositoryRoot,runtime,root,state,prune:true});
+    for(const row of sessionSnapshot.rows){retained.add(row.bootstrapId);records.push({...row,live:true});}
+    records.push(...sessionSnapshot.stale);
+    return {retained,records};
   });
 }
 
 /** Revalidate a planned generation under the canonical reclaim lock order.
  * The callback runs while generation EX and both authoritative indexes SH are
  * held; it must only capture/remove the already snapshotted generation. */
-export function withUnreferencedBootstrapGeneration({repositoryRoot,bootstrapId,identity,deployLease,publicationLease,remove,observe}) {
+export function withUnreferencedBootstrapGeneration({repositoryRoot,bootstrapId,identity,leaseIdentity,
+  deployLease,publicationLease,retainedEvidence=null,remove,observe}) {
   requireLeaseIdentity(deployLease,path.join(repositoryRoot,'.jhw-runtime/deploy.lock'),'DEPLOY_BOOTSTRAP_INVALID');
   requireLeaseIdentity(publicationLease,path.join(repositoryRoot,'.jhw-runtime/publication.lock'),'DEPLOY_BOOTSTRAP_INVALID');
-  if(!BOOTSTRAP.test(bootstrapId)||!identity||typeof remove!=='function')fail('DEPLOY_BOOTSTRAP_INVALID');
+  if(!BOOTSTRAP.test(bootstrapId)||!identity||!leaseIdentity||typeof remove!=='function')fail('DEPLOY_BOOTSTRAP_INVALID');
+  const leasePath=path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${bootstrapId}/lease`);
+  const planned={repositoryRoot,bootstrapId,identity,leaseIdentity,leasePath};
   let generationLease;let sessionIndex;let invocationIndex;let stale=[];let result=false;
-  try{generationLease=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${bootstrapId}/lease`));}
-  catch(error){if(error.code==='DEPLOY_LOCK_CONTENDED')return false;throw error;}
+  try{generationLease=acquireLease(leasePath);}
+  catch(error){if(error.code!=='DEPLOY_LOCK_CONTENDED')throw error;
+    withPlannedBootstrapGeneration(planned,null);return false;}
   try{
     observe?.('generation_ex_acquired',{bootstrapId});
     sessionIndex=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);
     invocationIndex=v2IndexLease(repositoryRoot,bootstrapId,'invocation',true);
-    const snapshot=snapshotBootstrapReferences({repositoryRoot});
+    const snapshot=retainedEvidence===null?snapshotBootstrapReferences({repositoryRoot}):
+      retainedPruneReferences({repositoryRoot,bootstrapId,retainedEvidence});
+    withPlannedBootstrapGeneration(planned,generationLease);
     if(snapshot.retained.has(bootstrapId))return false;
     stale=snapshot.records.filter(record=>record.bootstrapId===bootstrapId&&!record.live);
-    if(!stale.length){const planned=snapshot.generations.find(item=>item.bootstrapId===bootstrapId);
-     if(!planned||canonical(planned.identity)!==canonical(identity))fail('DEPLOY_BOOTSTRAP_CHANGED');
-     result=withStore(repositoryRoot,false,runtime=>{
-      const v2=runtime.child('v2',false,true);const bootstraps=v2.child('bootstraps',false,true);
-      const generation=bootstraps.child(bootstrapId,false,true);
-      try{
-        const stat=fs.fstatSync(generation.fd,{bigint:true});
-        const actual={dev:String(stat.dev),ino:String(stat.ino),uid:Number(stat.uid),mode:Number(stat.mode&0o7777n)};
-        if(canonical(actual)!==canonical(identity))fail('DEPLOY_BOOTSTRAP_CHANGED');
-        return remove({directory:bootstraps.at(bootstrapId),identity:actual,
-          syncSource:()=>{fs.fsyncSync(bootstraps.fd);bootstraps.verify();}});
-      }finally{generation.close();bootstraps.close();v2.close();}
-     });}
+    if(!stale.length){
+      if(retainedEvidence===null){
+        const candidate=snapshot.generations.find(item=>item.bootstrapId===bootstrapId);
+        if(!candidate||canonical(candidate.identity)!==canonical(identity))fail('DEPLOY_BOOTSTRAP_CHANGED');
+      }
+      result=withPlannedBootstrapGeneration(planned,generationLease,remove);
+    }
   }finally{invocationIndex?.close();sessionIndex?.close();generationLease.close();}
   if(stale.length){
     for(const row of stale){const {token,live:_live,private:privateRecord,privateName,privateState,...record}=row;try{
@@ -763,6 +916,188 @@ function validateRuntimePairIn(runtime,repositoryRoot,pair,code) {
       canonical(source.files)!==canonical(generation.manifest.files) ||
       releaseCompatibilityIn(runtime,repositoryRoot,pair.releaseId)!==pair.compatibilityDigest)fail(code);
   return generation;
+}
+
+function releaseEntriesFromEvidence(tree,repositoryRoot) {
+  const entries=[];
+  for(const record of tree.records){
+    if(record.path===''||record.path==='manifest.json')continue;
+    if(!['mcp-server','scripts','skills'].includes(record.path.split('/')[0]))fail('DEPLOY_RELEASE_INVALID');
+    if(record.type==='directory'){
+      entries.push({path:record.path,type:'directory',mode:Number(record.stat.mode)&0o7777});
+    }else if(record.type==='file'){
+      entries.push({path:record.path,type:'file',mode:Number(record.stat.mode)&0o7777,sha256:record.sha256});
+    }else if(record.path==='mcp-server/.env'&&record.target===path.join(repositoryRoot,'mcp-server/.env')){
+      entries.push({path:record.path,type:'credential',target:'canonical-mcp-env'});
+    }else{
+      if(path.isAbsolute(record.target)||!record.target||record.target.includes('\0')||record.target.includes('\\'))fail('DEPLOY_RELEASE_INVALID');
+      entries.push({path:record.path,type:'symlink',target:record.target});
+    }
+  }
+  entries.sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
+  validateLinks(entries);
+  return entries;
+}
+
+function capturedCompatibilityDeclaration(release) {
+  const entry=release.manifest.entries.find(candidate=>candidate.path===COMPATIBILITY_DECLARATION);
+  if(!entry)return null;
+  if(entry.type!=='file')fail('DEPLOY_RELEASE_INVALID');
+  const bytes=release.artifacts.get(COMPATIBILITY_DECLARATION);
+  if(!bytes||digest(bytes)!==entry.sha256)fail('DEPLOY_RELEASE_INVALID');
+  let value;
+  try{value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}
+  catch{fail('DEPLOY_RELEASE_INVALID');}
+  if(!exact(value,['version','generation','guardFloor'])||value.version!==1||![1,2].includes(value.generation)||
+      !Number.isSafeInteger(value.guardFloor)||value.guardFloor<=0)fail('DEPLOY_RELEASE_INVALID');
+  return value;
+}
+function capturedBootstrapFiles(release) {
+  const files=[];
+  for(const name of BOOTSTRAP_HELPERS){
+    const record=release.manifest.entries.find(entry=>entry.path===`scripts/${name}`);
+    const bytes=release.artifacts.get(`scripts/${name}`);
+    if(!record||record.type!=='file'||record.mode!==0o644||!bytes||digest(bytes)!==record.sha256){
+      fail('DEPLOY_BOOTSTRAP_INVALID');
+    }
+    files.push({name,mode:0o644,sha256:record.sha256});
+  }
+  return files;
+}
+
+function captureEntryRelease(runtime,repositoryRoot,releaseId) {
+  let releases;let release;
+  try{
+    if(typeof releaseId!=='string'||!RELEASE.test(releaseId))fail('DEPLOY_RELEASE_INVALID');
+    releases=runtime.child('releases',false,true);release=releases.child(releaseId,false,true);
+    const captured=captureEvidenceSnapshot(release,{repositoryRoot,artifactPaths:new Set([
+      COMPATIBILITY_DECLARATION,...BOOTSTRAP_HELPERS.map(name=>`scripts/${name}`),
+    ]),limit:relative=>relative==='manifest.json'?MAX_MANIFEST:MAX_FILE});
+    const manifestRecord=captured.records.find(record=>record.path==='manifest.json');
+    if(!manifestRecord?.bytes||(Number(manifestRecord.stat.mode)&0o7777)!==0o600)fail('DEPLOY_RELEASE_INVALID');
+    let manifest;
+    try{manifest=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(manifestRecord.bytes));}
+    catch{fail('DEPLOY_RELEASE_INVALID');}
+    if(!exact(manifest,['version','releaseId','sourceRevision','sourceDigest','contentDigest','dirty','createdAt','entries'])||
+        manifest.version!==1||manifest.releaseId!==releaseId||manifest.sourceRevision!==RELEASE.exec(releaseId)[1]||
+        typeof manifest.sourceDigest!=='string'||!DIGEST.test(manifest.sourceDigest)||typeof manifest.dirty!=='boolean'||
+        !timestamp(manifest.createdAt)||!validEntries(manifest.entries)||contentDigest(manifest)!==manifest.contentDigest||
+        RELEASE.exec(releaseId)[2]!==manifest.contentDigest)fail('DEPLOY_RELEASE_INVALID');
+    const entries=releaseEntriesFromEvidence(captured,repositoryRoot);
+    if(canonical(entries)!==canonical(manifest.entries))fail('DEPLOY_RELEASE_INVALID');
+    requiredArtifacts(entries);credentialSource(repositoryRoot);
+    const snapshot=evidenceSnapshot(captured);
+    revalidateEvidenceSnapshot(release,snapshot);
+    return {releaseId,manifest,snapshot,artifacts:new Map(captured.artifacts)};
+  }catch(error){boundary(error,'DEPLOY_RELEASE_INVALID');}
+  finally{release?.close();releases?.close();}
+}
+
+function prepareEntryPairEvidence({repositoryRoot,selectedPair,generationLease}) {
+  const handle=Object.freeze({});
+  const state=withStore(repositoryRoot,false,(runtime,root)=>{
+    if(!runtime)sessionFail();
+    let v2;let catalog;let bootstraps;let generation;
+    try{
+      v2=runtime.child('v2',false,true);catalog=v2.child('bootstrap-catalog',false,true);
+      const catalogName=`${selectedPair.bootstrapId}.json`;
+      const capturedCatalog=captureEvidenceFile(catalog,catalogName,16384);
+      let generationRecord;
+      try{generationRecord=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(capturedCatalog.bytes));}
+      catch{fail('DEPLOY_BOOTSTRAP_INVALID');}
+      if(!generationManifest(generationRecord,selectedPair.bootstrapId)||
+          capturedCatalog.bytes.toString('utf8')!==canonical(generationRecord)+'\n')fail('DEPLOY_BOOTSTRAP_INVALID');
+      const releaseIds=new Set([selectedPair.releaseId,generationRecord.sourceReleaseId]);
+      const releases=new Map([...releaseIds].map(releaseId=>[releaseId,captureEntryRelease(runtime,repositoryRoot,releaseId)]));
+      const selected=releases.get(selectedPair.releaseId);const source=releases.get(generationRecord.sourceReleaseId);
+      const declaration=capturedCompatibilityDeclaration(selected);
+      if(declaration?.generation!==2||declaration.guardFloor!==1||
+          compatibilityDigest(selected.manifest,declaration)!==selectedPair.compatibilityDigest)sessionFail();
+      const sourceDeclaration=capturedCompatibilityDeclaration(source);
+      if(sourceDeclaration?.generation!==2||sourceDeclaration.guardFloor!==1)fail('DEPLOY_BOOTSTRAP_INVALID');
+      const sourceFiles=capturedBootstrapFiles(source);const selectedFiles=capturedBootstrapFiles(selected);
+      if(canonical(sourceFiles)!==canonical(generationRecord.files)||canonical(selectedFiles)!==canonical(generationRecord.files)||
+          generationRecord.runtimeContract!==selectedPair.runtimeContract){
+        fail('DEPLOY_BOOTSTRAP_INVALID');
+      }
+      bootstraps=v2.child('bootstraps',false,true);generation=bootstraps.child(selectedPair.bootstrapId,false,true);
+      requireLeaseIdentity(generationLease,path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${selectedPair.bootstrapId}/lease`),
+        'DEPLOY_BOOTSTRAP_INVALID',false);
+      const generationCaptured=captureEvidenceSnapshot(generation,{artifactPaths:new Set(['lease',...BOOTSTRAP_HELPERS]),
+        limit:relative=>relative==='manifest.json'?16384:relative==='lease'?1:1024*1024});
+      const rootRecord=generationCaptured.records.find(record=>record.path==='');
+      if(canonical(rootRecord?.children)!==canonical(['lease','manifest.json',...BOOTSTRAP_HELPERS]))fail('DEPLOY_BOOTSTRAP_INVALID');
+      const copyManifest=generationCaptured.records.find(record=>record.path==='manifest.json');
+      if(!copyManifest?.bytes||!copyManifest.bytes.equals(capturedCatalog.bytes)||
+          generationCaptured.artifacts.get('lease')?.length!==0)fail('DEPLOY_BOOTSTRAP_INVALID');
+      for(const record of generationRecord.files){
+        const copy=generationCaptured.records.find(item=>item.path===record.name);
+        const bytes=generationCaptured.artifacts.get(record.name);const original=source.artifacts.get(`scripts/${record.name}`);
+        if(!copy||copy.type!=='file'||(Number(copy.stat.mode)&0o7777)!==record.mode||copy.sha256!==record.sha256||
+            !bytes||!original||!bytes.equals(original))fail('DEPLOY_BOOTSTRAP_INVALID');
+      }
+      const generationSnapshot=evidenceSnapshot(generationCaptured);
+      revalidateEvidenceSnapshot(generation,generationSnapshot);
+      revalidateEvidenceFile(capturedCatalog);
+      return {repositoryRoot,pair:canonical(selectedPair),root:evidenceStat(root.stat),runtime:evidenceStat(runtime.stat),
+        releases:[...releases.values()].map(item=>({releaseId:item.releaseId,snapshot:item.snapshot,
+          anchors:evidenceAnchors(item.snapshot,ENTRY_RELEASE_ANCHORS)})),
+        catalog:{name:catalogName,stat:evidenceStat(capturedCatalog.stat)},generationLease,generationSnapshot,
+        generationAnchors:evidenceAnchors(generationSnapshot,new Set(['lease','manifest.json',...BOOTSTRAP_HELPERS]))};
+    }finally{
+      generation?.close();
+      bootstraps?.close();catalog?.close();v2?.close();
+    }
+  });
+  preparedEntryPairs.set(handle,state);return handle;
+}
+
+function revalidateEntryPairEvidenceIn(runtime,root,repositoryRoot,evidence,selectedPair) {
+  const state=preparedEntryPairs.get(evidence);
+  if(!state||state.repositoryRoot!==repositoryRoot||state.pair!==canonical(selectedPair)||
+      !objectSame(state.root,root.stat)||!objectSame(state.runtime,runtime.stat))sessionFail();
+  requireLeaseIdentity(state.generationLease,
+    path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${selectedPair.bootstrapId}/lease`),
+    'DEPLOY_BOOTSTRAP_INVALID',false);
+  let releases;let v2;let catalog;let bootstraps;let generation;
+  try{
+    releases=runtime.child('releases',false,true);
+    for(const retained of state.releases){
+      const release=releases.child(retained.releaseId,false,true);
+      try{revalidateEvidenceSnapshot(release,retained.snapshot);}finally{release.close();}
+    }
+    v2=runtime.child('v2',false,true);catalog=v2.child('bootstrap-catalog',false,true);
+    const catalogStat=fs.lstatSync(catalog.at(state.catalog.name),{bigint:true});
+    if(!catalogStat.isFile()||!same(state.catalog.stat,catalogStat))sessionFail();
+    catalog.verify();
+    bootstraps=v2.child('bootstraps',false,true);generation=bootstraps.child(selectedPair.bootstrapId,false,true);
+    revalidateEvidenceSnapshot(generation,state.generationSnapshot);
+  }catch{sessionFail();}
+  finally{generation?.close();bootstraps?.close();catalog?.close();v2?.close();releases?.close();}
+}
+
+function confirmEntryPairEvidenceIn(runtime,root,repositoryRoot,evidence,selectedPair) {
+  const state=preparedEntryPairs.get(evidence);
+  if(!state||state.repositoryRoot!==repositoryRoot||state.pair!==canonical(selectedPair)||
+      !objectSame(state.root,root.stat)||!objectSame(state.runtime,runtime.stat))sessionFail();
+  requireLeaseIdentity(state.generationLease,
+    path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${selectedPair.bootstrapId}/lease`),
+    'DEPLOY_BOOTSTRAP_INVALID',false);
+  let releases;let v2;let catalog;let bootstraps;let generation;
+  try{
+    releases=runtime.child('releases',false,true);
+    for(const retained of state.releases){
+      const release=releases.child(retained.releaseId,false,true);
+      try{revalidateEvidenceAnchors(release,retained.anchors);}finally{release.close();}
+    }
+    v2=runtime.child('v2',false,true);catalog=v2.child('bootstrap-catalog',false,true);
+    const catalogStat=fs.lstatSync(catalog.at(state.catalog.name),{bigint:true});
+    if(!catalogStat.isFile()||!same(state.catalog.stat,catalogStat))sessionFail();
+    catalog.verify();
+    bootstraps=v2.child('bootstraps',false,true);generation=bootstraps.child(selectedPair.bootstrapId,false,true);
+    revalidateEvidenceAnchors(generation,state.generationAnchors);
+  }catch{sessionFail();}
+  finally{generation?.close();bootstraps?.close();catalog?.close();v2?.close();releases?.close();}
 }
 
 /** Complete validation and hashing happen here, outside publication.lock. The
@@ -836,6 +1171,9 @@ export function prepareRuntimeEvidence({repositoryRoot,pairs}) {
 
 export function revalidateRuntimeEvidence(evidence) {
   const state=evidenceState(evidence);
+  revalidateRuntimeEvidenceState(state);
+}
+function revalidateRuntimeEvidenceState(state) {
   try {
     state.root.verify(); state.runtime.verify();
     for (const tree of state.trees) revalidateEvidenceTree(tree);
@@ -2159,6 +2497,16 @@ function compatibilityDeclaration(release, manifest) {
       !Number.isSafeInteger(value.guardFloor) || value.guardFloor <= 0) fail('DEPLOY_RELEASE_INVALID');
   return value;
 }
+function compatibilityDigest(manifest,declaration) {
+  return declaration === null
+    ? digest(canonical({ version: 1, entries: manifest.entries.filter(entry => !compatibleMcpEntry(entry.path)) }))
+    : declaration.generation === 1
+      ? digest(canonical({ version: 2, generation: declaration.generation, guardFloor: declaration.guardFloor,
+          entries: manifest.entries.map(entry => compatibilityEntry(entry, 1)) }))
+      : digest(canonical({ version: 3, generation: declaration.generation, guardFloor: declaration.guardFloor,
+          runtimeContract: 2, routerContract: 1,
+          entries: manifest.entries.map(entry => compatibilityEntry(entry, 2)) }));
+}
 function releaseCompatibilityIn(runtime, repositoryRoot, releaseId, walkTree = true) {
   const validated = validateReleaseIn(runtime, repositoryRoot, releaseId, walkTree);
   let releases; let release;
@@ -2172,14 +2520,7 @@ function releaseCompatibilityIn(runtime, repositoryRoot, releaseId, walkTree = t
       const helpers = manifest.entries.filter(entry => GENERATION_HELPERS.has(entry.path));
       if (helpers.length !== GENERATION_HELPERS.size || helpers.some(entry => entry.type !== 'file')) fail('DEPLOY_RELEASE_INVALID');
     }
-    const result = declaration === null
-      ? digest(canonical({ version: 1, entries: manifest.entries.filter(entry => !compatibleMcpEntry(entry.path)) }))
-      : declaration.generation === 1
-        ? digest(canonical({ version: 2, generation: declaration.generation, guardFloor: declaration.guardFloor,
-            entries: manifest.entries.map(entry => compatibilityEntry(entry, 1)) }))
-        : digest(canonical({ version: 3, generation: declaration.generation, guardFloor: declaration.guardFloor,
-            runtimeContract: 2, routerContract: 1,
-            entries: manifest.entries.map(entry => compatibilityEntry(entry, 2)) }));
+    const result = compatibilityDigest(manifest,declaration);
     release.verify();
     if (canonical(manifest) !== canonical(readJson(release))) fail('DEPLOY_RELEASE_INVALID');
     return result;
@@ -2391,7 +2732,7 @@ function createSessionBindingWith({ repositoryRoot, releaseId, kind, parentBindi
 
 const V2_BINDING_TOKEN = /^v2:(b-[a-f0-9]{64}):((?:s|i)-[a-f0-9]{32}):([a-f0-9]{64})$/;
 const V2_PRIVATE_BINDING = /^(?:\.creating\.((?:s|i)-[a-f0-9]{32})|\.retired\.((?:s|i)-[a-f0-9]{32})\.[a-f0-9]{32})$/;
-function v2IndexLease(repositoryRoot, bootstrapId, kind, shared) {
+function v2IndexLease(repositoryRoot, bootstrapId, kind, shared, options={}) {
   const file = kind === 'session'
     ? path.join(repositoryRoot, '.jhw-runtime/v2/session-index.lock')
     : path.join(repositoryRoot, `.jhw-runtime/v2/invocation-index/${bootstrapId}.lock`);
@@ -2401,11 +2742,16 @@ function v2IndexLease(repositoryRoot, bootstrapId, kind, shared) {
     try{if(kind==='invocation')indexes=v2.child('invocation-index',true,true);}
     finally{indexes?.close();v2.close();}
   });
-  const deadline = process.hrtime.bigint() + SESSION_INDEX_WAIT_NS;
+  const deadline=options.deadline??process.hrtime.bigint()+SESSION_INDEX_WAIT_NS;
+  let waited=false;
   for (;;) {
-    try { return acquireLease(file, {shared,create:true}); }
+    try {
+      const lease=acquireLease(file,{shared,create:true});
+      return options.reportWait?{lease,waited}:lease;
+    }
     catch (error) {
       if (error.code !== 'DEPLOY_LOCK_CONTENDED' || process.hrtime.bigint() >= deadline) sessionFail();
+      waited=true;
       Atomics.wait(SESSION_INDEX_SLEEP, 0, 0, 5);
     }
   }
@@ -2504,20 +2850,20 @@ function verifyV2Pair(runtime, repositoryRoot, record) {
   readGeneration(runtime, repositoryRoot, record.bootstrapId);
   if (releaseCompatibilityIn(runtime, repositoryRoot, record.releaseId) !== record.compatibilityDigest) sessionFail();
 }
-function verifyV2Live(runtime, repositoryRoot, data, pid) {
+function verifyV2Live(runtime, repositoryRoot, data, pid, verifyPair = true) {
   if (!leaseIsHeld(data.leaseFile)) sessionFail();
   ownerMatches(data.record);
   requireSessionDescendant(pid, data.record);
-  verifyV2Pair(runtime, repositoryRoot, data.record);
+  if(verifyPair)verifyV2Pair(runtime, repositoryRoot, data.record);
   if (!leaseIsHeld(data.leaseFile)) sessionFail();
   ownerMatches(data.record);
 }
-function v2RootByToken(runtime, root, repositoryRoot, token, pid) {
+function v2RootByToken(runtime, root, repositoryRoot, token, pid, verifyPair = true) {
   const parsed = V2_ROOT_TOKEN.exec(token);
   if (!parsed) sessionFail();
   const data = v2Record(runtime, root, repositoryRoot, parsed[2], token);
   if (data.record.kind !== 'session' || data.record.bootstrapId !== parsed[1]) sessionFail();
-  verifyV2Live(runtime, repositoryRoot, data, pid);
+  verifyV2Live(runtime, repositoryRoot, data, pid, verifyPair);
   return data;
 }
 function revalidateV2ParentForPublication(runtime,root,repositoryRoot,token,pid,selectedPair,parentLease){
@@ -2571,14 +2917,13 @@ function retireV2Record({repositoryRoot,record,token}) {
     } finally { index.close(); }
   } finally { generation?.close(); }
 }
-function createV2Record({repositoryRoot,selectedPair,kind,parentBinding,generationLease,parentLease}) {
+function createV2Record({repositoryRoot,selectedPair,kind,parentBinding,generationLease,parentLease,pairEvidence}) {
   return withStore(repositoryRoot,false,(runtime,root) => {
     const observed=sessionProcess(process.pid);
     const owner={uid:observed.uid,pid:observed.pid,startTime:observed.startTime,bootId:sessionBootId(),
       commandDigest:observed.commandDigest,exeDev:observed.exeDev,exeIno:observed.exeIno};
     const id=(kind==='session'?'s-':'i-')+randomBytes(16).toString('hex');
     const staging='.creating.'+id;
-    const index=v2IndexLease(repositoryRoot,selectedPair.bootstrapId,kind,false);
     const location=v2Namespace(runtime,selectedPair.bootstrapId,kind,true);
     let directory;let lease;let manifestFd;let published=false;
     try {
@@ -2601,6 +2946,7 @@ function createV2Record({repositoryRoot,selectedPair,kind,parentBinding,generati
       if (!validV2SessionRecord(record)) sessionFail();
       const bytes=canonical(record)+'\n'; fs.writeFileSync(manifestFd,bytes); fs.fsyncSync(manifestFd);
       fs.closeSync(manifestFd);manifestFd=undefined;fs.fsyncSync(directory.fd);
+      confirmEntryPairEvidenceIn(runtime,root,repositoryRoot,pairEvidence,selectedPair);
       if(parentBinding!==null)revalidateV2ParentForPublication(runtime,root,repositoryRoot,parentBinding,process.pid,selectedPair,parentLease);
       ownerMatches(record);fs.renameSync(location.namespace.at(staging),location.namespace.at(id));published=true;
       fs.fsyncSync(location.namespace.fd);directory.close();directory=undefined;
@@ -2615,7 +2961,7 @@ function createV2Record({repositoryRoot,selectedPair,kind,parentBinding,generati
     } finally {
       if(manifestFd!==undefined)fs.closeSync(manifestFd);lease?.close();
       if(!published&&directory){try{for(const name of names(directory))fs.unlinkSync(directory.at(name));fs.rmdirSync(location.namespace.at(staging));}catch{}}
-      directory?.close();closeV2Namespace(location);index.close();
+      directory?.close();closeV2Namespace(location);
     }
   });
 }
@@ -2631,20 +2977,34 @@ export function bindEntryPair({repositoryRoot,token,kind='invocation',selectedPa
           runtimeContract:current.runtimeContract,compatibilityDigest:current.compatibilityDigest})!==canonical(selectedPair))return {retryCurrent:true};
     }
     let generationLease=acquireLease(path.join(repositoryRoot,`.jhw-runtime/v2/bootstraps/${selectedPair.bootstrapId}/lease`),{shared:true});
-    let parentLease=null;
+    let parentLease=null;let index=null;
     try {
-      validateBootstrapGeneration({repositoryRoot,bootstrapId:selectedPair.bootstrapId});
       if(token!==undefined){
-        const parent=withStore(repositoryRoot,false,(runtime,root)=>v2RootByToken(runtime,root,repositoryRoot,token,process.pid));
+        const parent=withStore(repositoryRoot,false,(runtime,root)=>v2RootByToken(runtime,root,repositoryRoot,token,process.pid,false));
         const pair={releaseId:parent.record.releaseId,bootstrapId:parent.record.bootstrapId,runtimeContract:parent.record.runtimeContract,
           compatibilityDigest:parent.record.compatibilityDigest};
         if(canonical(pair)!==canonical(selectedPair))sessionFail();
         parentLease=acquireLease(parent.leaseFile,{shared:true});
-        withStore(repositoryRoot,false,(runtime,root)=>v2RootByToken(runtime,root,repositoryRoot,token,process.pid));
+        withStore(repositoryRoot,false,(runtime,root)=>revalidateV2ParentForPublication(runtime,root,repositoryRoot,token,process.pid,selectedPair,parentLease));
       }
-      const result=createV2Record({repositoryRoot,selectedPair,kind,parentBinding:token??null,generationLease,parentLease});
+      const pairEvidence=prepareEntryPairEvidence({repositoryRoot,selectedPair,generationLease});
+      let indexDeadline=null;
+      for(;;){
+        withStore(repositoryRoot,false,(runtime,root)=>
+          revalidateEntryPairEvidenceIn(runtime,root,repositoryRoot,pairEvidence,selectedPair));
+        if(token!==undefined){
+          withStore(repositoryRoot,false,(runtime,root)=>
+            revalidateV2ParentForPublication(runtime,root,repositoryRoot,token,process.pid,selectedPair,parentLease));
+        }
+        indexDeadline??=process.hrtime.bigint()+SESSION_INDEX_WAIT_NS;
+        const acquired=v2IndexLease(repositoryRoot,selectedPair.bootstrapId,kind,false,
+          {deadline:indexDeadline,reportWait:true});
+        if(!acquired.waited){index=acquired.lease;break;}
+        acquired.lease.close();
+      }
+      const result=createV2Record({repositoryRoot,selectedPair,kind,parentBinding:token??null,generationLease,parentLease,pairEvidence});
       generationLease=undefined;parentLease=undefined;return result;
-    } finally {parentLease?.close();generationLease?.close();}
+    } finally {index?.close();parentLease?.close();generationLease?.close();}
   });
 }
 function inspectSessionBindingsV2WithLimit({repositoryRoot,limit=Number.MAX_SAFE_INTEGER}) {
@@ -2666,7 +3026,7 @@ export function inspectSessionBindingsV2({repositoryRoot}){return inspectSession
 
 /** Prepare an opaque, fully validated root set whose publication-time checks
  * use only pointer, process, lease, and filesystem metadata. */
-export function preparePairPublicationEvidence({repositoryRoot,evidence,current,roots}) {
+function preparePairPublicationEvidenceWithOptions({repositoryRoot,evidence,current,roots},allowStale) {
   const evidenceRecord=evidenceState(evidence);
   if(evidenceRecord.repositoryRoot!==repositoryRoot||!validV2Current(current)||!Array.isArray(roots))sessionFail();
   const handle=Object.freeze({});
@@ -2675,7 +3035,8 @@ export function preparePairPublicationEvidence({repositoryRoot,evidence,current,
     const records=new Map();
     for(const row of roots){
       const record=Object.fromEntries(Object.entries(row).filter(([key])=>key!=='token'));
-      if(!validV2SessionRecord(record)||row.kind!=='session'||!statePairPresent(evidenceRecord,row))sessionFail();
+      if(!validV2SessionRecord(record)||row.kind!=='session'||records.has(row.id)||
+          !statePairPresent(evidenceRecord,row))sessionFail();
       const data=v2Record(runtime,root,repositoryRoot,row.id,row.token);
       if(canonical(data.record)!==canonical(record))sessionFail();
       const location=v2Namespace(runtime,null,'session');let directory;
@@ -2685,61 +3046,129 @@ export function preparePairPublicationEvidence({repositoryRoot,evidence,current,
           lease:evidenceStat(fs.lstatSync(directory.at('lease'),{bigint:true}))});
       }finally{directory?.close();closeV2Namespace(location);}
     }
-    const legacy=sessionDirectory(runtime);let legacyIds=[];
-    try{if(legacy)legacyIds=sessionInventory(legacy).ids;}finally{legacy?.close();}
-    if(legacyIds.length)sessionFail();
+    if(!allowStale)checkLegacyPublicationSessions(runtime,root,repositoryRoot,false);
     return records;
   });
   const pair={releaseId:current.releaseId,bootstrapId:current.bootstrapId,runtimeContract:current.runtimeContract,
     compatibilityDigest:current.compatibilityDigest};
   if(!statePairPresent(evidenceRecord,pair))sessionFail();
-  preparedPairPublications.set(handle,{repositoryRoot,evidence,current:canonical(current),records:captured});
+  preparedPairPublications.set(handle,{repositoryRoot,evidence,current:canonical(current),records:captured,allowStale});
   return handle;
+}
+export function preparePairPublicationEvidence(options) {
+  return preparePairPublicationEvidenceWithOptions(options,false);
+}
+export function preparePrunePublicationEvidence(options) {
+  requireNoLiveLegacySessions(options.repositoryRoot);
+  return preparePairPublicationEvidenceWithOptions(options,true);
+}
+
+function requireNoLiveLegacySessions(repositoryRoot) {
+  if(inspectSessionBindings({repositoryRoot}).length){
+    throw new DeploymentError('DEPLOY_COMPATIBILITY_MISMATCH','v1_session');
+  }
+}
+
+// Under the legacy index, prune may encounter validated records left by a
+// stopped v1 installation. A held lease still excludes pruning with live roots.
+function checkLegacyPublicationSessions(runtime,root,repositoryRoot,prune) {
+  const legacy=sessionDirectory(runtime);
+  if(!legacy)return;
+  try{
+    if(!prune){
+      if(sessionInventory(legacy).ids.length)sessionFail();
+      return;
+    }
+    for(const id of sessionNames(legacy)){
+      const data=sessionRecord(runtime,root,repositoryRoot,id);
+      if(leaseIsHeld(data.leaseFile))throw new DeploymentError('DEPLOY_COMPATIBILITY_MISMATCH','v1_session');
+    }
+  }finally{legacy.close();}
 }
 function statePairPresent(evidenceRecord,value) {
   return evidenceRecord.pairs.has(pairKey({releaseId:value.releaseId,bootstrapId:value.bootstrapId,
     runtimeContract:value.runtimeContract,compatibilityDigest:value.compatibilityDigest}));
 }
-export function revalidatePairPublicationEvidence({repositoryRoot,prepared,observer}) {
+function pairPublicationState(repositoryRoot,prepared) {
   const state=preparedPairPublications.get(prepared);
-  if(!state||state.repositoryRoot!==repositoryRoot)evidenceFail();
+  if(!state||state.repositoryRoot!==repositoryRoot)fail('DEPLOY_SOURCE_CHANGED');
   const evidenceRecord=evidenceState(state.evidence);
-  if(evidenceRecord.repositoryRoot!==repositoryRoot)evidenceFail();
+  if(evidenceRecord.repositoryRoot!==repositoryRoot)fail('DEPLOY_SOURCE_CHANGED');
+  return {state,evidenceRecord};
+}
+function revalidatePairPublicationIn({repositoryRoot,runtime,root,state,observer,prune=false,checkLegacy=false}) {
+  const current=JSON.parse(state.current);
+  if(!runtime)fail('DEPLOY_CURRENT_CHANGED');
+  const observed=prune?currentIn(runtime,repositoryRoot,false):observation(runtime);
+  if(canonical(observed)!==canonical(prune?current:current.observation)){
+    fail('DEPLOY_CURRENT_CHANGED');
+  }
+  if(checkLegacy)checkLegacyPublicationSessions(runtime,root,repositoryRoot,prune);
+  observer?.({phase:'root_index_held',exclusive:true});
+  let location;
+  try{location=v2Namespace(runtime,null,'session');}
+  catch(error){
+    if(error.code==='ENOENT'&&state.records.size===0)return {rows:[],stale:[]};
+    throw error;
+  }
+  try{
+    const actual=v2BindingEntries(location.namespace,'session',{scan:{count:0}});
+    if(!actual.complete)sessionFail();
+    const rows=[];const stale=[];
+    for(const entry of actual.entries){
+      if(entry.state!=='public'){
+        const value=v2PrivateEvidence(location.namespace,root.stat,repositoryRoot,'session',null,entry);
+        if(value===null)sessionFail();
+        if(prune)stale.push({...value.record,
+          token:`v2:${value.record.bootstrapId}:${entry.id}:${digest(value.bytes)}`,
+          live:false,private:true,privateName:entry.name,privateState:entry.state});
+        continue;
+      }
+      const expected=state.records.get(entry.id);
+      if(!expected){
+        if(!prune||!state.allowStale)sessionFail();
+        const data=v2Record(runtime,root,repositoryRoot,entry.id);
+        if(leaseIsHeld(data.leaseFile))sessionFail();
+        stale.push({...data.record,token:data.token,live:false});
+        continue;
+      }
+      let directory;
+      try{directory=location.namespace.child(entry.id,false,true);
+        if(!same(expected.directory,fs.fstatSync(directory.fd,{bigint:true}))||
+          !same(expected.manifest,fs.lstatSync(directory.at('manifest.json'),{bigint:true}))||
+          !same(expected.lease,fs.lstatSync(directory.at('lease'),{bigint:true}))||
+          !leaseIsHeld(path.join(repositoryRoot,'.jhw-runtime/v2/sessions',entry.id,'lease')))sessionFail();
+        ownerMatches(expected.row);rows.push(expected.row);
+      }finally{directory?.close();}
+    }
+    if(prune&&rows.length!==state.records.size)sessionFail();
+    return {rows,stale};
+  }finally{closeV2Namespace(location);}
+}
+export function revalidatePairPublicationEvidence({repositoryRoot,prepared,observer}) {
+  const {state}=pairPublicationState(repositoryRoot,prepared);
+  return revalidatePairPublicationWithIndexes({repositoryRoot,state,observer});
+}
+function revalidatePairPublicationWithIndexes({repositoryRoot,state,observer,prune=false}) {
   const legacyIndex=sessionIndexLease(repositoryRoot,true);
   let v2Index;
   try{
     v2Index=v2IndexLease(repositoryRoot,'b-'+'0'.repeat(64),'session',true);
-    return withStore(repositoryRoot,false,(runtime,root)=>{
-    if(!runtime||canonical(observation(runtime))!==canonical(JSON.parse(state.current).observation))fail('DEPLOY_CURRENT_CHANGED');
-    const legacy=sessionDirectory(runtime);try{if(legacy&&sessionInventory(legacy).ids.length)sessionFail();}finally{legacy?.close();}
-    observer?.({phase:'root_index_held',exclusive:true});
-    let location;try{location=v2Namespace(runtime,null,'session');}
-    catch(error){if(error.code==='ENOENT'&&state.records.size===0)return[];throw error;}
-    try{
-      const actual=v2BindingEntries(location.namespace,'session',{scan:{count:0}});
-      if(!actual.complete)sessionFail();
-      const rows=[];
-      for(const entry of actual.entries){
-        if(entry.state!=='public'){
-          if(v2PrivateEvidence(location.namespace,root.stat,repositoryRoot,'session',null,entry)===null)sessionFail();
-          continue;
-        }
-        const id=entry.id;
-        const expected=state.records.get(id);if(!expected)sessionFail();let directory;
-        try{directory=location.namespace.child(id,false,true);
-          if(!same(expected.directory,fs.fstatSync(directory.fd,{bigint:true}))||
-            !same(expected.manifest,fs.lstatSync(directory.at('manifest.json'),{bigint:true}))||
-            !same(expected.lease,fs.lstatSync(directory.at('lease'),{bigint:true}))||
-            !leaseIsHeld(path.join(repositoryRoot,'.jhw-runtime/v2/sessions',id,'lease')))sessionFail();
-          ownerMatches(expected.row);rows.push(expected.row);
-        }finally{directory?.close();}
-      }
-      return rows;
-    }finally{closeV2Namespace(location);}
-    });
+    return withStore(repositoryRoot,false,(runtime,root)=>
+      revalidatePairPublicationIn({repositoryRoot,runtime,root,state,observer,prune,checkLegacy:true}).rows);
   }finally{
     try{v2Index?.close();}finally{legacyIndex.close();}
   }
+}
+export function revalidateRetainedPruneEvidence({repositoryRoot,retainedEvidence}) {
+  const {state,evidenceRecord}=retainedPruneState(repositoryRoot,retainedEvidence);
+  revalidateRuntimeEvidenceState(evidenceRecord);
+  requireNoLiveLegacySessions(repositoryRoot);
+  const records=inspectSessionBindingsV2({repositoryRoot});
+  if(records.some(row=>row.kind==='invocation'&&row.parentBinding===null)){
+    throw new DeploymentError('DEPLOY_CONSUMERS_ACTIVE','unbound_invocation');
+  }
+  return revalidatePairPublicationWithIndexes({repositoryRoot,state,prune:true});
 }
 export function verifyPairPublicationConsumer({prepared,observation}) {
   const state=preparedPairPublications.get(prepared);

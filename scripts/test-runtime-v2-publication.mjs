@@ -5,6 +5,7 @@ import {test} from 'node:test';
 
 import * as store from './runtime-store.mjs';
 import {acquireLease} from './runtime-safety.mjs';
+import {observeCompatiblePairDeployment} from './runtime-deploy.mjs';
 import {createRuntimeFixture} from './test-support/runtime-v2.mjs';
 
 async function prepared(t, {reuse = false} = {}) {
@@ -322,4 +323,145 @@ test('pointer intent must complete synchronously before current changes', async 
     } finally { lease.close(); }
     assert.deepEqual(store.readActivation({repositoryRoot:state.f.root}),before);
   });
+});
+
+test('prepared consumer checks reuse full evidence while root proof stays independently live', async t => {
+  const f=await createRuntimeFixture(t);
+  const release=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  t.after(()=>deployLease.close());
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  const current=f.seedPair(pair);
+  const admission=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true,create:true});
+  t.after(()=>admission.close());
+  const binding=store.bindEntryPair({repositoryRoot:f.root,selectedPair:pair,kind:'session',admissionLease:admission});
+  t.after(()=>binding.close());
+  const roots=store.inspectSessionBindingsV2({repositoryRoot:f.root})
+    .filter(row=>row.kind==='session'&&row.live).map(({live,...row})=>row);
+  assert.equal(roots.length,1);
+  const evidence=store.prepareRuntimeEvidence({repositoryRoot:f.root,pairs:[pair]});
+  t.after(()=>evidence.close());
+  const prepared=store.preparePairPublicationEvidence({repositoryRoot:f.root,evidence,current,roots});
+  assert.deepEqual(store.revalidatePairPublicationEvidence({repositoryRoot:f.root,prepared}),roots);
+  const original=fs.readSync;let releaseReads=0;
+  fs.readSync=function(fd,...args){
+    try{if(fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(path.join(f.root,'.jhw-runtime/releases')+path.sep))releaseReads++;}catch{}
+    return original.call(this,fd,...args);
+  };
+  try{
+    for(let index=0;index<32;index++)assert.equal(store.verifyPairPublicationConsumer({prepared,
+      observation:{pid:process.pid,startTime:roots[0].owner.startTime,category:'managed',args:[],token:roots[0].token}}),true);
+    assert.deepEqual(store.revalidatePairPublicationEvidence({repositoryRoot:f.root,prepared}),roots);
+  }finally{fs.readSync=original;}
+  assert.equal(releaseReads,0);
+  const baselineBound=observation=>{
+    try{store.resolveSessionBindingV2({repositoryRoot:f.root,token:observation.token,pid:observation.pid});return true;}
+    catch{return false;}
+  };
+  const preparedBound=observation=>store.verifyPairPublicationConsumer({prepared,observation});
+  const consumerCases=[
+    {name:'exact root owner and token',expected:true,
+      observation:{pid:process.pid,startTime:roots[0].owner.startTime,category:'managed',args:[],token:roots[0].token}},
+    {name:'unknown token',expected:false,
+      observation:{pid:process.pid,startTime:roots[0].owner.startTime,category:'managed',args:[],token:'invalid'}},
+    {name:'unrelated process',expected:false,
+      observation:{pid:999999999,startTime:roots[0].owner.startTime,category:'managed',args:[],token:roots[0].token}},
+  ];
+  for(const {name,expected,observation} of consumerCases){
+    const baseline=baselineBound(observation);
+    const reused=preparedBound(observation);
+    assert.equal(baseline,expected,name+' baseline result');
+    assert.equal(reused,expected,name+' prepared result');
+    assert.equal(reused,baseline,name+' methods disagree');
+  }
+  binding.close();
+  assert.deepEqual(store.revalidatePairPublicationEvidence({repositoryRoot:f.root,prepared}),[],
+    'fresh root evidence exposes membership loss even though the prepared process proof remains opaque');
+});
+
+test('module-only pair observation requires both real MCP probes before post-probe census', async t => {
+  const f=await createRuntimeFixture(t);
+  const release=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  const current=f.seedPair(pair);
+  deployLease.close();
+  f.write('mcp-server/src/index.ts','export const observedCandidate = true;\n');
+  const candidate=await f.prepare();
+  const procRoot=path.join(f.home,'observation-proc');fs.mkdirSync(procRoot,{mode:0o700});
+  const events=[];
+  let observed;
+  await assert.rejects(observeCompatiblePairDeployment({repositoryRoot:f.root,home:f.home,procRoot,
+    environment:f.environment,releaseId:candidate.releaseId,phaseRunner:async()=>{},observe:event=>events.push(event)}),
+  error=>{observed=error.observations;return error.code==='DEPLOY_VALIDATION_FAILED';});
+  assert.deepEqual(observed.reached,['preliminary']);
+  assert.equal(observed.failed,undefined,'candidate probe failure must not be mislabeled as root mismatch');
+  assert.equal(observed.stages[0].observation.outcome,'complete');
+  assert.ok(observed.stages[0].observation.elapsedMs>=0);
+  assert.deepEqual(events,[
+    {phase:'inventory_start',stage:'preliminary',exclusive:false},
+    {phase:'inventory_complete',stage:'preliminary',exclusive:false},
+  ]);
+  assert.deepEqual(store.readActivation({repositoryRoot:f.root}),current);
+  assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/v2/journals')),false,
+    'read-only observation must not create a deployment journal');
+});
+
+test('module-only pair observation stops after the first incomplete stage', async t => {
+  const f=await createRuntimeFixture(t);
+  const release=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  const current=f.seedPair(pair);
+  deployLease.close();
+  f.write('mcp-server/src/index.ts','export const incompleteCandidate = true;\n');
+  const candidate=await f.prepare();
+  const procRoot=path.join(f.home,'incomplete-observation-proc');fs.mkdirSync(procRoot,{mode:0o700});
+  fs.mkdirSync(path.join(procRoot,'100'),{mode:0o700});
+  const result=await observeCompatiblePairDeployment({repositoryRoot:f.root,home:f.home,procRoot,
+    environment:f.environment,releaseId:candidate.releaseId,phaseRunner:async()=>{}});
+  assert.deepEqual(result.reached,['preliminary']);
+  assert.deepEqual(result.missed,['post_probe','publication']);
+  assert.equal(result.stages[0].observation.outcome,'incomplete');
+  assert.deepEqual(result.probes,{current:false,candidate:false});
+  assert.equal(result.stages[0].inventory.uncertain,1);
+  assert.ok(result.stages[0].observation.causeCounts.record_unreadable>=1);
+  assert.deepEqual(result.currentBefore,current);
+  assert.deepEqual(result.currentAfter,current);
+  assert.deepEqual(store.readActivation({repositoryRoot:f.root}),current);
+  assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/v2/journals')),false);
+});
+
+test('module-only pair observation attributes changed root membership to its exact stage', async t => {
+  const f=await createRuntimeFixture(t);
+  const release=await f.prepare();
+  const deployLease=acquireLease(path.join(f.root,'.jhw-runtime/deploy.lock'));
+  const pair=store.ensureBootstrapGeneration({repositoryRoot:f.root,releaseId:release.releaseId,deployLease});
+  const current=f.seedPair(pair);
+  deployLease.close();
+  f.write('mcp-server/src/index.ts','export const rootChangeCandidate = true;\n');
+  const candidate=await f.prepare();
+  const procRoot=path.join(f.home,'root-change-observation-proc');fs.mkdirSync(procRoot,{mode:0o700});
+  const admission=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true,create:true});
+  t.after(()=>admission.close());
+  let binding=store.bindEntryPair({repositoryRoot:f.root,selectedPair:pair,kind:'session',admissionLease:admission});
+  let observed;
+  t.after(()=>binding?.close());
+  let caught;
+  await assert.rejects(observeCompatiblePairDeployment({repositoryRoot:f.root,home:f.home,procRoot,
+    environment:f.environment,releaseId:candidate.releaseId,phaseRunner:async()=>{},observe:event=>{
+      if(event.phase==='inventory_start'&&event.stage==='preliminary') {
+        binding.close();binding=null;
+      }
+    }}),error=>{caught=error;observed=error.observations;return true;});
+  assert.ok(observed,'root-change failure must carry stage observations');
+  assert.equal(caught.code,'DEPLOY_CONSUMERS_ACTIVE');
+  assert.equal(caught.reason,'root_membership_changed');
+  assert.deepEqual(observed.reached,[]);
+  assert.deepEqual(observed.missed,['preliminary','post_probe','publication']);
+  assert.equal(observed.failed.stage,'preliminary');
+  assert.equal(observed.failed.outcome,'disallowed');
+  assert.equal(observed.failed.causeCounts.root_mismatch,1);
+  assert.deepEqual(observed.probes,{current:false,candidate:false});
+  assert.deepEqual(store.readActivation({repositoryRoot:f.root}),current);
 });

@@ -280,9 +280,17 @@ fsync를 소유하며 deploy callback은 그 descriptor를 동기적으로 journ
   assert.ok(samples.filter(row => row.hook && row.event !== 'SessionEnd').every(row => row.elapsedMs < 12000));
   ```
 - [ ] **2. 통합 검증을 실행한다.** `rtk proxy node --test scripts/test-runtime-v2-integration.mjs`. synthetic dependency나 준비된 process 목록만으로 완료하지 않고 실제 proc/lease 증거를 대조한다. 실패하면 성능/안전 기준을 낮추지 말고 소유 task로 돌아간다.
+
+  일반 호스트 시험에서는 전체 릴리스 검증을 PID 검사 밖으로 옮겼다. 연속 호출 중에 PID 목록과 개별 프로세스 관측이 계속 변했다. 일반 호스트는 불확실한 관측에서 게시와 회수를 중단한다. [실행 경계 설계](../specs/2026-11-24-managed-execution-boundary-261.md#일반-호스트-진단)
+
+  전담 서비스 UID의 관리형 실행 경계에서 기존 사용자 UID에 세션과 호출을 결속했다. 실제 의존성으로 빌드한 네 세션을 유지하며 호환 활성화, 롤백, 제3세대 회수를 확인했다. 운영 C5와 승인된 `PostToolUse`는 별도 배포 승인 뒤에 검증한다. [재현 절차와 검증](../specs/2026-11-24-managed-execution-boundary-261.md#실제-번들-반복-검증)
+
 - [ ] **3. 운영 문서를 구현 결과로 갱신한다.** README에는 새 명령과 결과 코드, 초기 `prepare→status→activate→migrate-codex-config→refresh-bootstrap` 순서, router 변경의 정지 조건, rollback/anchor/catalog/30일 정책, hook 시간 측정과 지원 범위를 기록한다. DESIGN에는 실제 lock/FD/snapshot/fingerprint 계약을 기록한다. helper 갱신은 activate-compatible로 수행하고 v2 refresh가 정확한 pair면 no-op임을 명시한다.
 - [ ] **4. 전체 정적·회귀 검증을 실행한다.** 아래 최종 명령 목록을 사용하고 각 종료코드와 pass/fail/skip을 기록한다. 입력 파일은 실행 중 변경하지 않는다. 제품 오류와 기준선에서도 재현되는 호스트 환경 실패를 구분한다.
 - [ ] **5. 실제 Codex C5를 격리해 재검증한다.** 새 설정의 기본 whitelist를 적용한 대화형 세션에서 MCP 초기화와 읽기 전용 조회를 확인한다. 기존 live 설치의 per-run env 보완 성공을 후보 기본 설정 성공으로 재사용하지 않는다. 후보 검증에 실제 HOME 배포가 필요하면 승인된 한 번의 배포 뒤 검증 항목으로 남기고 선행 배포를 하지 않는다. MCP 호출 승인이 거부된 결과는 runtime 성공/실패로 계산하지 않는다.
+
+  2026-11-23 사용자 결정에 따라 별도 Guard enforce 시험 환경이 없는 현재, C5와 승인된 `PostToolUse`의 대화형 검증은 별도 배포 승인 뒤 수행한다. 후보의 보호된 세션에서 사용자가 실제 요청을 승인하고 대응하는 `PostToolUse`가 `COMPLETED`인지 확인한다. 네 hook 모두 거부 0건이라는 수락 기준은 그대로 적용한다.
+
 - [ ] **6. 문서와 통합 증거를 커밋한다.** 제목: `test(runtime): 세대 전환의 다중 세션 호출 연속성을 검증한다`. 전체 branch review 후 결과를 보고하며 push·PR·배포 승인은 이 계획 검토와 분리한다.
 
 ## 최종 검증 명령과 보고

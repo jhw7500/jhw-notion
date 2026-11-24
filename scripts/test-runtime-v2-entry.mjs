@@ -261,7 +261,25 @@ process.stdout.write(JSON.stringify({status:result.status,stderr:result.stderr})
   assert.deepEqual(JSON.parse(wrapper.stdout),{status:75,stderr:'DEPLOY_SESSION_INVALID\n'});
 });
 
-test('managed root owner exit refuses new calls while inherited payload leases preserve the pair', async t => {
+function inspectAndReapInFreshProcess(repositoryRoot) {
+  const storeUrl = new URL('./runtime-store.mjs', import.meta.url).href;
+  const source = `
+    import {inspectSessionBindingsV2, reapCompletedSessionBindingsV2} from ${JSON.stringify(storeUrl)};
+    const repositoryRoot = process.argv[1];
+    const inspect = () => inspectSessionBindingsV2({repositoryRoot})
+      .map(({id, kind, live, token, manifest, lease}) => ({id, kind, live, token, manifest, lease}));
+    const before = inspect();
+    const reaped = reapCompletedSessionBindingsV2({repositoryRoot, dryRun: false, limit: 8});
+    console.log(JSON.stringify({before, reaped, after: inspect()}));
+  `;
+  const processResult = spawnSync(process.execPath, ['--input-type=module', '-e', source, repositoryRoot], {
+    encoding: 'utf8', timeout: 5_000,
+  });
+  assert.equal(processResult.status, 0, processResult.stderr || String(processResult.error));
+  return JSON.parse(processResult.stdout);
+}
+
+async function verifyRetainedLeasesAfterOwnerExit(t, workerExit) {
   const f=await createRuntimeFixture(t,{productionEntry:true,holdingMcp:true,credentialFdEvidence:true});
   f.write('mcp-server/.env','NOTION_API_KEY=fixture-secret\n',0o600);
   const releaseSummary=await f.prepare();
@@ -278,27 +296,85 @@ const [root,tokenFile,ready,release,attempt,resultFile,allowExit]=process.argv.s
 fs.writeFileSync(tokenFile,process.env.JHW_RUNTIME_SESSION_BINDING);
 const entry=path.join(root,'.jhw-runtime/bootstrap/jhw-runtime-entry');
 const held=spawn(entry,['mcp',ready,release],{env:process.env,stdio:'inherit'});
-const timer=setInterval(()=>{if(!fs.existsSync(attempt))return;clearInterval(timer);const call=spawnSync(entry,['mcp',ready+'.new',allowExit],{env:process.env,encoding:'utf8',timeout:4000});fs.writeFileSync(resultFile,JSON.stringify({status:call.status,stderr:call.stderr}));},10);
-held.once('close',code=>{clearInterval(timer);process.exit(code??1)});
+const writeResult=(file,result)=>{
+  fs.writeFileSync(file+'.tmp',JSON.stringify(result),{mode:0o600,flag:'wx'});
+  fs.renameSync(file+'.tmp',file);
+};
+const timer=setInterval(()=>{
+  if(!fs.existsSync(attempt))return;
+  clearInterval(timer);
+  const call=spawnSync(entry,['mcp',ready+'.new',allowExit],{env:process.env,encoding:'utf8',timeout:4000});
+  writeResult(resultFile,{status:call.status,stderr:call.stderr});
+},10);
+held.once('close',code=>{
+  clearInterval(timer);
+  writeResult(release+'.result',{status:code});
+  process.exit(code??1);
+});
 `;
   const managed=f.spawnRouter(['jhw-runtime-entry','session','--',process.execPath,'-e',payload,f.root,files.token,files.ready,files.release,files.attempt,files['attempt-result'],files['allow-exit']]);
   const waitFor=async predicate=>{const deadline=Date.now()+6000;while(!predicate()){if(Date.now()>deadline)assert.fail('fixture IPC deadline');await new Promise(resolve=>setTimeout(resolve,10));}};
-  await waitFor(()=>fs.existsSync(files.token)&&fs.existsSync(files.ready));
-  const token=fs.readFileSync(files.token,'utf8');const rootId=token.split(':')[2];
-  const rootRecord=JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/v2/sessions',rootId,'manifest.json')));
-  assert.equal(rootRecord.owner.pid,managed.child.pid);
-  const ready=JSON.parse(fs.readFileSync(files.ready,'utf8'));
-  assert.deepEqual(Object.fromEntries(Object.entries(ready.fdEvidence).map(([fd,value])=>[fd,value.role])),{3:'admission',6:'binding',7:'generation',8:'parent'});
-  for(const value of Object.values(ready.fdEvidence)){const stat=fs.statSync(value.target,{bigint:true});assert.deepEqual({dev:String(stat.dev),ino:String(stat.ino)},{dev:value.dev,ino:value.ino});}
-  const ownerResult=managed.result;managed.child.send({type:'exit'});
-  assert.deepEqual(await ownerResult,{status:0,signal:null,stdout:'',stderr:'',error:null});
-  fs.writeFileSync(files.attempt,'');await waitFor(()=>fs.existsSync(files['attempt-result']));
-  assert.deepEqual(JSON.parse(fs.readFileSync(files['attempt-result'],'utf8')),{status:75,stderr:'DEPLOY_SESSION_INVALID\n'});
-  assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/v2/sessions',rootId)),true);
-  assert.throws(()=>acquireLease(path.join(f.root,`.jhw-runtime/v2/bootstraps/${pair.bootstrapId}/lease`)),{code:'DEPLOY_LOCK_CONTENDED'});
-  fs.writeFileSync(files.release,'');await managed.result;
-  const rootLease=path.join(f.root,'.jhw-runtime/v2/sessions',rootId,'lease');
-  await waitFor(()=>{try{const lease=acquireLease(rootLease);lease.close();return true;}catch(error){if(error.code==='DEPLOY_LOCK_CONTENDED')return false;throw error;}});
-  await waitFor(()=>store.reapCompletedSessionBindingsV2({repositoryRoot:f.root,dryRun:false}).retired.includes(rootId));
-  assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/v2/sessions',rootId)),false);
+  const generationLease = path.join(f.root, `.jhw-runtime/v2/bootstraps/${pair.bootstrapId}/lease`);
+  let heldRoot;
+  let workerStatus;
+  try {
+    await waitFor(() => fs.existsSync(files.token) && fs.existsSync(files.ready));
+    const token = fs.readFileSync(files.token, 'utf8');
+    heldRoot = token.split(':')[2];
+    const manifest = path.join(f.root, '.jhw-runtime/v2/sessions', heldRoot, 'manifest.json');
+    const rootRecord = JSON.parse(fs.readFileSync(manifest));
+    assert.equal(rootRecord.owner.pid, managed.child.pid);
+    const ready = JSON.parse(fs.readFileSync(files.ready, 'utf8'));
+    assert.deepEqual(Object.fromEntries(Object.entries(ready.fdEvidence).map(([fd, value]) => [fd, value.role])),
+      {3: 'admission', 6: 'binding', 7: 'generation', 8: 'parent'});
+    for (const value of Object.values(ready.fdEvidence)) {
+      const stat = fs.statSync(value.target, {bigint: true});
+      assert.deepEqual({dev: String(stat.dev), ino: String(stat.ino)}, {dev: value.dev, ino: value.ino});
+    }
+    managed.child.send({type: 'exit'});
+    assert.deepEqual(await managed.result, {status: 0, signal: null, stdout: '', stderr: '', error: null});
+    fs.writeFileSync(files.attempt, '');
+    await waitFor(() => fs.existsSync(files['attempt-result']));
+    const denied = JSON.parse(fs.readFileSync(files['attempt-result'], 'utf8'));
+    assert.deepEqual(denied, {status: 75, stderr: 'DEPLOY_SESSION_INVALID\n'});
+
+    const restarted = inspectAndReapInFreshProcess(f.root);
+    assert.equal(restarted.before.find(row => row.id === heldRoot)?.live, true);
+    assert.equal(restarted.before.filter(row => row.kind === 'invocation' && row.live).length, 1);
+    assert.deepEqual(restarted.after, restarted.before);
+    assert.deepEqual(restarted.reaped.retired, []);
+    assert.deepEqual(new Set(restarted.reaped.preserved), new Set(restarted.before.map(row => row.id)));
+    assert.throws(() => acquireLease(generationLease), {code: 'DEPLOY_LOCK_CONTENDED'});
+  } finally {
+    fs.writeFileSync(files.release + '.tmp', workerExit);
+    fs.renameSync(files.release + '.tmp', files.release);
+    await managed.result;
+    if (fs.existsSync(files.ready)) {
+      await waitFor(() => fs.existsSync(files.release + '.result'));
+      workerStatus = JSON.parse(fs.readFileSync(files.release + '.result', 'utf8')).status;
+      await waitFor(() => {
+        try {
+          acquireLease(generationLease).close();
+          return true;
+        } catch (error) {
+          if (error.code !== 'DEPLOY_LOCK_CONTENDED') throw error;
+          return false;
+        }
+      });
+    }
+  }
+  assert.equal(workerStatus, workerExit === 'crash' ? 137 : 0);
+  const recovered = inspectAndReapInFreshProcess(f.root);
+  assert.ok(recovered.reaped.retired.includes(heldRoot));
+  assert.deepEqual(recovered.after, []);
+  const lease = acquireLease(generationLease);
+  lease.close();
+}
+
+test('managed root owner exit preserves an inherited lease through a fresh reaper', async t => {
+  await verifyRetainedLeasesAfterOwnerExit(t, 'close');
+});
+
+test('a fresh reaper retires the orphan root only after the inherited worker crashes', async t => {
+  await verifyRetainedLeasesAfterOwnerExit(t, 'crash');
 });
