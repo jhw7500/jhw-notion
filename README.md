@@ -530,6 +530,19 @@ env_vars = ["JHW_RUNTIME_SESSION_BINDING"]
 `NOTION_MANAGED_UNAVAILABLE`로, Control의 Notion 검사는 `NOTION_GUARD_INDETERMINATE`로 끝난다.
 중계를 다시 시작하면 살아 있는 관리형 세션에서도 다음 조회를 새로 요청할 수 있다.
 
+#### 관리형 배포 검증
+
+- **PR 심사**에서 격리된 관리형 실물 시험 `scripts/test_runtime_managed_acceptance.py --trials 1`을
+  독립적으로 실행하고 관련 회귀를 검증한다. 일반 모드 통합 시험은 관측 불확실로 중단됐을 때
+  포인터, 세대, lease, 실행 중인 세션의 보존을 확인한다.
+- **배포 전 수락**은 최종 후보의 소스로 같은 격리 시험을 `--trials 10`으로 연속 실행한다.
+  네 세션을 유지한 A→B→A와 C 회수, hook 제한 시간, 중계 중단·재시작을 10/10회
+  확인하고 후보 Git SHA, 실행 로그, 종료코드를 남긴다.
+- **배포 후 수락**은 새 기본 설정으로 시작한 보호 세션의 C5 MCP 초기화와 읽기 전용
+  조회를 확인한다. 사용자가 실제 요청을 승인한 뒤 대응하는 `PostToolUse`가
+  `COMPLETED`이고 네 hook의 거부가 0건인지 확인한다. 이미지 전용
+  `UserPromptSubmit`(#253 item12)도 확인한다.
+
 #### 첫 관리형 설치와 중계 경계 전환
 
 운영자는 심사를 마친 커밋 하나에서 서비스 checkout과 보호 스크립트를 준비한다.

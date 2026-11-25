@@ -539,8 +539,16 @@ test('a retained root ending after one deletion preserves the second candidate a
   const recovery1=path.join(marker,'recovery.00000001');
   assert.equal(fs.existsSync(path.join(recovery0,'payload')),true);
   assert.equal(fs.existsSync(path.join(recovery1,'payload')),true);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(recovery0,'inventory.json'))).name,candidates[0]);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(recovery1,'inventory.json'))).name,candidates[1]);
+  const inventories = [recovery0, recovery1].map(recovery =>
+    JSON.parse(fs.readFileSync(path.join(recovery, 'inventory.json'))));
+  assert.deepEqual(inventories.map(inventory => inventory.name), candidates);
+  const intent = JSON.parse(fs.readFileSync(path.join(marker, 'intent.json')));
+  assert.deepEqual(intent.candidates, inventories.map(({ name, identity, files }) => ({
+    type: 'bootstrapGenerations',
+    name,
+    identity,
+    children: files.map(file => file.name),
+  })));
   const state=JSON.parse(fs.readFileSync(path.join(marker,'state.json')));
   assert.equal(state.phase,'removing_originals');
   assert.deepEqual(state.removed,{journals:0,previous:0,bootstrapGenerations:1});

@@ -897,6 +897,8 @@ async function generationPruneExperiment(t, continuous) {
       ...sessionEvidence(fixture, [clientB], pairB),
       ...sessionEvidence(fixture, [clientAfterRollback], pairA),
     ];
+    const pruneEvidence = path.join(fixture.root, '.jhw-runtime/.prune.v1');
+    assert.equal(fs.existsSync(pruneEvidence), false);
     let beforeSamples = [];
     let duringSamples = [];
     if (continuous) {
@@ -1036,26 +1038,35 @@ async function generationPruneExperiment(t, continuous) {
       },
     };
     t.diagnostic(JSON.stringify(diagnostic));
-    if (commandError) throw commandError;
     if (sampleError) throw sampleError;
-    assert.equal(applied.code, 'DEPLOY_PRUNED');
-    assert.deepEqual(applied.candidates.bootstrapGenerations, [pairC.bootstrapId]);
-    assert.deepEqual(applied.candidates.previous, []);
-    assert.deepEqual(applied.candidates.journals, []);
-    assert.deepEqual(applied.removed, {journals: 0, previous: 0, bootstrapGenerations: 1});
-    assert.equal(cPresentAfter, false);
-    assert.equal(fs.existsSync(path.join(fixture.root, '.jhw-runtime/releases', releaseC.releaseId)), true);
-    assert.equal(fs.existsSync(path.join(fixture.root,
-      '.jhw-runtime/v2/bootstrap-catalog', pairC.bootstrapId + '.json')), true);
-    assert.equal(diagnostic.identities.aDirectoryAndLeasePreserved, true);
-    assert.equal(diagnostic.identities.bDirectoryAndLeasePreserved, true);
-    assert.equal(diagnostic.identities.fiveRootPairAndLeaseProofPreserved, true);
+    if (commandError) {
+      if (!continuous || commandError.code !== 'DEPLOY_INVENTORY_UNCERTAIN') throw commandError;
+      assert.deepEqual(diagnostic.command,
+        {status: 'indeterminate', code: 'DEPLOY_INVENTORY_UNCERTAIN'});
+      assert.deepEqual(afterNames, beforeNames);
+      assert.deepEqual(generationObjectEvidence(fixture.root, pairC), beforeObjects.C);
+      assert.equal(fs.existsSync(pruneEvidence), false);
+    } else {
+      assert.equal(applied.code, 'DEPLOY_PRUNED');
+      assert.deepEqual(applied.candidates.bootstrapGenerations, [pairC.bootstrapId]);
+      assert.deepEqual(applied.candidates.previous, []);
+      assert.deepEqual(applied.candidates.journals, []);
+      assert.deepEqual(applied.removed, {journals: 0, previous: 0, bootstrapGenerations: 1});
+      assert.equal(cPresentAfter, false);
+      assert.equal(diagnostic.retained.cRelease, true);
+      assert.equal(diagnostic.retained.cCatalog, true);
+      assert.deepEqual(diagnostic.unchanged, {
+        pointer: true, activations: true, journals: true, releases: true, catalog: true,
+        onlyThirdBootstrapRemoved: true,
+      });
+      assert.equal(applied.inventory.before.roots.length, 5);
+      assert.equal(applied.inventory.after.roots.length, 5);
+      assert.equal(applied.inventory.before.processes.clear, true);
+      assert.equal(applied.inventory.after.processes.clear, true);
+    }
     assert.deepEqual(aAfter, beforeObjects.A);
     assert.deepEqual(bAfter, beforeObjects.B);
-    assert.deepEqual(diagnostic.unchanged, {
-      pointer: true, activations: true, journals: true, releases: true, catalog: true,
-      onlyThirdBootstrapRemoved: true,
-    });
+    assert.deepEqual(afterRoots, beforeRoots);
     assert.equal(continuous
       ? diagnostic.calls.duringSessionsComplete : diagnostic.calls.beforeSessionsComplete, true);
     assert.equal(diagnostic.calls.afterSessionsComplete, true);
@@ -1067,10 +1078,6 @@ async function generationPruneExperiment(t, continuous) {
     assert.equal(diagnostic.calls.total.successfulPostToolCount, 0);
     assert.equal(diagnostic.calls.total.terminalHookFailureCount, 0);
     assert.equal(diagnostic.calls.total.timingViolationCount, 0);
-    assert.equal(applied.inventory.before.roots.length, 5);
-    assert.equal(applied.inventory.after.roots.length, 5);
-    assert.equal(applied.inventory.before.processes.clear, true);
-    assert.equal(applied.inventory.after.processes.clear, true);
     if (continuous) assert.ok(validatedOverlapCount > 0, 'prune apply missed validated calls');
   } finally {
     await stopClients(clients);
@@ -1083,7 +1090,7 @@ test('v2 prune removes only an aged third generation between five-root calls', a
   await generationPruneExperiment(t, false);
 });
 
-test('v2 prune removes only an aged third generation during five-root calls', async t => {
+test('v2 prune removes only an aged third generation or safely refuses during five-root calls', async t => {
   await generationPruneExperiment(t, true);
 });
 
@@ -1512,6 +1519,7 @@ test('v2 real dependencies keep bound sessions and claim-free hook conformance t
   let failure;
   let commandFailure;
   let acceptance;
+  let safeRefusal = false;
   try {
     const releaseA = await fixture.prepare();
     const activated = await runDeployment({
@@ -1667,6 +1675,17 @@ test('v2 real dependencies keep bound sessions and claim-free hook conformance t
     stages.rollback.acceptance = 'pending';
     const rollbackBefore = boundedPointer(fixture.root, {A: pairA, B: pairB});
     const rollbackJournalsBefore = journalNames(fixture.root);
+    const rollbackStateBefore = pruneObjectNames(fixture.root);
+    const rollbackObjectsBefore = {
+      A: generationObjectEvidence(fixture.root, pairA),
+      B: generationObjectEvidence(fixture.root, pairB),
+    };
+    const rollbackRootsBefore = [
+      ...sessionEvidence(fixture, clientsA, pairA),
+      ...sessionEvidence(fixture, [clientB], pairB),
+    ];
+    const pruneEvidence = path.join(fixture.root, '.jhw-runtime/.prune.v1');
+    assert.equal(fs.existsSync(pruneEvidence), false);
     requestRound(clients, 'during-rollback');
     await waitFor(() => roundStarted(clients, 'during-rollback'), 'rollback samples started');
     const rollbackPhase = publicationPhase();
@@ -1721,6 +1740,31 @@ test('v2 real dependencies keep bound sessions and claim-free hook conformance t
     stages.rollback.sampleEvidence = 'confirmed';
     if (rollbackError) {
       stages.rollback.acceptance = stages.rollback.command.status;
+      if (rollbackError.code === 'DEPLOY_INVENTORY_UNCERTAIN') {
+        assert.deepEqual(stages.rollback.command,
+          {status: 'refused', code: 'DEPLOY_INVENTORY_UNCERTAIN'});
+        assert.deepEqual(stages.rollback.pointer,
+          {before: 'B', after: 'B', unchanged: true, changedFields: []});
+        assert.deepEqual(stages.rollback.journal, {status: 'none', count: 0, states: []});
+        assert.deepEqual(stages.rollback.probes, {started: false, completed: false});
+        assert.equal(stages.rollback.publicationAcquired, false);
+        assert.equal(stages.rollback.pointerIntent, false);
+        assert.equal(stages.rollback.pointerRenamed, false);
+        assert.equal(stages.rollback.samples.processFailureCount, 0);
+        assert.equal(stages.rollback.samples.responseFailureCount, 0);
+        assert.equal(stages.rollback.samples.unexpectedDenyCount, 0);
+        assert.equal(stages.rollback.samples.terminalHookFailureCount, 0);
+        assert.equal(stages.rollback.samples.timingViolationCount, 0);
+        assert.deepEqual(pruneObjectNames(fixture.root), rollbackStateBefore);
+        assert.deepEqual(generationObjectEvidence(fixture.root, pairA), rollbackObjectsBefore.A);
+        assert.deepEqual(generationObjectEvidence(fixture.root, pairB), rollbackObjectsBefore.B);
+        assert.deepEqual([
+          ...sessionEvidence(fixture, clientsA, pairA),
+          ...sessionEvidence(fixture, [clientB], pairB),
+        ], rollbackRootsBefore);
+        assert.equal(fs.existsSync(pruneEvidence), false);
+        safeRefusal = true;
+      }
       commandFailure = rollbackError;
       throw rollbackError;
     }
@@ -1964,14 +2008,15 @@ test('v2 real dependencies keep bound sessions and claim-free hook conformance t
     acceptance = {timingViolations, positivePostToolCount, expectedDenyCount,
       expectedPostToolCount: allSamples.length};
   } catch (error) {
-    failure = error;
     if (isDeploymentRefusal(error) && error === commandFailure) {
       transitionResult.stop = {
         kind: stages[activeStage]?.command.status,
         stage: activeStage,
         code: error.code,
       };
+      if (!safeRefusal) failure = error;
     } else {
+      failure = error;
       if (stages[activeStage]?.acceptance === 'pending') stages[activeStage].acceptance = 'harness_failed';
       transitionResult.harness = {
         status: 'failed',
@@ -1990,12 +2035,18 @@ test('v2 real dependencies keep bound sessions and claim-free hook conformance t
     activeStage = 'final';
     try {
       assert.deepEqual(inspectSessionBindingsV2({repositoryRoot: fixture.root}), []);
-      assert.ok(acceptance, 'acceptance evidence was not completed');
-      assert.equal(acceptance.timingViolations.length, 0, 'hook timing acceptance failed');
-      assert.equal(acceptance.positivePostToolCount, 0,
-        'claim-free Read must not impersonate an approved PostToolUse completion');
-      assert.equal(acceptance.expectedDenyCount, acceptance.expectedPostToolCount,
-        'claim-free Read PostToolUse must remain explicit negative coverage');
+      if (safeRefusal) {
+        assert.deepEqual(transitionResult.stop,
+          {kind: 'refused', stage: 'rollback', code: 'DEPLOY_INVENTORY_UNCERTAIN'});
+        assert.equal(transitionResult.harness.status, 'complete');
+      } else {
+        assert.ok(acceptance, 'acceptance evidence was not completed');
+        assert.equal(acceptance.timingViolations.length, 0, 'hook timing acceptance failed');
+        assert.equal(acceptance.positivePostToolCount, 0,
+          'claim-free Read must not impersonate an approved PostToolUse completion');
+        assert.equal(acceptance.expectedDenyCount, acceptance.expectedPostToolCount,
+          'claim-free Read PostToolUse must remain explicit negative coverage');
+      }
     } catch (error) {
       transitionResult.harness = {
         status: 'failed', stage: activeStage,

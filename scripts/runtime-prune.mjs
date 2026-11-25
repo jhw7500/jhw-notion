@@ -994,13 +994,25 @@ export function applyRuntimePrune(options) {
   if (!plan.previous.length && !plan.journals.length && !plan.bootstrapGenerations.length) {
     return {...publicPlan(plan,false), code:'DEPLOY_PRUNED', removed};
   }
-  fs.mkdirSync(runtime.at(PRUNE),{mode:0o700});fs.chmodSync(runtime.at(PRUNE),0o700);runtime.sync();
-  evidence=new PinnedDirectory(runtime.at(PRUNE),{parentVerify:()=>runtime.verify()});
-  writePrivate(evidence.at('intent.json'),{version:1,candidates:[...plan.previous,...plan.journals].map(item=>({name:item.name,identity:item.identity,children:item.children}))},{directoryFd:evidence.fd});
-  writePrivate(evidence.at('state.json'),{version:1,status:'pending',phase:'copying',recovered:0,removed},{directoryFd:evidence.fd});evidence.sync();options.faultInjector?.('after_intent_sync');
-  const paired=new Set();const ordered=[];for(const item of plan.previous){ordered.push({type:'previous',item});const journal=plan.journals.find(candidate=>candidate.receipt.previous?.name===item.name);if(journal){ordered.push({type:'journals',item:journal});paired.add(journal.name);}}
+  const paired = new Set();
+  const ordered = [];
+  for (const item of plan.previous) {
+   ordered.push({type:'previous',item});
+   const journal = plan.journals.find(candidate => candidate.receipt.previous?.name === item.name);
+   if (journal) {
+    ordered.push({type:'journals',item:journal});
+    paired.add(journal.name);
+   }
+  }
   ordered.push(...plan.journals.filter(item=>!paired.has(item.name)).map(item=>({type:'journals',item})));
   ordered.push(...plan.bootstrapGenerations.map(item=>({type:'bootstrapGenerations',item})));
+  fs.mkdirSync(runtime.at(PRUNE),{mode:0o700});fs.chmodSync(runtime.at(PRUNE),0o700);runtime.sync();
+  evidence=new PinnedDirectory(runtime.at(PRUNE),{parentVerify:()=>runtime.verify()});
+  const candidates = ordered.map(({type,item}) => ({
+   type, name:item.name, identity:item.identity, children:item.children,
+  }));
+  writePrivate(evidence.at('intent.json'),{version:1,candidates},{directoryFd:evidence.fd});
+  writePrivate(evidence.at('state.json'),{version:1,status:'pending',phase:'copying',recovered:0,removed},{directoryFd:evidence.fd});evidence.sync();options.faultInjector?.('after_intent_sync');
   const recoveries=[];for(let index=0;index<ordered.length;index++){
    const item=ordered[index].item;verifyCandidate(item);recoveries[index]=createRecovery(evidence,item,index,options.faultInjector);writePrivate(evidence.at('state.json'),{version:1,status:'pending',phase:'copying',recovered:index+1,removed},{exclusive:false,directoryFd:evidence.fd});
   }
