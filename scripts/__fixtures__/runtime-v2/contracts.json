@@ -1,0 +1,81 @@
+{
+  "v1": {
+    "activationId": "a-11111111111111111111111111111111",
+    "releaseId": "r-1111111111111111111111111111111111111111-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "predecessorActivationId": null,
+    "observation": {
+      "target": "activations/a-11111111111111111111111111111111",
+      "dev": "1",
+      "ino": "2",
+      "ctimeNs": "3"
+    }
+  },
+  "v2": {
+    "version": 2,
+    "activationId": "a-22222222222222222222222222222222",
+    "releaseId": "r-2222222222222222222222222222222222222222-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "bootstrapId": "b-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "runtimeContract": 2,
+    "compatibilityDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "predecessorActivationId": null,
+    "migrationId": "m-33333333333333333333333333333333",
+    "observation": {
+      "target": "v2/activations/a-22222222222222222222222222222222",
+      "dev": "4",
+      "ino": "5",
+      "ctimeNs": "6"
+    }
+  },
+  "runtimePair": {
+    "releaseId": "r-2222222222222222222222222222222222222222-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "bootstrapId": "b-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "runtimeContract": 2,
+    "compatibilityDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "rootRecord": {
+    "version": 2,
+    "id": "s-44444444444444444444444444444444",
+    "kind": "session",
+    "releaseId": "r-2222222222222222222222222222222222222222-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "bootstrapId": "b-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "runtimeContract": 2,
+    "compatibilityDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "parentBinding": null,
+    "repository": {"path": "/fixture/repository", "dev": "10", "ino": "11"},
+    "owner": {
+      "uid": 0,
+      "pid": 1234,
+      "startTime": "12",
+      "bootId": "12345678-1234-1234-1234-123456789abc",
+      "commandDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "exeDev": "13",
+      "exeIno": "14"
+    },
+    "manifest": {"dev": "15", "ino": "16"},
+    "lease": {"dev": "17", "ino": "18", "fd": 6},
+    "createdAt": "2026-11-17T00:00:00.000Z"
+  },
+  "invocationRecord": {
+    "version": 2,
+    "id": "i-55555555555555555555555555555555",
+    "kind": "invocation",
+    "releaseId": "r-2222222222222222222222222222222222222222-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "bootstrapId": "b-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "runtimeContract": 2,
+    "compatibilityDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "parentBinding": "v2:b-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:s-44444444444444444444444444444444:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "repository": {"path": "/fixture/repository", "dev": "10", "ino": "11"},
+    "owner": {
+      "uid": 0,
+      "pid": 1234,
+      "startTime": "12",
+      "bootId": "12345678-1234-1234-1234-123456789abc",
+      "commandDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "exeDev": "13",
+      "exeIno": "14"
+    },
+    "manifest": {"dev": "15", "ino": "16"},
+    "lease": {"dev": "17", "ino": "18", "fd": 6},
+    "createdAt": "2026-11-17T00:00:00.000Z"
+  }
+}

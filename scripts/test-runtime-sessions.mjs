@@ -281,7 +281,11 @@ for (const [label, mutate] of [
   ['Markdown bytes outside skills', f => write(f.root, 'mcp-server/src/control/notes.md', 'changed protected control notes')],
   ['skill mode', f => fs.chmodSync(path.join(f.root, 'skills/claude/task.md'), 0o600)],
   ['skill symlink target', f => { const link = path.join(f.root, 'skills/codex/jhw-task/references/task.md'); fs.unlinkSync(link); fs.symlinkSync('../SKILL.md', link); }],
-  ['generation', f => write(f.root, 'mcp-server/src/control/runtime-compatibility.json', '{"version":1,"generation":2,"guardFloor":1}\n')],
+  ['generation', f => {
+    write(f.root, 'mcp-server/src/control/runtime-compatibility.json', '{"version":1,"generation":2,"guardFloor":1}\n');
+    write(f.root, 'scripts/runtime-safety.mjs', 'export const helper = 1;');
+    write(f.root, 'scripts/runtime-store.mjs', 'export const helper = 1;');
+  }],
   ['guard floor', f => write(f.root, 'mcp-server/src/control/runtime-compatibility.json', '{"version":1,"generation":1,"guardFloor":2}\n')],
 ]) {
   test('compatibility rejects changed ' + label, async t => {

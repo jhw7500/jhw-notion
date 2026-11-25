@@ -19,6 +19,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+  Reflect.deleteProperty(globalThis, "__JHW_MANAGED_NOTION_RELAY__");
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
 });
 
@@ -130,6 +131,26 @@ describe("preflight Notion output boundary", () => {
 
     expect(authorization).toEqual([`Bearer ${notionToken}`]);
     expect(result).toEqual({ exitCode: 78, stdout: "", stderr: '{"error":{"code":"NOTION_GUARD_INDETERMINATE"}}\n' });
+  });
+
+  it("uses the dedicated managed preflight relay without a host Notion credential", async () => {
+    const requests: unknown[] = [];
+    Object.defineProperty(globalThis, "__JHW_MANAGED_NOTION_RELAY__", {
+      configurable: true,
+      value: async (request: unknown) => {
+        requests.push(request);
+        return { status: 200, body: { ok: true } };
+      },
+    });
+    const { dependencies, runCli } = await dependenciesForNotionProbe();
+    delete dependencies.env.NOTION_API_KEY;
+
+    const result = await runCli(["preflight"], dependencies);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ operation: "preflight" });
+    expect(result.stderr).not.toContain("MISSING_CREDENTIAL");
+    expect(result.stderr).not.toContain("NOTION_GUARD_INDETERMINATE");
   });
 
   it("preserves the MCP client's default request logging", async () => {

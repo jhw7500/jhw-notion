@@ -892,6 +892,10 @@ register_codex_mcp() {
   if [ "$CONFIG_EDITOR_CHANGED" -eq 1 ]; then
     CODEX_BACKUP_PRUNE_FILE="$config_file"
   fi
+  node "$CONFIG_EDITOR" verify-codex-binding "$config_file" "$MCP_ENTRY" "$SCRIPT_DIR" || {
+    fail "Codex: 생성된 MCP 환경 whitelist 검증에 실패했습니다."
+    exit 1
+  }
 }
 
 # Records adapter $1 when the entry the editor just removed carried non-default env.

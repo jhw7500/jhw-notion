@@ -19,7 +19,12 @@ import {
 import { RegistrationHintStore } from "../registration-hint.js";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
-const CORPUS_DIR = join(TEST_DIR, "__fixtures__", "persistent-contract", "generation-1");
+const CONTRACT_DIR = join(TEST_DIR, "__fixtures__", "persistent-contract");
+const GENERATION_DIR = join(CONTRACT_DIR, "generation-2");
+const GENERATION_MANIFEST = JSON.parse(
+  await readFile(join(GENERATION_DIR, "manifest.json"), "utf8"),
+) as { generation: number; declaration: unknown; corpus: string };
+const CORPUS_DIR = join(GENERATION_DIR, GENERATION_MANIFEST.corpus);
 const START = Date.parse("2026-08-25T01:00:00.000Z");
 const REQUEST_ID = "req-018f21e0-7b2c-7a00-8000-000000000011";
 const roots: string[] = [];
@@ -92,26 +97,21 @@ async function temporaryRoot(prefix: string): Promise<string> {
   return root;
 }
 
-describe("persistent compatibility generation 1", () => {
-  it("binds the repository declaration to the hand-reviewed generation-1 corpus", async () => {
+describe("persistent compatibility generation 2", () => {
+  it("binds the repository declaration to the hand-reviewed generation corpus", async () => {
     const declaration = JSON.parse(
       await readFile(join(TEST_DIR, "..", "runtime-compatibility.json"), "utf8"),
     ) as { version: number; generation: number; guardFloor: number };
-    const manifest = await golden<{ generation: number; declaration: unknown }>("manifest.json");
+    const manifest = GENERATION_MANIFEST;
 
-    expect(declaration).toEqual({ version: 1, generation: 1, guardFloor: 1 });
+    expect(declaration).toEqual({ version: 1, generation: 2, guardFloor: 1 });
     expect(manifest).toEqual({
       generation: declaration.generation,
       declaration,
-      covered: [
-        "guard-requests.yaml pending lifecycle and public reader",
-        "guard-digest.key raw 32-byte key",
-        "boards.yaml registered lifecycle and public reader",
-        "project-registrations.json v1 writer and public reader",
-        "registry.lock, boards.lock, guard-observe-journal.lock, guard-requests.lock",
-        "operation digest fixed vector",
-      ],
+      corpus: "../generation-1",
     });
+    const inherited = JSON.parse(await readFile(join(CORPUS_DIR, "manifest.json"), "utf8"));
+    expect(inherited).toEqual(await golden("manifest.json"));
   });
 
   it("writes the pending Guard lifecycle golden and reads the corpus through the public store", async () => {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { validateBootstrap, STARTUP_ENVIRONMENT } from "./runtime-entry.mjs";
 
@@ -9,6 +9,9 @@ const [operation, configFileArgument, mcpEntry, repositoryRoot, backupStampArgum
 let configFile = configFileArgument;
 let backupStamp = backupStampArgument;
 if (!operation || !configFile || !mcpEntry || !repositoryRoot) process.exit(2);
+// Legacy registration workers do not need the v2 migration reader.
+const { readCodexMigrationJournal, readObservedCodexObject } = operation === "migrate-codex-binding-transaction"
+  ? await import("./runtime-prune.mjs") : {};
 const logicalConfigFile = configFile;
 // check-* operations are the read-only first-activation plan. They never write,
 // back up, lock, or open transactions; bootstrap is installed before wiring.
@@ -24,6 +27,7 @@ const AMBIGUOUS = 6;
 const CLEANUP_UNCONFIRMED = 7;
 const MANUAL_RECOVERY = 8;
 const ADOPT_UNPRESERVABLE = 9;
+const CODEX_BINDING = "JHW_RUNTIME_SESSION_BINDING";
 // First activation with --adopt-from: the driver validated this sibling
 // checkout of the same repository before passing it.
 const adoptRoot = process.env.JHW_ADOPT_FROM ?? "";
@@ -1590,15 +1594,24 @@ function finalizeControlHookLinkTransaction() {
   return CHANGED;
 }
 
+function strictCodexBindingText(text, { bindingRequired }) {
+  const inspected = ownedToml(text);
+  if (!inspected.owned) return false;
+  const parent = inspected.range.lines.slice(inspected.range.start + 1, inspected.range.parentEnd);
+  const args = parent.map(line => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(line))).find(Boolean);
+  if (!args || JSON.stringify(JSON.parse(args[1])) !== JSON.stringify(stdioArgs())) return false;
+  if (bindingRequired) {
+    let environment; try { environment = inspectCodexEnvironment(text, inspected.range); } catch { return false; }
+    if (environment.envVars.filter((name) => name === CODEX_BINDING).length !== 1) return false;
+  }
+  return true;
+}
+
 function verifyManagedConfiguration() {
   const current = safeExistingFile(configFile);
   if (!current.exists) failForeign();
-  if (operation === "verify-codex") {
-    const inspected = ownedToml(current.text);
-    if (!inspected.owned) failForeign();
-    const parent = inspected.range.lines.slice(inspected.range.start + 1, inspected.range.parentEnd);
-    const args = parent.map(line => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(line)).find(Boolean);
-    if (!args || JSON.stringify(JSON.parse(args[1])) !== JSON.stringify(stdioArgs())) failForeign();
+  if (operation === "verify-codex" || operation === "verify-codex-binding") {
+    if (!strictCodexBindingText(current.text, { bindingRequired: operation === "verify-codex-binding" })) failForeign();
   } else if (operation === "verify-stdio" || operation === "verify-opencode") {
     const settings = parsedJson(current.text);
     const vector = operation === "verify-stdio" ? settings.mcpServers?.["jhw-notion"] : settings.mcp?.["jhw-notion"];
@@ -1827,6 +1840,60 @@ function tomlAssignmentKeys(line) {
   return undefined;
 }
 
+function replaceTomlAssignmentValue(line, value) {
+  const source = stripTomlComment(line);
+  let quote;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote === '"' && character === "\\" && !escaped) {
+      escaped = true;
+      continue;
+    }
+    if ((character === '"' || character === "'") && !escaped) {
+      if (quote === character) quote = undefined;
+      else if (quote === undefined) quote = character;
+    } else if (character === "=" && quote === undefined) {
+      let start = index + 1;
+      while (/\s/.test(source[start] ?? "")) start += 1;
+      let end = source.length;
+      while (end > start && /\s/.test(source[end - 1])) end -= 1;
+      if (start === end) throw new Error("missing TOML assignment value");
+      return `${line.slice(0, start)}${value}${line.slice(end)}`;
+    }
+    escaped = false;
+  }
+  throw new Error("missing TOML assignment");
+}
+
+function tomlAssignmentStringValue(line) {
+  const source = stripTomlComment(line);
+  let quote;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote === '"' && character === "\\" && !escaped) {
+      escaped = true;
+      continue;
+    }
+    if ((character === '"' || character === "'") && !escaped) {
+      if (quote === character) quote = undefined;
+      else if (quote === undefined) quote = character;
+    } else if (character === "=" && quote === undefined) {
+      const value = source.slice(index + 1).trim();
+      if (value.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(value);
+          return typeof parsed === "string" ? parsed : undefined;
+        } catch { return undefined; }
+      }
+      return /^'[^']*'$/.test(value) ? value.slice(1, -1) : undefined;
+    }
+    escaped = false;
+  }
+  return undefined;
+}
+
 function sameNameTomlHeader(line) {
   const keys = tomlHeaderKeys(line);
   return keys?.[0] === "mcp_servers" && keys[1] === "jhw-notion";
@@ -1866,7 +1933,7 @@ function tomlRange(source) {
   const hasAlternate = lines.some((line) => sameNameTomlHeader(line) &&
     line.trim() !== parentHeader && !line.trim().startsWith(childPrefix));
   if (starts.length === 0) return { lines, hasOrphan: hasSameName || hasConflictingAssignment, hasAlternate };
-  if (starts.length !== 1) failForeign();
+  if (starts.length !== 1) return { lines, hasOrphan: true, hasAlternate: true };
   const start = starts[0];
   let parentEnd = start + 1;
   while (parentEnd < lines.length && !/^\s*\[/.test(lines[parentEnd])) parentEnd += 1;
@@ -1892,7 +1959,7 @@ function ownedToml(source) {
   const range = tomlRange(source);
   if (range.start === undefined) return { owned: false, range };
   if (range.hasAlternate) return { owned: false, range };
-  const parent = range.lines.slice(range.start + 1, range.parentEnd);
+  const parent = range.lines.slice(range.start + 1, range.parentEnd).map(stripTomlComment);
   const commands = parent.map((line) => /^\s*command\s*=\s*"([^"]*)"\s*$/.exec(line)).filter(Boolean);
   const argsLines = parent.map((line) => /^\s*args\s*=\s*(\[.*\])\s*$/.exec(line)).filter(Boolean);
   if (commands.length !== 1 || argsLines.length !== 1 || commands[0][1] !== "node") return { owned: false, range };
@@ -1908,6 +1975,7 @@ function codexEntry() {
     'command = "node"',
     `args = ${JSON.stringify(stdioArgs())}`,
     "startup_timeout_sec = 60.0",
+    `env_vars = ${JSON.stringify([CODEX_BINDING])}`,
   ];
 }
 
@@ -1922,44 +1990,125 @@ function saveToml(current, next) {
   process.exit(CHANGED);
 }
 
+function inspectCodexEnvironment(source, range) {
+  const parent = range.lines.slice(range.start + 1, range.parentEnd);
+  const envAssignments = parent.flatMap((line, index) =>
+    /^\s*env_vars\s*=/.test(stripTomlComment(line)) ? [{ line, index }] : []);
+  if (envAssignments.length > 1) throw new Error("duplicate Codex env_vars assignment");
+  let envVars = [];
+  if (envAssignments.length === 1) {
+    const match = /^\s*env_vars\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(envAssignments[0].line));
+    try { envVars = match ? JSON.parse(match[1]) : undefined; } catch { envVars = undefined; }
+    if (!Array.isArray(envVars) || !envVars.every((name) => typeof name === "string") ||
+        new Set(envVars).size !== envVars.length || envVars.some(isLoaderVariable)) {
+      throw new Error("unsafe Codex env_vars");
+    }
+  }
+  const childLines = range.lines.slice(range.parentEnd, range.end);
+  let inEnvironment = false;
+  const childKeys = [];
+  for (const line of childLines) {
+    const tableHeader = tomlHeaderKeys(line);
+    const header = tableHeader ?? tomlArrayHeaderKeys(line);
+    if (header) {
+      if (!tableHeader || JSON.stringify(tableHeader) !== JSON.stringify(["mcp_servers", "jhw-notion", "env"])) {
+        throw new Error("unsupported Codex child table");
+      }
+      if (inEnvironment) throw new Error("duplicate Codex env child table");
+      inEnvironment = true;
+      continue;
+    }
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    if (!inEnvironment) throw new Error("ambiguous Codex child environment");
+    const keys = tomlAssignmentKeys(line);
+    if (!keys || keys.length !== 1 || tomlAssignmentStringValue(line) === undefined) {
+      throw new Error("ambiguous Codex env assignment");
+    }
+    childKeys.push(keys[0]);
+  }
+  if (new Set(childKeys).size !== childKeys.length || childKeys.some(isLoaderVariable) ||
+      childKeys.includes(CODEX_BINDING) || childKeys.some((name) => envVars.includes(name))) {
+    throw new Error("duplicate or unsafe Codex environment key");
+  }
+  return {
+    envAssignment: envAssignments[0],
+    envVars,
+    userEnvironmentPresent: envVars.some((name) => name !== CODEX_BINDING) || childKeys.length > 0,
+  };
+}
+
+function mergeCodexBinding(source) {
+  const range = tomlRange(source);
+  if (range.start === undefined || range.hasAlternate) throw new Error("ambiguous Codex entry");
+  const environment = inspectCodexEnvironment(source, range);
+  if (environment.envVars.includes(CODEX_BINDING)) {
+    return { text: source, changed: false, userEnvironmentPresent: environment.userEnvironmentPresent };
+  }
+  const lines = [...range.lines];
+  if (environment.envAssignment) {
+    const lineIndex = range.start + 1 + environment.envAssignment.index;
+    const line = lines[lineIndex];
+    const array = /\[.*\]/.exec(stripTomlComment(line));
+    if (!array) throw new Error("invalid Codex env_vars assignment");
+    const names = JSON.stringify([...environment.envVars, CODEX_BINDING]);
+    lines[lineIndex] = `${line.slice(0, array.index)}${names}${line.slice(array.index + array[0].length)}`;
+  } else {
+    lines.splice(range.parentEnd, 0, `env_vars = ${JSON.stringify([CODEX_BINDING])}`);
+  }
+  return { text: lines.join("\n"), changed: true, userEnvironmentPresent: environment.userEnvironmentPresent };
+}
+
+function updateAdoptedCodexVector(source) {
+  const range = tomlRange(source);
+  if (range.start === undefined || range.hasAlternate) throw new Error("ambiguous adopted Codex entry");
+  const lines = [...range.lines];
+  const assignments = new Map();
+  for (let index = range.start + 1; index < range.parentEnd; index += 1) {
+    const keys = tomlAssignmentKeys(lines[index]);
+    if (keys?.length === 1) assignments.set(keys[0], index);
+  }
+  const commandIndex = assignments.get("command");
+  const argsIndex = assignments.get("args");
+  if (commandIndex === undefined || argsIndex === undefined) throw new Error("missing adopted Codex vector");
+  lines[commandIndex] = replaceTomlAssignmentValue(lines[commandIndex], JSON.stringify("node"));
+  lines[argsIndex] = replaceTomlAssignmentValue(lines[argsIndex], JSON.stringify(stdioArgs()));
+  const timeoutIndex = assignments.get("startup_timeout_sec");
+  if (timeoutIndex === undefined) lines.splice(argsIndex + 1, 0, "startup_timeout_sec = 60.0");
+  else lines[timeoutIndex] = replaceTomlAssignmentValue(lines[timeoutIndex], "60.0");
+  return lines.join("\n");
+}
+
 function inspectCodexRegistration() {
   const current = safeExistingFile(configFile);
   const inspected = ownedToml(current.text);
   if ((inspected.range.start !== undefined && !inspected.owned && !inspected.adopted) ||
       (inspected.range.start === undefined && inspected.range.hasOrphan)) failForeign();
-  let preserved = [];
-  if (inspected.adopted) {
-    // Only env_vars and an env child table carry over from the adopted entry.
-    const { lines, start, parentEnd, end } = inspected.range;
+  let binding;
+  if (inspected.range.start !== undefined) {
+    const { lines, start, parentEnd } = inspected.range;
     const parent = lines.slice(start + 1, parentEnd);
-    const children = lines.slice(parentEnd, end);
-    if (!parent.every((line) => /^\s*(#.*)?$/.test(line) || /^\s*(command|args|startup_timeout_sec|env_vars)\s*=/.test(line)) ||
-        !children.every((line) => !/^\s*\[/.test(line) || line.trim() === "[mcp_servers.jhw-notion.env]")) process.exit(ADOPT_UNPRESERVABLE);
-    preserved = [...parent.filter((line) => /^\s*env_vars\s*=/.test(line)), ...children];
-    // Preserved names must be readable and never loader/runtime-control variables.
-    for (const line of preserved) {
-      if (/^\s*(#.*)?$/.test(line) || /^\s*\[/.test(line)) continue;
-      const envVars = /^\s*env_vars\s*=\s*(\[.*\])\s*$/.exec(stripTomlComment(line));
-      let names;
-      if (envVars) { try { names = JSON.parse(envVars[1]); } catch { names = undefined; } }
-      else { const keys = tomlAssignmentKeys(line); names = keys?.length === 1 ? keys : undefined; }
-      if (!Array.isArray(names) || !names.every((name) => typeof name === "string") || names.some(isLoaderVariable)) process.exit(ADOPT_UNPRESERVABLE);
+    if (!parent.every((line) => /^\s*(#.*)?$/.test(line) ||
+        /^\s*(command|args|startup_timeout_sec|env_vars)\s*=/.test(line))) {
+      process.exit(ADOPT_UNPRESERVABLE);
     }
+    const assignmentNames = parent.flatMap((line) => tomlAssignmentKeys(line) ?? []);
+    if (["command", "args", "startup_timeout_sec", "env_vars"].some((name) =>
+      assignmentNames.filter((candidate) => candidate === name).length > 1)) {
+      process.exit(ADOPT_UNPRESERVABLE);
+    }
+    try { binding = mergeCodexBinding(current.text); }
+    catch { process.exit(ADOPT_UNPRESERVABLE); }
   }
-  return { current, inspected, preserved };
+  return { current, inspected, binding };
 }
 
 function registerCodex() {
-  const { current, inspected, preserved } = inspectCodexRegistration();
+  const { current, inspected, binding } = inspectCodexRegistration();
+  if (inspected.owned) saveToml(current, binding.text);
   let output;
-  if (inspected.range.start !== undefined) {
-    const suffix = inspected.range.lines.slice(inspected.range.end);
-    output = [
-      ...inspected.range.lines.slice(0, inspected.range.start),
-      ...codexEntry(),
-      ...preserved,
-      ...(suffix.length === 0 && current.text.endsWith("\n") ? [""] : suffix),
-    ].join("\n");
+  if (inspected.adopted) {
+    try { output = updateAdoptedCodexVector(binding.text); }
+    catch { process.exit(ADOPT_UNPRESERVABLE); }
   } else {
     const body = current.text.replace(/\n+$/, "");
     output = body ? `${body}\n\n${codexEntry().join("\n")}\n` : `${codexEntry().join("\n")}\n`;
@@ -1967,15 +2116,274 @@ function registerCodex() {
   saveToml(current, output);
 }
 
+const CODEX_MIGRATION_ARTIFACTS = new Set(["state.json", "before", "after-copy", "after"]);
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const migrationIdentity = (info) => ({
+  dev: String(info.dev), ino: String(info.ino), uid: Number(info.uid),
+  mode: Number(info.mode & 0o7777n), nlink: Number(info.nlink), size: String(info.size),
+});
+function migrationCheckpoint(evidenceFd, state) {
+  const temporary = `.state.${randomUUID()}`;
+  const fd = fs.openSync(`/proc/self/fd/${evidenceFd}/${temporary}`, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try { fs.fchmodSync(fd, 0o600); fs.writeFileSync(fd, `${JSON.stringify(state)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  fs.renameSync(`/proc/self/fd/${evidenceFd}/${temporary}`, `/proc/self/fd/${evidenceFd}/state.json`);
+  fs.fsyncSync(evidenceFd);
+  // The production worker has no IPC channel. Tests may attach one to stop
+  // exactly after a durable checkpoint without adding an environment bypass.
+  migrationPause(state.phase);
+}
+
+function migrationPause(phase, details = {}) {
+  if (typeof process.send === "function") { process.send({ phase, ...details }); process.kill(process.pid, "SIGSTOP"); }
+}
+
+function migrationArtifact(evidenceFd, name, bytes, mode) {
+  if (!CODEX_MIGRATION_ARTIFACTS.has(name) || name === "state.json") throw new Error("unknown migration artifact");
+  const fd = fs.openSync(`/proc/self/fd/${evidenceFd}/${name}`, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try { fs.fchmodSync(fd, mode); fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); return migrationIdentity(fs.fstatSync(fd, { bigint: true })); }
+  finally { fs.closeSync(fd); }
+}
+
+function runCodexBindingTransaction() {
+  if (!transactionEvidence || !path.isAbsolute(transactionEvidence)) throw new Error("missing migration evidence");
+  const logicalParent = path.dirname(path.resolve(logicalConfigFile));
+  const parentInfo = fs.lstatSync(logicalParent, { bigint: true });
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || parentInfo.uid !== BigInt(process.getuid()) || fs.realpathSync(logicalParent) !== logicalParent) throw new Error("unsafe config parent");
+  const parentFd = fs.openSync(logicalParent, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  let evidenceFd;
+  const captureFds = new Map();
+  const live = `/proc/self/fd/${parentFd}/${path.basename(logicalConfigFile)}`;
+  try {
+    const evidenceInfo = fs.lstatSync(transactionEvidence, { bigint: true });
+    evidenceFd = fs.openSync(transactionEvidence, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    const openedParent = fs.fstatSync(parentFd, { bigint: true });
+    const openedEvidence = fs.fstatSync(evidenceFd, { bigint: true });
+    if (openedParent.dev !== parentInfo.dev || openedParent.ino !== parentInfo.ino || !evidenceInfo.isDirectory() || !openedEvidence.isDirectory() ||
+        openedEvidence.uid !== BigInt(process.getuid()) || (openedEvidence.mode & 0o7777n) !== 0o700n ||
+        openedEvidence.dev !== evidenceInfo.dev || openedEvidence.ino !== evidenceInfo.ino || openedEvidence.dev !== openedParent.dev) throw new Error("unsafe migration evidence");
+    const at = (name) => `/proc/self/fd/${evidenceFd}/${name}`;
+    const directoryIdentity = (info) => ({ dev: String(info.dev), ino: String(info.ino), uid: Number(info.uid), mode: Number(info.mode & 0o7777n) });
+    const sameDirectory = (info, expected) => info.isDirectory() && Object.entries(expected).every(([key, value]) => directoryIdentity(info)[key] === value);
+    const pinCapture = (key, capture) => {
+      const fd = fs.openSync(at(capture.name), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      captureFds.set(key, fd);
+      if (!sameDirectory(fs.fstatSync(fd, { bigint: true }), capture.identity)) throw new Error("migration capture changed");
+    };
+    const reserveCapture = (key) => {
+      const name = `capture-${randomUUID().replaceAll("-", "")}`;
+      migrationPause("capture_reserve_intent", { name, key });
+      fs.mkdirSync(at(name), { mode: 0o700 }); // Exclusive reservation, never recursive or reused.
+      const fd = fs.openSync(at(name), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      captureFds.set(key, fd); fs.fchmodSync(fd, 0o700);
+      const identity = directoryIdentity(fs.fstatSync(fd, { bigint: true }));
+      if (identity.uid !== process.getuid() || identity.mode !== 0o700 || !sameDirectory(fs.lstatSync(at(name), { bigint: true }), identity)) throw new Error("migration capture changed");
+      fs.fsyncSync(fd); fs.fsyncSync(evidenceFd);
+      return { name, identity };
+    };
+    const names = fs.readdirSync(at(""));
+    let state; let recoveryClassification;
+    const resuming = names.includes("state.json");
+    if (resuming) {
+      const parsed = readCodexMigrationJournal({ journalDirectory: transactionEvidence });
+      state = parsed.state; recoveryClassification = parsed.classification;
+      if (state.config !== path.resolve(logicalConfigFile) || state.editorReleaseId !== backupStamp) throw new Error("migration coordinates changed");
+      if (state.status === "complete") process.exit(state.outcome === "migrated" ? CHANGED : MANUAL_RECOVERY);
+      for (const key of ["source", "temp", "control"]) pinCapture(key, state.captures[key]);
+      if (state.phase === "ambiguous") throw new Error("migration recovery ambiguous");
+    } else {
+      if (names.length) throw new Error("unknown migration evidence");
+      const sourceFd = fs.openSync(live, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      let source;
+      try {
+        const initial = fs.fstatSync(sourceFd, { bigint: true });
+        if (!initial.isFile() || initial.uid !== BigInt(process.getuid()) || initial.nlink !== 1n ||
+            (initial.mode & 0o7777n) !== 0o600n || initial.size > 2n * 1024n * 1024n) failForeign();
+        const bytes = Buffer.alloc(Number(initial.size) + 1); let length = 0;
+        while (length < bytes.length) { const count = fs.readSync(sourceFd, bytes, length, bytes.length - length, null); if (!count) break; length += count; }
+        const final = fs.fstatSync(sourceFd, { bigint: true });
+        const named = fs.lstatSync(live, { bigint: true });
+        if (length !== Number(initial.size) || ["dev","ino","uid","mode","nlink","size","ctimeNs","mtimeNs"].some((key) => initial[key] !== final[key] || initial[key] !== named[key])) throw new Error("source changed");
+        source = { bytes: bytes.subarray(0, length), info: final };
+      } finally { fs.closeSync(sourceFd); }
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(source.bytes);
+      const inspected = ownedToml(text);
+      if (!inspected.owned || inspected.range.start === undefined) failForeign();
+      const transformed = Buffer.from(mergeCodexBinding(text).text, "utf8");
+      if (transformed.equals(source.bytes)) {
+        if (!strictCodexBindingText(text, { bindingRequired: true })) failForeign();
+        process.exit(UNCHANGED);
+      }
+      const beforeCopy = migrationArtifact(evidenceFd, "before", source.bytes, 0o600);
+      const afterCopy = migrationArtifact(evidenceFd, "after-copy", transformed, 0o600);
+      const after = migrationArtifact(evidenceFd, "after", transformed, 0o600);
+      const captures = { source: reserveCapture("source"), temp: reserveCapture("temp"), control: reserveCapture("control") };
+      const headerBytes = Buffer.from(`${JSON.stringify({version:2,kind:"codex-config",control:captures.control})}\n`);
+      const headerFd = fs.openSync(at("state.json"), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      let header;
+      try {
+        fs.fchmodSync(headerFd,0o600); fs.writeFileSync(headerFd,headerBytes); fs.fsyncSync(headerFd);
+        header={identity:migrationIdentity(fs.fstatSync(headerFd,{bigint:true})),sha256:sha256(headerBytes)};
+      } finally { fs.closeSync(headerFd); }
+      fs.fsyncSync(evidenceFd);
+      state = { version: 2, kind: "codex-config", status: "pending", phase: "prepared",
+        config: path.resolve(logicalConfigFile), editorReleaseId: backupStamp,
+        before: { identity: migrationIdentity(source.info), sha256: sha256(source.bytes), copy: beforeCopy },
+        after: { identity: after, sha256: sha256(transformed), copy: afterCopy },
+        captures, header,
+        resolution: null, observed: null, outcome: null };
+      migrationCheckpoint(captureFds.get("control"), state);
+    }
+    const capturePath = (key) => `/proc/self/fd/${captureFds.get(key)}/object`;
+    const verifyDirectories = () => {
+      if (!sameDirectory(fs.lstatSync(logicalParent, { bigint: true }), directoryIdentity(openedParent)) ||
+          !sameDirectory(fs.lstatSync(transactionEvidence, { bigint: true }), directoryIdentity(openedEvidence))) throw new Error("migration parent changed");
+      const header = readObservedCodexObject(at("state.json"));
+      if (header?.kind !== "file" || header.sha256 !== state.header.sha256 ||
+          Object.entries(state.header.identity).some(([key,value]) => header.identity[key] !== value)) throw new Error("migration header changed");
+      for (const key of ["source", "temp", "control"]) {
+        const fd = captureFds.get(key); const capture = state.captures[key];
+        if (!sameDirectory(fs.fstatSync(fd, { bigint: true }), capture.identity) ||
+            !sameDirectory(fs.lstatSync(at(capture.name), { bigint: true }), capture.identity) ||
+            fs.readdirSync(`/proc/self/fd/${fd}`).some(name => name !== (key === "control" ? "state.json" : "object"))) throw new Error("migration capture changed");
+      }
+    };
+    const objects = () => ({ live: readObservedCodexObject(live), quarantine: readObservedCodexObject(capturePath("source")),
+      after: readObservedCodexObject(at("after")), capturedAfter: readObservedCodexObject(capturePath("temp")) });
+    const preserveAmbiguity = (reason) => {
+      verifyDirectories();
+      state.phase = "ambiguous"; state.observed = { reason, ...objects() };
+      migrationCheckpoint(captureFds.get("control"), state); throw new Error(reason);
+    };
+    const validate = (expectedClassification = "active") => {
+      verifyDirectories();
+      let parsed;
+      try { parsed = readCodexMigrationJournal({ journalDirectory: transactionEvidence }); }
+      catch { preserveAmbiguity("migration object changed"); }
+      // Readable recovery evidence is not permission for a normal mutation.
+      if (parsed.classification !== expectedClassification) preserveAmbiguity("migration classification changed");
+      return parsed.objects;
+    };
+    const checkpoint = (phase) => { state.phase = phase; migrationCheckpoint(captureFds.get("control"), state); };
+    const matches = (actual, expected, hash, links) => actual?.kind === "file" && actual.sha256 === hash &&
+      ["dev", "ino", "uid", "mode", "size"].every(key => actual.identity[key] === expected[key]) && links.includes(actual.identity.nlink);
+    const restoreForeign = () => {
+      verifyDirectories();
+      if (state.phase !== "foreign_restore_intent") {
+        const snapshot = objects();
+        const parsed = readCodexMigrationJournal({ journalDirectory: transactionEvidence });
+        if (parsed.classification !== "foreign-capture" || snapshot.live) preserveAmbiguity("migration quarantine changed");
+        // This durable record identifies the actual captured inode/content, never
+        // the numeric FD. The shared reader accepts both sides of the link below.
+        state.observed = { reason: "migration foreign restore", ...snapshot };
+        checkpoint("foreign_restore_intent");
+      }
+      const actual = validate("foreign-restore");
+      if (!actual.live) {
+        try { fs.linkSync(capturePath("source"), live); fs.fsyncSync(parentFd); }
+        catch (cause) { if (cause.code === "EEXIST") preserveAmbiguity("migration live reoccupied"); throw cause; }
+        migrationPause("foreign_restore_linked");
+      }
+      validate("foreign-restore");
+      // Restoring a raced foreign object never certifies a managed migration.
+      // Keep both links and all evidence; repeated calls remain pending failures.
+      preserveAmbiguity("migration quarantine changed");
+    };
+    if (recoveryClassification === "foreign-capture" || recoveryClassification === "foreign-restore") restoreForeign();
+    let actual = objects();
+    if (resuming && ["prepared", "quarantine_intent", "quarantined", "publish_intent"].includes(state.phase)) {
+      validate();
+      if (matches(actual.live, state.before.identity, state.before.sha256, [1]) && !actual.quarantine) {
+        state.resolution = "unchanged"; checkpoint("temp_capture_intent");
+      } else if (!actual.live && matches(actual.quarantine, state.before.identity, state.before.sha256, [1])) {
+        state.resolution = "restored-before"; checkpoint("restore_intent");
+      }
+      // A publish_intent crash after link is proven by the shared nlink=2 table.
+    }
+    if (["prepared", "quarantine_intent"].includes(state.phase)) {
+      validate(); checkpoint("quarantine_intent"); verifyDirectories();
+      if (readObservedCodexObject(capturePath("source"))) preserveAmbiguity("migration capture occupied");
+      // The destination is inside a freshly reserved single-writer container.
+      // The public source may race; inspect the object actually moved, never delete it on mismatch.
+      fs.renameSync(live, capturePath("source")); fs.fsyncSync(parentFd); fs.fsyncSync(captureFds.get("source"));
+      migrationPause("quarantine_moved");
+      actual = objects();
+      if (!matches(actual.quarantine, state.before.identity, state.before.sha256, [1])) restoreForeign();
+      checkpoint("quarantined");
+    }
+    if (["quarantined", "publish_intent"].includes(state.phase)) {
+      actual = objects();
+      if (!actual.live && !matches(actual.quarantine, state.before.identity, state.before.sha256, [1])) restoreForeign();
+      validate();
+      if (!actual.live) {
+        checkpoint("publish_intent"); validate();
+        fs.linkSync(at("after"), live); fs.fsyncSync(parentFd); migrationPause("publish_linked");
+      }
+      validate(); checkpoint("published");
+    }
+    if (state.phase === "published") {
+      validate(); state.resolution = "migrated"; checkpoint("temp_capture_intent");
+    }
+    if (state.phase === "restore_intent") {
+      actual = validate();
+      if (!actual.live) {
+        fs.linkSync(capturePath("source"), live); fs.fsyncSync(parentFd); migrationPause("restore_linked");
+      }
+      validate(); checkpoint("quarantine_retire_intent");
+    }
+    if (state.phase === "quarantine_retire_intent") {
+      actual = validate();
+      if (actual.quarantine) {
+        // Only this transaction writes names inside the verified active capture.
+        fs.unlinkSync(capturePath("source")); fs.fsyncSync(captureFds.get("source")); fs.fsyncSync(parentFd);
+        migrationPause("quarantine_retired");
+      }
+      validate(); checkpoint("temp_capture_intent");
+    }
+    if (state.phase === "temp_capture_intent") {
+      actual = validate();
+      if (actual.after) {
+        verifyDirectories();
+        if (readObservedCodexObject(capturePath("temp"))) preserveAmbiguity("migration capture occupied");
+        fs.renameSync(at("after"), capturePath("temp")); fs.fsyncSync(evidenceFd); fs.fsyncSync(captureFds.get("temp"));
+        migrationPause("temp_captured");
+      }
+      validate(); checkpoint("temp_retire_intent");
+    }
+    if (state.phase === "temp_retire_intent") {
+      actual = validate();
+      if (actual.capturedAfter) {
+        fs.unlinkSync(capturePath("temp")); fs.fsyncSync(captureFds.get("temp")); fs.fsyncSync(parentFd);
+        migrationPause("temp_retired");
+      }
+      validate(); checkpoint("verified");
+    }
+    if (state.phase !== "verified") preserveAmbiguity("migration phase invalid");
+    validate();
+    if (state.resolution === "migrated") {
+      configFile = logicalConfigFile;
+      const finalText = safeExistingFile(configFile);
+      if (!finalText.exists || !strictCodexBindingText(finalText.text, { bindingRequired: true })) preserveAmbiguity("migration strict verification failed");
+    }
+    validate();
+    state.status = "complete"; state.outcome = state.resolution; checkpoint("complete");
+    process.exit(state.outcome === "migrated" ? CHANGED : MANUAL_RECOVERY);
+  } finally {
+    for (const fd of captureFds.values()) fs.closeSync(fd);
+    if (evidenceFd !== undefined) fs.closeSync(evidenceFd);
+    fs.closeSync(parentFd);
+  }
+}
+
 function unregisterCodex() {
   const current = safeExistingFile(configFile);
   if (!current.exists) process.exit(UNCHANGED);
   const inspected = ownedToml(current.text);
   if (!inspected.owned || inspected.range.start === undefined) process.exit(UNCHANGED);
-  // The register path writes neither env_vars nor child tables.
   const { lines, start, parentEnd, end } = inspected.range;
-  reportEnvDropped(lines.slice(start + 1, parentEnd).some((line) => /^\s*env_vars\s*=/.test(line)) ||
-    lines.slice(parentEnd, end).some((line) => /^\s*\[/.test(line)));
+  let environment;
+  try { environment = inspectCodexEnvironment(current.text, inspected.range); }
+  catch { preserveUnowned(); }
+  reportEnvDropped(environment.userEnvironmentPresent);
   const output = [
     ...inspected.range.lines.slice(0, inspected.range.start),
     ...inspected.range.lines.slice(inspected.range.end),
@@ -2000,7 +2408,7 @@ try {
     if (guardPolicyOperations.has(operation)) assertTrustedGuardPolicyLocation();
     anchorHookTransactionPaths();
   }
-  if (["verify-stdio","verify-opencode","verify-codex","verify-claude-hooks","verify-codex-hooks"].includes(operation)) verifyManagedConfiguration();
+  if (["verify-stdio","verify-opencode","verify-codex","verify-codex-binding","verify-claude-hooks","verify-codex-hooks"].includes(operation)) verifyManagedConfiguration();
   if (operation === "check-transaction-parent") {
     try { anchorHookTransactionPaths(); } catch { failForeign(); }
     process.exit(CHANGED);
@@ -2008,6 +2416,12 @@ try {
   if (operation === "check-stdio") { inspectStdioRegistration(); process.exit(CHANGED); }
   if (operation === "check-opencode") { inspectOpenCodeRegistration(); process.exit(CHANGED); }
   if (operation === "check-codex") { inspectCodexRegistration(); process.exit(CHANGED); }
+  if (operation === "check-codex-binding-migration") {
+    const { inspected } = inspectCodexRegistration();
+    if (inspected.range.start === undefined || (!inspected.owned && !inspected.adopted)) failForeign();
+    process.stdout.write(`${JSON.stringify({ version: 1, capabilities: ["codex-binding-migration-v1"] })}\n`);
+    process.exit(CHANGED);
+  }
   if (operation === "check-codex-hooks" || operation === "check-claude-hooks") checkCodexHooks();
   if (operation === "check-guard-policy") process.exit(checkGuardPolicy());
   if (operation === "check-guard-policy-target") process.exit(await checkGuardPolicyTarget());
@@ -2016,6 +2430,7 @@ try {
   if (operation === "register-opencode") registerOpenCode();
   if (operation === "unregister-opencode") unregisterOpenCode();
   if (operation === "register-codex") registerCodex();
+  if (operation === "migrate-codex-binding-transaction") runCodexBindingTransaction();
   if (operation === "unregister-codex") unregisterCodex();
   if (operation === "unregister-codex-hooks-transaction") process.exit(unregisterCodexHooksTransaction());
   if (operation === "register-codex-hooks-transaction") process.exit(registerCodexHooksTransaction());

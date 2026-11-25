@@ -3,27 +3,42 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawnSync, spawn} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {once} from 'node:events';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import test from 'node:test';
+import childProcess from 'node:child_process';
+import {syncBuiltinESMExports} from 'node:module';
 import {acquireLease} from './runtime-safety.mjs';
 import {prepareRelease, readActivation} from './runtime-store.mjs';
+import {readRuntimeJournalV2} from './runtime-prune.mjs';
 const deploy = await import('./runtime-deploy.mjs').catch(e => {if(e.code!=='ERR_MODULE_NOT_FOUND')throw e;return {};});
 const source = path.dirname(fileURLToPath(import.meta.url));
 function write(root,name,bytes,mode=0o644) {const p=path.join(root,name);fs.mkdirSync(path.dirname(p),{recursive:true,mode:0o755});fs.writeFileSync(p,bytes,{mode});fs.chmodSync(p,mode);return p;}
-function fixture(t) {
+function fixture(t,{legacyRevision=null}={}) {
  const outer=fs.mkdtempSync(path.join(os.tmpdir(),'jhw-deploy-'));fs.chmodSync(outer,0o700);t.after(()=>{ if(t.passed===false) {for(const p of fs.readdirSync(outer,{recursive:true}).filter(p=>p.endsWith('.log'))) t.diagnostic(fs.readFileSync(path.join(outer,p),'utf8'));} fs.rmSync(outer,{recursive:true,force:true});});
  const root=path.join(outer,'repo'),home=path.join(outer,'home'),procRoot=path.join(outer,'proc');for(const p of [root,home,procRoot])fs.mkdirSync(p,{mode:0o700});
  for(const [p,b] of Object.entries({'.gitignore':'.jhw-runtime/\n','mcp-server/package.json':'{"type":"module"}','mcp-server/package-lock.json':'{"lockfileVersion":3}','mcp-server/tsconfig.json':'{}','mcp-server/src/index.ts':'export {};','scripts/sync-codex-skills.mjs':'','skills/claude/task.md':'fixture','skills/codex/jhw-task/SKILL.md':'fixture'}))write(root,p,b);
- for(const name of ['runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);
+ for(const name of ['runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','runtime-managed-scope.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);
+ if(legacyRevision!==null){
+  assert.match(legacyRevision,/^[a-f0-9]{40}$/);
+  const verified=spawnSync('git',['merge-base','--is-ancestor',legacyRevision,'HEAD'],{cwd:path.dirname(source)});assert.equal(verified.status,0);
+  const archive=spawnSync('git',['archive','--format=tar',legacyRevision,'scripts'],{cwd:path.dirname(source),maxBuffer:32*1024*1024});assert.equal(archive.status,0);
+  const fixtureMask=process.umask(0o022);
+  try{assert.equal(spawnSync('tar',['-xf','-','-C',root],{input:archive.stdout}).status,0);}finally{process.umask(fixtureMask);}
+ }
  for(const args of [['init','-q'],['add','.'],['-c','user.name=Fixture','-c','user.email=f@example.invalid','commit','-qm','fixture']])assert.equal(spawnSync('git',args,{cwd:root}).status,0);
  let builds=0;
  const build=async ({stagingRoot})=>{builds++;const mcp="process.stdin.setEncoding('utf8');let b='';process.stdin.on('data',c=>{b+=c;let n;while((n=b.indexOf('\\n'))>=0){const q=JSON.parse(b.slice(0,n));b=b.slice(n+1);if(q.id)process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result:q.method==='tools/list'?{tools:[]}:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n');}});";const control="#!/usr/bin/env node\nconsole.log(JSON.stringify({error:{code:'INVALID_CONFIG'}}));process.exitCode=78;";const hook='#!/usr/bin/env node\nconsole.log("{}");';write(stagingRoot,'mcp-server/dist/index.js',mcp);write(stagingRoot,'mcp-server/dist/control/cli.js',control,0o755);write(stagingRoot,'mcp-server/dist/control/hook-adapter.js',hook,0o755);write(stagingRoot,'mcp-server/dist/runtime/mcp.cjs',mcp);write(stagingRoot,'mcp-server/dist/runtime/control.cjs',control,0o755);write(stagingRoot,'mcp-server/dist/runtime/hook.cjs',hook,0o755);fs.mkdirSync(path.join(stagingRoot,'mcp-server/node_modules'),{mode:0o755});};
  const options={repositoryRoot:root,home,procRoot,build};
- return {root,home,procRoot,options,build,builds:()=>builds,run:argv=>{assert.equal(typeof deploy.runDeployment,'function','deployment orchestrator must exist');return deploy.runDeployment({...options,argv});}};
+ let useLegacy=legacyRevision!==null;
+ return {root,home,procRoot,options,build,builds:()=>builds,
+  useCurrentRuntime:()=>{for(const name of ['runtime-deploy.mjs','runtime-safety.mjs','runtime-store.mjs','runtime-entry.mjs','runtime-prune.mjs','runtime-guard.mjs','runtime-managed-scope.mjs','install-config.mjs','install-wiring.sh','jhw-runtime-entry','jhw-runtime-control','jhw-runtime-hook','jhw-control-hook'])write(root,`scripts/${name}`,fs.readFileSync(path.join(source,name)),name.startsWith('jhw-')?0o755:0o644);useLegacy=false;},
+  run:async argv=>{const runner=useLegacy?await import(pathToFileURL(path.join(root,'scripts/runtime-deploy.mjs')).href):deploy;return runner.runDeployment({...options,argv});}};
 }
 function addConsumer(f,name='codex') {const p=path.join(f.procRoot,'100');fs.mkdirSync(p);write(p,'status',`Uid:\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\t${process.getuid()}\n`,0o600);write(p,'stat','100 (fixture) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0\n',0o600);write(p,'cmdline',`${name}\0`,0o600);fs.symlinkSync(f.root,path.join(p,'cwd'));}
 function host(f) {const contract={commands:['unlock','preflight','portfolio status','task start','task child-start','task contract','task completion-ready','task promote','task status','task handoff','task finish','task recover','task assert-owner','board status','board acquire','board with'],credential_policy:'secure-store-only',name:'jhw-control-host',version:5};write(f.home,'.local/bin/jhw-control-host',`#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(contract)}'\n`,0o755);}
+function contentSnapshot(root){const rows=[];const visit=(directory,prefix='')=>{for(const name of fs.readdirSync(directory).sort()){const file=path.join(directory,name),relative=prefix?`${prefix}/${name}`:name,stat=fs.lstatSync(file);if(stat.isDirectory()){rows.push([relative,'d',stat.mode&0o7777]);visit(file,relative);}else if(stat.isSymbolicLink())rows.push([relative,'l',fs.readlinkSync(file)]);else rows.push([relative,'f',stat.mode&0o7777,createHash('sha256').update(fs.readFileSync(file)).digest('hex')]);}};visit(root);return rows;}
 
 test('strict public arguments reject before any store or HOME write',async t=>{const f=fixture(t);for(const argv of [['--force'],['--status','extra'],['--activate'],['--activate','../bad'],['--prepare','--rollback'],['--uninstall','extra'],['--refresh-bootstrap','extra'],['--prune','--force'],['--prune','--apply','extra']])await assert.rejects(f.run(argv),{code:'DEPLOY_ARGUMENTS_INVALID'});assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime')),false);assert.deepEqual(fs.readdirSync(f.home),[]);});
 test('prepare permits active consumers and never invokes wiring or touches legacy builds',async t=>{const f=fixture(t);addConsumer(f);write(f.root,'mcp-server/dist/legacy','old');const r=await f.run(['--prepare']);assert.match(r.releaseId,/^r-/);assert.equal(f.builds(),1);assert.deepEqual(fs.readdirSync(f.home),[]);assert.equal(readActivation({repositoryRoot:f.root}),null);assert.equal(fs.readFileSync(path.join(f.root,'mcp-server/dist/legacy'),'utf8'),'old');});
@@ -34,8 +49,385 @@ test('prepare is not refused by ignored excluded subtrees under source inputs an
 test('existing default install returns bounded explicit instructions without building',async t=>{const f=fixture(t);write(f.home,'.claude.json','{"mcpServers":{"jhw-notion":{"command":"node","args":["foreign"]}}}');const r=await f.run([]);assert.equal(r.code,'DEPLOY_EXPLICIT_ACTIVATION_REQUIRED');assert.equal(f.builds(),0);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime')),false);});
 test('active and uncertain inventory refuse activation and uninstall before shared mutation',async t=>{const f=fixture(t);const r=await f.run(['--prepare']);addConsumer(f);for(const argv of [['--activate',r.releaseId],['--uninstall'],['--rollback']])await assert.rejects(f.run(argv),{code:'DEPLOY_CONSUMERS_ACTIVE'});assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/admission.lock')),false);fs.unlinkSync(path.join(f.procRoot,'100/status'));await assert.rejects(f.run(['--activate',r.releaseId]),{code:'DEPLOY_INVENTORY_UNCERTAIN'});assert.deepEqual(fs.readdirSync(f.home),[]);});
 test('admission shared holder refuses activation preserving current and wiring',async t=>{const f=fixture(t);const r=await f.run(['--prepare']);const lock=acquireLease(path.join(f.root,'.jhw-runtime/admission.lock'),{shared:true,create:true});try{await assert.rejects(f.run(['--activate',r.releaseId]),{code:'DEPLOY_LOCK_CONTENDED'});}finally{lock.close();}assert.equal(readActivation({repositoryRoot:f.root}),null);assert.deepEqual(fs.readdirSync(f.home),[]);});
-test('first activation wires stable entries, next activation is pointer-only, rollback and reinstall retain releases',async t=>{const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});const r=await f.run(['--prepare']);const a=await f.run(['--activate',r.releaseId]);assert.equal(a.releaseId,r.releaseId);const config=path.join(f.home,'.claude.json');assert.deepEqual(JSON.parse(fs.readFileSync(config)).mcpServers['jhw-notion'].args,[path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']);assert.equal(fs.readlinkSync(path.join(f.home,'.local/bin/jhw-control-hook')),path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-hook'));assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home,'.config/opencode/opencode.json'))).mcp['jhw-notion'].command,['node',path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']);assert.match(fs.readFileSync(path.join(f.home,'.codex/config.toml'),'utf8'),/"mcp"/);const before=fs.statSync(config,{bigint:true});write(f.root,'mcp-server/src/index.ts','export const version=2;');const r2=await f.run(['--prepare']);await f.run(['--activate',r2.releaseId]);assert.equal(fs.statSync(config,{bigint:true}).ino,before.ino);assert.equal(fs.statSync(config,{bigint:true}).mtimeNs,before.mtimeNs);await f.run(['--rollback']);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,r.releaseId);await f.run(['--uninstall']);assert.equal(fs.existsSync(path.join(f.home,'.local/bin/jhw-control')),false);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/releases',r2.releaseId)),true);await f.run(['--activate',r.releaseId]);assert.equal(fs.existsSync(path.join(f.home,'.local/bin/jhw-control')),true);});
+test('first activation wires stable entries, next activation is pointer-only, rollback and reinstall retain releases',async t=>{const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});const r=await f.run(['--prepare']);const a=await f.run(['--activate',r.releaseId]);assert.equal(a.releaseId,r.releaseId);const config=path.join(f.home,'.claude.json');assert.deepEqual(JSON.parse(fs.readFileSync(config)).mcpServers['jhw-notion'].args,[path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']);assert.equal(fs.readlinkSync(path.join(f.home,'.local/bin/jhw-control-hook')),path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-hook'));assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home,'.config/opencode/opencode.json'))).mcp['jhw-notion'].command,['node',path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),'mcp']);const codex=fs.readFileSync(path.join(f.home,'.codex/config.toml'),'utf8');assert.match(codex,/"mcp"/);assert.match(codex,/^env_vars = \["JHW_RUNTIME_SESSION_BINDING"\]$/m);const before=fs.statSync(config,{bigint:true});write(f.root,'mcp-server/src/index.ts','export const version=2;');const r2=await f.run(['--prepare']);await f.run(['--activate',r2.releaseId]);assert.equal(fs.statSync(config,{bigint:true}).ino,before.ino);assert.equal(fs.statSync(config,{bigint:true}).mtimeNs,before.mtimeNs);await f.run(['--rollback']);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,r.releaseId);await f.run(['--uninstall']);assert.equal(fs.existsSync(path.join(f.home,'.local/bin/jhw-control')),false);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/releases',r2.releaseId)),true);await f.run(['--activate',r.releaseId]);assert.equal(fs.existsSync(path.join(f.home,'.local/bin/jhw-control')),true);});
 test('first managed activation has no invented legacy predecessor',async t=>{const f=fixture(t);host(f);const r=await f.run(['--prepare']);await f.run(['--activate',r.releaseId]);await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_PREDECESSOR_INVALID'});});
+
+test('fresh generation2 installation publishes a v2 pair without a migration predecessor',async t=>{
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.codex'),{mode:0o700});
+ write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
+ const current=readActivation({repositoryRoot:f.root});assert.equal(current.version,2);assert.equal(current.predecessorActivationId,null);assert.equal(current.migrationId,null);
+ const manifest=JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime',current.observation.target,'manifest.json')));
+ assert.equal(manifest.priorCurrent,null);assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime/bootstrap/manifest.json'))).version,2);
+ const homeBefore=contentSnapshot(f.home);const routerBefore=contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap'));
+ const refresh=await f.run(['--refresh-bootstrap']);assert.equal(refresh.unchanged,true);assert.deepEqual(readActivation({repositoryRoot:f.root}),current);
+ assert.deepEqual(contentSnapshot(f.home),homeBefore);assert.deepEqual(contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap')),routerBefore);
+ await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_PREDECESSOR_INVALID'});
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+
+test('v2 refresh rechecks pending pair after acquiring deploy lock',async t=>{
+ const f=fixture(t);host(f);write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const first=await f.run(['--prepare']);await f.run(['--activate',first.releaseId]);const current=readActivation({repositoryRoot:f.root});
+ write(f.root,'mcp-server/src/index.ts','export const competingDeployment=2;');const candidate=await f.run(['--prepare']);
+ const runChild=`const {runDeployment}=await import(${JSON.stringify(pathToFileURL(path.join(source,'runtime-deploy.mjs')).href)});let reached=false;const phaseRunner=async()=>{};phaseRunner.observe=({phase})=>{if(phase==='pointer_intent'){reached=true;throw new Error('fixture-pending');}};try{await runDeployment({...${JSON.stringify({repositoryRoot:f.root,home:f.home,procRoot:f.procRoot,argv:['--activate-compatible',candidate.releaseId]})},phaseRunner});process.exit(9);}catch(e){if(!reached||e.code!=='DEPLOY_ACTIVATION_INVALID')throw e;process.stdout.write('pending');}`;
+ const open=fs.openSync;let armed=true;let injected=false;
+ fs.openSync=function(file,...args){
+  if(armed&&path.basename(String(file))==='deploy.lock'){
+   armed=false;const child=spawnSync(process.execPath,['--input-type=module','-e',runChild],{encoding:'utf8',timeout:30000,env:{...process.env,HOME:f.home}});
+   if(child.status!==0)t.diagnostic(child.stderr||String(child.error));
+   assert.equal(child.status,0,child.stderr);assert.equal(child.stdout,'pending');injected=true;
+  }
+  return open.call(this,file,...args);
+ };
+ try{await assert.rejects(f.run(['--refresh-bootstrap']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});}
+ finally{fs.openSync=open;}
+ assert.equal(injected,true);assert.deepEqual(readActivation({repositoryRoot:f.root}),current);assert.equal((await f.run(['--status'])).recoveryPending,1);
+});
+
+test('fresh generation2 late wire failure restores HOME before publishing a pair',async t=>{
+ const f=fixture(t);host(f);write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const release=await f.run(['--prepare']);const shape=homeShape(f.home);let wired=false;
+ const phaseRunner=async options=>{const result=await deploy.wiringPhase(options);if(options.phase==='wire'){wired=true;throw new Error('fixture late wire failure');}return result;};
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--activate',release.releaseId],phaseRunner}),{code:'DEPLOY_WIRING_FAILED',reason:'first_activation_rolled_back'});
+ assert.equal(wired,true);assertFirstActivationRolledBack(f,shape);assert.equal((await f.run(['--status'])).recoveryPending,0);
+ assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/bootstrap')),false);
+ await f.run(['--activate',release.releaseId]);assert.equal(readActivation({repositoryRoot:f.root}).version,2);
+});
+
+function interruptTransition(f,argv,phase) {
+ const program=`const m=await import(${JSON.stringify(pathToFileURL(path.join(source,'runtime-deploy.mjs')).href)});const phaseRunner=options=>m.wiringPhase(options);phaseRunner.observe=event=>{if(event.phase===${JSON.stringify(phase)})process.exit(73);};await m.runDeployment({repositoryRoot:${JSON.stringify(f.root)},home:${JSON.stringify(f.home)},procRoot:${JSON.stringify(f.procRoot)},argv:${JSON.stringify(argv)},phaseRunner});process.exit(74);`;
+ return spawnSync(process.execPath,['--input-type=module','-e',program],{encoding:'utf8',env:{...process.env,HOME:f.home},timeout:45000});
+}
+test('initial preparation prerequisite failure permits a clean retry with no public pending owner',async t=>{
+ const f=fixture(t);host(f);write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const release=await f.run(['--prepare']),before=homeShape(f.home);const original=childProcess.spawnSync;let called=false;
+ childProcess.spawnSync=function(command,...args){if(command==='/usr/bin/python3'){called=true;return {status:0,signal:null,stdout:'{"ok":false,"errno":38}\n',stderr:''};}return original.call(this,command,...args);};syncBuiltinESMExports();
+ try{await assert.rejects(f.run(['--activate',release.releaseId]),{code:'DEPLOY_ATOMIC_RENAME_UNSUPPORTED'});}finally{childProcess.spawnSync=original;syncBuiltinESMExports();}
+ assert.equal(called,true);assert.equal(readActivation({repositoryRoot:f.root}),null);assert.deepEqual(homeShape(f.home),before);assert.equal((await f.run(['--status'])).recoveryPending,0);
+ assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATED');
+});
+test('initial installation publishes exactly one owner containing its v1 wiring evidence',async t=>{
+ const f=fixture(t);host(f);write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const release=await f.run(['--prepare']);assert.equal(interruptTransition(f,['--activate',release.releaseId],'initial_prepared').status,73);
+ const runtime=path.join(f.root,'.jhw-runtime');assert.deepEqual(fs.readdirSync(runtime).filter(name=>/^\.deploy\./.test(name)),[]);
+ const journals=path.join(runtime,'v2/journals'),names=fs.readdirSync(journals).filter(name=>/^d-/.test(name));assert.equal(names.length,1);
+ const owner=path.join(journals,names[0]),parsed=readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:owner});
+ assert.equal(parsed.state.wiring.name,'wiring');for(const name of ['state.json','before.json','listings.json'])assert.ok(fs.statSync(path.join(owner,'wiring',name)).isFile());
+ assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATION_RESTORED');
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+test('initial nested wiring preserves preexisting config and inventories its restore scratch',async t=>{
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.claude'),{mode:0o700});write(f.home,'.claude.json','{"existing":"keep","mcpServers":{}}\n',0o640);
+ write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const release=await f.run(['--prepare']),before=homeShape(f.home);
+ assert.equal(interruptTransition(f,['--activate',release.releaseId],'initial_prepared').status,73);
+ const root=path.join(f.root,'.jhw-runtime/v2/journals'),name=fs.readdirSync(root).find(name=>/^d-/.test(name));
+ const scratch=path.join(root,name,'wiring/restore');fs.mkdirSync(scratch,{mode:0o700});
+ write(scratch,'a'.repeat(16),fs.readFileSync(path.join(f.home,'.claude.json')),0o640);
+ assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATION_RESTORED');assertFirstActivationRolledBack(f,before);
+ const parsed=readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:path.join(root,name)});
+ assert.ok([...parsed.files.keys()].some(name=>name.startsWith('wiring/restore/')));
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+for(const phase of ['prepare_start','capability_ready','generation_ready','router_ready','activation_ready','wiring_ready','candidate_ready'])test(`initial private preparation interruption permits fresh retry at ${phase}`,async t=>{
+ const f=fixture(t);host(f);write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const release=await f.run(['--prepare']),before=homeShape(f.home);
+ const interrupted=interruptTransition(f,['--activate',release.releaseId],`initial_${phase}`);assert.equal(interrupted.status,73,interrupted.stderr);
+ assert.equal(readActivation({repositoryRoot:f.root}),null);assert.deepEqual(homeShape(f.home),before);assert.equal((await f.run(['--status'])).recoveryPending,0);
+ const runtime=path.join(f.root,'.jhw-runtime');assert.equal(fs.existsSync(path.join(runtime,'bootstrap')),false);assert.deepEqual(fs.readdirSync(runtime).filter(name=>/^\.deploy\./.test(name)),[]);
+ const journals=path.join(runtime,'v2/journals');const retained=fs.existsSync(journals)?fs.readdirSync(journals).filter(name=>/^\.candidate\./.test(name)).map(name=>({name,bytes:contentSnapshot(path.join(journals,name))})):[];
+ assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATED');
+ for(const item of retained)assert.deepEqual(contentSnapshot(path.join(journals,item.name)),item.bytes);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+for(const phase of ['backup-synced','backup-linked','config-synced'])test(`initial scratch inventory preserves real editor interruption at ${phase}`,async t=>{
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.codex'),{mode:0o700});
+ write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');const release=await f.run(['--prepare']);
+ assert.equal(interruptTransition(f,['--activate',release.releaseId],'initial_wired').status,73);
+ const runtime=path.join(f.root,'.jhw-runtime'),journals=path.join(runtime,'v2/journals'),owner=path.join(journals,fs.readdirSync(journals).find(name=>/^d-/.test(name)));
+ const scratch=path.join(owner,'wiring/restore');fs.mkdirSync(scratch,{mode:0o700});const copy=path.join(scratch,'a'.repeat(16));write(scratch,path.basename(copy),'[other]\nvalue = "keep"\n',0o600);
+ const editor=path.join(runtime,'releases',release.releaseId,'scripts/install-config.mjs'),argv=[editor,'register-codex',copy,path.join(runtime,'bootstrap/jhw-runtime-entry'),f.root,'20000101000000'];
+ const code=`import fs from 'node:fs';const phase=${JSON.stringify(phase)},sync=fs.fsyncSync,link=fs.linkSync;fs.fsyncSync=fd=>{const result=sync(fd);const name=fs.readlinkSync('/proc/self/fd/'+fd);if(name.endsWith('.tmp')&&(phase==='backup-synced'&&name.includes('.bak.jhw-notion.')||phase==='config-synced'&&!name.includes('.bak.jhw-notion.')))process.exit(73);return result;};fs.linkSync=(from,to,...rest)=>{const result=link(from,to,...rest);if(phase==='backup-linked'&&String(to).includes('.bak.jhw-notion.'))process.exit(73);return result;};process.argv=[process.execPath,...${JSON.stringify(argv)}];await import(${JSON.stringify(pathToFileURL(editor).href)});`;
+ const interrupted=spawnSync(process.execPath,['--input-type=module','-e',code],{encoding:'utf8',env:{...process.env,HOME:f.home},timeout:30000});assert.equal(interrupted.status,73,interrupted.stderr);
+ const names=fs.readdirSync(scratch);assert.ok(names.some(name=>name.endsWith('.tmp')));if(phase==='backup-linked')assert.equal(names.filter(name=>fs.lstatSync(path.join(scratch,name)).nlink===2).length,2);
+ const retained=contentSnapshot(scratch),identities=names.map(name=>({name,ino:fs.lstatSync(path.join(scratch,name)).ino,nlink:fs.lstatSync(path.join(scratch,name)).nlink}));assert.doesNotThrow(()=>readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:owner}));
+ assert.equal((await f.run(['--activate',release.releaseId])).code,'DEPLOY_ACTIVATION_RESTORED');
+ const after=contentSnapshot(scratch);for(const row of retained)assert.deepEqual(after.find(item=>item[0]===row[0]),row);
+ for(const item of identities){const stat=fs.lstatSync(path.join(scratch,item.name));assert.equal(stat.ino,item.ino);assert.equal(stat.nlink,item.nlink);}
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+for(const change of ['external-hardlink','unmatched-hardlinks','oversized'])test(`initial scratch inventory rejects unproven or unbounded data: ${change}`,async t=>{
+ const f=fixture(t);host(f);write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');const release=await f.run(['--prepare']),home=homeShape(f.home);
+ assert.equal(interruptTransition(f,['--activate',release.releaseId],'initial_prepared').status,73);
+ const runtime=path.join(f.root,'.jhw-runtime'),journals=path.join(runtime,'v2/journals'),owner=path.join(journals,fs.readdirSync(journals).find(name=>/^d-/.test(name))),scratch=path.join(owner,'wiring/restore');fs.mkdirSync(scratch,{mode:0o700});
+ const file=write(scratch,'a'.repeat(16),'preserve',0o600);
+ if(change==='external-hardlink')fs.linkSync(file,path.join(runtime,'foreign-scratch-link'));
+ if(change==='unmatched-hardlinks')fs.linkSync(file,path.join(scratch,'b'.repeat(16)));
+ if(change==='oversized'){const fd=fs.openSync(file,'r+');try{fs.ftruncateSync(fd,32*1024*1024+1);}finally{fs.closeSync(fd);}}
+ const before=fs.lstatSync(file);assert.throws(()=>readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:owner}));await assert.rejects(f.run(['--activate',release.releaseId]));
+ const after=fs.lstatSync(file);for(const key of ['ino','size','nlink'])assert.equal(after[key],before[key]);assert.deepEqual(homeShape(f.home),home);assert.equal(readActivation({repositoryRoot:f.root}),null);
+});
+for(const change of ['before-bytes','listings-inode','directory-inode','unknown-child','log-symlink','restore-symlink','worker-key'])test(`initial owner rejects foreign nested wiring evidence: ${change}`,async t=>{
+ const f=fixture(t);host(f);write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const release=await f.run(['--prepare']),home=homeShape(f.home);
+ assert.equal(interruptTransition(f,['--activate',release.releaseId],'initial_prepared').status,73);
+ const runtime=path.join(f.root,'.jhw-runtime'),journals=path.join(runtime,'v2/journals'),owner=path.join(journals,fs.readdirSync(journals).find(name=>/^d-/.test(name))),wiring=path.join(owner,'wiring');
+ if(change==='before-bytes')fs.appendFileSync(path.join(wiring,'before.json'),'\n');
+ if(change==='listings-inode'){const file=path.join(wiring,'listings.json'),bytes=fs.readFileSync(file);fs.renameSync(file,path.join(runtime,'saved-listings'));fs.writeFileSync(file,bytes,{mode:0o600});}
+ if(change==='directory-inode'){fs.renameSync(wiring,path.join(runtime,'saved-wiring'));fs.cpSync(path.join(runtime,'saved-wiring'),wiring,{recursive:true});}
+ if(change==='unknown-child')fs.writeFileSync(path.join(wiring,'foreign'),'retained',{mode:0o600});
+ if(change==='log-symlink')fs.symlinkSync('before.json',path.join(wiring,`wire.${'f'.repeat(16)}.log`));
+ if(change==='restore-symlink')fs.symlinkSync(wiring,path.join(wiring,'restore'));
+ if(change==='worker-key'){const file=path.join(wiring,'state.json'),state=JSON.parse(fs.readFileSync(file));state.foreign=true;fs.writeFileSync(file,JSON.stringify(state)+'\n');}
+ const evidence=contentSnapshot(owner);await assert.rejects(f.run(['--activate',release.releaseId]));
+ assert.deepEqual(contentSnapshot(owner),evidence);assert.deepEqual(homeShape(f.home),home);assert.equal(readActivation({repositoryRoot:f.root}),null);assert.equal(fs.existsSync(path.join(runtime,'bootstrap')),false);
+});
+for(const phase of ['prepared','router_intent','router_renamed','wire_intent','wired','pointer_intent','before_atomic_pointer','after_atomic_pointer','published','validation','wiring_complete'])test(`initial installation recovers actual process exit at ${phase}`,async t=>{
+ const f=fixture(t);host(f);write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const release=await f.run(['--prepare']);const before=homeShape(f.home);
+ const interrupted=interruptTransition(f,['--activate',release.releaseId],`initial_${phase}`);assert.equal(interrupted.status,73,interrupted.stderr);
+ assert.ok((await f.run(['--status'])).recoveryPending>0);
+ await assert.rejects(f.run(['--activate-compatible',release.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED'});
+ const published=['after_atomic_pointer','published','validation','wiring_complete'].includes(phase);
+ const result=await f.run(['--activate',release.releaseId]);
+ if(published){assert.equal(result.code,'DEPLOY_ACTIVATED');assert.equal(readActivation({repositoryRoot:f.root}).version,2);}
+ else{assert.equal(result.code,'DEPLOY_ACTIVATION_RESTORED');assertFirstActivationRolledBack(f,before);assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/bootstrap')),false);}
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+async function migrationFixture(t){
+ const f=fixture(t);host(f);fs.mkdirSync(path.join(f.home,'.codex'),{mode:0o700});
+ const a=await f.run(['--prepare']);await f.run(['--activate',a.releaseId]);
+ write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ const b=await f.run(['--prepare']);await f.run(['--activate',b.releaseId]);
+ await f.run(['--migrate-codex-config']);
+ return {...f,a,b,current:readActivation({repositoryRoot:f.root}),bootstrap:contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap'))};
+}
+for(const phase of ['prepared','router_intent','original_moved','router_renamed','router_published','current_intent','before_atomic_pointer','after_atomic_pointer','pair_published','validation'])test(`bootstrap upgrade recovers actual process exit at ${phase}`,async t=>{
+ const f=await migrationFixture(t);const interrupted=interruptTransition(f,['--refresh-bootstrap'],`migration_${phase}`);assert.equal(interrupted.status,73,interrupted.stderr);
+ const result=await f.run(['--refresh-bootstrap']);
+ if(['after_atomic_pointer','pair_published','validation'].includes(phase)){assert.equal(result.code,'DEPLOY_BOOTSTRAP_REFRESHED');assert.equal(readActivation({repositoryRoot:f.root}).version,2);}
+ else{assert.equal(result.outcome,'restored');assert.deepEqual(readActivation({repositoryRoot:f.root}),f.current);assert.deepEqual(contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap')),f.bootstrap);}
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+for(const phase of ['prepared','router_intent','original_moved','router_renamed','router_published','current_intent','before_atomic_pointer','after_atomic_pointer','pair_published','validation'])test(`legacy rollback recovers actual process exit at ${phase}`,async t=>{
+ const f=await migrationFixture(t);await f.run(['--refresh-bootstrap']);
+ const interrupted=interruptTransition(f,['--rollback'],`migration_${phase}`);assert.equal(interrupted.status,73,interrupted.stderr);
+ const result=await f.run(['--rollback']);assert.equal(result.releaseId,f.a.releaseId);assert.equal(readActivation({repositoryRoot:f.root}).version,undefined);
+ assert.deepEqual(contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap')),f.bootstrap);assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+
+for(const target of ['bootstrap','current'])test(`bootstrap recovery preserves a foreign ${target}`,async t=>{
+ const f=await migrationFixture(t);assert.equal(interruptTransition(f,['--refresh-bootstrap'],'migration_router_published').status,73);
+ const runtime=path.join(f.root,'.jhw-runtime');const selected=path.join(runtime,target);fs.renameSync(selected,`${selected}.fixture-original`);
+ if(target==='bootstrap')fs.mkdirSync(selected,{mode:0o700});else fs.symlinkSync(f.current.observation.target,selected);
+ const identity=fs.lstatSync(selected);await assert.rejects(f.run(['--refresh-bootstrap']));
+ assert.equal(fs.lstatSync(selected).ino,identity.ino);assert.ok(fs.lstatSync(`${selected}.fixture-original`));
+});
+test('bootstrap refresh requires explicit Codex binding migration before live mutation',async t=>{
+ const f=await migrationFixture(t);const config=path.join(f.home,'.codex/config.toml');fs.writeFileSync(config,fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,''));
+ await assert.rejects(f.run(['--refresh-bootstrap']),{code:'DEPLOY_ARGUMENTS_INVALID',reason:'codex_config_migration_required'});
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),f.current);assert.deepEqual(contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap')),f.bootstrap);
+});
+test('bootstrap upgrade refuses missing successful activate receipt before changing root',async t=>{
+ const f=await migrationFixture(t);const runtime=path.join(f.root,'.jhw-runtime');
+ for(const name of fs.readdirSync(runtime).filter(name=>/^\.deploy\./.test(name))){const state=JSON.parse(fs.readFileSync(path.join(runtime,name,'state.json')));if(state.current?.activationId===f.current.activationId)fs.unlinkSync(path.join(runtime,name,'retention.json'));}
+ await assert.rejects(f.run(['--refresh-bootstrap']));assert.deepEqual(readActivation({repositoryRoot:f.root}),f.current);assert.deepEqual(contentSnapshot(path.join(runtime,'bootstrap')),f.bootstrap);
+});
+test('legacy migration rollback rejects an orphan generation lease before root mutation',async t=>{
+ const f=await migrationFixture(t);await f.run(['--refresh-bootstrap']);const current=readActivation({repositoryRoot:f.root});
+ const runtime=path.join(f.root,'.jhw-runtime');const root=contentSnapshot(path.join(runtime,'bootstrap'));
+ const lease=acquireLease(path.join(runtime,'v2/bootstraps',current.bootstrapId,'lease'),{shared:true});
+ try{await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_CONSUMERS_ACTIVE',reason:'orphan_generation_lease'});}finally{lease.close();}
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),current);assert.deepEqual(contentSnapshot(path.join(runtime,'bootstrap')),root);
+ assert.equal((await f.run(['--rollback'])).releaseId,f.a.releaseId);
+});
+test('migration validation leaves published transaction pending when a consumer arrives',async t=>{
+ const f=await migrationFixture(t);const phaseRunner=async options=>{await deploy.wiringPhase(options);if(options.phase==='validate')addConsumer(f);};
+ await assert.rejects(deploy.runDeployment({...f.options,argv:['--refresh-bootstrap'],phaseRunner}),{code:'DEPLOY_CONSUMERS_ACTIVE'});
+ const current=readActivation({repositoryRoot:f.root});assert.equal(current.version,2);assert.ok((await f.run(['--status'])).recoveryPending>0);
+ fs.rmSync(path.join(f.procRoot,'100'),{recursive:true});await f.run(['--refresh-bootstrap']);assert.deepEqual(readActivation({repositoryRoot:f.root}),current);assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+test('re-upgrade creates a new anchor and first activation while retaining the old anchor',async t=>{
+ const f=await migrationFixture(t);await f.run(['--refresh-bootstrap']);const first=readActivation({repositoryRoot:f.root});
+ const old=path.join(f.root,'.jhw-runtime/v2/migrations',first.migrationId);const bytes=contentSnapshot(old);
+ await f.run(['--rollback']);await f.run(['--activate',f.b.releaseId]);await f.run(['--refresh-bootstrap']);const next=readActivation({repositoryRoot:f.root});
+ assert.notEqual(next.activationId,first.activationId);assert.notEqual(next.migrationId,first.migrationId);assert.deepEqual(contentSnapshot(old),bytes);
+});
+
+for(const change of ['anchor-bytes','anchor-inode','owner-missing','owner-duplicate','receipt-missing'])test(`legacy rollback requires the original completed migration seal: ${change}`,async t=>{
+ const f=await migrationFixture(t);await f.run(['--refresh-bootstrap']);
+ const current=readActivation({repositoryRoot:f.root}),runtime=path.join(f.root,'.jhw-runtime');
+ const root=contentSnapshot(path.join(runtime,'bootstrap')),home=contentSnapshot(f.home);
+ const journals=path.join(runtime,'v2/journals');
+ const owner=fs.readdirSync(journals).filter(name=>/^d-/.test(name)).find(name=>{
+  const state=JSON.parse(fs.readFileSync(path.join(journals,name,'state.json')));
+  return state.kind==='bootstrap-migration'&&state.operation==='upgrade'&&state.migrationId===current.migrationId;
+ });
+ assert.ok(owner);
+ const anchor=path.join(runtime,'v2/migrations',current.migrationId,'anchor.json');
+ if(change==='anchor-bytes')fs.appendFileSync(anchor,'\n');
+ if(change==='anchor-inode'){const bytes=fs.readFileSync(anchor);fs.renameSync(anchor,`${anchor}.saved`);fs.writeFileSync(anchor,bytes,{mode:0o600});fs.renameSync(`${anchor}.saved`,path.join(runtime,'saved-anchor'));}
+ if(change==='owner-missing')fs.renameSync(path.join(journals,owner),path.join(journals,`.saved-${owner}`));
+ if(change==='owner-duplicate'){
+  const duplicate=`d-${'e'.repeat(32)}`;fs.cpSync(path.join(journals,owner),path.join(journals,duplicate),{recursive:true});
+  const receiptFile=path.join(journals,duplicate,'retention.json');const receipt=JSON.parse(fs.readFileSync(receiptFile));receipt.journal=duplicate;fs.writeFileSync(receiptFile,JSON.stringify(receipt)+'\n');
+ }
+ if(change==='receipt-missing')fs.renameSync(path.join(journals,owner,'retention.json'),path.join(runtime,'saved-retention'));
+ await assert.rejects(f.run(['--rollback']));
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),current);assert.deepEqual(contentSnapshot(path.join(runtime,'bootstrap')),root);assert.deepEqual(contentSnapshot(f.home),home);
+});
+
+test('legacy rollback refuses changed anchor target even when copied receipt coordinates agree',async t=>{
+ const f=fixture(t);host(f);const x=await f.run(['--prepare']);await f.run(['--activate',x.releaseId]);const older=readActivation({repositoryRoot:f.root});
+ write(f.root,'mcp-server/src/index.ts','export const middle=2;');const a=await f.run(['--prepare']);await f.run(['--activate',a.releaseId]);
+ write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');const b=await f.run(['--prepare']);await f.run(['--activate',b.releaseId]);await f.run(['--refresh-bootstrap']);
+ const current=readActivation({repositoryRoot:f.root}),runtime=path.join(f.root,'.jhw-runtime');const root=contentSnapshot(path.join(runtime,'bootstrap'));
+ const file=path.join(runtime,'v2/migrations',current.migrationId,'anchor.json'),anchor=JSON.parse(fs.readFileSync(file));
+ anchor.legacyRollbackTarget=older;anchor.preMigrationCurrent.predecessorActivationId=older.activationId;anchor.legacyReceipt.previous=older;anchor.legacyReceipt.current=anchor.preMigrationCurrent;
+ fs.writeFileSync(file,JSON.stringify(anchor)+'\n');
+ await assert.rejects(f.run(['--rollback']));assert.deepEqual(readActivation({repositoryRoot:f.root}),current);assert.deepEqual(contentSnapshot(path.join(runtime,'bootstrap')),root);
+});
+
+test('v1 bridge activates before explicit refresh and rolls back through its anchor',async t=>{
+ const baseline='75a50711661b547d303f53000d699a683785fa4d';const f=fixture(t,{legacyRevision:baseline});host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const original=await f.run(['--prepare']);await f.run(['--activate',original.releaseId]);const originalReleaseA=readActivation({repositoryRoot:f.root}).releaseId;
+ const legacyRelease=path.join(f.root,'.jhw-runtime/releases',originalReleaseA);
+ const legacyFiles=contentSnapshot(path.join(f.root,'.jhw-runtime/activations'));
+ const retainedWorker=fs.readFileSync(path.join(legacyRelease,'scripts/install-wiring.sh'));
+ assert.deepEqual(retainedWorker,spawnSync('git',['show',`${baseline}:scripts/install-wiring.sh`],{cwd:path.dirname(source),maxBuffer:4*1024*1024}).stdout);
+ f.useCurrentRuntime();
+ write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
+ write(f.root,'mcp-server/src/index.ts','export const migrationBridge=2;');const candidate=await f.run(['--prepare']);await f.run(['--activate',candidate.releaseId]);
+ const intermediateCurrent=readActivation({repositoryRoot:f.root});assert.equal(intermediateCurrent.version,undefined);
+ const originalBootstrap=contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap'));
+ const entrySource=path.join(f.root,'scripts/runtime-entry.mjs');const entryBytes=fs.readFileSync(entrySource);
+ fs.appendFileSync(entrySource,'\n// unmatched migration installer\n');
+ await assert.rejects(f.run(['--refresh-bootstrap']),{code:'DEPLOY_ARGUMENTS_INVALID',reason:'refresh_installer_mismatch'});
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),intermediateCurrent);assert.deepEqual(contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap')),originalBootstrap);
+ fs.writeFileSync(entrySource,entryBytes);
+ const intermediateCall=spawnSync(path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),['hook','--adapter','claude','--event','SessionEnd'],{input:'{}',encoding:'utf8',env:{...process.env,HOME:f.home},timeout:12000});
+ assert.equal(intermediateCall.status,0,intermediateCall.stderr);
+ const codex=path.join(f.home,'.codex/config.toml');write(f.home,'.codex/config.toml',fs.readFileSync(codex,'utf8').replace(/^env_vars = .*\n/m,''),0o600);
+ assert.equal((await f.run(['--migrate-codex-config'])).code,'DEPLOY_CODEX_CONFIG_MIGRATED');
+ const migrated=await f.run(['--refresh-bootstrap']);assert.equal(migrated.code,'DEPLOY_BOOTSTRAP_REFRESHED');
+ const firstV2=readActivation({repositoryRoot:f.root});const firstManifest=JSON.parse(fs.readFileSync(path.join(f.root,'.jhw-runtime',firstV2.observation.target,'manifest.json')));
+ assert.equal(firstManifest.priorCurrent,null);assert.equal(firstV2.predecessorActivationId,null);assert.match(firstV2.migrationId,/^m-[a-f0-9]{32}$/);
+ const oldReader=spawnSync(process.execPath,['--input-type=module','-e',`const m=await import(${JSON.stringify(pathToFileURL(path.join(legacyRelease,'scripts/runtime-store.mjs')).href)});try{m.readActivation({repositoryRoot:${JSON.stringify(f.root)}});process.exit(9);}catch(e){process.stdout.write(e.code+'\\n');process.exit(1);}`],{encoding:'utf8',timeout:12000});
+ assert.equal(oldReader.status,1);assert.equal(oldReader.stdout,'DEPLOY_ACTIVATION_INVALID\n');
+ assert.deepEqual(contentSnapshot(path.join(f.root,'.jhw-runtime/activations')).filter(row=>legacyFiles.some(old=>old[0]===row[0])),legacyFiles);
+ const beforeRefresh=contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap'));const homeBefore=contentSnapshot(f.home);
+ assert.equal((await f.run(['--refresh-bootstrap'])).unchanged,true);assert.deepEqual(readActivation({repositoryRoot:f.root}),firstV2);
+ assert.deepEqual(contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap')),beforeRefresh);assert.deepEqual(contentSnapshot(f.home),homeBefore);
+ write(f.root,'mcp-server/src/index.ts','export const migrationBridge=3;');const next=await f.run(['--prepare']);await f.run(['--activate-compatible',next.releaseId]);
+ assert.equal((await f.run(['--rollback'])).releaseId,firstV2.releaseId);
+ const returned=readActivation({repositoryRoot:f.root});assert.equal(returned.activationId,firstV2.activationId);assert.equal(returned.migrationId,firstV2.migrationId);assert.equal(returned.predecessorActivationId,null);
+ const stoppedLegacyRollback=await f.run(['--rollback']);assert.equal(stoppedLegacyRollback.releaseId,originalReleaseA);assert.equal(readActivation({repositoryRoot:f.root}).version,undefined);
+ assert.deepEqual(contentSnapshot(path.join(f.root,'.jhw-runtime/bootstrap')),originalBootstrap);
+});
+
+test('explicit Codex config migration uses the current editor and retains exact journal evidence',async t=>{
+ const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
+ const config=path.join(f.home,'.codex/config.toml');const legacy=fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,'');write(f.home,'.codex/config.toml',legacy,0o600);
+ const oldFd=fs.openSync(config,'r+');t.after(()=>fs.closeSync(oldFd));
+ const before=fs.statSync(config,{bigint:true});const result=await f.run(['--migrate-codex-config']);
+ assert.equal(result.code,'DEPLOY_CODEX_CONFIG_MIGRATED');assert.equal(result.changed,true);assert.equal(result.inventory.before.clear,true);assert.equal(result.inventory.after.clear,true);
+ assert.equal(spawnSync(process.execPath,[path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs'),'verify-codex-binding',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId]).status,0);
+ const journals=fs.readdirSync(path.join(f.root,'.jhw-runtime/v2/journals'));assert.equal(journals.length,1);
+ const journal=path.join(f.root,'.jhw-runtime/v2/journals',journals[0]);const state=readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:journal}).state;
+ assert.equal(state.kind,'codex-config');assert.equal(state.status,'complete');assert.equal(state.phase,'complete');assert.equal(state.outcome,'migrated');
+ for(const name of ['state.json','before','after-copy',`${state.captures.source.name}/object`,`${state.captures.control.name}/state.json`])assert.equal(fs.statSync(path.join(journal,name)).mode&0o7777,0o600);
+ const after=fs.statSync(config,{bigint:true});assert.notEqual(after.ino,before.ino);const retry=await f.run(['--migrate-codex-config']);assert.equal(retry.changed,false);const byteIdenticalAfter=fs.statSync(config,{bigint:true});assert.deepEqual({ino:byteIdenticalAfter.ino,mtimeNs:byteIdenticalAfter.mtimeNs},{ino:after.ino,mtimeNs:after.mtimeNs});
+ fs.writeSync(oldFd,'# completed old FD write\n',0,'utf8');fs.fsyncSync(oldFd);
+ fs.appendFileSync(config,'# normal user edit after migration\n');
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+ assert.equal((await f.run(['--migrate-codex-config'])).changed,false);
+ assert.equal((await f.run(['--prepare'])).code,'DEPLOY_PREPARED');
+});
+
+async function stopCodexEditorAt(child,phase) {
+ let listener;
+ await new Promise((resolve,reject)=>{
+  const onExit=(code,signal)=>reject(new Error(`editor exited before ${phase}: ${code??signal}`));child.once('exit',onExit);
+  listener=async message=>{
+   try {
+    let stopped=false;
+    for(let attempt=0;attempt<1000;attempt++) {
+     if(/^State:\s+T/m.test(fs.readFileSync(`/proc/${child.pid}/status`,'utf8'))){stopped=true;break;}
+     await new Promise(done=>setTimeout(done,1));
+    }
+    if(!stopped)throw new Error('editor checkpoint did not stop');
+    if(message.phase===phase){child.off('exit',onExit);resolve();}else process.kill(child.pid,'SIGCONT');
+   }catch(error){reject(error);}
+  };child.on('message',listener);
+ });
+ return ()=>child.off('message',listener);
+}
+
+for(const boundary of ['quarantine_moved','foreign_restore_intent','foreign_restore_linked']) {
+ test(`public Codex retry restores foreign capture after ${boundary} without completing migration`,async t=>{
+  const f=fixture(t);host(f);for(const name of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,name),{recursive:true,mode:0o700});
+  const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
+  const config=path.join(f.home,'.codex/config.toml');const before=fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,'');write(f.home,'.codex/config.toml',before,0o600);
+  const journals=path.join(f.root,'.jhw-runtime/v2/journals');fs.mkdirSync(journals,{recursive:true,mode:0o700});
+  const evidence=path.join(journals,'d-00000000000000000000000000000000');fs.mkdirSync(evidence,{mode:0o700});
+  const args=[path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs'),'migrate-codex-binding-transaction',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId,evidence];
+  const children=new Set();t.after(async()=>{for(const child of children){if(child.exitCode===null&&child.signalCode===null){const closed=once(child,'exit');child.kill('SIGKILL');await closed;}}});
+  const start=()=>{const child=spawn(process.execPath,args,{stdio:['ignore','ignore','ignore','ipc']});children.add(child);child.once('exit',()=>children.delete(child));return child;};
+  const child=start();const detach=await stopCodexEditorAt(child,'quarantine_intent');
+  const replacement=write(f.home,'foreign-config','foreign public recovery\n',0o600);const foreign=fs.statSync(replacement,{bigint:true});fs.renameSync(replacement,config);
+  detach();const moved=stopCodexEditorAt(child,'quarantine_moved');process.kill(child.pid,'SIGCONT');await moved;
+  process.kill(child.pid,'SIGKILL');await once(child,'exit');
+  if(boundary!=='quarantine_moved') {const retry=start();await stopCodexEditorAt(retry,boundary);process.kill(retry.pid,'SIGKILL');await once(retry,'exit');}
+  assert.equal((await f.run(['--status'])).recoveryPending,1);
+  await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'codex_config_migration_pending'});
+  const restored=fs.statSync(config,{bigint:true});assert.equal(restored.dev,foreign.dev);assert.equal(restored.ino,foreign.ino);
+  assert.equal(fs.readFileSync(config,'utf8'),'foreign public recovery\n');
+  const state=readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:evidence}).state;assert.equal(state.status,'pending');assert.equal(state.phase,'ambiguous');
+  assert.equal(fs.readFileSync(path.join(evidence,'before'),'utf8'),before);
+ });
+}
+
+test('Codex migration rejects a mismatched shared journal reader before mutation',async t=>{
+ const f=fixture(t);host(f);for(const name of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,name),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);
+ const config=path.join(f.home,'.codex/config.toml');const legacy=fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,'');write(f.home,'.codex/config.toml',legacy,0o600);
+ fs.appendFileSync(path.join(f.root,'scripts/runtime-prune.mjs'),'\n// changed reader version\n');
+ await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_ARGUMENTS_INVALID',reason:'codex_editor_mismatch'});
+ assert.equal(fs.readFileSync(config,'utf8'),legacy);
+ assert.equal(fs.existsSync(path.join(f.root,'.jhw-runtime/v2/journals')),false);
+});
+
+test('Codex migration refuses missing or foreign config without creating a replacement',async t=>{
+ const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);const config=path.join(f.home,'.codex/config.toml');
+ fs.unlinkSync(config);await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_WIRING_CONFLICT',reason:'codex_owned_vector_required'});assert.equal(fs.existsSync(config),false);
+ write(f.home,'.codex/config.toml','[mcp_servers.jhw-notion]\ncommand = "python"\nargs = []\n',0o600);
+ await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_WIRING_CONFLICT',reason:'codex_owned_vector_required'});
+ assert.equal(fs.readFileSync(config,'utf8'),'[mcp_servers.jhw-notion]\ncommand = "python"\nargs = []\n');
+ const journalRoot=path.join(f.root,'.jhw-runtime/v2/journals');assert.equal(fs.existsSync(journalRoot)?fs.readdirSync(journalRoot).length:0,0);
+});
+
+test('pending Codex migration preserves reoccupation and blocks every other mutation',async t=>{
+ const f=fixture(t);host(f);for(const p of ['.claude','.gemini','.codex','.config/opencode'])fs.mkdirSync(path.join(f.home,p),{recursive:true,mode:0o700});
+ const release=await f.run(['--prepare']);await f.run(['--activate',release.releaseId]);write(f.root,'mcp-server/src/index.ts','export const next=1;');const next=await f.run(['--prepare']);
+ const config=path.join(f.home,'.codex/config.toml');write(f.home,'.codex/config.toml',fs.readFileSync(config,'utf8').replace(/^env_vars = .*\n/m,''),0o600);
+ const journals=path.join(f.root,'.jhw-runtime/v2/journals');fs.mkdirSync(journals,{recursive:true,mode:0o700});fs.chmodSync(path.join(f.root,'.jhw-runtime/v2'),0o700);fs.chmodSync(journals,0o700);
+ const evidence=path.join(journals,'d-00000000000000000000000000000000');fs.mkdirSync(evidence,{mode:0o700});
+ const editor=path.join(f.root,'.jhw-runtime/releases',release.releaseId,'scripts/install-config.mjs');const child=spawn(process.execPath,[editor,'migrate-codex-binding-transaction',config,path.join(f.root,'.jhw-runtime/bootstrap/jhw-runtime-entry'),f.root,release.releaseId,evidence],{stdio:['ignore','ignore','ignore','ipc']});
+ await new Promise((resolve,reject)=>{child.once('exit',(code,signal)=>reject(new Error(`editor exited ${code??signal}`)));child.on('message',async message=>{for(let attempt=0;attempt<1000;attempt++){try{if(/^State:\s+T/m.test(fs.readFileSync(`/proc/${child.pid}/status`,'utf8')))break;}catch{return reject(new Error('editor exited before stop'));}await new Promise(done=>setTimeout(done,1));}if(message?.phase==='quarantined')resolve();else process.kill(child.pid,'SIGCONT');});});
+ const foreign='model = "foreign-reoccupied"\n';write(f.home,'.codex/config.toml',foreign,0o600);process.kill(child.pid,'SIGCONT');await once(child,'exit');
+ assert.equal(readRuntimeJournalV2({repositoryRoot:f.root,journalDirectory:evidence}).state.phase,'ambiguous');assert.equal(fs.readFileSync(config,'utf8'),foreign);
+ assert.equal((await f.run(['--status'])).recoveryPending,1);
+ await assert.rejects(f.run(['--migrate-codex-config']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'codex_config_migration_pending'});
+ await assert.rejects(f.run(['--activate',next.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ await assert.rejects(f.run(['--activate-compatible',next.releaseId]),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ await assert.rejects(f.run(['--rollback']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ await assert.rejects(f.run(['--prepare']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ await assert.rejects(f.run(['--prune']),{code:'DEPLOY_RECOVERY_REQUIRED',reason:'pair_journal_pending'});
+ assert.equal(fs.readFileSync(config,'utf8'),foreign);assert.equal(readActivation({repositoryRoot:f.root}).releaseId,release.releaseId);
+});
 
 test('successful deployment writes an additive retention receipt without changing state schema',async t=>{
  const f=fixture(t);host(f);const release=await f.run(['--prepare']);const result=await f.run(['--activate',release.releaseId]);assert.equal(result.warnings,undefined);
@@ -140,6 +532,11 @@ function assertFirstActivationRolledBack(f, shape) {
  const runtime=path.join(f.root,'.jhw-runtime');
  assert.equal(fs.existsSync(path.join(runtime,'current')),false);assert.equal(fs.existsSync(path.join(runtime,'wiring.json')),false);
  const journals=fs.readdirSync(runtime).filter(name=>name.startsWith('.deploy.')).map(name=>JSON.parse(fs.readFileSync(path.join(runtime,name,'state.json'))));
+ const owners=path.join(runtime,'v2/journals');
+ if(fs.existsSync(owners))for(const name of fs.readdirSync(owners).filter(name=>/^d-/.test(name))){
+  const directory=path.join(owners,name),state=JSON.parse(fs.readFileSync(path.join(directory,'state.json')));
+  if(state.kind==='initial-install')journals.push(JSON.parse(fs.readFileSync(path.join(directory,'wiring/state.json'))));
+ }
  assert.deepEqual(journals.map(state=>[state.status,state.phase]),[['complete','wire_rolled_back']]);
  assert.deepEqual(homeShape(f.home),shape);
 }
@@ -199,8 +596,9 @@ const lateCodexHookFailure = (f, {beforeRestore}={}) => async options => {
 };
 // A preimage under the 2 MiB bound whose registration pretty-prints past it
 // must still be recognised as this deployment's output and restored.
-test('first activation rollback restores an MCP config that registration grew past 2 MiB', async t => {
+for(const generation of [1,2])test(`first activation rollback restores an MCP config that registration grew past 2 MiB (generation ${generation})`, async t => {
  const f=fixture(t);host(f);for(const p of ['.claude','.codex'])fs.mkdirSync(path.join(f.home,p),{mode:0o700});
+ if(generation===2)write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
  const compact=JSON.stringify({padding:Array.from({length:300000},()=>[1])});
  assert.ok(compact.length<2*1024*1024);
  write(f.home,'.claude.json',compact,0o600);
@@ -916,7 +1314,7 @@ test('adopt-from takes over every legacy destination of sibling checkout P', asy
  const claude=JSON.parse(fs.readFileSync(path.join(h,'.claude.json')));assert.deepEqual(claude.mcpServers['jhw-notion'].args,entry);assert.deepEqual(claude.mcpServers['jhw-notion'].env,{NOTION_API_KEY:'${NOTION_API_KEY}'});assert.deepEqual(claude.projects,{keep:true});
  const gemini=JSON.parse(fs.readFileSync(path.join(h,'.gemini/settings.json')));assert.deepEqual(gemini.mcpServers['jhw-notion'].args,entry);assert.deepEqual(gemini.mcpServers['jhw-notion'].env,{NOTION_API_KEY:'real-secret-value'});
  const opencode=JSON.parse(fs.readFileSync(path.join(h,'.config/opencode/opencode.json')));assert.deepEqual(opencode.mcp['jhw-notion'].command,['node',...entry]);assert.deepEqual(opencode.mcp['jhw-notion'].environment,{NOTION_API_KEY:'opencode-value'});
- const toml=fs.readFileSync(path.join(h,'.codex/config.toml'),'utf8');assert.match(toml,/env_vars = \["NOTION_API_KEY"\]/);assert.match(toml,/"mcp"\]/);assert.doesNotMatch(toml,/legacy\/mcp-server/);
+ const toml=fs.readFileSync(path.join(h,'.codex/config.toml'),'utf8');assert.match(toml,/env_vars = \["NOTION_API_KEY","JHW_RUNTIME_SESSION_BINDING"\]/);assert.match(toml,/"mcp"\]/);assert.doesNotMatch(toml,/legacy\/mcp-server/);
  assert.equal(fs.readFileSync(path.join(h,'.claude/settings.json'),'utf8'),hookGroups('claude'));
  assert.deepEqual(treeDigest(P),legacy);
 });
@@ -1004,7 +1402,7 @@ test('adopt-from preserves a Codex env child table', async t => {
  write(f.home,'.codex/config.toml',`[mcp_servers.jhw-notion]\ncommand = "node"\nargs = ${JSON.stringify([index])}\nenv_vars = ["NOTION_API_KEY"]\n\n[mcp_servers.jhw-notion.env]\nNOTION_VERSION = "2022-06-28"\n\n[other]\nkey = 1\n`,0o600);
  assert.equal((await adopt()).code,'DEPLOY_ACTIVATED');
  const toml=fs.readFileSync(path.join(f.home,'.codex/config.toml'),'utf8');
- assert.match(toml,/\[mcp_servers\.jhw-notion\]\ncommand = "node"\nargs = \[[^\n]*"mcp"\]\nstartup_timeout_sec = 60\.0\nenv_vars = \["NOTION_API_KEY"\]\n\n?\[mcp_servers\.jhw-notion\.env\]\nNOTION_VERSION = "2022-06-28"\n\n\[other\]\nkey = 1\n$/);
+ assert.match(toml,/\[mcp_servers\.jhw-notion\]\ncommand = "node"\nargs = \[[^\n]*"mcp"\]\nstartup_timeout_sec = 60\.0\nenv_vars = \["NOTION_API_KEY","JHW_RUNTIME_SESSION_BINDING"\]\n\n?\[mcp_servers\.jhw-notion\.env\]\nNOTION_VERSION = "2022-06-28"\n\n\[other\]\nkey = 1\n$/);
 });
 test('adopt-from rolls back when P disappears between plan and wire', async t => {
  const {f,P,adopt}=adoptFixture(t);const shape=homeShape(f.home);const aside=`${P}-moved`;
@@ -1160,7 +1558,7 @@ function guardObserveControlBuild(f,{productionHook=false,runtimeMode='observe'}
   for(const file of ['mcp-server/dist/control/cli.js','mcp-server/dist/runtime/control.cjs'])write(options.stagingRoot,file,control,0o755);
  };
 }
-async function guardTransitionFixture(t,{provisioned=false,...buildOptions}={}) {
+async function guardTransitionFixture(t,{provisioned=false,generation2=false,...buildOptions}={}) {
  const f=fixture(t);host(f);
  for(const directory of ['.claude','.codex','.config/jhw-control'])fs.mkdirSync(path.join(f.home,directory),{recursive:true,mode:0o700});
  // Freeze the actual pre-feature retained helpers, not the new helper with a label.
@@ -1186,6 +1584,7 @@ async function guardTransitionFixture(t,{provisioned=false,...buildOptions}={}) 
  const controlEnv=write(f.home,'.config/jhw-control/control.env',Object.entries(coordinates).map(([key,value])=>`${key}=${value}\n`).join(''),0o600);
  for(const name of ['install-wiring.sh','install-config.mjs'])write(f.root,`scripts/${name}`,fs.readFileSync(path.join(source,name)));
  write(f.root,'skills/claude/task.md','new guard transition fixture');
+ if(generation2)write(f.root,'mcp-server/src/control/runtime-compatibility.json','{"version":1,"generation":2,"guardFloor":1}\n');
  const candidate=await deploy.runDeployment({...f.options,build:guardObserveControlBuild(f,buildOptions),argv:['--prepare']});
  return {f,old,candidate,baseline,original,coordinates,controlEnv,policy:path.join(f.home,'.config/jhw-control/guard-policy.json')};
 }
@@ -1312,6 +1711,31 @@ test('guard observe pointer-intent crash at origin cannot complete without resto
  const rollback=await f.run(['--rollback']);assert.equal(rollback.releaseId,old.releaseId);
  assert.equal(fs.existsSync(policy),false);assert.equal((await f.run(['--status'])).recoveryPending,0);
  for(const [file,bytes] of Object.entries(baseline))assert.deepEqual(fs.readFileSync(path.join(f.home,file)),bytes);
+});
+
+for(const interrupted of [false,true])test(`guard observe legacy migration rollback restores A hooks and policy${interrupted?' after interruption':''}`,async t=>{
+ const {f,old,candidate,baseline,policy}=await guardTransitionFixture(t,{generation2:true});
+ await f.run(['--activate',candidate.releaseId,'--guard-observe']);await f.run(['--migrate-codex-config']);await f.run(['--refresh-bootstrap']);
+ assert.equal(readActivation({repositoryRoot:f.root}).version,2);assert.equal(fs.existsSync(policy),true);
+ if(interrupted){const result=interruptTransition(f,['--rollback'],'migration_guard_restored');assert.equal(result.status,73,result.stderr);}
+ const result=await f.run(['--rollback']);assert.equal(result.releaseId,old.releaseId);assert.equal(fs.existsSync(policy),false);
+ for(const [file,bytes] of Object.entries(baseline))assert.deepEqual(fs.readFileSync(path.join(f.home,file)),bytes);
+ assert.equal((await f.run(['--status'])).recoveryPending,0);
+});
+
+for(const change of ['journal-moved','evidence-missing','evidence-inode','evidence-bytes'])test(`legacy rollback requires sealed guard evidence before mutation: ${change}`,async t=>{
+ const {f,candidate}=await guardTransitionFixture(t,{generation2:true});
+ await f.run(['--activate',candidate.releaseId,'--guard-observe']);await f.run(['--migrate-codex-config']);await f.run(['--refresh-bootstrap']);
+ const runtime=path.join(f.root,'.jhw-runtime'),current=readActivation({repositoryRoot:f.root});
+ const root=contentSnapshot(path.join(runtime,'bootstrap')),home=contentSnapshot(f.home);
+ const anchor=JSON.parse(fs.readFileSync(path.join(runtime,'v2/migrations',current.migrationId,'anchor.json')));
+ const journal=path.join(runtime,anchor.legacyReceipt.journal),evidence=path.join(journal,'before.json');
+ if(change==='journal-moved')fs.renameSync(journal,`${journal}.saved`);
+ if(change==='evidence-missing')fs.renameSync(evidence,path.join(runtime,'saved-before'));
+ if(change==='evidence-inode'){const bytes=fs.readFileSync(evidence);fs.renameSync(evidence,path.join(runtime,'saved-before'));fs.writeFileSync(evidence,bytes,{mode:0o600});}
+ if(change==='evidence-bytes')fs.appendFileSync(evidence,'\n');
+ await assert.rejects(f.run(['--rollback']));
+ assert.deepEqual(readActivation({repositoryRoot:f.root}),current);assert.deepEqual(contentSnapshot(path.join(runtime,'bootstrap')),root);assert.deepEqual(contentSnapshot(f.home),home);
 });
 
 test('guard observe survives normal activation refresh and an intermediate rollback', async t => {

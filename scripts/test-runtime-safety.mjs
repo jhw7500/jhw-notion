@@ -8,7 +8,7 @@ import { Worker } from 'node:worker_threads';
 import test from 'node:test';
 import {
   DeploymentError, trustedDirectory, trustedFile, acquireLease,
-  inspectConsumers, requireQuiescence,
+  inspectConsumers, observeSessionConsumers, requireQuiescence,
 } from './runtime-safety.mjs';
 
 const uid = process.getuid();
@@ -419,6 +419,89 @@ test('inventory entry and byte budgets fail closed with bounded diagnostics', t 
     const serialized = JSON.stringify({ result, error, message: error.message });
     for (const secret of [options.procRoot, options.repositoryRoot, '10987', 'private-session-coordinate']) assert.equal(serialized.includes(secret), false);
     assert.ok(serialized.length < 512);
+  }
+});
+
+test('stage observations preserve inventory and expose only bounded cause counts', t => {
+  const options = procFixture(t);
+  const directory = addProcess(options, 100, ['node', '--unknown-option', 'script.js']);
+  file(path.join(directory, 'environ'), '');
+  const observed = observeSessionConsumers(options, () => false, 'preliminary');
+  assert.deepEqual(observed.inventory, {
+    clear: false,
+    counts: { tui: 0, app_server: 0, legacy: 0, managed: 0 },
+    uncertain: 1,
+    bound: { tui: 0, app_server: 0, legacy: 0, managed: 0 },
+  });
+  assert.equal(observed.observation.stage, 'preliminary');
+  assert.equal(observed.observation.outcome, 'incomplete');
+  assert.ok(observed.observation.elapsedMs >= 0);
+  assert.deepEqual(observed.observation.causeCounts, {
+    pid_set_changed: 0,
+    process_vanished: 0,
+    identity_changed: 0,
+    record_unreadable: 0,
+    classification_unknown: 1,
+    root_mismatch: 0,
+  });
+  assert.equal(JSON.stringify(observed).includes(options.repositoryRoot), false);
+  assert.equal(JSON.stringify(observed).includes(options.procRoot), false);
+  assert.throws(() => observeSessionConsumers(options, () => false, 'unknown'), {
+    code: 'DEPLOY_INVENTORY_UNCERTAIN',
+  });
+});
+
+test('stage observations distinguish complete bound and disallowed unbound consumers', t => {
+  const options = procFixture(t);
+  const directory = addProcess(options, 100, ['node', `${options.repositoryRoot}/.jhw-runtime/bootstrap/jhw-runtime-entry`]);
+  file(path.join(directory, 'environ'), 'JHW_RUNTIME_SESSION_BINDING=opaque\0');
+  const bound = observeSessionConsumers(options, () => true, 'post_probe');
+  assert.equal(bound.observation.outcome, 'complete');
+  assert.equal(bound.inventory.bound.managed, 1);
+  assert.equal(bound.inventory.counts.managed, 0);
+  assert.equal(Object.values(bound.observation.causeCounts).reduce((sum, count) => sum + count, 0), 0);
+
+  const unbound = observeSessionConsumers(options, () => false, 'publication');
+  assert.equal(unbound.observation.outcome, 'disallowed');
+  assert.equal(unbound.inventory.bound.managed, 0);
+  assert.equal(unbound.inventory.counts.managed, 1);
+});
+
+test('stage observations separate unreadable, changed, vanished, and PID-set evidence', t => {
+  {
+    const options = procFixture(t);
+    const directory = addProcess(options, 100, ['node', '/other/script.js']);
+    fs.unlinkSync(path.join(directory, 'cmdline'));
+    const observed = observeSessionConsumers(options, () => false, 'preliminary');
+    assert.equal(observed.observation.causeCounts.record_unreadable, 1);
+    assert.equal(observed.inventory.uncertain, 1);
+  }
+  {
+    const options = procFixture(t);
+    addProcess(options, 100, ['node', '/other/script.js'], {owner: uid + 1});
+    const observed = observeSessionConsumers(options, () => false, 'preliminary');
+    assert.equal(observed.observation.causeCounts.identity_changed, 1);
+    assert.equal(observed.inventory.uncertain, 1);
+  }
+  {
+    const options = procFixture(t);
+    const directory = addProcess(options, 100, ['node', '/other/script.js']);
+    const original = fs.openSync;
+    let removed = false;
+    fs.openSync = function(name, ...args) {
+      if (!removed && String(name).endsWith('/100')) {
+        removed = true;
+        fs.rmSync(directory, {recursive: true});
+      }
+      return original.call(this, name, ...args);
+    };
+    let observed;
+    try { observed = observeSessionConsumers(options, () => false, 'preliminary'); }
+    finally { fs.openSync = original; }
+    assert.equal(removed, true);
+    assert.equal(observed.observation.causeCounts.process_vanished, 1);
+    assert.equal(observed.observation.causeCounts.pid_set_changed, 1);
+    assert.equal(observed.inventory.uncertain, 2);
   }
 });
 

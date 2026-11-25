@@ -1,10 +1,15 @@
 import { Client } from "@notionhq/client";
 import { loadNotionEnv } from "./env.js";
+import { createManagedNotionClient, hasManagedNotionRelay } from "./notion/managed-relay.js";
 
 let client: Client | null = null;
 
 export function getNotionClient(): Client {
   if (!client) {
+    if (hasManagedNotionRelay()) {
+      client = createManagedNotionClient();
+      return client;
+    }
     if (!process.env.NOTION_API_KEY) {
       loadNotionEnv();
     }

@@ -149,6 +149,13 @@ test('complete validated bootstrap is stable across preparation and identical in
   for (const file of manifest.files) assert.equal(fs.lstatSync(path.join(f.bootstrap,file.name)).mode & 0o777, file.name.startsWith('jhw-') ? 0o755 : 0o644);
 });
 
+test('legacy bootstrap remains executable beside the v2 router path', async t => {
+  const f = await fixture(t, "process.stdin.pipe(process.stdout);");
+  const legacyResult = run(f, 'jhw-runtime-entry', ['mcp'], 'legacy\n');
+  assert.equal(legacyResult.status, 0);
+  assert.equal(legacyResult.stdout, 'legacy\n');
+});
+
 // Break caught: accepting arbitrary selectors or printing deployment metadata to MCP transport.
 test('closed selectors preserve stdio and status for MCP and bound control launcher', async t => {
   const f = await fixture(t);

@@ -6,6 +6,7 @@ import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
 import test from 'node:test';
+import {acquireLease} from './runtime-safety.mjs';
 
 const prune = await import('./runtime-prune.mjs');
 const DAY=24*60*60*1000;
@@ -29,6 +30,29 @@ function journal(f,sequence,{age=60,status='complete',phase='complete',operation
  return {name,directory,state,completedAt};
 }
 function names(runtime) {return fs.readdirSync(runtime).sort();}
+
+test('a prepared empty prune requires its original plan and exclusive leases for this runtime', t => {
+  const f=fixture(t);
+  const options={repositoryRoot:f.root,now:NOW};
+  const deploy=acquireLease(path.join(f.runtime,'deploy.lock'),{create:true});
+  let admission=acquireLease(path.join(f.runtime,'admission.lock'),{create:true,shared:true});
+  const apply=preparedPlan=>prune.applyRuntimePrune({...options,preparedPlan,deployLease:deploy,admissionLease:admission});
+  const changed={code:'DEPLOY_PRUNE_BLOCKED',reason:'snapshot_changed'};
+  try {
+    const first=prune.prepareRuntimePrune(options);
+    assert.throws(()=>apply(first),changed);
+    admission.close();
+    admission=acquireLease(path.join(f.runtime,'admission.lock'));
+    assert.throws(()=>apply(first),changed);
+    const next=prune.prepareRuntimePrune(options);
+    assert.throws(()=>apply({plan:next.plan}),changed);
+    assert.throws(()=>apply(prune.prepareRuntimePrune({repositoryRoot:fixture(t).root,now:NOW})),changed);
+    assert.deepEqual(apply(next).removed,{journals:0,previous:0});
+    assert.throws(()=>apply(next),changed);
+    assert.equal(fs.existsSync(path.join(f.runtime,'.prune.v1')),false);
+  } finally { admission.close();deploy.close(); }
+});
+
 function recoveryPayload(runtime,index=0) {
  const recovery=path.join(runtime,'.prune.v1',`recovery.${index.toString().padStart(8,'0')}`);
  const inventory=JSON.parse(fs.readFileSync(path.join(recovery,'inventory.json'),'utf8'));
@@ -53,6 +77,25 @@ test('dry-run is advisory and byte-for-byte non-mutating',()=>{
  assert.deepEqual(names(f.runtime).map(name=>[name,fs.statSync(path.join(f.runtime,name)).ino]),before);
 });
 
+test('prune preserves the fixed probe workspace and legacy probe directories', t => {
+  const f = fixture(t);
+  const workspace = '.jhw-atomic-probe.v1';
+  const legacy = '.jhw-atomic-source-' + 'a'.repeat(32);
+  for (const name of [workspace, legacy]) fs.mkdirSync(path.join(f.runtime, name), 0o700);
+  const options = {repositoryRoot:f.root, now:NOW};
+  const deploy = acquireLease(path.join(f.runtime, 'deploy.lock'), {create:true});
+  const admission = acquireLease(path.join(f.runtime, 'admission.lock'), {create:true});
+  try {
+    const before = names(f.runtime);
+    const preparedPlan = prune.prepareRuntimePrune(options);
+    assert.equal(preparedPlan.plan.skipped.unknown, 1);
+    assert.deepEqual(prune.applyRuntimePrune({
+      ...options, preparedPlan, deployLease:deploy, admissionLease:admission,
+    }).removed, {journals:0, previous:0});
+    assert.deepEqual(names(f.runtime), before);
+  } finally { admission.close(); deploy.close(); }
+});
+
 test('bounded scanner accepts 4096 and 4097 entries and blocks cap plus one',()=>{
  const f=fixture(test);for(let i=0;i<4096;i++)fs.mkdirSync(path.join(f.runtime,`unknown-${i}`));
  assert.equal(prune.planRuntimePrune({repositoryRoot:f.root,now:NOW}).observed.entries,4096);
@@ -70,6 +113,19 @@ test('one pending or unverified journal blocks the entire batch',()=>{
  const malformed=path.join(f.runtime,'.deploy.00000000000000000000000000000003');fs.mkdirSync(malformed,{mode:0o700});write(path.join(malformed,'state.json'),'{}\n');
  assert.throws(()=>prune.planRuntimePrune({repositoryRoot:f.root,now:NOW}),{code:'DEPLOY_PRUNE_BLOCKED',reason:'unverified_journal'});
  assert.equal(fs.existsSync(eligible.directory),true);
+});
+
+test('prune recognizes compatible journal variants without widening ordinary keys',()=>{
+ const f=fixture(test);const previous={activationId:'a-'+'1'.repeat(32),releaseId:'r-'+'1'.repeat(40)+'-'+'2'.repeat(64),predecessorActivationId:null,observation:{target:'activations/a-'+'1'.repeat(32),dev:'1',ino:'2',ctimeNs:'3'}};
+ const candidate='r-'+'3'.repeat(40)+'-'+'4'.repeat(64);const name='.deploy.'+'a'.repeat(32);const directory=path.join(f.runtime,name);fs.mkdirSync(directory,{mode:0o700});
+ const state={version:1,status:'complete',operation:'activate',compatible:true,candidateReleaseId:candidate,compatibilityDigest:'5'.repeat(64),phase:'complete',previous,variables:{},mutationStarted:true,destination:{activationId:'a-'+'6'.repeat(32),releaseId:candidate,predecessorActivationId:previous.activationId},current:{activationId:'a-'+'6'.repeat(32),releaseId:candidate,predecessorActivationId:previous.activationId,observation:{target:'activations/a-'+'6'.repeat(32),dev:'7',ino:'8',ctimeNs:'9'}}};
+ write(path.join(directory,'state.json'),state);write(path.join(directory,'candidate-probe.log'),'ok\n');
+ prune.recordDeploymentRetention({repositoryRoot:f.root,journalDirectory:directory,completedAt:new Date(NOW-90*24*60*60*1000).toISOString()});
+ for(let sequence=2;sequence<=33;sequence++)journal(f,sequence,{age:60+sequence});
+ assert.ok(prune.planRuntimePrune({repositoryRoot:f.root,now:NOW}).candidates.journals.includes(name));
+ const ordinary=journal(f,34,{age:100,children:{'candidate-probe.log':'not compatible'}});
+ assert.throws(()=>prune.planRuntimePrune({repositoryRoot:f.root,now:NOW}),{code:'DEPLOY_PRUNE_BLOCKED',reason:'unverified_journal'});
+ assert.equal(fs.existsSync(ordinary.directory),true);
 });
 
 test('30 days, newest 32, and completedAt ties are retained',()=>{
