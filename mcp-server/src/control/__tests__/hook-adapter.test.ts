@@ -746,7 +746,7 @@ exec "$@"
 async function runLauncher(
   fixture: LauncherFixture,
   args: readonly string[],
-  stdin: string,
+  stdin?: string,
   extraEnv: NodeJS.ProcessEnv = {},
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -927,7 +927,6 @@ while :; do /usr/bin/sleep 1; done
     const result = await runLauncher(
       fixture,
       ["--adapter", "gemini", "--event", "PreToolUse"],
-      preToolPayload(),
     );
 
     expect(JSON.parse(result.stdout)).toEqual(exactFailure("PreToolUse", "GUARD_PROTOCOL_MISMATCH"));
@@ -942,7 +941,6 @@ while :; do /usr/bin/sleep 1; done
     const result = await runLauncher(
       fixture,
       ["--adapter", "codex", "--event", "PreToolUse"],
-      preToolPayload(),
     );
 
     expect(JSON.parse(result.stdout)).toEqual(exactFailure("PreToolUse", "GUARD_UNAVAILABLE"));
@@ -956,7 +954,6 @@ while :; do /usr/bin/sleep 1; done
     const result = await runLauncher(
       fixture,
       ["--adapter", "claude", "--event", "PreToolUse"],
-      preToolPayload(),
     );
 
     expect(JSON.parse(result.stdout)).toEqual(exactFailure("PreToolUse", "GUARD_UNAVAILABLE"));
